@@ -1,0 +1,5 @@
+# One line-ending discipline everywhere. The testkit compares generated text
+# against goldens byte-for-byte, so a CRLF checkout on Windows is a test
+# failure with identical content.
+* text=auto eol=lf
+*.png binary
