@@ -156,7 +156,7 @@ pub fn snap_surface(surface: &mut SurfaceClass, policy: &SnapPolicy) -> Vec<Stri
                 fit.minor_radius = snapped;
             }
         }
-        SurfaceClass::Freeform => {}
+        SurfaceClass::Pattern(_) | SurfaceClass::EdgeRound(_) | SurfaceClass::Freeform => {}
     }
     notes
 }

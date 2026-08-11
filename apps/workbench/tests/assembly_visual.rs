@@ -90,7 +90,6 @@ fn assembly_placement_and_joint_snapshots() {
     harness.snapshot("assembly_component_placement_preview");
 
     click_button(&mut harness, "Cancel operation");
-    click_button(&mut harness, "Properties");
     click_button(&mut harness, "Add revolute joint");
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().assembly_joint_count(), 1);

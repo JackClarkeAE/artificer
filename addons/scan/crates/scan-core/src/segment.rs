@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use artificer_geometry::{Point3, Vector3};
 
 use crate::fit::{
-    ConeFit, CylinderFit, PlaneFit, RevolvedBlendFit, SphereFit, fit_cone, fit_cylinder,
-    fit_plane, fit_sphere,
+    ConeFit, CylinderFit, EdgeRoundFit, PatternFit, PlaneFit, RevolvedBlendFit, SphereFit,
+    fit_cone, fit_cylinder, fit_plane, fit_sphere,
 };
 use crate::mesh::TriangleMesh;
 
@@ -122,6 +122,11 @@ pub enum SurfaceClass {
     /// A fillet ring: torus patch revolved about a datum axis. Produced by
     /// blend recognition after datum alignment, never by region fitting.
     Blend(RevolvedBlendFit),
+    /// An n-fold circular pattern (a gear's toothing): one master surface
+    /// repeated about the datum axis. Produced by pattern recognition.
+    Pattern(PatternFit),
+    /// The round/chamfer band along the shared edge of two features.
+    EdgeRound(EdgeRoundFit),
     Freeform,
 }
 
@@ -159,6 +164,12 @@ impl SurfaceClass {
                 minor_radius: fit.minor_radius,
                 deviation: fit.deviation,
             }),
+            Self::Pattern(fit) => Self::Pattern(PatternFit {
+                axis_point: transform.apply_point(fit.axis_point),
+                axis: transform.apply_vector(fit.axis),
+                ..*fit
+            }),
+            Self::EdgeRound(fit) => Self::EdgeRound(*fit),
             Self::Freeform => Self::Freeform,
         }
     }
@@ -210,7 +221,7 @@ impl SurfaceClass {
                     )
                 })
             }
-            Self::Freeform => None,
+            Self::Pattern(_) | Self::EdgeRound(_) | Self::Freeform => None,
         }
     }
 
@@ -221,6 +232,8 @@ impl SurfaceClass {
             Self::Sphere(_) => "sphere",
             Self::Cone(_) => "cone",
             Self::Blend(_) => "blend",
+            Self::Pattern(_) => "pattern",
+            Self::EdgeRound(_) => "edge_round",
             Self::Freeform => "freeform",
         }
     }
@@ -232,6 +245,8 @@ impl SurfaceClass {
             Self::Sphere(f) => Some(f.deviation.rms),
             Self::Cone(f) => Some(f.deviation.rms),
             Self::Blend(f) => Some(f.deviation.rms),
+            Self::Pattern(f) => Some(f.deviation.rms),
+            Self::EdgeRound(f) => Some(f.deviation.rms),
             Self::Freeform => None,
         }
     }

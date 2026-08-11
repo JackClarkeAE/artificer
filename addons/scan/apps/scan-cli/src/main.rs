@@ -16,6 +16,7 @@ use artificer_scan_core::{
     IcpParams, ReverseOptions, TriangleMesh, best_fit_align, reverse_engineer, synth,
 };
 
+mod snapshot;
 mod viewer;
 
 fn load_mesh(path: &str) -> Result<TriangleMesh, String> {
@@ -38,8 +39,10 @@ fn usage() -> String {
      artificer-scan reverse <mesh> [--tolerance MM] [--max-dihedral DEG] [--min-faces N]\n\
                             [--no-ransac] [--min-support N] [--ransac-epsilon MM]\n\
                             [--no-merge] [--min-feature MM2] [--no-datum] [--no-snap] [--json out.json]\n\
-                            [--aligned-out mesh.stl] [--history plan.json]\n\
+                            [--aligned-out mesh.stl] [--history plan.json] [--profile-out master.png]\n\
+                            [--labels labels.bin]\n\
      artificer-scan view <mesh> [reverse options] [--out viewer.html]\n\
+     artificer-scan snapshot <mesh> [reverse options] [--top] [--out snapshot.png]\n\
      artificer-scan demo [--out scan.stl]"
         .to_owned()
 }
@@ -176,6 +179,8 @@ fn run() -> Result<(), String> {
             let json_path = take_flag_value(&mut args, "--json");
             let aligned_path = take_flag_value(&mut args, "--aligned-out");
             let history_path = take_flag_value(&mut args, "--history");
+            let profile_path = take_flag_value(&mut args, "--profile-out");
+            let labels_path = take_flag_value(&mut args, "--labels");
             let path = args.first().ok_or_else(usage)?;
             let mesh = load_mesh(path)?;
             let report = reverse_engineer(&mesh, &options);
@@ -201,6 +206,32 @@ fn run() -> Result<(), String> {
                 std::fs::write(history_path, artificer_scan_core::plan_to_history_json(plan))
                     .map_err(|e| format!("cannot write {history_path}: {e}"))?;
             }
+            if let Some(profile_path) = &profile_path {
+                let profile = report
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.master_profile.as_ref())
+                    .ok_or("no master profile (no pattern feature was accepted)")?;
+                let png = snapshot::render_profile_plot(profile, 1400, 700);
+                std::fs::write(profile_path, png)
+                    .map_err(|e| format!("cannot write {profile_path}: {e}"))?;
+            }
+            if let Some(labels_path) = &labels_path {
+                // Face-ownership map: little-endian u32 feature id per
+                // triangle, in mesh face order; u32::MAX = unowned.
+                let mut labels = vec![u32::MAX; mesh.triangles().len()];
+                for feature in &report.features {
+                    for &face in &feature.faces {
+                        labels[face as usize] = feature.id as u32;
+                    }
+                }
+                let mut bytes = Vec::with_capacity(labels.len() * 4);
+                for label in labels {
+                    bytes.extend_from_slice(&label.to_le_bytes());
+                }
+                std::fs::write(labels_path, bytes)
+                    .map_err(|e| format!("cannot write {labels_path}: {e}"))?;
+            }
             print!("{}", report_summary(&report));
             if let Some(json_path) = json_path {
                 println!("report written to {json_path}");
@@ -210,6 +241,12 @@ fn run() -> Result<(), String> {
             }
             if let Some(history_path) = history_path {
                 println!("history proposal written to {history_path}");
+            }
+            if let Some(profile_path) = profile_path {
+                println!("master profile plot written to {profile_path}");
+            }
+            if let Some(labels_path) = labels_path {
+                println!("face labels written to {labels_path}");
             }
             Ok(())
         }
@@ -226,6 +263,25 @@ fn run() -> Result<(), String> {
             let html = viewer::build_viewer_html(&mesh, &report, name);
             std::fs::write(&out, html).map_err(|e| format!("cannot write {out}: {e}"))?;
             println!("viewer written to {out}");
+            Ok(())
+        }
+        "snapshot" => {
+            let options = parse_reverse_options(&mut args)?;
+            let top = take_flag(&mut args, "--top");
+            let out =
+                take_flag_value(&mut args, "--out").unwrap_or_else(|| "snapshot.png".to_owned());
+            let path = args.first().ok_or_else(usage)?;
+            let mesh = load_mesh(path)?;
+            let report = reverse_engineer(&mesh, &options);
+            let model = viewer::display_model(&mesh, &report);
+            let camera = if top {
+                snapshot::Camera::TOP
+            } else {
+                snapshot::Camera::default()
+            };
+            let png = snapshot::render_side_by_side(&model, &camera, 1800, 760);
+            std::fs::write(&out, png).map_err(|e| format!("cannot write {out}: {e}"))?;
+            println!("snapshot written to {out}");
             Ok(())
         }
         "demo" => {

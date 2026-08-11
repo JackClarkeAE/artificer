@@ -279,3 +279,27 @@ pub fn cone_patch_samples(
     }
     (points, normals)
 }
+
+/// Revolves an open profile polyline `(radial distance, z)` fully about
+/// +Z, outward winding.
+pub fn revolved_profile_soup(
+    profile: &[(f64, f64)],
+    segments: usize,
+) -> Vec<[Point3; 3]> {
+    let mut soup = Vec::new();
+    let point = |s: usize, p: (f64, f64)| {
+        let angle = std::f64::consts::TAU * s as f64 / segments as f64;
+        Point3::new(p.0 * angle.cos(), p.0 * angle.sin(), p.1)
+    };
+    for pair in profile.windows(2) {
+        for s in 0..segments {
+            let a = point(s, pair[0]);
+            let b = point(s + 1, pair[0]);
+            let c = point(s + 1, pair[1]);
+            let d = point(s, pair[1]);
+            soup.push([a, b, c]);
+            soup.push([a, c, d]);
+        }
+    }
+    soup
+}

@@ -65,7 +65,23 @@ dependency) so all types are kernel-native.
 8. **Canonicalize** (`snap`) — snap axes to datum directions, dimensions to
    a round grid, harmonize coplanar planes and coaxial cylinders; every
    adjustment is recorded as a note so the metrology story stays honest.
-9. **Pattern detection** (`reconstruct`) — the freeform residue's densest
+9. **Revolved-band extraction** (`reconstruct`) — interrupted surfaces
+   of revolution (a gear's tooth-tip and root bands, a spline's lands, a
+   synchro taper) defeat per-region fitting: every land patch bleeds
+   into its neighbours through edge rounds, so its own fit tilts and
+   fails the axis lock. In profile space `(radial distance, z)` a
+   cylinder is a vertical ridge and a cone is a slanted line. Phase one
+   histograms radially-facing donor faces by radius and claims dominant
+   vertical ridges as axis-locked cylinders; phase two detects slanted
+   lines with a deterministic line RANSAC and claims them as axis-true
+   cones. Donors include freeform patches, small scraps, **tilted**
+   cylinders/cones (a tilted axis on a revolved part is a misfit, not a
+   feature) and spheres (a shallow cone reads as an absurd giant
+   sphere). Every claim is gated by the locked fit meeting tolerance,
+   and the master tooth cross-section exports as a sweepable profile
+   polyline (`--profile-out` plots it; the history proposal carries it
+   as a `helical_sweep_pattern_proposal`).
+10. **Pattern detection** (`reconstruct`) — the freeform residue's densest
    band is autocorrelated azimuthally with two complementary signals: the
    area histogram (sparse patterns: lugs, bosses) and the mean-radius
    profile (dense bands: gear teeth, where the circumference is fully
@@ -75,7 +91,17 @@ dependency) so all types are kernel-native.
    climbs the harmonic ladder to undo subharmonic aliasing. A coverage
    metric reports how much of the scan the plan explains, and stays
    honest: unmodelled geometry counts against it.
-10. **Reconstruct** (`reconstruct`) — level planes and on-axis cylinders
+11. **Master-pattern recognition** (`reconstruct`) — the detected n-fold
+    band becomes a single design feature: every member face's azimuth is
+    unwrapped by an estimated helix rate (scanned for the rate that folds
+    tightest — measuring the helix angle from the scan) and folded into
+    one sector, where all instances collapse onto a master height-field
+    `radius(folded azimuth, z)`. Residuals are trimmed against the median
+    (tooth-end chamfers are not part of the repeated surface and honestly
+    stay outside), the master rebuilds from survivors, and the surviving
+    faces are claimed into one `Pattern` feature. The fold RMS and
+    worst-instance RMS are reported — they are the tooth-to-tooth error.
+12. **Reconstruct** (`reconstruct`) — level planes and on-axis cylinders
    assemble into a revolved profile: a stack of annulus segments (bores
    from inward-facing walls, bosses from outward), with fillet and chamfer
    proposals attached to the profile corners they round. `--history`
@@ -96,13 +122,27 @@ artificer-scan align   <source> <target> [--out aligned.stl]
 artificer-scan reverse <mesh> [--tolerance MM] [--max-dihedral DEG]
                               [--min-faces N] [--no-snap] [--json out.json]
 artificer-scan view    <mesh> [reverse options] [--out viewer.html]
+artificer-scan snapshot <mesh> [reverse options] [--top] [--out snapshot.png]
 artificer-scan demo    [--out scan.stl]
 ```
 
 `view` writes a self-contained WebGL viewer: original scan on the left, the
 classified segmentation on the right, orbiting in lockstep. Display geometry
 is decimated by vertex clustering; all reported numbers come from the
-full-resolution mesh.
+full-resolution mesh. `snapshot` renders the same side-by-side image to PNG
+without a browser (built-in z-buffered rasterizer and dependency-free PNG
+writer) — for chat, CI, and documentation.
+
+13. **Finalize** (`finalize`) — the decomposition completes: freeform
+    faces lying on a recognized surface join it face-by-face; faces
+    within reach of *two* features become the round along their shared
+    edge, grouped per feature pair as `EdgeRound` features with named
+    adjacency ("round along the edge between plane z +17.3 and cylinder
+    d 75.9"); implausible fits (a sphere centred outside the part)
+    demote first; and whatever truly remains collapses into one residue
+    record. Every face ends up owned by exactly one feature — areas tile
+    the mesh exactly — and `--labels` exports the face-to-feature map as
+    a little-endian u32 per triangle.
 
 ## Known limits / next milestones
 - Fillet/blend recognition (small-radius cylinders adjacent to two planes)

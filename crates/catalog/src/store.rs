@@ -784,8 +784,22 @@ fn atomic_create_or_compare(
     }
 }
 
+/// Flushes a directory entry so a freshly published object survives a crash.
+///
+/// This is a POSIX durability step: creating a link is not necessarily on disk
+/// until the containing directory is synced. Windows has no equivalent —
+/// opening a directory as a file is refused outright, which is why publishing
+/// failed there with "Access is denied" — and NTFS orders its own metadata, so
+/// the step is skipped rather than attempted and failed.
 fn sync_directory(path: &Path) -> Result<(), CatalogError> {
-    File::open(path)?.sync_all()?;
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
     Ok(())
 }
 

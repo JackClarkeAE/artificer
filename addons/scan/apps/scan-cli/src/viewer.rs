@@ -66,9 +66,21 @@ fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &str) -> String {
+/// Legend row: label, colour, and area of one classified feature.
+pub type LegendEntry = (String, [u8; 3], f64);
+
+/// Display-ready geometry shared by the HTML viewer and the offline
+/// snapshot renderer: datum-aligned, decimated, one colour per face.
+pub struct DisplayModel {
+    pub mesh: TriangleMesh,
+    /// Colour per display triangle.
+    pub colors: Vec<[u8; 3]>,
+    pub legend: Vec<LegendEntry>,
+}
+
+pub fn display_model(mesh: &TriangleMesh, report: &ReverseReport) -> DisplayModel {
     // Show the part in its datum frame when one was detected, so what the
-    // user orbits matches the coordinates in the report.
+    // user sees matches the coordinates in the report.
     let aligned;
     let mesh = match &report.datum {
         Some(alignment) => {
@@ -90,11 +102,27 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
         let identity: Vec<u32> = (0..mesh.triangles().len() as u32).collect();
         (mesh.clone(), identity)
     };
+    let (face_colors, legend) = face_colors_and_legend(mesh.triangles().len(), report);
+    let colors: Vec<[u8; 3]> = origins
+        .iter()
+        .map(|&origin| face_colors[origin as usize])
+        .collect();
+    DisplayModel {
+        mesh: display,
+        colors,
+        legend,
+    }
+}
+
+fn face_colors_and_legend(
+    face_count: usize,
+    report: &ReverseReport,
+) -> (Vec<[u8; 3]>, Vec<LegendEntry>) {
     // Color per original face from the classification.
-    let mut face_colors = vec![FREEFORM_COLOR; mesh.triangles().len()];
+    let mut face_colors = vec![FREEFORM_COLOR; face_count];
     let mut classified_count = 0usize;
     let mut freeform_count = 0usize;
-    let mut legend: Vec<(String, [u8; 3], f64)> = Vec::new();
+    let mut legend: Vec<LegendEntry> = Vec::new();
     for feature in &report.features {
         let color = if matches!(feature.surface, SurfaceClass::Freeform) {
             freeform_count += 1;
@@ -132,6 +160,12 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
                 SurfaceClass::Blend(fit) => {
                     format!("fillet r {:.2} mm", fit.minor_radius)
                 }
+                SurfaceClass::Pattern(fit) => {
+                    format!("pattern x {} (toothing)", fit.count)
+                }
+                SurfaceClass::EdgeRound(fit) => {
+                    format!("edge round, span {:.1} mm", fit.span)
+                }
                 SurfaceClass::Freeform => unreachable!(),
             };
             legend.push((label, color, feature.area));
@@ -139,11 +173,17 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
     }
     legend.sort_by(|a, b| b.2.total_cmp(&a.2));
     legend.truncate(14);
+    (face_colors, legend)
+}
+
+pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &str) -> String {
+    let model = display_model(mesh, report);
+    let display = &model.mesh;
     // De-index for flat shading: 9 floats and 9 color bytes per triangle.
     let mut positions = Vec::with_capacity(display.triangles().len() * 36);
     let mut colors = Vec::with_capacity(display.triangles().len() * 9);
-    for (face, _) in display.triangles().iter().enumerate() {
-        let color = face_colors[origins[face] as usize];
+    for face in 0..display.triangles().len() {
+        let color = model.colors[face];
         for corner in display.triangle_points(face) {
             for value in [corner.x, corner.y, corner.z] {
                 positions.extend_from_slice(&(value as f32).to_le_bytes());
@@ -151,7 +191,7 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
             colors.extend_from_slice(&color);
         }
     }
-    let bounds = mesh.bounds();
+    let bounds = display.bounds();
     let (center, diagonal) = bounds.map_or(([0.0f64; 3], 1.0), |b| {
         (
             [
@@ -169,7 +209,7 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
     };
     let legend_json: String = {
         let mut out = String::from("[");
-        for (index, (label, color, area)) in legend.iter().enumerate() {
+        for (index, (label, color, area)) in model.legend.iter().enumerate() {
             if index > 0 {
                 out.push(',');
             }

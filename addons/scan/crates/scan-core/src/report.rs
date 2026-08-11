@@ -5,12 +5,14 @@ use artificer_geometry::Point3;
 use artificer_geometry::Vector3;
 
 use crate::datum::{DatumAlignment, auto_datum_alignment};
+use crate::finalize::finalize_features;
 use crate::merge::{absorb_into_anchors, merge_fragments};
 use crate::mesh::TriangleMesh;
 use crate::ransac::{RansacParams, extract_primitives};
 use crate::reconstruct::{
-    ReconstructionPlan, axis_lock_refit, plan_summary, plan_to_history_json, recognize_blends,
-    reconstruct,
+    MasterProfile, PatternProposal, ReconstructionPlan, axis_lock_refit,
+    detect_circular_pattern, extract_revolved_bands, plan_summary, plan_to_history_json,
+    recognize_blends, recognize_pattern_feature, reconstruct,
 };
 use crate::segment::{SegmentationParams, SurfaceClass, classify_region, segment};
 use crate::snap::{SnapPolicy, harmonize_surfaces, snap_surface};
@@ -36,6 +38,9 @@ pub struct ReverseOptions {
     pub auto_datum: bool,
     /// Canonicalization policy; `None` reports raw fitted values.
     pub snap: Option<SnapPolicy>,
+    /// Complete the decomposition: claim on-surface faces, recognize edge
+    /// rounds between features, collapse the rest into one residue record.
+    pub finalize: bool,
 }
 
 impl Default for ReverseOptions {
@@ -48,6 +53,7 @@ impl Default for ReverseOptions {
             min_feature_area: 25.0,
             auto_datum: true,
             snap: Some(SnapPolicy::default()),
+            finalize: true,
         }
     }
 }
@@ -157,6 +163,8 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
     } else {
         None
     };
+    let mut detected_pattern: Option<PatternProposal> = None;
+    let mut master_profile: Option<MasterProfile> = None;
     if let Some(alignment) = &datum {
         // With a datum axis known, near-axis cylinders refit with the axis
         // locked: noisy patch axes stop wobbling, radii cluster, and a
@@ -172,6 +180,12 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             feature.surface = feature.surface.transformed(&alignment.transform);
         }
         recognize_blends(mesh, &mut features, alignment, options.tolerance);
+        extract_revolved_bands(mesh, &mut features, alignment, options.tolerance);
+        detected_pattern = detect_circular_pattern(mesh, &features, alignment);
+        if let Some(pattern) = &detected_pattern {
+            master_profile =
+                recognize_pattern_feature(mesh, &mut features, alignment, pattern, options.tolerance);
+        }
     }
     // Significance filter: what survives to here as a tiny analytic patch
     // is transition geometry (rounded edges, chamfer rows), not a design
@@ -180,7 +194,7 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         if feature.area < options.min_feature_area
             && !matches!(
                 feature.surface,
-                SurfaceClass::Freeform | SurfaceClass::Blend(_)
+                SurfaceClass::Freeform | SurfaceClass::Blend(_) | SurfaceClass::Pattern(_)
             )
         {
             feature.surface = SurfaceClass::Freeform;
@@ -204,6 +218,13 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             feature.notes.extend(notes);
         }
     }
+    if options.finalize {
+        finalize_features(mesh, &mut features, datum.as_ref(), options.tolerance);
+        features.sort_by(|a, b| b.area.total_cmp(&a.area));
+        for (id, feature) in features.iter_mut().enumerate() {
+            feature.id = id;
+        }
+    }
     let total_area: f64 = features.iter().map(|f| f.area).sum();
     let classified_area: f64 = features
         .iter()
@@ -212,7 +233,16 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         .sum();
     let plan = datum
         .as_ref()
-        .map(|alignment| reconstruct(mesh, &features, alignment, options.tolerance));
+        .map(|alignment| {
+            reconstruct(
+                mesh,
+                &features,
+                alignment,
+                options.tolerance,
+                detected_pattern,
+                master_profile.clone(),
+            )
+        });
     ReverseReport {
         features,
         total_area,
@@ -318,6 +348,25 @@ pub fn report_to_json(report: &ReverseReport) -> String {
                     fit.axis.x, fit.axis.y, fit.axis.z, fit.major_radius, fit.minor_radius
                 ));
             }
+            SurfaceClass::Pattern(fit) => {
+                out.push(',');
+                push_point(&mut out, "axis_point", fit.axis_point);
+                out.push_str(&format!(
+                    ",\"axis\":[{:.6},{:.6},{:.6}],\"count\":{},\"z_range\":[{:.6},{:.6}],\"radius_range\":[{:.6},{:.6}],\"worst_instance_rms\":{:.6}",
+                    fit.axis.x,
+                    fit.axis.y,
+                    fit.axis.z,
+                    fit.count,
+                    fit.z_range.0,
+                    fit.z_range.1,
+                    fit.radius_range.0,
+                    fit.radius_range.1,
+                    fit.worst_instance_rms
+                ));
+            }
+            SurfaceClass::EdgeRound(fit) => {
+                out.push_str(&format!(",\"span\":{:.6}", fit.span));
+            }
             SurfaceClass::Freeform => {}
         }
         if let Some(rms) = feature.surface.rms() {
@@ -400,6 +449,13 @@ pub fn report_summary(report: &ReverseReport) -> String {
                 fit.major_radius * 2.0,
                 fit.axis_point.z
             ),
+            SurfaceClass::Pattern(fit) => format!(
+                "pattern  {} instances about Z, fold rms {:.3} (worst instance {:.3})",
+                fit.count, fit.deviation.rms, fit.worst_instance_rms
+            ),
+            SurfaceClass::EdgeRound(fit) => {
+                format!("edge round, span {:.2} mm", fit.span)
+            }
             SurfaceClass::Freeform => "freeform".to_owned(),
         };
         let rms = feature

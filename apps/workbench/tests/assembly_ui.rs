@@ -141,7 +141,6 @@ fn placement_preview_cancel_confirm_and_undo_never_rewrite_component_geometry() 
 fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() {
     let mut harness = two_component_assembly();
     let poses = harness.state().component_poses();
-    click_button(&mut harness, "Properties");
 
     click_button(&mut harness, "Ground component");
     assert_eq!(

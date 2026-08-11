@@ -146,16 +146,31 @@ fn finish_active_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }
 
+/// Whether an accessibility node is the extrusion distance control.
+fn is_extrusion_distance(node: &egui_kittest::Node<'_>) -> bool {
+    node.value()
+        .as_deref()
+        .is_some_and(|value| value.starts_with("Distance "))
+        || node.accesskit_node().min_numeric_value() == Some(-1_000.0)
+}
+
 fn set_extrusion_distance(harness: &mut Harness<'static, KernelLabApp>, value: &str) {
     {
+        // Exactly one control must match. Two would mean the inspector and a
+        // command editor are both offering the distance, and picking the first
+        // silently drives whichever the accessibility tree happened to order
+        // first — which reads as a wrong value rather than a missing widget.
+        let matches = harness
+            .query_all_by_role(Role::SpinButton)
+            .filter(is_extrusion_distance)
+            .count();
+        assert_eq!(
+            matches, 1,
+            "expected exactly one extrusion distance control, found {matches}"
+        );
         let distance = harness
             .query_all_by_role(Role::SpinButton)
-            .find(|node| {
-                node.value()
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("Distance "))
-                    || node.accesskit_node().min_numeric_value() == Some(-1_000.0)
-            })
+            .find(is_extrusion_distance)
             .expect("extrusion distance control");
         distance.scroll_to_me();
     }
@@ -163,12 +178,7 @@ fn set_extrusion_distance(harness: &mut Harness<'static, KernelLabApp>, value: &
     {
         let distance = harness
             .query_all_by_role(Role::SpinButton)
-            .find(|node| {
-                node.value()
-                    .as_deref()
-                    .is_some_and(|value| value.starts_with("Distance "))
-                    || node.accesskit_node().min_numeric_value() == Some(-1_000.0)
-            })
+            .find(is_extrusion_distance)
             .expect("visible extrusion distance control");
         distance.click();
     }
@@ -224,7 +234,6 @@ fn prepare_finished_sketch(harness: &mut Harness<'static, KernelLabApp>, case: F
     commit_centered_rectangle(harness);
     finish_active_sketch(harness);
     if matches!(case, FeatureScenario::Cut) {
-        click_button(harness, "Properties");
         activate_button(harness, "Cut");
         set_extrusion_distance(harness, "-1");
     }
@@ -496,7 +505,6 @@ fn face_operation_override_preserves_direction_and_auto_restores_sign_inference(
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Add);
     assert!(initial_magnitude > 0.0);
 
-    click_button(&mut harness, "Properties");
     activate_button(&mut harness, "Cut");
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Cut);
     assert_eq!(harness.state().extrusion_distance(), initial_magnitude);
@@ -569,7 +577,6 @@ fn selected_solid_features_suppress_and_restore_with_atomic_clean_rebuilds() {
         assert_ne!(committed_snapshot, before_snapshot, "case: {case:?}");
 
         activate_button(&mut harness, &case.feature_button_label());
-        click_button(&mut harness, "Properties");
         activate_button(&mut harness, "Suppress selected feature");
         assert_eq!(harness.state().document_feature_count(), feature_count);
         assert_eq!(harness.state().document_dirty_feature_count(), 0);
@@ -851,7 +858,6 @@ fn explicitly_shown_consumed_sketch_survives_rebuild_undo_and_redo() {
     );
 
     activate_button(&mut harness, "Extrude 1 feature");
-    click_button(&mut harness, "Properties");
     activate_button(&mut harness, "Suppress selected feature");
     assert!(harness.state().sketch_visible(0));
     assert_eq!(harness.state().visible_model_sketch_overlay_count(), 1);

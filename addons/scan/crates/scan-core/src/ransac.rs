@@ -142,7 +142,12 @@ impl Primitive {
                 axis: f.axis,
                 half_angle: f.half_angle,
             },
-            SurfaceClass::Blend(_) | SurfaceClass::Freeform => return None,
+            SurfaceClass::Blend(_)
+            | SurfaceClass::Pattern(_)
+            | SurfaceClass::EdgeRound(_)
+            | SurfaceClass::Freeform => {
+                return None;
+            }
         })
     }
 }

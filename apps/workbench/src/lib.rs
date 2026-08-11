@@ -13422,7 +13422,11 @@ impl eframe::App for KernelLabApp {
             )
             .show(ui, |ui| self.feature_timeline(ui));
 
-        if self.inspector_open {
+        // The settings dialog takes the inspector's place while it is open.
+        // Both anchor to the right edge, and letting them stack put the
+        // dialog on top of the dock — the inspector's controls stayed in the
+        // accessibility tree but a pointer could no longer reach them.
+        if self.inspector_open && !self.document_properties_open {
             egui::Panel::right("contextual_inspector")
                 // Fixed width, deliberately not resizable. A width the content
                 // can influence lets one long diagnostic line shift the

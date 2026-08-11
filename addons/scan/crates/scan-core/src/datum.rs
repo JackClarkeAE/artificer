@@ -74,7 +74,8 @@ fn feature_direction(surface: &SurfaceClass) -> Option<Vector3> {
         SurfaceClass::Cylinder(fit) => Some(fit.axis),
         SurfaceClass::Cone(fit) => Some(fit.axis),
         SurfaceClass::Blend(fit) => Some(fit.axis),
-        SurfaceClass::Sphere(_) | SurfaceClass::Freeform => None,
+        SurfaceClass::Pattern(fit) => Some(fit.axis),
+        SurfaceClass::Sphere(_) | SurfaceClass::EdgeRound(_) | SurfaceClass::Freeform => None,
     }
 }
 

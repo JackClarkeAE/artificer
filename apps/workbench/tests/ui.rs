@@ -248,10 +248,6 @@ fn face_sketch_stops_motion_and_focuses_the_authored_face_pose() {
 fn canonical_case_exposes_native_result() {
     let mut harness = harness();
     harness.run();
-    harness
-        .get_by_role_and_label(Role::Button, "Properties")
-        .click_accesskit();
-    harness.run();
 
     assert!(harness.state().displayed_snapshot_id().is_some());
     assert_eq!(harness.state().last_error_code(), None);

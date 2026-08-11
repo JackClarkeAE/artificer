@@ -19,6 +19,7 @@
 //! report ready for feature reconstruction in the kernel.
 
 pub mod datum;
+pub mod finalize;
 pub mod fit;
 pub mod merge;
 pub mod mesh;
@@ -36,12 +37,14 @@ pub mod synth;
 pub mod transform;
 
 pub use datum::{DatumAlignment, auto_datum_alignment};
-pub use fit::{ConeFit, CylinderFit, DeviationStats, PlaneFit, SphereFit};
+pub use finalize::finalize_features;
+pub use fit::{ConeFit, CylinderFit, DeviationStats, EdgeRoundFit, PatternFit, PlaneFit, SphereFit};
 pub use merge::{absorb_into_anchors, merge_fragments};
 pub use mesh::TriangleMesh;
 pub use ransac::{ExtractedPrimitive, RansacParams, extract_primitives};
 pub use reconstruct::{
-    ChamferProposal, FilletProposal, ProfileSegment, ReconstructionPlan, plan_to_history_json,
+    ChamferProposal, FilletProposal, MasterProfile, PatternProposal, ProfileSegment,
+    ReconstructionPlan, extract_revolved_bands, plan_to_history_json, recognize_pattern_feature,
 };
 pub use register::{IcpParams, IcpResult, best_fit_align, datum_alignment};
 pub use report::{FeatureRecord, ReverseOptions, ReverseReport, reverse_engineer};

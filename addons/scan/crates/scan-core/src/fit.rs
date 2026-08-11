@@ -368,6 +368,37 @@ pub fn fit_revolved_blend(
     Some(RevolvedBlendFit { deviation, ..fit })
 }
 
+/// An n-fold circular pattern feature: one master surface, sampled as a
+/// height-field in folded profile space, repeated about the datum axis.
+/// The deviation statistics measure how tightly all instances collapse
+/// onto the master — the tooth-to-tooth error of a gear.
+#[derive(Clone, Copy, Debug)]
+pub struct PatternFit {
+    pub axis_point: Point3,
+    pub axis: Vector3,
+    pub count: usize,
+    pub z_range: (f64, f64),
+    pub radius_range: (f64, f64),
+    /// Fold residual across all instances against the master surface.
+    pub deviation: DeviationStats,
+    /// The worst single instance's RMS fold residual.
+    pub worst_instance_rms: f64,
+    /// Helical drift of the pattern about the axis (radians of azimuth per
+    /// millimetre of height); zero for a straight pattern.
+    pub helix_rate: f64,
+}
+
+/// Transition geometry along the shared edge of two recognized features:
+/// the physical round or chamfer band that connects them. Not an analytic
+/// surface — its identity is the feature pair it connects.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeRoundFit {
+    /// Mean total gap the band spans between its two support surfaces (mm).
+    pub span: f64,
+    /// Fold of the band's distances to its supports.
+    pub deviation: DeviationStats,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ConeFit {
     pub apex: Point3,
