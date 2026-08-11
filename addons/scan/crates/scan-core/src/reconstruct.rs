@@ -885,7 +885,7 @@ pub struct ReconstructionPlan {
 }
 
 /// z and radial extent of a feature's faces in the datum frame.
-fn extents(
+pub(crate) fn extents(
     mesh: &TriangleMesh,
     faces: &[u32],
     alignment: &DatumAlignment,
@@ -895,14 +895,16 @@ fn extents(
     let mut r_min = f64::INFINITY;
     let mut r_max = f64::NEG_INFINITY;
     for &face in faces {
-        let c = alignment
-            .transform
-            .apply_point(mesh.face_centroid(face as usize));
-        let radial = c.x.hypot(c.y);
-        z_min = z_min.min(c.z);
-        z_max = z_max.max(c.z);
-        r_min = r_min.min(radial);
-        r_max = r_max.max(radial);
+        // Corners, not centroids: a triangle fan's centroids all sit at
+        // one radius and would collapse the radial extent.
+        for corner in mesh.triangle_points(face as usize) {
+            let c = alignment.transform.apply_point(corner);
+            let radial = c.x.hypot(c.y);
+            z_min = z_min.min(c.z);
+            z_max = z_max.max(c.z);
+            r_min = r_min.min(radial);
+            r_max = r_max.max(radial);
+        }
     }
     (z_min, z_max, r_min, r_max)
 }

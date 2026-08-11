@@ -56,7 +56,7 @@ const FREEFORM_COLOR: [u8; 3] = [186, 189, 194];
 /// One visually distinct colour per classified feature: golden-angle hue
 /// stepping never puts similar hues next to each other, and cycling
 /// lightness separates features that land on nearby hues anyway.
-fn feature_color(instance: usize) -> [u8; 3] {
+pub(crate) fn feature_color(instance: usize) -> [u8; 3] {
     let hue = (instance as f64 * 137.508).rem_euclid(360.0);
     let lightness = [0.44, 0.58, 0.68][instance % 3];
     hsl_to_rgb(hue, 0.70, lightness)

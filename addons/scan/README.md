@@ -144,6 +144,37 @@ writer) — for chat, CI, and documentation.
     the mesh exactly — and `--labels` exports the face-to-feature map as
     a little-endian u32 per triangle.
 
+14. **Consolidate** (`consolidate`) — the advanced rungs. Merging is
+    decided by description length (BIC), not thresholds: two features
+    collapse exactly when the union's residual growth costs less than a
+    second parameter set, with tolerance as a hard safety cap.
+    Candidates come from the feature adjacency graph built off mesh
+    edges — including pairs joined only through an edge round, whose
+    seam dissolves into the merged surface. A joint solve then produces
+    **shared parameter entities**: one axis solved over every coaxial
+    cylinder's samples at once, one direction for the level planes, one
+    radius per equal-radius group. The report's `stages` table records
+    feature count and classified coverage after every stage, and
+    `parameters` lists the shared entities — the measure of success is
+    that the parameter list, not the feature list, is what shrinks.
+
+15. **Round refinement** (`finalize::refine_rounds`) — circumferential
+    edge rounds become parametric blend features: in profile space a
+    revolved fillet is an arc and a revolved chamfer is a line, chosen
+    by description length. Non-revolved rounds (a tooth edge) stay
+    rounds. Together with the topological residue resolution (unowned
+    components read their identity off the mesh adjacency — a pocket
+    bordered by one feature joins it, one bordered by two is their edge
+    round), coverage reaches ~100 percent.
+16. **Sharp rebuild** (`rebuild`) — the idealized model: every revolved
+    surface extends to its exact intersection with its neighbours,
+    fillet and chamfer rings drop out of the geometry into callouts,
+    and the toothing regenerates as the master profile swept helically.
+    `rebuild --out model.stl --snapshot cmp.png` writes the sharp STL
+    and a scan-versus-rebuild comparison image.
+
+Import formats: STL (binary/ascii), PLY (ascii/binary-LE), OBJ.
+
 ## Known limits / next milestones
 - Fillet/blend recognition (small-radius cylinders adjacent to two planes)
   and boundary-line extraction feed feature reconstruction in the kernel.

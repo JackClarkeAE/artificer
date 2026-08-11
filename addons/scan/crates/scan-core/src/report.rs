@@ -4,8 +4,9 @@ use artificer_geometry::Point3;
 
 use artificer_geometry::Vector3;
 
+use crate::consolidate::{consolidate_features, solve_shared_parameters};
 use crate::datum::{DatumAlignment, auto_datum_alignment};
-use crate::finalize::finalize_features;
+use crate::finalize::{finalize_features, refine_rounds};
 use crate::merge::{absorb_into_anchors, merge_fragments};
 use crate::mesh::TriangleMesh;
 use crate::ransac::{RansacParams, extract_primitives};
@@ -41,6 +42,12 @@ pub struct ReverseOptions {
     /// Complete the decomposition: claim on-surface faces, recognize edge
     /// rounds between features, collapse the rest into one residue record.
     pub finalize: bool,
+    /// MDL-gated merging over the feature adjacency graph, dissolving seam
+    /// rounds between merged surfaces (consolidation rungs 1 and 2).
+    pub consolidate: bool,
+    /// Joint solve for shared parameter entities: one axis for coaxial
+    /// features, shared directions and radii (consolidation rung 3).
+    pub shared_parameters: bool,
 }
 
 impl Default for ReverseOptions {
@@ -54,6 +61,8 @@ impl Default for ReverseOptions {
             auto_datum: true,
             snap: Some(SnapPolicy::default()),
             finalize: true,
+            consolidate: true,
+            shared_parameters: true,
         }
     }
 }
@@ -70,11 +79,23 @@ pub struct FeatureRecord {
     pub notes: Vec<String>,
 }
 
+/// Feature count and classified coverage captured after one pipeline stage.
+#[derive(Clone, Debug)]
+pub struct StageMetric {
+    pub stage: String,
+    pub features: usize,
+    pub classified_fraction: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ReverseReport {
     pub features: Vec<FeatureRecord>,
     pub total_area: f64,
     pub classified_area: f64,
+    /// Per-stage progress: how consolidation earned its keep.
+    pub stages: Vec<StageMetric>,
+    /// Shared-parameter entities from the joint solve (rung 3).
+    pub parameters: Vec<String>,
     /// When auto-datum ran: the transform from scan coordinates into the
     /// datum frame that all reported features are expressed in.
     pub datum: Option<DatumAlignment>,
@@ -101,6 +122,21 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             }
         })
         .collect();
+    let mut stages: Vec<StageMetric> = Vec::new();
+    let record_stage = |stages: &mut Vec<StageMetric>, name: &str, features: &[FeatureRecord]| {
+        let total: f64 = features.iter().map(|f| f.area).sum();
+        let classified: f64 = features
+            .iter()
+            .filter(|f| !matches!(f.surface, SurfaceClass::Freeform))
+            .map(|f| f.area)
+            .sum();
+        stages.push(StageMetric {
+            stage: name.to_owned(),
+            features: features.len(),
+            classified_fraction: if total > 0.0 { classified / total } else { 0.0 },
+        });
+    };
+    record_stage(&mut stages, "segment+classify", &features);
     if let Some(ransac) = &options.ransac {
         let mut params = *ransac;
         if params.epsilon <= 0.0 {
@@ -154,10 +190,12 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
     let merge_epsilon = options.ransac.as_ref().map_or(options.tolerance, |r| {
         if r.epsilon > 0.0 { r.epsilon } else { options.tolerance }
     });
+    record_stage(&mut stages, "ransac-peel", &features);
     if options.merge_fragments {
         features = merge_fragments(mesh, features, merge_epsilon);
         features = absorb_into_anchors(mesh, features, merge_epsilon);
     }
+    record_stage(&mut stages, "merge+absorb", &features);
     let datum = if options.auto_datum {
         auto_datum_alignment(&features)
     } else {
@@ -181,12 +219,14 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         }
         recognize_blends(mesh, &mut features, alignment, options.tolerance);
         extract_revolved_bands(mesh, &mut features, alignment, options.tolerance);
+        record_stage(&mut stages, "datum+lock+bands", &features);
         detected_pattern = detect_circular_pattern(mesh, &features, alignment);
         if let Some(pattern) = &detected_pattern {
             master_profile =
                 recognize_pattern_feature(mesh, &mut features, alignment, pattern, options.tolerance);
         }
     }
+    record_stage(&mut stages, "pattern", &features);
     // Significance filter: what survives to here as a tiny analytic patch
     // is transition geometry (rounded edges, chamfer rows), not a design
     // feature — report it as unexplained instead of as confetti.
@@ -218,12 +258,30 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             feature.notes.extend(notes);
         }
     }
+    record_stage(&mut stages, "snap+harmonize", &features);
     if options.finalize {
         finalize_features(mesh, &mut features, datum.as_ref(), options.tolerance);
         features.sort_by(|a, b| b.area.total_cmp(&a.area));
         for (id, feature) in features.iter_mut().enumerate() {
             feature.id = id;
         }
+        record_stage(&mut stages, "finalize", &features);
+    }
+    if options.consolidate {
+        consolidate_features(mesh, &mut features, options.tolerance);
+        features.sort_by(|a, b| b.area.total_cmp(&a.area));
+        for (id, feature) in features.iter_mut().enumerate() {
+            feature.id = id;
+        }
+        record_stage(&mut stages, "mdl-consolidate", &features);
+        refine_rounds(mesh, &mut features, datum.as_ref(), options.tolerance);
+        record_stage(&mut stages, "round-refine", &features);
+    }
+    let mut parameters: Vec<String> = Vec::new();
+    if options.shared_parameters {
+        parameters =
+            solve_shared_parameters(mesh, &mut features, datum.as_ref(), options.tolerance);
+        record_stage(&mut stages, "shared-parameters", &features);
     }
     let total_area: f64 = features.iter().map(|f| f.area).sum();
     let classified_area: f64 = features
@@ -247,6 +305,8 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         features,
         total_area,
         classified_area,
+        stages,
+        parameters,
         datum,
         plan,
     }
@@ -385,6 +445,25 @@ pub fn report_to_json(report: &ReverseReport) -> String {
         "],\"total_area\":{:.6},\"classified_area\":{:.6}",
         report.total_area, report.classified_area
     ));
+    out.push_str(",\"stages\":[");
+    for (index, stage) in report.stages.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"stage\":\"{}\",\"features\":{},\"classified\":{:.4}}}",
+            stage.stage, stage.features, stage.classified_fraction
+        ));
+    }
+    out.push(']');
+    out.push_str(",\"parameters\":[");
+    for (index, parameter) in report.parameters.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_escaped(&mut out, parameter);
+    }
+    out.push(']');
     if let Some(plan) = &report.plan {
         out.push_str(",\"reconstruction\":");
         out.push_str(&plan_to_history_json(plan));
@@ -399,6 +478,23 @@ pub fn report_summary(report: &ReverseReport) -> String {
         out.push_str("datum frame:\n");
         for note in &alignment.notes {
             out.push_str(&format!("  - {note}\n"));
+        }
+    }
+    if !report.stages.is_empty() {
+        out.push_str("stage progress (features / classified):\n");
+        for stage in &report.stages {
+            out.push_str(&format!(
+                "  {:<20} {:>6}   {:>5.1}%\n",
+                stage.stage,
+                stage.features,
+                stage.classified_fraction * 100.0
+            ));
+        }
+    }
+    if !report.parameters.is_empty() {
+        out.push_str("shared parameters:\n");
+        for parameter in &report.parameters {
+            out.push_str(&format!("  - {parameter}\n"));
         }
     }
     out.push_str(&format!(

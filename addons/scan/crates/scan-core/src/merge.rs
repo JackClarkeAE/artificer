@@ -57,7 +57,11 @@ fn compatible(a: &SurfaceClass, b: &SurfaceClass) -> bool {
     }
 }
 
-fn refit_like(mesh: &TriangleMesh, faces: &[u32], like: &SurfaceClass) -> Option<SurfaceClass> {
+pub(crate) fn refit_like(
+    mesh: &TriangleMesh,
+    faces: &[u32],
+    like: &SurfaceClass,
+) -> Option<SurfaceClass> {
     let FitInputs {
         points,
         normals,

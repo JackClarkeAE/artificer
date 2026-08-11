@@ -4,6 +4,8 @@ set -euo pipefail
 workspace_tree="$(cargo tree --workspace --edges normal,build)"
 kernel_tree="$(cargo tree --package artificer-kernel --edges normal,build)"
 sketch_tree="$(cargo tree --package artificer-sketch --edges normal,build)"
+ui_core_tree="$(cargo tree --package artificer-ui-core --edges normal,build)"
+sketch_ui_tree="$(cargo tree --package artificer-sketch-ui --edges normal,build)"
 
 if printf '%s\n' "$workspace_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(occt|opencascade)([^[:alnum:]_-]|$)'; then
     printf 'error: an OCCT/OpenCascade dependency entered the product workspace\n' >&2
@@ -17,6 +19,20 @@ fi
 
 if printf '%s\n' "$sketch_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(egui|eframe|wgpu|artificer-model|artificer-kernel v)([^[:alnum:]_-]|$)'; then
     printf 'error: UI, document, or B-rep dependencies entered the sketch-authoring crate\n' >&2
+    exit 1
+fi
+
+# The presentation split is a dependency boundary, not just a file move.
+# ui-core is pure presentation and must not see the kernel or the document
+# model at all; sketch-ui authors exact profiles and reaches the kernel's
+# vocabulary only through the sketch and geometry crates.
+if printf '%s\n' "$ui_core_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(artificer-kernel v|artificer-model)([^[:alnum:]_-]|$)'; then
+    printf 'error: kernel or document dependencies entered the ui-core presentation crate\n' >&2
+    exit 1
+fi
+
+if printf '%s\n' "$sketch_ui_tree" | rg --ignore-case '(^|[^[:alnum:]_-])(artificer-kernel v|artificer-model)([^[:alnum:]_-]|$)'; then
+    printf 'error: kernel or document dependencies entered the sketch-ui crate\n' >&2
     exit 1
 fi
 
@@ -46,9 +62,20 @@ fi
 # helpers; both consume immutable snapshots and cannot publish through widgets.
 # Extracted presentation modules may stage intents but must never execute the
 # kernel or mutate the parametric document directly.
-for module in material navigation ribbon theme; do
-    if rg 'NativeKernel::execute\(|execute_case\(|execute_sketch_extrusion\(|execute_face_push_pull\(|execute_library_insertion\(|apply_transform_preview\(|apply_component_placement_preview\(|apply_component_grounding\(|apply_revolute_joint\(|set_component_pose\(|set_component_grounded\(|add_joint\(' "apps/workbench/src/${module}.rs"; then
+mutation_pattern='NativeKernel::execute\(|execute_case\(|execute_sketch_extrusion\(|execute_face_push_pull\(|execute_library_insertion\(|apply_transform_preview\(|apply_component_placement_preview\(|apply_component_grounding\(|apply_revolute_joint\(|set_component_pose\(|set_component_grounded\(|add_joint\('
+for module in apps/workbench/src/material.rs apps/workbench/src/ribbon.rs; do
+    if rg "$mutation_pattern" "$module"; then
         printf 'error: a kernel-execution or document-mutation site entered the %s presentation module\n' "$module" >&2
+        exit 1
+    fi
+done
+
+# The extracted presentation crates may stage intents but must never execute
+# the kernel or mutate the parametric document outside their own test
+# modules, which build fixtures the same way integration tests do.
+for source in crates/ui-core/src/*.rs crates/viewport/src/*.rs crates/sketch-ui/src/*.rs; do
+    if sed '/^#\[cfg(test)\]/,$d' "$source" | rg "$mutation_pattern"; then
+        printf 'error: a kernel-execution or document-mutation site entered %s\n' "$source" >&2
         exit 1
     fi
 done
@@ -69,6 +96,9 @@ component_grounding_mutations="$(printf '%s\n' "$workbench_gate_source" | rg -c 
 joint_add_mutations="$(printf '%s\n' "$workbench_gate_source" | rg -c 'add_joint\(')"
 confirm_dispatch_sites="$(printf '%s\n' "$workbench_gate_source" | rg -c 'confirm_pending_operation\(')"
 cancel_dispatch_sites="$(printf '%s\n' "$workbench_gate_source" | rg -c 'cancel_pending_operation\(')"
+# `confirm_pending_operation` counts its definition, the tick/keyboard
+# dispatcher, and `finish_sketch_now`, which routes the one-click sketch
+# finish through the same coordinator rather than around it.
 if [[ "$native_execute_sites" -ne 10 \
     || "$case_transaction_sites" -ne 3 \
     || "$transform_transaction_sites" -ne 2 \
@@ -81,7 +111,7 @@ if [[ "$native_execute_sites" -ne 10 \
     || "$component_pose_mutations" -ne 1 \
     || "$component_grounding_mutations" -ne 1 \
     || "$joint_add_mutations" -ne 1 \
-    || "$confirm_dispatch_sites" -ne 2 \
+    || "$confirm_dispatch_sites" -ne 3 \
     || "$cancel_dispatch_sites" -ne 2 ]]; then
     printf 'error: the Kernel Lab interactive operation gate call graph changed\n' >&2
     exit 1

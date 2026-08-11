@@ -292,7 +292,6 @@ name = "artificer-sketch-ui"
 version = "0.1.0"
 dependencies = [
  "artificer-geometry",
- "artificer-kernel",
  "artificer-protocol",
  "artificer-sketch",
  "artificer-ui-core",

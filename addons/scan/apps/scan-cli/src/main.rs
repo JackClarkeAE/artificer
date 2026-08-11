@@ -28,7 +28,10 @@ fn load_mesh(path: &str) -> Result<TriangleMesh, String> {
     match extension.as_deref() {
         Some("stl") => artificer_scan_core::stl::read_stl(&bytes).map_err(|e| e.to_string()),
         Some("ply") => artificer_scan_core::ply::read_ply(&bytes).map_err(|e| e.to_string()),
-        _ => Err(format!("unsupported mesh format for {path} (expected .stl or .ply)")),
+        Some("obj") => artificer_scan_core::obj::read_obj(&bytes).map_err(|e| e.to_string()),
+        _ => Err(format!(
+            "unsupported mesh format for {path} (expected .stl, .ply, or .obj)"
+        )),
     }
 }
 
@@ -43,6 +46,7 @@ fn usage() -> String {
                             [--labels labels.bin]\n\
      artificer-scan view <mesh> [reverse options] [--out viewer.html]\n\
      artificer-scan snapshot <mesh> [reverse options] [--top] [--out snapshot.png]\n\
+     artificer-scan rebuild <mesh> [reverse options] [--out model.stl] [--snapshot cmp.png]\n\
      artificer-scan demo [--out scan.stl]"
         .to_owned()
 }
@@ -282,6 +286,54 @@ fn run() -> Result<(), String> {
             let png = snapshot::render_side_by_side(&model, &camera, 1800, 760);
             std::fs::write(&out, png).map_err(|e| format!("cannot write {out}: {e}"))?;
             println!("snapshot written to {out}");
+            Ok(())
+        }
+        "rebuild" => {
+            let options = parse_reverse_options(&mut args)?;
+            let out = take_flag_value(&mut args, "--out").unwrap_or_else(|| "rebuilt.stl".to_owned());
+            let snapshot_path = take_flag_value(&mut args, "--snapshot");
+            let path = args.first().ok_or_else(usage)?;
+            let mesh = load_mesh(path)?;
+            let report = reverse_engineer(&mesh, &options);
+            let rebuilt = artificer_scan_core::rebuild_sharp(&mesh, &report)
+                .ok_or("rebuild needs a datum frame (auto-datum found none)")?;
+            std::fs::write(&out, write_binary_stl(&rebuilt.mesh))
+                .map_err(|e| format!("cannot write {out}: {e}"))?;
+            println!(
+                "sharp rebuild written to {out} ({} triangles)",
+                rebuilt.mesh.triangles().len()
+            );
+            if let Some(snapshot_path) = snapshot_path {
+                let alignment = report.datum.as_ref().expect("datum present after rebuild");
+                let aligned_scan = mesh.transformed(&alignment.transform);
+                let (display_scan, _) = if aligned_scan.triangles().len() > 160_000 {
+                    let mut cell = aligned_scan.bounds_diagonal() / 260.0;
+                    let mut result = aligned_scan.simplified_by_clustering(cell);
+                    while result.0.triangles().len() > 160_000 {
+                        cell *= 1.35;
+                        result = aligned_scan.simplified_by_clustering(cell);
+                    }
+                    result
+                } else {
+                    (aligned_scan.clone(), Vec::new())
+                };
+                let colors: Vec<[u8; 3]> = rebuilt
+                    .feature_of_face
+                    .iter()
+                    .map(|&id| viewer::feature_color(id + 1))
+                    .collect();
+                let png = snapshot::render_comparison(
+                    &display_scan,
+                    &rebuilt.mesh,
+                    &colors,
+                    &snapshot::Camera::default(),
+                    1800,
+                    760,
+                );
+                std::fs::write(&snapshot_path, png)
+                    .map_err(|e| format!("cannot write {snapshot_path}: {e}"))?;
+                println!("comparison written to {snapshot_path}");
+            }
             Ok(())
         }
         "demo" => {

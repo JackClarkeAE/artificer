@@ -98,11 +98,10 @@ fn render_pane(
     frame: &mut Framebuffer,
     x0: usize,
     pane_width: usize,
-    model: &DisplayModel,
+    mesh: &artificer_scan_core::TriangleMesh,
     view: &View,
     colors: Option<&[[u8; 3]]>,
 ) {
-    let mesh = &model.mesh;
     let height = frame.height as f64;
     let width = pane_width as f64;
     let fov_scale = 1.0 / (0.4f64).tan();
@@ -186,8 +185,47 @@ pub fn render_side_by_side(
     });
     let view = View::new(camera, center, diagonal);
     let pane = width / 2;
-    render_pane(&mut frame, 0, pane, model, &view, None);
-    render_pane(&mut frame, pane, width - pane, model, &view, Some(&model.colors));
+    render_pane(&mut frame, 0, pane, &model.mesh, &view, None);
+    render_pane(
+        &mut frame,
+        pane,
+        width - pane,
+        &model.mesh,
+        &view,
+        Some(&model.colors),
+    );
+    for y in 0..height {
+        frame.color[y * width + pane] = [42, 46, 53];
+    }
+    encode_png(width, height, &frame.color)
+}
+
+/// Renders two different meshes side by side: the scan (gray, left) and
+/// the sharp rebuild (feature-coloured, right), same camera.
+pub fn render_comparison(
+    left: &artificer_scan_core::TriangleMesh,
+    right: &artificer_scan_core::TriangleMesh,
+    right_colors: &[[u8; 3]],
+    camera: &Camera,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut frame = Framebuffer::new(width, height);
+    let bounds = left.bounds();
+    let (center, diagonal) = bounds.map_or((Point3::default(), 1.0), |b| {
+        (
+            Point3::new(
+                (b.min.x + b.max.x) / 2.0,
+                (b.min.y + b.max.y) / 2.0,
+                (b.min.z + b.max.z) / 2.0,
+            ),
+            (b.max - b.min).length(),
+        )
+    });
+    let view = View::new(camera, center, diagonal);
+    let pane = width / 2;
+    render_pane(&mut frame, 0, pane, left, &view, None);
+    render_pane(&mut frame, pane, width - pane, right, &view, Some(right_colors));
     for y in 0..height {
         frame.color[y * width + pane] = [42, 46, 53];
     }

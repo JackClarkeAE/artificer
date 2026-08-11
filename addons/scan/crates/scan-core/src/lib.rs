@@ -18,14 +18,17 @@
 //! [`report::reverse_engineer`] chains stages 3-5 and emits a structured
 //! report ready for feature reconstruction in the kernel.
 
+pub mod consolidate;
 pub mod datum;
 pub mod finalize;
 pub mod fit;
 pub mod merge;
 pub mod mesh;
 pub mod numeric;
+pub mod obj;
 pub mod ply;
 pub mod ransac;
+pub mod rebuild;
 pub mod reconstruct;
 pub mod register;
 pub mod report;
@@ -36,12 +39,14 @@ pub mod stl;
 pub mod synth;
 pub mod transform;
 
+pub use consolidate::{consolidate_features, solve_shared_parameters};
 pub use datum::{DatumAlignment, auto_datum_alignment};
-pub use finalize::finalize_features;
+pub use finalize::{finalize_features, refine_rounds};
 pub use fit::{ConeFit, CylinderFit, DeviationStats, EdgeRoundFit, PatternFit, PlaneFit, SphereFit};
 pub use merge::{absorb_into_anchors, merge_fragments};
 pub use mesh::TriangleMesh;
 pub use ransac::{ExtractedPrimitive, RansacParams, extract_primitives};
+pub use rebuild::{RebuiltModel, rebuild_sharp};
 pub use reconstruct::{
     ChamferProposal, FilletProposal, MasterProfile, PatternProposal, ProfileSegment,
     ReconstructionPlan, extract_revolved_bands, plan_to_history_json, recognize_pattern_feature,
