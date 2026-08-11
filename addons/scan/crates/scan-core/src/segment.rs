@@ -163,6 +163,57 @@ impl SurfaceClass {
         }
     }
 
+    /// Signed distance to the surface and the unit surface normal at the
+    /// closest point; `None` for freeform or degenerate probe locations.
+    pub fn probe(&self, point: Point3) -> Option<(f64, Vector3)> {
+        match self {
+            Self::Plane(fit) => Some((fit.signed_distance(point), fit.normal)),
+            Self::Sphere(fit) => {
+                let radial = point - fit.center;
+                let length = radial.length();
+                (length > 1e-12).then(|| (length - fit.radius, radial / length))
+            }
+            Self::Cylinder(fit) => {
+                let v = point - fit.axis_point;
+                let radial = v - fit.axis * v.dot(fit.axis);
+                let length = radial.length();
+                (length > 1e-12).then(|| (length - fit.radius, radial / length))
+            }
+            Self::Cone(fit) => {
+                let v = point - fit.apex;
+                let h = v.dot(fit.axis);
+                let radial = v - fit.axis * h;
+                let length = radial.length();
+                let (sin_a, cos_a) = fit.half_angle.sin_cos();
+                (length > 1e-12).then(|| {
+                    (
+                        length * cos_a - h * sin_a,
+                        radial / length * cos_a - fit.axis * sin_a,
+                    )
+                })
+            }
+            Self::Blend(fit) => {
+                let v = point - fit.axis_point;
+                let h = v.dot(fit.axis);
+                let radial = v - fit.axis * h;
+                let length = radial.length();
+                if length < 1e-12 {
+                    return None;
+                }
+                let profile = (length - fit.major_radius, h);
+                let profile_length = profile.0.hypot(profile.1);
+                (profile_length > 1e-12).then(|| {
+                    (
+                        profile_length - fit.minor_radius,
+                        radial / length * (profile.0 / profile_length)
+                            + fit.axis * (profile.1 / profile_length),
+                    )
+                })
+            }
+            Self::Freeform => None,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Plane(_) => "plane",

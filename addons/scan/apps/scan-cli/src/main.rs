@@ -37,7 +37,7 @@ fn usage() -> String {
      artificer-scan align <source> <target> [--out aligned.stl]\n\
      artificer-scan reverse <mesh> [--tolerance MM] [--max-dihedral DEG] [--min-faces N]\n\
                             [--no-ransac] [--min-support N] [--ransac-epsilon MM]\n\
-                            [--no-merge] [--no-datum] [--no-snap] [--json out.json]\n\
+                            [--no-merge] [--min-feature MM2] [--no-datum] [--no-snap] [--json out.json]\n\
                             [--aligned-out mesh.stl] [--history plan.json]\n\
      artificer-scan view <mesh> [reverse options] [--out viewer.html]\n\
      artificer-scan demo [--out scan.stl]"
@@ -101,6 +101,11 @@ fn parse_reverse_options(args: &mut Vec<String>) -> Result<ReverseOptions, Strin
     }
     if take_flag(args, "--no-merge") {
         options.merge_fragments = false;
+    }
+    if let Some(value) = take_flag_value(args, "--min-feature") {
+        options.min_feature_area = value
+            .parse::<f64>()
+            .map_err(|_| format!("bad feature area {value}"))?;
     }
     if take_flag(args, "--no-datum") {
         options.auto_datum = false;

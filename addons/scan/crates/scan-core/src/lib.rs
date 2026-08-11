@@ -37,7 +37,7 @@ pub mod transform;
 
 pub use datum::{DatumAlignment, auto_datum_alignment};
 pub use fit::{ConeFit, CylinderFit, DeviationStats, PlaneFit, SphereFit};
-pub use merge::merge_fragments;
+pub use merge::{absorb_into_anchors, merge_fragments};
 pub use mesh::TriangleMesh;
 pub use ransac::{ExtractedPrimitive, RansacParams, extract_primitives};
 pub use reconstruct::{

@@ -32,12 +32,23 @@ dependency) so all types are kernel-native.
    estimates (PCA plane, Kåsa sphere/circle, normal-covariance axes, tangent
    plane apex intersection) refined by Levenberg–Marquardt, with
    RMS/max deviation statistics for tolerance-driven model selection.
-5. **Fragment merge** (`merge`) — RANSAC extracts connected components, so
-   one physical surface interrupted by keyways or slots returns as several
-   fragments. Compatible fragments (coaxial cylinders, coplanar planes,
-   concentric spheres) accrete greedily, and each merge is accepted only
-   when a least-squares refit over the union of faces still meets
-   tolerance — a genuine 46.8 mm step never swallows a 47.3 mm relief.
+5. **Fragment merge and absorption** (`merge`) — RANSAC extracts connected
+   components, so one physical surface interrupted by keyways or slots
+   returns as several fragments. Compatible fragments (coaxial cylinders,
+   coplanar planes, concentric spheres) accrete greedily, and each merge
+   is accepted only when a least-squares refit over the union of faces
+   still meets tolerance — a genuine 46.8 mm step never swallows a
+   47.3 mm relief. Absorption then handles what parameter compatibility
+   cannot: a small noisy patch on a big surface may have fit as a tilted
+   plane, a huge sphere, or stayed freeform — its parameters are noise,
+   but its **point membership** (distance band plus normal agreement
+   against the anchor surface) is decisive, so anchors claim on-surface
+   patches regardless of the patch's own kind and refit once grown.
+   Coplanar disconnected lands — a gear's tooth tops against its face —
+   deliberately count as one plane feature. A significance filter then
+   demotes analytic patches below `--min-feature` (default 25 mm^2) to
+   freeform: a few square millimetres of "cone" on a large part is
+   transition geometry, not a design feature.
 6. **Auto-datum** (`datum`) — cluster feature directions (cylinder/cone
    axes, plane normals, area weighted, sign insensitive): the dominant
    cluster becomes +Z, the strongest perpendicular cluster +X, and the
@@ -54,7 +65,17 @@ dependency) so all types are kernel-native.
 8. **Canonicalize** (`snap`) — snap axes to datum directions, dimensions to
    a round grid, harmonize coplanar planes and coaxial cylinders; every
    adjustment is recorded as a note so the metrology story stays honest.
-9. **Reconstruct** (`reconstruct`) — level planes and on-axis cylinders
+9. **Pattern detection** (`reconstruct`) — the freeform residue's densest
+   band is autocorrelated azimuthally with two complementary signals: the
+   area histogram (sparse patterns: lugs, bosses) and the mean-radius
+   profile (dense bands: gear teeth, where the circumference is fully
+   covered and only the root-to-tip radius oscillation carries the
+   pattern). Signals are built per z-slab so helical patterns — whose
+   azimuth drifts with height — still sum coherently, and the peak picker
+   climbs the harmonic ladder to undo subharmonic aliasing. A coverage
+   metric reports how much of the scan the plan explains, and stays
+   honest: unmodelled geometry counts against it.
+10. **Reconstruct** (`reconstruct`) — level planes and on-axis cylinders
    assemble into a revolved profile: a stack of annulus segments (bores
    from inward-facing walls, bosses from outward), with fillet and chamfer
    proposals attached to the profile corners they round. `--history`

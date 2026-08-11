@@ -10,7 +10,9 @@
 //! merging those would push the union RMS past tolerance, so they stay
 //! separate features.
 
-use crate::fit::{fit_cylinder, fit_plane, fit_sphere};
+use artificer_geometry::Vector3;
+
+use crate::fit::{fit_cone, fit_cylinder, fit_plane, fit_sphere};
 use crate::mesh::TriangleMesh;
 use crate::report::FeatureRecord;
 use crate::segment::{FitInputs, SurfaceClass, fit_inputs};
@@ -59,15 +61,136 @@ fn refit_like(mesh: &TriangleMesh, faces: &[u32], like: &SurfaceClass) -> Option
     let FitInputs {
         points,
         normals,
+        cone_samples,
         mean_normal,
-        ..
     } = fit_inputs(mesh, faces);
     match like {
         SurfaceClass::Cylinder(_) => fit_cylinder(&points, &normals).map(SurfaceClass::Cylinder),
         SurfaceClass::Plane(_) => fit_plane(&points, Some(mean_normal)).map(SurfaceClass::Plane),
         SurfaceClass::Sphere(_) => fit_sphere(&points).map(SurfaceClass::Sphere),
+        SurfaceClass::Cone(_) => fit_cone(&cone_samples).map(SurfaceClass::Cone),
         _ => None,
     }
+}
+
+/// A small feature's points either lie on a large anchor surface or they
+/// do not — regardless of what shape the small patch's own noisy fit
+/// chose. Absorption tests actual point membership (distance band plus
+/// normal agreement) against the biggest surfaces and folds compatible
+/// patches in, then refits each grown anchor.
+///
+/// This is the coplanar/coaxial consolidation the pairwise merge cannot
+/// do: a 12-face patch on a flat face may have fit as a tilted plane, a
+/// huge sphere, or stayed freeform — its parameters are noise, but its
+/// membership is decisive.
+pub fn absorb_into_anchors(
+    mesh: &TriangleMesh,
+    features: Vec<FeatureRecord>,
+    epsilon: f64,
+) -> Vec<FeatureRecord> {
+    const ANCHOR_MIN_AREA: f64 = 50.0;
+    const SAMPLE_BUDGET: usize = 36;
+    const MIN_PASS_FRACTION: f64 = 0.8;
+    let min_alignment = 25.0f64.to_radians().cos();
+    let mut order: Vec<usize> = (0..features.len()).collect();
+    order.sort_by(|&a, &b| features[b].area.total_cmp(&features[a].area));
+    let anchors: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&i| {
+            features[i].area >= ANCHOR_MIN_AREA
+                && !matches!(features[i].surface, SurfaceClass::Freeform)
+        })
+        .collect();
+    if anchors.is_empty() {
+        return features;
+    }
+    let mut consumed = vec![false; features.len()];
+    let mut additions: Vec<Vec<u32>> = vec![Vec::new(); features.len()];
+    let mut absorbed_counts = vec![0usize; features.len()];
+    // Smallest candidates first; each may join exactly one anchor.
+    for &candidate in order.iter().rev() {
+        let candidate_area = features[candidate].area;
+        let samples: Vec<(artificer_geometry::Point3, Option<Vector3>, f64)> = {
+            let faces = &features[candidate].faces;
+            let stride = faces.len().div_ceil(SAMPLE_BUDGET).max(1);
+            faces
+                .iter()
+                .step_by(stride)
+                .map(|&face| {
+                    (
+                        mesh.face_centroid(face as usize),
+                        mesh.face_normal(face as usize),
+                        mesh.face_area(face as usize),
+                    )
+                })
+                .collect()
+        };
+        if samples.is_empty() {
+            continue;
+        }
+        let mut best: Option<(usize, f64)> = None;
+        for &anchor in &anchors {
+            if anchor == candidate
+                || consumed[anchor]
+                || features[anchor].area < 2.0 * candidate_area
+            {
+                continue;
+            }
+            let mut passing = 0usize;
+            let mut squared = 0.0;
+            for (point, normal, _) in &samples {
+                let Some((distance, surface_normal)) = features[anchor].surface.probe(*point)
+                else {
+                    continue;
+                };
+                let aligned = normal.is_none_or(|n| n.dot(surface_normal).abs() >= min_alignment);
+                if distance.abs() <= epsilon && aligned {
+                    passing += 1;
+                }
+                squared += distance * distance;
+            }
+            let rms = (squared / samples.len() as f64).sqrt();
+            if passing as f64 >= MIN_PASS_FRACTION * samples.len() as f64
+                && rms <= epsilon
+                && best.is_none_or(|(_, best_rms)| rms < best_rms)
+            {
+                best = Some((anchor, rms));
+            }
+        }
+        if let Some((anchor, _)) = best {
+            consumed[candidate] = true;
+            let faces = features[candidate].faces.clone();
+            additions[anchor].extend(faces);
+            absorbed_counts[anchor] += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(features.len());
+    for (index, mut feature) in features.into_iter().enumerate() {
+        if consumed[index] {
+            continue;
+        }
+        if absorbed_counts[index] > 0 {
+            feature.faces.append(&mut additions[index]);
+            feature.face_count = feature.faces.len();
+            feature.area = feature
+                .faces
+                .iter()
+                .map(|&face| mesh.face_area(face as usize))
+                .sum();
+            feature.notes.push(format!(
+                "absorbed {} on-surface patch(es)",
+                absorbed_counts[index]
+            ));
+            if let Some(refit) = refit_like(mesh, &feature.faces, &feature.surface)
+                && refit.rms().is_some_and(|rms| rms <= epsilon)
+            {
+                feature.surface = refit;
+            }
+        }
+        out.push(feature);
+    }
+    out
 }
 
 /// Merges fragments of the same physical surface. `epsilon` is the RMS
@@ -202,6 +325,118 @@ mod tests {
         };
         assert!((fit.radius - 9.0).abs() < 0.01);
         assert!(merged[0].notes.iter().any(|n| n.contains("merged 1 fragment")));
+    }
+
+    #[test]
+    fn on_plane_patch_absorbs_regardless_of_its_own_fit() {
+        use crate::fit::{DeviationStats, SphereFit, fit_plane};
+        use artificer_geometry::{Point3, Vector3};
+        // A big flat plate plus a small disconnected coplanar patch whose
+        // own "fit" is a nonsense sphere: membership must win anyway.
+        let x = Vector3::new(1.0, 0.0, 0.0);
+        let y = Vector3::new(0.0, 1.0, 0.0);
+        let mut soup = synth::plane_patch_soup(Point3::new(0.0, 0.0, 0.0), x, y, 20.0, 20.0, 8, 8);
+        let base_count = soup.len();
+        soup.extend(synth::plane_patch_soup(
+            Point3::new(25.0, 0.0, 0.0),
+            x,
+            y,
+            2.0,
+            2.0,
+            2,
+            2,
+        ));
+        let mesh = crate::mesh::TriangleMesh::from_triangle_soup(&soup, 1e-9).unwrap();
+        let base_faces: Vec<u32> = (0..base_count as u32).collect();
+        let patch_faces: Vec<u32> = (base_count as u32..mesh.triangles().len() as u32).collect();
+        let base_points: Vec<Point3> = base_faces
+            .iter()
+            .map(|&f| mesh.face_centroid(f as usize))
+            .collect();
+        let plane = fit_plane(&base_points, Some(Vector3::new(0.0, 0.0, 1.0))).unwrap();
+        let features = vec![
+            FeatureRecord {
+                id: 0,
+                surface: SurfaceClass::Plane(plane),
+                face_count: base_faces.len(),
+                area: 400.0,
+                faces: base_faces,
+                notes: Vec::new(),
+            },
+            FeatureRecord {
+                id: 1,
+                surface: SurfaceClass::Sphere(SphereFit {
+                    center: Point3::new(26.0, 1.0, -500.0),
+                    radius: 500.0,
+                    deviation: DeviationStats {
+                        rms: 0.01,
+                        max_abs: 0.02,
+                    },
+                }),
+                face_count: patch_faces.len(),
+                area: 4.0,
+                faces: patch_faces,
+                notes: Vec::new(),
+            },
+        ];
+        let absorbed = absorb_into_anchors(&mesh, features, 0.05);
+        assert_eq!(absorbed.len(), 1, "patch was not absorbed");
+        assert!(matches!(absorbed[0].surface, SurfaceClass::Plane(_)));
+        assert_eq!(absorbed[0].face_count, mesh.triangles().len());
+        assert!(absorbed[0].notes.iter().any(|n| n.contains("absorbed 1")));
+    }
+
+    #[test]
+    fn off_plane_patch_is_not_absorbed() {
+        use crate::fit::fit_plane;
+        use artificer_geometry::{Point3, Vector3};
+        let x = Vector3::new(1.0, 0.0, 0.0);
+        let y = Vector3::new(0.0, 1.0, 0.0);
+        let mut soup = synth::plane_patch_soup(Point3::new(0.0, 0.0, 0.0), x, y, 20.0, 20.0, 8, 8);
+        let base_count = soup.len();
+        // The patch floats 1 mm above the plane: far outside a 0.05 band.
+        soup.extend(synth::plane_patch_soup(
+            Point3::new(25.0, 0.0, 1.0),
+            x,
+            y,
+            2.0,
+            2.0,
+            2,
+            2,
+        ));
+        let mesh = crate::mesh::TriangleMesh::from_triangle_soup(&soup, 1e-9).unwrap();
+        let base_faces: Vec<u32> = (0..base_count as u32).collect();
+        let patch_faces: Vec<u32> = (base_count as u32..mesh.triangles().len() as u32).collect();
+        let base_points: Vec<Point3> = base_faces
+            .iter()
+            .map(|&f| mesh.face_centroid(f as usize))
+            .collect();
+        let plane = fit_plane(&base_points, Some(Vector3::new(0.0, 0.0, 1.0))).unwrap();
+        let patch_points: Vec<Point3> = patch_faces
+            .iter()
+            .map(|&f| mesh.face_centroid(f as usize))
+            .collect();
+        let patch_plane = fit_plane(&patch_points, Some(Vector3::new(0.0, 0.0, 1.0))).unwrap();
+        let features = vec![
+            FeatureRecord {
+                id: 0,
+                surface: SurfaceClass::Plane(plane),
+                face_count: base_faces.len(),
+                area: 400.0,
+                faces: base_faces,
+                notes: Vec::new(),
+            },
+            FeatureRecord {
+                id: 1,
+                surface: SurfaceClass::Plane(patch_plane),
+                face_count: patch_faces.len(),
+                area: 4.0,
+                faces: patch_faces,
+                notes: Vec::new(),
+            },
+        ];
+        let absorbed = absorb_into_anchors(&mesh, features, 0.05);
+        assert_eq!(absorbed.len(), 2, "offset patch was wrongly absorbed");
     }
 
     #[test]

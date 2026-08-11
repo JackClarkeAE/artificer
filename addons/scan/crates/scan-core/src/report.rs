@@ -5,7 +5,7 @@ use artificer_geometry::Point3;
 use artificer_geometry::Vector3;
 
 use crate::datum::{DatumAlignment, auto_datum_alignment};
-use crate::merge::merge_fragments;
+use crate::merge::{absorb_into_anchors, merge_fragments};
 use crate::mesh::TriangleMesh;
 use crate::ransac::{RansacParams, extract_primitives};
 use crate::reconstruct::{
@@ -27,6 +27,10 @@ pub struct ReverseOptions {
     /// coplanar planes, concentric spheres) into single features, gated
     /// by a union refit meeting tolerance.
     pub merge_fragments: bool,
+    /// Analytic features below this area (mm^2) are demoted to freeform:
+    /// a few square millimetres of "cone" on a large part is transition
+    /// geometry, not a credible design feature.
+    pub min_feature_area: f64,
     /// Re-express all features in an automatically detected datum frame
     /// (dominant feature direction becomes +Z) before canonicalization.
     pub auto_datum: bool,
@@ -41,6 +45,7 @@ impl Default for ReverseOptions {
             segmentation: SegmentationParams::default(),
             ransac: Some(RansacParams::default()),
             merge_fragments: true,
+            min_feature_area: 25.0,
             auto_datum: true,
             snap: Some(SnapPolicy::default()),
         }
@@ -145,6 +150,7 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
     });
     if options.merge_fragments {
         features = merge_fragments(mesh, features, merge_epsilon);
+        features = absorb_into_anchors(mesh, features, merge_epsilon);
     }
     let datum = if options.auto_datum {
         auto_datum_alignment(&features)
@@ -160,11 +166,25 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         let locked = axis_lock_refit(mesh, &mut features, scan_axis, options.tolerance);
         if locked > 0 && options.merge_fragments {
             features = merge_fragments(mesh, features, merge_epsilon);
+            features = absorb_into_anchors(mesh, features, merge_epsilon);
         }
         for feature in &mut features {
             feature.surface = feature.surface.transformed(&alignment.transform);
         }
         recognize_blends(mesh, &mut features, alignment, options.tolerance);
+    }
+    // Significance filter: what survives to here as a tiny analytic patch
+    // is transition geometry (rounded edges, chamfer rows), not a design
+    // feature — report it as unexplained instead of as confetti.
+    for feature in &mut features {
+        if feature.area < options.min_feature_area
+            && !matches!(
+                feature.surface,
+                SurfaceClass::Freeform | SurfaceClass::Blend(_)
+            )
+        {
+            feature.surface = SurfaceClass::Freeform;
+        }
     }
     features.sort_by(|a, b| b.area.total_cmp(&a.area));
     for (id, feature) in features.iter_mut().enumerate() {

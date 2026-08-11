@@ -88,7 +88,15 @@ pub fn recognize_blends(
 ) -> usize {
     let mut recognized = 0;
     for feature in features.iter_mut() {
-        if !matches!(feature.surface, SurfaceClass::Freeform) || feature.face_count < 30 {
+        // Freeform patches are candidates outright; so are spheres, which
+        // is what a torus shoulder ring mis-fits as when no torus is in
+        // the vocabulary — those must beat their sphere fit to convert.
+        let sphere_rms = match &feature.surface {
+            SurfaceClass::Freeform => None,
+            SurfaceClass::Sphere(fit) => Some(fit.deviation.rms),
+            _ => continue,
+        };
+        if feature.face_count < 30 {
             continue;
         }
         let inputs = fit_inputs(mesh, &feature.faces);
@@ -118,12 +126,16 @@ pub fn recognize_blends(
             && blend.minor_radius >= 2.0 * tolerance
             && blend.minor_radius <= 0.3 * blend.major_radius
             && feature.area >= 10.0
-            && coverage >= 8;
+            && coverage >= 8
+            && sphere_rms.is_none_or(|rms| blend.deviation.rms < 0.8 * rms);
         if plausible {
+            let note = if sphere_rms.is_some() {
+                "sphere patch reclassified as a revolved fillet ring"
+            } else {
+                "recognized as a revolved fillet ring"
+            };
             feature.surface = SurfaceClass::Blend(blend);
-            feature
-                .notes
-                .push("recognized as a revolved fillet ring".to_owned());
+            feature.notes.push(note.to_owned());
             recognized += 1;
         }
     }
@@ -241,22 +253,31 @@ fn outwardness(mesh: &TriangleMesh, faces: &[u32], alignment: &DatumAlignment) -
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
-/// Detects an n-fold circular repetition in the freeform residue by
-/// circular autocorrelation of its azimuthal area distribution. A gear's
-/// teeth, a bolt circle's lugs, or a knurl band all leave a periodic
-/// signature that survives noise and arbitrary patch grouping.
+/// Detects an n-fold circular repetition in the freeform residue.
+///
+/// Two complementary azimuthal signals are autocorrelated: the **area
+/// histogram** (a sparse pattern — lugs, bosses — leaves presence/absence
+/// pulses) and the **mean-radius profile** (a dense band — gear teeth —
+/// covers the whole circumference, so its signature is the root-to-tip
+/// radius oscillation instead). Both are built per z-slab, because a
+/// helical pattern drifts in azimuth with height and autocorrelation is
+/// phase-invariant per slab, so slab correlations sum coherently no
+/// matter the twist. Shifts are fractional with linear interpolation,
+/// and the peak picker climbs to the largest multiple that still scores,
+/// which undoes the subharmonic alias (a shift of two periods reads as
+/// half the count).
 fn detect_circular_pattern(
     mesh: &TriangleMesh,
     features: &[FeatureRecord],
     alignment: &DatumAlignment,
 ) -> Option<PatternProposal> {
     const BINS: usize = 1440;
+    const SLABS: usize = 16;
     const MIN_AREA: f64 = 50.0;
-    const MIN_STRENGTH: f64 = 0.5;
-    let mut histogram = vec![0.0f64; BINS];
+    const MIN_STRENGTH: f64 = 0.35;
+    const MAX_COUNT: usize = 120;
+    let mut samples: Vec<(f64, f64, f64, f64)> = Vec::new();
     let mut total = 0.0;
-    let mut z_range = (f64::INFINITY, f64::NEG_INFINITY);
-    let mut radius_range = (f64::INFINITY, f64::NEG_INFINITY);
     for feature in features {
         if !matches!(feature.surface, SurfaceClass::Freeform) {
             continue;
@@ -270,58 +291,155 @@ fn detect_circular_pattern(
                 continue;
             }
             let area = mesh.face_area(face as usize);
-            let angle = c.y.atan2(c.x);
-            let bin =
-                (((angle + std::f64::consts::PI) / std::f64::consts::TAU) * BINS as f64) as usize;
-            histogram[bin.min(BINS - 1)] += area;
+            samples.push((c.y.atan2(c.x), c.z, radial, area));
             total += area;
-            z_range = (z_range.0.min(c.z), z_range.1.max(c.z));
-            radius_range = (radius_range.0.min(radial), radius_range.1.max(radial));
         }
     }
-    #[cfg(debug_assertions)]
-    eprintln!("pattern entry: freeform area {total:.1}");
     if total < MIN_AREA {
         return None;
     }
-    let mean = total / BINS as f64;
-    let centered: Vec<f64> = histogram.iter().map(|v| v - mean).collect();
-    let denominator: f64 = centered.iter().map(|v| v * v).sum();
-    if denominator < 1e-12 {
+    // Trim to the dense band: unexplained slivers are scattered over the
+    // whole part, and only the concentrated band (a gear's teeth, a lug
+    // ring) carries the pattern. Keep the 10th..90th area-weighted
+    // percentile window in height and radius.
+    let percentile_window = |key: fn(&(f64, f64, f64, f64)) -> f64,
+                             samples: &[(f64, f64, f64, f64)],
+                             total: f64| {
+        let mut sorted: Vec<(f64, f64)> = samples.iter().map(|s| (key(s), s.3)).collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut cumulative = 0.0;
+        let mut low = sorted.first().map_or(0.0, |s| s.0);
+        let mut high = sorted.last().map_or(0.0, |s| s.0);
+        let mut low_set = false;
+        for (value, area) in &sorted {
+            cumulative += area;
+            if !low_set && cumulative >= 0.10 * total {
+                low = *value;
+                low_set = true;
+            }
+            if cumulative <= 0.90 * total {
+                high = *value;
+            }
+        }
+        (low, high)
+    };
+    // Radius first, as a mode-centred window: the pattern band (teeth,
+    // lugs) is the densest radius family, and percentiles would blur it
+    // together with unexplained rings at other radii.
+    const RADIUS_BINS: usize = 48;
+    let r_min = samples.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
+    let r_max = samples.iter().map(|s| s.2).fold(f64::NEG_INFINITY, f64::max);
+    let span = (r_max - r_min).max(1e-9);
+    let mut radius_histogram = [0.0f64; RADIUS_BINS];
+    for &(_, _, radial, area) in &samples {
+        let bin = (((radial - r_min) / span) * RADIUS_BINS as f64) as usize;
+        radius_histogram[bin.min(RADIUS_BINS - 1)] += area;
+    }
+    let peak = (0..RADIUS_BINS)
+        .max_by(|&a, &b| radius_histogram[a].total_cmp(&radius_histogram[b]))?;
+    let floor = 0.2 * radius_histogram[peak];
+    let mut low_bin = peak;
+    while low_bin > 0 && radius_histogram[low_bin - 1] >= floor {
+        low_bin -= 1;
+    }
+    let mut high_bin = peak;
+    while high_bin + 1 < RADIUS_BINS && radius_histogram[high_bin + 1] >= floor {
+        high_bin += 1;
+    }
+    let r_low = r_min + span * low_bin as f64 / RADIUS_BINS as f64;
+    let r_high = r_min + span * (high_bin + 1) as f64 / RADIUS_BINS as f64;
+    samples.retain(|(_, _, radial, _)| (r_low..=r_high).contains(radial));
+    total = samples.iter().map(|(_, _, _, a)| a).sum();
+    if total < MIN_AREA {
         return None;
     }
-    let score_of = |count: usize| -> f64 {
-        let shift = (BINS as f64 / count as f64).round() as usize;
-        if shift == 0 {
+    // Then trim height to the dense 10th..90th percentile band.
+    let (z_low, z_high) = percentile_window(|s| s.1, &samples, total);
+    samples.retain(|(_, z, _, _)| (z_low..=z_high).contains(z));
+    total = samples.iter().map(|(_, _, _, a)| a).sum();
+    if total < MIN_AREA || z_high <= z_low {
+        return None;
+    }
+    let slab_height = ((z_high - z_low) / SLABS as f64).max(1e-9);
+    let mut weight = vec![vec![0.0f64; BINS]; SLABS];
+    let mut radius_sum = vec![vec![0.0f64; BINS]; SLABS];
+    for &(angle, z, radial, area) in &samples {
+        let slab = (((z - z_low) / slab_height) as usize).min(SLABS - 1);
+        let bin = ((((angle + std::f64::consts::PI) / std::f64::consts::TAU) * BINS as f64)
+            as usize)
+            .min(BINS - 1);
+        weight[slab][bin] += area;
+        radius_sum[slab][bin] += area * radial;
+    }
+    // Centered per-slab signals: area presence, and mean-radius profile.
+    let mut area_signal = vec![vec![0.0f64; BINS]; SLABS];
+    let mut radius_signal = vec![vec![0.0f64; BINS]; SLABS];
+    for slab in 0..SLABS {
+        let slab_area: f64 = weight[slab].iter().sum();
+        if slab_area <= 0.0 {
+            continue;
+        }
+        let area_mean = slab_area / BINS as f64;
+        let radius_mean = radius_sum[slab].iter().sum::<f64>() / slab_area;
+        for bin in 0..BINS {
+            area_signal[slab][bin] = weight[slab][bin] - area_mean;
+            if weight[slab][bin] > 0.0 {
+                radius_signal[slab][bin] = radius_sum[slab][bin] / weight[slab][bin] - radius_mean;
+            }
+        }
+    }
+    let correlation = |signals: &[Vec<f64>], count: usize| -> f64 {
+        let denominator: f64 = signals.iter().flat_map(|s| s.iter()).map(|v| v * v).sum();
+        if denominator < 1e-12 {
             return 0.0;
         }
-        centered
+        let shift = BINS as f64 / count as f64;
+        let base = shift.floor() as usize;
+        let fraction = shift - base as f64;
+        signals
             .iter()
-            .enumerate()
-            .map(|(b, v)| v * centered[(b + shift) % BINS])
+            .map(|slab| {
+                slab.iter()
+                    .enumerate()
+                    .map(|(b, v)| {
+                        let lower = slab[(b + base) % BINS];
+                        let upper = slab[(b + base + 1) % BINS];
+                        v * (lower * (1.0 - fraction) + upper * fraction)
+                    })
+                    .sum::<f64>()
+            })
             .sum::<f64>()
             / denominator
     };
-    let scores: Vec<(usize, f64)> = (5..=120).map(|count| (count, score_of(count))).collect();
-    let max_score = scores.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
-    #[cfg(debug_assertions)]
-    eprintln!("pattern probe: area {total:.1}, max score {max_score:.3}");
-    if max_score < MIN_STRENGTH {
+    let score_of = |count: usize| -> f64 {
+        correlation(&area_signal, count).max(correlation(&radius_signal, count))
+    };
+    let scores: Vec<f64> = (0..=MAX_COUNT)
+        .map(|count| if count < 5 { 0.0 } else { score_of(count) })
+        .collect();
+    let mut count = (5..=MAX_COUNT).max_by(|&a, &b| scores[a].total_cmp(&scores[b]))?;
+    if scores[count] < MIN_STRENGTH {
         return None;
     }
-    // Correlation also peaks when the shift is a multiple of the true
-    // period, which reads as a divisor of the true count — take the
-    // largest count that still scores near the maximum.
-    let count = scores
-        .iter()
-        .filter(|(_, s)| *s >= 0.92 * max_score)
-        .map(|(c, _)| *c)
-        .max()?;
+    // Climb the harmonic ladder: a shift of k periods aliases the true
+    // count down to count/k, so prefer the largest multiple that still
+    // scores close to the peak.
+    loop {
+        let climb = (2..)
+            .map(|k| count * k)
+            .take_while(|&m| m <= MAX_COUNT)
+            .filter(|&m| scores[m] >= 0.85 * scores[count])
+            .max();
+        match climb {
+            Some(higher) if higher != count => count = higher,
+            _ => break,
+        }
+    }
     Some(PatternProposal {
         count,
-        strength: score_of(count),
-        z_range,
-        radius_range,
+        strength: scores[count],
+        z_range: (z_low, z_high),
+        radius_range: (r_low, r_high),
         area: total,
     })
 }

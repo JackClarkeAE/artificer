@@ -1,6 +1,6 @@
 use artificer_workbench::KernelLabApp;
 use egui::accesskit::Role;
-use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
+use egui_kittest::{Harness, OsThreshold, SnapshotOptions, kittest::Queryable as _};
 
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     let position = harness
@@ -42,7 +42,17 @@ fn assembly_placement_and_joint_snapshots() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 

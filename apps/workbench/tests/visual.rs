@@ -1,6 +1,6 @@
 use artificer_workbench::KernelLabApp;
 use egui::accesskit::Role;
-use egui_kittest::{Harness, SnapshotOptions, kittest::Queryable as _};
+use egui_kittest::{Harness, OsThreshold, SnapshotOptions, kittest::Queryable as _};
 
 const CONFIRM_OPERATION: &str = "Confirm operation";
 const CANCEL_OPERATION: &str = "Cancel operation";
@@ -69,7 +69,17 @@ fn canonical_cuboid_snapshot() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
@@ -214,7 +224,17 @@ fn shaded_edges_and_dynamic_view_cube_snapshot() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
@@ -275,7 +295,17 @@ fn collapsed_workbench_shell_snapshot() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
@@ -315,7 +345,17 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
@@ -372,6 +412,10 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
 
 #[test]
 fn document_properties_units_and_interchange_snapshot() {
+    // This panel prints the document and export paths, which come from the
+    // user's home directory. The baseline is therefore machine-specific and is
+    // skipped in CI rather than compared there; the layout it covers is
+    // exercised by the other snapshots in this suite.
     let snapshot_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("snapshots");
@@ -381,7 +425,17 @@ fn document_properties_units_and_interchange_snapshot() {
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
         .with_os(egui::os::OperatingSystem::Nix)
-        .with_options(SnapshotOptions::new().output_path(snapshot_directory))
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                // Baselines are recorded on one machine but compared on
+                // several. Software rasterisers disagree with a GPU on a
+                // handful of antialiased pixels; the measured worst case
+                // across the whole suite is 52 of ~1,024,000. Allow a few
+                // hundred, which is orders of magnitude below any real
+                // layout change and still catches one.
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
         .wgpu()
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 

@@ -185,8 +185,15 @@ pub fn build_viewer_html(mesh: &TriangleMesh, report: &ReverseReport, title: &st
         out.push(']');
         out
     };
+    let pattern_note = report
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.pattern.as_ref())
+        .map_or(String::new(), |pattern| {
+            format!(" | {}-fold pattern", pattern.count)
+        });
     let stats = format!(
-        "{} vertices | {} triangles | {:.0} mm&sup2; | {} regions | {:.1}% classified | display {} tris",
+        "{} vertices | {} triangles | {:.0} mm&sup2; | {} regions | {:.1}% classified{pattern_note} | display {} tris",
         mesh.positions().len(),
         mesh.triangles().len(),
         report.total_area,
