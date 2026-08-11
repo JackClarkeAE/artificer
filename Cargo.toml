@@ -1,0 +1,69 @@
+[workspace]
+members = [
+    "apps/compute-bench",
+    "apps/cli",
+    "apps/workbench",
+    "crates/catalog",
+    "crates/compute",
+    "crates/geometry",
+    "crates/kernel",
+    "crates/protocol",
+    "crates/testkit",
+    "crates/model",
+    "crates/sketch",
+    "crates/sketch-ui",
+    "crates/ui-core",
+    "crates/viewport",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[workspace.dependencies]
+eframe = { version = "=0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wayland",
+    "wgpu",
+    "x11",
+] }
+egui = "=0.35.0"
+egui_kittest = { version = "=0.35.0", features = ["eframe", "snapshot", "wgpu"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+sha2 = "0.10"
+thiserror = "2.0"
+rayon = "1.11"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.dev]
+# Debug info is the dominant link cost here: every test binary statically
+# links the whole workbench, and there are two dozen of them. `unpacked`
+# leaves the debug info in the object files and records a pointer rather than
+# copying it into each executable, which is what makes a relink after touching
+# one file take minutes.
+debug = 1
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = 1
+split-debuginfo = "unpacked"
+
+# Dependencies are built once and rarely change, so optimising them costs
+# nothing on an incremental edit and makes the GPU snapshot suites, which are
+# dominated by rendering work, materially faster to run.
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.test.package."*"]
+opt-level = 1
+debug = false

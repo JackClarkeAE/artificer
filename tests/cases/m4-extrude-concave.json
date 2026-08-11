@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "protocol_version": 4,
+  "case_id": "m4.extrude-concave",
+  "title": "Extrude a certified concave linear profile transactionally",
+  "tags": [
+    "m4",
+    "extrude",
+    "profile",
+    "solid",
+    "deterministic"
+  ],
+  "required_capabilities": [
+    "native.extrude_polygon.v0"
+  ],
+  "precision": {
+    "unit": "millimetre",
+    "modeling_resolution": 1e-06,
+    "linear_agreement": 1e-09,
+    "angular_agreement_radians": 1e-10,
+    "parameter_resolution": 1e-12,
+    "approximation_budget": 1e-05,
+    "max_entity_uncertainty": 1e-06,
+    "max_operation_uncertainty": 1e-05,
+    "max_iterations": 128,
+    "max_subdivisions": 64,
+    "max_abs_coordinate": 1000000000.0,
+    "min_feature_size": 1e-05
+  },
+  "steps": [
+    {
+      "step_id": "extrude-concave-profile",
+      "command": {
+        "type": "extrude_polygon",
+        "frame": {
+          "origin": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "u": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "v": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0
+          }
+        },
+        "vertices": [
+          {
+            "x": 0.0,
+            "y": 0.0
+          },
+          {
+            "x": 3.0,
+            "y": 0.0
+          },
+          {
+            "x": 1.5,
+            "y": 1.0
+          },
+          {
+            "x": 3.0,
+            "y": 3.0
+          },
+          {
+            "x": 0.0,
+            "y": 3.0
+          }
+        ],
+        "distance": 4.0
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 10,
+          "edges": 15,
+          "coedges": 30,
+          "loops": 7,
+          "faces": 7,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 3.0,
+            "y": 3.0,
+            "z": 4.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "measures": {
+          "surface_area": 66.71110255092798,
+          "volume": 27.0,
+          "centroid": {
+            "x": 1.1666666666666667,
+            "y": 1.5555555555555556,
+            "z": 2.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "history": {
+          "record_count": 71,
+          "relation": "generated",
+          "all_records_one_to_one": false,
+          "complete_entity_mapping": false
+        },
+        "semantic_digest": "3d69c49902946bc85613748547b0e579acc232f11dbbbb0f6de55c99d450fb0f",
+        "validation_valid": true
+      }
+    }
+  ]
+}

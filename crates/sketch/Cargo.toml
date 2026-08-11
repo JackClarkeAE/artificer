@@ -1,0 +1,19 @@
+[package]
+name = "artificer-sketch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-compute = { path = "../compute" }
+artificer-geometry = { path = "../geometry" }
+artificer-protocol = { path = "../protocol" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

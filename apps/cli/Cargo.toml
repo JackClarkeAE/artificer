@@ -1,0 +1,12 @@
+[package]
+name = "artificer-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-testkit = { path = "../../crates/testkit" }
+
+[lints]
+workspace = true

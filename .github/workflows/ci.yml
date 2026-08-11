@@ -1,0 +1,104 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-contract:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Repeat deterministic success and failure contracts
+        run: |
+          cargo run --quiet --package artificer-cli -- repeat tests/cases/m0-cuboid.json --count 100
+          cargo run --quiet --package artificer-cli -- repeat tests/cases/m0-cuboid-zero-width.json --count 100
+
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native UI build libraries
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libegl1-mesa-dev libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
+          libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: |
+          cargo test --workspace --all-targets --exclude artificer-workbench
+          cargo test --package artificer-workbench \
+            --lib \
+            --bin artificer-workbench \
+            --test ui \
+            --test sketch_ui \
+            --test shell_ui \
+            --test frame_budget \
+            --test face_feature_ui \
+            --test model_document_ui \
+            --test parametric_history_ui
+      - name: Architecture boundaries
+        run: bash scripts/check-architecture-boundaries.sh
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # Windows is a first-class target: the kernel is pure Rust and the
+      # workbench is egui/wgpu, so the whole workspace is expected to build
+      # here. Pixel snapshots are recorded on Linux and are not compared on
+      # this runner; the kernel suites carry the exactness contracts and run
+      # everywhere.
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Kernel and geometry tests
+        run: cargo test --workspace --exclude artificer-workbench
+      - name: Release executable
+        run: cargo build --release --package artificer-workbench --bin artificer-workbench
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artificer-windows-x86_64
+          path: target/release/artificer-workbench.exe
+          if-no-files-found: error
+
+  focused-ui-pixels:
+    runs-on: ubuntu-24.04
+    env:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install headless graphics libraries
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libegl1-mesa-dev libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
+          libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Verify focused UI snapshots
+        run: cargo test --package artificer-workbench --test visual --test sketch_visual

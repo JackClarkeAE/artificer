@@ -1,0 +1,22 @@
+[package]
+name = "artificer-sketch-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-geometry = { path = "../geometry" }
+artificer-kernel = { path = "../kernel" }
+artificer-protocol = { path = "../protocol" }
+artificer-sketch = { path = "../sketch" }
+artificer-ui-core = { path = "../ui-core" }
+egui.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

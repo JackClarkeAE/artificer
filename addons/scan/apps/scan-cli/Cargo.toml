@@ -1,0 +1,17 @@
+[package]
+name = "artificer-scan-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "artificer-scan"
+path = "src/main.rs"
+
+[dependencies]
+artificer-geometry = { path = "../../../../crates/geometry" }
+artificer-scan-core = { path = "../../crates/scan-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "milestone": "M3",
+  "implementation": "artificer-kernel::brep",
+  "constructive_case_count": 100000,
+  "fixed_seed": "a0761d6478bd642f",
+  "primitives": ["box", "cylinder", "cone", "sphere", "torus"],
+  "properties": [
+    "complete validation",
+    "stale generation rejection",
+    "transactional corrupt-edit rejection",
+    "rigid-transform topology preservation",
+    "canonical semantic digest"
+  ],
+  "unallowlisted_validation_failures": 0
+}

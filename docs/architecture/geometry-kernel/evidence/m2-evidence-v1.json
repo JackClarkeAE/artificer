@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "milestone": "M2",
+  "implementation": "artificer-geometry::parametric",
+  "fixed_suites": [
+    "bezier_split_and_degree_elevation_preserve_geometry",
+    "knot_insertion_preserves_bspline",
+    "rational_quarter_circle_and_analytic_surfaces_evaluate",
+    "polynomial_and_rational_tensor_surfaces_agree_for_unit_weights",
+    "common_projection_extrema_and_surface_split_contracts_hold",
+    "malformed_parameterizations_fail_closed"
+  ],
+  "declared_surfaces": ["plane", "cylinder", "cone", "sphere", "torus"],
+  "unallowlisted_panics": 0,
+  "unallowlisted_invalid_successes": 0
+}

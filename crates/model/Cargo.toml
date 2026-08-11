@@ -1,0 +1,19 @@
+[package]
+name = "artificer-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-protocol = { path = "../protocol" }
+artificer-sketch = { path = "../sketch" }
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

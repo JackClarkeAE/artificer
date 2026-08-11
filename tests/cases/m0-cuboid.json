@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "protocol_version": 4,
+  "case_id": "m0.cuboid-2x3x4",
+  "title": "Canonical native 2 × 3 × 4 cuboid",
+  "tags": [
+    "m0",
+    "cuboid",
+    "solid",
+    "deterministic"
+  ],
+  "required_capabilities": [
+    "native.make_cuboid.v0"
+  ],
+  "precision": {
+    "unit": "millimetre",
+    "modeling_resolution": 1e-6,
+    "linear_agreement": 1e-9,
+    "angular_agreement_radians": 1e-10,
+    "parameter_resolution": 1e-12,
+    "approximation_budget": 1e-5,
+    "max_entity_uncertainty": 1e-6,
+    "max_operation_uncertainty": 1e-5,
+    "max_iterations": 128,
+    "max_subdivisions": 64,
+    "max_abs_coordinate": 1000000000.0,
+    "min_feature_size": 1e-5
+  },
+  "steps": [
+    {
+      "step_id": "make-cuboid",
+      "command": {
+        "type": "make_cuboid",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "size_x": 2.0,
+        "size_y": 3.0,
+        "size_z": 4.0
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 8,
+          "edges": 12,
+          "coedges": 24,
+          "loops": 6,
+          "faces": 6,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 4.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "measures": {
+          "surface_area": 52.0,
+          "volume": 24.0,
+          "centroid": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 2.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "validation_valid": true
+      }
+    }
+  ]
+}

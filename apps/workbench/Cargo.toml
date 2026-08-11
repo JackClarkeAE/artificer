@@ -1,0 +1,28 @@
+[package]
+name = "artificer-workbench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+artificer-catalog = { path = "../../crates/catalog" }
+artificer-compute = { path = "../../crates/compute" }
+artificer-geometry = { path = "../../crates/geometry" }
+artificer-kernel = { path = "../../crates/kernel" }
+artificer-protocol = { path = "../../crates/protocol" }
+artificer-model = { path = "../../crates/model" }
+artificer-sketch = { path = "../../crates/sketch" }
+artificer-sketch-ui = { path = "../../crates/sketch-ui" }
+artificer-ui-core = { path = "../../crates/ui-core" }
+artificer-viewport = { path = "../../crates/viewport" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+
+[lints]
+workspace = true

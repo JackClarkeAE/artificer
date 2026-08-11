@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640">
+  <title>m0.cuboid-2x3x4</title>
+  <desc>snapshot c02e03200b638347dd9a434e34811878 · digest c02e03200b638347dd9a434e3481187879d577cefd31b7e8e51fbcb0a6d9c52e · V=8 E=12 C=24 L=6 F=6 Sh=1 S=1</desc>
+  <rect width="960" height="640" fill="#0d1118"/>
+  <g stroke-linejoin="round">
+    <polygon points="646.543,434.615 513.309,357.692 313.457,473.077" fill="#386f94" fill-opacity="0.86" data-face="26" data-role="negative-z"/>
+    <polygon points="513.309,50.000 513.309,357.692 646.543,434.615" fill="#5159a8" fill-opacity="0.86" data-face="38" data-role="negative-y"/>
+    <polygon points="313.457,473.077 513.309,357.692 513.309,50.000" fill="#287e80" fill-opacity="0.86" data-face="50" data-role="negative-x"/>
+    <polygon points="313.457,473.077 446.691,550.000 646.543,434.615" fill="#386f94" fill-opacity="0.86" data-face="26" data-role="negative-z"/>
+    <polygon points="646.543,434.615 646.543,126.923 513.309,50.000" fill="#5159a8" fill-opacity="0.86" data-face="38" data-role="negative-y"/>
+    <polygon points="646.543,126.923 646.543,434.615 446.691,550.000" fill="#2f989a" fill-opacity="0.86" data-face="56" data-role="positive-x"/>
+    <polygon points="513.309,50.000 313.457,165.385 313.457,473.077" fill="#287e80" fill-opacity="0.86" data-face="50" data-role="negative-x"/>
+    <polygon points="446.691,550.000 313.457,473.077 313.457,165.385" fill="#6a74d7" fill-opacity="0.86" data-face="44" data-role="positive-y"/>
+    <polygon points="313.457,165.385 513.309,50.000 646.543,126.923" fill="#52a5de" fill-opacity="0.86" data-face="32" data-role="positive-z"/>
+    <polygon points="446.691,550.000 446.691,242.308 646.543,126.923" fill="#2f989a" fill-opacity="0.86" data-face="56" data-role="positive-x"/>
+    <polygon points="313.457,165.385 446.691,242.308 446.691,550.000" fill="#6a74d7" fill-opacity="0.86" data-face="44" data-role="positive-y"/>
+    <polygon points="646.543,126.923 446.691,242.308 313.457,165.385" fill="#52a5de" fill-opacity="0.86" data-face="32" data-role="positive-z"/>
+  </g>
+  <g fill="none" stroke="#d5e2ee" stroke-width="2" stroke-linecap="round">
+    <line x1="513.309" y1="357.692" x2="646.543" y2="434.615" data-edge="9"/>
+    <line x1="646.543" y1="434.615" x2="446.691" y2="550.000" data-edge="10"/>
+    <line x1="446.691" y1="550.000" x2="313.457" y2="473.077" data-edge="11"/>
+    <line x1="313.457" y1="473.077" x2="513.309" y2="357.692" data-edge="12"/>
+    <line x1="513.309" y1="50.000" x2="646.543" y2="126.923" data-edge="13"/>
+    <line x1="646.543" y1="126.923" x2="446.691" y2="242.308" data-edge="14"/>
+    <line x1="446.691" y1="242.308" x2="313.457" y2="165.385" data-edge="15"/>
+    <line x1="313.457" y1="165.385" x2="513.309" y2="50.000" data-edge="16"/>
+    <line x1="513.309" y1="357.692" x2="513.309" y2="50.000" data-edge="17"/>
+    <line x1="646.543" y1="434.615" x2="646.543" y2="126.923" data-edge="18"/>
+    <line x1="446.691" y1="550.000" x2="446.691" y2="242.308" data-edge="19"/>
+    <line x1="313.457" y1="473.077" x2="313.457" y2="165.385" data-edge="20"/>
+  </g>
+  <text x="28" y="606" fill="#e5eaf2" font-family="monospace" font-size="15">V=8 E=12 C=24 L=6 F=6 Sh=1 S=1 · c02e03200b638347dd9a434e3481187879d577cefd31b7e8e51fbcb0a6d9c52e</text>
+</svg>

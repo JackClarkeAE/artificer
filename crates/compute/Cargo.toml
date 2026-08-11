@@ -1,0 +1,12 @@
+[package]
+name = "artificer-compute"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rayon.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

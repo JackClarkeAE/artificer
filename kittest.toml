@@ -1,0 +1,15 @@
+output_path = "tests/snapshots"
+threshold = 0.6
+failed_pixel_count_threshold = 0
+
+[mac]
+threshold = 0.6
+failed_pixel_count_threshold = 0
+
+[linux]
+threshold = 0.6
+failed_pixel_count_threshold = 0
+
+[windows]
+threshold = 0.6
+failed_pixel_count_threshold = 0

@@ -1,0 +1,15 @@
+[package]
+name = "artificer-compute-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-compute = { path = "../../crates/compute" }
+artificer-kernel = { path = "../../crates/kernel" }
+artificer-protocol = { path = "../../crates/protocol" }
+artificer-sketch = { path = "../../crates/sketch" }
+
+[lints]
+workspace = true

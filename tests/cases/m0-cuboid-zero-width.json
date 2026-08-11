@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "protocol_version": 4,
+  "case_id": "m0.cuboid-zero-width",
+  "title": "Reject a zero-width cuboid transactionally",
+  "tags": [
+    "m0",
+    "cuboid",
+    "invalid-input",
+    "transaction"
+  ],
+  "required_capabilities": [
+    "native.make_cuboid.v0"
+  ],
+  "precision": {
+    "unit": "millimetre",
+    "modeling_resolution": 1e-6,
+    "linear_agreement": 1e-9,
+    "angular_agreement_radians": 1e-10,
+    "parameter_resolution": 1e-12,
+    "approximation_budget": 1e-5,
+    "max_entity_uncertainty": 1e-6,
+    "max_operation_uncertainty": 1e-5,
+    "max_iterations": 128,
+    "max_subdivisions": 64,
+    "max_abs_coordinate": 1000000000.0,
+    "min_feature_size": 1e-5
+  },
+  "steps": [
+    {
+      "step_id": "reject-zero-width",
+      "command": {
+        "type": "make_cuboid",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "size_x": 0.0,
+        "size_y": 3.0,
+        "size_z": 4.0
+      },
+      "expected": {
+        "status": "error",
+        "code": "invalid_input",
+        "diagnostic_codes": [
+          "CUBOID_EXTENT_TOO_SMALL"
+        ]
+      }
+    }
+  ]
+}

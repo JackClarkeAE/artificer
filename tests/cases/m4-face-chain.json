@@ -1,0 +1,355 @@
+{
+  "schema_version": 1,
+  "protocol_version": 4,
+  "case_id": "m4.face-chain",
+  "title": "Add, cut, and add again across generated rectangular faces",
+  "tags": [
+    "m4",
+    "m4d",
+    "extrude",
+    "face",
+    "add",
+    "cut",
+    "chain",
+    "deterministic"
+  ],
+  "required_capabilities": [
+    "native.make_cuboid.v0",
+    "native.extrude_face_profile.v0"
+  ],
+  "precision": {
+    "unit": "millimetre",
+    "modeling_resolution": 1e-06,
+    "linear_agreement": 1e-09,
+    "angular_agreement_radians": 1e-10,
+    "parameter_resolution": 1e-12,
+    "approximation_budget": 1e-05,
+    "max_entity_uncertainty": 1e-06,
+    "max_operation_uncertainty": 1e-05,
+    "max_iterations": 128,
+    "max_subdivisions": 64,
+    "max_abs_coordinate": 1000000000.0,
+    "min_feature_size": 1e-05
+  },
+  "steps": [
+    {
+      "step_id": "make-cuboid",
+      "command": {
+        "type": "make_cuboid",
+        "origin": {
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0
+        },
+        "size_x": 2.0,
+        "size_y": 3.0,
+        "size_z": 4.0
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 8,
+          "edges": 12,
+          "coedges": 24,
+          "loops": 6,
+          "faces": 6,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 4.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "measures": {
+          "surface_area": 52.0,
+          "volume": 24.0,
+          "centroid": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 2.0
+          },
+          "absolute_tolerance": 0.0
+        },
+        "validation_valid": true
+      }
+    },
+    {
+      "step_id": "add-boss",
+      "command": {
+        "type": "extrude_face_profile",
+        "target_face": {
+          "snapshot": "c02e03200b638347dd9a434e34811878",
+          "entity": 0,
+          "kind": "face"
+        },
+        "frame": {
+          "origin": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 4.0
+          },
+          "u": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "v": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0
+          }
+        },
+        "vertices": [
+          {
+            "x": -0.5,
+            "y": -1.0
+          },
+          {
+            "x": 0.5,
+            "y": -1.0
+          },
+          {
+            "x": 0.5,
+            "y": 1.0
+          },
+          {
+            "x": -0.5,
+            "y": 1.0
+          }
+        ],
+        "distance": 1.0,
+        "operation": "add"
+      },
+      "target_entity": {
+        "from_step": "make-cuboid",
+        "kind": "face",
+        "role": "face",
+        "ordinal": 1
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 16,
+          "edges": 24,
+          "coedges": 48,
+          "loops": 12,
+          "faces": 11,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 5.0
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "measures": {
+          "surface_area": 58.0,
+          "volume": 26.0,
+          "centroid": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 2.1923076923076925
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "validation_valid": true
+      }
+    },
+    {
+      "step_id": "cut-boss-end",
+      "command": {
+        "type": "extrude_face_profile",
+        "target_face": {
+          "snapshot": "3d6f3865c0a00d39601a51c336e9deea",
+          "entity": 0,
+          "kind": "face"
+        },
+        "frame": {
+          "origin": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 5.0
+          },
+          "u": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "v": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0
+          }
+        },
+        "vertices": [
+          {
+            "x": -0.25,
+            "y": -0.5
+          },
+          {
+            "x": 0.25,
+            "y": -0.5
+          },
+          {
+            "x": 0.25,
+            "y": 0.5
+          },
+          {
+            "x": -0.25,
+            "y": 0.5
+          }
+        ],
+        "distance": 0.5,
+        "operation": "cut"
+      },
+      "target_entity": {
+        "from_step": "add-boss",
+        "kind": "face",
+        "role": "face_extrude.boss.end_face"
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 24,
+          "edges": 36,
+          "coedges": 72,
+          "loops": 18,
+          "faces": 16,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 5.0
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "measures": {
+          "surface_area": 59.5,
+          "volume": 25.75,
+          "centroid": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 2.1674757281553396
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "validation_valid": true
+      }
+    },
+    {
+      "step_id": "add-pocket-floor",
+      "command": {
+        "type": "extrude_face_profile",
+        "target_face": {
+          "snapshot": "df3321715b091b1b1123fbc7f0846455",
+          "entity": 0,
+          "kind": "face"
+        },
+        "frame": {
+          "origin": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 4.5
+          },
+          "u": {
+            "x": 1.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "v": {
+            "x": 0.0,
+            "y": 1.0,
+            "z": 0.0
+          }
+        },
+        "vertices": [
+          {
+            "x": -0.125,
+            "y": -0.25
+          },
+          {
+            "x": 0.125,
+            "y": -0.25
+          },
+          {
+            "x": 0.125,
+            "y": 0.25
+          },
+          {
+            "x": -0.125,
+            "y": 0.25
+          }
+        ],
+        "distance": 0.25,
+        "operation": "add"
+      },
+      "target_entity": {
+        "from_step": "cut-boss-end",
+        "kind": "face",
+        "role": "face_extrude.pocket.floor_face"
+      },
+      "expected": {
+        "status": "success",
+        "topology": {
+          "vertices": 32,
+          "edges": 48,
+          "coedges": 96,
+          "loops": 24,
+          "faces": 21,
+          "shells": 1,
+          "solids": 1
+        },
+        "bounds": {
+          "min": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0
+          },
+          "max": {
+            "x": 2.0,
+            "y": 3.0,
+            "z": 5.0
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "measures": {
+          "surface_area": 59.875,
+          "volume": 25.78125,
+          "centroid": {
+            "x": 1.0,
+            "y": 1.5,
+            "z": 2.1704545454545454
+          },
+          "absolute_tolerance": 1e-09
+        },
+        "semantic_digest": "913030ee0e42fd2608e01ebab87f250c8cbb27da9c0f716eab4b2a5b603bcf2b",
+        "validation_valid": true
+      }
+    }
+  ]
+}
