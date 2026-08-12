@@ -245,7 +245,69 @@ fn prism_boolean_along(
     let mut slab_height = target.height;
     let compatible = match operation {
         BooleanOperation::Union => {
-            offset.abs() <= agreement && (target.height - tool.height).abs() <= agreement
+            let equal_slabs =
+                offset.abs() <= agreement && (target.height - tool.height).abs() <= agreement;
+            // A tool sitting exactly on the target's top cap is a boss: the
+            // additive mirror of the blind pocket. The two prisms glue at the
+            // interface plane — no face where they overlap, the target's top
+            // kept outside the tool, and the tool's underside kept where it
+            // overhangs. Both profiles may cross each other's boundaries
+            // freely; the flipped sense covers a boss under the bottom cap.
+            let stacked = (offset - target.height).abs() <= agreement;
+            if !equal_slabs && stacked {
+                if tool.height <= precision.min_feature_size {
+                    return Err(PrismBooleanError::EmptyResult);
+                }
+                let overlap = match profile_boolean(
+                    &target_region,
+                    &tool_region,
+                    BooleanOperation::Intersection,
+                    precision,
+                ) {
+                    Ok(regions) if !regions.is_empty() => regions,
+                    // Disjoint prisms have no shared material to glue.
+                    _ => return Err(PrismBooleanError::DomainUnsupported),
+                };
+                let _ = overlap;
+                let kept_top = match profile_boolean(
+                    &target_region,
+                    &tool_region,
+                    BooleanOperation::Difference,
+                    precision,
+                ) {
+                    Ok(regions) => regions,
+                    Err(ProfileBooleanError::EmptyResult) => Vec::new(),
+                    Err(ProfileBooleanError::Unsupported) => {
+                        return Err(PrismBooleanError::DomainUnsupported);
+                    }
+                };
+                let overhang = match profile_boolean(
+                    &tool_region,
+                    &target_region,
+                    BooleanOperation::Difference,
+                    precision,
+                ) {
+                    Ok(regions) => regions,
+                    Err(ProfileBooleanError::EmptyResult) => Vec::new(),
+                    Err(ProfileBooleanError::Unsupported) => {
+                        return Err(PrismBooleanError::DomainUnsupported);
+                    }
+                };
+                let lower_loops = imprinted_first_loops(&target_region, &tool_region, precision)
+                    .map_err(|_| PrismBooleanError::DomainUnsupported)?;
+                let upper_loops = imprinted_first_loops(&tool_region, &target_region, precision)
+                    .map_err(|_| PrismBooleanError::DomainUnsupported)?;
+                return build_stacked_boss(
+                    target,
+                    tool.height,
+                    &lower_loops,
+                    &upper_loops,
+                    &kept_top,
+                    &overhang,
+                    precision,
+                );
+            }
+            equal_slabs
         }
         BooleanOperation::Intersection => {
             slab_bottom = offset.max(0.0);
@@ -439,6 +501,64 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
 /// the floors are the 2D intersection (possibly several regions, each with
 /// holes: an annular tool has an annular floor). All three derive from the
 /// same deterministic imprint, so their shared vertices are the same floats.
+/// Builds a boss: the tool prism glued on top of the target prism.
+///
+/// The lower layer is the full target profile imprinted at the crossings,
+/// the upper layer the full tool profile likewise imprinted, and the
+/// interface carries a face only where exactly one of the two profiles has
+/// material — the target's kept top faces up, the tool's overhang underside
+/// faces down, and the overlap is open interior.
+fn build_stacked_boss(
+    target: &Slab,
+    tool_height: f64,
+    lower_loops: &[Vec<Segment>],
+    upper_loops: &[Vec<Segment>],
+    kept_top: &[ProfileRegion],
+    overhang: &[ProfileRegion],
+    precision: PrecisionPolicy,
+) -> Result<Topology, PrismBooleanError> {
+    let (Some(lower_outer), lower_holes) = (lower_loops.first(), &lower_loops[1..]) else {
+        return Err(PrismBooleanError::DomainUnsupported);
+    };
+    let lower_frame = protocol_frame(target.frame.origin, target.frame);
+    let lower_profile = PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: protocol_loop(lower_outer),
+            holes: lower_holes.iter().map(|hole| protocol_loop(hole)).collect(),
+        }],
+    };
+    let lower =
+        validate_analytic_profile_extrusion(lower_frame, &lower_profile, target.height, precision)
+            .map_err(|_| PrismBooleanError::DomainUnsupported)?;
+    let lower = build_analytic_extrusion(&lower);
+
+    let (Some(upper_outer), upper_holes) = (upper_loops.first(), &upper_loops[1..]) else {
+        return Err(PrismBooleanError::DomainUnsupported);
+    };
+    let upper_origin = target.frame.origin + target.frame.normal * target.height;
+    let upper_frame = protocol_frame(upper_origin, target.frame);
+    let upper_profile = PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: protocol_loop(upper_outer),
+            holes: upper_holes.iter().map(|hole| protocol_loop(hole)).collect(),
+        }],
+    };
+    let upper =
+        validate_analytic_profile_extrusion(upper_frame, &upper_profile, tool_height, precision)
+            .map_err(|_| PrismBooleanError::DomainUnsupported)?;
+    let upper = build_analytic_extrusion(&upper);
+
+    glue_layers(
+        &lower,
+        &upper,
+        target,
+        kept_top,
+        overhang,
+        target.height,
+        precision,
+    )
+}
+
 fn build_stacked_pocket(
     target: &Slab,
     lower_loops: &[Vec<Segment>],
@@ -496,6 +616,7 @@ fn build_stacked_pocket(
         &upper,
         target,
         floor_regions,
+        &[],
         floor_height,
         precision,
     )
@@ -636,9 +757,21 @@ fn build_interior_void(
 /// in-plane mirror, and reverses the traversal so the loop stays positive in
 /// the mirrored frame. Edges and vertices are untouched.
 fn reverse_shell_orientation(topology: &mut Topology) -> Result<(), PrismBooleanError> {
-    for face in &mut topology.faces {
+    for index in 0..topology.faces.len() {
+        reverse_face_orientation(topology, index)?;
+    }
+    Ok(())
+}
+
+/// Flips which side of one face is material, by the same mirror convention.
+fn reverse_face_orientation(
+    topology: &mut Topology,
+    face_index: usize,
+) -> Result<(), PrismBooleanError> {
+    let mirror: fn(Point2) -> Point2 = {
+        let face = &mut topology.faces[face_index];
         // The in-plane mirror matching the surface flip, as a linear map.
-        let mirror: fn(Point2) -> Point2 = match &mut face.value.surface {
+        match &mut face.value.surface {
             Surface::Plane(plane) => {
                 *plane = Plane::new(plane.origin, plane.v, plane.u);
                 |point: Point2| Point2::new(point.y, point.x)
@@ -650,8 +783,11 @@ fn reverse_shell_orientation(topology: &mut Topology) -> Result<(), PrismBoolean
             Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => {
                 return Err(PrismBooleanError::DomainUnsupported);
             }
-        };
-        for loop_key in face.value.loops().collect::<Vec<_>>() {
+        }
+    };
+    let loops = topology.faces[face_index].value.loops().collect::<Vec<_>>();
+    {
+        for loop_key in loops {
             let loop_record = &mut topology.loops[loop_key.0];
             loop_record.value.coedges.reverse();
             for coedge_key in loop_record.value.coedges.clone() {
@@ -705,6 +841,7 @@ fn glue_layers(
     upper: &Topology,
     target: &Slab,
     floor_regions: &[ProfileRegion],
+    ceiling_regions: &[ProfileRegion],
     floor_height: f64,
     precision: PrecisionPolicy,
 ) -> Result<Topology, PrismBooleanError> {
@@ -940,6 +1077,31 @@ fn glue_layers(
         });
         next_id += 1;
         faces.push(floor_face);
+    }
+    // Ceilings: interface faces whose material is above them — a boss's
+    // overhang underside. Built exactly like a floor and then flipped with
+    // the same mirror convention every reversed face uses, so the loop stays
+    // positively wound in its own parameter frame.
+    for region in ceiling_regions {
+        let outer_loop = floor_loop_from(&mut merged, &mut next_id, &region.outer)?;
+        let inner_loops = region
+            .holes
+            .iter()
+            .map(|hole| floor_loop_from(&mut merged, &mut next_id, hole))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ceiling_face = FaceKey(merged.faces.len());
+        merged.faces.push(Record {
+            id: EntityId::from_raw(next_id),
+            value: Face {
+                surface: Surface::Plane(Plane::new(floor_base, target.frame.u, target.frame.v)),
+                outer_loop,
+                inner_loops,
+                role: FaceRole::FeatureEnd,
+            },
+        });
+        next_id += 1;
+        reverse_face_orientation(&mut merged, ceiling_face.0)?;
+        faces.push(ceiling_face);
     }
 
     // One shell, one solid, and a compaction pass that drops the removed

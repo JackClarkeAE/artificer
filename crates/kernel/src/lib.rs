@@ -626,6 +626,89 @@ impl NativeKernel {
                         .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                         (topology, None, true)
                     }
+                    Err(PlanarProfileInputError::FaceFeature(
+                        FaceFeatureInputError::ProfileOutsideFace,
+                    )) if input.topology.solids.len() == 1 => {
+                        // The profile crosses the face boundary. That is not
+                        // an error of intent — half a circle over the edge is
+                        // an everyday boss or notch — so the operation is
+                        // reformulated exactly: the profile becomes a prism
+                        // tool and the whole solid the boolean target. A cut
+                        // becomes the difference the crossing-pocket engine
+                        // already certifies; an add becomes the stacked boss
+                        // glued at the face plane.
+                        let normal = {
+                            let u = frame.u;
+                            let v = frame.v;
+                            ProtocolVector3::new(
+                                u.y * v.z - u.z * v.y,
+                                u.z * v.x - u.x * v.z,
+                                u.x * v.y - u.y * v.x,
+                            )
+                        };
+                        let length =
+                            (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z)
+                                .sqrt();
+                        if !length.is_finite() || length <= f64::EPSILON {
+                            return Err(planar_profile_input_error(
+                                input.id,
+                                PlanarProfileInputError::FaceFeature(
+                                    FaceFeatureInputError::TargetDegenerate,
+                                ),
+                            ));
+                        }
+                        let unit = ProtocolVector3::new(
+                            normal.x / length,
+                            normal.y / length,
+                            normal.z / length,
+                        );
+                        // A cut's tool occupies the space below the face; an
+                        // add's tool the space above. Both extrude along the
+                        // frame normal, so the cut simply starts deeper.
+                        let tool_origin = match operation {
+                            FaceExtrusionOperation::Cut => ProtocolPoint3::new(
+                                frame.origin.x - unit.x * *distance,
+                                frame.origin.y - unit.y * *distance,
+                                frame.origin.z - unit.z * *distance,
+                            ),
+                            FaceExtrusionOperation::Add => frame.origin,
+                        };
+                        let tool_frame = PlanarFrame3::new(tool_origin, frame.u, frame.v);
+                        let tool = validate_analytic_profile_extrusion(
+                            tool_frame,
+                            profile,
+                            *distance,
+                            request.precision,
+                        )
+                        .map_err(|_| {
+                            planar_profile_input_error(
+                                input.id,
+                                PlanarProfileInputError::FaceFeature(
+                                    FaceFeatureInputError::ProfileOutsideFace,
+                                ),
+                            )
+                        })?;
+                        let tool = build_analytic_extrusion(&tool);
+                        let boolean_operation = match operation {
+                            FaceExtrusionOperation::Add => BooleanOperation::Union,
+                            FaceExtrusionOperation::Cut => BooleanOperation::Difference,
+                        };
+                        let topology = prism_boolean::build_prism_boolean(
+                            &input.topology,
+                            &tool,
+                            boolean_operation,
+                            request.precision,
+                        )
+                        .map_err(|_| {
+                            planar_profile_input_error(
+                                input.id,
+                                PlanarProfileInputError::FaceFeature(
+                                    FaceFeatureInputError::ProfileOutsideFace,
+                                ),
+                            )
+                        })?;
+                        (topology, None, true)
+                    }
                     Err(reason) => {
                         return Err(planar_profile_input_error(input.id, reason));
                     }
@@ -7862,7 +7945,10 @@ mod tests {
                         regions: vec![PlanarRegion2 {
                             outer: PlanarLoop2 {
                                 curves: vec![PlanarCurve2::Circle {
-                                    center: ProtocolPoint2::new(1.0, 1.5),
+                                    // Fully disjoint from the face: no
+                                    // interface exists, so even the
+                                    // boundary-crossing path must refuse.
+                                    center: ProtocolPoint2::new(30.0, 30.0),
                                     radius: 10.0,
                                     direction: ArcDirection::CounterClockwise,
                                 }],
