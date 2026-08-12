@@ -168,6 +168,16 @@ fn canonical_cuboid_snapshot() {
     harness.snapshot("pending_transform_confirmation");
 
     let viewport_rect = harness.get_by_label("Model viewport").rect();
+    // The floating confirmation chip vanishes on commit by design. Its zone
+    // is excluded from the jump check exactly like the status readout: both
+    // are transient chrome over the canvas, not model geometry.
+    let confirm_rect = harness
+        .get_by_role_and_label(Role::Button, CONFIRM_OPERATION)
+        .rect();
+    let chip_rect = egui::Rect::from_center_size(
+        egui::pos2(moved.width() as f32 / 2.0, confirm_rect.center().y),
+        egui::vec2(470.0, 56.0),
+    );
     harness
         .get_by_role_and_label(Role::Button, CONFIRM_OPERATION)
         .click();
@@ -196,7 +206,15 @@ fn canonical_cuboid_snapshot() {
         moved.width() as usize,
         status_rect,
     );
-    let changed_outside_status = changed_in_viewport.saturating_sub(changed_in_status);
+    let changed_in_chip = differing_rgba_pixels_in_rect(
+        combined_preview.as_raw(),
+        committed.as_raw(),
+        moved.width() as usize,
+        chip_rect,
+    );
+    let changed_outside_status = changed_in_viewport
+        .saturating_sub(changed_in_status)
+        .saturating_sub(changed_in_chip);
     assert!(
         changed_outside_status <= 24,
         "commit visibly jumped by {changed_outside_status} non-status viewport pixels"

@@ -1674,9 +1674,30 @@ fn show_document_impl(
         None
     };
 
+    // A hovered closed region highlights the way a hovered body face does,
+    // so a committed sketch reads as clickable material rather than as bare
+    // outlines with an invisible interior.
+    let hovered_sketch_region =
+        if active_tool == ActiveTool::Select && !feature_interaction.consumes_primary {
+            hover_position.and_then(|position| {
+                hit_test_model_sketch_regions(
+                    position,
+                    sketch_overlays,
+                    bodies,
+                    active_body,
+                    projection,
+                    *view,
+                    *active_display_transform,
+                    animation_phase,
+                )
+            })
+        } else {
+            None
+        };
     paint_model_sketch_overlays(
         &painter,
         sketch_overlays,
+        hovered_sketch_region.as_ref(),
         bodies,
         active_body,
         projection,
@@ -1912,25 +1933,9 @@ fn hit_test_model_sketch_regions(
             active_transform,
             animation_phase,
         )?;
-        if let Some(frame) = overlay.frame {
-            let facing = [
-                frame.origin,
-                Point3::new(
-                    frame.origin.x + frame.u.x,
-                    frame.origin.y + frame.u.y,
-                    frame.origin.z + frame.u.z,
-                ),
-                Point3::new(
-                    frame.origin.x + frame.v.x,
-                    frame.origin.y + frame.v.y,
-                    frame.origin.z + frame.v.z,
-                ),
-            ]
-            .map(|point| projection.instance_point(point, view, presentation));
-            if triangle_signed_area(facing) <= 1.0e-4 {
-                return None;
-            }
-        }
+        // No facing cull here: a closed region is a genuine selection target
+        // from any viewing direction, exactly as the curves that bound it now
+        // draw from any direction.
         overlay.regions.iter().find_map(|region| {
             let outer = region
                 .outer
@@ -3116,6 +3121,7 @@ fn triangle_depth_at(triangle: &ProjectedTriangle, position: Pos2) -> Option<f64
 fn paint_model_sketch_overlays(
     painter: &egui::Painter,
     overlays: &[ModelSketchOverlay],
+    hovered_region: Option<&ModelSketchRegionSelection>,
     bodies: &[DocumentBodyInstance<'_>],
     active_body: Option<BodyInstanceKey>,
     projection: Projection,
@@ -3133,7 +3139,14 @@ fn paint_model_sketch_overlays(
         ) else {
             continue;
         };
-        if let Some(frame) = overlay.frame {
+        // Only reference-plane cards cull by facing: a card seen edge-on or
+        // from behind has nothing useful to show. Sketch curves are
+        // one-dimensional and must stay visible from every direction — the
+        // whole point of showing a committed sketch in 3D is seeing it in
+        // relation to the model while orbiting.
+        if overlay.reference_plane.is_some()
+            && let Some(frame) = overlay.frame
+        {
             let facing = [
                 frame.origin,
                 Point3::new(
@@ -3150,6 +3163,38 @@ fn paint_model_sketch_overlays(
             .map(|point| projection.instance_point(point, view, presentation));
             if triangle_signed_area(facing) <= 1.0e-4 {
                 continue;
+            }
+        }
+        // The hovered closed region fills like a hovered body face. The
+        // triangulation honours holes, so an annular region highlights as a
+        // ring rather than a disc.
+        if let (Some(hovered), Some(frame)) = (hovered_region, overlay.frame)
+            && overlay.sketch_index == Some(hovered.sketch_index)
+        {
+            let normal = normalized_vector(cross_product(frame.u, frame.v));
+            for region in overlay
+                .regions
+                .iter()
+                .filter(|region| region.anchor == hovered.anchor)
+            {
+                let Some(normal) = normal else { break };
+                let preview = FeaturePreviewRegion {
+                    outer: region.outer.clone(),
+                    holes: region.holes.clone(),
+                };
+                let Some(triangles) = triangulate_preview_region(&preview, normal) else {
+                    continue;
+                };
+                let fill = HOVERED.gamma_multiply(0.30);
+                for triangle in triangles {
+                    let projected =
+                        triangle.map(|point| projection.instance_point(point, view, presentation));
+                    painter.add(egui::Shape::convex_polygon(
+                        projected.to_vec(),
+                        fill,
+                        Stroke::NONE,
+                    ));
+                }
             }
         }
         let color = if overlay.consumed {
@@ -4608,32 +4653,34 @@ fn paint_feature_preview(
         handle_active,
     );
 
+    // The readout rides just beyond the drag handle in a boxed chip, the
+    // same treatment the sketch canvas gives its live dimensions, so the
+    // current distance is legible at a glance while dragging rather than
+    // whispered along the middle of the arrow.
     let arrow = arrow_end - arrow_start;
-    let label_offset = if arrow.length_sq() > 1.0 {
-        egui::vec2(-arrow.y, arrow.x).normalized() * 11.0
+    let outward = if arrow.length_sq() > 1.0 {
+        arrow.normalized()
     } else {
-        egui::vec2(9.0, -9.0)
+        egui::vec2(0.707, -0.707)
     };
-    let label_position = arrow_start + arrow * 0.5 + label_offset;
     let label = format!(
         "{} · {:.3} mm",
         preview.style.label(),
         preview.distance.abs()
     );
-    painter.text(
-        label_position + egui::vec2(1.0, 1.0),
-        Align2::CENTER_CENTER,
-        &label,
-        FontId::monospace(10.0),
-        Color32::WHITE.gamma_multiply(0.88),
+    let font = FontId::monospace(11.5);
+    let galley = painter.layout_no_wrap(label, font, accent);
+    let chip_center = arrow_end + outward * 18.0 + egui::vec2(0.0, -14.0);
+    let chip = Rect::from_center_size(chip_center, galley.size() + egui::vec2(14.0, 8.0));
+    painter.rect(
+        chip,
+        4.0,
+        Color32::from_rgba_unmultiplied(255, 255, 255, 240),
+        Stroke::new(1.2, accent),
+        egui::StrokeKind::Inside,
     );
-    painter.text(
-        label_position,
-        Align2::CENTER_CENTER,
-        label,
-        FontId::monospace(10.0),
-        accent,
-    );
+    let text_origin = chip.center() - galley.size() / 2.0;
+    painter.galley(text_origin, galley, accent);
 }
 
 fn paint_preview_arrow(
@@ -5309,7 +5356,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_sketch_overlay_is_not_painted_from_the_rear_of_its_support_frame() {
+    fn committed_sketch_overlay_stays_visible_from_both_sides_of_its_support_frame() {
         struct Fixture {
             scene: DebugScene,
             bounds: Aabb3,
@@ -5394,14 +5441,19 @@ mod tests {
         let first = orange_pixels(forward);
         let second = orange_pixels(reversed);
 
+        // A committed sketch stays visible from both sides of its support
+        // plane. The earlier contract culled the rear side to avoid drawing
+        // through the solid, but the cure was worse than the disease: the
+        // sketch vanished entirely while orbiting, exactly when the user is
+        // trying to see it in relation to the part. Sketch curves showing
+        // through a body is how mainstream CAD behaves.
         assert!(
-            first.max(second) > 40,
-            "front-facing overlay was not visible"
+            first > 40,
+            "front-facing overlay was not visible ({first} orange pixels)"
         );
-        assert_eq!(
-            first.min(second),
-            0,
-            "rear-facing overlay leaked through the solid"
+        assert!(
+            second > 40,
+            "rear-facing overlay must stay visible while orbiting ({second} orange pixels)"
         );
     }
 

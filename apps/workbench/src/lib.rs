@@ -732,6 +732,13 @@ impl EdgeFinishSelectionSupport {
     }
 }
 
+/// A plane sketch deferred until its camera flight lands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingPlaneSketch {
+    Origin(SketchPlane),
+    Construction(u64),
+}
+
 impl SolidFeaturePreset {
     const fn label(self) -> &'static str {
         match self {
@@ -1582,6 +1589,21 @@ pub struct KernelLabApp {
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
+    /// A plane sketch waiting for its camera flight to land. Opening the 2D
+    /// canvas immediately would replace the very viewport the animation
+    /// plays in, which reads as a snap even though the camera is flying.
+    pending_plane_sketch: Option<PendingPlaneSketch>,
+    /// While sketching, holding the right mouse button swaps the 2D canvas
+    /// for the live 3D viewport so the sketch is visible in relation to the
+    /// rest of the part; releasing flies the camera back onto the plane.
+    sketch_orbit_peek: bool,
+    /// The camera exactly as the sketch had it when the peek began, so the
+    /// return flight restores the drawing view rather than recomputing an
+    /// approximation of it.
+    sketch_orbit_return_view: Option<ViewState>,
+    /// The peek's return flight is in progress: the 3D view stays up until
+    /// the camera lands back on the sketch plane, then the canvas returns.
+    sketch_orbit_returning: bool,
 }
 
 impl Default for KernelLabApp {
@@ -1687,6 +1709,10 @@ impl Default for KernelLabApp {
             edge_finish_tangent_chain: false,
             inspector_open: true,
             camera_before_plane_sketch: None,
+            pending_plane_sketch: None,
+            sketch_orbit_peek: false,
+            sketch_orbit_return_view: None,
+            sketch_orbit_returning: false,
         };
         // Internal bootstrap is the sole non-interactive construction path.
         // Once the UI is live, every model mutation is staged first.
@@ -5905,6 +5931,25 @@ impl KernelLabApp {
         else {
             return;
         };
+        let half_extent = plane.half_u.max(plane.half_v);
+        if self.start_plane_sketch_camera_transition(plane.frame, half_extent) {
+            self.pending_plane_sketch = Some(PendingPlaneSketch::Construction(id));
+            return;
+        }
+        self.open_construction_plane_sketch(id);
+    }
+
+    /// Opens a sketch on a construction plane, once the camera is looking at
+    /// it.
+    fn open_construction_plane_sketch(&mut self, id: u64) {
+        let Some(plane) = self
+            .construction_planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .cloned()
+        else {
+            return;
+        };
         let display_plane = sketch_plane_for_frame(plane.frame);
         self.sketch = SketchCanvasState::new(display_plane);
         self.active_sketch_tool = ToolVariant::Select;
@@ -5926,8 +5971,6 @@ impl KernelLabApp {
         self.feature_preview.begin_new_sketch();
         self.workbench_mode = WorkbenchMode::Sketch;
         self.show_properties_tab();
-        let half_extent = plane.half_u.max(plane.half_v);
-        self.start_plane_sketch_camera_transition(plane.frame, half_extent);
     }
 
     fn enter_sketch_mode(&mut self) {
@@ -5983,17 +6026,16 @@ impl KernelLabApp {
                 return;
             }
         } else if self.sketch.entities().is_empty() {
-            let _ = self.sketch.set_plane(self.selected_origin_plane);
-            self.sketch_support = SketchSupport::Origin {
-                plane: self.selected_origin_plane,
-            };
-            self.face_sketch_context = None;
-            self.extrusion_mode = ExtrusionMode::NewBody;
-            self.extrusion_mode_explicit = false;
-            self.start_plane_sketch_camera_transition(
-                sketch_plane_frame(self.selected_origin_plane),
+            let plane = self.selected_origin_plane;
+            let flying = self.start_plane_sketch_camera_transition(
+                sketch_plane_frame(plane),
                 ORIGIN_PLANE_HALF_EXTENT_MM,
             );
+            if flying {
+                self.pending_plane_sketch = Some(PendingPlaneSketch::Origin(plane));
+                return;
+            }
+            self.open_origin_plane_sketch(plane);
         } else if matches!(&self.sketch_support, SketchSupport::Origin { .. }) {
             self.selected_origin_plane = self.sketch.plane();
         } else if !self.sketch_support_is_current() {
@@ -6014,7 +6056,13 @@ impl KernelLabApp {
     /// Unlike a face sketch this needs no deferral: a plane is not backed by a
     /// body snapshot, so there is nothing that could go stale while the camera
     /// flies. The sketch opens immediately and only the view animates.
-    fn start_plane_sketch_camera_transition(&mut self, frame: PlanarFrame3, half_extent: f64) {
+    /// Returns `true` when a flight was scheduled and the caller should defer
+    /// opening the sketch until the camera lands.
+    fn start_plane_sketch_camera_transition(
+        &mut self,
+        frame: PlanarFrame3,
+        half_extent: f64,
+    ) -> bool {
         // Framing the plane is for drawing on it. A solid extruded off that
         // plane is invisible edge-on, so the view the user had is restored
         // when they leave, rather than leaving the model looking flat.
@@ -6028,12 +6076,25 @@ impl KernelLabApp {
             {
                 self.face_camera_transition = Some(transition);
                 self.last_face_camera_time = None;
+                return true;
             }
         } else if let Some(target) = self.view.face_aligned_target(frame, focus, half_extent) {
             // Instant transitions are the test default and the accessibility
             // fallback; the camera must still arrive, just without the flight.
             self.view = target;
         }
+        false
+    }
+
+    /// Opens a sketch on an origin plane, once the camera is looking at it.
+    fn open_origin_plane_sketch(&mut self, plane: SketchPlane) {
+        let _ = self.sketch.set_plane(plane);
+        self.sketch_support = SketchSupport::Origin { plane };
+        self.face_sketch_context = None;
+        self.extrusion_mode = ExtrusionMode::NewBody;
+        self.extrusion_mode_explicit = false;
+        self.workbench_mode = WorkbenchMode::Sketch;
+        self.show_properties_tab();
     }
 
     fn start_face_sketch_camera_transition(&mut self, support: PlanarFaceSupport) -> bool {
@@ -6139,6 +6200,14 @@ impl KernelLabApp {
         if complete {
             self.face_camera_transition = None;
             self.last_face_camera_time = None;
+            if let Some(pending) = self.pending_plane_sketch.take() {
+                match pending {
+                    PendingPlaneSketch::Origin(plane) => self.open_origin_plane_sketch(plane),
+                    PendingPlaneSketch::Construction(id) => {
+                        self.open_construction_plane_sketch(id);
+                    }
+                }
+            }
             if let Some(pending) = self.pending_face_sketch.take() {
                 if Some(pending.body) == self.active_body_id()
                     && Some(pending.snapshot) == self.displayed_snapshot_id()
@@ -12054,6 +12123,73 @@ impl KernelLabApp {
         }
     }
 
+    /// The live overlay of the sketch being drawn, projected onto its plane,
+    /// so the orbit peek shows the work in progress and not only committed
+    /// geometry.
+    fn active_sketch_peek_overlay(&self) -> Option<viewport::ModelSketchOverlay> {
+        let frame = self.sketch_support.frame();
+        let mut points = Vec::new();
+        let mut segments = Vec::new();
+        for entity in self.sketch.entities() {
+            let Some(polyline) = entity.geometry.display_polyline() else {
+                continue;
+            };
+            if polyline.segments().next().is_none() {
+                points.extend(
+                    polyline
+                        .points
+                        .iter()
+                        .copied()
+                        .map(|point| frame_point(frame, ProtocolPoint2::new(point.u, point.v))),
+                );
+            }
+            segments.extend(polyline.segments().map(|segment| {
+                segment.map(|point| frame_point(frame, ProtocolPoint2::new(point.u, point.v)))
+            }));
+        }
+        (!points.is_empty() || !segments.is_empty())
+            .then(|| viewport::ModelSketchOverlay::new(points, segments, false))
+    }
+
+    /// The 3D viewport shown while the preset's orbit button holds a
+    /// sketch-mode peek. Interactions other than the camera are ignored: the peek
+    /// is for looking, and a stray click must not select bodies or activate
+    /// another sketch while one is being drawn.
+    fn sketch_orbit_peek_viewport(&mut self, ui: &mut egui::Ui) {
+        let orbit_button = match self.document_settings.navigation.bindings().orbit {
+            navigation::Gesture::Right => egui::PointerButton::Secondary,
+            _ => egui::PointerButton::Middle,
+        };
+        let released = !ui.input(|input| input.pointer.button_down(orbit_button));
+        if released && !self.sketch_orbit_returning {
+            self.sketch_orbit_returning = true;
+            let mut landed = true;
+            if let Some(view) = self.sketch_orbit_return_view.take() {
+                if self.animate_face_camera_transitions
+                    && let Some(transition) = CameraTransition::to_view(self.view, view)
+                {
+                    self.face_camera_transition = Some(transition);
+                    self.last_face_camera_time = None;
+                    landed = false;
+                } else {
+                    self.view = view;
+                }
+            }
+            if landed {
+                // Instant mode: the camera has already landed.
+                self.sketch_orbit_peek = false;
+                self.sketch_orbit_returning = false;
+            }
+        }
+        if self.sketch_orbit_returning && self.face_camera_transition.is_none() {
+            self.sketch_orbit_peek = false;
+            self.sketch_orbit_returning = false;
+            self.sketch_viewport(ui);
+            return;
+        }
+        self.model_viewport(ui);
+    }
+
     fn sketch_viewport(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         let canvas_size = egui::vec2((available.x - 14.0).max(1.0), (available.y - 14.0).max(1.0));
@@ -12074,6 +12210,29 @@ impl KernelLabApp {
                 })
                 .inner
         };
+        // Trying to orbit while sketching peeks at the model in 3D: the
+        // canvas swaps for the model viewport while the button is held, and
+        // the camera flies back onto the sketch when it is released. Keyed
+        // to the active preset's orbit gesture so it reads as "orbit" under
+        // any binding; the 2D canvas pans with both middle and right drags,
+        // so whichever button the preset claims, the other still pans.
+        let orbit = self.document_settings.navigation.bindings().orbit;
+        if output.response.hovered()
+            && ui.input(|input| {
+                orbit.matches(navigation::GestureState {
+                    right: input.pointer.button_pressed(egui::PointerButton::Secondary),
+                    middle: input.pointer.button_pressed(egui::PointerButton::Middle),
+                    shift: input.modifiers.shift,
+                    ctrl: input.modifiers.command || input.modifiers.ctrl,
+                })
+            })
+        {
+            self.sketch_orbit_peek = true;
+            self.sketch_orbit_returning = false;
+            self.sketch_orbit_return_view = Some(self.view);
+            self.motion.pause();
+            self.last_motion_time = None;
+        }
         self.sketch_canvas_overlay(ui, output.response.rect);
         self.sketch_dimension_keys.enter |= output.dimension_keys.enter;
         self.sketch_dimension_keys.escape |= output.dimension_keys.escape;
@@ -12212,7 +12371,7 @@ impl KernelLabApp {
         // operation names incapable of widening the root UI and moving either
         // workbench viewport.
         let rail_size = ui.available_size();
-        let (rail_rect, _) = ui.allocate_exact_size(rail_size, egui::Sense::hover());
+        let (rail_rect, _) = ui.allocate_exact_size(rail_size, egui::Sense::click_and_drag());
         let rail_fill = if pending.is_some() {
             theme::GOOD_FILL
         } else {
@@ -12493,6 +12652,11 @@ impl KernelLabApp {
         let feature_preview = self.feature_preview_for_frame(ui.ctx());
         let edge_finish_preview = self.edge_finish_preview_for_frame(Some(ui.ctx()));
         let mut sketch_overlays = self.visible_sketch_overlays();
+        if self.sketch_orbit_peek
+            && let Some(overlay) = self.active_sketch_peek_overlay()
+        {
+            sketch_overlays.push(overlay);
+        }
         sketch_overlays.extend(self.visible_reference_plane_overlays());
         let reference_plane_bounds = self.visible_reference_plane_bounds();
         let active_body = self
@@ -12608,6 +12772,12 @@ impl KernelLabApp {
                         &mut self.model_edge_frame_memo,
                         self.document_settings.navigation,
                     );
+                    if self.sketch_orbit_peek {
+                        // The orbit peek is look-only: the camera responds,
+                        // but a stray click must not select bodies or
+                        // activate another sketch while one is being drawn.
+                        return;
+                    }
                     if let Some(feature_drag) = output.feature_drag {
                         self.set_extrusion_distance_intent(feature_drag.signed_extent);
                         self.sync_pending_sketch_extrusion_inputs();
@@ -13392,23 +13562,66 @@ impl eframe::App for KernelLabApp {
             )
             .show(ui, |ui| self.command_ribbon(ui));
 
-        let confirmation_action = egui::Panel::bottom("operation_confirmation")
-            .exact_size(38.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(
-                Frame::new()
-                    .fill(PANEL)
-                    .inner_margin(Margin::symmetric(6, 3))
-                    .stroke(Stroke::new(1.0, BORDER)),
-            )
-            .show(ui, |ui| self.confirmation_slot(ui))
-            .inner;
-
         let timeline_height = if self.shell.visibility().feature_timeline {
             38.0
         } else {
             28.0
+        };
+        // The confirmation controls only exist while they have something to
+        // say. Idle in model mode the old rail rendered as a bare strip
+        // under the timeline, indistinguishable from a layout bug. The
+        // sketch workspace keeps a rail for its persistent Finish/Exit pair
+        // (entering a sketch re-lays the whole screen out anyway), but a
+        // pending model operation floats its tick/cross over the canvas
+        // instead: staging an operation must never move or resize the
+        // viewport under a live drag.
+        let confirmation_action = if self.workbench_mode == WorkbenchMode::Sketch {
+            egui::Panel::bottom("operation_confirmation")
+                .exact_size(38.0)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(Margin::symmetric(6, 3))
+                        .stroke(Stroke::new(1.0, BORDER)),
+                )
+                .show(ui, |ui| self.confirmation_slot(ui))
+                .inner
+        } else if self.pending_operation.is_some() {
+            // Positioned from the screen rectangle rather than `anchor`:
+            // an anchored area only knows its own size one frame after it
+            // first appears, and a chip that shifts on its second frame
+            // breaks clicks aimed at where it stood on its first.
+            let screen = ui.ctx().content_rect();
+            let chip_size = egui::vec2(442.0, 38.0);
+            egui::Area::new(egui::Id::new("operation_confirmation_overlay"))
+                .fixed_pos(egui::pos2(
+                    screen.center().x - chip_size.x / 2.0,
+                    screen.bottom() - timeline_height - 10.0 - chip_size.y,
+                ))
+                // Without a size hint, the area's first frame runs egui's
+                // constrain pass against an unknown size and lands the chip
+                // mid-screen; the very first click aimed at it then misses.
+                .default_size(chip_size)
+                .constrain(false)
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |area_ui| {
+                    Frame::new()
+                        .fill(PANEL)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(6)
+                        .inner_margin(Margin::symmetric(6, 3))
+                        .show(area_ui, |ui| {
+                            ui.set_min_size(egui::vec2(430.0, 32.0));
+                            ui.set_max_size(egui::vec2(430.0, 32.0));
+                            self.confirmation_slot(ui)
+                        })
+                        .inner
+                })
+                .inner
+        } else {
+            None
         };
         egui::Panel::bottom("feature_timeline")
             .exact_size(timeline_height)
@@ -13475,7 +13688,13 @@ impl eframe::App for KernelLabApp {
             .frame(Frame::new().fill(BG).inner_margin(Margin::ZERO))
             .show(ui, |ui| match self.workbench_mode {
                 WorkbenchMode::Model => self.model_viewport(ui),
-                WorkbenchMode::Sketch => self.sketch_viewport(ui),
+                WorkbenchMode::Sketch => {
+                    if self.sketch_orbit_peek {
+                        self.sketch_orbit_peek_viewport(ui);
+                    } else {
+                        self.sketch_viewport(ui);
+                    }
+                }
             });
 
         self.edge_finish_editor(ui.ctx());
@@ -16053,7 +16272,9 @@ mod extrusion_workbench_tests {
                 "{plane:?} should restore the camera the sketch borrowed"
             );
 
-            // With animation on, the flight is scheduled instead of jumping.
+            // With animation on, the flight is scheduled and the sketch
+            // waits for it: opening the 2D canvas immediately would replace
+            // the very viewport the animation plays in.
             let mut animated = KernelLabApp::default();
             animated.reset_to_blank_workspace();
             animated.set_face_camera_animation(true);
@@ -16065,6 +16286,27 @@ mod extrusion_workbench_tests {
                 "{plane:?} should fly the camera when animating"
             );
             assert_eq!(animated.view, start, "an animated transition does not jump");
+            assert_eq!(
+                animated.workbench_mode,
+                WorkbenchMode::Model,
+                "the sketch waits for the flight to land"
+            );
+            assert_eq!(
+                animated.pending_plane_sketch,
+                Some(PendingPlaneSketch::Origin(plane))
+            );
+            // Landing opens the sketch, exactly as the completion handler does.
+            match animated.pending_plane_sketch.take().expect("pending") {
+                PendingPlaneSketch::Origin(plane) => animated.open_origin_plane_sketch(plane),
+                PendingPlaneSketch::Construction(id) => {
+                    animated.open_construction_plane_sketch(id);
+                }
+            }
+            assert_eq!(animated.workbench_mode, WorkbenchMode::Sketch);
+            assert!(matches!(
+                animated.sketch_support,
+                SketchSupport::Origin { .. }
+            ));
         }
     }
 

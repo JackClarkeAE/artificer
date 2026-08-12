@@ -276,3 +276,53 @@ fn three_point_arc_tab_sweep_validation_snapshot() {
         "workbench_three_point_arc_tab_sweep_validation_1040",
     );
 }
+
+#[test]
+fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    // Put some geometry in the sketch so the peek has live strokes to carry.
+    click_button(&mut harness, "Single line");
+    commit_line(
+        &mut harness,
+        SketchPoint::new(-4.0, -2.0),
+        SketchPoint::new(4.0, -2.0),
+    );
+    assert_eq!(harness.state().sketch_entity_count(), 1);
+    let center = harness.get_by_label("Sketch viewport").rect().center();
+    harness.hover_at(center);
+    harness.step();
+    // The default preset orbits with the right button; pressing it over the
+    // canvas swaps the 2D canvas for the 3D model viewport without leaving
+    // the sketch.
+    harness.event(egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Secondary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.step();
+    assert!(
+        harness.query_by_label("Sketch viewport").is_none(),
+        "the peek must replace the 2D canvas with the model viewport"
+    );
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    // Releasing the button returns to the sketch canvas with the sketch and
+    // its entities intact.
+    harness.event(egui::Event::PointerButton {
+        pos: center,
+        button: egui::PointerButton::Secondary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    for _ in 0..90 {
+        harness.step();
+        if harness.query_by_label("Sketch viewport").is_some() {
+            break;
+        }
+    }
+    harness.get_by_label("Sketch viewport");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    assert_eq!(harness.state().sketch_entity_count(), 1);
+}
