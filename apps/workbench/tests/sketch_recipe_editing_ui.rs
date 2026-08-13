@@ -9,7 +9,6 @@ use egui_kittest::{
 };
 
 const CONFIRM_OPERATION: &str = "Confirm operation";
-const CANCEL_OPERATION: &str = "Cancel operation";
 
 fn harness() -> Harness<'static, KernelLabApp> {
     Harness::builder()
@@ -87,6 +86,18 @@ fn replace_selected_parameter(
     harness.run();
 }
 
+/// A selected-feature parameter applies when it is accepted, so a test that
+/// wants the new value committed has to accept it. Typing alone only previews.
+fn accept_selected_parameter(
+    harness: &mut Harness<'static, KernelLabApp>,
+    label: &str,
+    value: &str,
+) {
+    replace_selected_parameter(harness, label, value);
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+}
+
 fn replace_active_tool_parameter(
     harness: &mut Harness<'static, KernelLabApp>,
     label: &str,
@@ -132,23 +143,18 @@ fn pick_right_angle_sources(harness: &mut Harness<'static, KernelLabApp>) {
 }
 
 #[test]
-fn rectangle_recipe_edit_previews_commits_and_drives_exact_new_body_volume() {
+fn rectangle_recipe_edit_applies_on_accept_and_drives_exact_new_body_volume() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     create_two_point_rectangle(&mut harness);
     select_rectangle_top(&mut harness);
 
     let revision = harness.state().sketch_revision();
-    replace_selected_parameter(&mut harness, "Width", "3");
-    replace_selected_parameter(&mut harness, "Height", "2");
-    assert_eq!(
-        harness.state().pending_operation_label(),
-        Some("Edit sketch parameters")
-    );
-    assert_eq!(harness.state().sketch_revision(), revision);
-    assert_eq!(harness.state().sketch_pending_entity_count(), 4);
-    confirm(&mut harness);
-    assert_eq!(harness.state().sketch_revision(), revision + 1);
+    accept_selected_parameter(&mut harness, "Width", "3");
+    accept_selected_parameter(&mut harness, "Height", "2");
+    assert!(!harness.state().operation_confirmation_pending());
+    assert_eq!(harness.state().sketch_revision(), revision + 2);
+    assert_eq!(harness.state().sketch_pending_entity_count(), 0);
     let editor = harness
         .state()
         .selected_sketch_recipe_editor()
@@ -167,8 +173,11 @@ fn rectangle_recipe_edit_previews_commits_and_drives_exact_new_body_volume() {
     assert!((volume - 24.0).abs() <= 1.0e-9);
 }
 
+/// The user's report, verbatim: change a rectangle dimension and the new size
+/// is simply the sketch. No second confirmation, no rail, and no red original
+/// beside a green replacement.
 #[test]
-fn invalid_selected_parameter_keeps_last_preview_and_cross_cancels_neutrally() {
+fn typed_dimension_applies_on_enter_with_no_confirmation_rail() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     create_two_point_rectangle(&mut harness);
@@ -176,19 +185,99 @@ fn invalid_selected_parameter_keeps_last_preview_and_cross_cancels_neutrally() {
 
     let revision = harness.state().sketch_revision();
     replace_selected_parameter(&mut harness, "Width", "3");
-    assert!(harness.state().operation_confirmation_pending());
+    assert!(!harness.state().operation_confirmation_pending());
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, CONFIRM_OPERATION)
+            .is_none()
+    );
+    assert_eq!(harness.state().sketch_pending_entity_count(), 4);
+    assert_eq!(harness.state().sketch_revision(), revision);
+
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().sketch_revision(), revision + 1);
+    assert_eq!(harness.state().sketch_pending_entity_count(), 0);
+    assert!(!harness.state().operation_confirmation_pending());
+    assert_eq!(
+        harness
+            .state()
+            .selected_sketch_recipe_editor()
+            .expect("the edited rectangle stays selected")
+            .parameters[0]
+            .text,
+        "3"
+    );
+}
+
+/// Clicking away is acceptance, and the click still does its own job: it both
+/// commits the typed width and clears the selection in the same frame.
+#[test]
+fn typed_dimension_applies_when_the_canvas_takes_the_click() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    create_two_point_rectangle(&mut harness);
+    select_rectangle_top(&mut harness);
+
+    let revision = harness.state().sketch_revision();
+    replace_selected_parameter(&mut harness, "Width", "3");
+    click_sketch_point(&mut harness, SketchPoint::new(3.5, 3.0));
+    assert_eq!(harness.state().sketch_revision(), revision + 1);
+    assert_eq!(harness.state().sketch_pending_entity_count(), 0);
+    assert!(harness.state().selected_sketch_recipe_editor().is_none());
+}
+
+/// One accepted value is one local undo step, not one per keystroke.
+#[test]
+fn accepted_dimension_is_one_local_undo_step() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    create_two_point_rectangle(&mut harness);
+    select_rectangle_top(&mut harness);
+
+    accept_selected_parameter(&mut harness, "Width", "3");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    harness.run();
+    assert_eq!(harness.state().sketch_entity_count(), 4);
+
+    // `undo_local` rebuilds presentation from authoring, which clears the
+    // selection, so the editor has to be reopened to read the value back.
+    select_rectangle_top(&mut harness);
+    assert_eq!(
+        harness
+            .state()
+            .selected_sketch_recipe_editor()
+            .expect("the rectangle is selectable after undo")
+            .parameters[0]
+            .text,
+        "2"
+    );
+}
+
+#[test]
+fn invalid_selected_parameter_keeps_last_preview_and_escape_reverts_neutrally() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    create_two_point_rectangle(&mut harness);
+    select_rectangle_top(&mut harness);
+
+    let revision = harness.state().sketch_revision();
+    replace_selected_parameter(&mut harness, "Width", "3");
+    assert!(!harness.state().operation_confirmation_pending());
+    assert_eq!(harness.state().sketch_pending_entity_count(), 4);
     replace_selected_parameter(&mut harness, "Width", "not-a-number");
-    let confirm = harness.get_by_role_and_label(Role::Button, CONFIRM_OPERATION);
-    assert!(confirm.accesskit_node().is_disabled());
+    // The last value that parsed keeps previewing; unparseable text never
+    // replaces it and never publishes.
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
 
-    click_button(&mut harness, CANCEL_OPERATION);
-    assert!(!harness.state().operation_confirmation_pending());
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert_eq!(harness.state().sketch_pending_entity_count(), 0);
     assert_eq!(harness.state().sketch_revision(), revision);
     let editor = harness
         .state()
         .selected_sketch_recipe_editor()
-        .expect("cancel retains selection");
+        .expect("escape retains selection");
     assert_eq!(editor.parameters[0].text, "2");
 }
 
@@ -208,10 +297,11 @@ fn polygon_and_slot_literals_replay_as_exact_compound_features() {
     let old_polygon_ids = harness.state().selected_sketch_recipe_output_ids();
     assert_eq!(old_polygon_ids.len(), 4);
 
-    replace_selected_parameter(&mut harness, "Sides", "6");
-    replace_selected_parameter(&mut harness, "Outer diameter", "4");
-    assert_eq!(harness.state().sketch_pending_entity_count(), 6);
-    confirm(&mut harness);
+    // Accept the side count last: it is the parameter that adds outputs, and
+    // asserting the shared prefix means asserting it across the accept that
+    // grew the polygon rather than across an earlier diameter edit.
+    accept_selected_parameter(&mut harness, "Outer diameter", "4");
+    accept_selected_parameter(&mut harness, "Sides", "6");
     let new_polygon_ids = harness.state().selected_sketch_recipe_output_ids();
     assert_eq!(new_polygon_ids.len(), 6);
     assert_eq!(&new_polygon_ids[..4], old_polygon_ids.as_slice());
@@ -241,8 +331,7 @@ fn polygon_and_slot_literals_replay_as_exact_compound_features() {
         "Two-point slot"
     );
     let old_slot_ids = harness.state().selected_sketch_recipe_output_ids();
-    replace_selected_parameter(&mut harness, "Width", "1.5");
-    confirm(&mut harness);
+    accept_selected_parameter(&mut harness, "Width", "1.5");
     assert_eq!(
         harness.state().selected_sketch_recipe_output_ids(),
         old_slot_ids
@@ -274,8 +363,7 @@ fn both_pattern_counts_replay_with_stable_existing_output_ids() {
     click_button(&mut rectangular, "Select sketch geometry");
     let before = rectangular.state().selected_sketch_recipe_output_ids();
     assert_eq!(before.len(), 2);
-    replace_selected_parameter(&mut rectangular, "Columns", "4");
-    confirm(&mut rectangular);
+    accept_selected_parameter(&mut rectangular, "Columns", "4");
     let after = rectangular.state().selected_sketch_recipe_output_ids();
     assert_eq!(after.len(), 3);
     assert_eq!(&after[..2], before.as_slice());
@@ -297,8 +385,7 @@ fn both_pattern_counts_replay_with_stable_existing_output_ids() {
     click_button(&mut circular, "Select sketch geometry");
     let before = circular.state().selected_sketch_recipe_output_ids();
     assert_eq!(before.len(), 2);
-    replace_selected_parameter(&mut circular, "Count", "5");
-    confirm(&mut circular);
+    accept_selected_parameter(&mut circular, "Count", "5");
     let after = circular.state().selected_sketch_recipe_output_ids();
     assert_eq!(after.len(), 4);
     assert_eq!(&after[..2], before.as_slice());
@@ -321,8 +408,7 @@ fn fillet_and_both_chamfer_parameter_forms_replay_exactly() {
         "2D fillet"
     );
     let fillet_ids = fillet.state().selected_sketch_recipe_output_ids();
-    replace_selected_parameter(&mut fillet, "Radius", "0.5");
-    confirm(&mut fillet);
+    accept_selected_parameter(&mut fillet, "Radius", "0.5");
     assert_eq!(
         fillet.state().selected_sketch_recipe_output_ids(),
         fillet_ids
@@ -337,8 +423,7 @@ fn fillet_and_both_chamfer_parameter_forms_replay_exactly() {
     let editor = equal.state().selected_sketch_recipe_editor().unwrap();
     assert_eq!(editor.parameters.len(), 1);
     assert_eq!(editor.parameters[0].label, "Distance");
-    replace_selected_parameter(&mut equal, "Distance", "0.5");
-    confirm(&mut equal);
+    accept_selected_parameter(&mut equal, "Distance", "0.5");
     let editor = equal.state().selected_sketch_recipe_editor().unwrap();
     assert_eq!(editor.parameters.len(), 1);
     assert_eq!(editor.parameters[0].text, "0.5");
@@ -356,9 +441,8 @@ fn fillet_and_both_chamfer_parameter_forms_replay_exactly() {
     pick_right_angle_sources(&mut unequal);
     let editor = unequal.state().selected_sketch_recipe_editor().unwrap();
     assert_eq!(editor.parameters.len(), 2);
-    replace_selected_parameter(&mut unequal, "Distance 1", "0.4");
-    replace_selected_parameter(&mut unequal, "Distance 2", "0.6");
-    confirm(&mut unequal);
+    accept_selected_parameter(&mut unequal, "Distance 1", "0.4");
+    accept_selected_parameter(&mut unequal, "Distance 2", "0.6");
     let editor = unequal.state().selected_sketch_recipe_editor().unwrap();
     assert_eq!(editor.parameters[0].text, "0.4");
     assert_eq!(editor.parameters[1].text, "0.6");
@@ -384,8 +468,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
     click_button(&mut restored, "Sketch 1 feature");
     assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Sketch);
     select_rectangle_top(&mut restored);
-    replace_selected_parameter(&mut restored, "Width", "3");
-    confirm(&mut restored);
+    accept_selected_parameter(&mut restored, "Width", "3");
     click_button(&mut restored, "Finish sketch command");
     assert_eq!(restored.state().document_feature_count(), feature_count);
     assert_eq!(restored.state().document_dirty_feature_count(), 1);
@@ -412,7 +495,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
 }
 
 #[test]
-fn edited_extruded_sketch_rebuilds_in_place_and_cancel_stays_neutral() {
+fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     create_two_point_rectangle(&mut harness);
@@ -427,7 +510,8 @@ fn edited_extruded_sketch_rebuilds_in_place_and_cancel_stays_neutral() {
     select_rectangle_top(&mut harness);
     replace_selected_parameter(&mut harness, "Width", "3");
     replace_selected_parameter(&mut harness, "Width", "invalid");
-    click_button(&mut harness, CANCEL_OPERATION);
+    harness.key_press(egui::Key::Escape);
+    harness.run();
     assert_eq!(harness.state().document_dirty_feature_count(), 0);
     assert_eq!(harness.state().displayed_snapshot_id(), original_snapshot);
     assert_eq!(
@@ -435,8 +519,7 @@ fn edited_extruded_sketch_rebuilds_in_place_and_cancel_stays_neutral() {
         original_feature_count
     );
 
-    replace_selected_parameter(&mut harness, "Width", "3");
-    confirm(&mut harness);
+    accept_selected_parameter(&mut harness, "Width", "3");
     click_button(&mut harness, "Finish sketch command");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(

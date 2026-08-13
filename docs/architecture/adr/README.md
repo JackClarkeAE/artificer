@@ -17,9 +17,9 @@ by tests, and **proposed** is a plan not yet executed.
 | [0004](0004-first-experimental-cuboid-slice.md) | First experimental cuboid slice | Accepted | — |
 | [0005](0005-display-transforms-and-motion.md) | Display transforms and deterministic motion | Accepted | 0006, 0007 |
 | [0006](0006-committed-similarity-transforms.md) | Committed whole-snapshot similarity transforms | Accepted | — |
-| [0007](0007-universal-model-operation-confirmation.md) | Universal confirmation for interactive model operations | Accepted | — |
-| [0008](0008-plane-profile-workbench.md) | Plane and profile workbench boundary | Accepted | — |
-| [0009](0009-live-sketch-dimensions.md) | Live sketch dimensions are editable construction intent | Accepted | — |
+| [0007](0007-universal-model-operation-confirmation.md) | Universal confirmation for interactive model operations | Accepted | 0027 |
+| [0008](0008-plane-profile-workbench.md) | Plane and profile workbench boundary | Accepted | 0027 |
+| [0009](0009-live-sketch-dimensions.md) | Live sketch dimensions are editable construction intent | Accepted | 0027 |
 | [0010](0010-first-convex-profile-extrusion.md) | First native profile extrusion is a declarative convex constructor | Accepted (historical M4a slice) | 0015 |
 | [0011](0011-expandable-workbench-shell.md) | Expandable workbench shell preserves a fixed confirmation rail | Accepted | 0014 (history-preview authority) |
 | [0012](0012-first-selected-face-add-cut.md) | First selected-face Add and Cut use an exact rectangular scaffold | Accepted (historical M4c slice) | 0013, 0015 |
@@ -31,12 +31,13 @@ by tests, and **proposed** is a plan not yet executed.
 | [0018](0018-content-addressed-part-library-and-components.md) | Content-addressed local Part Library and component occurrences | Accepted | — |
 | [0019](0019-rigid-occurrence-placement-and-joint-forest.md) | Rigid occurrence placement and persistent joint forest | Accepted | 0026 F8 (joint kinds, pose solver) |
 | [0020](0020-regularized-exact-planar-face-features.md) | One regularized exact-profile path for selected-face features | Accepted and implemented | — |
-| [0021](0021-editable-sketch-authoring-and-region-replay.md) | Editable sketch authoring and late-bound region replay | Accepted and implemented | — |
+| [0021](0021-editable-sketch-authoring-and-region-replay.md) | Editable sketch authoring and late-bound region replay | Accepted and implemented | 0027 |
 | [0022](0022-development-incidents-and-input-tracing.md) | Development incidents and privacy-conscious input tracing | Accepted | — |
 | [0023](0023-carrier-unified-rims-and-exact-rim-blends.md) | Carrier-unified rims and exact rim blends | Implemented | — |
 | 0024 | *never written* | — | — |
 | [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | — |
 | [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
+| [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

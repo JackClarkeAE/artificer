@@ -3450,6 +3450,11 @@ pub struct PendingSketchEdit {
     /// Committed presentation entities superseded when this transaction is
     /// confirmed. They remain visible as a red retirement preview until then.
     retired_entities: Vec<SketchEntityId>,
+    /// This edit re-authors existing geometry rather than adding to it: the
+    /// canvas must show the subject at its new value, not a replacement
+    /// beside a red original, because accepting the typed value is the
+    /// commit. Only the selected-feature parameter editor stages one.
+    in_place: bool,
 }
 
 struct PendingCorePresentation {
@@ -3482,6 +3487,11 @@ impl PendingSketchEdit {
     #[must_use]
     pub fn retired_entities(&self) -> &[SketchEntityId] {
         &self.retired_entities
+    }
+
+    #[must_use]
+    pub const fn is_in_place(&self) -> bool {
+        self.in_place
     }
 }
 
@@ -4185,7 +4195,12 @@ impl SketchCanvasState {
         SketchGestureProgress {
             completed_points: completed_points.min(required_points),
             required_points,
-            awaiting_confirmation: self.pending.is_some(),
+            // A typed parameter preview is not waiting for anything: it
+            // applies when it is accepted. Only a staged gesture is.
+            awaiting_confirmation: self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.in_place),
         }
     }
 
@@ -4892,6 +4907,7 @@ impl SketchCanvasState {
             pending.core_entities = presentation.core_entities;
             pending.retired_entities = presentation.retired_entities;
             pending.core_transaction = Some(transaction);
+            pending.in_place = true;
             self.dimension_session = None;
             self.refresh_profile_analysis();
             return Some(subject);
@@ -4901,26 +4917,29 @@ impl SketchCanvasState {
             transaction,
             "Edit sketch parameters",
             Some(subject),
+            true,
         )
         .ok()
     }
 
-    /// Restores one retained editor buffer to its last replayable value.
-    pub fn restore_selected_recipe_parameter(&mut self, stable_key: &'static str) -> bool {
-        let Some(parameter) = self.selected_recipe_editor.as_mut().and_then(|editor| {
-            editor
-                .parameters
-                .iter_mut()
-                .find(|parameter| parameter.stable_key == stable_key)
-        }) else {
-            return false;
-        };
-        let Some(value) = parameter.value else {
-            return false;
-        };
-        parameter.text = format_tool_number(value);
-        parameter.error = None;
-        true
+    /// Whether a typed parameter value is previewing on the canvas. It is
+    /// presentation only: no revision, identity, or undo entry exists until
+    /// the value is accepted.
+    #[must_use]
+    pub fn selected_recipe_edit_pending(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| pending.in_place)
+    }
+
+    /// Drops a typed parameter preview and puts every retained buffer back to
+    /// what the committed recipe says. Escape means "as you were", including
+    /// the text, whether or not the text ever parsed.
+    pub fn revert_selected_recipe_edit(&mut self) -> bool {
+        let reverted = self.selected_recipe_edit_pending();
+        if reverted {
+            self.cancel_pending();
+        }
+        self.rebuild_selected_recipe_editor();
+        reverted
     }
 
     #[must_use]
@@ -4975,7 +4994,7 @@ impl SketchCanvasState {
             return fields.into_iter().map(|field| field.readout).collect();
         }
         self.selected
-            .and_then(|id| self.entities.iter().find(|entity| entity.id == id))
+            .and_then(|id| self.presented_entity(id))
             .map_or_else(Vec::new, |entity| {
                 let phase = dimension_phase_for_geometry(entity.geometry);
                 dimension_fields_for_geometry(phase, entity.geometry)
@@ -5053,6 +5072,7 @@ impl SketchCanvasState {
             core_transaction: None,
             core_entities: vec![None],
             retired_entities: Vec::new(),
+            in_place: false,
         });
         let existing_draft = self.dimension_session.take().filter(|session| {
             session.target == DimensionTarget::Draft
@@ -5122,6 +5142,7 @@ impl SketchCanvasState {
             transaction,
             "Delete sketch geometry",
             Some(selected),
+            false,
         )
     }
 
@@ -5133,7 +5154,7 @@ impl SketchCanvasState {
         transaction: CoreTransaction,
         label: &'static str,
     ) -> Result<SketchEntityId, SketchEditError> {
-        self.stage_core_transaction_for_subject(transaction, label, None)
+        self.stage_core_transaction_for_subject(transaction, label, None, false)
     }
 
     /// Stages either an insertion/modifier or a retirement-only transaction.
@@ -5144,6 +5165,7 @@ impl SketchCanvasState {
         transaction: CoreTransaction,
         label: &'static str,
         subject: Option<SketchEntityId>,
+        in_place: bool,
     ) -> Result<SketchEntityId, SketchEditError> {
         if self.pending.is_some() {
             return Err(SketchEditError::PendingEditAlreadyExists);
@@ -5167,6 +5189,7 @@ impl SketchCanvasState {
             core_transaction: Some(transaction),
             core_entities,
             retired_entities,
+            in_place,
         });
         self.dimension_session = None;
         self.refresh_profile_analysis();
@@ -6061,6 +6084,37 @@ impl SketchCanvasState {
             return None;
         }
         self.profile_analysis.profile.clone()
+    }
+
+    /// The geometry the canvas is showing for one entity. While a typed value
+    /// previews, that is the candidate rather than the committed original, so
+    /// a measured readout can never disagree with what is drawn.
+    fn presented_entity(&self, id: SketchEntityId) -> Option<SketchEntity> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.in_place)
+            .and_then(|pending| pending.entities.iter().find(|entity| entity.id == id))
+            .or_else(|| self.entities.iter().find(|entity| entity.id == id))
+            .copied()
+    }
+
+    /// Committed entities that a live in-place edit has already replaced.
+    /// They must not paint under the candidate.
+    fn superseded_by_in_place_edit(&self) -> &[SketchEntityId] {
+        match self.pending.as_ref() {
+            Some(pending) if pending.in_place => &pending.retired_entities,
+            _ => &[],
+        }
+    }
+
+    /// The entity the canvas should highlight as hovered. Trim owns its own
+    /// hover presentation, so every entity pass has to suppress the ordinary
+    /// highlight the same way.
+    const fn hovered_for_paint(&self) -> Option<SketchEntityId> {
+        match self.exact_tool {
+            ToolVariant::Trim => None,
+            _ => self.hovered,
+        }
     }
 
     fn refresh_profile_analysis(&mut self) {
@@ -7222,6 +7276,7 @@ impl SketchCanvasState {
             core_transaction: Some(transaction),
             core_entities: Vec::new(),
             retired_entities: Vec::new(),
+            in_place: false,
         });
         self.refresh_profile_analysis();
         Ok(subject)
@@ -9120,16 +9175,20 @@ pub fn show_with_context(
         .unwrap_or_else(|| state.plane.axis_labels());
     paint_grid(&painter, response.rect, state.view, axis_labels, state.snap);
     paint_profile_fill(&painter, response.rect, state);
+    // A typed dimension replaces its subject in place. Painting the retired
+    // original underneath it is what made one edit look like two rectangles;
+    // `refresh_profile_analysis` has always excluded them the same way.
+    let superseded = state.superseded_by_in_place_edit();
     paint_entities(
         &painter,
         response.rect,
         state.view,
-        &state.entities,
-        if state.exact_tool == ToolVariant::Trim {
-            None
-        } else {
-            state.hovered
-        },
+        state
+            .entities
+            .iter()
+            .copied()
+            .filter(|entity| !superseded.contains(&entity.id)),
+        state.hovered_for_paint(),
         state.selected,
     );
     paint_modifier_sources(&painter, response.rect, state);
@@ -9859,7 +9918,7 @@ fn paint_entities(
     painter: &egui::Painter,
     rect: Rect,
     view: SketchView,
-    entities: &[SketchEntity],
+    entities: impl IntoIterator<Item = SketchEntity>,
     hovered: Option<SketchEntityId>,
     selected: Option<SketchEntityId>,
 ) {
@@ -9930,6 +9989,20 @@ fn paint_pending(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState)
     let Some(pending) = state.pending.as_ref() else {
         return;
     };
+    if pending.is_in_place() {
+        // The value applies the moment it is accepted, so the candidate is
+        // painted as the entity it will be — same stroke rules, same
+        // selection highlight — and no red ghost is drawn at all.
+        paint_entities(
+            painter,
+            rect,
+            state.view,
+            pending.entities().iter().copied(),
+            state.hovered_for_paint(),
+            state.selected,
+        );
+        return;
+    }
     for retired in pending.retired_entities() {
         if let Some(source) = state.entities.iter().find(|entity| entity.id == *retired) {
             paint_geometry(
@@ -10464,7 +10537,7 @@ fn dimension_widget_layouts(
     } else {
         state
             .selected
-            .and_then(|id| state.entities.iter().find(|entity| entity.id == id))
+            .and_then(|id| state.presented_entity(id))
             .map(|entity| {
                 let phase = dimension_phase_for_geometry(entity.geometry);
                 let readouts = dimension_fields_for_geometry(phase, entity.geometry)
@@ -14000,6 +14073,46 @@ mod tests {
             entity.geometry
                 == SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(3.0, 0.0))
         }));
+    }
+
+    /// A typed value re-authors its subject, so the canvas must stop painting
+    /// the original underneath it. Every other staged edit keeps the red
+    /// retirement overlay, because there the removal is the point.
+    #[test]
+    fn in_place_parameter_preview_supersedes_only_its_own_original() {
+        let mut sketch = SketchCanvasState::default();
+        let circle = sketch
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(2.0, 0.0),
+            ))
+            .expect("circle should stage");
+        sketch.commit_pending().expect("circle should commit");
+        assert!(sketch.set_selected(Some(circle)) || sketch.selected() == Some(circle));
+
+        assert_eq!(
+            sketch.set_selected_recipe_parameter_text("diameter", "6".to_owned()),
+            Some(circle)
+        );
+        assert!(sketch.pending().is_some_and(PendingSketchEdit::is_in_place));
+        assert!(sketch.selected_recipe_edit_pending());
+        assert_eq!(sketch.superseded_by_in_place_edit(), &[circle]);
+
+        assert!(sketch.revert_selected_recipe_edit());
+        assert!(sketch.pending().is_none());
+        assert_eq!(
+            sketch
+                .selected_recipe_editor()
+                .expect("the circle stays selected")
+                .parameters[0]
+                .text,
+            "4"
+        );
+
+        sketch.stage_delete_selected().expect("delete should stage");
+        assert!(!sketch.pending().expect("delete is staged").is_in_place());
+        assert!(!sketch.selected_recipe_edit_pending());
+        assert!(sketch.superseded_by_in_place_edit().is_empty());
     }
 
     fn commit_test_line(

@@ -1496,6 +1496,16 @@ impl FaceSketchDisplayContext {
     }
 }
 
+/// The selected-feature parameter field the user is typing in, with the
+/// rectangle it occupied last frame. A press outside that rectangle is an
+/// acceptance, and it has to be seen before any panel this frame reads
+/// sketch truth.
+#[derive(Clone, Copy)]
+struct RecipeParameterField {
+    id: egui::Id,
+    rect: egui::Rect,
+}
+
 /// State for the native Artificer workbench and kernel lab.
 pub struct KernelLabApp {
     document: ModelDocument,
@@ -1576,6 +1586,7 @@ pub struct KernelLabApp {
     sketch_extrusion_issue: Option<KernelError>,
     model_body_kind: ModelBodyKind,
     sketch_dimension_keys: DimensionKeyClaims,
+    recipe_parameter_field: Option<RecipeParameterField>,
     shell: WorkbenchShellState,
     catalog_store: Option<CatalogStore>,
     part_library: PartLibraryState,
@@ -1702,6 +1713,7 @@ impl Default for KernelLabApp {
             sketch_extrusion_issue: None,
             model_body_kind: ModelBodyKind::default(),
             sketch_dimension_keys: DimensionKeyClaims::default(),
+            recipe_parameter_field: None,
             shell: WorkbenchShellState::default(),
             catalog_store: None,
             part_library,
@@ -6353,9 +6365,9 @@ impl KernelLabApp {
     }
 
     /// Commits a freshly drawn sketch stroke immediately. Mainstream
-    /// sketching flows one stroke into the next with undo as the safety
-    /// net, so only typed dimension edits keep an explicit confirmation;
-    /// solid operations keep theirs untouched.
+    /// sketching flows one stroke into the next with undo as the safety net,
+    /// and a typed dimension applies the same way the moment it is accepted;
+    /// solid operations keep their confirmation untouched.
     fn commit_sketch_stroke(&mut self, entity: SketchEntityId) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
@@ -6371,16 +6383,21 @@ impl KernelLabApp {
             return;
         }
         match self.sketch.commit_pending() {
-            Ok(_) => {
-                self.sketch_revision = self.sketch_revision.saturating_add(1);
-                self.feature_preview
-                    .commit_sketch_revision(self.sketch_revision);
-                self.sketch_finished = false;
-                self.sync_active_sketch_record();
-                self.sketch_last_error = None;
-            }
+            Ok(_) => self.publish_committed_sketch_edit(),
             Err(error) => self.sketch_last_error = Some(error),
         }
+    }
+
+    /// Advances the document-facing sketch revision after a staged edit is
+    /// published. A stroke and an accepted dimension mean the same thing to
+    /// the document, so they must not drift apart here.
+    fn publish_committed_sketch_edit(&mut self) {
+        self.sketch_revision = self.sketch_revision.saturating_add(1);
+        self.feature_preview
+            .commit_sketch_revision(self.sketch_revision);
+        self.sketch_finished = false;
+        self.sync_active_sketch_record();
+        self.sketch_last_error = None;
     }
 
     /// Finishes the sketch in one action: stage the document append and
@@ -6414,6 +6431,89 @@ impl KernelLabApp {
         });
         self.sketch_last_error = None;
         self.sketch_finish_issue = None;
+    }
+
+    /// Applies or reverts a typed recipe parameter the moment its field stops
+    /// owning the keyboard. A dimension is not a staged operation — accepting
+    /// it is the commit — so this runs before any panel this frame can act on
+    /// sketch truth, and the press that ends the edit still does its own job.
+    fn settle_selected_recipe_parameter_edit(&mut self, context: &egui::Context, escape: bool) {
+        let Some(field) = self.recipe_parameter_field else {
+            return;
+        };
+        let pressed_outside = context.input(|input| {
+            input.raw.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton { pos, pressed: true, .. }
+                        if !field.rect.contains(*pos)
+                )
+            })
+        });
+        let still_focused = context.memory(|memory| memory.focused()) == Some(field.id);
+        if !escape && still_focused && !pressed_outside {
+            return;
+        }
+        if pressed_outside {
+            // egui only surrenders focus on a click, not on a press
+            // (`SurrenderFocusOn::Clicks` is the default), and never for a
+            // press-and-drag such as a pan. Dropping it here is what stops the
+            // accepted value re-arming itself next frame.
+            context.memory_mut(|memory| memory.surrender_focus(field.id));
+        }
+        if escape {
+            // Only claim the key when this field actually has something to
+            // undo; otherwise Escape still belongs to the global gate.
+            if self.sketch.selected_recipe_edit_pending()
+                || self.sketch.selected_recipe_parameter_issue().is_some()
+            {
+                self.sketch_dimension_keys.escape = true;
+            }
+            self.revert_selected_recipe_parameter_edit();
+        } else {
+            self.accept_selected_recipe_parameter_edit();
+        }
+    }
+
+    /// Publishes a typed parameter edit as one sketch revision and one undo
+    /// entry. Invalid text reverts instead of applying: the last valid
+    /// candidate is not what the field says, and publishing it silently would
+    /// commit a number the user never sees.
+    fn accept_selected_recipe_parameter_edit(&mut self) -> bool {
+        self.recipe_parameter_field = None;
+        if !self.sketch.selected_recipe_edit_pending() {
+            if self.sketch.selected_recipe_parameter_issue().is_some() {
+                self.sketch.revert_selected_recipe_edit();
+            }
+            return false;
+        }
+        if self.sketch.selected_recipe_parameter_issue().is_some()
+            || self.pending_operation.is_some()
+            || !self.history_is_at_end()
+        {
+            self.revert_selected_recipe_parameter_edit();
+            return false;
+        }
+        match self.sketch.commit_pending() {
+            Ok(_) => {
+                self.publish_committed_sketch_edit();
+                true
+            }
+            Err(error) => {
+                // A rejected publish must not strand a preview the user cannot
+                // reach: the rail that used to own it is gone.
+                self.sketch_last_error = Some(error);
+                self.sketch.revert_selected_recipe_edit();
+                false
+            }
+        }
+    }
+
+    fn revert_selected_recipe_parameter_edit(&mut self) {
+        self.recipe_parameter_field = None;
+        if self.sketch.revert_selected_recipe_edit() {
+            self.sketch_last_error = None;
+        }
     }
 
     fn stage_delete_selected_sketch(&mut self) -> bool {
@@ -7196,12 +7296,7 @@ impl KernelLabApp {
                             // Keep it monotonic across edits of a hydrated
                             // sketch; the authoring graph owns its own revision
                             // counter inside the portable payload.
-                            self.sketch_revision = self.sketch_revision.saturating_add(1);
-                            self.feature_preview
-                                .commit_sketch_revision(self.sketch_revision);
-                            self.sketch_finished = false;
-                            self.sync_active_sketch_record();
-                            self.sketch_last_error = None;
+                            self.publish_committed_sketch_edit();
                             self.pending_operation = None;
                         }
                         Err(error) => self.sketch_last_error = Some(error),
@@ -10647,8 +10742,11 @@ impl KernelLabApp {
                         }
                     }
 
-                    let operation_pending =
-                        self.pending_operation.is_some() || self.sketch.has_pending_edit();
+                    // A typed parameter preview is not an operation in flight,
+                    // so it must not grey the tool's own inputs.
+                    let operation_pending = self.pending_operation.is_some()
+                        || (self.sketch.has_pending_edit()
+                            && !self.sketch.selected_recipe_edit_pending());
                     let mut individual_input_error_visible = false;
                     for input in descriptor.inputs {
                         let conditionally_enabled = match (
@@ -10805,18 +10903,10 @@ impl KernelLabApp {
                 });
 
                 ui.add_space(7.0);
-                let recipe_edit_pending = matches!(
-                    self.pending_operation,
-                    Some(PendingOperation::SketchEdit {
-                        label: "Edit sketch parameters",
-                        ..
-                    })
-                );
-                if (matches!(
+                if matches!(
                     self.active_sketch_tool,
                     ToolVariant::Select | ToolVariant::Dimension
-                ) || recipe_edit_pending)
-                    && let Some(editor) = self.sketch.selected_recipe_editor()
+                ) && let Some(editor) = self.sketch.selected_recipe_editor()
                 {
                     collapsible_card(
                         ui,
@@ -10843,7 +10933,8 @@ impl KernelLabApp {
                             }
                             for parameter in editor.parameters {
                                 let enabled = parameter.editable
-                                    && (self.pending_operation.is_none() || recipe_edit_pending);
+                                    && self.pending_operation.is_none()
+                                    && self.history_is_at_end();
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(parameter.label).small().color(if enabled {
@@ -10864,7 +10955,8 @@ impl KernelLabApp {
                                             .font(FontId::monospace(11.0)),
                                     );
                                     let hover = parameter.read_only_reason.unwrap_or(
-                                        "Edits rebuild this recipe and every dependent curve exactly.",
+                                        "Enter or clicking away applies this value; Escape reverts. \
+                                         Edits rebuild this recipe and every dependent curve exactly.",
                                     );
                                     let response = if enabled {
                                         response.on_hover_text(hover)
@@ -10875,50 +10967,54 @@ impl KernelLabApp {
                                         node.set_label(parameter.label);
                                         node.set_description(hover);
                                     });
+                                    if response.has_focus() {
+                                        self.recipe_parameter_field = Some(RecipeParameterField {
+                                            id: response.id,
+                                            rect: response.rect,
+                                        });
+                                    }
                                     if response.changed() {
-                                        let staged = self.sketch.set_selected_recipe_parameter_text(
+                                        // Typing previews live. The candidate is
+                                        // presentation only until the value is
+                                        // accepted, so a keystroke costs no
+                                        // revision, no identity, and no undo entry.
+                                        self.sketch.set_selected_recipe_parameter_text(
                                             parameter.stable_key,
                                             text,
                                         );
-                                        if self.pending_operation.is_none()
-                                            && let Some(subject) = staged
-                                        {
-                                            self.stage_sketch_edit(subject);
-                                        }
                                     }
                                     let owns_keyboard =
                                         response.has_focus() || response.lost_focus();
-                                    let (enter, escape) = ui.ctx().input(|state| {
-                                        let pressed = |wanted: egui::Key| {
-                                            state.raw.events.iter().any(|event| {
-                                                matches!(
-                                                    event,
-                                                    egui::Event::Key {
-                                                        key,
-                                                        pressed: true,
-                                                        repeat: false,
-                                                        modifiers,
-                                                        ..
-                                                    } if *key == wanted
-                                                        && *modifiers == egui::Modifiers::NONE
-                                                )
-                                            })
-                                        };
-                                        (pressed(egui::Key::Enter), pressed(egui::Key::Escape))
+                                    let enter = ui.ctx().input(|state| {
+                                        state.raw.events.iter().any(|event| {
+                                            matches!(
+                                                event,
+                                                egui::Event::Key {
+                                                    key: egui::Key::Enter,
+                                                    pressed: true,
+                                                    repeat: false,
+                                                    modifiers,
+                                                    ..
+                                                } if *modifiers == egui::Modifiers::NONE
+                                            )
+                                        })
                                     });
                                     if owns_keyboard && enter {
+                                        // Acceptance is same-frame so the value
+                                        // is committed truth for every panel
+                                        // drawn after this one; the frame-start
+                                        // settle then finds nothing armed.
                                         self.sketch_dimension_keys.enter = true;
                                         if self.sketch.selected_recipe_parameter_issue().is_none() {
+                                            self.accept_selected_recipe_parameter_edit();
                                             response.surrender_focus();
                                         }
                                     }
-                                    if owns_keyboard && escape && !recipe_edit_pending {
-                                        self.sketch.restore_selected_recipe_parameter(
-                                            parameter.stable_key,
-                                        );
-                                        self.sketch_dimension_keys.escape = true;
-                                        response.surrender_focus();
-                                    }
+                                    // Escape is not handled here: egui clears
+                                    // focus in `Focus::begin_pass` before any
+                                    // widget renders, so the frame-start settle
+                                    // has already reverted by the time this card
+                                    // is drawn, and reverting again would fight it.
                                     if !parameter.unit.is_empty() {
                                         ui.label(
                                             RichText::new(parameter.unit).small().color(MUTED),
@@ -10945,9 +11041,9 @@ impl KernelLabApp {
                                 )
                                 .wrap(),
                             );
-                            if recipe_edit_pending {
+                            if self.sketch.selected_recipe_edit_pending() {
                                 ui.label(
-                                    RichText::new("Live exact preview · tick/Enter commits")
+                                    RichText::new("Enter or clicking away applies · Escape reverts")
                                         .small()
                                         .color(GOOD),
                                 );
@@ -11121,7 +11217,7 @@ impl KernelLabApp {
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(
-                        "Strokes commit as you draw; undo steps back. Finish from the rail below or the ribbon; only certified closed regions can extrude.",
+                        "Strokes and typed dimensions commit as you make them; undo steps back. Finish from the rail below or the ribbon; only certified closed regions can extrude.",
                     )
                     .small()
                     .color(MUTED),
@@ -12602,6 +12698,10 @@ impl KernelLabApp {
                 );
                 cancel_clicked = confirmation_button_activated(ui, &cancel_response);
 
+                // The recipe-parameter term is a belt, not braces: the field is
+                // disabled while any operation is pending and the frame-start
+                // settle reverts invalid text before this rail is drawn, so it
+                // should never fire. It costs nothing and it fails safe.
                 let dimension_confirmation_blocked = self.workbench_mode == WorkbenchMode::Sketch
                     && (self.sketch.dimension_error().is_some()
                         || self.sketch.selected_recipe_parameter_issue().is_some());
@@ -12672,8 +12772,6 @@ impl KernelLabApp {
                         self.edge_finish_selection_support().detail()
                     } else if boolean_confirmation_blocked {
                         "Click at least one tool body in the viewport before confirming."
-                    } else if self.sketch.selected_recipe_parameter_issue().is_some() {
-                        "Correct or cancel the invalid selected-feature parameter before confirming."
                     } else {
                         "Correct or cancel the invalid active dimension before confirming."
                     })
@@ -12752,7 +12850,7 @@ impl KernelLabApp {
                         egui::Label::new(RichText::new("Sketch").color(TEXT).strong()).truncate(),
                     )
                     .on_hover_text(
-                        "Strokes commit as you draw. Finish saves the sketch; exit leaves it as a draft.",
+                        "Strokes and typed dimensions commit as you make them. Finish saves the sketch; exit leaves it as a draft.",
                     );
                 });
             });
@@ -13709,6 +13807,13 @@ impl eframe::App for KernelLabApp {
                 key_pressed(egui::Key::Enter),
             )
         });
+        // A typed dimension applies on acceptance, so the preview must not
+        // survive into the rest of this frame: the ribbon, the rail, the
+        // browser and the canvas below all read committed sketch truth, and
+        // the click that accepted the value still lands on whatever it hit.
+        // `cancel_pending` is still the raw bare-Escape flag here; it is only
+        // re-derived against `operation_at_frame_start` after the panels run.
+        self.settle_selected_recipe_parameter_edit(ui.ctx(), cancel_pending);
         egui::Panel::top("lab_header")
             .exact_size(38.0)
             .show_separator_line(false)

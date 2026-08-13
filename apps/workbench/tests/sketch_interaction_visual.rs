@@ -326,3 +326,23 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     assert_eq!(harness.state().sketch_entity_count(), 1);
 }
+
+/// The reported symptom, as pixels: typing a new width shows one rectangle at
+/// the typed size, not a red original beside a green replacement.
+#[test]
+fn typed_dimension_live_preview_snapshot() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, -1.5));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 1.5));
+
+    click_button(&mut harness, "Select sketch geometry");
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 1.5));
+    harness.get_by_label("SELECTED FEATURE");
+
+    replace_tool_input(&mut harness, "Width", "6");
+    assert_eq!(harness.state().sketch_pending_entity_count(), 4);
+    assert!(!harness.state().operation_confirmation_pending());
+    settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1040");
+}
