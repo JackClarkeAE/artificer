@@ -1,6 +1,6 @@
 # ADR 0021: Editable sketch authoring and late-bound region replay
 
-- Status: Accepted and implemented for the declared S2D domain
+Status: Accepted and implemented for the declared S2D domain
 - Date: 2026-07-30
 - Decision owners: Artificer project
 

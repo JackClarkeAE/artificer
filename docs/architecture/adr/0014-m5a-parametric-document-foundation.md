@@ -1,6 +1,6 @@
 # ADR 0014: M5a parametric document foundation
 
-- Status: Accepted for the M5a foundation
+Status: Accepted for the M5a foundation
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

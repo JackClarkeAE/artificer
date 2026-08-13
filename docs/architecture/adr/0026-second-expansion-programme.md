@@ -1,6 +1,20 @@
 # 0026 — The second expansion programme: presentation, mainstream features, throughput, and the kernel frontier
 
-Status: proposed — execution plan for the next several working passes
+Status: accepted — execution plan for the next several working passes. Phase 1
+has landed: P1 (smooth shading and the four-term rig), P2 (MSAA, exact
+silhouettes, outline stroke weights), F1 stage 1 (the RELATIONS family, the
+eight kinds staged as atomic transactions through the confirmation gate),
+F3 (`RevolvePlanarProfile` with sphere bands, annulus faces, reversed bands,
+the `extract_rz_section` sphere arm, and sketch-region-plus-centreline
+staging), V1 (criterion benches, committed baselines, `perf_span!`), V6 (CI
+enumerates its own suites, nightly benches, macOS and Linux release
+artifacts), and K5 (orphan deleted, ADR index and statuses normalised). Of
+F10's seven borrowings, zoom-to-selection ships; double-click tangent chains
+and Enter-repeat are held back because the bindings they want are already
+taken by the explicit face pick and the confirmation gate, and reassigning
+those is a UX decision rather than plumbing. Also outstanding from Phase 1:
+relation glyphs (they belong with P5, which Phase 3 schedules) and a live
+worker-computed revolve preview.
 
 This ADR is a survey-grounded programme, in the manner of the blend
 frontier plan that produced `corner_blend`, `prism_edge_finish`,

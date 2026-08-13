@@ -326,7 +326,7 @@ pub(crate) fn validate_analytic_profile_extrusion(
     Ok(ValidatedAnalyticExtrusion { regions })
 }
 
-fn reversed_loop(profile_loop: AnalyticLoop) -> AnalyticLoop {
+pub(crate) fn reversed_loop(profile_loop: AnalyticLoop) -> AnalyticLoop {
     let segments = profile_loop
         .segments
         .into_iter()
@@ -359,7 +359,7 @@ fn reversed_loop(profile_loop: AnalyticLoop) -> AnalyticLoop {
     }
 }
 
-fn normalize_frame(
+pub(crate) fn normalize_frame(
     frame: PlanarFrame3,
     precision: PrecisionPolicy,
 ) -> Result<Frame, PlanarProfileInputError> {
@@ -412,7 +412,7 @@ fn robust_unit(vector: Vector3) -> Option<Vector3> {
     (length.is_finite() && length > 0.0).then_some(scaled / length)
 }
 
-fn parse_loop(
+pub(crate) fn parse_loop(
     profile_loop: &PlanarLoop2,
     minimum: f64,
     agreement: f64,

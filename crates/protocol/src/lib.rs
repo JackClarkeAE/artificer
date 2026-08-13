@@ -968,6 +968,39 @@ impl PlanarRegion2 {
     }
 }
 
+/// The axis of a revolve, in the profile's own frame.
+///
+/// Two points rather than a point and a direction: a sketch centreline is
+/// already two points, and a degenerate axis is then one equality check away
+/// rather than a normalisation that silently succeeds.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanarAxis2 {
+    pub start: Point2,
+    pub end: Point2,
+}
+
+impl PlanarAxis2 {
+    #[must_use]
+    pub const fn new(start: Point2, end: Point2) -> Self {
+        Self { start, end }
+    }
+
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.start.is_finite() && self.end.is_finite()
+    }
+}
+
+/// How far a revolve sweeps.
+///
+/// An enum rather than an angle so that partial revolves extend this contract
+/// later instead of reinterpreting a number whose full-turn value was special.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RevolveAngle {
+    FullTurn,
+}
+
 /// A deterministic set of disjoint planar material regions.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PlanarProfile2 {
@@ -1337,6 +1370,20 @@ pub enum KernelCommand {
         profile: PlanarProfile2,
         #[serde(with = "finite_f64")]
         distance: f64,
+    },
+    /// Revolves one certified planar region a full turn about an axis lying in
+    /// its own frame.
+    ///
+    /// The profile must sit entirely on one side of the axis, touching it only
+    /// along axis-collinear segments or at the ends of arcs — a line meeting
+    /// the axis obliquely would sweep a cone apex, which is a singularity
+    /// rather than a pole, and is refused.
+    RevolvePlanarProfile {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+        profile: PlanarProfile2,
+        axis: PlanarAxis2,
+        angle: RevolveAngle,
     },
     /// Adds an outward linear-profile boss or removes a blind/through pocket
     /// from one supported axis-aligned planar boundary patch.

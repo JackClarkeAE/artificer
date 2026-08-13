@@ -1,6 +1,6 @@
 # ADR 0013: Repeatable rectangular face features use local boundary rewrites
 
-- Status: Accepted for the historical M4d experimental slice; profile and topology domains are widened by ADR 0015
+Status: Accepted for the historical M4d experimental slice; profile and topology domains are widened by ADR 0015
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

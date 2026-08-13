@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Turns on the kernel's timing spans (ADR 0026, V1). Build with
+# `--features perf-spans` and run with `ARTIFICER_PERF_REPORT=1` to see the
+# strategy-ladder, validator, and tessellation stages in the COMPUTE ACTIVITY
+# card beside the parallel batches.
+perf-spans = ["artificer-compute/perf-spans"]
+
 [dependencies]
 eframe.workspace = true
 egui.workspace = true

@@ -4,9 +4,9 @@ use std::fmt;
 use artificer_protocol::PrecisionPolicy;
 
 use crate::{
-    CurveProvenance, OutputRole, PrimitiveEvaluation, SketchDefinition, SketchEntityId,
-    SketchEntityRecord, SketchInputValues, SketchOperationId, SketchOutputOwner, SketchOutputRef,
-    SketchPoint2, SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision,
+    CurveProvenance, OutputRole, PrimitiveEvaluation, SketchConstraintKind, SketchDefinition,
+    SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId, SketchOutputOwner,
+    SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision,
     SketchValidationError, evaluate_recipe, instantiate_curve,
 };
 
@@ -142,6 +142,12 @@ impl SketchTransaction {
     }
 }
 
+/// Whether two solved positions agree within the linear tolerance, so a
+/// relation the sketch already satisfies reports no movement.
+fn positions_agree(left: SketchPoint2, right: SketchPoint2, precision: PrecisionPolicy) -> bool {
+    (left.u - right.u).hypot(left.v - right.v) <= precision.linear_agreement
+}
+
 fn merge_impact(impact: &mut SketchImpactReport, appended: SketchImpactReport) {
     impact
         .inserted_operations
@@ -273,6 +279,86 @@ impl SketchDefinition {
             candidate,
             impact,
             inputs: inputs.clone(),
+            precision,
+        })
+    }
+
+    /// Stages one geometric relation as an atomic transaction (ADR 0026, F1).
+    ///
+    /// A relation adds no geometry: it adds an equation, and the solver moves
+    /// existing points to satisfy it. That makes the candidate the natural
+    /// home for it — `add_constraint` already refuses and rolls back a
+    /// non-converged system, so a conflicting relation leaves this definition,
+    /// its identifiers, and its revision untouched, exactly as a rejected
+    /// recipe does. Confirmation goes through the same tick/Enter gate as
+    /// every other model change.
+    pub fn stage_constraint(
+        &self,
+        kind: SketchConstraintKind,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        self.stage_constraints(vec![kind], label, precision)
+    }
+
+    /// Stages several relations as one atomic edit.
+    ///
+    /// Pinning a line is two `Fixed` equations, one per endpoint, and the user
+    /// asked for one relation — so they arrive, and are refused, together.
+    pub fn stage_constraints(
+        &self,
+        kinds: Vec<SketchConstraintKind>,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let label = checked_label(label)?;
+        if kinds.is_empty() {
+            return Err(SketchTransactionError::NoChange);
+        }
+        let before = self
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let mut candidate = self.clone();
+        for kind in kinds {
+            candidate
+                .add_constraint(kind, precision)
+                .map_err(SketchTransactionError::ConstraintRejected)?;
+        }
+        let after = candidate
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+
+        // The impact is whichever points the solver actually moved. A relation
+        // the sketch already satisfied moves nothing, and is still worth
+        // recording: it is what makes the sketch stay that way.
+        let mut impact = SketchImpactReport {
+            profile_changed: true,
+            ..SketchImpactReport::default()
+        };
+        for (point, position) in &after.positions {
+            let moved = before
+                .positions
+                .get(point)
+                .is_none_or(|previous| !positions_agree(*previous, *position, precision));
+            if moved {
+                impact.changed_points.insert(*point);
+                for (entity, record) in candidate.entities() {
+                    if record.active && record.geometry.referenced_points().contains(point) {
+                        impact.changed_entities.insert(*entity);
+                    }
+                }
+            }
+        }
+        // Each `add_constraint` advances the revision; the batch publishes one
+        // successor however many equations it carries.
+        candidate.set_revision(next_revision(self.revision())?);
+        candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
+        Ok(SketchTransaction {
+            expected_revision: self.revision(),
+            label,
+            candidate,
+            impact,
+            inputs: SketchInputValues::default(),
             precision,
         })
     }
@@ -811,6 +897,9 @@ pub enum SketchTransactionError {
     MissingActiveOperation(SketchOperationId),
     MissingActiveEntity(SketchEntityId),
     NotAModifier,
+    /// The solver refused the relation: the system is conflicting, or it names
+    /// a point that is missing, inactive, or repeated.
+    ConstraintRejected(crate::ConstraintError),
     DependentOperations {
         operation: SketchOperationId,
         dependents: Vec<SketchOperationId>,
@@ -837,6 +926,7 @@ impl fmt::Display for SketchTransactionError {
                 write!(formatter, "entity {entity} is missing or retired")
             }
             Self::NotAModifier => formatter.write_str("a modifier recipe is required"),
+            Self::ConstraintRejected(error) => write!(formatter, "relation refused: {error}"),
             Self::DependentOperations {
                 operation,
                 dependents,

@@ -1,6 +1,6 @@
 # ADR 0011: Expandable workbench shell preserves a fixed confirmation rail
 
-- Status: Accepted for the M4b shell and confirmation rail; the history-preview authority boundary is superseded by [ADR 0014](0014-m5a-parametric-document-foundation.md)
+Status: Accepted for the M4b shell and confirmation rail; the history-preview authority boundary is superseded by [ADR 0014](0014-m5a-parametric-document-foundation.md)
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

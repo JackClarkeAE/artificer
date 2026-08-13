@@ -1,6 +1,6 @@
 # ADR 0004: First experimental cuboid slice
 
-- Status: Accepted
+Status: Accepted
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

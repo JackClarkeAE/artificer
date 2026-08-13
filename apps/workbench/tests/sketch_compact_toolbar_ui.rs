@@ -127,6 +127,8 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
     enter_xy_sketch(&mut harness);
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
+    // Creation on the first row, modify and constrain on the second. The
+    // relation family (ADR 0026, F1) fills the grid to a full seven by two.
     let rows = [
         [
             "Select sketch geometry",
@@ -135,14 +137,16 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             "Two-point rectangle",
             "Centre-point circle",
             "Centre-start-end arc",
+            "Outer-diameter polygon",
         ],
         [
-            "Outer-diameter polygon",
             "Two-point centre-to-centre slot",
             "Trim curve span",
             "2D fillet",
             "Equal-distance chamfer",
             "Rectangular sketch pattern",
+            "Horizontal relation",
+            "Sketch dimension",
         ],
     ];
     for (row_index, row) in rows.into_iter().enumerate() {

@@ -1,6 +1,6 @@
 # ADR 0017: Portable native document v4 and atomic fresh-process replay
 
-- Status: Accepted for F1
+Status: Accepted for F1
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

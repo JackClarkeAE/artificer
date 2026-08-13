@@ -1,6 +1,6 @@
 # ADR 0008: Plane and profile workbench boundary
 
-- Status: Accepted
+Status: Accepted
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

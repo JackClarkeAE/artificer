@@ -75,7 +75,7 @@ impl ToolbarHarness {
 }
 
 #[test]
-fn compact_toolbar_is_a_uniform_six_by_two_grid_with_contained_variant_choosers() {
+fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_choosers() {
     let mut fixture = ToolbarHarness::new();
     fixture.run();
 
@@ -92,6 +92,8 @@ fn compact_toolbar_is_a_uniform_six_by_two_grid_with_contained_variant_choosers(
         "2D fillet",
         "Equal-distance chamfer",
         "Rectangular sketch pattern",
+        "Horizontal relation",
+        "Sketch dimension",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert_eq!(node.rect().width(), PRIMARY_CELL_SIZE, "{label}");
@@ -107,6 +109,7 @@ fn compact_toolbar_is_a_uniform_six_by_two_grid_with_contained_variant_choosers(
         "Choose slot type; current default: Two-point centre-to-centre slot.",
         "Choose chamfer type; current default: Equal-distance chamfer.",
         "Choose pattern type; current default: Rectangular sketch pattern.",
+        "Choose relation; current default: Horizontal.",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert!(node.rect().width() < PRIMARY_CELL_SIZE, "{label}");
@@ -124,6 +127,8 @@ fn compact_toolbar_is_a_uniform_six_by_two_grid_with_contained_variant_choosers(
         TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING
     );
 
+    // Creation on the first row, modify and constrain on the second: the
+    // relation family (ADR 0026, F1) completes a full seven-by-two grid.
     let rows = [
         [
             ToolFamily::Select,
@@ -132,14 +137,16 @@ fn compact_toolbar_is_a_uniform_six_by_two_grid_with_contained_variant_choosers(
             ToolFamily::Rectangle,
             ToolFamily::Circle,
             ToolFamily::Arc,
+            ToolFamily::Polygon,
         ],
         [
-            ToolFamily::Polygon,
             ToolFamily::Slot,
             ToolFamily::Trim,
             ToolFamily::Fillet,
             ToolFamily::Chamfer,
             ToolFamily::Pattern,
+            ToolFamily::Relation,
+            ToolFamily::Dimension,
         ],
     ];
     for (row_index, row) in rows.into_iter().enumerate() {

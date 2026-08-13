@@ -1,6 +1,6 @@
 # ADR 0007: Universal confirmation for interactive model operations
 
-- Status: Accepted
+Status: Accepted
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

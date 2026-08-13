@@ -1,6 +1,6 @@
 # ADR 0001: Native Rust kernel with an external development oracle
 
-- Status: Accepted
+Status: Accepted
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

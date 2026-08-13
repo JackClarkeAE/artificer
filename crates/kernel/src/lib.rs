@@ -24,6 +24,7 @@ mod prism_boolean;
 mod prism_edge_finish;
 mod profile_boolean;
 mod push_pull;
+mod revolve;
 mod rim_loop_blend;
 mod section_revolve;
 mod sew;
@@ -38,7 +39,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use artificer_compute::ComputePool;
+use artificer_compute::{ComputePool, perf_span};
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
     Diagnostic as ProtocolDiagnostic, DiagnosticCode as ProtocolDiagnosticCode,
@@ -160,6 +161,11 @@ impl CancellationToken {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DebugTriangle {
     pub vertices: [ProtocolPoint3; 3],
+    /// Exact unit outward normals of the carrier surface at each vertex, not
+    /// of the chord triangle. A curved face therefore shades as the surface it
+    /// approximates rather than as its facets, and a vertex shared by two
+    /// triangles of one carrier carries bit-identical normals in both.
+    pub normals: [ProtocolVector3; 3],
     pub source_face: EntityRef,
     pub role: FaceRole,
 }
@@ -173,6 +179,156 @@ pub struct DebugEdge {
     /// The topology retains it for validation, while CAD presentation and
     /// picking may treat it as a smooth internal subdivision.
     pub is_smooth: bool,
+    /// The faces this edge separates, in topology order. Presentation uses
+    /// them to tell an outline edge — one incident face turned away from the
+    /// camera — from an interior crease, which is most of why a drafting
+    /// viewport reads as crisp rather than as a wireframe.
+    pub incident_faces: [Option<EntityRef>; 2],
+}
+
+/// Presentation-only description of one curved face's carrier surface.
+///
+/// The viewport needs the analytic surface to draw the silhouette where a
+/// smooth face rolls away from the camera — a curve that is in no B-rep edge
+/// because no topology changes there. This descriptor mirrors the surface
+/// parameters for that purpose alone: it is display metadata, carries no
+/// authority, and nothing evaluated from it may re-enter modelling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayCarrier {
+    pub source_face: EntityRef,
+    pub surface: DisplaySurface,
+    /// The face's parameter rectangle `[[u_min, u_max], [v_min, v_max]]` —
+    /// the same domain its display tessellation spans, so a silhouette drawn
+    /// inside it is bounded exactly as the shaded fill is.
+    pub domain: [[f64; 2]; 2],
+}
+
+/// The curved half of the surface vocabulary, in display-facing form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DisplaySurface {
+    Cylinder {
+        origin: ProtocolPoint3,
+        axis: ProtocolVector3,
+        radial_u: ProtocolVector3,
+        radial_v: ProtocolVector3,
+        radius: f64,
+        angular_sign: f64,
+    },
+    Cone {
+        origin: ProtocolPoint3,
+        axis: ProtocolVector3,
+        radial_u: ProtocolVector3,
+        radial_v: ProtocolVector3,
+        base_radius: f64,
+        slope: f64,
+        angular_sign: f64,
+    },
+    Sphere {
+        origin: ProtocolPoint3,
+        axis: ProtocolVector3,
+        radial_u: ProtocolVector3,
+        radial_v: ProtocolVector3,
+        radius: f64,
+        angular_sign: f64,
+    },
+    Torus {
+        origin: ProtocolPoint3,
+        axis: ProtocolVector3,
+        radial_u: ProtocolVector3,
+        radial_v: ProtocolVector3,
+        major_radius: f64,
+        minor_radius: f64,
+        angular_sign: f64,
+    },
+}
+
+impl DisplaySurface {
+    /// The carrier point at one parameter pair, in the surface's own exact
+    /// parameterisation.
+    #[must_use]
+    pub fn evaluate(self, u: f64, v: f64) -> ProtocolPoint3 {
+        let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
+        let angle = angular_sign * u;
+        let (sin, cos) = angle.sin_cos();
+        let radial = ProtocolVector3::new(
+            radial_u.x.mul_add(cos, radial_v.x * sin),
+            radial_u.y.mul_add(cos, radial_v.y * sin),
+            radial_u.z.mul_add(cos, radial_v.z * sin),
+        );
+        let (ring, lift) = match self {
+            Self::Cylinder { radius, .. } => (radius, v),
+            Self::Cone {
+                base_radius, slope, ..
+            } => (slope.mul_add(v, base_radius), v),
+            Self::Sphere { radius, .. } => {
+                let (sin_v, cos_v) = v.sin_cos();
+                (radius * cos_v, radius * sin_v)
+            }
+            Self::Torus {
+                major_radius,
+                minor_radius,
+                ..
+            } => {
+                let (sin_v, cos_v) = v.sin_cos();
+                (
+                    minor_radius.mul_add(cos_v, major_radius),
+                    minor_radius * sin_v,
+                )
+            }
+        };
+        ProtocolPoint3::new(
+            radial.x.mul_add(ring, axis.x.mul_add(lift, origin.x)),
+            radial.y.mul_add(ring, axis.y.mul_add(lift, origin.y)),
+            radial.z.mul_add(ring, axis.z.mul_add(lift, origin.z)),
+        )
+    }
+
+    /// `(origin, axis, radial_u, radial_v, angular_sign)`, shared by every arm.
+    #[must_use]
+    pub const fn frame(
+        self,
+    ) -> (
+        ProtocolPoint3,
+        ProtocolVector3,
+        ProtocolVector3,
+        ProtocolVector3,
+        f64,
+    ) {
+        match self {
+            Self::Cylinder {
+                origin,
+                axis,
+                radial_u,
+                radial_v,
+                angular_sign,
+                ..
+            }
+            | Self::Cone {
+                origin,
+                axis,
+                radial_u,
+                radial_v,
+                angular_sign,
+                ..
+            }
+            | Self::Sphere {
+                origin,
+                axis,
+                radial_u,
+                radial_v,
+                angular_sign,
+                ..
+            }
+            | Self::Torus {
+                origin,
+                axis,
+                radial_u,
+                radial_v,
+                angular_sign,
+                ..
+            } => (origin, axis, radial_u, radial_v, angular_sign),
+        }
+    }
 }
 
 /// Deterministic, source-mapped B-rep vertex used for selection and diagnostics.
@@ -193,6 +349,8 @@ pub struct DebugScene {
     pub triangles: Vec<DebugTriangle>,
     pub edges: Vec<DebugEdge>,
     pub vertices: Vec<DebugVertex>,
+    /// One entry per curved face, for the per-frame silhouette pass.
+    pub carriers: Vec<DisplayCarrier>,
 }
 
 /// One exact face-boundary curve expressed in that face's own planar frame.
@@ -447,6 +605,18 @@ impl NativeKernel {
                 )
                 .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                 (build_analytic_extrusion(&extrusion), HistoryMode::Generated)
+            }
+            KernelCommand::RevolvePlanarProfile {
+                frame,
+                profile,
+                axis,
+                angle,
+            } => {
+                validate_extrusion_source(input)?;
+                let revolved =
+                    revolve::validate_revolve(*frame, profile, *axis, *angle, request.precision)
+                        .map_err(|reason| revolve_input_error(input.id, reason))?;
+                (revolve::build_revolve(&revolved), HistoryMode::Generated)
             }
             KernelCommand::TransformSnapshot { transform } => {
                 validate_transform_source(input)?;
@@ -1335,11 +1505,17 @@ impl NativeKernel {
         // direction with compatible slabs, the Boolean reduces to a certified
         // 2D profile Boolean and rebuilds through the analytic extrusion
         // path — curved walls included, no tessellation anywhere.
-        let analytic = prism_boolean::build_prism_boolean(
-            &target.topology,
-            &tool.topology,
-            request.operation,
-            request.precision,
+        let analytic = perf_span!(
+            "kernel.boolean.prism",
+            target.topology.faces.len() + tool.topology.faces.len(),
+            {
+                prism_boolean::build_prism_boolean(
+                    &target.topology,
+                    &tool.topology,
+                    request.operation,
+                    request.precision,
+                )
+            }
         );
         if matches!(analytic, Err(prism_boolean::PrismBooleanError::EmptyResult)) {
             return Err(error(
@@ -1363,11 +1539,17 @@ impl NativeKernel {
             Err(_) => {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
-                    match analytic_boolean::build_analytic_boolean(
-                        &target.topology,
-                        &tool.topology,
-                        request.operation,
-                        request.precision,
+                    match perf_span!(
+                        "kernel.boolean.analytic",
+                        target.topology.faces.len() + tool.topology.faces.len(),
+                        {
+                            analytic_boolean::build_analytic_boolean(
+                                &target.topology,
+                                &tool.topology,
+                                request.operation,
+                                request.precision,
+                            )
+                        }
                     ) {
                         Ok(topology) => topology,
                         Err(analytic_boolean::AnalyticBooleanError::EmptyResult) => {
@@ -1895,6 +2077,16 @@ impl NativeKernel {
         snapshot: &Snapshot,
         budget: ChordBudget,
     ) -> DebugScene {
+        perf_span!("kernel.tessellate", snapshot.topology.faces.len(), {
+            Self::scene_with_budget_inner(compute, snapshot, budget)
+        })
+    }
+
+    fn scene_with_budget_inner(
+        compute: &ComputePool,
+        snapshot: &Snapshot,
+        budget: ChordBudget,
+    ) -> DebugScene {
         let precision = snapshot.precision.unwrap_or_default();
         let triangles = compute.flat_map(
             "kernel.tessellation.faces",
@@ -1923,11 +2115,12 @@ impl NativeKernel {
                             return triangles;
                         }
                         for vertices in triangulate_face_boundaries(&boundaries, plane) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
+                            triangles.push(shaded_triangle(
+                                face.value.surface,
+                                vertices,
                                 source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
+                                snapshot.topology.faces[index].value.role,
+                            ));
                         }
                     }
                     Surface::Cylinder(cylinder) => {
@@ -1938,11 +2131,12 @@ impl NativeKernel {
                             budget,
                             precision,
                         ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
+                            triangles.push(shaded_triangle(
+                                face.value.surface,
+                                vertices,
                                 source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
+                                snapshot.topology.faces[index].value.role,
+                            ));
                         }
                     }
                     Surface::Torus(torus) => {
@@ -1953,11 +2147,12 @@ impl NativeKernel {
                             budget,
                             precision,
                         ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
+                            triangles.push(shaded_triangle(
+                                face.value.surface,
+                                vertices,
                                 source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
+                                snapshot.topology.faces[index].value.role,
+                            ));
                         }
                     }
                     Surface::Sphere(sphere) => {
@@ -1968,11 +2163,12 @@ impl NativeKernel {
                             budget,
                             precision,
                         ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
+                            triangles.push(shaded_triangle(
+                                face.value.surface,
+                                vertices,
                                 source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
+                                snapshot.topology.faces[index].value.role,
+                            ));
                         }
                     }
                     Surface::Cone(cone) => {
@@ -1983,11 +2179,12 @@ impl NativeKernel {
                             budget,
                             precision,
                         ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
+                            triangles.push(shaded_triangle(
+                                face.value.surface,
+                                vertices,
                                 source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
+                                snapshot.topology.faces[index].value.role,
+                            ));
                         }
                     }
                 }
@@ -1996,17 +2193,20 @@ impl NativeKernel {
         );
 
         let presentation_smooth_edges = presentation_smooth_edge_flags(&snapshot.topology);
+        let edge_incident_faces = edge_incident_faces(snapshot);
         let edges = compute.flat_map(
             "kernel.tessellation.edges",
             &snapshot.topology.edges,
             |index, edge| {
                 let is_smooth = presentation_smooth_edges[index];
+                let incident_faces = edge_incident_faces[index];
                 sampled_edge_segments(edge.value, budget, precision)
                     .into_iter()
                     .map(|endpoints| DebugEdge {
                         endpoints: endpoints.map(protocol_point),
                         source_edge: entity_ref(snapshot.id, edge.id.get(), EntityKind::Edge),
                         is_smooth,
+                        incident_faces,
                     })
                     .collect()
             },
@@ -2034,8 +2234,98 @@ impl NativeKernel {
             triangles,
             edges,
             vertices,
+            carriers: display_carriers(snapshot),
         }
     }
+}
+
+/// The faces on either side of every edge, in topology order.
+///
+/// One pass over the coedges rather than a face scan per edge: the display
+/// scene is rebuilt on every commit and dense Boolean results have thousands
+/// of edges.
+fn edge_incident_faces(snapshot: &Snapshot) -> Vec<[Option<EntityRef>; 2]> {
+    let mut incident = vec![[None; 2]; snapshot.topology.edges.len()];
+    for face in &snapshot.topology.faces {
+        let face_ref = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
+        for loop_key in face.value.loops() {
+            let Some(loop_record) = snapshot.topology.loop_record(loop_key) else {
+                continue;
+            };
+            for coedge_key in &loop_record.value.coedges {
+                let Some(coedge) = snapshot.topology.coedge(*coedge_key) else {
+                    continue;
+                };
+                let Some(slot) = incident.get_mut(coedge.value.edge.0) else {
+                    continue;
+                };
+                if slot[0].is_none() {
+                    slot[0] = Some(face_ref);
+                } else if slot[1].is_none() && slot[0] != Some(face_ref) {
+                    slot[1] = Some(face_ref);
+                }
+            }
+        }
+    }
+    incident
+}
+
+/// Display-only carrier descriptors for the curved faces of a snapshot.
+///
+/// Planes are omitted: a planar face's outline is its own boundary edges, so
+/// it has no silhouette the B-rep does not already carry.
+fn display_carriers(snapshot: &Snapshot) -> Vec<DisplayCarrier> {
+    snapshot
+        .topology
+        .faces
+        .iter()
+        .filter_map(|face| {
+            let (u_min, u_max, v_min, v_max) =
+                face_parameter_bounds(&snapshot.topology, &face.value)?;
+            let surface = match face.value.surface {
+                Surface::Plane(_) => return None,
+                Surface::Cylinder(cylinder) => DisplaySurface::Cylinder {
+                    origin: protocol_point(cylinder.origin),
+                    axis: protocol_vector(cylinder.axis),
+                    radial_u: protocol_vector(cylinder.radial_u),
+                    radial_v: protocol_vector(cylinder.radial_v),
+                    radius: cylinder.radius,
+                    angular_sign: cylinder.angular_sign,
+                },
+                Surface::Cone(cone) => DisplaySurface::Cone {
+                    origin: protocol_point(cone.origin),
+                    axis: protocol_vector(cone.axis),
+                    radial_u: protocol_vector(cone.radial_u),
+                    radial_v: protocol_vector(cone.radial_v),
+                    base_radius: cone.base_radius,
+                    slope: cone.slope,
+                    angular_sign: cone.angular_sign,
+                },
+                Surface::Sphere(sphere) => DisplaySurface::Sphere {
+                    origin: protocol_point(sphere.origin),
+                    axis: protocol_vector(sphere.axis),
+                    radial_u: protocol_vector(sphere.radial_u),
+                    radial_v: protocol_vector(sphere.radial_v),
+                    radius: sphere.radius,
+                    angular_sign: sphere.angular_sign,
+                },
+                Surface::Torus(torus) => DisplaySurface::Torus {
+                    origin: protocol_point(torus.origin),
+                    axis: protocol_vector(torus.axis),
+                    radial_u: protocol_vector(torus.radial_u),
+                    radial_v: protocol_vector(torus.radial_v),
+                    major_radius: torus.major_radius,
+                    minor_radius: torus.minor_radius,
+                    angular_sign: torus.angular_sign,
+                },
+            };
+            Some(DisplayCarrier {
+                source_face: entity_ref(snapshot.id, face.id.get(), EntityKind::Face),
+                surface,
+                domain: [[u_min, u_max], [v_min, v_max]],
+            })
+        })
+        .collect()
 }
 
 fn presentation_vertex_is_smooth(
@@ -3993,6 +4283,45 @@ fn planar_profile_error(
     )
 }
 
+fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError) -> KernelError {
+    let (diagnostic, message) = match reason {
+        revolve::RevolveInputError::Profile(reason) => {
+            return planar_profile_input_error(snapshot, reason);
+        }
+        revolve::RevolveInputError::SingleRegionOnly => (
+            "REVOLVE_SINGLE_REGION_ONLY",
+            "A revolve sweeps exactly one material region without holes; a hole would sweep a cavity of revolution, which needs a Boolean rather than a section chain.",
+        ),
+        revolve::RevolveInputError::DegenerateAxis => (
+            "REVOLVE_AXIS_DEGENERATE",
+            "The revolve axis endpoints coincide, so no axis is defined.",
+        ),
+        revolve::RevolveInputError::ProfileCrossesAxis => (
+            "REVOLVE_PROFILE_CROSSES_AXIS",
+            "The profile has material on both sides of the axis; the sweep would pass through itself.",
+        ),
+        revolve::RevolveInputError::ObliqueAxisContact => (
+            "REVOLVE_OBLIQUE_AXIS_CONTACT",
+            "A straight profile segment meets the axis obliquely. It would sweep a cone apex, which is a singular point rather than a pole, and stays outside the certified domain.",
+        ),
+        revolve::RevolveInputError::SectionNotContiguous => (
+            "REVOLVE_SECTION_NOT_CONTIGUOUS",
+            "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",
+        ),
+    };
+    error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Preflight,
+        snapshot,
+        "the revolve profile and axis leave the certified domain",
+        vec![simple_diagnostic(
+            diagnostic,
+            KernelStage::Preflight,
+            message,
+        )],
+    )
+}
+
 fn face_push_pull_input_error(snapshot: SnapshotId, reason: FacePushPullInputError) -> KernelError {
     let (code, diagnostic, message) = match reason {
         FacePushPullInputError::NonFinite => (
@@ -5847,6 +6176,39 @@ const fn internal_point(point: ProtocolPoint3) -> Point3 {
 
 const fn protocol_point(point: Point3) -> ProtocolPoint3 {
     ProtocolPoint3::new(point.x, point.y, point.z)
+}
+
+/// One display triangle carrying the carrier's exact normal at each vertex.
+///
+/// The chord triangle's own normal is used only where the closed form
+/// degenerates — at a parameter singularity a tessellator should never emit —
+/// which reproduces the previous flat shading rather than dropping the facet.
+fn shaded_triangle(
+    surface: Surface,
+    vertices: [Point3; 3],
+    source_face: EntityRef,
+    role: FaceRole,
+) -> DebugTriangle {
+    let facet = facet_normal(vertices);
+    DebugTriangle {
+        vertices: vertices.map(protocol_point),
+        normals: vertices
+            .map(|vertex| protocol_vector(surface.outward_normal_at(vertex).unwrap_or(facet))),
+        source_face,
+        role,
+    }
+}
+
+/// The chord triangle's unit normal under the outward winding every
+/// tessellator emits.
+fn facet_normal(vertices: [Point3; 3]) -> Vector3 {
+    let normal = (vertices[1] - vertices[0]).cross(vertices[2] - vertices[0]);
+    let length = normal.length();
+    if length.is_finite() && length > f64::EPSILON {
+        normal / length
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    }
 }
 
 const fn protocol_vector(vector: Vector3) -> ProtocolVector3 {

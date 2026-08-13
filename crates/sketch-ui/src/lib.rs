@@ -32,10 +32,11 @@ use artificer_sketch::{
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
     RegionSignature as CoreRegionSignature, RetirementPolicy as CoreRetirementPolicy,
     SignedLength as CoreSignedLength, SketchArrangement as CoreSketchArrangement,
+    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
     SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
     SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
-    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchRecipe as CoreRecipe,
-    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
+    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
     SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
@@ -3912,6 +3913,11 @@ pub struct SketchCanvasState {
     selected_recipe_editor: Option<SelectedRecipeEditor>,
     /// Stable seed/source acquisition for compound modifiers and patterns.
     modifier_sources: Vec<CoreEntityId>,
+    /// Operands picked so far for the active relation tool, in click order.
+    relation_operands: Vec<RelationOperand>,
+    /// Why the last relation was refused, in the solver's own words. Cleared
+    /// when a relation succeeds or the tool changes.
+    relation_diagnostic: Option<String>,
     /// Exact model-space picks keyed by the carrier selected for a corner tool.
     modifier_picks: BTreeMap<CoreEntityId, SketchPoint>,
     hovered: Option<SketchEntityId>,
@@ -3965,6 +3971,8 @@ impl Default for SketchCanvasState {
             selected: None,
             selected_recipe_editor: None,
             modifier_sources: Vec::new(),
+            relation_operands: Vec::new(),
+            relation_diagnostic: None,
             modifier_picks: BTreeMap::new(),
             hovered: None,
             trim_hover_fragment: None,
@@ -4408,7 +4416,15 @@ impl SketchCanvasState {
             | ToolVariant::Chamfer
             | ToolVariant::TwoDistanceChamfer
             | ToolVariant::RectangularPattern
-            | ToolVariant::CircularPattern => SketchTool::Select,
+            | ToolVariant::CircularPattern
+            | ToolVariant::FixedRelation
+            | ToolVariant::CoincidentRelation
+            | ToolVariant::HorizontalRelation
+            | ToolVariant::VerticalRelation
+            | ToolVariant::DistanceRelation
+            | ToolVariant::ParallelRelation
+            | ToolVariant::PerpendicularRelation
+            | ToolVariant::EqualLengthRelation => SketchTool::Select,
             ToolVariant::Point => SketchTool::Point,
             ToolVariant::SingleLine | ToolVariant::ChainedPolyline => SketchTool::Line,
             ToolVariant::Centreline => SketchTool::CentreLine,
@@ -5420,6 +5436,9 @@ impl SketchCanvasState {
             }
         }
         self.reconcile_active_core_entities();
+        // A relation moves points that existing curves already own, so their
+        // cached presentation geometry is stale until it is re-read.
+        self.refresh_presentation_geometry();
         self.selected = self
             .entities
             .iter()
@@ -5436,6 +5455,7 @@ impl SketchCanvasState {
         self.trim_hover_fragment = None;
         self.pattern_manipulator = None;
         self.modifier_sources.clear();
+        self.clear_relation_acquisition();
         self.modifier_picks.clear();
         self.refresh_profile_analysis();
         Ok(subject)
@@ -5515,6 +5535,7 @@ impl SketchCanvasState {
         self.selected_recipe_editor = None;
         self.hovered = None;
         self.modifier_sources.clear();
+        self.clear_relation_acquisition();
         self.modifier_picks.clear();
         self.trim_hover_fragment = None;
         self.pattern_manipulator = None;
@@ -6263,7 +6284,15 @@ impl SketchCanvasState {
             | ToolVariant::Chamfer
             | ToolVariant::TwoDistanceChamfer
             | ToolVariant::RectangularPattern
-            | ToolVariant::CircularPattern => None,
+            | ToolVariant::CircularPattern
+            | ToolVariant::FixedRelation
+            | ToolVariant::CoincidentRelation
+            | ToolVariant::HorizontalRelation
+            | ToolVariant::VerticalRelation
+            | ToolVariant::DistanceRelation
+            | ToolVariant::ParallelRelation
+            | ToolVariant::PerpendicularRelation
+            | ToolVariant::EqualLengthRelation => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
             ToolVariant::SingleLine => {
                 if let Some(start) = self.creation_anchor.take() {
@@ -6839,6 +6868,393 @@ impl SketchCanvasState {
         Some(subject)
     }
 
+    /// The nearest active point within the pick radius, in exact evaluated
+    /// coordinates. Display tessellation is never consulted.
+    fn exact_point_hit(&self, point: SketchPoint, radius: f64) -> Option<CorePointId> {
+        let target = core_point(point);
+        let radius = radius.max(PrecisionPolicy::default().modeling_resolution);
+        self.authoring
+            .active_points()
+            .filter_map(|record| {
+                let distance = (record.evaluated_position.u - target.u)
+                    .hypot(record.evaluated_position.v - target.v);
+                (distance <= radius).then_some((distance, record.id))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, id)| id)
+    }
+
+    fn relation_operand_hit(&self, point: SketchPoint, radius: f64) -> Option<RelationOperand> {
+        self.exact_point_hit(point, radius)
+            .map(RelationOperand::Point)
+            .or_else(|| {
+                self.exact_curve_hit(point, radius)
+                    .map(RelationOperand::Curve)
+            })
+    }
+
+    /// How many operands the active relation still wants, if a relation tool
+    /// owns the pointer.
+    /// The sketch's single centreline, as the axis a revolve can turn about
+    /// (ADR 0026, F3).
+    ///
+    /// One centreline is an axis; several are an ambiguity, and the user has
+    /// to say which. Returning nothing in that case is what lets the ribbon
+    /// explain itself rather than guess.
+    #[must_use]
+    pub fn centreline_axis(&self) -> Option<(SketchPoint, SketchPoint)> {
+        let mut axis = None;
+        for entity in &self.entities {
+            if entity.role != SketchEntityRole::Construction {
+                continue;
+            }
+            let SketchGeometry::Segment { start, end } = entity.geometry else {
+                continue;
+            };
+            if axis.is_some() {
+                return None;
+            }
+            axis = Some((start, end));
+        }
+        axis
+    }
+
+    #[must_use]
+    pub fn relation_operand_count(&self) -> usize {
+        self.relation_operands.len()
+    }
+
+    /// The last refusal, in the solver's own words.
+    #[must_use]
+    pub fn relation_diagnostic(&self) -> Option<&str> {
+        self.relation_diagnostic.as_deref()
+    }
+
+    fn clear_relation_acquisition(&mut self) {
+        self.relation_operands.clear();
+    }
+
+    /// The two endpoints of a straight operand, or a refusal naming why not.
+    ///
+    /// The recipe boundary of ADR 0026 lives here: a curve that a pattern,
+    /// slot, or polygon owns exposes no constrainable endpoints in v1, because
+    /// its shape is the recipe's to decide, not the solver's.
+    fn relation_line_points(
+        &self,
+        entity: CoreEntityId,
+    ) -> Result<(CorePointId, CorePointId), String> {
+        let record = self
+            .authoring
+            .entity(entity)
+            .ok_or_else(|| "That curve is no longer part of the sketch.".to_owned())?;
+        let owner = self.authoring.operation(record.provenance.operation);
+        if let Some(owner) = owner
+            && !matches!(
+                owner.recipe,
+                CoreRecipe::Line { .. }
+                    | CoreRecipe::CentreLine { .. }
+                    | CoreRecipe::Polyline { .. }
+            )
+        {
+            return Err(
+                "That curve belongs to a recipe feature, which owns its own shape. Relate its anchor points instead."
+                    .to_owned(),
+            );
+        }
+        match record.geometry {
+            CoreCurve2::Line { start, end } => Ok((start, end)),
+            CoreCurve2::CircularArc { .. } | CoreCurve2::Circle { .. } => Err(
+                "This relation applies to straight curves; pick a line or two endpoints."
+                    .to_owned(),
+            ),
+        }
+    }
+
+    fn relation_point_position(&self, point: CorePointId) -> Option<CorePoint2> {
+        self.authoring
+            .point(point)
+            .filter(|record| record.active)
+            .map(|record| record.evaluated_position)
+    }
+
+    /// Turns the picked operands into the equations the solver will hold.
+    fn relation_constraints(
+        &self,
+        variant: ToolVariant,
+    ) -> Result<Vec<CoreConstraintKind>, String> {
+        let operands = self.relation_operands.as_slice();
+        let pair_points = |first: RelationOperand, second: RelationOperand| match (first, second) {
+            (RelationOperand::Point(first), RelationOperand::Point(second)) => Ok((first, second)),
+            _ => Err("This relation applies to two endpoints.".to_owned()),
+        };
+        let pair_lines = |first: RelationOperand, second: RelationOperand| match (first, second) {
+            (RelationOperand::Curve(first), RelationOperand::Curve(second)) => {
+                let first = self.relation_line_points(first)?;
+                let second = self.relation_line_points(second)?;
+                Ok((first, second))
+            }
+            _ => Err("This relation applies to two lines.".to_owned()),
+        };
+        match (variant, operands) {
+            (ToolVariant::FixedRelation, [RelationOperand::Point(point)]) => {
+                let position = self
+                    .relation_point_position(*point)
+                    .ok_or_else(|| "That point is no longer part of the sketch.".to_owned())?;
+                Ok(vec![CoreConstraintKind::Fixed {
+                    point: *point,
+                    position,
+                }])
+            }
+            (ToolVariant::FixedRelation, [RelationOperand::Curve(curve)]) => {
+                let (start, end) = self.relation_line_points(*curve)?;
+                [start, end]
+                    .into_iter()
+                    .map(|point| {
+                        let position = self.relation_point_position(point).ok_or_else(|| {
+                            "That point is no longer part of the sketch.".to_owned()
+                        })?;
+                        Ok(CoreConstraintKind::Fixed { point, position })
+                    })
+                    .collect()
+            }
+            (
+                ToolVariant::HorizontalRelation | ToolVariant::VerticalRelation,
+                [RelationOperand::Curve(curve)],
+            ) => {
+                let (first, second) = self.relation_line_points(*curve)?;
+                Ok(vec![if variant == ToolVariant::HorizontalRelation {
+                    CoreConstraintKind::Horizontal { first, second }
+                } else {
+                    CoreConstraintKind::Vertical { first, second }
+                }])
+            }
+            (
+                ToolVariant::HorizontalRelation | ToolVariant::VerticalRelation,
+                [
+                    RelationOperand::Point(first),
+                    RelationOperand::Point(second),
+                ],
+            ) => Ok(vec![if variant == ToolVariant::HorizontalRelation {
+                CoreConstraintKind::Horizontal {
+                    first: *first,
+                    second: *second,
+                }
+            } else {
+                CoreConstraintKind::Vertical {
+                    first: *first,
+                    second: *second,
+                }
+            }]),
+            (ToolVariant::CoincidentRelation, [first, second]) => {
+                let (first, second) = pair_points(*first, *second)?;
+                Ok(vec![CoreConstraintKind::Coincident { first, second }])
+            }
+            (ToolVariant::DistanceRelation, [first, second]) => {
+                let (first, second) = pair_points(*first, *second)?;
+                let (from, to) = (
+                    self.relation_point_position(first),
+                    self.relation_point_position(second),
+                );
+                let (Some(from), Some(to)) = (from, to) else {
+                    return Err("Those points are no longer part of the sketch.".to_owned());
+                };
+                // The present separation becomes the held value: the relation
+                // locks what the user already sees, and the dimension tool
+                // edits it afterwards.
+                let distance = (to.u - from.u).hypot(to.v - from.v);
+                if distance <= PrecisionPolicy::default().min_feature_size {
+                    return Err(
+                        "Those points are already together; use a coincident relation.".to_owned(),
+                    );
+                }
+                Ok(vec![CoreConstraintKind::Distance {
+                    first,
+                    second,
+                    distance,
+                }])
+            }
+            (
+                ToolVariant::ParallelRelation
+                | ToolVariant::PerpendicularRelation
+                | ToolVariant::EqualLengthRelation,
+                [first, second],
+            ) => {
+                let ((first_start, first_end), (second_start, second_end)) =
+                    pair_lines(*first, *second)?;
+                Ok(vec![match variant {
+                    ToolVariant::ParallelRelation => CoreConstraintKind::Parallel {
+                        first_start,
+                        first_end,
+                        second_start,
+                        second_end,
+                    },
+                    ToolVariant::PerpendicularRelation => CoreConstraintKind::Perpendicular {
+                        first_start,
+                        first_end,
+                        second_start,
+                        second_end,
+                    },
+                    _ => CoreConstraintKind::EqualLength {
+                        first_start,
+                        first_end,
+                        second_start,
+                        second_end,
+                    },
+                }])
+            }
+            _ => Err("This relation needs different operands.".to_owned()),
+        }
+    }
+
+    /// Accumulates one relation operand and stages the relation once the
+    /// active kind has everything it needs.
+    fn append_relation_operand(
+        &mut self,
+        point: SketchPoint,
+        pick_radius: f64,
+    ) -> Option<SketchEntityId> {
+        let variant = self.exact_tool;
+        let arity = relation_arity(variant)?;
+        let operand = self.relation_operand_hit(point, pick_radius)?;
+        if self.relation_operands.contains(&operand) {
+            self.relation_diagnostic = Some("A relation needs two different operands.".to_owned());
+            return None;
+        }
+        self.relation_operands.push(operand);
+        if let RelationOperand::Curve(curve) = operand {
+            self.select_core_entity_for_modifier(curve);
+        }
+
+        // Horizontal and vertical accept either one line or two points, so a
+        // single point is a complete pick only when a second one follows.
+        let complete = match (variant, self.relation_operands.as_slice()) {
+            (
+                ToolVariant::HorizontalRelation | ToolVariant::VerticalRelation,
+                [RelationOperand::Point(_)],
+            ) => false,
+            _ => self.relation_operands.len() >= arity,
+        };
+        if !complete {
+            self.relation_diagnostic = None;
+            return None;
+        }
+        let staged = self.stage_relation(variant);
+        self.clear_relation_acquisition();
+        staged
+    }
+
+    fn stage_relation(&mut self, variant: ToolVariant) -> Option<SketchEntityId> {
+        let kinds = match self.relation_constraints(variant) {
+            Ok(kinds) => kinds,
+            Err(reason) => {
+                self.relation_diagnostic = Some(reason);
+                return None;
+            }
+        };
+        let label = relation_label(variant);
+        let transaction =
+            match self
+                .authoring
+                .stage_constraints(kinds, label, PrecisionPolicy::default())
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.relation_diagnostic = Some(error.to_string());
+                    return None;
+                }
+            };
+        // A relation inserts no geometry, so the confirmation gate needs a
+        // presentation subject: the entity the user last named.
+        let subject = self.relation_subject(&transaction)?;
+        match self.stage_core_relation(transaction, label, subject) {
+            Ok(subject) => {
+                self.relation_diagnostic = None;
+                Some(subject)
+            }
+            Err(_) => {
+                self.relation_diagnostic =
+                    Some("The relation could not be staged for confirmation.".to_owned());
+                None
+            }
+        }
+    }
+
+    /// The presentation entity a staged relation hangs from: a curve operand
+    /// if one was picked, otherwise any curve the solver moved.
+    fn relation_subject(&self, transaction: &CoreTransaction) -> Option<SketchEntityId> {
+        self.relation_operands
+            .iter()
+            .rev()
+            .find_map(|operand| match operand {
+                RelationOperand::Curve(curve) => self.ui_by_core.get(curve).copied(),
+                RelationOperand::Point(_) => None,
+            })
+            .or_else(|| {
+                transaction
+                    .impact()
+                    .changed_entities
+                    .iter()
+                    .find_map(|entity| self.ui_by_core.get(entity).copied())
+            })
+            .or(self.selected)
+            .or_else(|| self.entities.first().map(|entity| entity.id))
+    }
+
+    /// Stages a transaction that changes only existing geometry.
+    ///
+    /// The insertion and retirement paths both key their preview on entities
+    /// that appear or disappear. A relation does neither: it moves points that
+    /// are already there, so it carries no provisional geometry and the
+    /// preview is the moved sketch itself.
+    fn stage_core_relation(
+        &mut self,
+        transaction: CoreTransaction,
+        label: &'static str,
+        subject: SketchEntityId,
+    ) -> Result<SketchEntityId, SketchEditError> {
+        if self.pending.is_some() {
+            return Err(SketchEditError::PendingEditAlreadyExists);
+        }
+        self.pending = Some(PendingSketchEdit {
+            subject,
+            label,
+            entities: Vec::new(),
+            core_transaction: Some(transaction),
+            core_entities: Vec::new(),
+            retired_entities: Vec::new(),
+        });
+        self.refresh_profile_analysis();
+        Ok(subject)
+    }
+
+    /// Re-reads every presentation curve from the exact definition, keeping
+    /// user-facing identity. A relation moves points rather than replacing
+    /// curves, so the adapter must follow the geometry without renumbering it.
+    fn refresh_presentation_geometry(&mut self) {
+        let updates = self
+            .ui_by_core
+            .iter()
+            .filter(|(_, ui_id)| {
+                // A legacy composite presents several core curves as one
+                // entity; its geometry is the composite's, not any one side's,
+                // so only one-to-one adapters are re-read here.
+                self.core_by_ui
+                    .get(*ui_id)
+                    .is_none_or(|sources| sources.len() == 1)
+            })
+            .filter_map(|(core_id, ui_id)| {
+                let curve = self.authoring.evaluated_curve(*core_id).ok()?;
+                Some((*ui_id, legacy_geometry_from_core(curve)))
+            })
+            .collect::<Vec<_>>();
+        for (ui_id, geometry) in updates {
+            if let Some(entity) = self.entities.iter_mut().find(|entity| entity.id == ui_id) {
+                entity.geometry = geometry;
+            }
+        }
+        self.refresh_profile_analysis();
+    }
+
     fn select_core_entity_for_modifier(&mut self, core_id: CoreEntityId) {
         if let Some(ui_id) = self.ui_by_core.get(&core_id).copied() {
             let _ = self.set_selected(Some(ui_id));
@@ -7055,6 +7471,7 @@ impl SketchCanvasState {
         pending.retired_entities = presentation.retired_entities;
         pending.core_transaction = Some(transaction);
         self.modifier_sources.clear();
+        self.clear_relation_acquisition();
         self.modifier_picks.clear();
         self.dimension_session = None;
         self.refresh_profile_analysis();
@@ -7228,6 +7645,14 @@ impl SketchCanvasState {
                 }
                 staged
             }
+            ToolVariant::FixedRelation
+            | ToolVariant::CoincidentRelation
+            | ToolVariant::HorizontalRelation
+            | ToolVariant::VerticalRelation
+            | ToolVariant::DistanceRelation
+            | ToolVariant::ParallelRelation
+            | ToolVariant::PerpendicularRelation
+            | ToolVariant::EqualLengthRelation => self.append_relation_operand(point, pick_radius),
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern => {
                 if self.modifier_sources.is_empty() {
                     let picked = self.exact_curve_hit(point, pick_radius)?;
@@ -7248,6 +7673,47 @@ impl SketchCanvasState {
             }
             _ => None,
         }
+    }
+}
+
+/// One thing a relation can name.
+///
+/// Relations are equations over points, but a user picks what they see: a
+/// whole line reads as "this line", an endpoint as "this corner". An endpoint
+/// within the pick radius wins, exactly as it does for snapping, so the finer
+/// intent is always reachable without a modifier key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelationOperand {
+    Point(CorePointId),
+    Curve(CoreEntityId),
+}
+
+/// How many operands a relation needs before it can be staged.
+const fn relation_arity(variant: ToolVariant) -> Option<usize> {
+    match variant {
+        ToolVariant::FixedRelation => Some(1),
+        ToolVariant::HorizontalRelation | ToolVariant::VerticalRelation => Some(1),
+        ToolVariant::CoincidentRelation
+        | ToolVariant::DistanceRelation
+        | ToolVariant::ParallelRelation
+        | ToolVariant::PerpendicularRelation
+        | ToolVariant::EqualLengthRelation => Some(2),
+        _ => None,
+    }
+}
+
+/// The label a staged relation carries into the confirmation gate and undo.
+const fn relation_label(variant: ToolVariant) -> &'static str {
+    match variant {
+        ToolVariant::FixedRelation => "Fixed relation",
+        ToolVariant::CoincidentRelation => "Coincident relation",
+        ToolVariant::HorizontalRelation => "Horizontal relation",
+        ToolVariant::VerticalRelation => "Vertical relation",
+        ToolVariant::DistanceRelation => "Distance relation",
+        ToolVariant::ParallelRelation => "Parallel relation",
+        ToolVariant::PerpendicularRelation => "Perpendicular relation",
+        ToolVariant::EqualLengthRelation => "Equal-length relation",
+        _ => "Sketch relation",
     }
 }
 
@@ -13572,6 +14038,149 @@ mod tests {
             .collect::<Vec<_>>();
         ranges.sort_by(|left, right| left.0.total_cmp(&right.0));
         ranges
+    }
+
+    #[test]
+    fn a_relation_tool_levels_the_line_it_is_clicked_on() {
+        let mut state = SketchCanvasState::default();
+        let line = commit_test_line(&mut state, (0.0, 0.0), (8.0, 3.0));
+        assert!(state.set_exact_tool(ToolVariant::HorizontalRelation));
+
+        // Click the middle of the span, clear of both endpoints, so the curve
+        // is the operand rather than a point.
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(4.0, 1.5), 0.2)
+            .expect("one line completes a horizontal relation");
+        assert_eq!(subject, line);
+        assert!(state.pending().is_some(), "the relation must stage");
+        assert_eq!(state.relation_diagnostic(), None);
+
+        assert_eq!(state.commit_pending(), Ok(subject));
+        let SketchGeometry::Segment { start, end } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == line)
+            .expect("the line survives")
+            .geometry
+        else {
+            panic!("a line should present as a segment");
+        };
+        assert!(
+            (start.v - end.v).abs() <= 1.0e-9,
+            "the presented curve must follow the solved points, got {start:?} {end:?}"
+        );
+        assert_eq!(state.authoring.constraints().len(), 1);
+    }
+
+    #[test]
+    fn a_perpendicular_relation_needs_two_lines_and_squares_them() {
+        let mut state = SketchCanvasState::default();
+        commit_test_line(&mut state, (0.0, 0.0), (8.0, 0.0));
+        commit_test_line(&mut state, (0.0, 4.0), (6.0, 7.0));
+        assert!(state.set_exact_tool(ToolVariant::PerpendicularRelation));
+
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(4.0, 0.0), 0.2)
+                .is_none(),
+            "one line is not yet a perpendicular relation"
+        );
+        assert_eq!(state.relation_operand_count(), 1);
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(3.0, 5.5), 0.2)
+            .expect("the second line completes the relation");
+        assert_eq!(state.commit_pending(), Ok(subject));
+
+        let directions = state
+            .entities
+            .iter()
+            .filter_map(|entity| match entity.geometry {
+                SketchGeometry::Segment { start, end } => Some((end.u - start.u, end.v - start.v)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(directions.len(), 2);
+        let dot = directions[0]
+            .0
+            .mul_add(directions[1].0, directions[0].1 * directions[1].1);
+        assert!(
+            dot.abs() <= 1.0e-7,
+            "the lines should be square, dot = {dot}"
+        );
+    }
+
+    #[test]
+    fn a_relation_the_solver_refuses_stages_nothing_and_says_why() {
+        let mut state = SketchCanvasState::default();
+        commit_test_line(&mut state, (0.0, 0.0), (8.0, 0.0));
+        assert!(state.set_exact_tool(ToolVariant::FixedRelation));
+        let first = state
+            .handle_modifier_click(SketchPoint::new(4.0, 0.0), 0.2)
+            .expect("pinning a line stages");
+        assert_eq!(state.commit_pending(), Ok(first));
+
+        // The same line pinned twice repeats each point in one system, which
+        // the solver names as a duplicate rather than silently absorbing.
+        let authoring_before = state.authoring.clone();
+        assert!(state.set_exact_tool(ToolVariant::CoincidentRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(0.0, 0.0), 0.2)
+                .is_none()
+        );
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(0.0, 0.0), 0.2)
+                .is_none(),
+            "the same endpoint twice is not a relation"
+        );
+        assert!(
+            state
+                .relation_diagnostic()
+                .is_some_and(|reason| reason.contains("two different operands")),
+            "unexpected diagnostic: {:?}",
+            state.relation_diagnostic()
+        );
+        assert!(state.pending().is_none());
+        assert_eq!(state.authoring, authoring_before);
+    }
+
+    #[test]
+    fn a_recipe_owned_curve_refuses_a_relation_by_name() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_recipe(
+                CoreRecipe::TwoPointRectangle {
+                    first_corner: CorePointInput::Position(CorePoint2::new(0.0, 0.0)),
+                    width: CoreValue::Literal(CoreSignedLength::new(6.0).expect("finite width")),
+                    height: CoreValue::Literal(CoreSignedLength::new(4.0).expect("finite height")),
+                },
+                "Rectangle",
+            )
+            .expect("stage a rectangle");
+        state.commit_pending().expect("commit the rectangle");
+        commit_test_line(&mut state, (-4.0, -4.0), (-1.0, -2.0));
+
+        assert!(state.set_exact_tool(ToolVariant::ParallelRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(-2.5, -3.0), 0.2)
+                .is_none()
+        );
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(3.0, 0.0), 0.2)
+                .is_none(),
+            "a recipe-owned side must refuse"
+        );
+        assert!(
+            state
+                .relation_diagnostic()
+                .is_some_and(|reason| reason.contains("recipe feature")),
+            "unexpected diagnostic: {:?}",
+            state.relation_diagnostic()
+        );
+        assert!(state.pending().is_none());
     }
 
     #[test]

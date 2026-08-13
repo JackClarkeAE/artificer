@@ -1,6 +1,6 @@
 # ADR 0025: Analytic surface intersections and the Boolean domain oracle
 
-- Status: implemented — the intersection library, the domain oracle, the
+Status: implemented — the intersection library, the domain oracle, the
   prism reductions (through cuts, blind pockets of any lateral shape,
   interior voids), and the general imprint/classify/regularize/sew engine
   for plane- and cylinder-faced operands at any relative orientation all

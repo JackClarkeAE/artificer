@@ -1,6 +1,6 @@
 # ADR 0018: Content-addressed local Part Library and component occurrences
 
-- Status: Accepted for F2
+Status: Accepted for F2
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

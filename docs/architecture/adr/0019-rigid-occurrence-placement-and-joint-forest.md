@@ -1,6 +1,6 @@
 # ADR 0019: Rigid occurrence placement and persistent joint forest
 
-- Status: Accepted for F3
+Status: Accepted for F3
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

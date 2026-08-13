@@ -201,6 +201,14 @@ impl DisplayTransform {
         )
     }
 
+    /// The direction counterpart of [`Self::present_point`]: preview rotation
+    /// first, turntable motion second, with translation and the positive
+    /// uniform scale dropped because neither turns a direction.
+    pub fn present_direction(self, direction: ProtocolVector3, phase: f64) -> [f64; 3] {
+        let previewed = rotate_euler([direction.x, direction.y, direction.z], self.rotation);
+        rotate_z(previewed, finite_or_zero(phase))
+    }
+
     /// Applies preview first and turntable motion second. Motion is never
     /// folded into a committable transform.
     pub fn present_point(self, point: Point3, pivot: Point3, phase: f64) -> Point3 {
@@ -504,6 +512,14 @@ impl ViewState {
         let rolled = rotate_y(camera, finite_or_zero(self.roll));
         let yawed = rotate_x(rolled, finite_or_zero(self.pitch));
         rotate_z(yawed, finite_or_zero(self.yaw))
+    }
+
+    /// The world-space direction pointing from the model toward the viewer.
+    /// Under an orthographic projection this is the whole view direction, which
+    /// is what a silhouette condition `n · v = 0` needs.
+    #[must_use]
+    pub fn view_direction(self) -> ProtocolVector3 {
+        camera_world_axes(self).1
     }
 
     /// Projects a world-space direction through only the camera orientation.

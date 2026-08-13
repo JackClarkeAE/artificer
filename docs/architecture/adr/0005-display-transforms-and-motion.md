@@ -1,6 +1,6 @@
 # ADR 0005: Display transforms and deterministic motion
 
-- Status: Accepted; committed-transform path completed by ADR 0006 and confirmation generalized by ADR 0007
+Status: Accepted; committed-transform path completed by ADR 0006 and confirmation generalized by ADR 0007
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

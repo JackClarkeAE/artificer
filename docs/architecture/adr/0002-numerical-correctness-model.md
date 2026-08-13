@@ -1,6 +1,9 @@
 # ADR 0002: Numerical correctness and tolerance model
 
-- Status: Proposed
+Status: Accepted and implemented — the tolerance model ships as
+`PrecisionPolicy` (`crates/protocol/src/lib.rs`, `linear_agreement`,
+`angular_agreement_radians`, `min_feature_size`) and is enforced by the solid
+validator (`crates/kernel/src/validator.rs`) on every commit
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

@@ -1,8 +1,6 @@
 # ADR 0009: Live sketch dimensions are editable construction intent
 
-## Status
-
-Accepted.
+Status: Accepted
 
 ## Context
 

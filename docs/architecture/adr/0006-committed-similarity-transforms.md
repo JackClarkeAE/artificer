@@ -1,6 +1,6 @@
 # ADR 0006: Committed whole-snapshot similarity transforms
 
-- Status: Accepted
+Status: Accepted
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

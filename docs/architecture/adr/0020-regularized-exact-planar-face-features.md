@@ -1,6 +1,6 @@
 # ADR 0020: One regularized exact-profile path for selected-face features
 
-- Status: Accepted and implemented for the declared S2D domain
+Status: Accepted and implemented for the declared S2D domain
 - Date: 2026-07-30
 - Decision owners: Artificer project
 

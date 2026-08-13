@@ -1,6 +1,6 @@
 # ADR 0016: Exact planar curves form deterministic material regions
 
-- Status: Accepted for protocol v4, native standalone analytic extrusion, and exact-circle selected-face editing
+Status: Accepted for protocol v4, native standalone analytic extrusion, and exact-circle selected-face editing
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

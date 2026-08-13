@@ -11,5 +11,33 @@ artificer-geometry = { path = "../geometry" }
 artificer-protocol = { path = "../protocol" }
 sha2.workspace = true
 
+[dev-dependencies]
+# Statistics-driven timing only: the report generator and its plotting stack
+# stay out of the tree, so a bench run adds a handful of crates rather than a
+# hundred.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "extrude"
+harness = false
+
+[[bench]]
+name = "booleans"
+harness = false
+
+[[bench]]
+name = "blends"
+harness = false
+
+[[bench]]
+name = "validate"
+harness = false
+
+[[bench]]
+name = "tessellate"
+harness = false
+
 [lints]
 workspace = true

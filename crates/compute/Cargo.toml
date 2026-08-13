@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Kernel timing spans. Off by default so a release build cannot pay for
+# instrumentation; when on, `ARTIFICER_PERF_REPORT` still gates the timing at
+# run time.
+perf-spans = []
+
 [dependencies]
 rayon.workspace = true
 thiserror.workspace = true

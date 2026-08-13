@@ -1,0 +1,30 @@
+{
+  "benches": {
+    "boolean/analytic_crossed_difference": 185359.32015702542,
+    "boolean/prism_difference/256": 128455204.91,
+    "boolean/prism_difference/4": 178015.0217559777,
+    "boolean/prism_difference/64": 9359332.845,
+    "boolean/prism_union/256": 119324802.89,
+    "boolean/prism_union/4": 234923.5288294934,
+    "boolean/prism_union/64": 8753936.878333332,
+    "extrude/analytic_circle": 65221.888062162434,
+    "extrude/polygon_sides/256": 3112605.172352942,
+    "extrude/polygon_sides/4": 75103.49801320786,
+    "extrude/polygon_sides/64": 481273.9240632739,
+    "rim_blend/chamfer/16": 276250.6327408975,
+    "rim_blend/chamfer/4": 114978.28715517724,
+    "rim_blend/chamfer/64": 1204722.0126221476,
+    "rim_blend/fillet/16": 492685.21392442816,
+    "rim_blend/fillet/4": 169409.6334452975,
+    "rim_blend/fillet/64": 3014680.344705884,
+    "tessellate/authoritative_cylinder": 49432815.215,
+    "tessellate/display_cylinder": 94868.92857045791,
+    "tessellate/display_cylinder_scaled_quarter": 94797.81080499227,
+    "tessellate/display_prism_256": 2809214.2383333324,
+    "validate/solid_polygon_sides/256": 1033618.0044369672,
+    "validate/solid_polygon_sides/4": 42998.79671532541,
+    "validate/solid_polygon_sides/64": 164260.7155164891
+  },
+  "recorded_on": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "unit": "nanoseconds"
+}

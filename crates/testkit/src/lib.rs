@@ -540,6 +540,7 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
                 | "native.transform_snapshot.v0"
                 | "native.extrude_polygon.v0"
                 | "native.extrude_planar_profile.v0"
+                | "native.revolve_planar_profile.v0"
                 | "native.extrude_face_profile.v0"
                 | "native.extrude_face_planar_profile.v0"
                 | "native.push_pull_face.v0"
@@ -574,6 +575,7 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
             KernelCommand::TransformSnapshot { .. } => "native.transform_snapshot.v0",
             KernelCommand::ExtrudePolygon { .. } => "native.extrude_polygon.v0",
             KernelCommand::ExtrudePlanarProfile { .. } => "native.extrude_planar_profile.v0",
+            KernelCommand::RevolvePlanarProfile { .. } => "native.revolve_planar_profile.v0",
             KernelCommand::ExtrudeFaceProfile { .. } => "native.extrude_face_profile.v0",
             KernelCommand::ExtrudeFacePlanarProfile { .. } => {
                 "native.extrude_face_planar_profile.v0"

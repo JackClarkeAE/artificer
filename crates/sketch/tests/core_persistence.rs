@@ -184,3 +184,49 @@ fn legacy_import_reuses_identical_boundary_points_for_exact_connectivity() {
     };
     assert_eq!(first, last);
 }
+
+/// Relations are part of the sketch, not a UI overlay: they must survive the
+/// document round trip, and the geometry must still follow them afterwards
+/// (ADR 0026, F1).
+#[test]
+fn constraints_round_trip_with_the_definition() {
+    let mut sketch = SketchDefinition::new();
+    let transaction = sketch.stage(line(), "Line").expect("stage");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    let (start, end) = {
+        let mut points = sketch.points().keys().copied();
+        (
+            points.next().expect("start point"),
+            points.next().expect("end point"),
+        )
+    };
+    let relation = sketch
+        .stage_constraint(
+            artificer_sketch::SketchConstraintKind::Horizontal {
+                first: start,
+                second: end,
+            },
+            "Horizontal",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the relation");
+    sketch
+        .commit(relation, ConfirmationSource::GreenTick)
+        .expect("commit the relation");
+
+    let json = serde_json::to_string_pretty(&sketch).expect("serialize");
+    let decoded: SketchDefinition = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded, sketch);
+    assert_eq!(decoded.constraints().len(), 1);
+    let solved = decoded
+        .solve_constraints(PrecisionPolicy::default())
+        .expect("the decoded sketch still solves");
+    let first = solved.positions[&start];
+    let second = solved.positions[&end];
+    assert!(
+        (first.v - second.v).abs() <= 1.0e-9,
+        "the decoded relation must still hold the line level"
+    );
+}

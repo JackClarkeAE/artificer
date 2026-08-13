@@ -1,6 +1,9 @@
 # ADR 0003: Entity identity across snapshots and regeneration
 
-- Status: Proposed
+Status: Accepted and implemented — snapshot-local identity ships as
+`EntityRef`/`EntityKind` and `SemanticDigest` (`crates/protocol/src/lib.rs`),
+and the document-side persistent recipes that survive regeneration ship as
+`crates/model/src/persistent.rs`
 - Date: 2026-07-28
 - Decision owners: Artificer project
 

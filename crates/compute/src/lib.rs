@@ -15,6 +15,42 @@ use std::time::{Duration, Instant};
 const DEFAULT_PARALLEL_MIN_ITEMS: usize = 32;
 const MAX_METRICS: usize = 512;
 
+/// Whether [`perf_span!`] should time its body.
+///
+/// Optimising without instruments is guesswork, but instruments that cost
+/// something in the default build are their own regression. The macro compiles
+/// to nothing unless the `perf-spans` feature is on, and even then it stays
+/// dormant until `ARTIFICER_PERF_REPORT` is set — so a development build can
+/// switch profiling on without a rebuild, and a shipped build cannot pay for
+/// it at all.
+#[must_use]
+pub fn perf_spans_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cfg!(feature = "perf-spans")
+            && std::env::var_os("ARTIFICER_PERF_REPORT").is_some_and(|value| value != "0")
+    })
+}
+
+/// Times one serial stage into the global pool's metric ring.
+///
+/// `perf_span!("kernel.boolean.prism", faces, { ... })` evaluates the block and
+/// returns its value either way; only the timing is conditional.
+#[macro_export]
+macro_rules! perf_span {
+    ($task:literal, $items:expr, $body:block) => {{
+        if $crate::perf_spans_enabled() {
+            let items = $items;
+            let started = std::time::Instant::now();
+            let value = $body;
+            $crate::ComputePool::global().record_span($task, items, started.elapsed());
+            value
+        } else {
+            $body
+        }
+    }};
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionMode {
     Serial,
@@ -209,6 +245,18 @@ impl ComputePool {
 
     pub fn clear_metrics(&self) {
         self.metrics.lock().expect("metrics lock poisoned").clear();
+    }
+
+    /// Records one externally timed span into the same ring buffer the
+    /// parallel batches use, so the COMPUTE ACTIVITY card shows serial kernel
+    /// stages beside the parallel ones instead of only the parallel ones.
+    pub fn record_span(&self, task: &'static str, items: usize, elapsed: Duration) {
+        self.record(ComputeMetric {
+            task,
+            mode: ExecutionMode::Serial,
+            items,
+            elapsed,
+        });
     }
 
     fn record(&self, metric: ComputeMetric) {

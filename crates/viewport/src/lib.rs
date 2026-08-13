@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use artificer_compute::ComputePool;
-use artificer_kernel::{DebugScene, DebugTriangle, FaceRole};
+use artificer_kernel::{
+    DebugEdge, DebugScene, DebugTriangle, DisplayCarrier, DisplaySurface, FaceRole,
+};
 use artificer_protocol::{
     Aabb3, EdgeFinishKind, EntityRef, MAX_EXTRUSION_PROFILE_VERTICES, PlanarFrame3, Point3,
     RotationQuaternion, Vector3,
@@ -512,6 +514,16 @@ impl RigidOccurrenceTransform {
         )
     }
 
+    /// Rotates a direction without translating it.
+    #[must_use]
+    pub fn transform_direction(self, direction: Vector3) -> Vector3 {
+        let rotated = rotate_point_by_unit_quaternion(
+            Point3::new(direction.x, direction.y, direction.z),
+            self.rotation,
+        );
+        Vector3::new(rotated.x, rotated.y, rotated.z)
+    }
+
     #[must_use]
     pub fn transformed_bounds(self, bounds: Aabb3) -> Aabb3 {
         let corners = [
@@ -765,7 +777,18 @@ struct ProjectedTriangle {
     body: BodyInstanceKey,
     source: EntityRef,
     role: FaceRole,
-    shade: f32,
+    lighting: [VertexLighting; 3],
+}
+
+/// One vertex's evaluated light rig. `level` is the combined intensity and
+/// `sky` is the hemisphere parameter that tints ambient between the cool floor
+/// and the warm sky. Both are interpolated across the facet by the mesh
+/// rasteriser, which is what turns exact per-vertex normals into smooth
+/// shading without adding a single triangle.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct VertexLighting {
+    level: f32,
+    sky: f32,
 }
 
 #[derive(Clone)]
@@ -775,11 +798,29 @@ struct ProjectedModelEdge {
     visible: bool,
     smooth: bool,
     visible_intervals: Vec<[f32; 2]>,
+    /// True where the body's material ends at this edge from the current
+    /// camera. Outline edges take the heavier stroke; interior creases take
+    /// the lighter one, which is most of what makes a drafting viewport read
+    /// as crisp rather than as a wireframe.
+    outline: bool,
+}
+
+/// One screen-space run of a carrier's silhouette.
+///
+/// Silhouettes are presentation only: they carry the face they belong to so
+/// the occlusion pass can skip that face's own triangles, but they are never
+/// pickable and never carry edge identity, because no edge exists there.
+#[derive(Clone)]
+struct ProjectedSilhouette {
+    face: EntityRef,
+    screen: [Pos2; 2],
+    visible_intervals: Vec<[f32; 2]>,
 }
 
 #[derive(Clone, Default)]
 struct EdgeFrameCache {
     by_body: BTreeMap<BodyInstanceKey, Vec<ProjectedModelEdge>>,
+    silhouettes: BTreeMap<BodyInstanceKey, Vec<ProjectedSilhouette>>,
 }
 
 /// Exact hidden-line preparation reused across frames while the camera,
@@ -1017,6 +1058,17 @@ impl InstancePresentation {
             self.active_transform,
             self.animation_phase,
         )
+    }
+
+    /// Carries an exact surface normal through the same presentation the
+    /// points take. Occurrence placement and the preview transform are
+    /// rotations and a positive uniform scale, so only their rotations act on
+    /// a direction; the world-fixed light rig therefore plays across a body as
+    /// it is dragged or spun, instead of travelling with it.
+    fn present_normal(self, normal: Vector3) -> [f64; 3] {
+        let placed = self.base_transform.transform_direction(normal);
+        self.active_transform
+            .present_direction(placed, self.animation_phase)
     }
 }
 
@@ -1396,6 +1448,7 @@ fn show_document_impl(
                         animation_phase,
                         projection,
                         visible_edge_keys,
+                        &triangles,
                     )
                 } else {
                     let key = exact_edge_frame_key(
@@ -1553,13 +1606,20 @@ fn show_document_impl(
             .and_then(|body| body.tint)
     };
     for triangle in &triangles {
+        // One colour per vertex, so the mesh rasteriser interpolates the exact
+        // carrier shading across the facet. A cylinder's wall is the same
+        // triangle count it always was and no longer bands.
         let mut fill = if display_mode.is_shaded() {
             tint_of(triangle.body).map_or_else(
-                || shaded_face_color(triangle.shade),
-                |tint| shaded_material_color(tint, triangle.shade),
+                || triangle.lighting.map(shaded_face_color),
+                |tint| {
+                    triangle
+                        .lighting
+                        .map(|lighting| shaded_material_color(tint, lighting))
+                },
             )
         } else {
-            face_color(triangle.role)
+            [face_color(triangle.role); 3]
         };
         let identity = DocumentFaceSelection {
             body: triangle.body,
@@ -1576,7 +1636,7 @@ fn show_document_impl(
             // the newly exposed cut boundary; the translucent swept-volume
             // overlay painted later also identifies the material being
             // removed without restoring it to the depth scene.
-            fill = mix(fill, FeaturePreviewStyle::Cut.color(), 0.58);
+            fill = fill.map(|vertex| mix(vertex, FeaturePreviewStyle::Cut.color(), 0.58));
         } else if edge_finish_face {
             // The viewport is already displaying the privately evaluated
             // candidate body.  Tint only the new finish surface, rather than
@@ -1587,19 +1647,19 @@ fn show_document_impl(
                 Some(EdgeFinishKind::Fillet) => Color32::from_rgb(82, 224, 174),
                 None => HOVERED,
             };
-            fill = mix(fill, accent, 0.72);
+            fill = fill.map(|vertex| mix(vertex, accent, 0.72));
         } else if selected_face_groups.contains(&identity) {
-            fill = mix(fill, SELECTED, 0.48);
+            fill = fill.map(|vertex| mix(vertex, SELECTED, 0.48));
         } else if measurement.is_some_and(|measurement| {
             matches!(measurement, DocumentMeasurement::Face { selection, .. } if *selection == identity)
         }) {
-            fill = mix(fill, SELECTED, 0.24);
+            fill = fill.map(|vertex| mix(vertex, SELECTED, 0.24));
         } else if hovered_faces.contains(&identity) {
-            fill = mix(fill, HOVERED, 0.28);
+            fill = fill.map(|vertex| mix(vertex, HOVERED, 0.28));
         }
         let first = face_mesh.vertices.len() as u32;
-        for point in triangle.points {
-            face_mesh.colored_vertex(point, fill);
+        for (point, vertex_fill) in triangle.points.into_iter().zip(fill) {
+            face_mesh.colored_vertex(point, vertex_fill);
         }
         face_mesh.add_triangle(first, first + 1, first + 2);
     }
@@ -2140,7 +2200,9 @@ fn project_document_triangles(
                     body: *body,
                     source: triangle.source_face,
                     role: triangle.role,
-                    shade: camera_triangle_shade(camera, view.zoom),
+                    lighting: triangle
+                        .normals
+                        .map(|normal| vertex_lighting(presentation.present_normal(normal), view)),
                 })
             },
         )
@@ -2166,12 +2228,16 @@ fn prepare_interaction_edge_frame_cache(
     animation_phase: f64,
     projection: Projection,
     visible_edge_keys: &BTreeMap<BodyInstanceKey, HashSet<ModelEdgeKey>>,
+    triangles: &[ProjectedTriangle],
 ) -> EdgeFrameCache {
+    let front_facing_faces = front_facing_faces(triangles);
     let mut by_body = BTreeMap::new();
+    let mut silhouettes_by_body = BTreeMap::new();
     for body in bodies {
         let presentation =
             InstancePresentation::for_body(body, active_body, active_transform, animation_phase);
         let body_keys = visible_edge_keys.get(&body.key);
+        let front_facing = front_facing_faces.get(&body.key);
         let edges = body
             .scene
             .edges
@@ -2191,12 +2257,30 @@ fn prepare_interaction_edge_frame_cache(
                     visible: true,
                     smooth: false,
                     visible_intervals: vec![[0.0, 1.0]],
+                    outline: edge_is_outline(edge, front_facing),
                 }
             })
             .collect();
+        // The silhouette is the outline of a curved body; dropping it during
+        // orbit would make round parts visibly lose their edges exactly while
+        // the user is looking for them. Occlusion is what the cheap pass
+        // defers, so the chords go in whole.
+        let silhouettes = silhouette_chords(body.scene, presentation, view)
+            .into_iter()
+            .map(|(face, chord)| ProjectedSilhouette {
+                face,
+                screen: chord
+                    .map(|point| projection.camera_point(presentation.project_point(point, view))),
+                visible_intervals: vec![[0.0, 1.0]],
+            })
+            .collect();
         by_body.insert(body.key, edges);
+        silhouettes_by_body.insert(body.key, silhouettes);
     }
-    EdgeFrameCache { by_body }
+    EdgeFrameCache {
+        by_body,
+        silhouettes: silhouettes_by_body,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2211,11 +2295,14 @@ fn prepare_edge_frame_cache(
     triangles: &[ProjectedTriangle],
 ) -> EdgeFrameCache {
     let occlusion = TriangleOcclusionIndex::new(triangles);
+    let front_facing_faces = front_facing_faces(triangles);
     let mut by_body = BTreeMap::new();
+    let mut silhouettes_by_body = BTreeMap::new();
     for body in bodies {
         let presentation =
             InstancePresentation::for_body(body, active_body, active_transform, animation_phase);
         let body_keys = visible_edge_keys.get(&body.key);
+        let front_facing = front_facing_faces.get(&body.key);
         let edge_work = body
             .scene
             .edges
@@ -2236,7 +2323,13 @@ fn prepare_edge_frame_cache(
                 // logical-cylinder and coplanar fragments.
                 let visible = !edge.is_smooth && body_keys.is_some_and(|keys| keys.contains(&key));
                 let visible_intervals = if visible {
-                    visible_edge_intervals_indexed(screen, depths, body.key, key, &occlusion)
+                    visible_edge_intervals_indexed(
+                        screen,
+                        depths,
+                        body.key,
+                        LineOwnership::Edge(key),
+                        &occlusion,
+                    )
                 } else {
                     Vec::new()
                 };
@@ -2246,11 +2339,104 @@ fn prepare_edge_frame_cache(
                     visible,
                     smooth: edge.is_smooth,
                     visible_intervals,
+                    outline: edge_is_outline(edge, front_facing),
                 }
             });
+        let silhouette_work = silhouette_chords(body.scene, presentation, view);
+        let silhouettes = ComputePool::global().map(
+            "viewport.silhouettes.visibility",
+            &silhouette_work,
+            |_, (face, chord)| {
+                let camera = chord.map(|point| presentation.project_point(point, view));
+                let screen = camera.map(|point| projection.camera_point(point));
+                let depths = camera.map(|point| point.depth);
+                ProjectedSilhouette {
+                    face: *face,
+                    screen,
+                    visible_intervals: visible_edge_intervals_indexed(
+                        screen,
+                        depths,
+                        body.key,
+                        LineOwnership::Silhouette(*face),
+                        &occlusion,
+                    ),
+                }
+            },
+        );
         by_body.insert(body.key, edges);
+        silhouettes_by_body.insert(body.key, silhouettes);
     }
-    EdgeFrameCache { by_body }
+    EdgeFrameCache {
+        by_body,
+        silhouettes: silhouettes_by_body,
+    }
+}
+
+/// Every silhouette chord of a body's curved carriers, in model space.
+///
+/// The view direction is carried into the body's own space rather than the
+/// carriers being carried out of it: presentation is a rotation and a positive
+/// uniform scale, so its inverse on a direction is the transpose of the
+/// presented basis — three dot products, and no carrier parameter has to be
+/// transformed at all.
+fn silhouette_chords(
+    scene: &DebugScene,
+    presentation: InstancePresentation,
+    view: ViewState,
+) -> Vec<(EntityRef, [Point3; 2])> {
+    if scene.carriers.is_empty() {
+        return Vec::new();
+    }
+    let world = view.view_direction();
+    let world = [world.x, world.y, world.z];
+    let basis = [
+        presentation.present_normal(Vector3::new(1.0, 0.0, 0.0)),
+        presentation.present_normal(Vector3::new(0.0, 1.0, 0.0)),
+        presentation.present_normal(Vector3::new(0.0, 0.0, 1.0)),
+    ];
+    let model_view =
+        basis.map(|axis| axis[0].mul_add(world[0], axis[1].mul_add(world[1], axis[2] * world[2])));
+    scene
+        .carriers
+        .iter()
+        .flat_map(|carrier| {
+            carrier_silhouette_chords(carrier, model_view)
+                .into_iter()
+                .map(|chord| (carrier.source_face, chord))
+        })
+        .collect()
+}
+
+/// The faces of one body that currently present at least one front-facing
+/// facet. Back faces are culled during projection, so membership here is
+/// exactly "turned toward the camera".
+fn front_facing_faces(
+    triangles: &[ProjectedTriangle],
+) -> BTreeMap<BodyInstanceKey, HashSet<EntityRef>> {
+    let mut by_body = BTreeMap::<BodyInstanceKey, HashSet<EntityRef>>::new();
+    for triangle in triangles {
+        by_body
+            .entry(triangle.body)
+            .or_default()
+            .insert(triangle.source);
+    }
+    by_body
+}
+
+/// An edge is an outline when the material stops there from the camera's point
+/// of view: one incident face turned toward the viewer and one away, or an
+/// edge with only one incident face at all. Interior creases between two
+/// visible faces get the lighter stroke.
+fn edge_is_outline(edge: &DebugEdge, front_facing: Option<&HashSet<EntityRef>>) -> bool {
+    let Some(front_facing) = front_facing else {
+        return true;
+    };
+    match edge.incident_faces {
+        [Some(first), Some(second)] => {
+            front_facing.contains(&first) != front_facing.contains(&second)
+        }
+        _ => true,
+    }
 }
 
 struct FaceHitArea {
@@ -2436,7 +2622,7 @@ fn paint_edges(
         .filter(|selection| selection.body == body)
         .map(|selection| logical_edge_group(scene, selection.edge))
         .unwrap_or_default();
-    let mut groups = BTreeMap::<(EntityRef, bool, bool), Vec<[Pos2; 2]>>::new();
+    let mut groups = BTreeMap::<(EntityRef, bool, bool, bool), Vec<[Pos2; 2]>>::new();
     for edge in edge_frame.by_body.get(&body).into_iter().flatten() {
         let identity = DocumentEdgeSelection {
             body,
@@ -2452,7 +2638,9 @@ fn paint_edges(
         if edge.visible != visible_pass {
             continue;
         }
-        let segments = groups.entry((edge.source, selected, hovered)).or_default();
+        let segments = groups
+            .entry((edge.source, selected, hovered, edge.outline))
+            .or_default();
         if visible_pass {
             for [start, end] in &edge.visible_intervals {
                 segments.push([lerp_pos(edge.screen, *start), lerp_pos(edge.screen, *end)]);
@@ -2461,9 +2649,30 @@ fn paint_edges(
             segments.push(edge.screen);
         }
     }
-    for ((_source, selected, hovered), segments) in groups {
+    // A curved carrier's outline lives in no edge at all, so it is drawn from
+    // the exact silhouette rather than from the B-rep. It takes the outline
+    // weight for the same reason a real outline does.
+    if visible_pass {
+        let mut silhouette_groups = BTreeMap::<EntityRef, Vec<[Pos2; 2]>>::new();
+        for silhouette in edge_frame.silhouettes.get(&body).into_iter().flatten() {
+            let segments = silhouette_groups.entry(silhouette.face).or_default();
+            for [start, end] in &silhouette.visible_intervals {
+                segments.push([
+                    lerp_pos(silhouette.screen, *start),
+                    lerp_pos(silhouette.screen, *end),
+                ]);
+            }
+        }
+        let (stroke, _) = edge_presentation_strokes(false, false, display_mode, true, true);
+        for (_face, segments) in silhouette_groups {
+            for chain in joined_segment_chains(segments) {
+                painter.add(Shape::line(chain, stroke));
+            }
+        }
+    }
+    for ((_source, selected, hovered, outline), segments) in groups {
         let (stroke, halo) =
-            edge_presentation_strokes(selected, hovered, display_mode, visible_pass);
+            edge_presentation_strokes(selected, hovered, display_mode, visible_pass, outline);
         for chain in joined_segment_chains(segments) {
             if let Some(halo) = halo {
                 painter.add(Shape::line(chain.clone(), halo));
@@ -2541,11 +2750,130 @@ fn painted_visible_edge_intervals(
     }
 }
 
+/// Chords per full turn when a silhouette locus has to be swept rather than
+/// solved outright. Presentation may sample (ADR 0026, rule 3); nothing here
+/// reaches a snapshot, a measure, or an export.
+const SILHOUETTE_SWEEP_CHORDS: usize = 96;
+
+/// The model-space chords where a carrier turns away from the viewer.
+///
+/// `view` is the view direction expressed in the body's own space, so the
+/// carrier parameters never have to be transformed. Cylinders and cones solve
+/// outright — their silhouettes are generator lines, and a line needs no
+/// sampling. Spheres and tori sweep the azimuth and solve the closed-form
+/// condition `n(u, v) · view = 0` for `v` at each step, which is one `atan2`
+/// per sample rather than a numeric root search.
+fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[Point3; 2]> {
+    let (_, axis, radial_u, radial_v, angular_sign) = carrier.surface.frame();
+    let [[u_min, u_max], [v_min, v_max]] = carrier.domain;
+    if !(u_min < u_max && v_min < v_max) || angular_sign == 0.0 {
+        return Vec::new();
+    }
+    let dot = |vector: Vector3| {
+        vector
+            .x
+            .mul_add(view[0], vector.y.mul_add(view[1], vector.z * view[2]))
+    };
+    let (along_u, along_v, along_axis) = (dot(radial_u), dot(radial_v), dot(axis));
+    // `radial(a) · view` as one cosine: amplitude `radius` at phase `phase`.
+    let radius = along_u.hypot(along_v);
+    let phase = along_v.atan2(along_u);
+    let evaluate = |u: f64, v: f64| carrier.surface.evaluate(u, v);
+
+    match carrier.surface {
+        DisplaySurface::Cylinder { .. } | DisplaySurface::Cone { .. } => {
+            // radial(a)·view = slope · (axis·view) at the silhouette, with
+            // slope zero for a cylinder. No solution means every generator
+            // faces the same way — the carrier is being viewed down its axis.
+            let target = match carrier.surface {
+                DisplaySurface::Cone { slope, .. } => slope * along_axis,
+                _ => 0.0,
+            };
+            if radius <= f64::EPSILON || (target / radius).abs() > 1.0 {
+                return Vec::new();
+            }
+            let offset = (target / radius).acos();
+            [phase - offset, phase + offset]
+                .into_iter()
+                .flat_map(|angle| {
+                    parameters_in_span(angle / angular_sign, u_min, u_max).into_iter()
+                })
+                .map(|u| [evaluate(u, v_min), evaluate(u, v_max)])
+                .collect()
+        }
+        DisplaySurface::Sphere { .. } | DisplaySurface::Torus { .. } => {
+            // The outward normal is `cos v · radial(u) + sin v · axis` for
+            // both, so the condition is linear in `(cos v, sin v)` and solves
+            // to one meridian angle and its antipode at every azimuth.
+            let span = u_max - u_min;
+            let steps = ((span.abs() / std::f64::consts::TAU) * SILHOUETTE_SWEEP_CHORDS as f64)
+                .ceil()
+                .clamp(8.0, SILHOUETTE_SWEEP_CHORDS as f64) as usize;
+            let mut chords = Vec::new();
+            for branch in 0..2 {
+                let mut previous = None::<Point3>;
+                for step in 0..=steps {
+                    let u = span.mul_add(step as f64 / steps as f64, u_min);
+                    let angle = angular_sign * u;
+                    let radial = radius * (angle - phase).cos();
+                    let meridian = std::f64::consts::PI
+                        .mul_add(f64::from(branch), (-radial).atan2(along_axis));
+                    let meridian = wrap_to_span(meridian, v_min, v_max);
+                    let current = meridian.map(|v| evaluate(u, v));
+                    if let (Some(start), Some(end)) = (previous, current) {
+                        chords.push([start, end]);
+                    }
+                    previous = current;
+                }
+            }
+            chords
+        }
+    }
+}
+
+const PERIODIC_SPAN_EPSILON: f64 = 1.0e-9;
+
+/// Every representative of `parameter`, modulo a full turn, that lands inside
+/// the face's own parameter span.
+fn parameters_in_span(parameter: f64, min: f64, max: f64) -> Vec<f64> {
+    if !parameter.is_finite() {
+        return Vec::new();
+    }
+    let turns = ((min - parameter) / std::f64::consts::TAU).ceil();
+    // A face spanning a whole turn closes on itself, so its two endpoints are
+    // the same generator: emitting both would double every silhouette there.
+    let limit = if max - min >= std::f64::consts::TAU - PERIODIC_SPAN_EPSILON {
+        max - PERIODIC_SPAN_EPSILON
+    } else {
+        max
+    };
+    let mut values = Vec::new();
+    let mut candidate = std::f64::consts::TAU.mul_add(turns, parameter);
+    while candidate <= limit {
+        values.push(candidate);
+        candidate += std::f64::consts::TAU;
+    }
+    values
+}
+
+/// The representative of `parameter` inside `[min, max]`, if one exists. The
+/// meridian of a revolved carrier is periodic, so a face spanning the far side
+/// of the seam still finds its own solution.
+fn wrap_to_span(parameter: f64, min: f64, max: f64) -> Option<f64> {
+    parameters_in_span(parameter, min, max).first().copied()
+}
+
+/// Outline strokes are heavier than interior ones by the ratio mainstream CAD
+/// uses: enough that a part reads as a solid at a glance, little enough that a
+/// dense feature does not turn into a black mass.
+const OUTLINE_STROKE_RATIO: f32 = 1.45;
+
 fn edge_presentation_strokes(
     selected: bool,
     hovered: bool,
     display_mode: ModelDisplayMode,
     visible: bool,
+    outline: bool,
 ) -> (Stroke, Option<Stroke>) {
     if selected {
         return (
@@ -2559,10 +2887,23 @@ fn edge_presentation_strokes(
             Some(Stroke::new(7.0, HOVERED.gamma_multiply(0.24))),
         );
     }
+    let weight = |interior: f32| {
+        if outline {
+            interior * OUTLINE_STROKE_RATIO
+        } else {
+            interior
+        }
+    };
     if display_mode.is_shaded() {
-        (Stroke::new(1.15, Color32::from_rgb(48, 56, 66)), None)
+        (
+            Stroke::new(weight(1.15), Color32::from_rgb(48, 56, 66)),
+            None,
+        )
     } else if visible {
-        (Stroke::new(1.45, Color32::from_rgb(54, 66, 80)), None)
+        (
+            Stroke::new(weight(1.45), Color32::from_rgb(54, 66, 80)),
+            None,
+        )
     } else {
         (
             Stroke::new(1.0, Color32::from_rgba_unmultiplied(96, 108, 122, 110)),
@@ -2982,16 +3323,28 @@ fn visible_edge_intervals(
         edge,
         depths,
         body,
-        edge_key,
+        LineOwnership::Edge(edge_key),
         &TriangleOcclusionIndex::new(triangles),
     )
+}
+
+/// What a projected line belongs to, so the occlusion pass can tell the
+/// triangles that must never hide it from the ones that may.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LineOwnership {
+    /// A B-rep edge: its own incident facets are coplanar with it by
+    /// construction and would otherwise self-occlude.
+    Edge(ModelEdgeKey),
+    /// A carrier silhouette: it lies *on* its face, so that whole face is
+    /// excluded rather than three facets of it.
+    Silhouette(EntityRef),
 }
 
 fn visible_edge_intervals_indexed(
     edge: [Pos2; 2],
     depths: [f64; 2],
     body: BodyInstanceKey,
-    edge_key: ModelEdgeKey,
+    ownership: LineOwnership,
     index: &TriangleOcclusionIndex<'_>,
 ) -> Vec<[f32; 2]> {
     let mut breaks = vec![0.0_f32, 1.0];
@@ -2999,7 +3352,7 @@ fn visible_edge_intervals_indexed(
     let occluders = index
         .candidates(edge)
         .into_iter()
-        .filter(|triangle| !triangle_contains_model_edge(triangle, body, edge_key))
+        .filter(|triangle| !triangle_carries_line(triangle, body, ownership))
         .filter(|triangle| triangle.maximum_depth > minimum_edge_depth + index.depth_bias)
         .collect::<Vec<_>>();
     if occluders.is_empty() {
@@ -3063,15 +3416,18 @@ fn visible_edge_intervals_indexed(
     visible
 }
 
-fn triangle_contains_model_edge(
+fn triangle_carries_line(
     triangle: &ProjectedTriangle,
     body: BodyInstanceKey,
-    edge: ModelEdgeKey,
+    ownership: LineOwnership,
 ) -> bool {
     if triangle.body != body {
         return false;
     }
-    triangle.model_edges.contains(&edge)
+    match ownership {
+        LineOwnership::Edge(edge) => triangle.model_edges.contains(&edge),
+        LineOwnership::Silhouette(face) => triangle.source == face,
+    }
 }
 
 fn lerp_pos(segment: [Pos2; 2], parameter: f32) -> Pos2 {
@@ -4965,54 +5321,71 @@ fn face_color(role: FaceRole) -> Color32 {
     }
 }
 
-/// A material colour under the same diffuse term the neutral shading uses,
-/// so an assigned body reads as that material rather than as flat paint.
-fn shaded_material_color(tint: Color32, shade: f32) -> Color32 {
-    let level = 0.45 + 0.55 * shade.clamp(0.0, 1.0);
-    let channel = |value: u8| (f32::from(value) * level).round().clamp(0.0, 255.0) as u8;
-    Color32::from_rgb(channel(tint.r()), channel(tint.g()), channel(tint.b()))
-}
-
-fn shaded_face_color(shade: f32) -> Color32 {
-    // Neutral steel with a slight cool cast, shaded by the diffuse term so
-    // parts read as machined metal against the pale viewport gradient.
-    let value = (106.0 + 102.0 * shade.clamp(0.0, 1.0)).round() as u8;
+/// A material colour under the same rig the neutral shading uses, so an
+/// assigned body reads as that material rather than as flat paint.
+fn shaded_material_color(tint: Color32, lighting: VertexLighting) -> Color32 {
+    let level = 0.45 + 0.55 * lighting.level.clamp(0.0, 1.0);
+    let ambient = ambient_tint(lighting.sky);
+    let channel =
+        |value: u8, tone: f32| (f32::from(value) * level * tone).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(
-        value.saturating_sub(2),
-        value.saturating_add(2),
-        value.saturating_add(8),
+        channel(tint.r(), ambient[0]),
+        channel(tint.g(), ambient[1]),
+        channel(tint.b(), ambient[2]),
     )
 }
 
-fn camera_triangle_shade(camera: [CameraProjection; 3], zoom: f64) -> f32 {
-    let zoom = if zoom.is_finite() && zoom.abs() > f64::EPSILON {
-        zoom
-    } else {
-        1.0
-    };
-    let point = |projection: CameraProjection| {
-        [
-            projection.coordinates[0] / zoom,
-            projection.depth,
-            -projection.coordinates[1] / zoom,
-        ]
-    };
-    let points = camera.map(point);
-    let first = [
-        points[1][0] - points[0][0],
-        points[1][1] - points[0][1],
-        points[1][2] - points[0][2],
-    ];
-    let second = [
-        points[2][0] - points[0][0],
-        points[2][1] - points[0][1],
-        points[2][2] - points[0][2],
-    ];
-    let normal = [
-        first[1] * second[2] - first[2] * second[1],
-        first[2] * second[0] - first[0] * second[2],
-        first[0] * second[1] - first[1] * second[0],
-    ];
+fn shaded_face_color(lighting: VertexLighting) -> Color32 {
+    // Neutral steel with a slight cool cast, shaded by the light rig so parts
+    // read as machined metal against the pale viewport gradient.
+    let value = 106.0 + 102.0 * lighting.level.clamp(0.0, 1.0);
+    let ambient = ambient_tint(lighting.sky);
+    let channel =
+        |offset: f32, tone: f32| ((value + offset) * tone).round().clamp(0.0, 255.0) as u8;
+    Color32::from_rgb(
+        channel(-2.0, ambient[0]),
+        channel(2.0, ambient[1]),
+        channel(8.0, ambient[2]),
+    )
+}
+
+/// The two-tone hemisphere: a warm sky above, a cool floor below. The shift is
+/// deliberately small — enough to keep upward and downward faces of the same
+/// grey from reading as the same surface, not enough to look coloured.
+fn ambient_tint(sky: f32) -> [f32; 3] {
+    let sky = sky.clamp(0.0, 1.0);
+    let blend = |floor: f32, above: f32| floor + (above - floor) * sky;
+    [
+        blend(0.972, 1.014),
+        blend(0.988, 1.004),
+        blend(1.020, 0.978),
+    ]
+}
+
+/// The world-space key light. This is the direction the previous camera-space
+/// light occupied under the default view, so the familiar reading of a part
+/// survives; fixing it in world space is what lets a surface's tone change as
+/// the camera moves around it, the way a lit object behaves.
+const KEY_LIGHT: [f64; 3] = [0.095_6, 0.591_3, 0.800_8];
+/// A dim mirrored low-angle fill, so faces turned away from the key still
+/// carry form instead of flattening into one silhouette-coloured mass.
+const FILL_LIGHT: [f64; 3] = [-0.147_1, -0.910_6, 0.385_2];
+const KEY_WEIGHT: f64 = 0.62;
+const FILL_WEIGHT: f64 = 0.20;
+const AMBIENT_WEIGHT: f64 = 0.18;
+const RIM_WEIGHT: f64 = 0.12;
+/// How much of the ambient term survives on faces pointing straight down. The
+/// hemisphere is a lit room, not a void, so downward faces read as shadowed
+/// rather than as holes.
+const AMBIENT_FLOOR: f64 = 0.30;
+
+/// Evaluates the four-term rig for one exact world-space normal.
+///
+/// Key, fill, and hemisphere are world-fixed; only the rim depends on the
+/// camera, and under an orthographic projection its `n · view` is just the
+/// camera-space depth component of the normal — one projection, no square
+/// roots.
+fn vertex_lighting(normal: [f64; 3], view: ViewState) -> VertexLighting {
     let length = normal[0]
         .mul_add(
             normal[0],
@@ -5020,16 +5393,36 @@ fn camera_triangle_shade(camera: [CameraProjection; 3], zoom: f64) -> f32 {
         )
         .sqrt();
     if !length.is_finite() || length <= f64::EPSILON {
-        return 0.45;
+        return VertexLighting {
+            level: 0.45,
+            sky: 0.5,
+        };
     }
-    let light = [-0.35_f64, 0.82, 0.45];
-    let light_length = light[0]
-        .mul_add(light[0], light[1].mul_add(light[1], light[2] * light[2]))
-        .sqrt();
-    let diffuse = ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2])
-        / (length * light_length))
-        .abs();
-    (0.18 + 0.82 * diffuse) as f32
+    let unit = [normal[0] / length, normal[1] / length, normal[2] / length];
+    let dot =
+        |other: [f64; 3]| unit[0].mul_add(other[0], unit[1].mul_add(other[1], unit[2] * other[2]));
+    let key = dot(KEY_LIGHT).max(0.0);
+    let fill = dot(FILL_LIGHT).max(0.0);
+    // The hemisphere parameter: 1 straight up under the sky, 0 straight down
+    // over the floor.
+    let sky = 0.5f64.mul_add(unit[2], 0.5).clamp(0.0, 1.0);
+    let facing = view
+        .project_direction(Vector3::new(unit[0], unit[1], unit[2]))
+        .depth
+        .abs()
+        .clamp(0.0, 1.0);
+    let rim = (1.0 - facing).powi(2);
+    let level = RIM_WEIGHT.mul_add(
+        rim,
+        AMBIENT_WEIGHT.mul_add(
+            AMBIENT_FLOOR + (1.0 - AMBIENT_FLOOR) * sky,
+            KEY_WEIGHT.mul_add(key, FILL_WEIGHT * fill),
+        ),
+    );
+    VertexLighting {
+        level: level.clamp(0.0, 1.0) as f32,
+        sky: sky as f32,
+    }
 }
 
 fn mix(left: Color32, right: Color32, amount: f32) -> Color32 {
@@ -5056,6 +5449,156 @@ mod tests {
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     use super::*;
+
+    fn cylinder_carrier(domain: [[f64; 2]; 2], angular_sign: f64) -> DisplayCarrier {
+        DisplayCarrier {
+            source_face: EntityRef {
+                snapshot: artificer_protocol::SnapshotId::new([9; 16]),
+                entity: artificer_protocol::EntityId(4),
+                kind: artificer_protocol::EntityKind::Face,
+            },
+            surface: DisplaySurface::Cylinder {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                axis: Vector3::new(0.0, 0.0, 1.0),
+                radial_u: Vector3::new(1.0, 0.0, 0.0),
+                radial_v: Vector3::new(0.0, 1.0, 0.0),
+                radius: 5.0,
+                angular_sign,
+            },
+            domain,
+        }
+    }
+
+    /// The silhouette of a cylinder is the pair of generators where the radial
+    /// normal turns perpendicular to the view. Both are checked against the
+    /// condition itself, not against a recorded answer.
+    #[test]
+    fn a_cylinder_silhouette_is_two_perpendicular_generators() {
+        let full_turn = [[0.0, std::f64::consts::TAU], [0.0, 10.0]];
+        for angular_sign in [1.0, -1.0] {
+            let carrier = cylinder_carrier(full_turn, angular_sign);
+            let view = [0.0, 1.0, 0.0];
+            let chords = carrier_silhouette_chords(&carrier, view);
+            assert_eq!(chords.len(), 2, "angular_sign {angular_sign}");
+            for [start, end] in chords {
+                // The radial direction at the silhouette is perpendicular to
+                // the view, so the generator sits at y = 0 on the x axis.
+                assert!(start.y.abs() <= 1.0e-12 && end.y.abs() <= 1.0e-12);
+                assert!((start.x.abs() - 5.0).abs() <= 1.0e-12);
+                // A generator is parallel to the axis and spans the face.
+                assert!((start.x - end.x).abs() <= 1.0e-12);
+                assert!(((end.z - start.z).abs() - 10.0).abs() <= 1.0e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn a_cylinder_viewed_down_its_axis_has_no_silhouette() {
+        let carrier = cylinder_carrier([[0.0, std::f64::consts::TAU], [0.0, 10.0]], 1.0);
+        assert!(carrier_silhouette_chords(&carrier, [0.0, 0.0, 1.0]).is_empty());
+    }
+
+    /// A half-face only owns the silhouette that falls inside its own
+    /// parameter span; the other generator belongs to the opposite half.
+    #[test]
+    fn a_half_cylinder_owns_only_the_silhouette_inside_its_span() {
+        let carrier = cylinder_carrier([[0.0, std::f64::consts::PI], [0.0, 10.0]], 1.0);
+        let chords = carrier_silhouette_chords(&carrier, [1.0, 0.0, 0.0]);
+        assert_eq!(chords.len(), 1);
+        assert!(chords[0][0].x.abs() <= 1.0e-12, "{:?}", chords[0]);
+        assert!((chords[0][0].y - 5.0).abs() <= 1.0e-12, "{:?}", chords[0]);
+    }
+
+    /// Sphere and torus loci are swept rather than solved outright, so the gate
+    /// is the silhouette condition itself: the exact outward normal at every
+    /// emitted point is perpendicular to the view direction.
+    #[test]
+    fn swept_silhouettes_satisfy_the_exact_condition() {
+        let identity = EntityRef {
+            snapshot: artificer_protocol::SnapshotId::new([9; 16]),
+            entity: artificer_protocol::EntityId(4),
+            kind: artificer_protocol::EntityKind::Face,
+        };
+        let origin = Point3::new(1.0, -2.0, 0.5);
+        let sphere = DisplayCarrier {
+            source_face: identity,
+            surface: DisplaySurface::Sphere {
+                origin,
+                axis: Vector3::new(0.0, 0.0, 1.0),
+                radial_u: Vector3::new(1.0, 0.0, 0.0),
+                radial_v: Vector3::new(0.0, 1.0, 0.0),
+                radius: 3.0,
+                angular_sign: 1.0,
+            },
+            domain: [
+                [0.0, std::f64::consts::TAU],
+                [
+                    -std::f64::consts::FRAC_PI_2 + 1.0e-6,
+                    std::f64::consts::FRAC_PI_2 - 1.0e-6,
+                ],
+            ],
+        };
+        let view = {
+            let raw: [f64; 3] = [0.4, 0.7, 0.59];
+            let length = raw[0].hypot(raw[1]).hypot(raw[2]);
+            raw.map(|value| value / length)
+        };
+        let chords = carrier_silhouette_chords(&sphere, view);
+        assert!(
+            chords.len() > 40,
+            "expected a swept loop, got {}",
+            chords.len()
+        );
+        for [start, end] in &chords {
+            for point in [start, end] {
+                let radial = [point.x - origin.x, point.y - origin.y, point.z - origin.z];
+                let radius = radial[0].hypot(radial[1]).hypot(radial[2]);
+                assert!((radius - 3.0).abs() <= 1.0e-9, "off the carrier: {radius}");
+                // The sphere's normal is its own radial direction.
+                let facing =
+                    (radial[0] * view[0] + radial[1] * view[1] + radial[2] * view[2]) / radius;
+                assert!(facing.abs() <= 1.0e-9, "normal is not edge-on: {facing}");
+            }
+        }
+
+        let torus = DisplayCarrier {
+            source_face: identity,
+            surface: DisplaySurface::Torus {
+                origin,
+                axis: Vector3::new(0.0, 0.0, 1.0),
+                radial_u: Vector3::new(1.0, 0.0, 0.0),
+                radial_v: Vector3::new(0.0, 1.0, 0.0),
+                major_radius: 8.0,
+                minor_radius: 2.0,
+                angular_sign: 1.0,
+            },
+            domain: [
+                [0.0, std::f64::consts::TAU],
+                [0.0, std::f64::consts::FRAC_PI_2],
+            ],
+        };
+        let chords = carrier_silhouette_chords(&torus, view);
+        assert!(!chords.is_empty());
+        for [start, end] in &chords {
+            for point in [start, end] {
+                let relative = [point.x - origin.x, point.y - origin.y, point.z - origin.z];
+                let planar = relative[0].hypot(relative[1]);
+                assert!(planar > 1.0e-9);
+                // The tube centre circle sits at the major radius, so the
+                // outward normal is the direction from that circle.
+                let normal = [
+                    relative[0] - 8.0 * relative[0] / planar,
+                    relative[1] - 8.0 * relative[1] / planar,
+                    relative[2],
+                ];
+                let length = normal[0].hypot(normal[1]).hypot(normal[2]);
+                assert!((length - 2.0).abs() <= 1.0e-9, "off the tube: {length}");
+                let facing =
+                    (normal[0] * view[0] + normal[1] * view[1] + normal[2] * view[2]) / length;
+                assert!(facing.abs() <= 1.0e-9, "normal is not edge-on: {facing}");
+            }
+        }
+    }
 
     #[test]
     fn reference_plane_quad_is_directly_pickable() {
@@ -5217,7 +5760,10 @@ mod tests {
                 kind: artificer_protocol::EntityKind::Face,
             },
             role: FaceRole::PositiveZ,
-            shade: 1.0,
+            lighting: [VertexLighting {
+                level: 1.0,
+                sky: 1.0,
+            }; 3],
         };
         for display_mode in [ModelDisplayMode::Diagnostic, ModelDisplayMode::ShadedEdges] {
             let intervals = painted_visible_edge_intervals(
@@ -5280,7 +5826,10 @@ mod tests {
                 kind: artificer_protocol::EntityKind::Face,
             },
             role: FaceRole::PositiveZ,
-            shade: 1.0,
+            lighting: [VertexLighting {
+                level: 1.0,
+                sky: 1.0,
+            }; 3],
         };
 
         let expected = vec![[0.0, 1.0]];
@@ -6131,9 +6680,9 @@ mod tests {
     #[test]
     fn hovered_edges_receive_a_bright_primary_stroke_and_wide_halo() {
         let (ordinary, ordinary_halo) =
-            edge_presentation_strokes(false, false, ModelDisplayMode::ShadedEdges, true);
+            edge_presentation_strokes(false, false, ModelDisplayMode::ShadedEdges, true, false);
         let (hovered, hovered_halo) =
-            edge_presentation_strokes(false, true, ModelDisplayMode::ShadedEdges, true);
+            edge_presentation_strokes(false, true, ModelDisplayMode::ShadedEdges, true, false);
         let hovered_halo = hovered_halo.expect("hovered edge halo");
 
         assert!(ordinary_halo.is_none());
@@ -7290,6 +7839,7 @@ mod tests {
             0.0,
             projection,
             &keys,
+            &triangles,
         );
         let visible = cache
             .by_body
@@ -7423,6 +7973,7 @@ mod tests {
                     fixture.phase,
                     projection,
                     &keys,
+                    &triangles,
                 );
                 interaction_edge_time += start.elapsed();
             }

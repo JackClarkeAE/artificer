@@ -240,6 +240,20 @@ pub enum SketchCurve2 {
     },
 }
 
+impl SketchCurve2 {
+    /// The points this curve is defined by, in deterministic order.
+    #[must_use]
+    pub fn referenced_points(self) -> Vec<SketchPointId> {
+        match self {
+            Self::Line { start, end } => vec![start, end],
+            Self::CircularArc {
+                center, start, end, ..
+            } => vec![center, start, end],
+            Self::Circle { center, .. } => vec![center],
+        }
+    }
+}
+
 /// Direction of travel around a circular carrier in sketch-plane coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

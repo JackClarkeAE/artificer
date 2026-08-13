@@ -56,9 +56,9 @@ use artificer_protocol::{
     EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest, FaceExtrusionOperation, HistoryRelation,
     KernelCommand, KernelError, KernelErrorCode, KernelStage, MAX_EXTRUSION_PROFILE_VERTICES,
     MAX_PLANAR_PROFILE_CURVES, MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS,
-    OperationReport, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
-    Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RotationQuaternion,
-    SemanticDigest, SnapshotId, TopologyCounts, Vector3,
+    OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2,
+    PlanarRegion2, Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle,
+    RotationQuaternion, SemanticDigest, SnapshotId, TopologyCounts, Vector3,
 };
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
@@ -316,6 +316,15 @@ impl LabCase {
 ///
 /// Widgets may create or edit this state, but only
 /// `confirm_pending_operation` may execute it through the kernel.
+/// A revolve captured at staging time: the region, the axis it turns about,
+/// and the frame both live in.
+#[derive(Clone, Debug, PartialEq)]
+struct StagedRevolve {
+    frame: PlanarFrame3,
+    profile: PlanarProfile2,
+    axis: PlanarAxis2,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PendingOperation {
     Transform {
@@ -1526,6 +1535,10 @@ pub struct KernelLabApp {
     /// Tool bodies picked while a Boolean is staged, in click order. Empty
     /// outside a staged Boolean; the target is never a member.
     boolean_tools: Vec<BodyId>,
+    /// The sketch region and axis captured when a revolve was staged. It lives
+    /// beside the pending operation rather than inside it because a profile is
+    /// not `Copy`, exactly as the Boolean tool list does.
+    staged_revolve: Option<StagedRevolve>,
     active_tool: ActiveTool,
     display_transform: DisplayTransform,
     pending_operation: Option<PendingOperation>,
@@ -1654,6 +1667,7 @@ impl Default for KernelLabApp {
             measured_edges: Vec::new(),
             measured_face: None,
             boolean_tools: Vec::new(),
+            staged_revolve: None,
             active_tool: ActiveTool::Select,
             display_transform: DisplayTransform::default(),
             pending_operation: None,
@@ -7252,8 +7266,11 @@ impl KernelLabApp {
             }
             PendingOperation::SetParameterLiteral { .. }
             | PendingOperation::AddUserLengthParameter { .. }
-            | PendingOperation::CreateConstructionPlane { .. }
-            | PendingOperation::PresetFeature { .. } => self.pending_operation = None,
+            | PendingOperation::CreateConstructionPlane { .. } => self.pending_operation = None,
+            PendingOperation::PresetFeature { .. } => {
+                self.staged_revolve = None;
+                self.pending_operation = None;
+            }
             PendingOperation::SketchEdit { .. } => {
                 self.sketch.cancel_pending();
                 self.sketch_last_error = None;
@@ -8472,11 +8489,37 @@ impl KernelLabApp {
         ));
     }
 
+    /// The active sketch's closed profile and centreline, if it has both.
+    ///
+    /// A revolve needs a region and an axis in the same frame, which is
+    /// exactly what a sketch with one centreline already is.
+    fn staged_sketch_revolve(&self) -> Option<StagedRevolve> {
+        let (start, end) = self.sketch.centreline_axis()?;
+        let profile = self.sketch_planar_profile_payload()?;
+        Some(StagedRevolve {
+            frame: self.sketch_support.frame(),
+            profile,
+            axis: PlanarAxis2::new(
+                ProtocolPoint2::new(start.u, start.v),
+                ProtocolPoint2::new(end.u, end.v),
+            ),
+        })
+    }
+
     fn stage_preset_feature(&mut self, preset: SolidFeaturePreset) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
         if preset == SolidFeaturePreset::Revolve {
+            // A sketched region turning about its own centreline is the real
+            // command; the fixed tube remains only for an empty document.
+            self.staged_revolve = self.staged_sketch_revolve();
+            self.document_status = Some(if self.staged_revolve.is_some() {
+                "Revolve staged from the active sketch profile and centreline".to_owned()
+            } else {
+                "Revolve staged · draw a closed profile and one centreline to revolve your own"
+                    .to_owned()
+            });
             self.pending_operation = Some(PendingOperation::PresetFeature {
                 preset,
                 base_snapshot: SnapshotId::ZERO,
@@ -8643,16 +8686,47 @@ impl KernelLabApp {
             workbench.body.snapshot.clone()
         };
         let command = match preset {
-            SolidFeaturePreset::Revolve => KernelCommand::MakeRevolvedAnnulus {
-                frame: PlanarFrame3::new(
-                    Point3::new(0.0, 0.0, 0.0),
-                    Vector3::new(1.0, 0.0, 0.0),
-                    Vector3::new(0.0, 1.0, 0.0),
-                ),
-                inner_radius: 1.0,
-                outer_radius: 2.0,
-                height: 3.0,
-            },
+            // The preset is still a fixed tube, but it now travels the
+            // general revolve: a section rectangle beside an axis in its own
+            // frame, exactly as a sketched profile will once region-and-axis
+            // staging lands. `MakeRevolvedAnnulus` has no consumer left in the
+            // product.
+            SolidFeaturePreset::Revolve => {
+                let staged = self.staged_revolve.clone();
+                staged.map_or_else(
+                    // No sketch to turn: the preset still builds the tube it
+                    // always did, so an empty document has something to show.
+                    || KernelCommand::RevolvePlanarProfile {
+                        frame: PlanarFrame3::new(
+                            Point3::new(0.0, 0.0, 0.0),
+                            Vector3::new(1.0, 0.0, 0.0),
+                            Vector3::new(0.0, 0.0, 1.0),
+                        ),
+                        profile: PlanarProfile2 {
+                            regions: vec![PlanarRegion2 {
+                                outer: PlanarLoop2::from_polygon(&[
+                                    ProtocolPoint2::new(1.0, 0.0),
+                                    ProtocolPoint2::new(2.0, 0.0),
+                                    ProtocolPoint2::new(2.0, 3.0),
+                                    ProtocolPoint2::new(1.0, 3.0),
+                                ]),
+                                holes: Vec::new(),
+                            }],
+                        },
+                        axis: PlanarAxis2::new(
+                            ProtocolPoint2::new(0.0, 0.0),
+                            ProtocolPoint2::new(0.0, 1.0),
+                        ),
+                        angle: RevolveAngle::FullTurn,
+                    },
+                    |staged| KernelCommand::RevolvePlanarProfile {
+                        frame: staged.frame,
+                        profile: staged.profile,
+                        axis: staged.axis,
+                        angle: RevolveAngle::FullTurn,
+                    },
+                )
+            }
             SolidFeaturePreset::Hole => KernelCommand::DrillHole {
                 target_face: target_face.expect("staged hole face"),
                 frame: frame.expect("staged hole frame"),
@@ -8733,6 +8807,8 @@ impl KernelLabApp {
                 return;
             }
         };
+        // The captured region and axis have been spent.
+        self.staged_revolve = None;
         let association = SnapshotAssociation::new(
             outcome.report.input_snapshot,
             outcome.report.output_snapshot,
@@ -8928,8 +9004,69 @@ impl KernelLabApp {
     }
 
     fn frame_visible_body(&mut self, context: &egui::Context) {
+        // Frame what the user is looking at (ADR 0026, F10). With a face or
+        // edge selected, F means "show me this"; with nothing selected it
+        // keeps its old meaning of framing the document.
+        if self.frame_selection() {
+            context.request_repaint();
+            return;
+        }
         self.frame_visible_document();
         context.request_repaint();
+    }
+
+    /// The world bounds of the current selection, if anything is selected.
+    fn selection_world_bounds(&self) -> Option<Aabb3> {
+        let body = self.displayed.as_ref()?;
+        let scene = &body.scene;
+        let mut bounds: Option<Aabb3> = None;
+        let mut include = |point: Point3| {
+            bounds = Some(match bounds {
+                None => Aabb3::new(point, point),
+                Some(existing) => union_aabb(existing, Aabb3::new(point, point)),
+            });
+        };
+        let faces = self
+            .selected_face
+            .map(|face| viewport::tangent_face_group(scene, face))
+            .unwrap_or_default();
+        for triangle in &scene.triangles {
+            if faces.contains(&triangle.source_face) {
+                for vertex in triangle.vertices {
+                    include(vertex);
+                }
+            }
+        }
+        let edges = self
+            .selected_edges
+            .iter()
+            .map(|selection| selection.edge)
+            .collect::<Vec<_>>();
+        for edge in &scene.edges {
+            if edges.contains(&edge.source_edge) {
+                for endpoint in edge.endpoints {
+                    include(endpoint);
+                }
+            }
+        }
+        for vertex in &scene.vertices {
+            if self
+                .selected_vertices
+                .iter()
+                .any(|selection| selection.vertex == vertex.source_vertex)
+            {
+                include(vertex.point);
+            }
+        }
+        bounds
+    }
+
+    fn frame_selection(&mut self) -> bool {
+        let Some(bounds) = self.selection_world_bounds() else {
+            return false;
+        };
+        self.view.frame(bounds);
+        true
     }
 
     fn handle_shortcuts(
@@ -10424,6 +10561,9 @@ impl KernelLabApp {
                         }
                         SelectionRequirement::TwoConnectedProfileLines => {
                             Some("Select two connected profile lines")
+                        }
+                        SelectionRequirement::RelationOperands => {
+                            Some("Pick the curves or endpoints to relate")
                         }
                     };
                     if let Some(requirement) = selection {
@@ -19915,6 +20055,112 @@ mod circle_extrude_repro {
             app.pending_sketch_extrusion_command(),
             Some(KernelCommand::ExtrudePlanarProfile { .. })
         ));
+    }
+
+    /// The milestone's staging half (ADR 0026, F3): a sketched region turning
+    /// about the sketch's own centreline, with the volume checked against
+    /// Pappus rather than against a recorded number.
+    #[test]
+    fn revolve_turns_the_sketched_region_about_its_centreline() {
+        let mut app = KernelLabApp {
+            workbench_mode: WorkbenchMode::Sketch,
+            ..Default::default()
+        };
+
+        // A rectangle clear of the axis: section r in [2, 5], z in [0, 3].
+        assert!(app.sketch.set_tool(crate::sketch::SketchTool::Rectangle));
+        let region = app
+            .sketch
+            .stage_geometry(SketchGeometry::Rectangle {
+                first: point(2.0, 0.0),
+                opposite: point(5.0, 3.0),
+            })
+            .expect("rectangle should stage");
+        app.commit_sketch_stroke(region);
+
+        // The centreline is the axis, drawn on the sketch's v axis.
+        assert!(app.sketch.set_tool(crate::sketch::SketchTool::CentreLine));
+        let axis = app
+            .sketch
+            .stage_geometry_with_role(
+                SketchGeometry::Segment {
+                    start: point(0.0, 0.0),
+                    end: point(0.0, 3.0),
+                },
+                crate::sketch::SketchEntityRole::Construction,
+            )
+            .expect("centreline should stage");
+        app.commit_sketch_stroke(axis);
+        assert!(app.sketch.centreline_axis().is_some());
+
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(
+            app.staged_revolve.is_some(),
+            "the sketch profile and centreline should be captured: {:?}",
+            app.document_status
+        );
+        assert!(app.confirm_pending_operation());
+
+        let volume = app
+            .displayed_measures()
+            .expect("the revolved body should publish measures")
+            .volume;
+        let expected = std::f64::consts::PI * (25.0 - 4.0) * 3.0;
+        assert!(
+            ((volume - expected) / expected).abs() < 1.0e-9,
+            "revolved volume {volume} should equal {expected}"
+        );
+        assert!(app.staged_revolve.is_none(), "the staging is spent");
+    }
+
+    #[test]
+    fn revolve_without_a_centreline_still_builds_its_preset_tube() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.staged_revolve.is_none());
+        assert!(app.confirm_pending_operation());
+        let volume = app
+            .displayed_measures()
+            .expect("the preset tube should publish measures")
+            .volume;
+        let expected = std::f64::consts::PI * (4.0 - 1.0) * 3.0;
+        assert!(
+            ((volume - expected) / expected).abs() < 1.0e-9,
+            "preset revolve volume {volume} should equal {expected}"
+        );
+    }
+
+    /// F frames the selection when there is one (ADR 0026, F10).
+    #[test]
+    fn framing_prefers_the_selection_over_the_whole_document() {
+        let mut app = KernelLabApp::default();
+        let scene = &app.displayed.as_ref().expect("default body").scene;
+        let face = scene
+            .triangles
+            .first()
+            .expect("the default body has faces")
+            .source_face;
+        assert!(!app.frame_selection(), "nothing selected frames nothing");
+        app.selected_face = Some(face);
+        let selection = app
+            .selection_world_bounds()
+            .expect("a selected face has bounds");
+        let document = app
+            .bodies
+            .iter()
+            .filter_map(|body| app.committed_world_bounds_for_body(body))
+            .reduce(union_aabb)
+            .expect("the document has bounds");
+        let span = |bounds: Aabb3| {
+            (bounds.max.x - bounds.min.x)
+                + (bounds.max.y - bounds.min.y)
+                + (bounds.max.z - bounds.min.z)
+        };
+        assert!(
+            span(selection) < span(document),
+            "one face should be smaller than the whole body"
+        );
+        assert!(app.frame_selection());
     }
 
     #[test]

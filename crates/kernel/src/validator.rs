@@ -114,11 +114,13 @@ impl ValidationReport {
 }
 
 pub(crate) fn validate(topology: &Topology, linear_tolerance: f64) -> ValidationReport {
-    validate_with_pool(
-        artificer_compute::ComputePool::global(),
-        topology,
-        linear_tolerance,
-    )
+    artificer_compute::perf_span!("kernel.validate", topology.faces.len(), {
+        validate_with_pool(
+            artificer_compute::ComputePool::global(),
+            topology,
+            linear_tolerance,
+        )
+    })
 }
 
 pub(crate) fn validate_with_pool(

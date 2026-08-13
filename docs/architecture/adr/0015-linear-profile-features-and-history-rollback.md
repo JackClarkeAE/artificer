@@ -1,6 +1,6 @@
 # ADR 0015: Linear-profile features use hole-aware faces and exact push/pull
 
-- Status: Accepted for the M4e/M5a experimental slice; profile representation widened by ADR 0016
+Status: Accepted for the M4e/M5a experimental slice; profile representation widened by ADR 0016
 - Date: 2026-07-29
 - Decision owners: Artificer project
 

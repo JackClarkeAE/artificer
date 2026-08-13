@@ -652,6 +652,58 @@ impl Surface {
         }
     }
 
+    /// Exact unit outward normal at a point already known to lie on the
+    /// carrier.
+    ///
+    /// The direction is the surface differential `∂P/∂u × ∂P/∂v`, which is the
+    /// orientation convention every builder and every reversal maintains: the
+    /// in-plane mirror and the `angular_sign` flip that
+    /// `reverse_face_orientation` performs both flip this cross product.
+    /// Reducing that cross product in closed form leaves an expression in the
+    /// point alone, so the two triangles of a tessellation quad — and the two
+    /// faces meeting along a seam of one carrier — evaluate bit-identical
+    /// normals at a shared vertex without any mesh-side averaging.
+    pub(crate) fn outward_normal_at(self, point: Point3) -> Option<Vector3> {
+        match self {
+            Self::Plane(plane) => unit_vector(plane.normal),
+            Self::Cylinder(cylinder) => {
+                let axis = unit_vector(cylinder.axis)?;
+                let radial = unit_vector(radial_component(point - cylinder.origin, axis))?;
+                let sign = frame_orientation(
+                    cylinder.radial_u,
+                    cylinder.radial_v,
+                    axis,
+                    cylinder.angular_sign,
+                )?;
+                Some(radial * sign)
+            }
+            Self::Torus(torus) => {
+                let axis = unit_vector(torus.axis)?;
+                let relative = point - torus.origin;
+                let radial = unit_vector(radial_component(relative, axis))?;
+                // The tube centre circle sits at the major radius; the outward
+                // normal of a ring torus is the direction from that circle.
+                let minor = relative - radial * torus.major_radius;
+                let sign =
+                    frame_orientation(torus.radial_u, torus.radial_v, axis, torus.angular_sign)?;
+                unit_vector(minor).map(|normal| normal * sign)
+            }
+            Self::Cone(cone) => {
+                let axis = unit_vector(cone.axis)?;
+                let radial = unit_vector(radial_component(point - cone.origin, axis))?;
+                let sign =
+                    frame_orientation(cone.radial_u, cone.radial_v, axis, cone.angular_sign)?;
+                unit_vector(radial - axis * cone.slope).map(|normal| normal * sign)
+            }
+            Self::Sphere(sphere) => {
+                let axis = unit_vector(sphere.axis)?;
+                let sign =
+                    frame_orientation(sphere.radial_u, sphere.radial_v, axis, sphere.angular_sign)?;
+                unit_vector(point - sphere.origin).map(|normal| normal * sign)
+            }
+        }
+    }
+
     /// Maps a parameter-space tangent through the exact surface differential.
     pub(crate) fn map_tangent(self, point: Point2, tangent: Vector2) -> Vector3 {
         match self {
@@ -708,6 +760,32 @@ impl Surface {
             Self::Cylinder(_) | Self::Torus(_) | Self::Cone(_) | Self::Sphere(_) => None,
         }
     }
+}
+
+fn unit_vector(vector: Vector3) -> Option<Vector3> {
+    let length = vector.length();
+    (length.is_finite() && length > f64::EPSILON).then(|| vector / length)
+}
+
+/// The part of `vector` perpendicular to a unit `axis`.
+fn radial_component(vector: Vector3, axis: Vector3) -> Vector3 {
+    vector - axis * vector.dot(axis)
+}
+
+/// `+1` when increasing `u` then `v` traverses the carrier right-handed about
+/// its own outward normal, `-1` when the face is the inward-facing half. The
+/// revolved surfaces all reduce to this one factor: `∂P/∂u × ∂P/∂v` differs
+/// from the geometric radial direction by exactly `angular_sign` times the
+/// handedness of the surface's own frame.
+fn frame_orientation(
+    radial_u: Vector3,
+    radial_v: Vector3,
+    axis: Vector3,
+    angular_sign: f64,
+) -> Option<f64> {
+    let handedness = radial_u.cross(radial_v).dot(axis);
+    (handedness.is_finite() && handedness != 0.0 && angular_sign != 0.0)
+        .then(|| handedness.signum() * angular_sign.signum())
 }
 
 #[derive(Clone, Debug)]

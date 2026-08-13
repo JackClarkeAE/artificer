@@ -362,6 +362,10 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         | KernelCommand::ExtrudePolygon { .. }
         | KernelCommand::PushPullFace { .. }
         | KernelCommand::MakeRevolvedAnnulus { .. }
+        // A revolve carries no length parameter of its own: its dimensions
+        // live in the profile and the axis, which parameterization reaches
+        // through the sketch rather than through the command.
+        | KernelCommand::RevolvePlanarProfile { .. }
         | KernelCommand::DrillHole { .. }
         | KernelCommand::AddRib { .. }
         | KernelCommand::MirrorSnapshot { .. }

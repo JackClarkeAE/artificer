@@ -1,8 +1,6 @@
 # ADR 0010: First native profile extrusion is a declarative convex constructor
 
-## Status
-
-Accepted for the historical M4a experimental slice; the profile domain is widened by ADR 0015.
+Status: Accepted for the historical M4a experimental slice; the profile domain is widened by ADR 0015
 
 ## Context
 

@@ -512,6 +512,28 @@ fn workbench_analytic_annulus_extrusion_preview_snapshot() {
     harness.remove_cursor();
     harness.run();
     harness.snapshot("workbench_analytic_annulus_extrusion_committed");
+
+    // The banding tripwire (ADR 0026, P1). Flat per-triangle shading shows as
+    // vertical bands across a cylinder wall, and at this magnification each
+    // band is tens of pixels wide — far above the portability threshold, so a
+    // regression to per-facet shading cannot pass this baseline quietly.
+    let viewport_center = harness.get_by_label("Model viewport").rect().center();
+    harness.hover_at(viewport_center);
+    harness.step();
+    for _ in 0..3 {
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 120.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+    harness.remove_cursor();
+    // Hovering the viewport leaves a tooltip animating, so settle a fixed
+    // number of frames rather than waiting for a quiescent one.
+    harness.run_steps(6);
+    harness.snapshot("workbench_curved_wall_close_up");
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # ADR 0012: First selected-face Add and Cut use an exact rectangular scaffold
 
-- Status: Accepted for the historical M4c experimental topology-editing slice; extended by ADRs 0013 and 0015
+Status: Accepted for the historical M4c experimental topology-editing slice; extended by ADRs 0013 and 0015
 - Date: 2026-07-29
 - Decision owners: Artificer project
 
