@@ -64,6 +64,24 @@ fn through_cut_outcome(
     frame: PlanarFrame3,
     label: &str,
 ) -> artificer_kernel::ExecutionOutcome {
+    through_cut_outcome_at(
+        snapshot,
+        target_face,
+        frame,
+        Point2::new(0.0, 0.0),
+        RADIUS,
+        label,
+    )
+}
+
+fn through_cut_outcome_at(
+    snapshot: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    centre: Point2,
+    radius: f64,
+    label: &str,
+) -> artificer_kernel::ExecutionOutcome {
     let request = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         request_id: RequestId::new(label),
@@ -76,8 +94,8 @@ fn through_cut_outcome(
                 regions: vec![PlanarRegion2 {
                     outer: PlanarLoop2 {
                         curves: vec![PlanarCurve2::Circle {
-                            center: Point2::new(0.0, 0.0),
-                            radius: RADIUS,
+                            center: centre,
+                            radius,
                             direction: ArcDirection::CounterClockwise,
                         }],
                     },
@@ -270,5 +288,64 @@ fn an_exact_cut_publishes_no_approximation_warning() {
         outcome.report.warnings.is_empty(),
         "an exact cut must publish no warnings, got {:?}",
         outcome.report.warnings
+    );
+}
+
+/// A second bore that misses the first stays exact — and this records WHY it
+/// does, because the reason is not the guard people expect.
+///
+/// `sweep_contacts_source` rejects any cylinder whose axis is not parallel to
+/// the sweep, on orientation alone, without asking whether it is anywhere near
+/// the profile. That looks like it should send every second bore to the faceted
+/// fallback. It does not, because the axis-aligned bounds test upstream culls
+/// the first bore before the cylinder arm is ever reached. Tightening the
+/// orientation guard into a real footprint test was tried and reverted: it only
+/// changes the answer when the cut frame is oblique to the existing bore's
+/// axis, which needs a deliberately rotated frame to reach, and an untested
+/// tightening of an exactness guard is not worth carrying.
+/// A second bore that misses the first must stay exact.
+///
+/// The guard used to reject any cylinder whose axis was not parallel to the
+/// sweep, on orientation alone — so a bore anywhere inside the profile's
+/// bounding box sent the whole cut to the faceted fallback even when the two
+/// never came near each other. Testing the cylinder's real footprint keeps
+/// these exact.
+#[test]
+fn a_second_bore_that_misses_the_first_stays_exact() {
+    let bored = bored_box();
+    let side = face_where(&bored, |centre| (centre.x - SIZE).abs() < 1.0e-6);
+    // Offset across the first bore's axis, not along it: the first bore spans
+    // the whole height, so only a sideways offset actually clears it. Their
+    // bounding boxes still overlap, so nothing short of a real footprint test
+    // can tell these two apart.
+    let outcome = through_cut_outcome_at(
+        &bored,
+        side,
+        PlanarFrame3::new(
+            Point3::new(SIZE, SIZE / 2.0, SIZE / 2.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ),
+        Point2::new(14.0, 0.0),
+        4.0,
+        "offset-second-bore",
+    );
+    assert!(
+        outcome.report.warnings.is_empty(),
+        "a bore clear of the first must stay exact, got {:?}",
+        outcome.report.warnings
+    );
+    let faces = outcome.snapshot.counts().faces;
+    assert!(
+        faces <= 12,
+        "an exact second bore adds a wall and a cap, not a fan: {faces} faces"
+    );
+    let expected = SIZE.powi(3)
+        - std::f64::consts::PI * RADIUS * RADIUS * SIZE
+        - std::f64::consts::PI * 4.0 * 4.0 * SIZE;
+    let volume = outcome.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "two clear bores must both be exact: {volume} vs {expected}"
     );
 }
