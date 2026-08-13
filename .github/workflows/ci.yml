@@ -113,17 +113,29 @@ jobs:
             -- --skip document_properties_units_and_interchange_snapshot
 
   release:
-    # The releases page served Windows only, while the kernel and the
-    # workbench build on all three. A tag now produces the same product
-    # everywhere it is known to run.
+    # The releases page is the product's front door, and until now nothing
+    # published to it: the Windows job uploads a run artifact, which expires
+    # and lives behind the Actions tab. A tag now builds all three platforms
+    # and attaches them to the release itself, named as the existing assets
+    # are so the page stays consistent.
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     strategy:
+      # One failing platform must not withdraw the others from a release that
+      # is already public.
+      fail-fast: false
       matrix:
         include:
           - os: macos-15
-            artifact: artificer-macos-arm64
+            platform: macos-arm64
+            archive: zip
           - os: ubuntu-24.04
-            artifact: artificer-linux-x86_64
+            platform: linux-x86_64
+            archive: tar
+          - os: windows-latest
+            platform: windows-x86_64
+            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -141,21 +153,43 @@ jobs:
       - name: Release executable
         run: cargo build --release --package artificer-workbench --bin artificer-workbench
       - name: Package
+        # Bash on every runner, Windows included, so there is one packaging
+        # path to reason about rather than three.
+        shell: bash
         run: |
-          mkdir -p dist
-          cp target/release/artificer-workbench dist/
-          cp README.md dist/
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            (cd dist && zip -r "../${{ matrix.artifact }}.zip" .)
-          else
-            tar -czf "${{ matrix.artifact }}.tar.gz" -C dist .
+          set -euo pipefail
+          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          binary="artificer-workbench"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            binary="artificer-workbench.exe"
           fi
+          mkdir -p dist
+          cp "target/release/$binary" dist/
+          cp README.md LICENSE dist/ 2>/dev/null || cp README.md dist/
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd dist && 7z a -tzip "../$name.zip" . >/dev/null || zip -r "../$name.zip" .)
+            echo "asset=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" -C dist .
+            echo "asset=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Three jobs race to publish the same tag, so creating the release is
+          # best-effort and uploading is idempotent.
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --title "Artificer $GITHUB_REF_NAME" --generate-notes \
+            || true
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.tar.gz
+          name: ${{ matrix.platform }}
+          path: ${{ env.asset }}
           if-no-files-found: error
 
   nightly-benches:

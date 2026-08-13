@@ -685,6 +685,14 @@ baselines as the referee:
 - A `release` job on version tags: macOS arm64 zip, Linux x86-64
   tarball, alongside the existing Windows artifact — the releases page
   currently under-serves two of three platforms.
+  *Correction, made while implementing this:* the premise above was
+  wrong in two ways. The releases page carried macOS and Windows and was
+  missing only Linux, and the "existing Windows artifact" is a workflow
+  artifact, not a release asset — no CI job had ever published to the
+  releases page at all, so the two assets on v0.1.0 were uploaded by
+  hand. The job as built therefore covers all three platforms and
+  attaches the archives to the release itself; uploading a run artifact
+  and calling it a release was the actual gap.
 - The nightly job (V1 benches + K4 fuzz) on `schedule:`.
 
 ---
