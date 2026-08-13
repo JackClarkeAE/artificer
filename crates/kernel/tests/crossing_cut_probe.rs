@@ -58,12 +58,12 @@ fn face_where(snapshot: &Snapshot, pick: fn(Point3) -> bool) -> EntityRef {
     panic!("the fixture should expose the requested face");
 }
 
-fn through_cut(
+fn through_cut_outcome(
     snapshot: &Snapshot,
     target_face: EntityRef,
     frame: PlanarFrame3,
     label: &str,
-) -> Snapshot {
+) -> artificer_kernel::ExecutionOutcome {
     let request = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         request_id: RequestId::new(label),
@@ -90,7 +90,15 @@ fn through_cut(
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
         .unwrap_or_else(|error| panic!("{label} should build: {error:?}"))
-        .snapshot
+}
+
+fn through_cut(
+    snapshot: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    label: &str,
+) -> Snapshot {
+    through_cut_outcome(snapshot, target_face, frame, label).snapshot
 }
 
 fn bored_box() -> Snapshot {
@@ -203,5 +211,64 @@ fn the_display_scene_of_a_faceted_body_builds_promptly() {
     assert!(
         elapsed < std::time::Duration::from_millis(40),
         "the display scene took {elapsed:?}; the edge classification is quadratic again"
+    );
+}
+
+/// An approximation must say so. Every other report this kernel publishes means
+/// "certified", so the one path that publishes a tessellation has to carry a
+/// caveat the caller can see — otherwise a 0.15%-wrong volume is quoted with
+/// exactly the same authority as an exact one.
+#[test]
+fn the_faceted_fallback_warns_that_it_approximated() {
+    let bored = bored_box();
+    let side = face_where(&bored, |centre| (centre.x - SIZE).abs() < 1.0e-6);
+    let outcome = through_cut_outcome(
+        &bored,
+        side,
+        PlanarFrame3::new(
+            Point3::new(SIZE, SIZE / 2.0, SIZE / 2.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ),
+        "crossing-cut-warning",
+    );
+    let warning = outcome
+        .report
+        .warnings
+        .iter()
+        .find(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION")
+        .expect("a faceted result must warn that it is one");
+    assert_eq!(
+        warning.severity,
+        artificer_protocol::DiagnosticSeverity::Warning,
+        "an approximation is a caveat on a published result, not a refusal"
+    );
+    assert!(
+        warning.message.contains("ellipses"),
+        "the warning should name why the exact route is unavailable: {}",
+        warning.message
+    );
+}
+
+/// The exact route must stay silent. A caveat on every cut would be noise, and
+/// noise is how a real caveat gets ignored.
+#[test]
+fn an_exact_cut_publishes_no_approximation_warning() {
+    let box_body = cuboid();
+    let top = face_where(&box_body, |centre| (centre.z - SIZE).abs() < 1.0e-6);
+    let outcome = through_cut_outcome(
+        &box_body,
+        top,
+        PlanarFrame3::new(
+            Point3::new(SIZE / 2.0, SIZE / 2.0, SIZE),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ),
+        "single-cut-warning",
+    );
+    assert!(
+        outcome.report.warnings.is_empty(),
+        "an exact cut must publish no warnings, got {:?}",
+        outcome.report.warnings
     );
 }

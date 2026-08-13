@@ -540,6 +540,11 @@ impl NativeKernel {
             ));
         }
 
+        // Warnings a construction rung wants the caller to see. Most rungs
+        // publish none: a certified result needs no caveat. The faceted
+        // fallback does, because its answer is an approximation and nothing
+        // else in the report distinguishes it from an exact one.
+        let mut warnings = Vec::new();
         let (topology, history_mode) = match &request.command {
             KernelCommand::MakeCuboid {
                 origin,
@@ -806,6 +811,18 @@ impl NativeKernel {
                             request.precision,
                         )
                         .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                        // The result is a tessellation, not a certified solid.
+                        // Say so: every other report this kernel publishes means
+                        // "exact", so a caller with no way to tell the
+                        // difference will quote this body's volume as though it
+                        // were.
+                        warnings.push(approximation_warning(
+                            "FACE_FEATURE_FACETED_APPROXIMATION",
+                            "This cut crosses curved geometry that the exact rewrite cannot split, so the body was \
+                             rebuilt from a tessellation. Its faces, edges, and measures approximate the true solid \
+                             rather than certifying it: two round bores that cross meet in ellipses, which are \
+                             outside this kernel's line-and-circle curve vocabulary.",
+                        ));
                         (topology, None, true)
                     }
                     Err(PlanarProfileInputError::FaceFeature(
@@ -1441,7 +1458,7 @@ impl NativeKernel {
                 }
             },
             validation,
-            warnings: Vec::new(),
+            warnings,
         };
         report.sort_deterministically();
         Ok(ExecutionOutcome { snapshot, report })
@@ -4808,6 +4825,23 @@ fn simple_diagnostic(code: &str, stage: KernelStage, message: &str) -> ProtocolD
         code: ProtocolDiagnosticCode::new(code),
         severity: DiagnosticSeverity::Error,
         stage,
+        message: message.to_owned(),
+        subjects: Vec::new(),
+        path: Vec::new(),
+        measurement: None,
+        details: BTreeMap::new(),
+    }
+}
+
+/// A caveat attached to a published result rather than a refusal of it.
+///
+/// Everything this kernel publishes means "certified" unless it says otherwise,
+/// so the one path that publishes an approximation has to say otherwise.
+fn approximation_warning(code: &str, message: &str) -> ProtocolDiagnostic {
+    ProtocolDiagnostic {
+        code: ProtocolDiagnosticCode::new(code),
+        severity: DiagnosticSeverity::Warning,
+        stage: KernelStage::Construction,
         message: message.to_owned(),
         subjects: Vec::new(),
         path: Vec::new(),

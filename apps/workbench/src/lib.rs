@@ -53,12 +53,13 @@ use artificer_model::{
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
-    EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest, FaceExtrusionOperation, HistoryRelation,
-    KernelCommand, KernelError, KernelErrorCode, KernelStage, MAX_EXTRUSION_PROFILE_VERTICES,
-    MAX_PLANAR_PROFILE_CURVES, MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS,
-    OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2,
-    PlanarRegion2, Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle,
-    RotationQuaternion, SemanticDigest, SnapshotId, TopologyCounts, Vector3,
+    DiagnosticSeverity, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
+    FaceExtrusionOperation, HistoryRelation, KernelCommand, KernelError, KernelErrorCode,
+    KernelStage, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
+    MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarAxis2,
+    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
+    Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle, RotationQuaternion,
+    SemanticDigest, SnapshotId, TopologyCounts, Vector3,
 };
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
@@ -4858,6 +4859,25 @@ impl KernelLabApp {
         bounds_for_points(&points)
     }
 
+    /// The caveat the kernel attached to the displayed body, if it attached
+    /// one.
+    ///
+    /// Read from the report the body was published with rather than cached: a
+    /// cached flag is one more thing to keep in step with rebuild, rollback,
+    /// and suppression. The limitation that leaves is that a later exact
+    /// feature on an already-approximated body clears the caveat, which
+    /// under-reports; approximation is really sticky, and making it so needs
+    /// the document to carry it per feature rather than per displayed body.
+    fn approximated_body_reason(&self) -> Option<&str> {
+        self.displayed
+            .as_ref()?
+            .report
+            .warnings
+            .iter()
+            .find(|warning| warning.severity == DiagnosticSeverity::Warning)
+            .map(|warning| warning.message.as_str())
+    }
+
     fn origin_reference_planes_visible(&self) -> bool {
         // Entering a sketch is the moment the plane choice stops being a
         // question, so the standard planes retire then rather than lingering
@@ -9454,6 +9474,16 @@ impl KernelLabApp {
             .small()
             .color(TEXT),
         );
+        // The caveat belongs beside the number it qualifies, not in a log.
+        if let Some(reason) = self.approximated_body_reason() {
+            ui.label(
+                RichText::new("APPROXIMATE · measures are not certified")
+                    .small()
+                    .strong()
+                    .color(WARN),
+            )
+            .on_hover_text(reason);
+        }
         match properties.mass_grams {
             Some(grams) if grams >= 1000.0 => {
                 ui.label(
@@ -20173,6 +20203,43 @@ mod circle_extrude_repro {
             "one face should be smaller than the whole body"
         );
         assert!(app.frame_selection());
+    }
+
+    /// The measured volume of a faceted body is not the volume of the solid the
+    /// user drew. The number is quoted in the properties panel, so the caveat
+    /// has to be quoted beside it (ADR 0026 rule 4). The kernel side — that a
+    /// crossing cut warns and an exact one does not — is gated in
+    /// crates/kernel/tests/crossing_cut_probe.rs; this pins that the panel
+    /// reads the warning rather than ignoring it.
+    #[test]
+    fn the_properties_panel_quotes_the_kernels_approximation_caveat() {
+        let mut app = KernelLabApp::default();
+        assert_eq!(
+            app.approximated_body_reason(),
+            None,
+            "an exact body must carry no caveat"
+        );
+
+        let displayed = app.displayed.as_mut().expect("the default body");
+        displayed
+            .report
+            .warnings
+            .push(artificer_protocol::Diagnostic {
+                code: artificer_protocol::DiagnosticCode::new("FACE_FEATURE_FACETED_APPROXIMATION"),
+                severity: DiagnosticSeverity::Warning,
+                stage: KernelStage::Construction,
+                message: "rebuilt from a tessellation; its measures approximate the true solid"
+                    .to_owned(),
+                subjects: Vec::new(),
+                path: Vec::new(),
+                measurement: None,
+                details: std::collections::BTreeMap::new(),
+            });
+        assert_eq!(
+            app.approximated_body_reason(),
+            Some("rebuilt from a tessellation; its measures approximate the true solid"),
+            "a warned body must surface its caveat"
+        );
     }
 
     #[test]
