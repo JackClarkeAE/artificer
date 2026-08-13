@@ -127,6 +127,11 @@ fn install_theme_slot(context: &egui::Context, theme: egui::Theme) {
 // Shared chrome widgets
 // ---------------------------------------------------------------------------
 
+/// Every ribbon group reserves the same content height so that the captions
+/// underneath land on one baseline across the whole ribbon. A caption that
+/// floats to wherever its own group happened to end reads as debris.
+pub const RIBBON_GROUP_CONTENT_HEIGHT: f32 = 76.0;
+
 /// One captioned command group inside the ribbon, Office-ribbon style: the
 /// command row sits on top and the muted group caption is centered underneath,
 /// followed by a vertical separator before the next group.
@@ -140,14 +145,19 @@ pub fn ribbon_group<R>(
         ui.horizontal(|ui| {
             let output = ui
                 .vertical(|ui| {
-                    ui.set_min_height(48.0);
                     ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
                     let content = ui.scope(|ui| {
+                        ui.set_min_height(RIBBON_GROUP_CONTENT_HEIGHT);
                         ui.spacing_mut().button_padding = egui::vec2(7.0, 3.0);
                         ui.spacing_mut().interact_size.y = 26.0;
                         ui.visuals_mut().widgets.inactive.bg_fill = Color32::TRANSPARENT;
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-                        ui.horizontal(|ui| contents(ui)).inner
+                        // Top-aligned, so every group's commands start on the
+                        // same line however tall the group turns out to be.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                            contents(ui)
+                        })
+                        .inner
                     });
                     ui.add_space(1.0);
                     // The caption is centered under this group's commands, not

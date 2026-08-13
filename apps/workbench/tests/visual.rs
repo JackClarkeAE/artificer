@@ -394,7 +394,9 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         );
     }
     let viewport_top = harness.get_by_label("Model viewport").rect().top();
-    for label in ["Create sketch", "Extrude", "M  Move", "Home"] {
+    // "Home" now lives on the View tab, so this checks a Model-tab command from
+    // each weight instead: a large one, a primary one, and a small one.
+    for label in ["Create sketch", "Extrude", "M  Move", "Fillet"] {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.height() >= 24.0, "{label} is clipped: {rect:?}");
         assert!(

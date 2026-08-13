@@ -10,6 +10,8 @@ pub use artificer_ui_core::{drag_handle, navigation, presentation, theme};
 pub use artificer_viewport as viewport;
 
 pub mod assembly;
+mod command_icons;
+pub mod commands;
 mod development_log;
 pub mod document_replay;
 mod export;
@@ -1667,6 +1669,13 @@ pub struct KernelLabApp {
     sketch_orbit_peek: bool,
     /// The open model context menu, if one is open.
     model_context_menu: Option<ModelContextMenu>,
+    /// The ribbon tab the user explicitly picked, and the workspace they picked
+    /// it in. `None` means the tab follows the workspace, which is what makes
+    /// the Sketch tab appear the moment a sketch opens; storing the workspace
+    /// alongside the pick is what makes it stop following an old choice when
+    /// the workspace changes, without every mode switch having to remember to
+    /// clear it.
+    ribbon_tab: Option<(WorkbenchMode, commands::RibbonTab)>,
     /// The camera exactly as the sketch had it when the peek began, so the
     /// return flight restores the drawing view rather than recomputing an
     /// approximation of it.
@@ -1784,6 +1793,7 @@ impl Default for KernelLabApp {
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
             model_context_menu: None,
+            ribbon_tab: None,
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
         };
@@ -14263,15 +14273,12 @@ impl eframe::App for KernelLabApp {
             .show(ui, |ui| self.header(ui));
 
         let ribbon_height = if self.shell.visibility().command_ribbon {
-            if self.workbench_mode == WorkbenchMode::Sketch {
-                // Two 32 px icon rows plus the group caption underneath need
-                // their own vertical breathing room. The larger reservation
-                // prevents the second row from overlapping the viewport at
-                // 1040×700.
-                112.0
-            } else {
-                72.0
-            }
+            // Tab strip (20) plus the tallest group in any tab (76: three
+            // stacked 24 px commands, or the sketch grid's two 32 px rows)
+            // plus the caption and the panel's own margins. One reservation
+            // for every tab keeps the viewport rectangle still when the tab
+            // changes; `tests/ui.rs` holds it to the minimum window.
+            140.0
         } else {
             30.0
         };

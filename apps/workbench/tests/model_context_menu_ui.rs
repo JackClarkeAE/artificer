@@ -275,3 +275,51 @@ fn model_context_menu_snapshot() {
     }
     harness.snapshot("workbench_model_context_menu_1280");
 }
+
+/// Each ribbon tab, so the whole command surface is under pixel review rather
+/// than only the tab that happens to open first.
+#[test]
+fn ribbon_tab_snapshots() {
+    let snapshot_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots");
+    let mut harness = Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .with_theme(egui::Theme::Dark)
+        .with_os(egui::os::OperatingSystem::Nix)
+        .with_options(
+            egui_kittest::SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                .failed_pixel_count_threshold(
+                    egui_kittest::OsThreshold::new(0).linux(400).windows(400),
+                ),
+        )
+        .wgpu()
+        .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
+
+    create_extruded_body(&mut harness);
+    click_button(&mut harness, "Extrusion top face");
+    harness.remove_cursor();
+    harness.run();
+    harness.snapshot("workbench_ribbon_model_tab_1280");
+
+    click_button(&mut harness, "View ribbon tab");
+    harness.remove_cursor();
+    harness.run();
+    harness.snapshot("workbench_ribbon_view_tab_1280");
+
+    click_button(&mut harness, "Model ribbon tab");
+    click_button(&mut harness, "Sketch on selected face");
+    for _ in 0..120 {
+        harness.step();
+        if harness.state().workbench_mode() == WorkbenchMode::Sketch {
+            break;
+        }
+    }
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    harness.remove_cursor();
+    harness.run();
+    harness.snapshot("workbench_ribbon_sketch_tab_1280");
+}

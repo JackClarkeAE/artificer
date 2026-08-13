@@ -1,22 +1,56 @@
 //! The workbench command ribbon.
 //!
-//! One captioned command surface across both workspaces: the Model ribbon is a
-//! single row of Office-style captioned groups, and the Sketch ribbon hosts
-//! the compact tool grid beside its completion and view groups. Every command
-//! here only stages intents or immediate presentation changes; kernel
-//! execution stays behind the shared confirmation dispatcher in the crate
-//! root.
+//! A renderer over [`crate::commands::COMMANDS`], not a layout written by hand.
+//! A tab strip picks one taxonomy branch, each tab draws its captioned groups,
+//! and each group draws its commands at one of two weights. Nothing here knows
+//! what any individual command is called or when it applies: the table says how
+//! a command is presented, `command_availability` says whether it can run now,
+//! and `run_command` performs it.
+//!
+//! Every command here only stages intents or immediate presentation changes;
+//! kernel execution stays behind the shared confirmation dispatcher in the
+//! crate root.
 
-use egui::{RichText, Stroke};
+use std::borrow::Cow;
+
+use egui::{FontId, RichText, Sense, Stroke, Vec2, vec2};
 
 use artificer_protocol::BooleanOperation;
 
+use crate::command_icons::{CommandIcon, paint_command_icon};
+use crate::commands::{
+    CommandDescriptor, CommandSize, ModelCommand, RibbonGroupId, RibbonTab, groups_for_tab,
+};
 use crate::presentation::ActiveTool;
 use crate::sketch_toolbar::{
     SketchOperationGate, SketchToolCapabilities, ToolVariant, render_sketch_toolbar,
 };
 use crate::theme::{ACCENT, BORDER, CARD, MUTED, SELECTED_FILL, TEXT, WARN, ribbon_group};
 use crate::{KernelLabApp, SolidFeaturePreset, WorkbenchMode, shell_button_activated, viewport};
+
+/// Whether a command can run right now, and in plain words why not when it
+/// cannot. A disabled control that cannot say why is a dead end.
+pub(crate) enum CommandAvailability {
+    Enabled,
+    Disabled(Cow<'static, str>),
+}
+
+impl CommandAvailability {
+    const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+
+    fn disabled(reason: impl Into<Cow<'static, str>>) -> Self {
+        Self::Disabled(reason.into())
+    }
+}
+
+const LARGE_ICON: f32 = 26.0;
+const LARGE_BUTTON: Vec2 = vec2(62.0, 54.0);
+const SMALL_ICON: f32 = 16.0;
+// 24 px is the smallest hit target the workbench allows itself; the
+// minimum-window guard in `tests/ui.rs` holds every ribbon button to it.
+const SMALL_BUTTON: Vec2 = vec2(86.0, 24.0);
 
 impl KernelLabApp {
     pub(crate) fn command_ribbon(&mut self, ui: &mut egui::Ui) {
@@ -45,381 +79,363 @@ impl KernelLabApp {
             return;
         }
 
-        match self.workbench_mode {
-            // The single-row model ribbon keeps its established vertically
-            // centred placement and therefore does not churn unrelated model
-            // snapshots when the taller Sketch toolbar changes.
-            WorkbenchMode::Model => {
-                ui.horizontal_centered(|ui| {
-                    self.expanded_command_ribbon_contents(ui, operation_pending);
-                });
-            }
-            WorkbenchMode::Sketch => {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                    // Establish the tall sketch ribbon row before the small
-                    // collapse control participates in horizontal layout.
-                    // Otherwise egui can clamp the icon grid to the 28 px
-                    // collapse button and let row two cross the panel edge.
-                    ui.set_min_height(88.0);
-                    self.expanded_command_ribbon_contents(ui, operation_pending);
-                });
-            }
-        }
-    }
-
-    fn expanded_command_ribbon_contents(&mut self, ui: &mut egui::Ui, operation_pending: bool) {
-        let response = ui
-            .add_sized([24.0, 28.0], egui::Button::new("−").frame(false))
-            .on_hover_text("Collapse command ribbon");
-        response.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Collapse command ribbon")
-        });
-        if shell_button_activated(ui, &response, operation_pending) {
-            self.shell.set_command_ribbon(false);
-        }
-        match self.workbench_mode {
-            WorkbenchMode::Model => self.model_command_groups(ui),
-            WorkbenchMode::Sketch => self.sketch_command_groups(ui),
-        }
-    }
-
-    fn model_command_groups(&mut self, ui: &mut egui::Ui) {
-        let transform_tools_available = self.transform_tools_available();
-        ribbon_group(ui, "CREATE", "create_commands", |ui| {
-            let selected_linked_component =
-                self.selected_face.is_some() && self.active_component_instance().is_some();
-            let support_current = self.sketch_support_is_current();
-            let starts_new_origin_sketch = self.selected_face.is_none()
-                && !self.sketch.entities().is_empty()
-                && (self.sketch_finished
-                    || self.extruded_sketch_revision == Some(self.sketch_revision)
-                    || !support_current);
-            let action = if self.selected_face.is_some() {
-                "Sketch on selected face"
-            } else if starts_new_origin_sketch {
-                "New sketch"
-            } else if self.sketch.entities().is_empty() {
-                "Create sketch"
-            } else {
-                "Edit sketch"
-            };
-            let enabled = self.pending_operation.is_none()
-                && self.history_is_at_end()
-                && !selected_linked_component
-                && (support_current || self.selected_face.is_some() || starts_new_origin_sketch);
-            let response = ui.add_enabled(enabled, egui::Button::new(action));
-            let response = if selected_linked_component {
-                response.on_disabled_hover_text(
-                    "Library components are immutable occurrences. Edit the source part or create an independent workspace sketch.",
-                )
-            } else if !support_current && self.selected_face.is_none() && !starts_new_origin_sketch
-            {
-                response.on_disabled_hover_text(
-                    "The prior face sketch is read-only after the body changed. Select a current face to start the next sketch.",
-                )
-            } else {
-                response
-            };
-            if response.clicked() {
-                if starts_new_origin_sketch {
-                    self.begin_new_origin_sketch();
-                } else {
-                    self.enter_sketch_mode();
-                }
-            }
-            let plane_selection_valid = (1..=2).contains(&self.selected_faces.len());
-            let plane = ui
-                .add_enabled(
-                    self.pending_operation.is_none()
-                        && self.history_is_at_end()
-                        && plane_selection_valid,
-                    egui::Button::new("Plane"),
-                )
-                .on_hover_text(
-                    "Construction plane · select one planar face for a coincident plane or two parallel faces for a midplane",
-                );
-            if plane.clicked() {
-                self.stage_construction_plane();
-            }
-        });
-        self.extrude_command_group(ui);
-        ribbon_group(ui, "BOOLEAN", "body_boolean_commands", |ui| {
-            let target = self.active_body_id();
-            let has_tool = target.is_some_and(|target| {
-                self.bodies
-                    .iter()
-                    .any(|body| body.id != target && body.visible)
-            });
-            let enabled = self.pending_operation.is_none()
-                && self.history_is_at_end()
-                && has_tool
-                && self.active_component_instance().is_none();
-            ui.add_enabled_ui(enabled, |ui| {
-                ui.menu_button("Boolean...", |ui| {
-                    for (label, operation) in [
-                        ("Combine", BooleanOperation::Union),
-                        ("Subtract", BooleanOperation::Difference),
-                        ("Intersect", BooleanOperation::Intersection),
-                    ] {
-                        if ui
-                            .button(label)
-                            .on_hover_text(
-                                "Uses the active body as target. Click the tool bodies in the viewport, then confirm.",
-                            )
-                            .clicked()
-                        {
-                            self.stage_body_boolean(operation);
-                            ui.close();
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Boolean operations");
-            });
-            // While a Boolean is staged the group becomes its operand panel:
-            // the picks are the operation's real input and belong on screen,
-            // not only in the status line.
-            if let Some(crate::PendingOperation::BooleanBodies { keep_tools, .. }) =
-                self.pending_operation
-            {
-                let mut keep = keep_tools;
-                if ui
-                    .checkbox(&mut keep, "Keep tools")
-                    .on_hover_text(
-                        "Leave every tool body in the workspace after the Boolean instead of consuming it.",
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let response = ui
+                    .add_sized([24.0, 20.0], egui::Button::new("−").frame(false))
+                    .on_hover_text("Collapse command ribbon");
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        "Collapse command ribbon",
                     )
-                    .changed()
-                {
-                    self.set_boolean_keep_tools(keep);
+                });
+                if shell_button_activated(ui, &response, operation_pending) {
+                    self.shell.set_command_ribbon(false);
                 }
-                ui.label(
-                    egui::RichText::new(self.boolean_operand_summary())
-                        .small()
-                        .color(crate::theme::MUTED),
-                )
-                .on_hover_text("Click a body to add it as a tool; click it again to remove it.");
-            }
-        });
-        ribbon_group(ui, "FEATURES", "solid_feature_presets", |ui| {
-            let free = self.pending_operation.is_none() && self.history_is_at_end();
-            ui.add_enabled_ui(free, |ui| {
-                ui.menu_button("Features...", |ui| {
-                    for (label, preset, enabled) in [
-                        ("Revolve", SolidFeaturePreset::Revolve, true),
-                        (
-                            "Hole",
-                            SolidFeaturePreset::Hole,
-                            self.selected_face.is_some(),
-                        ),
-                        ("Rib", SolidFeaturePreset::Rib, self.selected_face.is_some()),
-                        (
-                            "Mirror",
-                            SolidFeaturePreset::Mirror,
-                            self.active_body_id().is_some(),
-                        ),
-                        (
-                            "Pattern",
-                            SolidFeaturePreset::LinearPattern,
-                            self.active_body_id().is_some(),
-                        ),
-                        (
-                            "Chamfer",
-                            SolidFeaturePreset::Chamfer,
-                            !self.selected_edges.is_empty(),
-                        ),
-                        (
-                            "Fillet",
-                            SolidFeaturePreset::Fillet,
-                            !self.selected_edges.is_empty(),
-                        ),
-                    ] {
-                        let response = ui
-                            .add_enabled(enabled, egui::Button::new(label))
-                            .on_hover_text(preset.detail());
-                        if response.clicked() {
-                            self.stage_preset_feature(preset);
-                            ui.close();
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Solid features");
+                self.ribbon_tab_strip(ui);
             });
-        });
-        ribbon_group(ui, "MODIFY", "transform_commands", |ui| {
-            let component_constraint = self.active_component_instance().and_then(|component| {
-                self.document
-                    .joint_for_child(component.id)
-                    .map(|joint| joint.name.clone())
+            ui.add_space(2.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.add_space(4.0);
+                self.ribbon_groups(ui);
             });
-            for tool in ActiveTool::ALL.into_iter().filter(|tool| {
-                matches!(
-                    tool,
-                    ActiveTool::Move | ActiveTool::Rotate | ActiveTool::Scale
-                )
-            }) {
-                let label = format!("{}  {}", tool.shortcut(), tool.label());
-                let tool_enabled = if tool == ActiveTool::Scale {
-                    self.scale_tool_available()
-                } else {
-                    transform_tools_available
-                };
-                let response = ui.add_enabled(
-                    tool_enabled,
-                    egui::Button::new(tool.shortcut())
-                        .selected(self.active_tool == tool)
-                        .corner_radius(6),
-                );
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Button, tool_enabled, label.clone())
-                });
-                if response.clicked() {
-                    self.active_tool = tool;
-                }
-                if matches!(tool, ActiveTool::Move | ActiveTool::Rotate)
-                    && component_constraint.is_some()
-                {
-                    response.on_disabled_hover_text(format!(
-                        "This component is constrained by {}; joint-coordinate editing comes next.",
-                        component_constraint
-                            .as_deref()
-                            .expect("the constraint was checked above")
-                    ));
-                } else if tool == ActiveTool::Scale && self.active_component_instance().is_some() {
-                    response.on_disabled_hover_text(
-                        "Component occurrences preserve exact authored size; change a part parameter instead.",
-                    );
-                } else {
-                    response.on_hover_text(format!(
-                        "{} transform-preview tool · keyboard {}",
-                        tool.label(),
-                        tool.shortcut()
-                    ));
-                }
-            }
-        });
-        ribbon_group(ui, "SELECT / VIEW", "selection_view_commands", |ui| {
-            for tool in ActiveTool::ALL.into_iter().filter(|tool| {
-                matches!(
-                    tool,
-                    ActiveTool::Select | ActiveTool::Measure | ActiveTool::Orbit
-                )
-            }) {
-                let label = format!("{}  {}", tool.shortcut(), tool.label());
-                let response = ui.add(
-                    egui::Button::new(tool.shortcut())
-                        .selected(self.active_tool == tool)
-                        .corner_radius(6),
-                );
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.clone())
-                });
-                if response.clicked() {
-                    self.active_tool = tool;
-                }
-                response.on_hover_text(tool.label());
-            }
-            if ui
-                .button("Frame")
-                .on_hover_text("Frame all visible bodies")
-                .clicked()
-            {
-                self.frame_visible_body(ui.ctx());
-            }
-            let shaded = self.model_display_mode.is_shaded();
-            let edges = ui
-                .add_enabled(
-                    !shaded,
-                    egui::Button::new("Edges").selected(self.edge_overlay),
-                )
-                .on_hover_text(if shaded {
-                    "Visible grey edges are always enabled in Shaded mode"
-                } else {
-                    "Toggle diagnostic source-edge overlay"
-                });
-            if edges.clicked() {
-                self.edge_overlay = !self.edge_overlay;
-            }
-            if ui
-                .add(egui::Button::new("Shaded").selected(shaded))
-                .on_hover_text(
-                    "Toggle standard grey shaded-with-visible-edges display; diagnostic mode retains face roles and labels",
-                )
-                .clicked()
-            {
-                self.model_display_mode = if shaded {
-                    viewport::ModelDisplayMode::Diagnostic
-                } else {
-                    viewport::ModelDisplayMode::ShadedEdges
-                };
-            }
-        });
-        ribbon_group(ui, "MOTION", "motion_commands", |ui| {
-            let active_motion = self.active_motion_name();
-            let motion_label = if self.motion.playing {
-                "Stop motion"
-            } else {
-                "Play motion"
-            };
-            if ui
-                .button(motion_label)
-                .on_hover_text(format!(
-                    "Play {active_motion} temporarily; Stop restores the authored pose"
-                ))
-                .clicked()
-            {
-                self.toggle_animation(ui.ctx());
-            }
-            if ui.button("Home").on_hover_text("Reset view").clicked() {
-                self.reset_view(ui.ctx());
-            }
         });
     }
 
-    fn sketch_command_groups(&mut self, ui: &mut egui::Ui) {
-        ribbon_group(ui, "SKETCH", "sketch_tool_grid", |ui| {
-            let capabilities = SketchToolCapabilities::default();
-            let gate = if self.pending_operation.is_some() || self.sketch.has_pending_edit() {
-                SketchOperationGate::AwaitingConfirmation
-            } else {
-                SketchOperationGate::Ready
-            };
-            let output = render_sketch_toolbar(
-                ui,
-                &mut self.sketch_toolbar,
-                self.active_sketch_tool,
-                gate,
-                &capabilities,
+    /// The tab strip. Tabs are a taxonomy, not a workspace switch: entering a
+    /// sketch selects the Sketch tab, but the user can read any tab from any
+    /// workspace, and a command that does not apply says so rather than
+    /// disappearing.
+    fn ribbon_tab_strip(&mut self, ui: &mut egui::Ui) {
+        let active = self.active_ribbon_tab();
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for tab in RibbonTab::ALL {
+            let selected = tab == active;
+            let response = ui.add(
+                egui::Button::new(
+                    RichText::new(tab.label())
+                        .font(FontId::proportional(12.5))
+                        .color(if selected { TEXT } else { MUTED }),
+                )
+                .fill(if selected {
+                    CARD
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .stroke(Stroke::new(
+                    1.0,
+                    if selected {
+                        BORDER
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    },
+                ))
+                .corner_radius(3)
+                .min_size(vec2(58.0, 20.0)),
             );
-            if let Some(variant) = output.chosen {
-                self.activate_sketch_tool_variant(variant);
-            }
-        });
-        ribbon_group(ui, "COMPLETE", "sketch_complete_commands", |ui| {
-            let finish_enabled = self.pending_operation.is_none()
-                && !self.sketch_creation_draft_active()
-                && !self.sketch.authoring().operations().is_empty();
-            let response = ui.add_enabled(finish_enabled, egui::Button::new("Finish"));
             response.widget_info(|| {
-                egui::WidgetInfo::labeled(
+                egui::WidgetInfo::selected(
                     egui::WidgetType::Button,
-                    finish_enabled,
-                    "Finish sketch command",
+                    true,
+                    selected,
+                    tab.accessible_name(),
                 )
             });
             if response.clicked() {
-                self.finish_sketch_now();
+                self.ribbon_tab = Some((self.workbench_mode, tab));
             }
-        });
-        self.extrude_command_group(ui);
-        ribbon_group(ui, "VIEW", "sketch_view_commands", |ui| {
-            if ui.button("Frame sketch").clicked() {
-                self.frame_active_sketch();
+        }
+    }
+
+    /// The tab whose commands are showing. Following the workspace by default
+    /// is what makes the Sketch tab appear the moment a sketch opens, the way a
+    /// contextual tab does elsewhere; an explicit pick overrides it until the
+    /// workspace changes again.
+    fn active_ribbon_tab(&self) -> RibbonTab {
+        let workspace_tab = match self.workbench_mode {
+            WorkbenchMode::Model => RibbonTab::Model,
+            WorkbenchMode::Sketch => RibbonTab::Sketch,
+        };
+        self.ribbon_tab
+            .filter(|(mode, _)| *mode == self.workbench_mode)
+            .map_or(workspace_tab, |(_, tab)| tab)
+    }
+
+    fn ribbon_groups(&mut self, ui: &mut egui::Ui) {
+        let tab = self.active_ribbon_tab();
+        // The drawing tools are the sketch crate's own registry-driven toolbar,
+        // rendered whole. It leads the Sketch tab because it is what the tab is
+        // for; every other group here comes from this crate's table.
+        if tab == RibbonTab::Sketch {
+            let group = RibbonGroupId::SketchTools;
+            ribbon_group(ui, group.caption(), group.stable_key(), |ui| {
+                self.sketch_tool_grid(ui);
+            });
+        }
+        for (group, members) in groups_for_tab(tab) {
+            ribbon_group(ui, group.caption(), group.stable_key(), |ui| {
+                self.ribbon_group_commands(ui, group, &members);
+                if group == RibbonGroupId::Boolean {
+                    self.boolean_operand_panel(ui);
+                }
+            });
+        }
+    }
+
+    fn ribbon_group_commands(
+        &mut self,
+        ui: &mut egui::Ui,
+        group: RibbonGroupId,
+        members: &[&'static CommandDescriptor],
+    ) {
+        let large = members
+            .iter()
+            .filter(|descriptor| descriptor.size == CommandSize::Large);
+        for descriptor in large {
+            self.large_command_button(ui, descriptor, group);
+        }
+        let small = members
+            .iter()
+            .filter(|descriptor| descriptor.size == CommandSize::Small)
+            .collect::<Vec<_>>();
+        // Small commands stack three to a column, so a six-command group reads
+        // as one block rather than a long unbroken strip.
+        for column in small.chunks(3) {
+            ui.vertical(|ui| {
+                for descriptor in column {
+                    self.small_command_button(ui, descriptor);
+                }
+            });
+        }
+    }
+
+    fn large_command_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        descriptor: &'static CommandDescriptor,
+        group: RibbonGroupId,
+    ) {
+        let availability = self.command_availability(descriptor.command);
+        let enabled = availability.is_enabled();
+        let active = self.command_is_active(descriptor.command);
+        // The groups that publish geometry carry the ribbon's only emphasis, so
+        // "what do I press to make a solid" is answerable at a glance.
+        let primary = matches!(
+            group,
+            RibbonGroupId::Solid | RibbonGroupId::SketchSolid | RibbonGroupId::Complete
+        );
+        let (response, painter) = ui.allocate_painter(
+            LARGE_BUTTON,
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let rect = response.rect;
+        let hovered = response.hovered() && enabled;
+        let fill = if !enabled {
+            egui::Color32::TRANSPARENT
+        } else if active {
+            SELECTED_FILL
+        } else if hovered {
+            CARD
+        } else if primary {
+            CARD.gamma_multiply(0.7)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        let outline = if active {
+            ACCENT
+        } else if hovered || (primary && enabled) {
+            BORDER
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect(
+            rect,
+            4.0,
+            fill,
+            Stroke::new(1.0, outline),
+            egui::StrokeKind::Inside,
+        );
+        let tint = if enabled {
+            TEXT
+        } else {
+            MUTED.gamma_multiply(0.6)
+        };
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, rect.top() + 6.0 + LARGE_ICON / 2.0),
+            Vec2::splat(LARGE_ICON),
+        );
+        paint_command_icon(
+            &painter,
+            icon_rect,
+            self.command_icon(descriptor),
+            if enabled {
+                ACCENT
+            } else {
+                MUTED.gamma_multiply(0.6)
+            },
+        );
+        painter.text(
+            egui::pos2(rect.center().x, rect.bottom() - 5.0),
+            egui::Align2::CENTER_BOTTOM,
+            self.command_label(descriptor),
+            FontId::proportional(10.5),
+            tint,
+        );
+        self.finish_command_button(ui, response, descriptor, availability);
+    }
+
+    fn small_command_button(&mut self, ui: &mut egui::Ui, descriptor: &'static CommandDescriptor) {
+        let availability = self.command_availability(descriptor.command);
+        let enabled = availability.is_enabled();
+        let active = self.command_is_active(descriptor.command);
+        let (response, painter) = ui.allocate_painter(
+            SMALL_BUTTON,
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let rect = response.rect;
+        let hovered = response.hovered() && enabled;
+        let fill = if !enabled {
+            egui::Color32::TRANSPARENT
+        } else if active {
+            SELECTED_FILL
+        } else if hovered {
+            CARD
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect(
+            rect,
+            3.0,
+            fill,
+            Stroke::new(
+                1.0,
+                if active {
+                    ACCENT
+                } else {
+                    egui::Color32::TRANSPARENT
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 3.0 + SMALL_ICON / 2.0, rect.center().y),
+            Vec2::splat(SMALL_ICON),
+        );
+        paint_command_icon(
+            &painter,
+            icon_rect,
+            self.command_icon(descriptor),
+            if enabled {
+                ACCENT
+            } else {
+                MUTED.gamma_multiply(0.6)
+            },
+        );
+        painter.text(
+            egui::pos2(icon_rect.right() + 5.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            self.command_label(descriptor),
+            FontId::proportional(10.5),
+            if enabled {
+                TEXT
+            } else {
+                MUTED.gamma_multiply(0.6)
+            },
+        );
+        self.finish_command_button(ui, response, descriptor, availability);
+    }
+
+    /// Accessibility, tooltip and activation, identical for both button sizes.
+    fn finish_command_button(
+        &mut self,
+        ui: &egui::Ui,
+        response: egui::Response,
+        descriptor: &'static CommandDescriptor,
+        availability: CommandAvailability,
+    ) {
+        let enabled = availability.is_enabled();
+        let name = self.command_accessible_name(descriptor);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, name));
+        let shortcut = descriptor.shortcut;
+        let tooltip = descriptor.tooltip;
+        let response = match availability {
+            CommandAvailability::Enabled => response.on_hover_ui(|ui| {
+                ui.label(RichText::new(name).strong());
+                ui.label(RichText::new(tooltip).small().color(MUTED));
+                if let Some(shortcut) = shortcut {
+                    ui.label(
+                        RichText::new(format!("Keyboard: {shortcut}"))
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+            }),
+            CommandAvailability::Disabled(reason) => response.on_hover_ui(|ui| {
+                ui.label(RichText::new(name).strong());
+                ui.label(RichText::new(tooltip).small().color(MUTED));
+                ui.label(RichText::new(reason.as_ref()).small().color(WARN));
+            }),
+        };
+        if response.clicked() {
+            self.run_command(descriptor.command, ui.ctx());
+        }
+    }
+
+    fn sketch_tool_grid(&mut self, ui: &mut egui::Ui) {
+        let capabilities = SketchToolCapabilities::default();
+        let gate = if self.pending_operation.is_some() || self.sketch.has_pending_edit() {
+            SketchOperationGate::AwaitingConfirmation
+        } else {
+            SketchOperationGate::Ready
+        };
+        let output = render_sketch_toolbar(
+            ui,
+            &mut self.sketch_toolbar,
+            self.active_sketch_tool,
+            gate,
+            &capabilities,
+        );
+        if let Some(variant) = output.chosen {
+            self.activate_sketch_tool_variant(variant);
+        }
+    }
+
+    /// While a Boolean is staged the group becomes its operand panel: the picks
+    /// are the operation's real input and belong on screen, not only in the
+    /// status line.
+    fn boolean_operand_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(crate::PendingOperation::BooleanBodies { keep_tools, .. }) =
+            self.pending_operation
+        else {
+            return;
+        };
+        ui.vertical(|ui| {
+            let mut keep = keep_tools;
+            if ui
+                .checkbox(&mut keep, "Keep tools")
+                .on_hover_text(
+                    "Leave every tool body in the workspace after the Boolean instead of consuming it.",
+                )
+                .changed()
+            {
+                self.set_boolean_keep_tools(keep);
             }
-            let mut settings = self.sketch.snap_settings();
-            if ui.toggle_value(&mut settings.enabled, "Snap").changed() {
-                self.sketch.set_snap_settings(settings);
-            }
+            ui.label(
+                RichText::new(self.boolean_operand_summary())
+                    .small()
+                    .color(MUTED),
+            )
+            .on_hover_text("Click a body to add it as a tool; click it again to remove it.");
         });
     }
 
@@ -429,90 +445,351 @@ impl KernelLabApp {
         }
     }
 
-    fn extrude_command_group(&mut self, ui: &mut egui::Ui) {
-        ribbon_group(ui, "SOLID", "persistent_extrude_command", |ui| {
-            let linked_sketch_support = self
-                .sketch_support
-                .body()
-                .is_some_and(|body| self.component_for_body(body).is_some());
-            let linked_active_body = self.active_component_instance().is_some();
-            let eligibility = self.sketch_extrusion_eligibility();
-            let already_extruded = self.extruded_sketch_revision == Some(self.sketch_revision);
-            let distance_valid = self.extrusion_distance_is_valid();
-            let sketch_edit_complete =
-                !self.sketch.has_pending_edit() && !self.sketch_creation_draft_active();
-            let sketch_enabled = self.pending_operation.is_none()
-                && self.history_is_at_end()
-                && !already_extruded
-                && distance_valid
-                && sketch_edit_complete
-                && !linked_sketch_support
-                && eligibility.can_stage();
-            let active_sketch_consumed = self
-                .active_sketch_index
-                .and_then(|index| self.sketches.get(index))
-                .is_none_or(|sketch| sketch.consumed);
-            let push_pull_support = self.selected_face_push_pull_support();
-            let push_pull_enabled = self.pending_operation.is_none()
-                && self.history_is_at_end()
-                && self.workbench_mode == WorkbenchMode::Model
-                && distance_valid
-                && active_sketch_consumed
-                && !linked_active_body
-                && push_pull_support.is_some();
-            let enabled = sketch_enabled || push_pull_enabled;
-            let label = if enabled {
-                RichText::new("Extrude").color(TEXT).strong()
-            } else {
-                RichText::new("Extrude").color(MUTED)
-            };
-            let response = ui.add_enabled(
-                enabled,
-                egui::Button::new(label)
-                    .fill(if enabled { SELECTED_FILL } else { CARD })
-                    .stroke(Stroke::new(1.0, if enabled { ACCENT } else { BORDER }))
-                    .corner_radius(4),
-            );
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, "Extrude")
-            });
-            let response = if enabled {
-                response.on_hover_text(if push_pull_enabled {
-                    "Move the complete selected face with a signed live preview."
-                } else if self.sketch_finished {
-                    "Start a live extrusion preview."
-                } else {
-                    "Start a live preview; the green tick finishes the sketch and publishes the extrusion together."
-                })
-            } else {
-                let reason = if self.pending_operation.is_some() {
-                    "Confirm or cancel the pending operation first.".to_owned()
-                } else if !self.history_is_at_end() {
-                    "Move the history marker to the end before creating another feature.".to_owned()
-                } else if !distance_valid {
-                    "Enter a finite, non-zero extrusion distance.".to_owned()
-                } else if linked_sketch_support
-                    || (self.selected_face.is_some() && linked_active_body)
+    // ---- per-command presentation ------------------------------------------
+
+    fn command_icon(&self, descriptor: &CommandDescriptor) -> CommandIcon {
+        match descriptor.command {
+            ModelCommand::PlayMotion if self.motion.playing => CommandIcon::Stop,
+            _ => descriptor.icon,
+        }
+    }
+
+    /// The visible label. Only the two commands whose meaning genuinely changes
+    /// with state override the table.
+    fn command_label(&self, descriptor: &CommandDescriptor) -> &'static str {
+        match descriptor.command {
+            ModelCommand::NewSketch => match self.sketch_entry_action() {
+                SketchEntryAction::OnSelectedFace => "On face",
+                SketchEntryAction::New => "New sketch",
+                SketchEntryAction::Create => "Sketch",
+                SketchEntryAction::Edit => "Edit sketch",
+            },
+            ModelCommand::PlayMotion if self.motion.playing => "Stop",
+            _ => descriptor.label,
+        }
+    }
+
+    /// The accessible name, which is what the UI tests and assistive technology
+    /// use. It stays the long, unambiguous form even where the visible label is
+    /// abbreviated to fit a ribbon button.
+    fn command_accessible_name(&self, descriptor: &CommandDescriptor) -> &'static str {
+        match descriptor.command {
+            ModelCommand::NewSketch => match self.sketch_entry_action() {
+                SketchEntryAction::OnSelectedFace => "Sketch on selected face",
+                SketchEntryAction::New => "New sketch",
+                SketchEntryAction::Create => "Create sketch",
+                SketchEntryAction::Edit => "Edit sketch",
+            },
+            ModelCommand::PlayMotion if self.motion.playing => "Stop motion",
+            _ => descriptor.accessible_name,
+        }
+    }
+
+    fn command_is_active(&self, command: ModelCommand) -> bool {
+        match command {
+            ModelCommand::Move => self.active_tool == ActiveTool::Move,
+            ModelCommand::Rotate => self.active_tool == ActiveTool::Rotate,
+            ModelCommand::Scale => self.active_tool == ActiveTool::Scale,
+            ModelCommand::Select => self.active_tool == ActiveTool::Select,
+            ModelCommand::Measure => self.active_tool == ActiveTool::Measure,
+            ModelCommand::Orbit => self.active_tool == ActiveTool::Orbit,
+            ModelCommand::ToggleEdges => self.edge_overlay && !self.model_display_mode.is_shaded(),
+            ModelCommand::ToggleShaded => self.model_display_mode.is_shaded(),
+            ModelCommand::ToggleSnap => self.sketch.snap_settings().enabled,
+            ModelCommand::ShowBrowser => self.shell.visibility().model_browser,
+            // The properties palette has no hidden state of its own; the
+            // command raises and focuses it, so it is never "on".
+            ModelCommand::ShowHistory => self.shell.visibility().feature_timeline,
+            ModelCommand::PlayMotion => self.motion.playing,
+            _ => false,
+        }
+    }
+
+    /// Which sketch the Create group would open, which decides both its name
+    /// and whether it is available at all.
+    fn sketch_entry_action(&self) -> SketchEntryAction {
+        if self.selected_face.is_some() {
+            return SketchEntryAction::OnSelectedFace;
+        }
+        let starts_new_origin_sketch = !self.sketch.entities().is_empty()
+            && (self.sketch_finished
+                || self.extruded_sketch_revision == Some(self.sketch_revision)
+                || !self.sketch_support_is_current());
+        if starts_new_origin_sketch {
+            SketchEntryAction::New
+        } else if self.sketch.entities().is_empty() {
+            SketchEntryAction::Create
+        } else {
+            SketchEntryAction::Edit
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SketchEntryAction {
+    OnSelectedFace,
+    New,
+    Create,
+    Edit,
+}
+
+impl KernelLabApp {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn command_availability(&self, command: ModelCommand) -> CommandAvailability {
+        // Two conditions gate almost everything that changes the model, so they
+        // are answered once, in the same words, for every command.
+        let free = |app: &Self| -> Option<CommandAvailability> {
+            if app.pending_operation.is_some() {
+                return Some(CommandAvailability::disabled(
+                    "Confirm or cancel the pending operation first.",
+                ));
+            }
+            if !app.history_is_at_end() {
+                return Some(CommandAvailability::disabled(
+                    "Move the history marker to the end before creating another feature.",
+                ));
+            }
+            None
+        };
+        match command {
+            ModelCommand::NewSketch => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self.selected_face.is_some() && self.active_component_instance().is_some() {
+                    return CommandAvailability::disabled(
+                        "Library components are immutable occurrences. Edit the source part or create an independent workspace sketch.",
+                    );
+                }
+                let action = self.sketch_entry_action();
+                if !self.sketch_support_is_current()
+                    && action != SketchEntryAction::OnSelectedFace
+                    && action != SketchEntryAction::New
                 {
-                    "Library component geometry is immutable in this workspace; edit its source definition or place another component.".to_owned()
-                } else if self.selected_face.is_some() && push_pull_support.is_none() {
-                    "Direct push/pull requires one unholed planar extrusion cap.".to_owned()
-                } else if self.selected_face.is_some() && !active_sketch_consumed {
-                    "Finish or consume the active sketch before pushing the selected face."
-                        .to_owned()
-                } else if already_extruded {
-                    "Select an eligible face to push/pull, or create another sketch.".to_owned()
-                } else if !sketch_edit_complete {
-                    "Complete or cancel the active sketch edit first.".to_owned()
+                    return CommandAvailability::disabled(
+                        "The prior face sketch is read-only after the body changed. Select a current face to start the next sketch.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
+            ModelCommand::ConstructionPlane => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if (1..=2).contains(&self.selected_faces.len()) {
+                    CommandAvailability::Enabled
                 } else {
-                    eligibility.visible_reason().unwrap_or_else(|| {
-                        "Create an eligible closed sketch before starting extrusion.".to_owned()
-                    })
-                };
-                response.on_disabled_hover_text(reason)
-            };
-            if response.clicked() {
-                let staged = if sketch_enabled {
+                    CommandAvailability::disabled(
+                        "Select one planar face for a coincident plane, or two parallel faces for a midplane.",
+                    )
+                }
+            }
+            ModelCommand::Extrude => self.extrude_availability(),
+            ModelCommand::Revolve => self.preset_feature_availability(SolidFeaturePreset::Revolve),
+            ModelCommand::Hole => self.preset_feature_availability(SolidFeaturePreset::Hole),
+            ModelCommand::Rib => self.preset_feature_availability(SolidFeaturePreset::Rib),
+            ModelCommand::Mirror => self.preset_feature_availability(SolidFeaturePreset::Mirror),
+            ModelCommand::Pattern => {
+                self.preset_feature_availability(SolidFeaturePreset::LinearPattern)
+            }
+            ModelCommand::Chamfer => self.preset_feature_availability(SolidFeaturePreset::Chamfer),
+            ModelCommand::Fillet => self.preset_feature_availability(SolidFeaturePreset::Fillet),
+            ModelCommand::Combine | ModelCommand::Subtract | ModelCommand::Intersect => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self.active_component_instance().is_some() {
+                    return CommandAvailability::disabled(
+                        "Library component geometry is immutable in this workspace.",
+                    );
+                }
+                let target = self.active_body_id();
+                let has_tool = target.is_some_and(|target| {
+                    self.bodies
+                        .iter()
+                        .any(|body| body.id != target && body.visible)
+                });
+                if has_tool {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled(
+                        "A Boolean needs a second visible body to use as a tool.",
+                    )
+                }
+            }
+            ModelCommand::Move | ModelCommand::Rotate => {
+                if let Some(name) = self
+                    .active_component_instance()
+                    .and_then(|component| self.document.joint_for_child(component.id))
+                    .map(|joint| joint.name.clone())
+                {
+                    return CommandAvailability::disabled(format!(
+                        "This component is constrained by {name}; joint-coordinate editing comes next."
+                    ));
+                }
+                if self.transform_tools_available() {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled("Select a body to transform.")
+                }
+            }
+            ModelCommand::Scale => {
+                if self.active_component_instance().is_some() {
+                    return CommandAvailability::disabled(
+                        "Component occurrences preserve exact authored size; change a part parameter instead.",
+                    );
+                }
+                if self.scale_tool_available() {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled("Select a body to scale.")
+                }
+            }
+            ModelCommand::FinishSketch => {
+                if self.pending_operation.is_some() {
+                    return CommandAvailability::disabled(
+                        "Confirm or cancel the pending operation first.",
+                    );
+                }
+                if self.sketch_creation_draft_active() {
+                    return CommandAvailability::disabled(
+                        "Complete or cancel the stroke in progress first.",
+                    );
+                }
+                if self.sketch.authoring().operations().is_empty() {
+                    return CommandAvailability::disabled("Draw something before finishing.");
+                }
+                CommandAvailability::Enabled
+            }
+            ModelCommand::Select
+            | ModelCommand::Measure
+            | ModelCommand::Orbit
+            | ModelCommand::FrameVisible
+            | ModelCommand::Home
+            | ModelCommand::PlayMotion
+            | ModelCommand::FrameSketch
+            | ModelCommand::ToggleSnap => CommandAvailability::Enabled,
+            ModelCommand::ToggleEdges => {
+                if self.model_display_mode.is_shaded() {
+                    CommandAvailability::disabled(
+                        "Visible grey edges are always enabled in Shaded mode.",
+                    )
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
+            ModelCommand::ToggleShaded
+            | ModelCommand::ShowBrowser
+            | ModelCommand::ShowProperties
+            | ModelCommand::ShowHistory => CommandAvailability::Enabled,
+        }
+    }
+
+    fn preset_feature_availability(&self, preset: SolidFeaturePreset) -> CommandAvailability {
+        if self.pending_operation.is_some() {
+            return CommandAvailability::disabled("Confirm or cancel the pending operation first.");
+        }
+        if !self.history_is_at_end() {
+            return CommandAvailability::disabled(
+                "Move the history marker to the end before creating another feature.",
+            );
+        }
+        let ready = match preset {
+            SolidFeaturePreset::Revolve => true,
+            SolidFeaturePreset::Hole | SolidFeaturePreset::Rib => self.selected_face.is_some(),
+            SolidFeaturePreset::Mirror | SolidFeaturePreset::LinearPattern => {
+                self.active_body_id().is_some()
+            }
+            SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet => {
+                !self.selected_edges.is_empty()
+            }
+        };
+        if ready {
+            CommandAvailability::Enabled
+        } else {
+            CommandAvailability::disabled(match preset {
+                SolidFeaturePreset::Hole | SolidFeaturePreset::Rib => "Select a planar face first.",
+                SolidFeaturePreset::Mirror | SolidFeaturePreset::LinearPattern => {
+                    "Activate a body first."
+                }
+                _ => "Select at least one edge first.",
+            })
+        }
+    }
+
+    /// Extrude is the one command that serves two operations — extruding the
+    /// active sketch and pushing the selected face — so its reasons stay
+    /// enumerated in the order the user is most likely to have hit them.
+    fn extrude_availability(&self) -> CommandAvailability {
+        let linked_sketch_support = self
+            .sketch_support
+            .body()
+            .is_some_and(|body| self.component_for_body(body).is_some());
+        let linked_active_body = self.active_component_instance().is_some();
+        let eligibility = self.sketch_extrusion_eligibility();
+        let already_extruded = self.extruded_sketch_revision == Some(self.sketch_revision);
+        let distance_valid = self.extrusion_distance_is_valid();
+        let sketch_edit_complete =
+            !self.sketch.has_pending_edit() && !self.sketch_creation_draft_active();
+        let sketch_enabled = self.pending_operation.is_none()
+            && self.history_is_at_end()
+            && !already_extruded
+            && distance_valid
+            && sketch_edit_complete
+            && !linked_sketch_support
+            && eligibility.can_stage();
+        let active_sketch_consumed = self
+            .active_sketch_index
+            .and_then(|index| self.sketches.get(index))
+            .is_none_or(|sketch| sketch.consumed);
+        let push_pull_support = self.selected_face_push_pull_support();
+        let push_pull_enabled = self.pending_operation.is_none()
+            && self.history_is_at_end()
+            && self.workbench_mode == WorkbenchMode::Model
+            && distance_valid
+            && active_sketch_consumed
+            && !linked_active_body
+            && push_pull_support.is_some();
+        if sketch_enabled || push_pull_enabled {
+            return CommandAvailability::Enabled;
+        }
+        CommandAvailability::disabled(if self.pending_operation.is_some() {
+            "Confirm or cancel the pending operation first.".to_owned()
+        } else if !self.history_is_at_end() {
+            "Move the history marker to the end before creating another feature.".to_owned()
+        } else if !distance_valid {
+            "Enter a finite, non-zero extrusion distance.".to_owned()
+        } else if linked_sketch_support || (self.selected_face.is_some() && linked_active_body) {
+            "Library component geometry is immutable in this workspace; edit its source definition or place another component.".to_owned()
+        } else if self.selected_face.is_some() && push_pull_support.is_none() {
+            "Direct push/pull requires one unholed planar extrusion cap.".to_owned()
+        } else if self.selected_face.is_some() && !active_sketch_consumed {
+            "Finish or consume the active sketch before pushing the selected face.".to_owned()
+        } else if already_extruded {
+            "Select an eligible face to push/pull, or create another sketch.".to_owned()
+        } else if !sketch_edit_complete {
+            "Complete or cancel the active sketch edit first.".to_owned()
+        } else {
+            eligibility.visible_reason().unwrap_or_else(|| {
+                "Create an eligible closed sketch before starting extrusion.".to_owned()
+            })
+        })
+    }
+
+    fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
+        match command {
+            ModelCommand::NewSketch => {
+                if self.sketch_entry_action() == SketchEntryAction::New {
+                    self.begin_new_origin_sketch();
+                } else {
+                    self.enter_sketch_mode();
+                }
+            }
+            ModelCommand::ConstructionPlane => self.stage_construction_plane(),
+            ModelCommand::Extrude => {
+                let staged = if self.sketch_extrusion_eligibility().can_stage()
+                    && self.extruded_sketch_revision != Some(self.sketch_revision)
+                {
                     self.stage_sketch_extrusion()
                 } else {
                     self.stage_face_push_pull()
@@ -521,6 +798,45 @@ impl KernelLabApp {
                     self.show_properties_tab();
                 }
             }
-        });
+            ModelCommand::Revolve => self.stage_preset_feature(SolidFeaturePreset::Revolve),
+            ModelCommand::Hole => self.stage_preset_feature(SolidFeaturePreset::Hole),
+            ModelCommand::Rib => self.stage_preset_feature(SolidFeaturePreset::Rib),
+            ModelCommand::Mirror => self.stage_preset_feature(SolidFeaturePreset::Mirror),
+            ModelCommand::Pattern => self.stage_preset_feature(SolidFeaturePreset::LinearPattern),
+            ModelCommand::Chamfer => self.stage_preset_feature(SolidFeaturePreset::Chamfer),
+            ModelCommand::Fillet => self.stage_preset_feature(SolidFeaturePreset::Fillet),
+            ModelCommand::Combine => self.stage_body_boolean(BooleanOperation::Union),
+            ModelCommand::Subtract => self.stage_body_boolean(BooleanOperation::Difference),
+            ModelCommand::Intersect => self.stage_body_boolean(BooleanOperation::Intersection),
+            ModelCommand::Move => self.active_tool = ActiveTool::Move,
+            ModelCommand::Rotate => self.active_tool = ActiveTool::Rotate,
+            ModelCommand::Scale => self.active_tool = ActiveTool::Scale,
+            ModelCommand::Select => self.active_tool = ActiveTool::Select,
+            ModelCommand::Measure => self.active_tool = ActiveTool::Measure,
+            ModelCommand::Orbit => self.active_tool = ActiveTool::Orbit,
+            ModelCommand::FrameVisible => self.frame_visible_body(context),
+            ModelCommand::Home => self.reset_view(context),
+            ModelCommand::ToggleEdges => self.edge_overlay = !self.edge_overlay,
+            ModelCommand::ToggleShaded => {
+                self.model_display_mode = if self.model_display_mode.is_shaded() {
+                    viewport::ModelDisplayMode::Diagnostic
+                } else {
+                    viewport::ModelDisplayMode::ShadedEdges
+                };
+            }
+            ModelCommand::PlayMotion => self.toggle_animation(context),
+            ModelCommand::ShowBrowser => self.shell.set_model_browser(true),
+            ModelCommand::ShowProperties => self.show_properties_tab(),
+            ModelCommand::ShowHistory => self.shell.set_feature_timeline(true),
+            ModelCommand::FinishSketch => {
+                self.finish_sketch_now();
+            }
+            ModelCommand::FrameSketch => self.frame_active_sketch(),
+            ModelCommand::ToggleSnap => {
+                let mut settings = self.sketch.snap_settings();
+                settings.enabled = !settings.enabled;
+                self.sketch.set_snap_settings(settings);
+            }
+        }
     }
 }

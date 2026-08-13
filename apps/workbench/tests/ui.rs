@@ -60,6 +60,15 @@ fn minimum_diagnostic_harness() -> Harness<'static, KernelLabApp> {
     harness
 }
 
+/// The ribbon is tabbed, so a test that wants a View-tab command has to open
+/// that tab first — the same trip the user makes.
+fn open_ribbon_tab(harness: &mut Harness<'static, KernelLabApp>, tab: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, tab)
+        .click_accesskit();
+    harness.run();
+}
+
 fn click_tool(harness: &mut Harness<'static, KernelLabApp>, shortcut: &str, label: &str) {
     harness
         .get_by_role_and_label(Role::Button, &format!("{shortcut}  {label}"))
@@ -709,18 +718,31 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
     harness.run();
     let ribbon_bottom = harness.get_by_label("Model viewport").rect().top();
 
-    for label in [
-        "Create sketch",
-        "Extrude",
-        "V  Select",
-        "I  Measure",
-        "O  Orbit",
-        "M  Move",
-        "R  Rotate",
-        "S  Scale",
-        "Play motion",
-        "Home",
+    // Every tab, not just the one that opens first: a ribbon that fits at the
+    // minimum window on one tab and overflows on another is still broken.
+    for (tab, label) in [
+        (None, "Create sketch"),
+        (None, "Extrude"),
+        (None, "Revolve"),
+        (None, "Hole"),
+        (None, "Fillet"),
+        (None, "Combine"),
+        (None, "V  Select"),
+        (None, "I  Measure"),
+        (None, "O  Orbit"),
+        (None, "M  Move"),
+        (None, "R  Rotate"),
+        (None, "S  Scale"),
+        (Some("View ribbon tab"), "Frame"),
+        (Some("View ribbon tab"), "Home"),
+        (Some("View ribbon tab"), "Edges"),
+        (Some("View ribbon tab"), "Shaded"),
+        (Some("View ribbon tab"), "Play motion"),
+        (Some("View ribbon tab"), "Show browser panel"),
     ] {
+        if let Some(tab) = tab {
+            open_ribbon_tab(&mut harness, tab);
+        }
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must have a visible hit region");
         assert!(
@@ -740,6 +762,8 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
             "{label} overlaps the canvas below the command ribbon: {rect:?}"
         );
     }
+    // Leave the ribbon where the rest of this test expects to find it.
+    open_ribbon_tab(&mut harness, "Model ribbon tab");
 
     let clean_viewport = harness.get_by_label("Model viewport").rect();
     assert!(
@@ -1134,6 +1158,7 @@ fn universal_orbit_and_zoom_work_without_leaving_select() {
 #[test]
 fn shaded_display_and_view_cube_controls_are_live_toolbar_actions() {
     let mut harness = harness();
+    open_ribbon_tab(&mut harness, "View ribbon tab");
     assert!(harness.state().shaded_display_enabled());
     harness
         .get_by_role_and_label(Role::Button, "Shaded")
@@ -1241,6 +1266,7 @@ fn orbit_returns_a_face_focused_camera_to_the_visible_document_centre() {
 fn animation_advances_at_fixed_test_time_and_pauses_cleanly() {
     let mut harness = diagnostic_harness();
     open_collapsible(&mut harness, "MOTION");
+    open_ribbon_tab(&mut harness, "View ribbon tab");
     assert!(!harness.state().animation_playing());
 
     harness
