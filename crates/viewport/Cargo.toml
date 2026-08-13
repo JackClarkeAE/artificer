@@ -15,8 +15,15 @@ egui.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
 egui_kittest.workspace = true
 serde_json.workspace = true
+
+[[bench]]
+name = "tangent_group"
+harness = false
 
 [lints]
 workspace = true

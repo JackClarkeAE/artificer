@@ -4867,10 +4867,15 @@ impl KernelLabApp {
         if self.workbench_mode == WorkbenchMode::Sketch {
             return false;
         }
+        // A committed sketch is not a solid feature: it answers "where", not
+        // "what". Retiring the datum planes for it left a finished sketch on a
+        // bodiless document with nothing on screen at all, and the viewport
+        // fell through to its "No committed body" placeholder — which reads as
+        // a failed commit when the commit in fact succeeded.
         self.document
             .active_features()
             .iter()
-            .all(|feature| feature.kind == FeatureKind::Origin)
+            .all(|feature| matches!(feature.kind, FeatureKind::Origin | FeatureKind::Sketch))
     }
 
     fn construction_plane_is_active(&self, plane: &ConstructionPlane) -> bool {
@@ -12874,7 +12879,14 @@ impl KernelLabApp {
                         )
                     })
                     .collect::<Vec<_>>();
-                if body_instances.is_empty() && reference_plane_bounds.is_none() {
+                // A finished sketch is content even when no body exists yet:
+                // the placeholder must not replace the viewport while there is
+                // still something to look at.
+                let sketch_overlay_visible = !sketch_overlays.is_empty();
+                if body_instances.is_empty()
+                    && reference_plane_bounds.is_none()
+                    && !sketch_overlay_visible
+                {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             RichText::new(if self.bodies.is_empty() {

@@ -791,6 +791,18 @@ impl NativeKernel {
                             profile,
                             plane.normal / normal_length * -1.0,
                             *distance,
+                            // NOTE: this is deliberately the request's budget,
+                            // not the clamped `boolean_precision` above, even
+                            // though the comment on that clamp reads as though
+                            // both meshes should share it. Handing the cutter
+                            // the clamped budget halves the fragmentation
+                            // (2959 -> 1551 faces) but drops one bore's panel
+                            // fan below the eight-normal threshold in
+                            // `presentation_prismatic_feature_roles`, so its
+                            // seams stop being recognised as one logical
+                            // cylinder and are drawn as creases instead. Change
+                            // it together with the coplanar merge that removes
+                            // the fan altogether, not before.
                             request.precision,
                         )
                         .map_err(|reason| planar_profile_input_error(input.id, reason))?;
@@ -2363,8 +2375,9 @@ fn presentation_vertex_is_smooth(
 
 fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
     let prismatic_feature_roles = presentation_prismatic_feature_roles(topology);
+    let incident_faces = edge_incident_face_indices(topology);
     let classifications = (0..topology.edges.len())
-        .map(|edge_index| presentation_edge_classification(topology, edge_index))
+        .map(|edge_index| presentation_edge_classification(topology, &incident_faces, edge_index))
         .collect::<Vec<_>>();
     let logical_carrier_subdivision = classifications
         .iter()
@@ -2524,11 +2537,45 @@ struct PresentationEdgeClassification {
 
 #[cfg(test)]
 fn presentation_edge_is_smooth(topology: &Topology, edge_index: usize) -> bool {
-    presentation_edge_classification(topology, edge_index).smooth
+    presentation_edge_classification(topology, &edge_incident_face_indices(topology), edge_index)
+        .smooth
+}
+
+/// The faces incident to every edge, as indices, built in one pass.
+///
+/// The classification below used to answer this per edge by scanning every
+/// face, every loop, and every coedge — quadratic in a body's size, and paid on
+/// every display-scene build. Two crossing round cuts take a box from 6 faces
+/// to nearly three thousand, where the difference is seconds rather than
+/// milliseconds.
+fn edge_incident_face_indices(topology: &Topology) -> Vec<Vec<usize>> {
+    let mut incident = vec![Vec::new(); topology.edges.len()];
+    for (face_index, face) in topology.faces.iter().enumerate() {
+        for loop_key in face.value.loops() {
+            let Some(loop_record) = topology.loops.get(loop_key.0) else {
+                continue;
+            };
+            for coedge_key in &loop_record.value.coedges {
+                let Some(coedge) = topology.coedges.get(coedge_key.0) else {
+                    continue;
+                };
+                let Some(slot) = incident.get_mut(coedge.value.edge.0) else {
+                    continue;
+                };
+                // One face may use an edge through several coedges (a seam
+                // closing on itself); the classification counts faces, not uses.
+                if slot.last() != Some(&face_index) && !slot.contains(&face_index) {
+                    slot.push(face_index);
+                }
+            }
+        }
+    }
+    incident
 }
 
 fn presentation_edge_classification(
     topology: &Topology,
+    incident_faces: &[Vec<usize>],
     edge_index: usize,
 ) -> PresentationEdgeClassification {
     let hard = || PresentationEdgeClassification {
@@ -2536,20 +2583,7 @@ fn presentation_edge_classification(
         coplanar_subdivision: false,
         same_feature_side_role: None,
     };
-    let mut incident_faces = Vec::with_capacity(2);
-    for (face_index, face) in topology.faces.iter().enumerate() {
-        let uses_edge = face.value.loops().any(|loop_key| {
-            topology.loops[loop_key.0]
-                .value
-                .coedges
-                .iter()
-                .any(|coedge_key| topology.coedges[coedge_key.0].value.edge.0 == edge_index)
-        });
-        if uses_edge {
-            incident_faces.push(face_index);
-        }
-    }
-    let [first, second] = incident_faces.as_slice() else {
+    let Some([first, second]) = incident_faces.get(edge_index).map(Vec::as_slice) else {
         return hard();
     };
     let endpoints = topology.edges[edge_index].value.endpoints();
@@ -9927,8 +9961,9 @@ mod tests {
             "each circle cut must publish one coherent prismatic carrier"
         );
         let smooth = presentation_smooth_edge_flags(topology);
+        let incidence = edge_incident_face_indices(topology);
         assert!(smooth.iter().enumerate().all(|(edge_index, smooth)| {
-            let classification = presentation_edge_classification(topology, edge_index);
+            let classification = presentation_edge_classification(topology, &incidence, edge_index);
             classification
                 .same_feature_side_role
                 .filter(|role| prismatic_roles.contains(role))

@@ -25,6 +25,9 @@ const POSITIVE_X: Color32 = Color32::from_rgb(118, 124, 186);
 const POSITIVE_Y: Color32 = Color32::from_rgb(86, 150, 152);
 const SELECTED: Color32 = Color32::from_rgb(46, 132, 210);
 const HOVERED: Color32 = Color32::from_rgb(126, 188, 236);
+/// The hover colour used for line work, which must out-contrast a near-black
+/// edge on a pale background rather than wash it out.
+const HOVERED_EDGE_CORE: Color32 = Color32::from_rgb(17, 105, 184);
 const AXIS_X: Color32 = Color32::from_rgb(244, 111, 111);
 const AXIS_Y: Color32 = Color32::from_rgb(102, 210, 151);
 const AXIS_Z: Color32 = Color32::from_rgb(103, 168, 255);
@@ -2882,9 +2885,14 @@ fn edge_presentation_strokes(
         );
     }
     if hovered {
+        // An ordinary edge is near-black on a pale viewport, so the pale hover
+        // blue was *lower* contrast than the edge it replaced: hovering made an
+        // edge harder to see rather than easier. The core stroke is the
+        // saturated hover colour and the pale one becomes the halo around it,
+        // which is the way round that reads as a highlight on a light theme.
         return (
-            Stroke::new(3.0, HOVERED),
-            Some(Stroke::new(7.0, HOVERED.gamma_multiply(0.24))),
+            Stroke::new(3.0, HOVERED_EDGE_CORE),
+            Some(Stroke::new(7.0, HOVERED.gamma_multiply(0.45))),
         );
     }
     let weight = |interior: f32| {
@@ -3772,11 +3780,50 @@ pub fn tangent_face_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
                 .any(|point| vector_length(vector_between(*point, *endpoint)) <= tolerance)
         })
     };
+
+    // Index the triangles by where their vertices sit before asking which ones
+    // an edge touches. Scanning every triangle for every smooth edge is
+    // quadratic, and a body that has fallen back to faceting has thousands of
+    // both: the same hovered face cost a fifth of a second per frame. The cell
+    // is the match tolerance itself and the neighbourhood is the surrounding
+    // 27, so no pair within tolerance can fall outside the candidates and the
+    // exact test below still decides every case.
+    let cell_of = |point: Point3| {
+        [
+            (point.x / tolerance).floor() as i64,
+            (point.y / tolerance).floor() as i64,
+            (point.z / tolerance).floor() as i64,
+        ]
+    };
+    let mut buckets = HashMap::<[i64; 3], Vec<usize>>::new();
+    for (index, triangle) in scene.triangles.iter().enumerate() {
+        for vertex in triangle.vertices {
+            let bucket = buckets.entry(cell_of(vertex)).or_default();
+            if bucket.last() != Some(&index) {
+                bucket.push(index);
+            }
+        }
+    }
+
     let mut adjacency = BTreeMap::<EntityRef, BTreeSet<EntityRef>>::new();
+    let mut candidates = Vec::new();
     for edge in scene.edges.iter().filter(|edge| edge.is_smooth) {
-        let faces = scene
-            .triangles
+        candidates.clear();
+        let [origin_x, origin_y, origin_z] = cell_of(edge.endpoints[0]);
+        for x in -1..=1 {
+            for y in -1..=1 {
+                for z in -1..=1 {
+                    if let Some(bucket) = buckets.get(&[origin_x + x, origin_y + y, origin_z + z]) {
+                        candidates.extend_from_slice(bucket);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let faces = candidates
             .iter()
+            .map(|index| &scene.triangles[*index])
             .filter(|triangle| contains_segment(triangle, edge.endpoints))
             .map(|triangle| triangle.source_face)
             .collect::<BTreeSet<_>>();
@@ -3801,7 +3848,11 @@ pub fn tangent_face_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
 }
 
 fn edge_at_position(edge_frame: &EdgeFrameCache, position: Pos2) -> Option<DocumentEdgeSelection> {
-    const HIT_RADIUS: f32 = 9.0;
+    // An edge is a one-pixel line: it needs a wider aperture than a face,
+    // which is a whole region, and than a vertex, which is a visible disc the
+    // user can aim at. Nine points was narrower than the vertex disc it has to
+    // compete with, so edges near a corner were effectively unreachable.
+    const HIT_RADIUS: f32 = 14.0;
     let mut closest = None::<(f32, DocumentEdgeSelection)>;
     for (body, edges) in &edge_frame.by_body {
         for edge in edges {
@@ -6688,7 +6739,30 @@ mod tests {
         assert!(ordinary_halo.is_none());
         assert!(hovered.width > ordinary.width * 2.0);
         assert!(hovered_halo.width > hovered.width * 2.0);
-        assert_eq!(hovered.color, HOVERED);
+
+        // The point of a highlight is contrast against the background, not
+        // brightness in the abstract. The viewport is pale, so the hovered
+        // stroke has to be dark enough to read on it — the pale hover tint it
+        // used to use was lighter than the near-black edge it replaced, which
+        // is why hovering appeared to do nothing.
+        let luminance = |colour: Color32| {
+            0.2126f32.mul_add(
+                f32::from(colour.r()),
+                0.7152f32.mul_add(f32::from(colour.g()), 0.0722 * f32::from(colour.b())),
+            )
+        };
+        assert!(
+            luminance(hovered.color) < luminance(HOVERED),
+            "the hovered stroke must be darker than the pale hover tint to read on a light viewport"
+        );
+        assert!(
+            hovered_halo.color.a() < u8::MAX,
+            "the halo is the translucent half of the pair"
+        );
+        assert_ne!(
+            hovered.color, ordinary.color,
+            "hovering must change the edge's colour"
+        );
     }
 
     #[test]

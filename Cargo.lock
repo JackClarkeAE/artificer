@@ -352,6 +352,7 @@ dependencies = [
  "artificer-kernel",
  "artificer-protocol",
  "artificer-ui-core",
+ "criterion",
  "egui",
  "egui_kittest",
  "serde",
