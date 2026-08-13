@@ -86,7 +86,9 @@ fn arm_dimension_tool(harness: &mut Harness<'static, KernelLabApp>) {
 /// Type into whichever dimension box currently holds the caret.
 fn type_into_armed_box(harness: &mut Harness<'static, KernelLabApp>, label: &str, value: &str) {
     assert!(
-        harness.get_by_role_and_label(Role::TextInput, label).is_focused(),
+        harness
+            .get_by_role_and_label(Role::TextInput, label)
+            .is_focused(),
         "{label} should hold the caret"
     );
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);

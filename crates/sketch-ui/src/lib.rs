@@ -4932,7 +4932,9 @@ impl SketchCanvasState {
     /// the value is accepted.
     #[must_use]
     pub fn selected_recipe_edit_pending(&self) -> bool {
-        self.pending.as_ref().is_some_and(|pending| pending.in_place)
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.in_place)
     }
 
     /// Drops a typed parameter preview and puts every retained buffer back to
@@ -9214,9 +9216,7 @@ pub fn show_with_context(
                         // does not read `selection_changed`, so re-picking a
                         // curve that is already selected re-arms it. A staged
                         // candidate owns the boxes, so it is left alone.
-                        if state.exact_tool == ToolVariant::Dimension
-                            && state.pending.is_none()
-                        {
+                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
                             state.focus_dimension_box = first_armed_dimension_kind(state);
                         }
                     } else {
@@ -10929,13 +10929,14 @@ fn show_dimension_widgets(
         // The text is the literal that will be replayed, so what is typed is
         // exactly what the kernel receives. Bind it first: the shared borrow
         // of `state` has to end before the edit below takes it mutably.
-        let committed = committed_dimension_parameter(state, layout.readout.kind).map(|parameter| {
-            (
-                parameter.stable_key,
-                parameter.text.clone(),
-                parameter.error.map(RecipeParameterError::label),
-            )
-        });
+        let committed =
+            committed_dimension_parameter(state, layout.readout.kind).map(|parameter| {
+                (
+                    parameter.stable_key,
+                    parameter.text.clone(),
+                    parameter.error.map(RecipeParameterError::label),
+                )
+            });
         if let Some((stable_key, mut text, error)) = committed {
             // An armed box still has to read as a dimension, so it keeps the
             // plate and leader the read-only boxes use and the field is drawn
@@ -10967,7 +10968,11 @@ fn show_dimension_widgets(
                     .horizontal_align(egui::Align::Center)
                     .background_color(Color32::TRANSPARENT)
                     .font(FontId::monospace(11.0))
-                    .text_color(if error.is_some() { INVALID } else { DIMENSION_LOCKED }),
+                    .text_color(if error.is_some() {
+                        INVALID
+                    } else {
+                        DIMENSION_LOCKED
+                    }),
             );
             response.ctx.accesskit_node_builder(response.id, |node| {
                 node.set_label(layout.readout.kind.label());

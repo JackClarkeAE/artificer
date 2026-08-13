@@ -291,6 +291,26 @@ pub struct DocumentViewportOutput {
     pub edge_finish_distance_delta: Option<f64>,
     pub selected_sketch_region: Option<ModelSketchRegionSelection>,
     pub selected_reference_plane: Option<ReferencePlaneSelection>,
+    pub context_click: Option<ViewportContextClick>,
+}
+
+/// What one secondary click in the model viewport landed on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewportContextTarget {
+    Vertex(DocumentVertexSelection),
+    Edge(DocumentEdgeSelection),
+    Face(DocumentFaceSelection),
+    Empty,
+}
+
+/// One secondary click, reported so the shell can raise a menu over it.
+///
+/// The viewport resolves *what* was clicked and deliberately owns no menu: the
+/// commands a menu offers are document commands, and those live in the shell.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportContextClick {
+    pub position: Pos2,
+    pub target: ViewportContextTarget,
 }
 
 /// Typed identity returned when a visible datum plane is picked directly in
@@ -1344,6 +1364,20 @@ fn show_document_impl(
         node.set_description(accessible_tool_description(interaction_tool));
     });
 
+    // Sampled before the early returns below: with every body hidden there is
+    // nothing to pick, but the shell still needs the click so its menu can
+    // offer to show them again.
+    let canvas_secondary_click = canvas
+        .clicked_by(PointerButton::Secondary)
+        .then(|| canvas.interact_pointer_pos())
+        .flatten();
+    let empty_context_click = || {
+        canvas_secondary_click.map(|position| ViewportContextClick {
+            position,
+            target: ViewportContextTarget::Empty,
+        })
+    };
+
     // Per-body committed poses make snapshot-local aggregate bounds stale.
     // Prefer occurrence-aware bounds whenever display geometry is available;
     // retain the reported value only as a legacy/empty-scene fallback.
@@ -1359,13 +1393,19 @@ fn show_document_impl(
         if let Some(state) = feature_drag_state.as_deref_mut() {
             state.cancel();
         }
-        return DocumentViewportOutput::default();
+        return DocumentViewportOutput {
+            context_click: empty_context_click(),
+            ..DocumentViewportOutput::default()
+        };
     };
     let Some(projection) = projection_for_view(*view, canvas.rect) else {
         if let Some(state) = feature_drag_state.as_deref_mut() {
             state.cancel();
         }
-        return DocumentViewportOutput::default();
+        return DocumentViewportOutput {
+            context_click: empty_context_click(),
+            ..DocumentViewportOutput::default()
+        };
     };
 
     let feature_presentation = feature_preview.map(|_| {
@@ -1827,6 +1867,11 @@ fn show_document_impl(
     }
 
     let mut selected_from_ui = clicked;
+    // The secondary-button twin of `selected_from_ui`: the per-face
+    // accessibility rects below sense clicks, and egui's hit test is
+    // button-agnostic, so while the pointer is inside one of them the canvas
+    // never sees the secondary click at all.
+    let mut secondary_from_face_label: Option<Pos2> = None;
     // Accessible face targets and diagnostic labels are rebuilt once the
     // camera gesture ends. Omitting that source-face map during orbit avoids
     // allocating thousands of transient hit regions for a faceted Boolean
@@ -1877,6 +1922,9 @@ fn show_document_impl(
                     input.has_accesskit_action_request(response.id, egui::accesskit::Action::Click)
                 });
                 let primary_clicked = response.clicked_by(PointerButton::Primary);
+                if response.clicked_by(PointerButton::Secondary) {
+                    secondary_from_face_label = response.interact_pointer_pos();
+                }
                 let geometric = primary_clicked
                     .then(|| response.interact_pointer_pos())
                     .flatten()
@@ -1928,6 +1976,44 @@ fn show_document_impl(
     }
     paint_axes(&painter, canvas.rect, *view);
     paint_tool_hint(&painter, canvas.rect, interaction_tool);
+    // A secondary click is a menu gesture, never a camera gesture: egui only
+    // reports `clicked_by` once it has ruled out a drag, so the right-drag
+    // orbit binding keeps working untouched. The pick is re-run from the
+    // pointer position rather than reusing `hover_position`, which a hovered
+    // feature handle suppresses.
+    let context_pointer = if feature_interaction.consumes_primary {
+        None
+    } else {
+        canvas_secondary_click.or(secondary_from_face_label)
+    };
+    let context_click = context_pointer.map(|position| {
+        // Resolving a target is gated to Select for the same reason the
+        // primary picks are: in Measure, Orbit, or a transform tool a
+        // right-click must not quietly replace the selection those tools are
+        // working on. Every tool still gets a menu; outside Select it simply
+        // describes nothing under the pointer.
+        let target = (active_tool == ActiveTool::Select)
+            .then(|| {
+                vertex_at_position(
+                    bodies,
+                    active_body,
+                    *active_display_transform,
+                    *view,
+                    animation_phase,
+                    projection,
+                    &triangles,
+                    position,
+                )
+                .map(ViewportContextTarget::Vertex)
+                .or_else(|| {
+                    edge_at_position(&edge_frame, position).map(ViewportContextTarget::Edge)
+                })
+                .or_else(|| face_at_position(&triangles, position).map(ViewportContextTarget::Face))
+            })
+            .flatten()
+            .unwrap_or(ViewportContextTarget::Empty);
+        ViewportContextClick { position, target }
+    });
     DocumentViewportOutput {
         selected_face: selected_from_ui,
         selected_edge: clicked_edge,
@@ -1936,6 +2022,7 @@ fn show_document_impl(
         edge_finish_distance_delta,
         selected_sketch_region,
         selected_reference_plane,
+        context_click,
     }
 }
 
@@ -6936,6 +7023,136 @@ mod tests {
         assert!(finished.consumes_primary);
         assert_eq!(finished.event.unwrap().phase, FeatureDragPhase::Finished);
         assert!(!state.is_active());
+    }
+
+    /// A stationary right-click is a menu gesture and a right-drag is still an
+    /// orbit. The second half is the one thing this feature could plausibly
+    /// break, so it is pinned in the crate that owns the binding.
+    #[test]
+    fn a_secondary_click_reports_a_context_target_and_a_secondary_drag_still_orbits() {
+        struct Fixture {
+            scene: DebugScene,
+            bounds: Aabb3,
+            pivot: Point3,
+            transform: DisplayTransform,
+            view: ViewState,
+            drag: FeaturePreviewDragState,
+            edge_frame_memo: Option<EdgeFrameMemo>,
+            last_context: Option<ViewportContextClick>,
+        }
+
+        let (scene, bounds, pivot) = cuboid_scene_fixture();
+        let mut view = ViewState::default();
+        view.frame(bounds);
+        let mut harness = Harness::builder()
+            .with_size([900.0, 650.0])
+            .with_step_dt(1.0 / 60.0)
+            .build_ui_state(
+                |ui, state| {
+                    let body = BodyInstanceKey::new(1);
+                    let bodies = [DocumentBodyInstance::new(
+                        body,
+                        &state.scene,
+                        Some(state.bounds),
+                        state.pivot,
+                    )];
+                    let output = show_document_with_feature_drag(
+                        ui,
+                        &bodies,
+                        Some(state.bounds),
+                        true,
+                        ModelDisplayMode::ShadedEdges,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        &[],
+                        Some(body),
+                        ActiveTool::Select,
+                        &mut state.transform,
+                        &mut state.view,
+                        0.0,
+                        None,
+                        &[],
+                        &[],
+                        None,
+                        None,
+                        &mut state.drag,
+                        &mut state.edge_frame_memo,
+                        artificer_ui_core::navigation::NavigationPreset::Artificer,
+                    );
+                    if output.context_click.is_some() {
+                        state.last_context = output.context_click;
+                    }
+                },
+                Fixture {
+                    scene,
+                    bounds,
+                    pivot,
+                    edge_frame_memo: None,
+                    transform: DisplayTransform::default(),
+                    view,
+                    drag: FeaturePreviewDragState::default(),
+                    last_context: None,
+                },
+            );
+        harness.run();
+        let centre = harness.ctx.content_rect().center();
+        harness.event(egui::Event::PointerMoved(centre));
+        harness.step();
+
+        // Press and release inside one frame: egui never treats that as a drag.
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: centre,
+                button: PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+        let click = harness
+            .state()
+            .last_context
+            .expect("a stationary right-click reports where it landed");
+        assert!(
+            (click.position - centre).abs().max_elem() <= 1.0,
+            "the reported position is where the pointer was"
+        );
+        assert_ne!(
+            click.target,
+            ViewportContextTarget::Empty,
+            "a right-click on the body resolves to something on it"
+        );
+
+        harness.state_mut().last_context = None;
+        let yaw_before = harness.state().view.yaw;
+        harness.event(egui::Event::PointerButton {
+            pos: centre,
+            button: PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        let dragged = centre + Vec2::new(46.0, -25.0);
+        harness.event(egui::Event::PointerMoved(dragged));
+        harness.step();
+        harness.event(egui::Event::PointerButton {
+            pos: dragged,
+            button: PointerButton::Secondary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+        assert!(
+            harness.state().last_context.is_none(),
+            "a right-drag is an orbit, not a menu gesture"
+        );
+        assert!(
+            (harness.state().view.yaw - yaw_before).abs() > f64::EPSILON,
+            "the right-drag orbit binding still turns the camera"
+        );
     }
 
     #[test]

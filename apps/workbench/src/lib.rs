@@ -1419,6 +1419,48 @@ struct ArchivedFeatureReport {
     report: OperationReport,
 }
 
+/// The model-viewport context menu, anchored where the user right-clicked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModelContextMenu {
+    position: egui::Pos2,
+    target: viewport::ViewportContextTarget,
+    /// The right-click that opened the menu is still in this frame's input, so
+    /// a "was anything clicked elsewhere" test would close the menu on the very
+    /// frame it appears.
+    just_opened: bool,
+}
+
+/// One command the model context menu offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelContextCommand {
+    NormalToFace,
+    SketchOnFace,
+    ZoomToSelection,
+    HideBody,
+    IsolateBody,
+    ShowAllBodies,
+    ClearSelection,
+    ZoomToFit,
+}
+
+impl ModelContextCommand {
+    /// The visible label, which is also the accessible name. Each one is
+    /// distinct from every other accessible name in the shell, because an
+    /// ambiguous name is not a name.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NormalToFace => "Normal to face",
+            Self::SketchOnFace => "Sketch on this face",
+            Self::ZoomToSelection => "Zoom to selection",
+            Self::HideBody => "Hide this body",
+            Self::IsolateBody => "Isolate this body",
+            Self::ShowAllBodies => "Show all bodies",
+            Self::ClearSelection => "Clear face, edge and vertex selection",
+            Self::ZoomToFit => "Zoom to fit",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorkbenchBody {
     id: BodyId,
@@ -1623,6 +1665,8 @@ pub struct KernelLabApp {
     /// for the live 3D viewport so the sketch is visible in relation to the
     /// rest of the part; releasing flies the camera back onto the plane.
     sketch_orbit_peek: bool,
+    /// The open model context menu, if one is open.
+    model_context_menu: Option<ModelContextMenu>,
     /// The camera exactly as the sketch had it when the peek began, so the
     /// return flight restores the drawing view rather than recomputing an
     /// approximation of it.
@@ -1739,6 +1783,7 @@ impl Default for KernelLabApp {
             camera_before_plane_sketch: None,
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
+            model_context_menu: None,
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
         };
@@ -2223,6 +2268,21 @@ impl KernelLabApp {
             .iter()
             .find(|triangle| triangle.source_face == selected)
             .map(|triangle| triangle.role)
+    }
+
+    /// The commands the open model context menu is offering, in order. Empty
+    /// when no menu is open, so a test can assert both that an item is present
+    /// and that one is absent.
+    #[must_use]
+    pub fn model_context_menu_labels(&self) -> Vec<&'static str> {
+        self.model_context_menu
+            .map(|menu| {
+                self.model_context_commands(menu)
+                    .into_iter()
+                    .map(ModelContextCommand::label)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -6212,15 +6272,15 @@ impl KernelLabApp {
         &self,
         pending: &PendingFaceSketch,
     ) -> Option<(PlanarFrame3, Point3, f64)> {
-        let pivot = self.body_pivot?;
-        let presented_frame = presented_planar_frame(
-            pending.support.frame,
-            pivot,
-            self.display_transform,
-            self.motion.phase,
-        )?;
-        let unit_scale = vector_length(presented_frame.u)?;
         if let (Some(view), Some(size)) = (pending.fitted_view, self.last_model_viewport_size) {
+            let pivot = self.body_pivot?;
+            let presented_frame = presented_planar_frame(
+                pending.support.frame,
+                pivot,
+                self.display_transform,
+                self.motion.phase,
+            )?;
+            let unit_scale = vector_length(presented_frame.u)?;
             let raw_focus = frame_point(
                 pending.support.frame,
                 ProtocolPoint2::new(view.center.u, view.center.v),
@@ -6236,11 +6296,74 @@ impl KernelLabApp {
                 fit_radius,
             ));
         }
-        let (raw_focus, raw_radius) = face_support_focus(&pending.support)?;
+        self.face_support_camera_target(&pending.support)
+    }
+
+    /// The presented frame, focus, and framing radius that put one planar face
+    /// square to the camera. Shared so "Normal to face" and starting a face
+    /// sketch can never disagree about where the camera should end up.
+    fn face_support_camera_target(
+        &self,
+        support: &PlanarFaceSupport,
+    ) -> Option<(PlanarFrame3, Point3, f64)> {
+        let pivot = self.body_pivot?;
+        let presented_frame = presented_planar_frame(
+            support.frame,
+            pivot,
+            self.display_transform,
+            self.motion.phase,
+        )?;
+        let unit_scale = vector_length(presented_frame.u)?;
+        let (raw_focus, raw_radius) = face_support_focus(support)?;
         let focus = self
             .display_transform
             .present_point(raw_focus, pivot, self.motion.phase);
         Some((presented_frame, focus, raw_radius * unit_scale))
+    }
+
+    /// The camera target that would put the selected face square to the
+    /// viewer, or `None` when it has no exact planar support to align to.
+    ///
+    /// Recomputed rather than captured: the answer is measured in the display
+    /// transform and the motion phase, and a captured one goes stale in both.
+    fn selected_face_camera_target(&self) -> Option<(PlanarFrame3, Point3, f64)> {
+        let face = self.selected_face?;
+        let body = self.displayed.as_ref()?;
+        let support = NativeKernel::planar_face_support(&body.snapshot, face).ok()?;
+        self.face_support_camera_target(&support)
+    }
+
+    /// Flies the camera square to the selected planar face — the SolidWorks
+    /// "Normal To" gesture, running through the same transition a face sketch
+    /// uses so the two read as one motion.
+    ///
+    /// Returns `false` when there is nothing to align to, so the caller can say
+    /// so rather than appearing to do nothing. Nothing is mutated before that
+    /// is known: a refusal must not leave the inspection motion stopped.
+    fn view_normal_to_selected_face(&mut self) -> bool {
+        let Some((frame, focus, fit_radius)) = self.selected_face_camera_target() else {
+            return false;
+        };
+        let transition = self
+            .animate_face_camera_transitions
+            .then(|| CameraTransition::face_aligned(self.view, frame, focus, fit_radius))
+            .flatten();
+        let instant = self.view.face_aligned_target(frame, focus, fit_radius);
+        if transition.is_none() && instant.is_none() {
+            return false;
+        }
+        // The target is measured at one animation phase. Letting the inspection
+        // motion keep running would slide the face back off-axis the instant
+        // the camera arrived, which is what the face-sketch flights pause for.
+        self.motion.pause();
+        self.last_motion_time = None;
+        if let Some(transition) = transition {
+            self.face_camera_transition = Some(transition);
+            self.last_face_camera_time = None;
+        } else if let Some(target) = instant {
+            self.view = target;
+        }
+        true
     }
 
     fn advance_face_camera_transition(&mut self, context: &egui::Context) -> bool {
@@ -9195,6 +9318,77 @@ impl KernelLabApp {
         };
         self.view.frame(bounds);
         true
+    }
+
+    /// The body a context click landed on, if it landed on one.
+    fn context_target_body_index(&self, target: viewport::ViewportContextTarget) -> Option<usize> {
+        let key = match target {
+            viewport::ViewportContextTarget::Vertex(selection) => selection.body,
+            viewport::ViewportContextTarget::Edge(selection) => selection.body,
+            viewport::ViewportContextTarget::Face(selection) => selection.body,
+            viewport::ViewportContextTarget::Empty => return None,
+        };
+        self.bodies
+            .iter()
+            .position(|body| body.id.get() == key.get())
+    }
+
+    /// Whether `enter_sketch_mode` would actually open a sketch on the selected
+    /// face rather than refusing at one of its guards. The planar-support term
+    /// is the same kernel answer "Normal to face" needs, so the two items can
+    /// never disagree about whether this face is flat.
+    fn face_sketch_available(&self) -> bool {
+        self.selected_face.is_some()
+            && self.pending_operation.is_none()
+            && self.history_is_at_end()
+            && self.active_component_instance().is_none()
+            && self.active_document_sketch_is_available()
+            && self
+                .selected_face
+                .zip(self.displayed.as_ref())
+                .is_some_and(|(face, body)| {
+                    NativeKernel::planar_face_support(&body.snapshot, face).is_ok()
+                })
+    }
+
+    /// The commands that apply to the current selection right now.
+    ///
+    /// Inapplicable commands are omitted rather than greyed out: a context menu
+    /// is read at the speed of a glance, and a list that changes length says
+    /// what is possible faster than a list that changes colour.
+    fn model_context_commands(&self, menu: ModelContextMenu) -> Vec<ModelContextCommand> {
+        let mut commands = Vec::new();
+        if self.selected_face_camera_target().is_some() {
+            commands.push(ModelContextCommand::NormalToFace);
+        }
+        if self.face_sketch_available() {
+            commands.push(ModelContextCommand::SketchOnFace);
+        }
+        if self.selection_world_bounds().is_some() {
+            commands.push(ModelContextCommand::ZoomToSelection);
+        }
+        if let Some(index) = self.context_target_body_index(menu.target) {
+            commands.push(ModelContextCommand::HideBody);
+            if self
+                .bodies
+                .iter()
+                .enumerate()
+                .any(|(other, body)| other != index && body.visible)
+            {
+                commands.push(ModelContextCommand::IsolateBody);
+            }
+        }
+        if self.bodies.iter().any(|body| !body.visible) {
+            commands.push(ModelContextCommand::ShowAllBodies);
+        }
+        if !self.selected_faces.is_empty()
+            || !self.selected_edges.is_empty()
+            || !self.selected_vertices.is_empty()
+        {
+            commands.push(ModelContextCommand::ClearSelection);
+        }
+        commands.push(ModelContextCommand::ZoomToFit);
+        commands
     }
 
     fn handle_shortcuts(
@@ -13030,6 +13224,24 @@ impl KernelLabApp {
                             .color(MUTED),
                         );
                     });
+                    // An empty viewport is exactly where "Show all bodies" is
+                    // needed, so the placeholder still answers a right-click.
+                    // Registered after the label so it is the top widget here.
+                    let placeholder = ui.interact(
+                        ui.max_rect(),
+                        egui::Id::new("model_viewport_placeholder"),
+                        egui::Sense::click(),
+                    );
+                    if placeholder.clicked_by(egui::PointerButton::Secondary)
+                        && let Some(position) = placeholder.interact_pointer_pos()
+                        && self.workbench_mode == WorkbenchMode::Model
+                        && self.pending_operation.is_none()
+                    {
+                        self.open_model_context_menu(viewport::ViewportContextClick {
+                            position,
+                            target: viewport::ViewportContextTarget::Empty,
+                        });
+                    }
                 } else {
                     let output = viewport::show_document_with_feature_drag(
                         ui,
@@ -13062,6 +13274,18 @@ impl KernelLabApp {
                         // but a stray click must not select bodies or
                         // activate another sketch while one is being drawn.
                         return;
+                    }
+                    // The peek clears its own flag on the frame the button is
+                    // released and still renders this viewport, so the return
+                    // above does not cover that one frame. The workspace mode
+                    // does: it stays Sketch for every peek frame, release
+                    // included. A staged operation owns the canvas until its
+                    // rail resolves.
+                    if let Some(context_click) = output.context_click
+                        && self.workbench_mode == WorkbenchMode::Model
+                        && self.pending_operation.is_none()
+                    {
+                        self.open_model_context_menu(context_click);
                     }
                     if let Some(feature_drag) = output.feature_drag {
                         self.set_extrusion_distance_intent(feature_drag.signed_extent);
@@ -13207,6 +13431,214 @@ impl KernelLabApp {
             });
         self.model_canvas_overlay(ui, frame_output.response.rect.shrink(7.0));
         self.sync_transform_preview();
+    }
+
+    /// Opens the model context menu on what the secondary click landed on.
+    ///
+    /// Right-click acts on what is under it, the way mainstream CAD does: an
+    /// entity outside the current selection replaces it, an entity already
+    /// inside it leaves the set intact so a multi-edge pick survives, and empty
+    /// space leaves the selection alone entirely.
+    fn open_model_context_menu(&mut self, context_click: viewport::ViewportContextClick) {
+        match context_click.target {
+            viewport::ViewportContextTarget::Face(selection) => {
+                if !self.selected_faces.contains(&selection) {
+                    self.activate_context_target_body(selection.body);
+                    self.select_model_face(selection, false);
+                }
+            }
+            viewport::ViewportContextTarget::Edge(selection) => {
+                if !self.selected_edges.contains(&selection) {
+                    self.activate_context_target_body(selection.body);
+                    self.select_model_edge(selection, false);
+                }
+            }
+            viewport::ViewportContextTarget::Vertex(selection) => {
+                if !self.selected_vertices.contains(&selection) {
+                    self.activate_context_target_body(selection.body);
+                    self.select_model_vertex(selection, false);
+                }
+            }
+            viewport::ViewportContextTarget::Empty => {}
+        }
+        self.model_context_menu = Some(ModelContextMenu {
+            position: context_click.position,
+            target: context_click.target,
+            just_opened: true,
+        });
+    }
+
+    fn activate_context_target_body(&mut self, body: viewport::BodyInstanceKey) {
+        if let Some(index) = self
+            .bodies
+            .iter()
+            .position(|candidate| candidate.id.get() == body.get())
+        {
+            self.activate_body(index);
+        }
+    }
+
+    /// The right-click menu over the model viewport.
+    fn show_model_context_menu(&mut self, context: &egui::Context) {
+        if self.workbench_mode != WorkbenchMode::Model || self.pending_operation.is_some() {
+            self.model_context_menu = None;
+            return;
+        }
+        let Some(mut menu) = self.model_context_menu else {
+            return;
+        };
+        let commands = self.model_context_commands(menu);
+        let item_height = 22.0;
+        let item_spacing = 2.0;
+        let margin = 5.0;
+        let inner = egui::vec2(
+            208.0,
+            commands.len() as f32 * item_height
+                + (commands.len().saturating_sub(1)) as f32 * item_spacing,
+        );
+        let size = inner + egui::Vec2::splat(margin * 2.0);
+        let screen = context.content_rect();
+        let origin = egui::pos2(
+            menu.position
+                .x
+                .clamp(screen.left(), (screen.right() - size.x).max(screen.left())),
+            menu.position
+                .y
+                .clamp(screen.top(), (screen.bottom() - size.y).max(screen.top())),
+        );
+        let area = egui::Area::new(egui::Id::new("model_context_menu"))
+            .fixed_pos(origin)
+            // Without a size hint the first frame runs egui's constrain pass
+            // against an unknown size and lands the menu mid-screen; the very
+            // first click aimed at an item then misses.
+            .default_size(size)
+            .constrain(false)
+            .order(egui::Order::Foreground)
+            .show(context, |ui| {
+                // The margin and the gaps between rows sense nothing, so
+                // without this backstop a click on the menu's own padding falls
+                // through to the viewport and reopens a different menu.
+                ui.interact(
+                    egui::Rect::from_min_size(origin, size),
+                    egui::Id::new("model_context_menu_backstop"),
+                    egui::Sense::click(),
+                );
+                Frame::new()
+                    .fill(PANEL)
+                    .stroke(Stroke::new(1.0, BORDER))
+                    .corner_radius(4)
+                    .inner_margin(Margin::same(margin as i8))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = item_spacing;
+                        ui.set_min_size(inner);
+                        ui.set_max_width(inner.x);
+                        let mut chosen = None;
+                        let mut first_item = None;
+                        for command in &commands {
+                            let response = ui.add_sized(
+                                [inner.x, item_height],
+                                egui::Button::new(
+                                    RichText::new(command.label())
+                                        .font(FontId::proportional(12.0))
+                                        .color(TEXT),
+                                )
+                                .frame(false),
+                            );
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    command.label(),
+                                )
+                            });
+                            first_item.get_or_insert(response.id);
+                            if response.clicked() {
+                                chosen = Some(*command);
+                            }
+                        }
+                        // A menu nobody can reach from the keyboard is not a
+                        // menu. Focus the first command as it opens so Tab,
+                        // arrows, and a screen reader all start inside it
+                        // rather than at the far end of the shell.
+                        if menu.just_opened
+                            && let Some(id) = first_item
+                        {
+                            ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                        }
+                        chosen
+                    })
+                    .inner
+            });
+        let chosen = area.inner;
+        // `Response` pointer queries read the context's input themselves, so
+        // they are sampled before the keyboard read rather than inside it.
+        let clicked_elsewhere = area.response.clicked_elsewhere();
+        let dismissed = context.input(|input| input.key_pressed(egui::Key::Escape));
+        if let Some(command) = chosen {
+            self.model_context_menu = None;
+            self.run_model_context_command(command, menu, context);
+            return;
+        }
+        if dismissed || (!menu.just_opened && clicked_elsewhere) {
+            self.model_context_menu = None;
+            return;
+        }
+        menu.just_opened = false;
+        self.model_context_menu = Some(menu);
+    }
+
+    fn run_model_context_command(
+        &mut self,
+        command: ModelContextCommand,
+        menu: ModelContextMenu,
+        context: &egui::Context,
+    ) {
+        match command {
+            ModelContextCommand::NormalToFace => {
+                if !self.view_normal_to_selected_face() {
+                    self.document_status =
+                        Some("This face has no exact planar support to align to".to_owned());
+                }
+                context.request_repaint();
+            }
+            ModelContextCommand::SketchOnFace => self.enter_sketch_mode(),
+            ModelContextCommand::ZoomToSelection => {
+                self.frame_selection();
+                context.request_repaint();
+            }
+            ModelContextCommand::ZoomToFit => {
+                self.frame_visible_document();
+                context.request_repaint();
+            }
+            ModelContextCommand::HideBody => {
+                if let Some(index) = self.context_target_body_index(menu.target) {
+                    self.set_body_visibility(index, false);
+                }
+            }
+            ModelContextCommand::IsolateBody => {
+                if let Some(keep) = self.context_target_body_index(menu.target) {
+                    for index in 0..self.bodies.len() {
+                        if index != keep && self.bodies[index].visible {
+                            self.set_body_visibility(index, false);
+                        }
+                    }
+                }
+            }
+            ModelContextCommand::ShowAllBodies => {
+                for index in 0..self.bodies.len() {
+                    // A body inside a hidden or suppressed component stays
+                    // hidden: that visibility is the component's to grant.
+                    let eligible = !self.bodies[index].visible
+                        && self
+                            .component_for_body(self.bodies[index].id)
+                            .is_none_or(|component| component.visible && !component.suppressed);
+                    if eligible {
+                        self.set_body_visibility(index, true);
+                    }
+                }
+            }
+            ModelContextCommand::ClearSelection => self.clear_model_entity_selection(),
+        }
     }
 
     fn model_canvas_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -13989,6 +14421,11 @@ impl eframe::App for KernelLabApp {
                 }
             });
 
+        // Above `handle_shortcuts`, so the Escape that dismisses the menu is
+        // read here first. The shortcut pass sees it too, but with no pending
+        // operation `cancel_pending_operation` is a no-op and Escape has no
+        // other binding in the model workspace.
+        self.show_model_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.extrusion_feature_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
