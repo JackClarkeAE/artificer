@@ -9752,8 +9752,14 @@ impl KernelLabApp {
 
         if let Some(material) = assigned {
             ui.horizontal(|ui| {
+                ui.add_sized(
+                    egui::vec2(theme::PROPERTY_NAME_WIDTH, 14.0),
+                    egui::Label::new(RichText::new("Density").small().color(MUTED))
+                        .selectable(false)
+                        .halign(egui::Align::LEFT),
+                );
                 let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 2, material.colour);
                 ui.painter().rect_stroke(
                     rect,
@@ -9764,7 +9770,7 @@ impl KernelLabApp {
                 ui.label(
                     RichText::new(format!("{:.0} kg/m³", material.density))
                         .small()
-                        .color(MUTED),
+                        .color(TEXT),
                 );
             });
         }
@@ -9772,14 +9778,14 @@ impl KernelLabApp {
         let properties = self.mass_properties();
         let unit = self.document_settings.length_unit;
         let per_unit = unit.millimetres_per_unit();
-        ui.label(
-            RichText::new(format!(
-                "Volume {:.3} {}³",
+        theme::property_row(
+            ui,
+            "Volume",
+            &format!(
+                "{:.3} {}³",
                 properties.volume / per_unit.powi(3),
                 unit.symbol()
-            ))
-            .small()
-            .color(TEXT),
+            ),
         );
         // The caveat belongs beside the number it qualifies, not in a log.
         if let Some(reason) = self.approximated_body_reason() {
@@ -9793,47 +9799,40 @@ impl KernelLabApp {
         }
         match properties.mass_grams {
             Some(grams) if grams >= 1000.0 => {
-                ui.label(
-                    RichText::new(format!("Mass {:.3} kg", grams / 1000.0))
-                        .small()
-                        .color(ACCENT),
+                theme::property_row_colored(
+                    ui,
+                    "Mass",
+                    &format!("{:.3} kg", grams / 1000.0),
+                    ACCENT,
                 );
             }
             Some(grams) => {
-                ui.label(
-                    RichText::new(format!("Mass {grams:.3} g"))
-                        .small()
-                        .color(ACCENT),
-                );
+                theme::property_row_colored(ui, "Mass", &format!("{grams:.3} g"), ACCENT);
             }
             None => {
-                ui.label(
-                    RichText::new("Mass needs a material on every visible body")
-                        .small()
-                        .color(MUTED),
+                theme::property_row_unavailable(
+                    ui,
+                    "Mass",
+                    "needs a material on every visible body",
                 );
             }
         }
         match properties.centre {
             Some(centre) => {
-                ui.label(
-                    RichText::new(format!(
-                        "Centre of mass [{:.3}, {:.3}, {:.3}] {}",
+                theme::property_row(
+                    ui,
+                    "Centre of mass",
+                    &format!(
+                        "[{:.3}, {:.3}, {:.3}] {}",
                         Self::display_coordinate(centre[0] / per_unit),
                         Self::display_coordinate(centre[1] / per_unit),
                         Self::display_coordinate(centre[2] / per_unit),
                         unit.symbol()
-                    ))
-                    .small()
-                    .color(TEXT),
+                    ),
                 );
             }
             None => {
-                ui.label(
-                    RichText::new("Centre of mass unavailable for this body")
-                        .small()
-                        .color(MUTED),
-                );
+                theme::property_row_unavailable(ui, "Centre of mass", "unavailable for this body");
             }
         }
     }
@@ -11726,46 +11725,55 @@ impl KernelLabApp {
                     || self.selected_vertex.is_some()
                 {
                     collapsible_card(ui, "selection_properties", "SELECTION", true, |ui| {
+                        // Name/value rows, with the sentence explaining what the
+                        // selection is good for moved onto the row's hover. A
+                        // professional doing this two hundred times a day wants
+                        // the identity at a glance, not the tutorial.
                         let selection_count = self.selected_faces.len()
                             + self.selected_edges.len()
                             + self.selected_vertices.len();
                         if selection_count > 1 {
-                            status_line(ui, &format!("{selection_count} ITEMS SELECTED"), ACCENT);
-                            ui.label(
-                                RichText::new(format!(
+                            theme::property_row_colored(
+                                ui,
+                                "Selected",
+                                &format!("{selection_count} items"),
+                                ACCENT,
+                            );
+                            theme::property_row(
+                                ui,
+                                "Breakdown",
+                                &format!(
                                     "{} faces · {} edges · {} vertices",
                                     self.selected_faces.len(),
                                     self.selected_edges.len(),
                                     self.selected_vertices.len()
-                                ))
-                                .small()
-                                .color(TEXT),
+                                ),
                             );
                         }
-                        if let Some(face) = self.selected_face {
-                            status_line(ui, &format!("Face #{}", face.entity), ACCENT);
-                            ui.label(
-                                RichText::new(
-                                    "Faces can host sketches, push/pull operations, and face-based features.",
-                                )
-                                .small()
-                                .color(MUTED),
-                            );
+                        let (kind, id, detail) = if let Some(face) = self.selected_face {
+                            (
+                                "Face",
+                                face.entity.to_string(),
+                                "Faces can host sketches, push/pull operations, and face-based features.",
+                            )
                         } else if let Some(edge) = self.selected_edge {
-                            status_line(ui, &format!("Edge #{}", edge.edge.entity), ACCENT);
-                            ui.label(
-                                RichText::new("This edge can be used by Chamfer or Fillet.")
-                                    .small()
-                                    .color(MUTED),
-                            );
+                            (
+                                "Edge",
+                                edge.edge.entity.to_string(),
+                                "This edge can be used by Chamfer or Fillet.",
+                            )
                         } else if let Some(vertex) = self.selected_vertex {
-                            status_line(ui, &format!("Vertex #{}", vertex.vertex.entity), ACCENT);
-                            ui.label(
-                                RichText::new("Authoritative B-rep point selected.")
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        }
+                            (
+                                "Vertex",
+                                vertex.vertex.entity.to_string(),
+                                "Authoritative B-rep point selected.",
+                            )
+                        } else {
+                            return;
+                        };
+                        theme::property_row(ui, "Type", kind);
+                        theme::property_row_colored(ui, "Entity", &format!("#{id}"), ACCENT)
+                            .on_hover_text(detail);
                     });
                     ui.add_space(5.0);
                 }
@@ -12069,24 +12077,27 @@ impl KernelLabApp {
             && let Some(measures) = self.displayed_measures()
         {
             ui.separator();
-            ui.label(
-                RichText::new(format!(
-                    "Volume {:.3} mm³ · area {:.3} mm²",
-                    measures.volume, measures.surface_area
-                ))
-                .small()
-                .color(ACCENT),
+            theme::property_row_colored(
+                ui,
+                "Volume",
+                &format!("{:.3} mm³", measures.volume),
+                ACCENT,
+            );
+            theme::property_row(
+                ui,
+                "Surface area",
+                &format!("{:.3} mm²", measures.surface_area),
             );
             if let Some(centroid) = measures.centroid {
-                ui.label(
-                    RichText::new(format!(
-                        "Centroid [{:.3}, {:.3}, {:.3}] mm",
+                theme::property_row(
+                    ui,
+                    "Centroid",
+                    &format!(
+                        "[{:.3}, {:.3}, {:.3}] mm",
                         Self::display_coordinate(centroid.x),
                         Self::display_coordinate(centroid.y),
                         Self::display_coordinate(centroid.z)
-                    ))
-                    .small()
-                    .color(MUTED),
+                    ),
                 );
             }
         }

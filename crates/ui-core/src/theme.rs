@@ -186,6 +186,62 @@ pub fn ribbon_group<R>(
     .inner
 }
 
+/// Width of the name column in the property grid. Fixed rather than
+/// content-derived so every value in the panel starts on the same column
+/// whatever card it belongs to.
+pub const PROPERTY_NAME_WIDTH: f32 = 92.0;
+
+/// One row of the two-column property grid: a muted name, then its value.
+///
+/// Measurements read down a column far faster than they read as prose. A panel
+/// that says "Volume 32.000 mm³" on one line and "Centre of mass [0, 0, 2] mm"
+/// on the next makes the reader parse each sentence to find the number; the
+/// same two facts as name/value rows are one glance.
+pub fn property_row(ui: &mut egui::Ui, name: &str, value: &str) -> egui::Response {
+    property_row_colored(ui, name, value, TEXT)
+}
+
+pub fn property_row_colored(
+    ui: &mut egui::Ui,
+    name: &str,
+    value: &str,
+    colour: Color32,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        // The name column is allocated and painted rather than laid out, so it
+        // is exactly one width for every row: a value column that shifts with
+        // the length of its own name is not a column.
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(PROPERTY_NAME_WIDTH, 15.0), egui::Sense::hover());
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            name,
+            FontId::proportional(11.0),
+            MUTED,
+        );
+        let response = ui.add(
+            egui::Label::new(RichText::new(value).small().color(colour))
+                .selectable(false)
+                .wrap(),
+        );
+        // The painted name is invisible to assistive technology, so the row
+        // announces itself as one "name: value" fact.
+        let announcement = format!("{name}: {value}");
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &announcement)
+        });
+        response
+    })
+    .inner
+}
+
+/// A property whose value does not exist yet, said in the value column rather
+/// than as a sentence somewhere else, so the row still lines up.
+pub fn property_row_unavailable(ui: &mut egui::Ui, name: &str, reason: &str) -> egui::Response {
+    property_row_colored(ui, name, reason, MUTED)
+}
+
 /// Paints the standard modeling-viewport backdrop: a vertical gradient from
 /// near-white to pale blue-gray, in the mainstream CAD tradition.
 pub fn paint_viewport_gradient(painter: &egui::Painter, rect: egui::Rect) {
