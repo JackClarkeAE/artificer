@@ -346,3 +346,19 @@ fn typed_dimension_live_preview_snapshot() {
     assert!(!harness.state().operation_confirmation_pending());
     settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1040");
 }
+
+/// The Dimension tool, armed: clicking the rectangle turns its two driving
+/// dimensions into real fields on the curve, with the first holding the caret.
+#[test]
+fn dimension_tool_armed_on_a_rectangle_snapshot() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, -1.5));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 1.5));
+
+    click_button(&mut harness, "Sketch dimension");
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 1.5));
+    harness.get_by_role_and_label(Role::TextInput, "Rectangle width");
+    settle_snapshot(&mut harness, "workbench_dimension_tool_armed_1040");
+}

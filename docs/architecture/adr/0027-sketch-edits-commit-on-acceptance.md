@@ -64,6 +64,16 @@ Acceptance is settled once per frame, before any panel renders, so the ribbon,
 rail, browser, and canvas all read committed truth and the click that ended the
 edit still lands on whatever it hit.
 
+The Dimension tool is this same editor, drawn on the curve. Picking a curve
+with it arms every on-canvas dimension box whose value is a literal in the
+selected feature's recipe, seeded with the literal that will be replayed, and
+gives the first one the caret. A box with no literal behind it — a plain line's
+length, a point's coordinates, a free arc's sweep — stays a read-only label,
+and the canvas says so rather than leaving the tool looking silent. Because a
+rectangle authors one recipe but presents as four curves after its first replay
+or a document reload, the boxes measure the authored operation rather than
+whichever curve was picked.
+
 ADR 0021's formula is preserved exactly: one private candidate definition is
 staged, bare `Enter` publishes it, `Escape` discards it. Only the rail's
 visible tick and cross stop participating for these two gestures. A keystroke
@@ -91,6 +101,17 @@ library insertion.
   (crates/sketch-ui) — a staged delete keeps its red retirement overlay.
 - `workbench_typed_dimension_live_preview_1040.png` — the pixels: exactly one
   rectangle at the typed size while typing.
+- `dimension_pick_arms_the_caret_on_the_first_driving_box`,
+  `dimension_pick_on_the_semantic_chip_also_arms` — both pick routes arm.
+- `rectangle_stays_dimensionable_after_its_first_canvas_edit`,
+  `reloaded_rectangle_is_dimensionable` — the tool survives the presentation
+  explode that used to silence it after one use.
+- `circle_diameter_edits_on_the_canvas_without_losing_the_caret` — a
+  single-curve candidate does not evict its own focused field.
+- `line_without_a_driving_literal_stays_a_label` — the honest negative, with
+  the canvas saying which it is.
+- `workbench_dimension_tool_armed_1040.png` — the pixels: two real fields on
+  the rectangle, the first holding the caret.
 
 ## Consequences
 

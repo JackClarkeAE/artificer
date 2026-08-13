@@ -263,6 +263,11 @@ pub enum CapabilityRequirement {
 pub enum CommitContract {
     SessionOnly,
     StageThenUniversalTickOrEnter,
+    /// The tool stages a private candidate that previews live and publishes it
+    /// the moment the value is accepted — bare `Enter`, or the field losing the
+    /// keyboard — with `Escape` reverting. It never shows the shared rail.
+    /// [ADR 0027](../../../docs/architecture/adr/0027-sketch-edits-commit-on-acceptance.md).
+    CommitsOnAcceptance,
 }
 
 /// Vector icon authored in normalized coordinates and painted by this module.
@@ -1468,7 +1473,7 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         ToolFamily::Dimension,
         "Sketch dimension",
         "Display and edit a driving dimension on selected sketch geometry.",
-        "Click a sketch curve to display its dimensions. Edit the driving value in the palette; the change previews immediately and commits through the green tick.",
+        "Click a sketch curve to arm its driving dimensions. Type the exact value in the box on the curve or in the palette; the change previews as you type and applies on Enter or when you click away.",
         "Select sketch geometry to dimension.",
         "Dimension has no variants.",
         Some(SHORTCUT_D),
@@ -1477,10 +1482,10 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         NO_PHASES,
         NO_INPUTS,
         SelectionRequirement::OneOrMoreEditableEntities,
-        ToolOutputRole::SessionOnly,
+        ToolOutputRole::Modification,
         CapabilityRequirement::EditableSketch,
         "Dimensions require an editable sketch entity.",
-        CommitContract::SessionOnly,
+        CommitContract::CommitsOnAcceptance,
     ),
 ];
 
@@ -2554,13 +2559,12 @@ mod tests {
     #[test]
     fn every_model_changing_tool_uses_the_universal_confirmation_contract() {
         for descriptor in SketchToolRegistry::tools() {
-            let expected = if matches!(
-                descriptor.variant,
-                ToolVariant::Select | ToolVariant::Dimension
-            ) {
-                CommitContract::SessionOnly
-            } else {
-                CommitContract::StageThenUniversalTickOrEnter
+            let expected = match descriptor.variant {
+                ToolVariant::Select => CommitContract::SessionOnly,
+                // Dimension re-authors an existing recipe, so it publishes on
+                // acceptance rather than through the shared rail (ADR 0027).
+                ToolVariant::Dimension => CommitContract::CommitsOnAcceptance,
+                _ => CommitContract::StageThenUniversalTickOrEnter,
             };
             assert_eq!(
                 descriptor.commit_contract, expected,

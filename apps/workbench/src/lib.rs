@@ -92,7 +92,8 @@ use crate::sketch::{
     SketchViewportContext,
 };
 use crate::sketch_toolbar::{
-    SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant, paint_tool_icon,
+    CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
+    paint_tool_icon,
 };
 
 use crate::theme::{
@@ -2416,6 +2417,13 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_pending_entity_count(&self) -> usize {
         self.sketch.pending_entity_count()
+    }
+
+    /// The single line of prose the sketch canvas is showing for the active
+    /// tool, so a test can assert what the user is told.
+    #[must_use]
+    pub fn sketch_canvas_instruction(&self) -> &'static str {
+        self.sketch.canvas_instruction()
     }
 
     #[must_use]
@@ -10896,7 +10904,14 @@ impl KernelLabApp {
                         }
                     }
                     ui.label(
-                        RichText::new("Tab / Shift-Tab moves fields · Enter accepts · tick commits")
+                        RichText::new(if descriptor.commit_contract
+                            == CommitContract::CommitsOnAcceptance
+                        {
+                            // This tool has no tick to press (ADR 0027).
+                            "Click a curve, then type on it or here · Enter applies · Esc reverts"
+                        } else {
+                            "Tab / Shift-Tab moves fields · Enter accepts · tick commits"
+                        })
                             .small()
                             .color(GOOD),
                     );
@@ -12509,24 +12524,14 @@ impl KernelLabApp {
         self.sketch_dimension_keys.escape |= output.dimension_keys.escape;
         self.sketch_dimension_keys.confirmation_blocked |=
             output.dimension_keys.confirmation_blocked;
-        if output.selection_changed
-            && self.active_sketch_tool == ToolVariant::Dimension
-            && let Some(parameter) = self.sketch.selected_recipe_editor().and_then(|editor| {
-                editor
-                    .parameters
-                    .into_iter()
-                    .find(|parameter| parameter.editable)
-            })
-        {
-            // Dimension selection is a select-and-type workflow: the next
-            // keystroke replaces the authoritative driving value instead of
-            // requiring a second trip to the Properties panel.
-            ui.ctx().memory_mut(|memory| {
-                memory.request_focus(egui::Id::new((
-                    "selected_sketch_recipe_parameter",
-                    parameter.stable_key,
-                )));
-            });
+        // An on-canvas dimension box is the same editor as the Properties
+        // field, drawn on the curve. It settles through the same path, so the
+        // workbench only has to know which rectangle holds the caret.
+        if let Some((id, rect)) = output.recipe_dimension_field {
+            self.recipe_parameter_field = Some(RecipeParameterField { id, rect });
+        }
+        if output.recipe_dimension_accepted {
+            self.accept_selected_recipe_parameter_edit();
         }
         if let Some(entity) = output.pending_created {
             self.commit_sketch_stroke(entity);

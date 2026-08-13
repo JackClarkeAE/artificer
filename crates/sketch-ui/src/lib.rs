@@ -3957,6 +3957,10 @@ pub struct SketchCanvasState {
     profile_analysis: ProfileAnalysis,
     analytic_regions: AnalyticRegionSelection,
     dimension_session: Option<DimensionSession>,
+    /// One-shot caret request for the box the Dimension tool just armed. The
+    /// pick and the boxes render in the same frame, so this never survives a
+    /// frame boundary: it is a focus request, not editor state.
+    focus_dimension_box: Option<SketchDimensionKind>,
     next_dimension_serial: u64,
     last_context_fit_key: Option<SketchContextFitKey>,
     /// The active support's analytic curves, mirrored here because snapping
@@ -4004,6 +4008,7 @@ impl Default for SketchCanvasState {
             ),
             analytic_regions: AnalyticRegionSelection::default(),
             dimension_session: None,
+            focus_dimension_box: None,
             next_dimension_serial: 1,
             last_context_fit_key: None,
             support_curves: Vec::new(),
@@ -4993,19 +4998,20 @@ impl SketchCanvasState {
         if let Some((_, fields)) = pending_single_curve_measurement(self) {
             return fields.into_iter().map(|field| field.readout).collect();
         }
-        self.selected
-            .and_then(|id| self.presented_entity(id))
-            .map_or_else(Vec::new, |entity| {
-                let phase = dimension_phase_for_geometry(entity.geometry);
-                dimension_fields_for_geometry(phase, entity.geometry)
-                    .into_iter()
-                    .map(|mut field| {
-                        field.readout.editable = false;
-                        field.readout.locked = false;
-                        field.readout
-                    })
-                    .collect()
-            })
+        dimension_target(self).map_or_else(Vec::new, |(geometry, _)| {
+            let phase = dimension_phase_for_geometry(geometry);
+            dimension_fields_for_geometry(phase, geometry)
+                .into_iter()
+                .map(|mut field| {
+                    // The canvas box and this card describe the same thing, so
+                    // they take editability from the same predicate.
+                    field.readout.editable =
+                        committed_dimension_parameter(self, field.readout.kind).is_some();
+                    field.readout.locked = false;
+                    field.readout
+                })
+                .collect()
+        })
     }
 
     #[must_use]
@@ -6084,6 +6090,62 @@ impl SketchCanvasState {
             return None;
         }
         self.profile_analysis.profile.clone()
+    }
+
+    /// The single line of prose the canvas shows for the active tool. It is a
+    /// method rather than a local so a test can assert what the user is told
+    /// without reading pixels.
+    #[must_use]
+    pub fn canvas_instruction(&self) -> &'static str {
+        let state = self;
+        let descriptor = state.exact_tool.descriptor();
+        let progress = state.gesture_progress();
+        if progress.awaiting_confirmation
+            && matches!(
+                state.exact_tool,
+                ToolVariant::Fillet | ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer
+            )
+            && state.modifier_sources.is_empty()
+        {
+            "Corner preview · select another corner or press Enter / ✓"
+        } else if progress.awaiting_confirmation
+            && matches!(
+                state.exact_tool,
+                ToolVariant::Fillet | ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer
+            )
+        {
+            "Corner preview · select the second curve or press Enter / ✓"
+        } else if progress.awaiting_confirmation {
+            "Pending sketch edit · Enter or ✓ to confirm · Esc to cancel"
+        } else if state.exact_tool == ToolVariant::Dimension
+            && first_armed_dimension_kind(state).is_some()
+        {
+            "Click a dimension and type an exact value · Enter applies · Esc reverts"
+        } else if state.exact_tool == ToolVariant::Dimension && state.selected.is_some() {
+            // The honest negative: a plain line, a point, or a free arc measures
+            // itself, so nothing here drives a literal. Say so on the canvas
+            // rather than leaving the tool looking broken.
+            "This feature has no driving dimension · see SELECTED FEATURE"
+        } else if matches!(
+            state.exact_tool,
+            ToolVariant::RectangularPattern | ToolVariant::CircularPattern
+        ) && state.modifier_sources.is_empty()
+        {
+            "Select seed geometry · Shift-click adds or removes seed curves"
+        } else if matches!(
+            state.exact_tool,
+            ToolVariant::RectangularPattern | ToolVariant::CircularPattern
+        ) {
+            "Drag square direction/centre handle · release to stage · Shift-click edits seeds"
+        } else if descriptor.acquisition_phases.is_empty() {
+            descriptor.prompt
+        } else {
+            descriptor
+                .acquisition_phases
+                .get(usize::from(progress.completed_points))
+                .or_else(|| descriptor.acquisition_phases.last())
+                .map_or(descriptor.prompt, |phase| phase.prompt)
+        }
     }
 
     /// The geometry the canvas is showing for one entity. While a typed value
@@ -8921,6 +8983,13 @@ pub struct SketchCanvasOutput {
     pub draft_changed: bool,
     pub pending_created: Option<SketchEntityId>,
     pub dimension_keys: DimensionKeyClaims,
+    /// The on-canvas recipe field that owns the keyboard, with the rectangle it
+    /// occupies, so the workbench can settle acceptance from the same place it
+    /// settles the Properties field.
+    pub recipe_dimension_field: Option<(Id, Rect)>,
+    /// An on-canvas recipe field consumed `Enter` this frame and the value
+    /// should be published now.
+    pub recipe_dimension_accepted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -9139,6 +9208,17 @@ pub fn show_with_context(
                         if !additive {
                             selection_changed |= state.clear_selected_regions();
                         }
+                        // Picking is the whole Dimension gesture: the first
+                        // driving box takes the caret so "click the curve, type
+                        // 3, Enter" never leaves the canvas. This deliberately
+                        // does not read `selection_changed`, so re-picking a
+                        // curve that is already selected re-arms it. A staged
+                        // candidate owns the boxes, so it is left alone.
+                        if state.exact_tool == ToolVariant::Dimension
+                            && state.pending.is_none()
+                        {
+                            state.focus_dimension_box = first_armed_dimension_kind(state);
+                        }
                     } else {
                         selection_changed = state.set_selected(None);
                         selection_changed |= state.select_region_at_point(
@@ -9198,6 +9278,13 @@ pub fn show_with_context(
         if !ui.input(|input| input.modifiers.shift) {
             selection_changed |= state.clear_selected_regions();
         }
+        // The semantic chip sits over the canvas and takes the click outright,
+        // so a pick that lands on it never reaches the branch above. Arming
+        // here keeps both routes equivalent, and it still runs before the boxes
+        // lay out below.
+        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+            state.focus_dimension_box = first_armed_dimension_kind(state);
+        }
     }
     paint_pending(&painter, response.rect, state);
     paint_trim_hover(&painter, response.rect, state);
@@ -9205,9 +9292,8 @@ pub fn show_with_context(
     paint_overlay(&painter, response.rect, state, context.is_some());
     let dimension_layouts = dimension_widget_layouts(state, response.rect);
     paint_dimension_leaders(&painter, &dimension_layouts);
-    let (dimension_keys, dimension_pending) =
-        show_dimension_widgets(ui, state, &dimension_layouts, canvas_owned_keyboard);
-    pending_created = pending_created.or(dimension_pending);
+    let dimensions = show_dimension_widgets(ui, state, &dimension_layouts, canvas_owned_keyboard);
+    pending_created = pending_created.or(dimensions.pending_created);
 
     SketchCanvasOutput {
         response,
@@ -9216,7 +9302,9 @@ pub fn show_with_context(
         navigation_changed,
         draft_changed,
         pending_created,
-        dimension_keys,
+        dimension_keys: dimensions.claims,
+        recipe_dimension_field: dimensions.recipe_field,
+        recipe_dimension_accepted: dimensions.recipe_accepted,
     }
 }
 
@@ -10432,45 +10520,7 @@ fn paint_overlay(
             SketchPlane::XZ => "XZ plane",
         }
     };
-    let descriptor = state.exact_tool.descriptor();
-    let progress = state.gesture_progress();
-    let instruction = if progress.awaiting_confirmation
-        && matches!(
-            state.exact_tool,
-            ToolVariant::Fillet | ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer
-        )
-        && state.modifier_sources.is_empty()
-    {
-        "Corner preview · select another corner or press Enter / ✓"
-    } else if progress.awaiting_confirmation
-        && matches!(
-            state.exact_tool,
-            ToolVariant::Fillet | ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer
-        )
-    {
-        "Corner preview · select the second curve or press Enter / ✓"
-    } else if progress.awaiting_confirmation {
-        "Pending sketch edit · Enter or ✓ to confirm · Esc to cancel"
-    } else if matches!(
-        state.exact_tool,
-        ToolVariant::RectangularPattern | ToolVariant::CircularPattern
-    ) && state.modifier_sources.is_empty()
-    {
-        "Select seed geometry · Shift-click adds or removes seed curves"
-    } else if matches!(
-        state.exact_tool,
-        ToolVariant::RectangularPattern | ToolVariant::CircularPattern
-    ) {
-        "Drag square direction/centre handle · release to stage · Shift-click edits seeds"
-    } else if descriptor.acquisition_phases.is_empty() {
-        descriptor.prompt
-    } else {
-        descriptor
-            .acquisition_phases
-            .get(usize::from(progress.completed_points))
-            .or_else(|| descriptor.acquisition_phases.last())
-            .map_or(descriptor.prompt, |phase| phase.prompt)
-    };
+    let instruction = state.canvas_instruction();
     painter.text(
         rect.left_top() + Vec2::new(13.0, 12.0),
         Align2::LEFT_TOP,
@@ -10500,10 +10550,130 @@ struct DimensionWidgetLayout {
     id: Id,
 }
 
+/// The geometry the dimension boxes measure for the selected feature.
+///
+/// A rectangle authors one recipe but does not stay one presentation entity:
+/// the first replay of a legacy composite explodes it into one entity per
+/// exact curve (see `core_transaction_presentation`), and reloading a document
+/// rebuilds it the same way. Measuring whichever side happened to be picked
+/// would then show a line's length where the recipe says Width — so the
+/// composite is reassembled from every sibling the same authored operation
+/// owns, which is what the SELECTED FEATURE card is already describing.
+fn dimension_target(state: &SketchCanvasState) -> Option<(SketchGeometry, u64)> {
+    let selected = state.selected?;
+    let entity = state.presented_entity(selected)?;
+    let composite = state
+        .selected_recipe_editor
+        .as_ref()
+        .filter(|editor| {
+            editor.subject == selected
+                && matches!(
+                    editor.original_recipe,
+                    CoreRecipe::TwoPointRectangle { .. } | CoreRecipe::CentrePointRectangle { .. }
+                )
+        })
+        .and_then(|_| rectangle_from_operation_siblings(state, selected));
+    // The picked entity keeps the widget serial: its identity survives the
+    // explode, so a `TextEdit` under the caret is not rebuilt underneath it.
+    Some((composite.unwrap_or(entity.geometry), selected.get()))
+}
+
+/// Reassembles an axis-aligned rectangle from the curves of one authored
+/// operation. Both rectangle recipes are axis-aligned, so their bounds are the
+/// rectangle exactly rather than an approximation of it.
+fn rectangle_from_operation_siblings(
+    state: &SketchCanvasState,
+    selected: SketchEntityId,
+) -> Option<SketchGeometry> {
+    let siblings: Vec<SketchEntity> = match state.pending.as_ref() {
+        // A live in-place candidate is the whole feature, exploded.
+        Some(pending) if pending.in_place => pending.entities.clone(),
+        _ => {
+            let operation = state.operation_by_ui.get(&selected).copied()?;
+            state
+                .entities
+                .iter()
+                .filter(|entity| state.operation_by_ui.get(&entity.id) == Some(&operation))
+                .copied()
+                .collect()
+        }
+    };
+    let bounds = sketch_point_bounds(
+        siblings
+            .iter()
+            .flat_map(|entity| entity.geometry.control_points().iter()),
+    )?;
+    let [min_u, max_u, min_v, max_v] = bounds;
+    (max_u > min_u && max_v > min_v).then(|| {
+        SketchGeometry::rectangle(
+            SketchPoint::new(min_u, min_v),
+            SketchPoint::new(max_u, max_v),
+        )
+    })
+}
+
+/// The recipe literal a committed dimension box drives, if the Dimension tool
+/// has armed one.
+///
+/// The Dimension tool owns no session of its own: it edits the selected
+/// feature's persistent recipe through the same authoritative path the
+/// Properties field uses, so a box becomes a real field only where that
+/// literal actually exists. A point, a plain line, or a free arc measures
+/// itself — nothing in its recipe drives that number — and its box stays an
+/// honest read-only label.
+///
+/// The key/kind pairing is unambiguous because the committed branch derives
+/// its phase from `dimension_phase_for_geometry`, which never yields the
+/// slot phases that reuse `"width"`.
+fn committed_dimension_parameter(
+    state: &SketchCanvasState,
+    kind: SketchDimensionKind,
+) -> Option<&RetainedRecipeParameter> {
+    if state.exact_tool != ToolVariant::Dimension {
+        return None;
+    }
+    let stable_key = match kind {
+        SketchDimensionKind::Width => "width",
+        SketchDimensionKind::Height => "height",
+        SketchDimensionKind::Diameter => "diameter",
+        SketchDimensionKind::Radius => "radius",
+        _ => return None,
+    };
+    let editor = state.selected_recipe_editor.as_ref()?;
+    if state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.subject != editor.subject)
+    {
+        return None;
+    }
+    editor
+        .parameters
+        .iter()
+        .find(|parameter| parameter.stable_key == stable_key && parameter.value.is_some())
+}
+
+/// The dimension the Dimension tool arms first for the selected feature.
+fn first_armed_dimension_kind(state: &SketchCanvasState) -> Option<SketchDimensionKind> {
+    let (geometry, _) = dimension_target(state)?;
+    dimension_fields_for_geometry(dimension_phase_for_geometry(geometry), geometry)
+        .into_iter()
+        .map(|field| field.readout.kind)
+        .find(|kind| committed_dimension_parameter(state, *kind).is_some())
+}
+
 fn dimension_widget_layouts(
     state: &SketchCanvasState,
     canvas_rect: Rect,
 ) -> Vec<DimensionWidgetLayout> {
+    // A typed parameter is the selected feature's own candidate. Its read-only
+    // one-curve measurement must never evict the box whose keystroke staged
+    // it: on a circle that would replace the focused field with a label and
+    // drop the caret on the first character.
+    let editing_selected_recipe = state
+        .pending
+        .as_ref()
+        .is_some_and(|pending| pending.in_place);
     let source = if let Some(session) = &state.dimension_session {
         Some((
             session.geometry,
@@ -10521,7 +10691,9 @@ fn dimension_widget_layouts(
             state.next_dimension_serial,
             true,
         ))
-    } else if let Some((geometry, fields)) = pending_single_curve_measurement(state) {
+    } else if !editing_selected_recipe
+        && let Some((geometry, fields)) = pending_single_curve_measurement(state)
+    {
         Some((
             geometry,
             fields
@@ -10535,20 +10707,18 @@ fn dimension_widget_layouts(
             false,
         ))
     } else {
-        state
-            .selected
-            .and_then(|id| state.presented_entity(id))
-            .map(|entity| {
-                let phase = dimension_phase_for_geometry(entity.geometry);
-                let readouts = dimension_fields_for_geometry(phase, entity.geometry)
-                    .into_iter()
-                    .map(|mut field| {
-                        field.readout.editable = false;
-                        field.readout
-                    })
-                    .collect::<Vec<_>>();
-                (entity.geometry, readouts, entity.id.get(), false)
-            })
+        dimension_target(state).map(|(geometry, serial)| {
+            let phase = dimension_phase_for_geometry(geometry);
+            let readouts = dimension_fields_for_geometry(phase, geometry)
+                .into_iter()
+                .map(|mut field| {
+                    field.readout.editable =
+                        committed_dimension_parameter(state, field.readout.kind).is_some();
+                    field.readout
+                })
+                .collect::<Vec<_>>();
+            (geometry, readouts, serial, false)
+        })
     };
     let Some((geometry, readouts, serial, live)) = source else {
         return Vec::new();
@@ -10722,12 +10892,24 @@ fn paint_dimension_leaders(painter: &egui::Painter, layouts: &[DimensionWidgetLa
     }
 }
 
+/// What one frame of dimension boxes hands back to the canvas.
+struct DimensionWidgetOutcome {
+    claims: DimensionKeyClaims,
+    pending_created: Option<SketchEntityId>,
+    /// The on-canvas recipe field that owns the keyboard, with the rectangle it
+    /// occupies. The workbench settles acceptance from this exactly as it does
+    /// for the Properties field.
+    recipe_field: Option<(Id, Rect)>,
+    /// The focused on-canvas recipe field consumed `Enter` this frame.
+    recipe_accepted: bool,
+}
+
 fn show_dimension_widgets(
     ui: &mut Ui,
     state: &mut SketchCanvasState,
     layouts: &[DimensionWidgetLayout],
     canvas_owned_keyboard: bool,
-) -> (DimensionKeyClaims, Option<SketchEntityId>) {
+) -> DimensionWidgetOutcome {
     let active_at_start = state.active_dimension();
     let enter_pressed = raw_key_pressed(ui, egui::Key::Enter, egui::Modifiers::NONE);
     let escape_pressed = raw_key_pressed(ui, egui::Key::Escape, egui::Modifiers::NONE);
@@ -10738,7 +10920,98 @@ fn show_dimension_widgets(
     let mut clicked_kind = None;
     let mut live_changed = false;
     let mut active_editor_owned_keyboard = false;
+    let mut claims = DimensionKeyClaims::default();
+    let mut recipe_field = None;
+    let mut recipe_accepted = false;
     for layout in layouts {
+        // The Dimension tool edits committed geometry through the selected
+        // feature's authoritative recipe rather than through a second editor.
+        // The text is the literal that will be replayed, so what is typed is
+        // exactly what the kernel receives. Bind it first: the shared borrow
+        // of `state` has to end before the edit below takes it mutably.
+        let committed = committed_dimension_parameter(state, layout.readout.kind).map(|parameter| {
+            (
+                parameter.stable_key,
+                parameter.text.clone(),
+                parameter.error.map(RecipeParameterError::label),
+            )
+        });
+        if let Some((stable_key, mut text, error)) = committed {
+            // An armed box still has to read as a dimension, so it keeps the
+            // plate and leader the read-only boxes use and the field is drawn
+            // transparent on top of it. Focus is read before the widget so the
+            // plate can carry the highlight the text alone would not.
+            let focused = ui.memory(|memory| memory.focused()) == Some(layout.id)
+                || state.focus_dimension_box == Some(layout.readout.kind);
+            ui.painter().rect(
+                layout.rect,
+                4.0,
+                DIMENSION_BACKGROUND,
+                Stroke::new(
+                    if focused { 1.8 } else { 1.0 },
+                    if error.is_some() {
+                        INVALID
+                    } else if focused {
+                        SELECTED
+                    } else {
+                        DIMENSION
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            let response = ui.put(
+                layout.rect,
+                egui::TextEdit::singleline(&mut text)
+                    .id(layout.id)
+                    .desired_width(layout.rect.width())
+                    .horizontal_align(egui::Align::Center)
+                    .background_color(Color32::TRANSPARENT)
+                    .font(FontId::monospace(11.0))
+                    .text_color(if error.is_some() { INVALID } else { DIMENSION_LOCKED }),
+            );
+            response.ctx.accesskit_node_builder(response.id, |node| {
+                node.set_label(layout.readout.kind.label());
+                node.set_description(format!(
+                    "{} in {}. Enter applies the value; Escape reverts it.",
+                    layout.readout.kind.label(),
+                    dimension_unit_label(layout.readout.kind)
+                ));
+            });
+            let char_count = text.chars().count();
+            if state.focus_dimension_box == Some(layout.readout.kind) {
+                response.request_focus();
+                select_all_dimension_text(ui, layout.id, &response, char_count);
+            }
+            if let Some(error) = error {
+                ui.painter().text(
+                    layout.rect.left_bottom() + Vec2::new(0.0, 3.0),
+                    Align2::LEFT_TOP,
+                    error,
+                    FontId::monospace(9.0),
+                    INVALID,
+                );
+            }
+            if response.has_focus() {
+                recipe_field = Some((response.id, response.rect));
+            }
+            let owns_keyboard = response.has_focus() || response.lost_focus();
+            if response.changed() {
+                state.set_selected_recipe_parameter_text(stable_key, text);
+            }
+            // Enter and Escape mean here exactly what they mean in the
+            // Properties field for this parameter (ADR 0027): Enter applies,
+            // Escape reverts. Escape is not claimed here because egui clears
+            // focus before any widget renders, so the workbench has already
+            // settled it by the time this box is drawn.
+            if owns_keyboard && enter_pressed {
+                claims.enter = true;
+                if state.selected_recipe_parameter_issue().is_none() {
+                    recipe_accepted = true;
+                    response.surrender_focus();
+                }
+            }
+            continue;
+        }
         let is_active = active_at_start == Some(layout.readout.kind);
         if is_active {
             let (mut buffer, request_focus) = state
@@ -10841,7 +11114,6 @@ fn show_dimension_widgets(
         }
     }
 
-    let mut claims = DimensionKeyClaims::default();
     let mut pending_created = None;
     let polyline_gesture_owned = canvas_owned_keyboard
         || (state.exact_tool == ToolVariant::ChainedPolyline
@@ -10970,7 +11242,15 @@ fn show_dimension_widgets(
             input.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
         });
     }
-    (claims, pending_created)
+    // The request lives for exactly the frame that armed it, whether or not
+    // the armed box actually laid out.
+    state.focus_dimension_box = None;
+    DimensionWidgetOutcome {
+        claims,
+        pending_created,
+        recipe_field,
+        recipe_accepted,
+    }
 }
 
 fn stage_complete_dimension_draft(state: &mut SketchCanvasState) -> Option<SketchEntityId> {
@@ -14025,14 +14305,20 @@ mod tests {
         sketch.commit_pending().expect("circle should commit");
         assert!(sketch.set_exact_tool(ToolVariant::Dimension));
         assert!(sketch.set_selected(Some(circle)) || sketch.selected() == Some(circle));
+        // Editable: the Dimension tool arms this readout because the circle's
+        // recipe carries a `"diameter"` literal to drive.
         assert_eq!(
             sketch.dimension_readouts(),
             vec![DimensionReadout {
                 kind: SketchDimensionKind::Diameter,
                 value: 4.0,
                 locked: false,
-                editable: false,
+                editable: true,
             }]
+        );
+        assert_eq!(
+            first_armed_dimension_kind(&sketch),
+            Some(SketchDimensionKind::Diameter)
         );
         let editor = sketch
             .selected_recipe_editor()
