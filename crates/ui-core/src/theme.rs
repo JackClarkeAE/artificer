@@ -9,51 +9,208 @@
 //! kernel or the model document.
 
 use egui::{Color32, FontId, RichText, Stroke};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 // ---------------------------------------------------------------------------
-// Core chrome tokens. Names are stable across the crate; values define the
-// light workbench theme.
+// Palettes. Every colour the workbench paints comes from one of these fields,
+// so a new theme is a new value of `Palette` and nothing else: no call site
+// anywhere knows which theme is active.
 // ---------------------------------------------------------------------------
 
-/// Application background behind and between the docked regions.
-pub const BG: Color32 = Color32::from_rgb(233, 237, 242);
-/// Docked chrome: header, side panels, confirmation rail.
-pub const PANEL: Color32 = Color32::from_rgb(242, 244, 247);
-/// Raised cards, inspector sections, and input surfaces.
-pub const CARD: Color32 = Color32::from_rgb(255, 255, 255);
-/// Hairline borders between chrome regions and around cards.
-pub const BORDER: Color32 = Color32::from_rgb(198, 205, 214);
-/// Primary text on chrome.
-pub const TEXT: Color32 = Color32::from_rgb(31, 38, 46);
-/// Secondary text: captions, group titles, de-emphasized values.
-pub const MUTED: Color32 = Color32::from_rgb(91, 102, 114);
-/// Command accent: active tools, links, primary actions.
-pub const ACCENT: Color32 = Color32::from_rgb(18, 102, 189);
-/// Positive states: valid results, committed features, additive previews.
-pub const GOOD: Color32 = Color32::from_rgb(23, 122, 67);
-/// Cautionary states: pending confirmation, stale data.
-pub const WARN: Color32 = Color32::from_rgb(168, 106, 0);
-/// Failure states: rejected operations, invalid input, subtractive previews.
-pub const BAD: Color32 = Color32::from_rgb(189, 57, 52);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Palette {
+    /// Application background behind and between the docked regions.
+    pub bg: Color32,
+    /// Docked chrome: header, side panels, confirmation rail.
+    pub panel: Color32,
+    /// Raised cards, inspector sections, and input surfaces.
+    pub card: Color32,
+    /// Hairline borders between chrome regions and around cards.
+    pub border: Color32,
+    /// Primary text on chrome.
+    pub text: Color32,
+    /// Secondary text: captions, group titles, de-emphasized values.
+    pub muted: Color32,
+    /// Command accent: active tools, links, primary actions.
+    pub accent: Color32,
+    /// Positive states: valid results, committed features, additive previews.
+    pub good: Color32,
+    /// Cautionary states: pending confirmation, stale data.
+    pub warn: Color32,
+    /// Failure states: rejected operations, invalid input, subtractive previews.
+    pub bad: Color32,
+    /// Ribbon strip fill, offset from the docked panels so the command surface
+    /// reads as the topmost chrome layer.
+    pub ribbon_fill: Color32,
+    /// Fill behind widget rows in the bottom feature timeline.
+    pub timeline_fill: Color32,
+    /// Hovered interactive chrome.
+    pub hover_fill: Color32,
+    /// Pressed/active interactive chrome.
+    pub active_fill: Color32,
+    /// Fill for toggled-on (selected) chrome controls.
+    pub selected_fill: Color32,
+    /// Pale positive-state fill behind pending-confirmation chrome.
+    pub good_fill: Color32,
+    /// Top of the modeling-viewport gradient.
+    pub viewport_top: Color32,
+    /// Bottom of the modeling-viewport gradient.
+    pub viewport_bottom: Color32,
+    /// Whether egui should build its own widget defaults from a dark base.
+    pub dark: bool,
+}
 
-/// Ribbon strip fill, slightly lighter than the docked panels so the command
-/// surface reads as the topmost chrome layer.
-pub const RIBBON_FILL: Color32 = Color32::from_rgb(245, 246, 248);
-/// Fill behind widget rows in the bottom feature timeline.
-pub const TIMELINE_FILL: Color32 = Color32::from_rgb(238, 241, 245);
-/// Hovered interactive chrome.
-pub const HOVER_FILL: Color32 = Color32::from_rgb(223, 231, 240);
-/// Pressed/active interactive chrome.
-pub const ACTIVE_FILL: Color32 = Color32::from_rgb(208, 220, 234);
-/// Fill for toggled-on (selected) chrome controls.
-pub const SELECTED_FILL: Color32 = Color32::from_rgb(214, 230, 247);
-/// Pale positive-state fill behind pending-confirmation chrome.
-pub const GOOD_FILL: Color32 = Color32::from_rgb(224, 240, 231);
+/// The light professional-CAD chrome: near-white ribbon and panels, dark
+/// legible text, a restrained command-blue accent, and a pale blue-gray
+/// gradient viewport.
+pub const LIGHT: Palette = Palette {
+    bg: Color32::from_rgb(233, 237, 242),
+    panel: Color32::from_rgb(242, 244, 247),
+    card: Color32::from_rgb(255, 255, 255),
+    border: Color32::from_rgb(198, 205, 214),
+    text: Color32::from_rgb(31, 38, 46),
+    muted: Color32::from_rgb(91, 102, 114),
+    accent: Color32::from_rgb(18, 102, 189),
+    good: Color32::from_rgb(23, 122, 67),
+    warn: Color32::from_rgb(168, 106, 0),
+    bad: Color32::from_rgb(189, 57, 52),
+    ribbon_fill: Color32::from_rgb(245, 246, 248),
+    timeline_fill: Color32::from_rgb(238, 241, 245),
+    hover_fill: Color32::from_rgb(223, 231, 240),
+    active_fill: Color32::from_rgb(208, 220, 234),
+    selected_fill: Color32::from_rgb(214, 230, 247),
+    good_fill: Color32::from_rgb(224, 240, 231),
+    viewport_top: Color32::from_rgb(251, 252, 253),
+    viewport_bottom: Color32::from_rgb(195, 206, 219),
+    dark: false,
+};
 
-/// Top of the modeling-viewport gradient.
-pub const VIEWPORT_TOP: Color32 = Color32::from_rgb(251, 252, 253);
-/// Bottom of the modeling-viewport gradient.
-pub const VIEWPORT_BOTTOM: Color32 = Color32::from_rgb(195, 206, 219);
+/// The dark chrome. Not an inversion of the light one: the neutrals keep a
+/// slight blue bias toward the accent so the chrome reads as one family, the
+/// accent and state colours are lifted until they carry on a dark ground, and
+/// the viewport gradient stays darker than the panels so the model still reads
+/// as the lit surface in the window.
+pub const DARK: Palette = Palette {
+    bg: Color32::from_rgb(24, 28, 34),
+    panel: Color32::from_rgb(32, 37, 44),
+    card: Color32::from_rgb(42, 48, 57),
+    border: Color32::from_rgb(62, 70, 81),
+    text: Color32::from_rgb(228, 233, 239),
+    muted: Color32::from_rgb(155, 167, 181),
+    accent: Color32::from_rgb(93, 165, 240),
+    good: Color32::from_rgb(90, 196, 138),
+    warn: Color32::from_rgb(225, 173, 88),
+    bad: Color32::from_rgb(233, 118, 111),
+    ribbon_fill: Color32::from_rgb(36, 42, 50),
+    timeline_fill: Color32::from_rgb(29, 34, 41),
+    hover_fill: Color32::from_rgb(50, 58, 68),
+    active_fill: Color32::from_rgb(62, 72, 85),
+    selected_fill: Color32::from_rgb(31, 60, 90),
+    good_fill: Color32::from_rgb(29, 54, 41),
+    viewport_top: Color32::from_rgb(46, 53, 62),
+    viewport_bottom: Color32::from_rgb(20, 24, 29),
+    dark: true,
+};
+
+/// A theme the user can choose.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WorkbenchTheme {
+    #[default]
+    Light,
+    Dark,
+}
+
+impl WorkbenchTheme {
+    pub const ALL: [Self; 2] = [Self::Light, Self::Dark];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    #[must_use]
+    pub const fn palette(self) -> Palette {
+        match self {
+            Self::Light => LIGHT,
+            Self::Dark => DARK,
+        }
+    }
+
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+}
+
+/// The active theme, as an index into `WorkbenchTheme::ALL`.
+///
+/// A process-wide atomic rather than a value threaded through every paint call:
+/// the palette is read hundreds of times per frame from code that has no other
+/// reason to know about application state, and a `Relaxed` load of a `u8` is
+/// cheaper than the plumbing would be. Changing it is a user action, so no
+/// ordering between the write and the next frame's reads is required.
+static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
+
+#[must_use]
+pub fn active_theme() -> WorkbenchTheme {
+    match ACTIVE_THEME.load(Ordering::Relaxed) {
+        0 => WorkbenchTheme::Light,
+        _ => WorkbenchTheme::Dark,
+    }
+}
+
+/// Chooses the theme. Callers must re-run [`install_style`] afterwards so the
+/// widget defaults egui derives from the palette are rebuilt too.
+pub fn set_active_theme(theme: WorkbenchTheme) {
+    let index = match theme {
+        WorkbenchTheme::Light => 0,
+        WorkbenchTheme::Dark => 1,
+    };
+    ACTIVE_THEME.store(index, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn palette() -> Palette {
+    active_theme().palette()
+}
+
+macro_rules! palette_accessors {
+    ($($name:ident),* $(,)?) => {
+        $(
+            #[must_use]
+            pub fn $name() -> Color32 {
+                palette().$name
+            }
+        )*
+    };
+}
+
+palette_accessors!(
+    bg,
+    panel,
+    card,
+    border,
+    text,
+    muted,
+    accent,
+    good,
+    warn,
+    bad,
+    ribbon_fill,
+    timeline_fill,
+    hover_fill,
+    active_fill,
+    selected_fill,
+    good_fill,
+    viewport_top,
+    viewport_bottom,
+);
 
 // ---------------------------------------------------------------------------
 // Style installation
@@ -64,18 +221,27 @@ pub const VIEWPORT_BOTTOM: Color32 = Color32::from_rgb(195, 206, 219);
 /// so a host- or harness-selected dark preference cannot reintroduce dark
 /// widget chrome under the light workbench palette.
 pub fn install_style(context: &egui::Context) {
-    context.set_theme(egui::Theme::Light);
+    let palette = palette();
+    context.set_theme(if palette.dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
-        install_theme_slot(context, theme);
+        install_theme_slot(context, theme, palette);
     }
 }
 
-fn install_theme_slot(context: &egui::Context, theme: egui::Theme) {
-    // Both slots start from the stock light style so no dark-slot widget
-    // default (window title bars, hover text, open-header fills) can leak
-    // through when the host requests the dark theme.
-    let mut style = (*context.style_of(egui::Theme::Light)).clone();
-    style.visuals = egui::Visuals::light();
+fn install_theme_slot(context: &egui::Context, theme: egui::Theme, palette: Palette) {
+    // Both slots are installed from the active palette so a host- or
+    // harness-selected theme preference cannot reintroduce widget chrome from
+    // the palette the user did not choose.
+    let mut style = (*context.style_of(theme)).clone();
+    style.visuals = if palette.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     style.spacing.item_spacing = egui::vec2(5.0, 4.0);
     style.spacing.button_padding = egui::vec2(7.0, 4.0);
     style.spacing.interact_size.y = 28.0;
@@ -94,31 +260,31 @@ fn install_theme_slot(context: &egui::Context, theme: egui::Theme) {
     style
         .text_styles
         .insert(egui::TextStyle::Monospace, FontId::monospace(11.0));
-    style.visuals.panel_fill = PANEL;
-    style.visuals.window_fill = CARD;
-    style.visuals.extreme_bg_color = CARD;
-    style.visuals.faint_bg_color = Color32::from_rgb(236, 239, 243);
-    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(44, 52, 61));
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(231, 235, 240);
-    style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(231, 235, 240);
-    style.visuals.widgets.hovered.bg_fill = HOVER_FILL;
-    style.visuals.widgets.hovered.weak_bg_fill = HOVER_FILL;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(160, 176, 194));
-    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT);
-    style.visuals.widgets.active.bg_fill = ACTIVE_FILL;
-    style.visuals.widgets.active.weak_bg_fill = ACTIVE_FILL;
-    style.visuals.widgets.active.fg_stroke = Stroke::new(2.0, TEXT);
-    style.visuals.widgets.open.bg_fill = PANEL;
-    style.visuals.widgets.open.weak_bg_fill = PANEL;
-    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
-    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, BORDER);
-    style.visuals.selection.bg_fill = SELECTED_FILL;
-    style.visuals.selection.stroke = Stroke::new(1.5, ACCENT);
-    style.visuals.hyperlink_color = ACCENT;
-    style.visuals.window_stroke = Stroke::new(1.0, BORDER);
-    style.visuals.dark_mode = false;
+    style.visuals.panel_fill = palette.panel;
+    style.visuals.window_fill = palette.card;
+    style.visuals.extreme_bg_color = palette.card;
+    style.visuals.faint_bg_color = palette.timeline_fill;
+    style.visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.inactive.bg_fill = palette.hover_fill.gamma_multiply(0.85);
+    style.visuals.widgets.inactive.weak_bg_fill = palette.hover_fill.gamma_multiply(0.85);
+    style.visuals.widgets.hovered.bg_fill = palette.hover_fill;
+    style.visuals.widgets.hovered.weak_bg_fill = palette.hover_fill;
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, palette.text);
+    style.visuals.widgets.active.bg_fill = palette.active_fill;
+    style.visuals.widgets.active.weak_bg_fill = palette.active_fill;
+    style.visuals.widgets.active.fg_stroke = Stroke::new(2.0, palette.text);
+    style.visuals.widgets.open.bg_fill = palette.panel;
+    style.visuals.widgets.open.weak_bg_fill = palette.panel;
+    style.visuals.widgets.open.fg_stroke = Stroke::new(1.0, palette.text);
+    style.visuals.widgets.open.bg_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.selection.bg_fill = palette.selected_fill;
+    style.visuals.selection.stroke = Stroke::new(1.5, palette.accent);
+    style.visuals.hyperlink_color = palette.accent;
+    style.visuals.window_stroke = Stroke::new(1.0, palette.border);
+    style.visuals.dark_mode = palette.dark;
     style.visuals.override_text_color = None;
     context.set_style_of(theme, style);
 }
@@ -170,7 +336,7 @@ pub fn ribbon_group<R>(
                             ui.label(
                                 RichText::new(title)
                                     .font(FontId::proportional(9.5))
-                                    .color(MUTED),
+                                    .color(muted()),
                             );
                         },
                     );
@@ -198,7 +364,7 @@ pub const PROPERTY_NAME_WIDTH: f32 = 92.0;
 /// on the next makes the reader parse each sentence to find the number; the
 /// same two facts as name/value rows are one glance.
 pub fn property_row(ui: &mut egui::Ui, name: &str, value: &str) -> egui::Response {
-    property_row_colored(ui, name, value, TEXT)
+    property_row_colored(ui, name, value, text())
 }
 
 pub fn property_row_colored(
@@ -218,7 +384,7 @@ pub fn property_row_colored(
             egui::Align2::LEFT_CENTER,
             name,
             FontId::proportional(11.0),
-            MUTED,
+            muted(),
         );
         let response = ui.add(
             egui::Label::new(RichText::new(value).small().color(colour))
@@ -239,17 +405,17 @@ pub fn property_row_colored(
 /// A property whose value does not exist yet, said in the value column rather
 /// than as a sentence somewhere else, so the row still lines up.
 pub fn property_row_unavailable(ui: &mut egui::Ui, name: &str, reason: &str) -> egui::Response {
-    property_row_colored(ui, name, reason, MUTED)
+    property_row_colored(ui, name, reason, muted())
 }
 
 /// Paints the standard modeling-viewport backdrop: a vertical gradient from
 /// near-white to pale blue-gray, in the mainstream CAD tradition.
 pub fn paint_viewport_gradient(painter: &egui::Painter, rect: egui::Rect) {
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.left_top(), VIEWPORT_TOP);
-    mesh.colored_vertex(rect.right_top(), VIEWPORT_TOP);
-    mesh.colored_vertex(rect.right_bottom(), VIEWPORT_BOTTOM);
-    mesh.colored_vertex(rect.left_bottom(), VIEWPORT_BOTTOM);
+    mesh.colored_vertex(rect.left_top(), viewport_top());
+    mesh.colored_vertex(rect.right_top(), viewport_top());
+    mesh.colored_vertex(rect.right_bottom(), viewport_bottom());
+    mesh.colored_vertex(rect.left_bottom(), viewport_bottom());
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     painter.add(egui::Shape::mesh(mesh));
@@ -277,31 +443,83 @@ mod tests {
         (lighter + 0.05) / (darker + 0.05)
     }
 
+    /// Every theme, not only the active one. A dark palette that has never had
+    /// its contrast checked is how "supports dark mode" turns into "has a dark
+    /// mode nobody can read".
     #[test]
-    fn chrome_text_meets_wcag_aa_contrast_on_every_chrome_surface() {
-        for background in [BG, PANEL, CARD, RIBBON_FILL, TIMELINE_FILL] {
-            assert!(
-                contrast_ratio(TEXT, background) >= 4.5,
-                "primary text must stay legible on chrome"
-            );
-            assert!(
-                contrast_ratio(MUTED, background) >= 4.5,
-                "secondary text must stay legible on chrome"
-            );
-            assert!(
-                contrast_ratio(ACCENT, background) >= 3.0,
-                "accent chrome must stay distinguishable"
-            );
+    fn chrome_text_meets_wcag_aa_contrast_in_every_theme() {
+        for theme in WorkbenchTheme::ALL {
+            let palette = theme.palette();
+            for background in [
+                palette.bg,
+                palette.panel,
+                palette.card,
+                palette.ribbon_fill,
+                palette.timeline_fill,
+            ] {
+                assert!(
+                    contrast_ratio(palette.text, background) >= 4.5,
+                    "{}: primary text must stay legible on chrome",
+                    theme.label()
+                );
+                assert!(
+                    contrast_ratio(palette.muted, background) >= 4.5,
+                    "{}: secondary text must stay legible on chrome",
+                    theme.label()
+                );
+                assert!(
+                    contrast_ratio(palette.accent, background) >= 3.0,
+                    "{}: accent chrome must stay distinguishable",
+                    theme.label()
+                );
+            }
         }
     }
 
     #[test]
-    fn state_colors_stay_legible_on_light_chrome() {
-        for state in [GOOD, WARN, BAD] {
-            assert!(
-                contrast_ratio(state, PANEL) >= 3.0,
-                "state colors must read on light chrome"
-            );
+    fn state_colors_stay_legible_in_every_theme() {
+        for theme in WorkbenchTheme::ALL {
+            let palette = theme.palette();
+            for state in [palette.good, palette.warn, palette.bad] {
+                assert!(
+                    contrast_ratio(state, palette.panel) >= 3.0,
+                    "{}: state colors must read on chrome",
+                    theme.label()
+                );
+            }
         }
+    }
+
+    /// A theme whose surfaces are indistinguishable from one another is one
+    /// flat sheet: the panel/card/ribbon separation is what makes the docked
+    /// regions readable as regions.
+    #[test]
+    fn every_theme_separates_its_chrome_surfaces() {
+        for theme in WorkbenchTheme::ALL {
+            let palette = theme.palette();
+            for (name, first, second) in [
+                ("bg/panel", palette.bg, palette.panel),
+                ("panel/card", palette.panel, palette.card),
+                ("panel/ribbon", palette.panel, palette.ribbon_fill),
+            ] {
+                let difference = relative_luminance(first) - relative_luminance(second);
+                assert!(
+                    difference.abs() > 0.002,
+                    "{}: {name} are the same surface",
+                    theme.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn choosing_a_theme_changes_what_every_accessor_returns() {
+        set_active_theme(WorkbenchTheme::Dark);
+        assert_eq!(active_theme(), WorkbenchTheme::Dark);
+        assert_eq!(text(), DARK.text);
+        assert!(palette().dark);
+        set_active_theme(WorkbenchTheme::Light);
+        assert_eq!(text(), LIGHT.text);
+        assert!(!palette().dark);
     }
 }

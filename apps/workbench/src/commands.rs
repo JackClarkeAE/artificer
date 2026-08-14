@@ -42,10 +42,14 @@ impl RibbonTab {
         }
     }
 
+    /// Model and Sketch keep the names the workspace buttons they replaced
+    /// already had: it is the same control doing the same job, now drawn as a
+    /// tab, and renaming it would break every script and habit that names it.
+    /// View is a ribbon tab only, and says so.
     pub const fn accessible_name(self) -> &'static str {
         match self {
-            Self::Model => "Model ribbon tab",
-            Self::Sketch => "Sketch ribbon tab",
+            Self::Model => "Model mode",
+            Self::Sketch => "Sketch mode",
             Self::View => "View ribbon tab",
         }
     }
@@ -68,6 +72,7 @@ pub enum RibbonGroupId {
     Display,
     Motion,
     Panels,
+    Appearance,
 }
 
 impl RibbonGroupId {
@@ -85,6 +90,7 @@ impl RibbonGroupId {
             Self::Camera => "CAMERA",
             Self::Motion => "MOTION",
             Self::Panels => "PANELS",
+            Self::Appearance => "APPEARANCE",
         }
     }
 
@@ -106,6 +112,7 @@ impl RibbonGroupId {
             Self::Display => "group_display",
             Self::Motion => "group_motion",
             Self::Panels => "group_panels",
+            Self::Appearance => "group_appearance",
         }
     }
 }
@@ -152,6 +159,7 @@ pub enum ModelCommand {
     ShowBrowser,
     ShowProperties,
     ShowHistory,
+    ToggleTheme,
     FinishSketch,
     FrameSketch,
     ToggleSnap,
@@ -586,6 +594,18 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "History",
         "Show history panel",
         "Show the parametric history strip along the bottom of the workspace.",
+        None,
+    ),
+    command(
+        ModelCommand::ToggleTheme,
+        "view.theme",
+        RibbonTab::View,
+        RibbonGroupId::Appearance,
+        CommandIcon::Theme,
+        CommandSize::Large,
+        "Theme",
+        "Switch theme",
+        "Switch between the light and dark workbench themes.",
         None,
     ),
 ];

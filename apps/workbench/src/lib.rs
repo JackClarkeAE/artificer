@@ -98,10 +98,7 @@ use crate::sketch_toolbar::{
     paint_tool_icon,
 };
 
-use crate::theme::{
-    ACCENT, BAD, BG, BORDER, CARD, GOOD, MUTED, PANEL, RIBBON_FILL, SELECTED_FILL, TEXT,
-    TIMELINE_FILL, WARN, install_style,
-};
+use crate::theme::install_style;
 const ORIGIN_PLANE_HALF_EXTENT_MM: f64 = 25.0;
 const MAX_NATIVE_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 static DOCUMENT_SAVE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -9570,13 +9567,89 @@ impl KernelLabApp {
         }
     }
 
+    /// Every action that reads or writes a file, in one menu.
+    ///
+    /// They used to be spread across the header (Save, Open) and the document
+    /// properties popout (Save .ARTIFICER, Open .ARTIFICER, Export STL, Export
+    /// faceted STEP) — the same two actions under two names in two places, and
+    /// exports filed under "properties", where nobody would look for them.
+    fn file_menu(&mut self, ui: &mut egui::Ui, operation_pending: bool) {
+        let response = ui
+            .menu_button("File", |ui| {
+                ui.set_min_width(190.0);
+                let path = self.document_path.clone();
+                let save = ui
+                    .add_enabled(!operation_pending, egui::Button::new("Save"))
+                    .on_hover_text(format!("Save Artificer workspace to {}", path.display()));
+                save.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        !operation_pending,
+                        "Save document",
+                    )
+                });
+                if save.clicked() {
+                    self.document_status = Some(match self.save_workspace_to_path(&path) {
+                        Ok(()) => format!("Saved Artificer workspace to {}", path.display()),
+                        Err(error) => format!("Save failed: {error}"),
+                    });
+                    ui.close();
+                }
+                let can_open = !operation_pending && path.is_file();
+                let open = ui
+                    .add_enabled(can_open, egui::Button::new("Open"))
+                    .on_hover_text(if path.is_file() {
+                        format!("Stage opening {}", path.display())
+                    } else {
+                        format!("No saved document exists at {}", path.display())
+                    });
+                open.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        can_open,
+                        "Open saved document",
+                    )
+                });
+                if open.clicked() {
+                    self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+                    ui.close();
+                }
+                ui.separator();
+                // Exports need a path, and the path editor lives in the
+                // document properties popout. The menu routes there rather
+                // than growing a second pair of export buttons that write
+                // somewhere else — the ellipsis is the promise that this
+                // opens a dialog rather than doing the thing.
+                if ui
+                    .add_enabled(!operation_pending, egui::Button::new("Export…"))
+                    .on_hover_text("Choose an STL or faceted STEP path and export")
+                    .clicked()
+                {
+                    self.document_properties_open = true;
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(!operation_pending, egui::Button::new("Document properties"))
+                    .on_hover_text("Units, navigation scheme, and document-wide settings")
+                    .clicked()
+                {
+                    self.document_properties_open = true;
+                    ui.close();
+                }
+            })
+            .response;
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "File menu"));
+    }
+
     fn header(&mut self, ui: &mut egui::Ui) {
         let operation_pending = self.operation_confirmation_pending();
         ui.horizontal_centered(|ui| {
             let product_mark = ui.label(
                 RichText::new("ARTIFICER")
                     .font(FontId::proportional(10.0))
-                    .color(ACCENT)
+                    .color(theme::accent())
                     .strong(),
             );
             product_mark.widget_info(|| {
@@ -9588,41 +9661,41 @@ impl KernelLabApp {
             ui.label(
                 RichText::new("Document 1")
                     .font(FontId::proportional(14.0))
-                    .color(TEXT)
+                    .color(theme::text())
                     .strong(),
             );
-            let can_save = !operation_pending;
-            let save = ui
-                .add_enabled(can_save, egui::Button::new("Save").small())
-                .on_hover_text(format!(
-                    "Save Artificer workspace to {}",
-                    self.document_path.display()
-                ));
-            save.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, can_save, "Save document")
+            ui.add_space(6.0);
+            self.file_menu(ui, operation_pending);
+            // Undo and redo belong beside the file actions, not buried in the
+            // history strip: they are the two controls a user reaches for
+            // without looking, and the strip is where you go to inspect
+            // history, not to step it.
+            let undo_enabled = !operation_pending && self.document.can_undo();
+            let undo = ui
+                .add_enabled(undo_enabled, egui::Button::new("Undo").small())
+                .on_hover_text("Undo the last committed document change");
+            undo.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    undo_enabled,
+                    "Undo history change",
+                )
             });
-            let can_open = !operation_pending && self.document_path.is_file();
-            let open = ui
-                .add_enabled(can_open, egui::Button::new("Open").small())
-                .on_hover_text(if self.document_path.is_file() {
-                    format!("Stage opening {}", self.document_path.display())
-                } else {
-                    format!(
-                        "No saved document exists at {}",
-                        self.document_path.display()
-                    )
-                });
-            open.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, can_open, "Open saved document")
+            let redo_enabled = !operation_pending && self.document.can_redo();
+            let redo = ui
+                .add_enabled(redo_enabled, egui::Button::new("Redo").small())
+                .on_hover_text("Redo the change that was undone");
+            redo.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    redo_enabled,
+                    "Redo history change",
+                )
             });
-            if save.clicked() {
-                let path = self.document_path.clone();
-                self.document_status = Some(match self.save_workspace_to_path(&path) {
-                    Ok(()) => format!("Saved Artificer workspace to {}", path.display()),
-                    Err(error) => format!("Save failed: {error}"),
-                });
-            } else if open.clicked() {
-                self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+            if undo.clicked() {
+                self.undo_document();
+            } else if redo.clicked() {
+                self.redo_document();
             }
             shell_toggle_button(
                 ui,
@@ -9631,27 +9704,10 @@ impl KernelLabApp {
                 "part library",
                 operation_pending,
             );
-            ui.add_space(8.0);
-            for mode in [WorkbenchMode::Model, WorkbenchMode::Sketch] {
-                let enabled = self.pending_operation.is_none();
-                let response = workspace_tab(
-                    ui,
-                    &format!("{} mode", mode.label()),
-                    self.workbench_mode == mode,
-                    enabled,
-                );
-                if response.clicked() {
-                    match mode {
-                        WorkbenchMode::Model => self.enter_model_mode(),
-                        WorkbenchMode::Sketch => self.enter_sketch_mode(),
-                    }
-                }
-                if !enabled {
-                    response.on_disabled_hover_text(
-                        "Confirm or cancel the pending operation before changing workspaces.",
-                    );
-                }
-            }
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(2.0);
+            self.ribbon_tab_strip(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let properties =
                     ui.add_enabled(!operation_pending, egui::Button::new("Properties"));
@@ -9706,7 +9762,11 @@ impl KernelLabApp {
         if changed {
             self.document_settings.navigation = preset;
         }
-        ui.label(RichText::new(preset.summary()).small().color(MUTED));
+        ui.label(
+            RichText::new(preset.summary())
+                .small()
+                .color(theme::muted()),
+        );
     }
 
     /// Material assignment for the active body, and the mass properties that
@@ -9714,7 +9774,11 @@ impl KernelLabApp {
     /// unavailable rather than filled in with a plausible number.
     fn material_card(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.active_body_id() else {
-            ui.label(RichText::new("No body is active.").small().color(MUTED));
+            ui.label(
+                RichText::new("No body is active.")
+                    .small()
+                    .color(theme::muted()),
+            );
             return;
         };
         let assigned = self.body_material(active);
@@ -9737,7 +9801,7 @@ impl KernelLabApp {
                     for entry in material::LIBRARY {
                         if entry.category != category {
                             category = entry.category;
-                            ui.label(RichText::new(category).small().color(MUTED));
+                            ui.label(RichText::new(category).small().color(theme::muted()));
                         }
                         let selected = assigned.is_some_and(|current| current.key == entry.key);
                         if ui.selectable_label(selected, entry.name).clicked() {
@@ -9754,7 +9818,7 @@ impl KernelLabApp {
             ui.horizontal(|ui| {
                 ui.add_sized(
                     egui::vec2(theme::PROPERTY_NAME_WIDTH, 14.0),
-                    egui::Label::new(RichText::new("Density").small().color(MUTED))
+                    egui::Label::new(RichText::new("Density").small().color(theme::muted()))
                         .selectable(false)
                         .halign(egui::Align::LEFT),
                 );
@@ -9764,13 +9828,13 @@ impl KernelLabApp {
                 ui.painter().rect_stroke(
                     rect,
                     2,
-                    Stroke::new(1.0, BORDER),
+                    Stroke::new(1.0, theme::border()),
                     egui::StrokeKind::Inside,
                 );
                 ui.label(
                     RichText::new(format!("{:.0} kg/m³", material.density))
                         .small()
-                        .color(TEXT),
+                        .color(theme::text()),
                 );
             });
         }
@@ -9793,7 +9857,7 @@ impl KernelLabApp {
                 RichText::new("APPROXIMATE · measures are not certified")
                     .small()
                     .strong()
-                    .color(WARN),
+                    .color(theme::warn()),
             )
             .on_hover_text(reason);
         }
@@ -9803,11 +9867,11 @@ impl KernelLabApp {
                     ui,
                     "Mass",
                     &format!("{:.3} kg", grams / 1000.0),
-                    ACCENT,
+                    theme::accent(),
                 );
             }
             Some(grams) => {
-                theme::property_row_colored(ui, "Mass", &format!("{grams:.3} g"), ACCENT);
+                theme::property_row_colored(ui, "Mass", &format!("{grams:.3} g"), theme::accent());
             }
             None => {
                 theme::property_row_unavailable(
@@ -9845,7 +9909,7 @@ impl KernelLabApp {
                 egui::CollapsingHeader::new(
                     RichText::new("Document 1 · Root")
                         .font(FontId::proportional(12.5))
-                        .color(TEXT)
+                        .color(theme::text())
                         .strong(),
                 )
                 .id_salt("browser_document")
@@ -9854,7 +9918,7 @@ impl KernelLabApp {
                     egui::CollapsingHeader::new(
                         RichText::new("Origin")
                             .font(FontId::proportional(12.0))
-                            .color(TEXT)
+                            .color(theme::text())
                             .strong(),
                     )
                     .id_salt("browser_origin")
@@ -9907,7 +9971,7 @@ impl KernelLabApp {
                         egui::CollapsingHeader::new(
                             RichText::new(format!("Construction ({})", rows.len()))
                                 .font(FontId::proportional(12.0))
-                                .color(TEXT)
+                                .color(theme::text())
                                 .strong(),
                         )
                         .id_salt("browser_construction_planes")
@@ -10113,9 +10177,9 @@ impl KernelLabApp {
                             let response = ui.add_sized(
                                 [(ui.available_width() - 2.0).max(24.0), 22.0],
                                 egui::Button::new(RichText::new(&label).color(if visible {
-                                    ACCENT
+                                    theme::accent()
                                 } else {
-                                    MUTED
+                                    theme::muted()
                                 }))
                                 .frame(false)
                                 .selected(active)
@@ -10145,7 +10209,7 @@ impl KernelLabApp {
                                 self.feature_preview.current_sketch_ordinal(),
                                 self.sketch_support.label()
                             ),
-                            ACCENT,
+                            theme::accent(),
                         );
                     }
                     if let Some((index, visible)) = sketch_visibility_change {
@@ -10173,7 +10237,7 @@ impl KernelLabApp {
                         egui::CollapsingHeader::new(
                             RichText::new(format!("Joints ({})", joint_rows.len()))
                                 .font(FontId::proportional(12.0))
-                                .color(TEXT)
+                                .color(theme::text())
                                 .strong(),
                         )
                         .id_salt("browser_joints")
@@ -10191,7 +10255,11 @@ impl KernelLabApp {
                                         if enabled { "↻" } else { "○" },
                                         child.get()
                                     ),
-                                    if enabled { GOOD } else { MUTED },
+                                    if enabled {
+                                        theme::good()
+                                    } else {
+                                        theme::muted()
+                                    },
                                 );
                             }
                         });
@@ -10286,7 +10354,7 @@ impl KernelLabApp {
         collapsible_card(ui, "lab_diagnostics", "LAB / DIAGNOSTICS", false, |ui| {
             if let Some(recorder) = self.development_recorder.as_ref() {
                 collapsible_card(ui, "development_trace", "DEVELOPMENT TRACE", true, |ui| {
-                    status_line(ui, "Session log active", GOOD);
+                    status_line(ui, "Session log active", theme::good());
                     ui.label(
                         RichText::new(
                             recorder
@@ -10296,14 +10364,14 @@ impl KernelLabApp {
                                 .unwrap_or("session.jsonl"),
                         )
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                     ui.label(
                                     RichText::new(
                                         "Local only · gestures are coalesced · text and clipboard data are excluded",
                                     )
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                                 );
                 });
                 ui.add_space(5.0);
@@ -10318,11 +10386,13 @@ impl KernelLabApp {
                         if config.threads == 1 { "" } else { "s" },
                         config.parallel_min_items
                     ))
-                    .color(ACCENT),
+                    .color(theme::accent()),
                 );
                 let metrics = compute.recent_metrics();
                 if metrics.is_empty() {
-                    ui.label(RichText::new("No measured compute batches yet").color(MUTED));
+                    ui.label(
+                        RichText::new("No measured compute batches yet").color(theme::muted()),
+                    );
                 } else {
                     for metric in metrics.iter().rev().take(6) {
                         let mode = match metric.mode {
@@ -10338,7 +10408,7 @@ impl KernelLabApp {
                                 metric.elapsed.as_secs_f64() * 1_000.0
                             ))
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                         );
                     }
                 }
@@ -10358,17 +10428,21 @@ impl KernelLabApp {
                     let button = egui::Button::new(
                         RichText::new(case.title())
                             .color(if staged {
-                                WARN
+                                theme::warn()
                             } else if selected {
-                                TEXT
+                                theme::text()
                             } else {
-                                MUTED
+                                theme::muted()
                             })
                             .strong(),
                     )
                     .selected(selected)
                     .corner_radius(3)
-                    .fill(if selected { SELECTED_FILL } else { CARD });
+                    .fill(if selected {
+                        theme::selected_fill()
+                    } else {
+                        theme::card()
+                    });
                     let response = ui.add_enabled(
                         !operation_pending,
                         button.min_size(egui::vec2(ui.available_width(), 30.0)),
@@ -10381,7 +10455,7 @@ impl KernelLabApp {
                             "Confirm or cancel the pending operation first.",
                         );
                     }
-                    ui.label(RichText::new(case.detail()).small().color(MUTED));
+                    ui.label(RichText::new(case.detail()).small().color(theme::muted()));
                     ui.add_space(5.0);
                 }
             });
@@ -10410,7 +10484,7 @@ impl KernelLabApp {
                                 "Every model change stays pending until Enter or the green tick confirms it.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                         );
             });
         });
@@ -10433,8 +10507,8 @@ impl KernelLabApp {
             .open(&mut open)
             .frame(
                 Frame::new()
-                    .fill(PANEL.gamma_multiply(0.98))
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
                     .corner_radius(6)
                     .inner_margin(Margin::same(10)),
             )
@@ -10442,7 +10516,7 @@ impl KernelLabApp {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     self.workspace_settings_cards(ui);
                     ui.add_space(6.0);
-                    ui.label(RichText::new("UNITS").small().color(MUTED));
+                    ui.label(RichText::new("UNITS").small().color(theme::muted()));
                     let previous = self.document_settings.length_unit;
                     egui::ComboBox::new("document_length_unit", "Length unit")
                         .selected_text(previous.label())
@@ -10467,11 +10541,11 @@ impl KernelLabApp {
                             "Measurement readouts use this unit. Kernel geometry, current feature-entry fields, and interchange authority remain millimetres.",
                         )
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
 
                     ui.separator();
-                    ui.label(RichText::new("ARTIFICER DOCUMENT").small().color(MUTED));
+                    ui.label(RichText::new("ARTIFICER DOCUMENT").small().color(theme::muted()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.document_path_text)
                             .desired_width(f32::INFINITY)
@@ -10514,12 +10588,12 @@ impl KernelLabApp {
                             "Workspace envelope v{ARTIFICER_WORKSPACE_VERSION} · feature history + settings"
                         ))
                         .small()
-                        .color(GOOD),
+                        .color(theme::good()),
                     );
 
                     ui.separator();
-                    ui.label(RichText::new("INTERCHANGE EXPORT").small().color(MUTED));
-                    ui.label(RichText::new("STL path").small().color(MUTED));
+                    ui.label(RichText::new("INTERCHANGE EXPORT").small().color(theme::muted()));
+                    ui.label(RichText::new("STL path").small().color(theme::muted()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.stl_export_path_text)
                             .desired_width(f32::INFINITY),
@@ -10536,7 +10610,7 @@ impl KernelLabApp {
                             ),
                         );
                     }
-                    ui.label(RichText::new("STEP path").small().color(MUTED));
+                    ui.label(RichText::new("STEP path").small().color(theme::muted()));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.step_export_path_text)
                             .desired_width(f32::INFINITY),
@@ -10558,7 +10632,7 @@ impl KernelLabApp {
                             "STL and this first STEP exporter use the committed visible tessellation in millimetres; previews are never exported.",
                         )
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                 });
             });
@@ -10641,8 +10715,8 @@ impl KernelLabApp {
             .default_width(248.0)
             .frame(
                 Frame::new()
-                    .fill(PANEL.gamma_multiply(0.98))
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
                     .corner_radius(6)
                     .inner_margin(Margin::same(10)),
             )
@@ -10651,29 +10725,29 @@ impl KernelLabApp {
                 status_line(
                     ui,
                     &format!("{} EDGES", self.selected_edges.len()),
-                    if self.selected_edges.is_empty() { BAD } else { ACCENT },
+                    if self.selected_edges.is_empty() { theme::bad() } else { theme::accent() },
                 );
                 ui.label(
                     RichText::new("Shift-click adds or removes edges from this feature.")
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                 );
                 status_line(
                     ui,
                     support.headline(),
-                    if support.can_commit() { GOOD } else { BAD },
+                    if support.can_commit() { theme::good() } else { theme::bad() },
                 );
                 ui.label(
                     RichText::new(support.detail())
                         .small()
-                        .color(if support.can_commit() { MUTED } else { BAD }),
+                        .color(if support.can_commit() { theme::muted() } else { theme::bad() }),
                 );
                 ui.separator();
                 ui.label(RichText::new(if preset == SolidFeaturePreset::Chamfer {
                     "Setback distance"
                 } else {
                     "Radius"
-                }).small().color(MUTED));
+                }).small().color(theme::muted()));
                 let slider = ui.add(
                     egui::Slider::new(&mut self.edge_finish_distance, 0.01..=10.0)
                         .logarithmic(true)
@@ -10701,7 +10775,7 @@ impl KernelLabApp {
                 ui.label(
                     RichText::new(format!("{:.3} mm", self.edge_finish_distance))
                         .monospace()
-                        .color(GOOD),
+                        .color(theme::good()),
                 );
                 ui.separator();
                 if ui
@@ -10716,13 +10790,13 @@ impl KernelLabApp {
                         "Manual Shift selections form one chain. Tangent chain adds connected collinear continuations.",
                     )
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
                 );
                 ui.separator();
                 ui.label(
                     RichText::new("Drag the in-canvas diamond to adjust this value visually.")
                         .small()
-                        .color(ACCENT),
+                        .color(theme::accent()),
                 );
             });
     }
@@ -10757,7 +10831,7 @@ impl KernelLabApp {
             .resizable(false)
             .collapsible(true)
             .show(context, |ui| {
-                ui.label(RichText::new("OPERATION").small().color(MUTED));
+                ui.label(RichText::new("OPERATION").small().color(theme::muted()));
                 ui.horizontal(|ui| {
                     let modes: &[_] = if face_supported {
                         &[ExtrusionMode::Add, ExtrusionMode::Cut]
@@ -10806,14 +10880,14 @@ impl KernelLabApp {
                 collapsible_card(ui, "sketch_plane", "SKETCH PLANE", true, |ui| {
                     ui.label(
                         RichText::new(self.sketch_support.label())
-                            .color(ACCENT)
+                            .color(theme::accent())
                             .strong(),
                     );
                     if matches!(&self.sketch_support, SketchSupport::PlanarFace { .. }) {
                         ui.label(
                             RichText::new("Authoritative face-local frame · reference boundary")
                                 .small()
-                                .color(GOOD),
+                                .color(theme::good()),
                         );
                     }
                     let screen_axes = self.sketch_screen_axis_labels();
@@ -10824,7 +10898,7 @@ impl KernelLabApp {
                             screen_axes[0], screen_axes[1]
                         ))
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                     ui.label(
                         RichText::new(format!(
@@ -10832,7 +10906,7 @@ impl KernelLabApp {
                             normal.x, normal.y, normal.z
                         ))
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                 });
 
@@ -10846,19 +10920,19 @@ impl KernelLabApp {
                             ui.painter(),
                             icon_rect.shrink(3.0),
                             descriptor.icon,
-                            ACCENT,
+                            theme::accent(),
                         );
                         ui.vertical(|ui| {
                             ui.label(
                                 RichText::new(descriptor.accessible_name)
-                                    .color(ACCENT)
+                                    .color(theme::accent())
                                     .strong(),
                             );
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(descriptor.short_tooltip)
                                         .small()
-                                        .color(MUTED),
+                                        .color(theme::muted()),
                                 )
                                 .wrap(),
                             );
@@ -10884,9 +10958,9 @@ impl KernelLabApp {
                         "Gesture complete · Enter stages".to_owned()
                     };
                     ui.label(RichText::new(step).small().color(if progress.awaiting_confirmation {
-                        GOOD
+                        theme::good()
                     } else {
-                        TEXT
+                        theme::text()
                     }));
 
                     let selection = match descriptor.selection {
@@ -10915,9 +10989,9 @@ impl KernelLabApp {
                             ))
                             .small()
                             .color(if self.sketch.selected().is_some() {
-                                GOOD
+                                theme::good()
                             } else {
-                                WARN
+                                theme::warn()
                             }),
                         );
                     }
@@ -11001,9 +11075,9 @@ impl KernelLabApp {
                         {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(input.label).small().color(if enabled {
-                                    MUTED
+                                    theme::muted()
                                 } else {
-                                    MUTED.gamma_multiply(0.58)
+                                    theme::muted().gamma_multiply(0.58)
                                 }));
                                 let response = ui.add_enabled(
                                     enabled,
@@ -11076,26 +11150,26 @@ impl KernelLabApp {
                                     | ToolInputKind::Boolean => "",
                                 };
                                 if !unit.is_empty() {
-                                    ui.label(RichText::new(unit).small().color(MUTED));
+                                    ui.label(RichText::new(unit).small().color(theme::muted()));
                                 }
                             });
                             if let Some(error) =
                                 self.sketch.active_tool_input_error(input.stable_key)
                             {
                                 individual_input_error_visible = true;
-                                ui.label(RichText::new(error.label()).small().color(BAD));
+                                ui.label(RichText::new(error.label()).small().color(theme::bad()));
                             } else if !conditionally_enabled {
                                 ui.label(
                                     RichText::new("Inactive in current mode")
                                         .small()
-                                        .color(MUTED),
+                                        .color(theme::muted()),
                                 );
                             }
                         } else {
                             ui.label(
                                 RichText::new(format!("{} · live on canvas", input.label))
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                             )
                             .on_hover_text(input.domain);
                         }
@@ -11103,7 +11177,7 @@ impl KernelLabApp {
                     if let Some(issue) = self.sketch.active_tool_parameter_issue() {
                         self.sketch_dimension_keys.confirmation_blocked = true;
                         if !individual_input_error_visible {
-                            ui.label(RichText::new(issue.label()).small().color(BAD));
+                            ui.label(RichText::new(issue.label()).small().color(theme::bad()));
                         }
                     }
                     ui.label(
@@ -11116,7 +11190,7 @@ impl KernelLabApp {
                             "Tab / Shift-Tab moves fields · Enter accepts · tick commits"
                         })
                             .small()
-                            .color(GOOD),
+                            .color(theme::good()),
                     );
                 });
 
@@ -11132,7 +11206,7 @@ impl KernelLabApp {
                         "SELECTED FEATURE",
                         true,
                         |ui| {
-                            ui.label(RichText::new(editor.title).color(ACCENT).strong());
+                            ui.label(RichText::new(editor.title).color(theme::accent()).strong());
                             ui.label(
                                 RichText::new(if editor.parameters.is_empty() {
                                     "READ-ONLY RECIPE"
@@ -11140,13 +11214,13 @@ impl KernelLabApp {
                                     "EDIT PARAMETERS"
                                 })
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                             );
                             if editor.parameters.is_empty() {
                                 ui.label(
                                     RichText::new("No editable literal dimensions")
                                         .small()
-                                        .color(MUTED),
+                                        .color(theme::muted()),
                                 );
                             }
                             for parameter in editor.parameters {
@@ -11156,9 +11230,9 @@ impl KernelLabApp {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(parameter.label).small().color(if enabled {
-                                            MUTED
+                                            theme::muted()
                                         } else {
-                                            MUTED.gamma_multiply(0.62)
+                                            theme::muted().gamma_multiply(0.62)
                                         }),
                                     );
                                     let mut text = parameter.text.clone();
@@ -11235,19 +11309,19 @@ impl KernelLabApp {
                                     // is drawn, and reverting again would fight it.
                                     if !parameter.unit.is_empty() {
                                         ui.label(
-                                            RichText::new(parameter.unit).small().color(MUTED),
+                                            RichText::new(parameter.unit).small().color(theme::muted()),
                                         );
                                     }
                                 });
                                 if let Some(error) = parameter.error {
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(error.label()).small().color(BAD),
+                                            RichText::new(error.label()).small().color(theme::bad()),
                                         )
                                         .wrap(),
                                     );
                                 } else if let Some(reason) = parameter.read_only_reason {
-                                    ui.label(RichText::new(reason).small().color(MUTED));
+                                    ui.label(RichText::new(reason).small().color(theme::muted()));
                                 }
                             }
                             if self.sketch.selected_recipe_parameter_issue().is_some() {
@@ -11255,7 +11329,7 @@ impl KernelLabApp {
                             }
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(editor.reference_note).small().color(MUTED),
+                                    RichText::new(editor.reference_note).small().color(theme::muted()),
                                 )
                                 .wrap(),
                             );
@@ -11263,7 +11337,7 @@ impl KernelLabApp {
                                 ui.label(
                                     RichText::new("Enter or clicking away applies · Escape reverts")
                                         .small()
-                                        .color(GOOD),
+                                        .color(theme::good()),
                                 );
                             }
                         },
@@ -11277,7 +11351,7 @@ impl KernelLabApp {
                         ui.label(
                             RichText::new("Start drawing or select an entity")
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     }
                     for readout in readouts {
@@ -11295,7 +11369,7 @@ impl KernelLabApp {
                             ui.label(
                                 RichText::new(readout.kind.label())
                                     .small()
-                                    .color(if active { ACCENT } else { MUTED }),
+                                    .color(if active { theme::accent() } else { theme::muted() }),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -11303,25 +11377,25 @@ impl KernelLabApp {
                                     ui.label(
                                         RichText::new(format!("{:.3}{unit}", readout.value))
                                             .monospace()
-                                            .color(if readout.locked { GOOD } else { TEXT }),
+                                            .color(if readout.locked { theme::good() } else { theme::text() }),
                                     );
                                 },
                             );
                         });
                     }
                     if let Some(error) = self.sketch.dimension_error() {
-                        ui.label(RichText::new(error.label()).small().color(BAD));
+                        ui.label(RichText::new(error.label()).small().color(theme::bad()));
                     } else if self.sketch.dimension_editor_active() {
                         ui.label(
                             RichText::new("Type a value · Tab cycles · Enter stages")
                                 .small()
-                                .color(GOOD),
+                                .color(theme::good()),
                         );
                     } else if !self.sketch.dimension_readouts().is_empty() {
                         ui.label(
                             RichText::new("Tab cycles editable values")
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     }
                 });
@@ -11344,13 +11418,13 @@ impl KernelLabApp {
                                 "{selected_regions} selected · {available_regions} available"
                             ))
                             .small()
-                            .color(if selected_regions > 0 { GOOD } else { WARN }),
+                            .color(if selected_regions > 0 { theme::good() } else { theme::warn() }),
                         );
                         ui.add(
                             egui::Label::new(
                                 RichText::new("Click inside a bounded profile cell · Shift-click adds")
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                             )
                             .wrap(),
                         );
@@ -11362,7 +11436,7 @@ impl KernelLabApp {
                             diagnostics.pending_entities
                         ))
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                     ui.label(
                         RichText::new(format!(
@@ -11373,9 +11447,9 @@ impl KernelLabApp {
                         ))
                         .small()
                         .color(if diagnostics.certified_loops > 0 {
-                            GOOD
+                            theme::good()
                         } else {
-                            MUTED
+                            theme::muted()
                         }),
                     );
                     if diagnostics.analytic_curves > 0 {
@@ -11386,7 +11460,7 @@ impl KernelLabApp {
                                 if diagnostics.analytic_curves == 1 { "" } else { "s" }
                             ))
                             .small()
-                            .color(ACCENT),
+                            .color(theme::accent()),
                         );
                     }
                     if diagnostics.open_wire_components > 0
@@ -11399,7 +11473,7 @@ impl KernelLabApp {
                                 diagnostics.branched_vertices
                             ))
                             .small()
-                            .color(WARN),
+                            .color(theme::warn()),
                         );
                     }
                     ui.add(
@@ -11408,7 +11482,7 @@ impl KernelLabApp {
                                 "Entity order and direction do not matter. Exact circles and connected arc chains remain analytic.",
                             )
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                         )
                         .wrap(),
                     );
@@ -11416,7 +11490,7 @@ impl KernelLabApp {
                         ui.label(
                             RichText::new(format!("Edit rejected · {error:?}"))
                                 .small()
-                                .color(BAD),
+                                .color(theme::bad()),
                         );
                     }
                     if let Some(issue) = self.sketch_finish_issue {
@@ -11424,7 +11498,7 @@ impl KernelLabApp {
                             egui::Label::new(
                                 RichText::new(format!("Finish rejected · {}", issue.label()))
                                     .small()
-                                    .color(BAD),
+                                    .color(theme::bad()),
                             )
                             .wrap(),
                         );
@@ -11438,7 +11512,7 @@ impl KernelLabApp {
                         "Strokes and typed dimensions commit as you make them; undo steps back. Finish from the rail below or the ribbon; only certified closed regions can extrude.",
                     )
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
                 );
 
                 ui.add_space(7.0);
@@ -11512,24 +11586,24 @@ impl KernelLabApp {
                         status_line(
                             ui,
                             &format!("{label} · C{}", component_id.get()),
-                            ACCENT,
+                            theme::accent(),
                         );
                         ui.label(
                             RichText::new(format!(
                                 "{definition_key} · revision {definition_revision}"
                             ))
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                         );
                         ui.label(
                             RichText::new(format!("Variant {}…", &binding_digest[..12]))
                                 .small()
                                 .monospace()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                         let fields = assembly::ComponentPoseFields::from_pose(pose);
                         ui.separator();
-                        ui.label(RichText::new("COMMITTED PLACEMENT").small().color(MUTED));
+                        ui.label(RichText::new("COMMITTED PLACEMENT").small().color(theme::muted()));
                         ui.label(
                             RichText::new(format!(
                                 "X {:.2}  Y {:.2}  Z {:.2} mm",
@@ -11538,7 +11612,7 @@ impl KernelLabApp {
                                 fields.translation_mm.z
                             ))
                             .monospace()
-                            .color(TEXT),
+                            .color(theme::text()),
                         );
                         ui.label(
                             RichText::new(format!(
@@ -11548,7 +11622,7 @@ impl KernelLabApp {
                                 fields.rotation_degrees.z
                             ))
                             .monospace()
-                            .color(TEXT),
+                            .color(theme::text()),
                         );
                         let can_stage = self.pending_operation.is_none()
                             && self.history_is_at_end();
@@ -11584,12 +11658,12 @@ impl KernelLabApp {
                                         },
                                         if enabled { "ENABLED" } else { "DISABLED" }
                                     ),
-                                    GOOD,
+                                    theme::good(),
                                 );
                                 ui.label(
                                     RichText::new(format!("{name} · {joint_id}"))
                                         .small()
-                                        .color(TEXT),
+                                        .color(theme::text()),
                                 );
                                 if let JointKind::Revolute { axis, limits, .. } = kind {
                                     ui.label(
@@ -11601,7 +11675,7 @@ impl KernelLabApp {
                                             if limits.is_some() { " · limited" } else { "" }
                                         ))
                                         .small()
-                                        .color(MUTED),
+                                        .color(theme::muted()),
                                     );
                                 }
                             }
@@ -11625,7 +11699,7 @@ impl KernelLabApp {
                                         "Creates a named world-Z rotation at the component pivot.",
                                     )
                                     .small()
-                                    .color(MUTED),
+                                    .color(theme::muted()),
                                 );
                             }
                         }
@@ -11647,9 +11721,9 @@ impl KernelLabApp {
                                 _ => "EDGE-TO-EDGE RESULT",
                             },
                             if measured_geometry.is_empty() && measured_face.is_none() {
-                                MUTED
+                                theme::muted()
                             } else {
-                                ACCENT
+                                theme::accent()
                             },
                         );
                         if let Some((selection, area)) = measured_face {
@@ -11658,7 +11732,7 @@ impl KernelLabApp {
                                     "Face #{} · area {:.3} mm²",
                                     selection.face.entity, area
                                 ))
-                                .color(GOOD)
+                                .color(theme::good())
                                 .strong(),
                             );
                         }
@@ -11672,7 +11746,7 @@ impl KernelLabApp {
                                     selection.edge.entity,
                                     length
                                 ))
-                                .color(TEXT),
+                                .color(theme::text()),
                             );
                         }
                         if let [(_, first_segments, _), (_, second_segments, _)] =
@@ -11689,13 +11763,13 @@ impl KernelLabApp {
                             ui.separator();
                             ui.label(
                                 RichText::new(format!("Minimum distance  {distance:.3} mm"))
-                                    .color(GOOD)
+                                    .color(theme::good())
                                     .strong(),
                             );
                             if let Some(angle) = self.measured_edge_angle_degrees() {
                                 ui.label(
                                     RichText::new(format!("Included angle  {angle:.3}°"))
-                                        .color(ACCENT)
+                                        .color(theme::accent())
                                         .strong(),
                                 );
                             }
@@ -11707,7 +11781,7 @@ impl KernelLabApp {
                                     "Click a second edge for the model-space minimum distance."
                                 })
                                 .small()
-                                .color(MUTED),
+                                .color(theme::muted()),
                             );
                         }
                         if (!self.measured_edges.is_empty() || self.measured_face.is_some())
@@ -11737,7 +11811,7 @@ impl KernelLabApp {
                                 ui,
                                 "Selected",
                                 &format!("{selection_count} items"),
-                                ACCENT,
+                                theme::accent(),
                             );
                             theme::property_row(
                                 ui,
@@ -11772,7 +11846,7 @@ impl KernelLabApp {
                             return;
                         };
                         theme::property_row(ui, "Type", kind);
-                        theme::property_row_colored(ui, "Entity", &format!("#{id}"), ACCENT)
+                        theme::property_row_colored(ui, "Entity", &format!("#{id}"), theme::accent())
                             .on_hover_text(detail);
                     });
                     ui.add_space(5.0);
@@ -11802,13 +11876,13 @@ impl KernelLabApp {
                         RichText::new("NATIVE RUST ONLY")
                             .font(FontId::proportional(10.0))
                             .strong()
-                            .color(ACCENT),
+                            .color(theme::accent()),
                     );
                     ui.separator();
                     ui.label(
                         RichText::new("60 FPS GOAL")
                             .font(FontId::proportional(10.0))
-                            .color(GOOD),
+                            .color(theme::good()),
                     );
                 });
                 self.compact_attempt_status(ui);
@@ -11831,18 +11905,18 @@ impl KernelLabApp {
                 ui.label(
                     RichText::new("No document parameters yet")
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                 );
             }
             for record in records {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&record.spec.label).color(TEXT));
+                        ui.label(RichText::new(&record.spec.label).color(theme::text()));
                         ui.label(
                             RichText::new(&record.spec.key)
                                 .small()
                                 .monospace()
-                                .color(MUTED),
+                                .color(theme::muted()),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -11857,7 +11931,7 @@ impl KernelLabApp {
                         match &record.binding {
                             ParameterBinding::Literal { value } => {
                                 let Some(base) = ParameterLiteralDraft::from_value(value) else {
-                                    ui.label(RichText::new("choice").small().color(MUTED));
+                                    ui.label(RichText::new("choice").small().color(theme::muted()));
                                     return;
                                 };
                                 let mut edited = staged.unwrap_or(base);
@@ -11901,10 +11975,12 @@ impl KernelLabApp {
                                 }
                             }
                             ParameterBinding::Expression { .. } => {
-                                ui.label(RichText::new("expression").small().color(ACCENT));
+                                ui.label(
+                                    RichText::new("expression").small().color(theme::accent()),
+                                );
                             }
                             ParameterBinding::Unresolved => {
-                                ui.label(RichText::new("required").small().color(WARN));
+                                ui.label(RichText::new("required").small().color(theme::warn()));
                             }
                         }
                     });
@@ -11935,7 +12011,7 @@ impl KernelLabApp {
             ui.label(
                 RichText::new("Changes remain staged until Enter or the green tick")
                     .small()
-                    .color(GOOD),
+                    .color(theme::good()),
             );
         });
     }
@@ -11981,11 +12057,15 @@ impl KernelLabApp {
                 (false, false, _) => "EXTRUSION UNAVAILABLE",
             },
             match (extrusion_pending, already_extruded, eligibility) {
-                (true, _, _) => WARN,
-                (false, true, _) | (false, false, SketchExtrusionEligibility::Ready) => GOOD,
-                (false, false, SketchExtrusionEligibility::SketchNotFinished) => MUTED,
-                (false, false, SketchExtrusionEligibility::RegionSelectionRequired { .. }) => WARN,
-                (false, false, _) => WARN,
+                (true, _, _) => theme::warn(),
+                (false, true, _) | (false, false, SketchExtrusionEligibility::Ready) => {
+                    theme::good()
+                }
+                (false, false, SketchExtrusionEligibility::SketchNotFinished) => theme::muted(),
+                (false, false, SketchExtrusionEligibility::RegionSelectionRequired { .. }) => {
+                    theme::warn()
+                }
+                (false, false, _) => theme::warn(),
             },
         );
         ui.label(
@@ -11995,7 +12075,7 @@ impl KernelLabApp {
                 self.sketch_revision
             ))
             .small()
-            .color(MUTED),
+            .color(theme::muted()),
         );
 
         let editable = self.pending_operation.is_none() || extrusion_pending;
@@ -12062,7 +12142,7 @@ impl KernelLabApp {
                     "Auto · positive adds, negative cuts · choose Add or Cut to override without reversing direction"
                 })
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
             );
         }
         if extrusion_pending {
@@ -12081,7 +12161,7 @@ impl KernelLabApp {
                 ui,
                 "Volume",
                 &format!("{:.3} mm³", measures.volume),
-                ACCENT,
+                theme::accent(),
             );
             theme::property_row(
                 ui,
@@ -12104,19 +12184,22 @@ impl KernelLabApp {
 
         if extrusion_pending {
             if let Some(error) = &self.sketch_extrusion_issue {
-                status_line(ui, "EXTRUSION REJECTED · INTENT RETAINED", BAD);
+                status_line(ui, "EXTRUSION REJECTED · INTENT RETAINED", theme::bad());
                 ui.label(
                     RichText::new(format!("Rejected · {}", error.code))
                         .small()
-                        .color(BAD),
+                        .color(theme::bad()),
                 );
-                ui.add(egui::Label::new(RichText::new(&error.message).small().color(MUTED)).wrap());
+                ui.add(
+                    egui::Label::new(RichText::new(&error.message).small().color(theme::muted()))
+                        .wrap(),
+                );
                 ui.label(
                     RichText::new(
                         "Previous body retained · adjust the inputs or cancel this preview",
                     )
                     .small()
-                    .color(GOOD),
+                    .color(theme::good()),
                 );
             } else {
                 ui.label(
@@ -12132,7 +12215,7 @@ impl KernelLabApp {
                         }
                     })
                     .small()
-                    .color(WARN),
+                    .color(theme::warn()),
                 );
             }
         } else if already_extruded {
@@ -12144,14 +12227,14 @@ impl KernelLabApp {
             ui.label(
                 RichText::new("Click Extrude in the ribbon to start a live preview.")
                     .small()
-                    .color(GOOD),
+                    .color(theme::good()),
             );
         } else if !distance_valid {
             ui.add(
                 egui::Label::new(
                     RichText::new("Enter a finite, non-zero extrusion distance.")
                         .small()
-                        .color(WARN),
+                        .color(theme::warn()),
                 )
                 .wrap(),
             );
@@ -12162,10 +12245,10 @@ impl KernelLabApp {
                     profile.label()
                 ))
                 .small()
-                .color(MUTED),
+                .color(theme::muted()),
             );
         } else if let Some(reason) = eligibility.visible_reason() {
-            ui.add(egui::Label::new(RichText::new(reason).small().color(WARN)).wrap());
+            ui.add(egui::Label::new(RichText::new(reason).small().color(theme::warn())).wrap());
         }
     }
 
@@ -12193,18 +12276,18 @@ impl KernelLabApp {
                 "PUSH/PULL UNAVAILABLE"
             },
             if pending {
-                WARN
+                theme::warn()
             } else if support.is_some() {
-                GOOD
+                theme::good()
             } else {
-                MUTED
+                theme::muted()
             },
         );
         if let Some(face) = self.selected_face {
             ui.label(
                 RichText::new(format!("Face #{} · exact boundary", face.entity))
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
             );
         }
 
@@ -12252,22 +12335,25 @@ impl KernelLabApp {
         ui.label(
             RichText::new("Pull the viewport arrow · positive adds, negative cuts")
                 .small()
-                .color(MUTED),
+                .color(theme::muted()),
         );
 
         if pending {
             if let Some(error) = &self.sketch_extrusion_issue {
-                status_line(ui, "PUSH/PULL REJECTED · INTENT RETAINED", BAD);
+                status_line(ui, "PUSH/PULL REJECTED · INTENT RETAINED", theme::bad());
                 ui.label(
                     RichText::new(format!("Rejected · {}", error.code))
                         .small()
-                        .color(BAD),
+                        .color(theme::bad()),
                 );
-                ui.add(egui::Label::new(RichText::new(&error.message).small().color(MUTED)).wrap());
+                ui.add(
+                    egui::Label::new(RichText::new(&error.message).small().color(theme::muted()))
+                        .wrap(),
+                );
                 ui.label(
                     RichText::new("Previous body retained · adjust the distance or cancel")
                         .small()
-                        .color(GOOD),
+                        .color(theme::good()),
                 );
             } else {
                 ui.label(
@@ -12277,14 +12363,14 @@ impl KernelLabApp {
                         "Add preview staged · confirm with Enter or the green tick"
                     })
                     .small()
-                    .color(WARN),
+                    .color(theme::warn()),
                 );
             }
         } else if support.is_some() {
             ui.label(
                 RichText::new("Click Extrude in the ribbon to move the complete selected face.")
                     .small()
-                    .color(GOOD),
+                    .color(theme::good()),
             );
         } else {
             ui.add(
@@ -12293,7 +12379,7 @@ impl KernelLabApp {
                         "Direct push/pull currently requires one unholed planar extrusion cap.",
                     )
                     .small()
-                    .color(WARN),
+                    .color(theme::warn()),
                 )
                 .wrap(),
             );
@@ -12305,7 +12391,7 @@ impl KernelLabApp {
         ui.label(
             RichText::new(format!("Playback · {motion_name}"))
                 .small()
-                .color(ACCENT),
+                .color(theme::accent()),
         );
         let button_label = if self.motion.playing {
             "Stop animation"
@@ -12381,12 +12467,12 @@ impl KernelLabApp {
             )
             .small()
             .color(if component_target.is_some() {
-                ACCENT
+                theme::accent()
             } else {
-                MUTED
+                theme::muted()
             }),
         );
-        ui.label(RichText::new("Offset · mm").small().color(MUTED));
+        ui.label(RichText::new("Offset · mm").small().color(theme::muted()));
         ui.horizontal(|ui| {
             let field_width =
                 ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x - 12.0) / 3.0).max(44.0);
@@ -12410,7 +12496,11 @@ impl KernelLabApp {
             }
         });
 
-        ui.label(RichText::new("Rotation · degrees").small().color(MUTED));
+        ui.label(
+            RichText::new("Rotation · degrees")
+                .small()
+                .color(theme::muted()),
+        );
         ui.horizontal(|ui| {
             let field_width =
                 ((ui.available_width() - 2.0 * ui.spacing().item_spacing.x - 12.0) / 3.0).max(44.0);
@@ -12461,7 +12551,7 @@ impl KernelLabApp {
             ui.label(
                 RichText::new("Scale is defined by the component's authored parameters.")
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
             );
         }
         let mut zoom = self.view.zoom;
@@ -12497,17 +12587,17 @@ impl KernelLabApp {
             self.pending_operation,
             Some(PendingOperation::RunCase { .. })
         ) {
-            status_line(ui, "ANOTHER OPERATION IS PENDING", WARN);
+            status_line(ui, "ANOTHER OPERATION IS PENDING", theme::warn());
             ui.add(
                 egui::Label::new(
                     RichText::new("Confirm or cancel it before editing a transform")
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                 )
                 .wrap(),
             );
         } else if self.transform_preview_pending() {
-            status_line(ui, "PREVIEW — NOT COMMITTED", WARN);
+            status_line(ui, "PREVIEW — NOT COMMITTED", theme::warn());
             ui.add(
                 egui::Label::new(
                     RichText::new(if component_target.is_some() {
@@ -12516,7 +12606,7 @@ impl KernelLabApp {
                         "Target: whole body/group · snapshot unchanged"
                     })
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
                 )
                 .wrap(),
             );
@@ -12537,9 +12627,9 @@ impl KernelLabApp {
                     "Model and view are in sync"
                 },
                 if grounded || joint_name.is_some() {
-                    WARN
+                    theme::warn()
                 } else {
-                    GOOD
+                    theme::good()
                 },
             );
             ui.label(
@@ -12551,22 +12641,22 @@ impl KernelLabApp {
                     },
                 ))
                 .small()
-                .color(MUTED),
+                .color(theme::muted()),
             );
         }
     }
 
     fn cadence_status(&self) -> (String, Color32) {
         if !self.motion.playing {
-            return ("Animation stopped".to_owned(), MUTED);
+            return ("Animation stopped".to_owned(), theme::muted());
         }
         let Some(fps) = self.motion.smoothed_fps else {
-            return ("Measuring UI cadence…".to_owned(), MUTED);
+            return ("Measuring UI cadence…".to_owned(), theme::muted());
         };
         let color = if fps >= f64::from(self.motion.target_hz) * 0.995 {
-            GOOD
+            theme::good()
         } else {
-            BAD
+            theme::bad()
         };
         (format!("{fps:.0} FPS UI"), color)
     }
@@ -12574,29 +12664,29 @@ impl KernelLabApp {
     fn attempt_card(&self, ui: &mut egui::Ui) {
         match &self.last_attempt {
             Attempt::NotRun => {
-                status_line(ui, "Not run", MUTED);
+                status_line(ui, "Not run", theme::muted());
             }
             Attempt::Accepted { operation } => {
-                status_line(ui, operation, GOOD);
+                status_line(ui, operation, theme::good());
                 ui.label(
                     RichText::new("Accepted · validated before publication")
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                 );
             }
             Attempt::Rejected { operation, error } => {
-                status_line(ui, operation, BAD);
+                status_line(ui, operation, theme::bad());
                 ui.label(
                     RichText::new(format!("Rejected · {}", error.code))
                         .small()
-                        .color(BAD),
+                        .color(theme::bad()),
                 );
-                ui.label(RichText::new(&error.message).small().color(MUTED));
+                ui.label(RichText::new(&error.message).small().color(theme::muted()));
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Last valid snapshot retained")
                         .small()
-                        .color(GOOD),
+                        .color(theme::good()),
                 );
             }
         }
@@ -12605,19 +12695,19 @@ impl KernelLabApp {
     fn compact_attempt_status(&self, ui: &mut egui::Ui) {
         match &self.last_attempt {
             Attempt::NotRun => {}
-            Attempt::Accepted { operation } => status_line(ui, operation, GOOD),
+            Attempt::Accepted { operation } => status_line(ui, operation, theme::good()),
             Attempt::Rejected { operation, error } => {
-                status_line(ui, operation, BAD);
+                status_line(ui, operation, theme::bad());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!("Rejected · {}", error.code))
                             .small()
-                            .color(BAD),
+                            .color(theme::bad()),
                     );
                     ui.label(
                         RichText::new("Last valid snapshot retained")
                             .small()
-                            .color(GOOD),
+                            .color(theme::good()),
                     );
                 });
             }
@@ -12700,8 +12790,8 @@ impl KernelLabApp {
                 .as_ref()
                 .map(FaceSketchDisplayContext::viewport_context);
             Frame::new()
-                .fill(CARD)
-                .stroke(Stroke::new(1.0, BORDER))
+                .fill(theme::card())
+                .stroke(Stroke::new(1.0, theme::border()))
                 .corner_radius(4)
                 .inner_margin(Margin::same(6))
                 .show(ui, |ui| {
@@ -12764,7 +12854,7 @@ impl KernelLabApp {
             "sketch_canvas_breadcrumb",
             title_rect,
             &format!("Sketch · {}", self.sketch_support.label()),
-            ACCENT,
+            theme::accent(),
         );
         let accessible_plane = if self.sketch_is_face_supported() {
             format!(
@@ -12798,7 +12888,7 @@ impl KernelLabApp {
                     SketchPlane::XZ => "XZ · ORTHOGRAPHIC",
                 }
             },
-            MUTED,
+            theme::muted(),
         );
 
         if let Some(entity) = self.sketch.selected() {
@@ -12811,7 +12901,7 @@ impl KernelLabApp {
                 "sketch_selection_status",
                 selection_rect,
                 &format!("Sketch entity #{}", entity.get()),
-                ACCENT,
+                theme::accent(),
             );
         }
 
@@ -12835,8 +12925,8 @@ impl KernelLabApp {
         );
         hud_ui.set_clip_rect(rect);
         Frame::new()
-            .fill(PANEL.gamma_multiply(0.94))
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(theme::panel().gamma_multiply(0.94))
+            .stroke(Stroke::new(1.0, theme::border()))
             .corner_radius(3)
             .inner_margin(Margin::symmetric(3, 2))
             .show(&mut hud_ui, |ui| {
@@ -12864,9 +12954,9 @@ impl KernelLabApp {
         let rail_size = ui.available_size();
         let (rail_rect, _) = ui.allocate_exact_size(rail_size, egui::Sense::click_and_drag());
         let rail_fill = if pending.is_some() {
-            theme::GOOD_FILL
+            theme::good_fill()
         } else {
-            PANEL
+            theme::panel()
         };
         ui.painter()
             .rect_filled(rail_rect, CornerRadius::ZERO, rail_fill);
@@ -12890,7 +12980,7 @@ impl KernelLabApp {
                     .add_enabled(
                         !direct_manipulation_active,
                         egui::Button::new("")
-                            .fill(BAD)
+                            .fill(theme::bad())
                             .stroke(Stroke::NONE)
                             .corner_radius(2)
                             .min_size(egui::vec2(30.0, 30.0)),
@@ -12911,7 +13001,7 @@ impl KernelLabApp {
                     ui,
                     cancel_response.rect,
                     if direct_manipulation_active {
-                        MUTED
+                        theme::muted()
                     } else {
                         Color32::WHITE
                     },
@@ -12960,7 +13050,7 @@ impl KernelLabApp {
                 let confirm_response = ui.add_enabled(
                     !confirmation_blocked,
                     egui::Button::new("")
-                        .fill(GOOD)
+                        .fill(theme::good())
                         .stroke(Stroke::NONE)
                         .corner_radius(2)
                         .min_size(egui::vec2(30.0, 30.0)),
@@ -12976,7 +13066,7 @@ impl KernelLabApp {
                     ui,
                     confirm_response.rect,
                     if confirmation_blocked {
-                        MUTED
+                        theme::muted()
                     } else {
                         Color32::WHITE
                     },
@@ -13006,7 +13096,7 @@ impl KernelLabApp {
                         ui.spinner();
                     }
                     ui.add(
-                        egui::Label::new(RichText::new(pending.title()).color(TEXT).strong())
+                        egui::Label::new(RichText::new(pending.title()).color(theme::text()).strong())
                             .truncate(),
                     )
                     .on_hover_text(pending.detail());
@@ -13022,7 +13112,7 @@ impl KernelLabApp {
                 let exit_response = ui
                     .add(
                         egui::Button::new("")
-                            .fill(BAD)
+                            .fill(theme::bad())
                             .stroke(Stroke::NONE)
                             .corner_radius(2)
                             .min_size(egui::vec2(30.0, 30.0)),
@@ -13040,7 +13130,7 @@ impl KernelLabApp {
                 let finish_response = ui.add_enabled(
                     finish_enabled,
                     egui::Button::new("")
-                        .fill(GOOD)
+                        .fill(theme::good())
                         .stroke(Stroke::NONE)
                         .corner_radius(2)
                         .min_size(egui::vec2(30.0, 30.0)),
@@ -13055,7 +13145,7 @@ impl KernelLabApp {
                 paint_confirmation_tick(
                     ui,
                     finish_response.rect,
-                    if finish_enabled { Color32::WHITE } else { MUTED },
+                    if finish_enabled { Color32::WHITE } else { theme::muted() },
                 );
                 let finish_response = if finish_enabled {
                     finish_response.on_hover_text("Finish the sketch and save it to the document")
@@ -13067,7 +13157,7 @@ impl KernelLabApp {
 
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.add(
-                        egui::Label::new(RichText::new("Sketch").color(TEXT).strong()).truncate(),
+                        egui::Label::new(RichText::new("Sketch").color(theme::text()).strong()).truncate(),
                     )
                     .on_hover_text(
                         "Strokes and typed dimensions commit as you make them. Finish saves the sketch; exit leaves it as a draft.",
@@ -13166,8 +13256,8 @@ impl KernelLabApp {
         self.refresh_display_detail_buckets(viewport_size);
 
         let frame_output = Frame::new()
-            .fill(theme::VIEWPORT_BOTTOM)
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(theme::viewport_bottom())
+            .stroke(Stroke::new(1.0, theme::border()))
             .corner_radius(4)
             .inner_margin(Margin::same(6))
             .show(ui, |ui| {
@@ -13242,7 +13332,7 @@ impl KernelLabApp {
                             } else {
                                 "All bodies hidden"
                             })
-                            .color(MUTED),
+                            .color(theme::muted()),
                         );
                     });
                     // An empty viewport is exactly where "Show all bodies" is
@@ -13545,8 +13635,8 @@ impl KernelLabApp {
                     egui::Sense::click(),
                 );
                 Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .fill(theme::panel())
+                    .stroke(Stroke::new(1.0, theme::border()))
                     .corner_radius(4)
                     .inner_margin(Margin::same(margin as i8))
                     .show(ui, |ui| {
@@ -13561,7 +13651,7 @@ impl KernelLabApp {
                                 egui::Button::new(
                                     RichText::new(command.label())
                                         .font(FontId::proportional(12.0))
-                                        .color(TEXT),
+                                        .color(theme::text()),
                                 )
                                 .frame(false),
                             );
@@ -13703,9 +13793,9 @@ impl KernelLabApp {
             title_rect,
             &selected,
             if selection_count > 0 || self.selected_face.is_some() {
-                ACCENT
+                theme::accent()
             } else {
-                TEXT
+                theme::text()
             },
         );
 
@@ -13736,8 +13826,8 @@ impl KernelLabApp {
         );
         hud_ui.set_clip_rect(rect);
         Frame::new()
-            .fill(PANEL.gamma_multiply(0.94))
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(theme::panel().gamma_multiply(0.94))
+            .stroke(Stroke::new(1.0, theme::border()))
             .corner_radius(3)
             .inner_margin(Margin::symmetric(3, 2))
             .show(&mut hud_ui, |ui| {
@@ -13815,8 +13905,8 @@ impl KernelLabApp {
         );
         status_ui.set_clip_rect(rect);
         Frame::new()
-            .fill(PANEL.gamma_multiply(0.94))
-            .stroke(Stroke::new(1.0, BORDER))
+            .fill(theme::panel().gamma_multiply(0.94))
+            .stroke(Stroke::new(1.0, theme::border()))
             .corner_radius(3)
             .inner_margin(Margin::symmetric(6, 3))
             .show(&mut status_ui, |ui| {
@@ -13824,7 +13914,7 @@ impl KernelLabApp {
                     ui.label(
                         RichText::new(format!("{} faces", report.topology.faces))
                             .small()
-                            .color(TEXT),
+                            .color(theme::text()),
                     );
                     ui.label(
                         RichText::new(format!(
@@ -13832,7 +13922,7 @@ impl KernelLabApp {
                             report.topology.edges, report.topology.vertices
                         ))
                         .small()
-                        .color(MUTED),
+                        .color(theme::muted()),
                     );
                     ui.label(
                         RichText::new(if report.validation.valid {
@@ -13841,7 +13931,11 @@ impl KernelLabApp {
                             "Invalid"
                         })
                         .small()
-                        .color(if report.validation.valid { GOOD } else { BAD }),
+                        .color(if report.validation.valid {
+                            theme::good()
+                        } else {
+                            theme::bad()
+                        }),
                     );
                 });
                 ui.horizontal(|ui| {
@@ -13851,7 +13945,11 @@ impl KernelLabApp {
                             .color(cadence_color),
                     );
                     if self.transform_preview_pending() {
-                        ui.label(RichText::new("PREVIEW — NOT COMMITTED").small().color(WARN));
+                        ui.label(
+                            RichText::new("PREVIEW — NOT COMMITTED")
+                                .small()
+                                .color(theme::warn()),
+                        );
                     }
                 });
             });
@@ -13887,10 +13985,14 @@ impl KernelLabApp {
                 if shell_button_activated(ui, &response, operation_pending) {
                     self.shell.set_feature_timeline(true);
                 }
-                ui.label(RichText::new("Parametric history").small().color(MUTED))
-                    .on_hover_text(
-                        "Authoritative feature history with undo, suppression, and rebuild.",
-                    );
+                ui.label(
+                    RichText::new("Parametric history")
+                        .small()
+                        .color(theme::muted()),
+                )
+                .on_hover_text(
+                    "Authoritative feature history with undo, suppression, and rebuild.",
+                );
             });
             return;
         }
@@ -13913,7 +14015,7 @@ impl KernelLabApp {
                 RichText::new("PARAMETRIC HISTORY")
                     .font(FontId::proportional(10.5))
                     .strong()
-                    .color(MUTED),
+                    .color(theme::muted()),
             )
             .on_hover_text("Stable feature identities and deterministic branch-local regeneration.");
             ui.separator();
@@ -13975,30 +14077,12 @@ impl KernelLabApp {
                 RichText::new(format!("{history_position}/{history_end}"))
                     .monospace()
                     .small()
-                    .color(ACCENT),
+                    .color(theme::accent()),
             );
             if let Some(position) = requested_history_position {
                 self.move_history_cursor(position);
             }
             ui.separator();
-            let undo_enabled = !operation_pending && self.document.can_undo();
-            let undo = ui.add_enabled(undo_enabled, egui::Button::new("Undo").small());
-            undo.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    undo_enabled,
-                    "Undo history change",
-                )
-            });
-            let redo_enabled = !operation_pending && self.document.can_redo();
-            let redo = ui.add_enabled(redo_enabled, egui::Button::new("Redo").small());
-            redo.widget_info(|| {
-                egui::WidgetInfo::labeled(
-                    egui::WidgetType::Button,
-                    redo_enabled,
-                    "Redo history change",
-                )
-            });
             let selected_node = self
                 .selected_history_feature
                 .and_then(|feature| self.document.feature(feature));
@@ -14040,11 +14124,7 @@ impl KernelLabApp {
                     "Rebuild selected branch",
                 )
             });
-            if undo.clicked() {
-                self.undo_document();
-            } else if redo.clicked() {
-                self.redo_document();
-            } else if suppress.clicked()
+            if suppress.clicked()
                 && let Some(feature) = self.selected_history_feature
             {
                 self.toggle_feature_suppression(feature);
@@ -14061,7 +14141,7 @@ impl KernelLabApp {
                     format!("{dirty_count} DIRTY")
                 })
                 .small()
-                .color(if dirty_count == 0 { GOOD } else { WARN }),
+                .color(if dirty_count == 0 { theme::good() } else { theme::warn() }),
             )
             .on_hover_text(
                 self.document_status
@@ -14103,7 +14183,7 @@ impl KernelLabApp {
                                     ui,
                                     &entry.label(),
                                     false,
-                                    if index < history_position { GOOD } else { MUTED },
+                                    if index < history_position { theme::good() } else { theme::muted() },
                                 );
                                 return;
                             }
@@ -14174,7 +14254,7 @@ impl KernelLabApp {
                         let mut index = 0;
                         while index < entries.len() {
                             if index > 0 {
-                                timeline_connector(ui, false, BORDER);
+                                timeline_connector(ui, false, theme::border());
                             }
                             let group = entries[index].group;
                             if group == 0 {
@@ -14277,19 +14357,20 @@ impl eframe::App for KernelLabApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(PANEL)
+                    .fill(theme::panel())
                     .inner_margin(Margin::symmetric(10, 4))
                     .stroke(Stroke::new(0.0, Color32::TRANSPARENT)),
             )
             .show(ui, |ui| self.header(ui));
 
         let ribbon_height = if self.shell.visibility().command_ribbon {
-            // Tab strip (20) plus the tallest group in any tab (76: three
-            // stacked 24 px commands, or the sketch grid's two 32 px rows)
-            // plus the caption and the panel's own margins. One reservation
-            // for every tab keeps the viewport rectangle still when the tab
-            // changes; `tests/ui.rs` holds it to the minimum window.
-            140.0
+            // The tallest group in any tab (76: three stacked 24 px commands,
+            // or the sketch grid's two 32 px rows) plus its caption and the
+            // panel's own margins. The tab strip is in the header now, so the
+            // ribbon is one row of groups. One reservation for every tab keeps
+            // the viewport rectangle still when the tab changes;
+            // `tests/ui.rs` holds it to the minimum window.
+            116.0
         } else {
             30.0
         };
@@ -14298,9 +14379,9 @@ impl eframe::App for KernelLabApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(RIBBON_FILL)
+                    .fill(theme::ribbon_fill())
                     .inner_margin(Margin::symmetric(8, 4))
-                    .stroke(Stroke::new(1.0, BORDER)),
+                    .stroke(Stroke::new(1.0, theme::border())),
             )
             .show(ui, |ui| self.command_ribbon(ui));
 
@@ -14324,9 +14405,9 @@ impl eframe::App for KernelLabApp {
                 .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(PANEL)
+                        .fill(theme::panel())
                         .inner_margin(Margin::symmetric(6, 3))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| self.confirmation_slot(ui))
                 .inner
@@ -14350,8 +14431,8 @@ impl eframe::App for KernelLabApp {
                 .order(egui::Order::Foreground)
                 .show(ui.ctx(), |area_ui| {
                     Frame::new()
-                        .fill(PANEL)
-                        .stroke(Stroke::new(1.0, BORDER))
+                        .fill(theme::panel())
+                        .stroke(Stroke::new(1.0, theme::border()))
                         .corner_radius(6)
                         .inner_margin(Margin::symmetric(6, 3))
                         .show(area_ui, |ui| {
@@ -14371,9 +14452,9 @@ impl eframe::App for KernelLabApp {
             .show_separator_line(false)
             .frame(
                 Frame::new()
-                    .fill(TIMELINE_FILL)
+                    .fill(theme::timeline_fill())
                     .inner_margin(Margin::symmetric(8, 3))
-                    .stroke(Stroke::new(1.0, BORDER)),
+                    .stroke(Stroke::new(1.0, theme::border())),
             )
             .show(ui, |ui| self.feature_timeline(ui));
 
@@ -14392,9 +14473,9 @@ impl eframe::App for KernelLabApp {
                 .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(PANEL)
+                        .fill(theme::panel())
                         .inner_margin(Margin::symmetric(6, 6))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| self.contextual_inspector_panel(ui));
         }
@@ -14407,9 +14488,9 @@ impl eframe::App for KernelLabApp {
                 .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(PANEL)
+                        .fill(theme::panel())
                         .inner_margin(Margin::symmetric(6, 6))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| self.left_workspace_panel(ui));
         } else {
@@ -14419,15 +14500,15 @@ impl eframe::App for KernelLabApp {
                 .show_separator_line(false)
                 .frame(
                     Frame::new()
-                        .fill(PANEL)
+                        .fill(theme::panel())
                         .inner_margin(Margin::symmetric(2, 4))
-                        .stroke(Stroke::new(1.0, BORDER)),
+                        .stroke(Stroke::new(1.0, theme::border())),
                 )
                 .show(ui, |ui| self.collapsed_browser_rail(ui));
         }
 
         let central_panel = egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(Margin::ZERO))
+            .frame(Frame::new().fill(theme::bg()).inner_margin(Margin::ZERO))
             .show(ui, |ui| match self.workbench_mode {
                 WorkbenchMode::Model => self.model_viewport(ui),
                 WorkbenchMode::Sketch => {
@@ -14585,8 +14666,8 @@ fn model_view_cube(
     ui.painter().rect(
         rect,
         4.0,
-        translucent(PANEL, 92),
-        Stroke::new(1.0, translucent(BORDER, 132)),
+        translucent(theme::panel(), 92),
+        Stroke::new(1.0, translucent(theme::border(), 132)),
         egui::StrokeKind::Inside,
     );
     let cube_center = egui::pos2(
@@ -14646,7 +14727,7 @@ fn model_view_cube(
         let light = (0.86 + facing as f32 * 0.14).clamp(0.86, 1.0);
         let mut fill = translucent(base.gamma_multiply(light), 235);
         if response.hovered() {
-            fill = blend_color(fill, ACCENT, 0.30);
+            fill = blend_color(fill, theme::accent(), 0.30);
         }
         ui.painter().add(egui::Shape::convex_polygon(
             points.to_vec(),
@@ -14699,7 +14780,7 @@ fn model_view_cube(
             button_rect,
             egui::Button::new(RichText::new(text).small())
                 .corner_radius(3)
-                .fill(translucent(CARD, 188)),
+                .fill(translucent(theme::card(), 188)),
         );
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
         if response.clicked() {
@@ -16501,23 +16582,23 @@ const fn origin_plane_label(plane: SketchPlane) -> &'static str {
     }
 }
 
-const fn profile_status_color(status: CertifiedProfileStatus) -> Color32 {
+fn profile_status_color(status: CertifiedProfileStatus) -> Color32 {
     match status {
         CertifiedProfileStatus::Closed { .. }
         | CertifiedProfileStatus::ClosedAnalyticCircle
         | CertifiedProfileStatus::ClosedAnalyticCurves
-        | CertifiedProfileStatus::ClosedRegions { .. } => GOOD,
+        | CertifiedProfileStatus::ClosedRegions { .. } => theme::good(),
         CertifiedProfileStatus::SelfIntersecting
         | CertifiedProfileStatus::Invalid
         | CertifiedProfileStatus::TooManyCurves { .. }
         | CertifiedProfileStatus::TooManyLoops { .. }
         | CertifiedProfileStatus::TooManyRegions { .. }
-        | CertifiedProfileStatus::LinearLoopTooLarge { .. } => BAD,
+        | CertifiedProfileStatus::LinearLoopTooLarge { .. } => theme::bad(),
         CertifiedProfileStatus::Open
         | CertifiedProfileStatus::Indeterminate
         | CertifiedProfileStatus::CurvesNeedCertification
-        | CertifiedProfileStatus::MultipleProfiles => WARN,
-        CertifiedProfileStatus::Empty => MUTED,
+        | CertifiedProfileStatus::MultipleProfiles => theme::warn(),
+        CertifiedProfileStatus::Empty => theme::muted(),
     }
 }
 
@@ -16634,26 +16715,6 @@ fn shell_toggle_button(
     });
 }
 
-fn workspace_tab(ui: &mut egui::Ui, label: &str, selected: bool, enabled: bool) -> egui::Response {
-    let response = ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(label).font(FontId::proportional(12.0)))
-            .frame(false)
-            .corner_radius(2)
-            .min_size(egui::vec2(66.0, 28.0)),
-    );
-    if selected {
-        ui.painter().line_segment(
-            [
-                egui::pos2(response.rect.left() + 7.0, response.rect.bottom() - 1.0),
-                egui::pos2(response.rect.right() - 7.0, response.rect.bottom() - 1.0),
-            ],
-            Stroke::new(2.0, ACCENT),
-        );
-    }
-    response
-}
-
 fn browser_text_row(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.add_sized(
         [ui.available_width(), 24.0],
@@ -16674,7 +16735,7 @@ fn collapsible_card<R>(
     default_open: bool,
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> Option<R> {
-    egui::CollapsingHeader::new(RichText::new(title).small().strong().color(MUTED))
+    egui::CollapsingHeader::new(RichText::new(title).small().strong().color(theme::muted()))
         .id_salt(id)
         .default_open(default_open)
         .show_background(false)
@@ -16694,7 +16755,10 @@ fn timeline_chip(ui: &mut egui::Ui, label: &str, selected: bool, color: Color32)
         } else {
             Color32::TRANSPARENT
         })
-        .stroke(Stroke::new(1.0, if selected { color } else { BORDER }))
+        .stroke(Stroke::new(
+            1.0,
+            if selected { color } else { theme::border() },
+        ))
         .corner_radius(3)
         .inner_margin(Margin::symmetric(7, 2))
         .show(ui, |ui| {
@@ -16712,7 +16776,7 @@ fn timeline_group_color(group: u64) -> Color32 {
         Color32::from_rgb(164, 62, 86),
     ];
     if group == 0 {
-        BORDER
+        theme::border()
     } else {
         HUES[(group as usize) % HUES.len()]
     }
@@ -16724,7 +16788,7 @@ fn timeline_connector(ui: &mut egui::Ui, related: bool, color: Color32) {
             .color(if related {
                 color.gamma_multiply(0.72)
             } else {
-                BORDER
+                theme::border()
             })
             .strong(),
     );
@@ -16734,7 +16798,7 @@ fn status_line(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.horizontal_top(|ui| {
         let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
         ui.painter().circle_filled(dot.center(), 3.0, color);
-        ui.add(egui::Label::new(RichText::new(text).color(TEXT).strong()).wrap());
+        ui.add(egui::Label::new(RichText::new(text).color(theme::text()).strong()).wrap());
     });
 }
 
@@ -16752,8 +16816,8 @@ fn canvas_overlay_label(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     Frame::new()
-        .fill(PANEL.gamma_multiply(0.94))
-        .stroke(Stroke::new(1.0, BORDER))
+        .fill(theme::panel().gamma_multiply(0.94))
+        .stroke(Stroke::new(1.0, theme::border()))
         .corner_radius(3)
         .inner_margin(Margin::symmetric(6, 2))
         .show(&mut overlay_ui, |ui| {

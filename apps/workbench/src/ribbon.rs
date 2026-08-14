@@ -25,7 +25,7 @@ use crate::presentation::ActiveTool;
 use crate::sketch_toolbar::{
     SketchOperationGate, SketchToolCapabilities, ToolVariant, render_sketch_toolbar,
 };
-use crate::theme::{ACCENT, BORDER, CARD, MUTED, SELECTED_FILL, TEXT, WARN, ribbon_group};
+use crate::theme::{self, ribbon_group};
 use crate::{KernelLabApp, SolidFeaturePreset, WorkbenchMode, shell_button_activated, viewport};
 
 /// Whether a command can run right now, and in plain words why not when it
@@ -70,81 +70,95 @@ impl KernelLabApp {
                 }
                 ui.label(
                     RichText::new(format!("{} workspace", self.workbench_mode.label()))
-                        .color(MUTED),
+                        .color(theme::muted()),
                 );
                 if let Some(pending) = self.pending_operation {
-                    ui.label(RichText::new(pending.title()).color(WARN));
+                    ui.label(RichText::new(pending.title()).color(theme::warn()));
                 }
             });
             return;
         }
 
-        ui.vertical(|ui| {
-            ui.horizontal(|ui| {
-                let response = ui
-                    .add_sized([24.0, 20.0], egui::Button::new("−").frame(false))
-                    .on_hover_text("Collapse command ribbon");
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        true,
-                        "Collapse command ribbon",
-                    )
-                });
-                if shell_button_activated(ui, &response, operation_pending) {
-                    self.shell.set_command_ribbon(false);
-                }
-                self.ribbon_tab_strip(ui);
+        // The tab strip lives in the header, not here: two rows of tabs stacked
+        // one above the other — workspace above, ribbon below — was the jarring
+        // part, and they were always the same choice said twice.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            let response = ui
+                .add_sized([24.0, 22.0], egui::Button::new("−").frame(false))
+                .on_hover_text("Collapse command ribbon");
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Collapse command ribbon")
             });
-            ui.add_space(2.0);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                ui.add_space(4.0);
-                self.ribbon_groups(ui);
-            });
+            if shell_button_activated(ui, &response, operation_pending) {
+                self.shell.set_command_ribbon(false);
+            }
+            self.ribbon_groups(ui);
         });
     }
 
-    /// The tab strip. Tabs are a taxonomy, not a workspace switch: entering a
-    /// sketch selects the Sketch tab, but the user can read any tab from any
-    /// workspace, and a command that does not apply says so rather than
-    /// disappearing.
-    fn ribbon_tab_strip(&mut self, ui: &mut egui::Ui) {
+    /// The tab strip, drawn in the header beside the document name.
+    ///
+    /// Model and Sketch are the workspace: picking one enters it, which is what
+    /// the separate "Model mode / Sketch mode" pair used to do a row above. They
+    /// were always the same choice said twice, so there is now one control.
+    /// View is a ribbon tab only — it changes what is shown, never the
+    /// workspace — and is therefore reachable while an operation is pending.
+    pub(crate) fn ribbon_tab_strip(&mut self, ui: &mut egui::Ui) {
         let active = self.active_ribbon_tab();
-        ui.spacing_mut().item_spacing.x = 2.0;
+        let operation_pending = self.pending_operation.is_some();
+        ui.spacing_mut().item_spacing.x = 1.0;
         for tab in RibbonTab::ALL {
             let selected = tab == active;
-            let response = ui.add(
+            let switches_workspace = tab != RibbonTab::View;
+            let enabled = !switches_workspace || !operation_pending;
+            let response = ui.add_enabled(
+                enabled,
                 egui::Button::new(
                     RichText::new(tab.label())
-                        .font(FontId::proportional(12.5))
-                        .color(if selected { TEXT } else { MUTED }),
+                        .font(FontId::proportional(12.0))
+                        .color(if selected {
+                            theme::text()
+                        } else {
+                            theme::muted()
+                        }),
                 )
-                .fill(if selected {
-                    CARD
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .stroke(Stroke::new(
-                    1.0,
-                    if selected {
-                        BORDER
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    },
-                ))
-                .corner_radius(3)
-                .min_size(vec2(58.0, 20.0)),
+                .frame(false)
+                .corner_radius(2)
+                .min_size(vec2(62.0, 26.0)),
             );
             response.widget_info(|| {
                 egui::WidgetInfo::selected(
                     egui::WidgetType::Button,
-                    true,
+                    enabled,
                     selected,
                     tab.accessible_name(),
                 )
             });
-            if response.clicked() {
-                self.ribbon_tab = Some((self.workbench_mode, tab));
+            if selected {
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(response.rect.left() + 6.0, response.rect.bottom() - 1.0),
+                        egui::pos2(response.rect.right() - 6.0, response.rect.bottom() - 1.0),
+                    ],
+                    Stroke::new(2.0, theme::accent()),
+                );
+            }
+            if !enabled {
+                response.on_disabled_hover_text(
+                    "Confirm or cancel the pending operation before changing workspaces.",
+                );
+            } else if response.clicked() {
+                match tab {
+                    RibbonTab::Model => {
+                        self.ribbon_tab = None;
+                        self.enter_model_mode();
+                    }
+                    RibbonTab::Sketch => {
+                        self.ribbon_tab = None;
+                        self.enter_sketch_mode();
+                    }
+                    RibbonTab::View => self.ribbon_tab = Some((self.workbench_mode, tab)),
+                }
             }
         }
     }
@@ -239,18 +253,18 @@ impl KernelLabApp {
         let fill = if !enabled {
             egui::Color32::TRANSPARENT
         } else if active {
-            SELECTED_FILL
+            theme::selected_fill()
         } else if hovered {
-            CARD
+            theme::card()
         } else if primary {
-            CARD.gamma_multiply(0.7)
+            theme::card().gamma_multiply(0.7)
         } else {
             egui::Color32::TRANSPARENT
         };
         let outline = if active {
-            ACCENT
+            theme::accent()
         } else if hovered || (primary && enabled) {
-            BORDER
+            theme::border()
         } else {
             egui::Color32::TRANSPARENT
         };
@@ -262,9 +276,9 @@ impl KernelLabApp {
             egui::StrokeKind::Inside,
         );
         let tint = if enabled {
-            TEXT
+            theme::text()
         } else {
-            MUTED.gamma_multiply(0.6)
+            theme::muted().gamma_multiply(0.6)
         };
         let icon_rect = egui::Rect::from_center_size(
             egui::pos2(rect.center().x, rect.top() + 6.0 + LARGE_ICON / 2.0),
@@ -275,9 +289,9 @@ impl KernelLabApp {
             icon_rect,
             self.command_icon(descriptor),
             if enabled {
-                ACCENT
+                theme::accent()
             } else {
-                MUTED.gamma_multiply(0.6)
+                theme::muted().gamma_multiply(0.6)
             },
         );
         painter.text(
@@ -307,9 +321,9 @@ impl KernelLabApp {
         let fill = if !enabled {
             egui::Color32::TRANSPARENT
         } else if active {
-            SELECTED_FILL
+            theme::selected_fill()
         } else if hovered {
-            CARD
+            theme::card()
         } else {
             egui::Color32::TRANSPARENT
         };
@@ -320,7 +334,7 @@ impl KernelLabApp {
             Stroke::new(
                 1.0,
                 if active {
-                    ACCENT
+                    theme::accent()
                 } else {
                     egui::Color32::TRANSPARENT
                 },
@@ -336,9 +350,9 @@ impl KernelLabApp {
             icon_rect,
             self.command_icon(descriptor),
             if enabled {
-                ACCENT
+                theme::accent()
             } else {
-                MUTED.gamma_multiply(0.6)
+                theme::muted().gamma_multiply(0.6)
             },
         );
         painter.text(
@@ -347,9 +361,9 @@ impl KernelLabApp {
             self.command_label(descriptor),
             FontId::proportional(10.5),
             if enabled {
-                TEXT
+                theme::text()
             } else {
-                MUTED.gamma_multiply(0.6)
+                theme::muted().gamma_multiply(0.6)
             },
         );
         self.finish_command_button(ui, response, descriptor, availability);
@@ -371,19 +385,19 @@ impl KernelLabApp {
         let response = match availability {
             CommandAvailability::Enabled => response.on_hover_ui(|ui| {
                 ui.label(RichText::new(name).strong());
-                ui.label(RichText::new(tooltip).small().color(MUTED));
+                ui.label(RichText::new(tooltip).small().color(theme::muted()));
                 if let Some(shortcut) = shortcut {
                     ui.label(
                         RichText::new(format!("Keyboard: {shortcut}"))
                             .small()
-                            .color(MUTED),
+                            .color(theme::muted()),
                     );
                 }
             }),
             CommandAvailability::Disabled(reason) => response.on_hover_ui(|ui| {
                 ui.label(RichText::new(name).strong());
-                ui.label(RichText::new(tooltip).small().color(MUTED));
-                ui.label(RichText::new(reason.as_ref()).small().color(WARN));
+                ui.label(RichText::new(tooltip).small().color(theme::muted()));
+                ui.label(RichText::new(reason.as_ref()).small().color(theme::warn()));
             }),
         };
         if response.clicked() {
@@ -433,7 +447,7 @@ impl KernelLabApp {
             ui.label(
                 RichText::new(self.boolean_operand_summary())
                     .small()
-                    .color(MUTED),
+                    .color(theme::muted()),
             )
             .on_hover_text("Click a body to add it as a tool; click it again to remove it.");
         });
@@ -465,6 +479,7 @@ impl KernelLabApp {
                 SketchEntryAction::Edit => "Edit sketch",
             },
             ModelCommand::PlayMotion if self.motion.playing => "Stop",
+            ModelCommand::ToggleTheme => theme::active_theme().other().label(),
             _ => descriptor.label,
         }
     }
@@ -500,6 +515,7 @@ impl KernelLabApp {
             // The properties palette has no hidden state of its own; the
             // command raises and focuses it, so it is never "on".
             ModelCommand::ShowHistory => self.shell.visibility().feature_timeline,
+            ModelCommand::ToggleTheme => theme::active_theme() == theme::WorkbenchTheme::Dark,
             ModelCommand::PlayMotion => self.motion.playing,
             _ => false,
         }
@@ -681,7 +697,8 @@ impl KernelLabApp {
             ModelCommand::ToggleShaded
             | ModelCommand::ShowBrowser
             | ModelCommand::ShowProperties
-            | ModelCommand::ShowHistory => CommandAvailability::Enabled,
+            | ModelCommand::ShowHistory
+            | ModelCommand::ToggleTheme => CommandAvailability::Enabled,
         }
     }
 
@@ -828,6 +845,13 @@ impl KernelLabApp {
             ModelCommand::ShowBrowser => self.shell.set_model_browser(true),
             ModelCommand::ShowProperties => self.show_properties_tab(),
             ModelCommand::ShowHistory => self.shell.set_feature_timeline(true),
+            ModelCommand::ToggleTheme => {
+                theme::set_active_theme(theme::active_theme().other());
+                // egui derives its own widget defaults from the palette, so the
+                // style has to be rebuilt before anything else paints.
+                theme::install_style(context);
+                context.request_repaint();
+            }
             ModelCommand::FinishSketch => {
                 self.finish_sketch_now();
             }

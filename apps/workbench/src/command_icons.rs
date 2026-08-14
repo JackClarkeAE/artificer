@@ -48,6 +48,7 @@ pub enum CommandIcon {
     Open,
     Rebuild,
     Material,
+    Theme,
 }
 
 pub fn paint_command_icon(painter: &Painter, rect: Rect, icon: CommandIcon, color: Color32) {
@@ -407,6 +408,22 @@ impl IconPainter<'_> {
                 self.arrowhead((0.78, 0.36), (0.6, -0.8), 0.10);
                 self.arc((0.50, 0.50), 0.32, TAU * 0.30, TAU * 0.62);
                 self.arrowhead((0.22, 0.64), (-0.6, 0.8), 0.10);
+            }
+            CommandIcon::Theme => {
+                // The contrast mark: one circle, half of it filled.
+                self.circle((0.50, 0.50), 0.36);
+                let radius = 0.36;
+                let mut points = vec![self.p(0.50, 0.50 - radius)];
+                let steps = 18;
+                for index in 0..=steps {
+                    let angle = -TAU / 4.0 + TAU / 2.0 * index as f32 / steps as f32;
+                    points.push(self.p(0.50 + radius * angle.cos(), 0.50 + radius * angle.sin()));
+                }
+                self.painter.add(egui::Shape::convex_polygon(
+                    points,
+                    self.color,
+                    Stroke::NONE,
+                ));
             }
             CommandIcon::Material => {
                 self.circle((0.50, 0.50), 0.36);

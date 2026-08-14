@@ -763,7 +763,7 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
         );
     }
     // Leave the ribbon where the rest of this test expects to find it.
-    open_ribbon_tab(&mut harness, "Model ribbon tab");
+    open_ribbon_tab(&mut harness, "Model mode");
 
     let clean_viewport = harness.get_by_label("Model viewport").rect();
     assert!(

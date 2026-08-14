@@ -7,16 +7,15 @@
 //! catalog/model adapter can consume the same intents without moving parameter
 //! validation into rendering code.
 
-use egui::{Color32, FontId, RichText, Stroke};
+use egui::{FontId, RichText, Stroke};
 
-const LIBRARY_PANEL: Color32 = crate::theme::PANEL;
-const LIBRARY_CARD: Color32 = crate::theme::CARD;
-const LIBRARY_BORDER: Color32 = crate::theme::BORDER;
-const LIBRARY_TEXT: Color32 = crate::theme::TEXT;
-const LIBRARY_MUTED: Color32 = crate::theme::MUTED;
-const LIBRARY_ACCENT: Color32 = crate::theme::ACCENT;
-const LIBRARY_GOOD: Color32 = crate::theme::GOOD;
-const LIBRARY_BAD: Color32 = crate::theme::BAD;
+// Aliases rather than a second palette: the library styles itself from the
+// active theme like every other panel, and these names only exist so the
+// module reads in its own vocabulary.
+use crate::theme::{
+    accent as library_accent, bad as library_bad, border as library_border, card as library_card,
+    good as library_good, muted as library_muted, panel as library_panel, text as library_text,
+};
 
 /// Stable key for the first built-in parametric library definition.
 pub const ALUMINIUM_EXTRUSION_20X20_KEY: &str = "builtin.aluminium-extrusion-20x20";
@@ -345,8 +344,8 @@ impl PartLibraryState {
             .collapsible(true)
             .frame(
                 egui::Frame::window(context.style_of(context.theme()).as_ref())
-                    .fill(LIBRARY_PANEL)
-                    .stroke(Stroke::new(1.0, LIBRARY_BORDER)),
+                    .fill(library_panel())
+                    .stroke(Stroke::new(1.0, library_border())),
             )
             .show(context, |ui| {
                 requested_stage = self.contents(ui, another_operation_pending);
@@ -365,14 +364,14 @@ impl PartLibraryState {
             ui.label(
                 RichText::new("LOCAL PARTS")
                     .font(FontId::proportional(10.5))
-                    .color(LIBRARY_ACCENT)
+                    .color(library_accent())
                     .strong(),
             );
             ui.separator();
             ui.label(
                 RichText::new("Immutable definitions · exact revision insertion")
                     .small()
-                    .color(LIBRARY_MUTED),
+                    .color(library_muted()),
             );
         });
         ui.add_space(5.0);
@@ -411,7 +410,7 @@ impl PartLibraryState {
         ui.label(
             RichText::new("STANDARD COMPONENTS")
                 .small()
-                .color(LIBRARY_MUTED)
+                .color(library_muted())
                 .strong(),
         );
         ui.add_space(5.0);
@@ -422,15 +421,15 @@ impl PartLibraryState {
         if !query.is_empty() && !searchable.contains(&query) {
             ui.label(
                 RichText::new("No local parts match this search.")
-                    .color(LIBRARY_MUTED)
+                    .color(library_muted())
                     .italics(),
             );
             return;
         }
 
         egui::Frame::new()
-            .fill(LIBRARY_CARD)
-            .stroke(Stroke::new(1.0, LIBRARY_ACCENT.gamma_multiply(0.65)))
+            .fill(library_card())
+            .stroke(Stroke::new(1.0, library_accent().gamma_multiply(0.65)))
             .corner_radius(4)
             .inner_margin(egui::Margin::same(7))
             .show(ui, |ui| {
@@ -438,7 +437,7 @@ impl PartLibraryState {
                     [ui.available_width(), 66.0],
                     egui::Button::new(
                         RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
-                            .color(LIBRARY_TEXT)
+                            .color(library_text())
                             .strong(),
                     )
                     .frame(false)
@@ -452,11 +451,11 @@ impl PartLibraryState {
                     )
                 });
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("PARAMETRIC").small().color(LIBRARY_ACCENT));
+                    ui.label(RichText::new("PARAMETRIC").small().color(library_accent()));
                     ui.label(
                         RichText::new("Aluminium profiles")
                             .small()
-                            .color(LIBRARY_MUTED),
+                            .color(library_muted()),
                     );
                 });
             });
@@ -466,7 +465,7 @@ impl PartLibraryState {
         ui.label(
             RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
                 .font(FontId::proportional(17.0))
-                .color(LIBRARY_TEXT)
+                .color(library_text())
                 .strong(),
         );
         let package_identity = if self.definition_digest.len() == 64 {
@@ -482,14 +481,14 @@ impl PartLibraryState {
         ui.label(
             RichText::new(package_identity)
                 .small()
-                .color(LIBRARY_ACCENT),
+                .color(library_accent()),
         );
         ui.add_space(5.0);
         ui.label(
             RichText::new(
                 "Exact 20 mm × 20 mm profile with a user-resolved extrusion length. Equal variants may share evaluated geometry while every insertion remains independent.",
             )
-            .color(LIBRARY_MUTED),
+            .color(library_muted()),
         );
         ui.add_space(12.0);
         ui.separator();
@@ -497,18 +496,18 @@ impl PartLibraryState {
         ui.label(
             RichText::new("PARAMETERS")
                 .small()
-                .color(LIBRARY_MUTED)
+                .color(library_muted())
                 .strong(),
         );
         ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Length").color(LIBRARY_TEXT).strong());
+            ui.label(RichText::new("Length").color(library_text()).strong());
             if self.length_default_mm.is_some()
                 && self.length_source == ParameterValueSource::Default
             {
-                ui.label(RichText::new("DEFAULT").small().color(LIBRARY_GOOD));
+                ui.label(RichText::new("DEFAULT").small().color(library_good()));
             } else {
-                ui.label(RichText::new("REQUIRED").small().color(LIBRARY_ACCENT));
+                ui.label(RichText::new("REQUIRED").small().color(library_accent()));
             }
         });
         let editor = ui.add(
@@ -522,7 +521,7 @@ impl PartLibraryState {
                 "Required aluminium extrusion length in millimetres. A valid value enables Add to current workspace.",
             );
         });
-        ui.label(RichText::new("millimetres").small().color(LIBRARY_MUTED));
+        ui.label(RichText::new("millimetres").small().color(library_muted()));
         if editor.changed() {
             self.length_source = ParameterValueSource::Entered;
             self.status = None;
@@ -530,7 +529,7 @@ impl PartLibraryState {
 
         let eligibility = self.eligibility();
         if let Some(reason) = eligibility.visible_reason() {
-            ui.label(RichText::new(reason).small().color(LIBRARY_BAD));
+            ui.label(RichText::new(reason).small().color(library_bad()));
         } else if let PartInsertionEligibility::Ready { length_mm, source } = eligibility {
             let source_label = match source {
                 ParameterValueSource::Default => "definition default",
@@ -542,7 +541,7 @@ impl PartLibraryState {
                     format_millimetres(length_mm)
                 ))
                 .small()
-                .color(LIBRARY_GOOD),
+                .color(library_good()),
             );
         }
 
@@ -556,11 +555,11 @@ impl PartLibraryState {
                 blocked_reason.is_none(),
                 egui::Button::new(
                     RichText::new("Add to current workspace")
-                        .color(LIBRARY_TEXT)
+                        .color(library_text())
                         .strong(),
                 )
-                .fill(LIBRARY_ACCENT.gamma_multiply(0.28))
-                .stroke(Stroke::new(1.0, LIBRARY_ACCENT))
+                .fill(library_accent().gamma_multiply(0.28))
+                .stroke(Stroke::new(1.0, library_accent()))
                 .corner_radius(3)
                 .min_size(egui::vec2(ui.available_width(), 34.0)),
             );
@@ -572,7 +571,7 @@ impl PartLibraryState {
                 )
             };
             if let Some(status) = &self.status {
-                ui.label(RichText::new(status).small().color(LIBRARY_MUTED));
+                ui.label(RichText::new(status).small().color(library_muted()));
             }
             add.clicked()
         })

@@ -310,7 +310,13 @@ fn ribbon_tab_snapshots() {
     harness.run();
     harness.snapshot("workbench_ribbon_view_tab_1280");
 
-    click_button(&mut harness, "Model ribbon tab");
+    click_button(&mut harness, "Switch theme");
+    harness.remove_cursor();
+    harness.run();
+    harness.snapshot("workbench_ribbon_dark_theme_1280");
+    click_button(&mut harness, "Switch theme");
+
+    click_button(&mut harness, "Model mode");
     click_button(&mut harness, "Sketch on selected face");
     for _ in 0..120 {
         harness.step();

@@ -378,9 +378,12 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
     harness.run();
+    // The file actions live in the File menu now, so the header holds the menu
+    // itself plus the controls that earn a permanent place beside it.
     for label in [
-        "Save document",
-        "Open saved document",
+        "File menu",
+        "Undo history change",
+        "Redo history change",
         "Library",
         "Browser",
         "Properties",
@@ -393,6 +396,21 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
             "{label} is clipped by the supported window: {rect:?}"
         );
     }
+    // Opening it must reach every file action, at the minimum window.
+    harness
+        .get_by_role_and_label(Role::Button, "File menu")
+        .click_accesskit();
+    harness.run();
+    for label in ["Save document", "Open saved document", "Export…"] {
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        assert!(rect.is_positive(), "{label} must be reachable: {rect:?}");
+        assert!(
+            rect.min.x >= 0.0 && rect.max.x <= 1040.0 && rect.max.y <= 700.0,
+            "{label} is clipped by the supported window: {rect:?}"
+        );
+    }
+    harness.key_press(egui::Key::Escape);
+    harness.run();
     let viewport_top = harness.get_by_label("Model viewport").rect().top();
     // "Home" now lives on the View tab, so this checks a Model-tab command from
     // each weight instead: a large one, a primary one, and a small one.
