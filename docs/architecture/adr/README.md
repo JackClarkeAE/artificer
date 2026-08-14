@@ -21,7 +21,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0008](0008-plane-profile-workbench.md) | Plane and profile workbench boundary | Accepted | 0027 |
 | [0009](0009-live-sketch-dimensions.md) | Live sketch dimensions are editable construction intent | Accepted | 0027 |
 | [0010](0010-first-convex-profile-extrusion.md) | First native profile extrusion is a declarative convex constructor | Accepted (historical M4a slice) | 0015 |
-| [0011](0011-expandable-workbench-shell.md) | Expandable workbench shell preserves a fixed confirmation rail | Accepted | 0014 (history-preview authority) |
+| [0011](0011-expandable-workbench-shell.md) | Expandable workbench shell preserves a fixed confirmation rail | Accepted | 0014 (history-preview authority), 0028 |
 | [0012](0012-first-selected-face-add-cut.md) | First selected-face Add and Cut use an exact rectangular scaffold | Accepted (historical M4c slice) | 0013, 0015 |
 | [0013](0013-repeatable-rectangular-face-features.md) | Repeatable rectangular face features use local boundary rewrites | Accepted (historical M4d slice) | 0015 |
 | [0014](0014-m5a-parametric-document-foundation.md) | M5a parametric document foundation | Accepted | — |
@@ -38,6 +38,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | — |
 | [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
+| [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

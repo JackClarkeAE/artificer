@@ -43,6 +43,8 @@ The universal confirmation contract from [ADR 0007](0007-universal-model-operati
 
 The rail is intentionally separate from operation-specific input. The user can reclaim screen space without losing sight of whether an action will change model truth, and showing or hiding chrome cannot move the commit boundary.
 
+> **Model-workspace note:** [ADR 0028](0028-workbench-command-registry-and-contextual-properties.md) reverses this separation for the model workspace, where an operation's inputs and its tick are now one surface, and moves the rail off the outer bottom edge. Everything the invariant protects — one staged intent, no confirmation of invalid intent, no panel-local bypass, no cancellation by collapsing chrome — is unchanged, and the sketch workspace still reads exactly as written here.
+
 ### Historical M4b feature-preview boundary (superseded)
 
 At the time of M4b, the bottom strip was a **read-only committed-feature preview until M5**. A presentation-owned, session-local ledger preserved successful Sketch, Extrude, Add, Cut, and Transform entries after Origin and Base body. Staging, rejection, and cancellation did not append entries. Beginning a later sketch did not erase earlier committed entries. Its chips could navigate to the current Model or active Sketch view, but did not mutate model truth.
