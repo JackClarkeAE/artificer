@@ -43,6 +43,13 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     harness.run();
 }
 
+/// Save, Open and Export live in the File menu, so reaching one means opening
+/// the menu first — the same trip the user makes.
+fn click_file_menu_item(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    click_button(harness, "File menu");
+    click_button(harness, label);
+}
+
 fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
     harness.key_down(key);
     harness.step();
@@ -423,7 +430,7 @@ fn save_and_open_buttons_use_native_file_and_universal_confirmation_gate() {
     enter_length(&mut harness, "310");
     click_button(&mut harness, "Add to current workspace");
     click_button(&mut harness, "Confirm operation");
-    click_button(&mut harness, "Save document");
+    click_file_menu_item(&mut harness, "Save document");
     assert!(document_path.is_file());
 
     replace_length(&mut harness, "455");
@@ -431,7 +438,7 @@ fn save_and_open_buttons_use_native_file_and_universal_confirmation_gate() {
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().component_instance_count(), 2);
 
-    click_button(&mut harness, "Open saved document");
+    click_file_menu_item(&mut harness, "Open saved document");
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Open saved document")
@@ -440,7 +447,7 @@ fn save_and_open_buttons_use_native_file_and_universal_confirmation_gate() {
     click_button(&mut harness, "Cancel operation");
     assert_eq!(harness.state().component_instance_count(), 2);
 
-    click_button(&mut harness, "Open saved document");
+    click_file_menu_item(&mut harness, "Open saved document");
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().component_instance_count(), 1);
     assert_eq!(harness.state().body_count(), 2);

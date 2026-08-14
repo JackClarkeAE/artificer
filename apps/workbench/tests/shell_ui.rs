@@ -22,10 +22,23 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
 }
 
 fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
-    harness
-        .get_by_role_and_label(Role::Button, label)
-        .scroll_to_me();
-    harness.run();
+    // `scroll_to_me` animates the scroll offset, and `run()` can return while
+    // that animation is still in flight. A click aimed at a rect sampled from
+    // one of those frames lands wherever the row has moved on to by the time
+    // the press is processed, which is a real one-in-a-dozen flake rather than
+    // a product fault. Settle until the row stops moving, then aim.
+    let mut previous = None;
+    for _ in 0..60 {
+        harness
+            .get_by_role_and_label(Role::Button, label)
+            .scroll_to_me();
+        harness.run();
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        if previous == Some(rect) {
+            break;
+        }
+        previous = Some(rect);
+    }
     click_button(harness, label);
 }
 
