@@ -10736,36 +10736,62 @@ impl KernelLabApp {
         None
     }
 
+    /// Whether the contextual card is on screen, which decides whether it is
+    /// the thing hosting the confirmation controls this frame.
+    fn contextual_card_visible(&self) -> bool {
+        // Every other surface that owns the screen suppresses the card, and
+        // the confirmation controls fall back to their floating chip. The
+        // Part Library is one of them: it covers the bottom-right corner, and
+        // a tick the user cannot reach is worse than a tick somewhere else.
+        !self.inspector_open()
+            && !self.document_properties_open
+            && !self.part_library.is_open()
+            && self.model_context_menu.is_none()
+            && self.contextual_card_subject().is_some()
+    }
+
+    /// The height the view cube and its roll controls occupy at the top-right
+    /// of the viewport. The card starts below it, and leaves the same gap at
+    /// the bottom, so the two sit as one column of chrome down the right edge.
+    const VIEW_CUBE_BLOCK: f32 = 115.0;
+
     /// The contextual card: the model workspace's replacement for a palette
     /// that was reserved on every frame whether or not it had anything to
     /// report.
     ///
     /// It floats over the viewport rather than taking layout width, which is
-    /// the point — a docked panel that appears on selection would reflow the
+    /// the point — a docked panel that appeared on selection would reflow the
     /// model under the pointer at the exact moment the user is pointing at
     /// something.
-    fn contextual_card(&mut self, context: &egui::Context, viewport: egui::Rect) {
-        if self.inspector_open()
-            || self.document_properties_open
-            || self.model_context_menu.is_some()
-        {
-            return;
+    fn contextual_card(
+        &mut self,
+        context: &egui::Context,
+        viewport: egui::Rect,
+    ) -> Option<ConfirmationAction> {
+        if !self.contextual_card_visible() {
+            return None;
         }
-        let Some(subject) = self.contextual_card_subject() else {
-            return;
-        };
-        let width = 224.0;
-        // Bottom-right, not top-right: the view cube and the workspace
-        // breadcrumb own the top-right corner, and a card that lands on the
-        // cube takes away the control the user reaches for to see the face
-        // they just picked. Anchored rather than positioned because the card's
-        // height depends on what it is describing and is not known here.
-        let bottom_inset = context.content_rect().bottom() - viewport.bottom() + 46.0;
+        let subject = self.contextual_card_subject()?;
+        let width = 236.0;
+        // Top margin clears the view cube; the bottom margin matches it, so the
+        // card reads as a deliberate column rather than something that drifted
+        // to wherever it fitted.
+        let margin = Self::VIEW_CUBE_BLOCK + 14.0;
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(viewport.right() - 12.0 - width, viewport.top() + margin),
+            egui::pos2(viewport.right() - 12.0, viewport.bottom() - margin),
+        );
+        if rect.height() < 120.0 {
+            return None;
+        }
+        let mut action = None;
         egui::Area::new(egui::Id::new("model_contextual_card"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -bottom_inset))
-            // Clamped into the viewport, so a tall card is pushed up rather
-            // than off the bottom of the window taking its controls with it.
-            .constrain_to(viewport.shrink(10.0))
+            .fixed_pos(rect.min)
+            // Without a size hint the first frame runs egui's constrain pass
+            // against an unknown size and lands the card mid-screen; the very
+            // first click aimed at an item then misses.
+            .default_size(rect.size())
+            .constrain(false)
             .order(egui::Order::Middle)
             .show(context, |ui| {
                 Frame::new()
@@ -10780,10 +10806,9 @@ impl KernelLabApp {
                         color: egui::Color32::from_black_alpha(38),
                     })
                     .show(ui, |ui| {
-                        // The frame's own margins sit outside this width, so
-                        // the card as drawn is `width`, not width plus padding
-                        // hanging off the edge of the window.
-                        ui.set_width(width - 16.0);
+                        let inner = rect.size() - egui::vec2(16.0, 14.0);
+                        ui.set_min_size(inner);
+                        ui.set_max_size(inner);
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(subject.title())
@@ -10811,21 +10836,48 @@ impl KernelLabApp {
                             );
                         });
                         ui.separator();
-                        self.contextual_card_contents(ui, subject, viewport.height());
+                        // The acceptance controls are pinned to the foot of the
+                        // card, so the inputs an operation needs and the tick
+                        // that commits them are one surface instead of two at
+                        // opposite ends of the screen.
+                        // Both halves are carved out of what is actually
+                        // left, never out of what we hoped would be: a card
+                        // squeezed by a short window must not ask egui for a
+                        // negative rectangle.
+                        let available = ui.available_height();
+                        let rail_height = if self.pending_operation.is_some() {
+                            42.0_f32.min(available)
+                        } else {
+                            0.0
+                        };
+                        let body_height = (available - rail_height).max(0.0);
+                        if body_height > 1.0 {
+                            ui.allocate_ui(egui::vec2(inner.x, body_height), |ui| {
+                                // Claim the whole height even when the subject
+                                // has little to say, so the acceptance controls
+                                // sit at the foot of the card the way a dialog's
+                                // do rather than floating under the title.
+                                ui.set_min_height(body_height);
+                                self.contextual_card_contents(ui, subject, body_height);
+                            });
+                        }
+                        if rail_height > 1.0 {
+                            ui.allocate_ui(egui::vec2(inner.x, rail_height), |ui| {
+                                action = self.confirmation_slot(ui);
+                            });
+                        }
                     });
             });
+        action
     }
 
     fn contextual_card_contents(
         &mut self,
         ui: &mut egui::Ui,
         subject: ContextualSubject,
-        viewport_height: f32,
+        body_height: f32,
     ) {
-        self.controls(
-            ui,
-            ControlsScope::Contextual(subject, (viewport_height - 150.0).clamp(120.0, 460.0)),
-        );
+        self.controls(ui, ControlsScope::Contextual(subject, body_height));
         if subject == ContextualSubject::Selection {
             self.selection_command_chips(ui);
         }
@@ -14684,7 +14736,7 @@ impl eframe::App for KernelLabApp {
         // pending model operation floats its tick/cross over the canvas
         // instead: staging an operation must never move or resize the
         // viewport under a live drag.
-        let confirmation_action = if self.workbench_mode == WorkbenchMode::Sketch {
+        let mut confirmation_action = if self.workbench_mode == WorkbenchMode::Sketch {
             egui::Panel::bottom("operation_confirmation")
                 .exact_size(38.0)
                 .resizable(false)
@@ -14697,7 +14749,11 @@ impl eframe::App for KernelLabApp {
                 )
                 .show(ui, |ui| self.confirmation_slot(ui))
                 .inner
-        } else if self.pending_operation.is_some() {
+        } else if self.pending_operation.is_some() && !self.contextual_card_visible() {
+            // The contextual card hosts these controls whenever it is on
+            // screen. This floating chip is the fallback for the frames where
+            // it is not — the docked palette open, the context menu up — so a
+            // pending operation can never be left with no way to resolve it.
             // Positioned from the screen rectangle rather than `anchor`:
             // an anchored area only knows its own size one frame after it
             // first appears, and a chip that shifts on its second frame
@@ -14808,7 +14864,9 @@ impl eframe::App for KernelLabApp {
                 }
             });
 
-        self.contextual_card(ui.ctx(), central_panel.response.rect);
+        if let Some(card_action) = self.contextual_card(ui.ctx(), central_panel.response.rect) {
+            confirmation_action = Some(card_action);
+        }
 
         // Above `handle_shortcuts`, so the Escape that dismisses the menu is
         // read here first. The shortcut pass sees it too, but with no pending
