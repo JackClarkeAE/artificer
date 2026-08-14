@@ -1418,6 +1418,14 @@ struct ArchivedFeatureReport {
     report: OperationReport,
 }
 
+/// Whether the transform editor is being drawn as the staged operation's own
+/// card, or as the settings panel it also serves as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransformControlsScope {
+    Operation,
+    Settings,
+}
+
 /// How much of the properties stack to draw. The docked palette shows all of
 /// it; the contextual card shows only what belongs to the moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -10520,7 +10528,7 @@ impl KernelLabApp {
 
             ui.add_space(5.0);
             collapsible_card(ui, "transform_preview", "TRANSFORM PREVIEW", false, |ui| {
-                self.transform_controls(ui);
+                self.transform_controls(ui, TransformControlsScope::Settings);
             });
 
             ui.add_space(5.0);
@@ -12185,6 +12193,20 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                // A staged transform's inputs used to live only on the gizmo,
+                // which left its card with a title, a lot of nothing, and a
+                // tick. "How far have I moved this" is the question the user
+                // is asking while they drag, so the exact offsets belong in
+                // the card that is asking them to accept it.
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::Transform { .. }))
+                {
+                    card(ui, "transform_preview", "TRANSFORM", &mut |ui| {
+                        self.transform_controls(ui, TransformControlsScope::Operation);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if shows(ContextualSubject::PendingOperation)
                     && ((self.sketch.entities().is_empty() && self.selected_face.is_some())
                         || matches!(
@@ -12768,7 +12790,7 @@ impl KernelLabApp {
         });
     }
 
-    fn transform_controls(&mut self, ui: &mut egui::Ui) {
+    fn transform_controls(&mut self, ui: &mut egui::Ui, scope: TransformControlsScope) {
         let mut changed = false;
         let editable = self.transform_tools_available();
         let component_target = self.active_component_instance().map(|component| {
@@ -12876,32 +12898,39 @@ impl KernelLabApp {
                     .color(theme::muted()),
             );
         }
-        let mut zoom = self.view.zoom;
-        if ui
-            .add_sized(
-                [
-                    (ui.available_width() - 8.0).max(80.0),
-                    ui.spacing().interact_size.y,
-                ],
-                egui::Slider::new(&mut zoom, 0.45..=2.0)
-                    .max_decimals(3)
-                    .custom_formatter(|value, _| format!("{value:04.2}"))
-                    .text("Camera zoom"),
-            )
-            .changed()
-        {
-            self.view.set_zoom(zoom);
-        }
+        // Camera zoom and the two framing buttons are view controls, not part
+        // of the transform being staged, so they are drawn only where this card
+        // is a settings panel — never inside the operation card, where they
+        // would offer to move the camera from the surface asking the user to
+        // accept a body move. The View tab owns them there.
+        if scope == TransformControlsScope::Settings {
+            let mut zoom = self.view.zoom;
+            if ui
+                .add_sized(
+                    [
+                        (ui.available_width() - 8.0).max(80.0),
+                        ui.spacing().interact_size.y,
+                    ],
+                    egui::Slider::new(&mut zoom, 0.45..=2.0)
+                        .max_decimals(3)
+                        .custom_formatter(|value, _| format!("{value:04.2}"))
+                        .text("Camera zoom"),
+                )
+                .changed()
+            {
+                self.view.set_zoom(zoom);
+            }
 
-        ui.horizontal(|ui| {
-            if ui.button("Reset view").clicked() {
-                self.reset_view(ui.ctx());
-            }
-            if ui.button("Frame all visible").clicked() {
-                self.frame_visible_body(ui.ctx());
-                ui.ctx().request_repaint();
-            }
-        });
+            ui.horizontal(|ui| {
+                if ui.button("Reset view").clicked() {
+                    self.reset_view(ui.ctx());
+                }
+                if ui.button("Frame all visible").clicked() {
+                    self.frame_visible_body(ui.ctx());
+                    ui.ctx().request_repaint();
+                }
+            });
+        }
         if changed {
             self.sync_transform_preview();
         }
@@ -12919,7 +12948,12 @@ impl KernelLabApp {
                 .wrap(),
             );
         } else if self.transform_preview_pending() {
-            status_line(ui, "PREVIEW — NOT COMMITTED", theme::warn());
+            // The status chip says this on every frame a preview is live,
+            // whichever surface happens to be up. Repeating it here would put
+            // the same sentence on screen twice, an arm's length apart.
+            if scope == TransformControlsScope::Settings {
+                status_line(ui, "PREVIEW — NOT COMMITTED", theme::warn());
+            }
             ui.add(
                 egui::Label::new(
                     RichText::new(if component_target.is_some() {
