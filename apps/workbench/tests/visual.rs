@@ -190,34 +190,31 @@ fn canonical_cuboid_snapshot() {
         viewport_rect,
         "confirming must preserve the model viewport rectangle"
     );
-    let changed_in_viewport = differing_rgba_pixels_in_rect(
+    // What must not move is the model. The right-hand strip of the viewport is
+    // floating chrome — the status chip, and the contextual card, which appears
+    // and disappears with the operation by design — so the comparison is made
+    // over the region the geometry actually occupies rather than over every
+    // pixel the viewport owns.
+    let model_rect = egui::Rect::from_min_max(
+        viewport_rect.min,
+        egui::pos2(viewport_rect.right() - 300.0, viewport_rect.bottom()),
+    );
+    let changed_in_model = differing_rgba_pixels_in_rect(
         combined_preview.as_raw(),
         committed.as_raw(),
         moved.width() as usize,
-        viewport_rect,
-    );
-    let status_rect = egui::Rect::from_min_max(
-        egui::pos2(viewport_rect.right() - 250.0, viewport_rect.bottom() - 70.0),
-        viewport_rect.right_bottom(),
-    );
-    let changed_in_status = differing_rgba_pixels_in_rect(
-        combined_preview.as_raw(),
-        committed.as_raw(),
-        moved.width() as usize,
-        status_rect,
+        model_rect,
     );
     let changed_in_chip = differing_rgba_pixels_in_rect(
         combined_preview.as_raw(),
         committed.as_raw(),
         moved.width() as usize,
-        chip_rect,
+        chip_rect.intersect(model_rect),
     );
-    let changed_outside_status = changed_in_viewport
-        .saturating_sub(changed_in_status)
-        .saturating_sub(changed_in_chip);
+    let changed_outside_status = changed_in_model.saturating_sub(changed_in_chip);
     assert!(
         changed_outside_status <= 24,
-        "commit visibly jumped by {changed_outside_status} non-status viewport pixels"
+        "commit visibly jumped by {changed_outside_status} model pixels"
     );
     assert_ne!(harness.state().displayed_snapshot_id(), snapshot);
     assert_ne!(harness.state().displayed_semantic_digest(), digest);

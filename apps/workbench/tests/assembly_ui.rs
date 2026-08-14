@@ -16,6 +16,25 @@ fn new_harness() -> Harness<'static, KernelLabApp> {
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context))
 }
 
+/// The component card scrolls when its reference facts are longer than the
+/// card, so a control below the fold has to be brought into view first — the
+/// same thing the user does.
+fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    let mut previous = None;
+    for _ in 0..60 {
+        harness
+            .get_by_role_and_label(Role::Button, label)
+            .scroll_to_me();
+        harness.run();
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        if previous == Some(rect) {
+            break;
+        }
+        previous = Some(rect);
+    }
+    click_button(harness, label);
+}
+
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     harness.get_by_role_and_label(Role::Button, label).click();
     harness.run();
@@ -142,7 +161,7 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
     let mut harness = two_component_assembly();
     let poses = harness.state().component_poses();
 
-    click_button(&mut harness, "Ground component");
+    click_scrolled_button(&mut harness, "Ground component");
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Ground component")
@@ -155,7 +174,7 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
             .is_disabled()
     );
 
-    click_button(&mut harness, "Ground component");
+    click_scrolled_button(&mut harness, "Ground component");
     click_button(&mut harness, "Confirm operation");
     assert!(
         harness
@@ -165,9 +184,9 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
     );
     assert_eq!(harness.state().component_poses(), poses);
 
-    click_button(&mut harness, "Release component");
+    click_scrolled_button(&mut harness, "Release component");
     click_button(&mut harness, "Confirm operation");
-    click_button(&mut harness, "Add revolute joint");
+    click_scrolled_button(&mut harness, "Add revolute joint");
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Create revolute joint")
@@ -176,7 +195,7 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
     click_button(&mut harness, "Cancel operation");
     assert_eq!(harness.state().assembly_joint_count(), 0);
 
-    click_button(&mut harness, "Add revolute joint");
+    click_scrolled_button(&mut harness, "Add revolute joint");
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().assembly_joint_count(), 1);
     let summaries = harness.state().assembly_joint_summaries();

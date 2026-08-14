@@ -811,9 +811,10 @@ impl KernelLabApp {
                 } else {
                     self.stage_face_push_pull()
                 };
-                if staged {
-                    self.show_properties_tab();
-                }
+                // Staging no longer docks a panel: the contextual card carries
+                // the operation's controls, over the viewport, beside the rail
+                // that will commit it.
+                let _ = staged;
             }
             ModelCommand::Revolve => self.stage_preset_feature(SolidFeaturePreset::Revolve),
             ModelCommand::Hole => self.stage_preset_feature(SolidFeaturePreset::Hole),

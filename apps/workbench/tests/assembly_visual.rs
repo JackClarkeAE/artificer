@@ -2,6 +2,24 @@ use artificer_workbench::KernelLabApp;
 use egui::accesskit::Role;
 use egui_kittest::{Harness, OsThreshold, SnapshotOptions, kittest::Queryable as _};
 
+/// Controls inside the contextual card can sit below its fold, so bring the
+/// target into view before aiming at it — the same thing the user does.
+fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    let mut previous = None;
+    for _ in 0..60 {
+        harness
+            .get_by_role_and_label(Role::Button, label)
+            .scroll_to_me();
+        harness.run();
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        if previous == Some(rect) {
+            break;
+        }
+        previous = Some(rect);
+    }
+    click_button(harness, label);
+}
+
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     let position = harness
         .get_by_role_and_label(Role::Button, label)
@@ -90,7 +108,7 @@ fn assembly_placement_and_joint_snapshots() {
     harness.snapshot("assembly_component_placement_preview");
 
     click_button(&mut harness, "Cancel operation");
-    click_button(&mut harness, "Add revolute joint");
+    click_scrolled_button(&mut harness, "Add revolute joint");
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().assembly_joint_count(), 1);
     let at_rest = harness.render().expect("joint rest pose should render");

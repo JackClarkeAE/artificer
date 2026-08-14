@@ -1418,6 +1418,37 @@ struct ArchivedFeatureReport {
     report: OperationReport,
 }
 
+/// How much of the properties stack to draw. The docked palette shows all of
+/// it; the contextual card shows only what belongs to the moment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ControlsScope {
+    Full,
+    /// The subject to describe, and the height its scrolling body may use
+    /// before the card would overrun the viewport it floats in.
+    Contextual(ContextualSubject, f32),
+}
+
+/// What the contextual card is describing, which decides both its title and
+/// which existing card body it renders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextualSubject {
+    PendingOperation,
+    Component,
+    Measurement,
+    Selection,
+}
+
+impl ContextualSubject {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::PendingOperation => "OPERATION",
+            Self::Component => "COMPONENT",
+            Self::Measurement => "MEASURE",
+            Self::Selection => "SELECTION",
+        }
+    }
+}
+
 /// The model-viewport context menu, anchored where the user right-clicked.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ModelContextMenu {
@@ -1652,7 +1683,13 @@ pub struct KernelLabApp {
     /// Whether the floating context inspector is showing. It carries the
     /// active tool's options, so it opens with a command and stays until the
     /// user dismisses it.
-    inspector_open: bool,
+    /// Whether the docked palette is open in each workspace. Two flags, not
+    /// one: the model workspace opens without it — its facts arrive as a
+    /// contextual card over the viewport — while sketching genuinely does want
+    /// the tool inputs on screen for every frame, so the two must not share a
+    /// default and undo each other on every workspace change.
+    model_inspector_open: bool,
+    sketch_inspector_open: bool,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
@@ -1785,7 +1822,8 @@ impl Default for KernelLabApp {
             edge_finish_distance: 0.4,
             edge_finish_distance_text: "0.400".to_owned(),
             edge_finish_tangent_chain: false,
-            inspector_open: true,
+            model_inspector_open: false,
+            sketch_inspector_open: true,
             camera_before_plane_sketch: None,
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
@@ -10296,8 +10334,23 @@ impl KernelLabApp {
         self.model_browser(ui);
     }
 
+    /// Whether the docked palette is showing in the active workspace.
+    const fn inspector_open(&self) -> bool {
+        match self.workbench_mode {
+            WorkbenchMode::Model => self.model_inspector_open,
+            WorkbenchMode::Sketch => self.sketch_inspector_open,
+        }
+    }
+
+    fn set_inspector_open(&mut self, open: bool) {
+        match self.workbench_mode {
+            WorkbenchMode::Model => self.model_inspector_open = open,
+            WorkbenchMode::Sketch => self.sketch_inspector_open = open,
+        }
+    }
+
     fn show_properties_tab(&mut self) {
-        self.inspector_open = true;
+        self.set_inspector_open(true);
     }
 
     fn committed_export_triangles(&self) -> Vec<ExportTriangle> {
@@ -10514,6 +10567,14 @@ impl KernelLabApp {
             )
             .show(context, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Material and mass live here now rather than in a panel
+                    // that used to be open on every frame: they are facts
+                    // about the document, and this is where the document's
+                    // facts are.
+                    collapsible_card(ui, "document_material_and_mass", "MATERIAL", true, |ui| {
+                        self.material_card(ui);
+                    });
+                    ui.add_space(5.0);
                     self.workspace_settings_cards(ui);
                     ui.add_space(6.0);
                     ui.label(RichText::new("UNITS").small().color(theme::muted()));
@@ -10646,6 +10707,169 @@ impl KernelLabApp {
     /// hides a quarter of the drawing area and silently swallows every click
     /// that lands on it. Transient command editors still float, because they
     /// come and go with one operation.
+    /// Whether the contextual card has anything to say right now.
+    ///
+    /// This is the whole rule the card lives by: a surface that appears when
+    /// there is something to describe, and is simply absent otherwise. Document
+    /// facts — material, mass, units, parameters — are deliberately not on this
+    /// list. They are true whether or not anything is selected, so they live in
+    /// File ▸ Document properties rather than hovering over the model forever.
+    fn contextual_card_subject(&self) -> Option<ContextualSubject> {
+        if self.workbench_mode != WorkbenchMode::Model {
+            return None;
+        }
+        if self.pending_operation.is_some() {
+            return Some(ContextualSubject::PendingOperation);
+        }
+        if self.active_component_instance().is_some() {
+            return Some(ContextualSubject::Component);
+        }
+        if !self.measured_edge_geometry().is_empty() || self.measured_face_area().is_some() {
+            return Some(ContextualSubject::Measurement);
+        }
+        if self.selected_face.is_some()
+            || self.selected_edge.is_some()
+            || self.selected_vertex.is_some()
+        {
+            return Some(ContextualSubject::Selection);
+        }
+        None
+    }
+
+    /// The contextual card: the model workspace's replacement for a palette
+    /// that was reserved on every frame whether or not it had anything to
+    /// report.
+    ///
+    /// It floats over the viewport rather than taking layout width, which is
+    /// the point — a docked panel that appears on selection would reflow the
+    /// model under the pointer at the exact moment the user is pointing at
+    /// something.
+    fn contextual_card(&mut self, context: &egui::Context, viewport: egui::Rect) {
+        if self.inspector_open()
+            || self.document_properties_open
+            || self.model_context_menu.is_some()
+        {
+            return;
+        }
+        let Some(subject) = self.contextual_card_subject() else {
+            return;
+        };
+        let width = 224.0;
+        // Bottom-right, not top-right: the view cube and the workspace
+        // breadcrumb own the top-right corner, and a card that lands on the
+        // cube takes away the control the user reaches for to see the face
+        // they just picked. Anchored rather than positioned because the card's
+        // height depends on what it is describing and is not known here.
+        let bottom_inset = context.content_rect().bottom() - viewport.bottom() + 46.0;
+        egui::Area::new(egui::Id::new("model_contextual_card"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -bottom_inset))
+            // Clamped into the viewport, so a tall card is pushed up rather
+            // than off the bottom of the window taking its controls with it.
+            .constrain_to(viewport.shrink(10.0))
+            .order(egui::Order::Middle)
+            .show(context, |ui| {
+                Frame::new()
+                    .fill(theme::card())
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(4)
+                    .inner_margin(Margin::symmetric(8, 7))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 3],
+                        blur: 12,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(38),
+                    })
+                    .show(ui, |ui| {
+                        // The frame's own margins sit outside this width, so
+                        // the card as drawn is `width`, not width plus padding
+                        // hanging off the edge of the window.
+                        ui.set_width(width - 16.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(subject.title())
+                                    .small()
+                                    .strong()
+                                    .color(theme::muted()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let dismiss =
+                                        ui.small_button("×").on_hover_text("Dismiss · Escape");
+                                    dismiss.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            "Dismiss contextual card",
+                                        )
+                                    });
+                                    if dismiss.clicked() {
+                                        self.clear_model_entity_selection();
+                                        self.measured_edges.clear();
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                        self.contextual_card_contents(ui, subject, viewport.height());
+                    });
+            });
+    }
+
+    fn contextual_card_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        subject: ContextualSubject,
+        viewport_height: f32,
+    ) {
+        self.controls(
+            ui,
+            ControlsScope::Contextual(subject, (viewport_height - 150.0).clamp(120.0, 460.0)),
+        );
+        if subject == ContextualSubject::Selection {
+            self.selection_command_chips(ui);
+        }
+    }
+
+    /// The commands that apply to what is selected, as chips.
+    ///
+    /// The list is `model_context_commands` — the same answer the right-click
+    /// menu gives — so a command cannot be offered in one place and missing
+    /// from the other.
+    fn selection_command_chips(&mut self, ui: &mut egui::Ui) {
+        let menu = ModelContextMenu {
+            position: egui::Pos2::ZERO,
+            target: viewport::ViewportContextTarget::Empty,
+            just_opened: false,
+        };
+        let commands = self
+            .model_context_commands(menu)
+            .into_iter()
+            .filter(|command| {
+                !matches!(
+                    command,
+                    ModelContextCommand::ZoomToFit | ModelContextCommand::ClearSelection
+                )
+            })
+            .collect::<Vec<_>>();
+        if commands.is_empty() {
+            return;
+        }
+        ui.separator();
+        let context = ui.ctx().clone();
+        ui.horizontal_wrapped(|ui| {
+            for command in commands {
+                let response = ui.small_button(command.label());
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, command.label())
+                });
+                if response.clicked() {
+                    self.run_model_context_command(command, menu, &context);
+                }
+            }
+        });
+    }
+
     fn contextual_inspector_panel(&mut self, ui: &mut egui::Ui) {
         let title = match self.workbench_mode {
             WorkbenchMode::Model => "PROPERTIES",
@@ -10659,7 +10883,7 @@ impl KernelLabApp {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Collapse inspector")
                 });
                 if response.clicked() {
-                    self.inspector_open = false;
+                    self.set_inspector_open(false);
                 }
             });
         });
@@ -10687,7 +10911,7 @@ impl KernelLabApp {
             // every model coordinate under the pointer.
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .show(ui, |ui| match self.workbench_mode {
-                WorkbenchMode::Model => self.controls(ui),
+                WorkbenchMode::Model => self.controls(ui, ControlsScope::Full),
                 WorkbenchMode::Sketch => self.sketch_inspector(ui),
             });
     }
@@ -10811,7 +11035,7 @@ impl KernelLabApp {
         // Distance fields on screen, which is confusing to use and ambiguous
         // to drive.
         if self.document_properties_open
-            || self.inspector_open
+            || self.inspector_open()
             || self.workbench_mode != WorkbenchMode::Model
             || self.sketch_extrusion_eligibility() != SketchExtrusionEligibility::Ready
             || self.pending_operation.is_some()
@@ -11542,18 +11766,72 @@ impl KernelLabApp {
             });
     }
 
-    fn controls(&mut self, ui: &mut egui::Ui) {
+    fn controls(&mut self, ui: &mut egui::Ui, scope: ControlsScope) {
+        let contextual = matches!(scope, ControlsScope::Contextual(..));
+        // In the card the section header would repeat the card's own title, so
+        // the body is drawn bare; the docked palette keeps its collapsibles
+        // because there it is one section among many.
+        // The component body consumes what it captured, so it needs a
+        // once-only twin of the same rule.
+        fn once_card<R>(
+            ui: &mut egui::Ui,
+            contextual: bool,
+            id: &'static str,
+            title: &'static str,
+            body: impl FnOnce(&mut egui::Ui) -> R,
+        ) {
+            if contextual {
+                body(ui);
+            } else {
+                collapsible_card(ui, id, title, true, body);
+            }
+        }
+        let card = |ui: &mut egui::Ui,
+                    id: &'static str,
+                    title: &'static str,
+                    body: &mut dyn FnMut(&mut egui::Ui)| {
+            if contextual {
+                body(ui);
+            } else {
+                collapsible_card(ui, id, title, true, body);
+            }
+        };
+        // The card describes the one thing it is titled after. The docked
+        // palette shows everything, which is what a palette is for.
+        let shows = |subject: ContextualSubject| match scope {
+            ControlsScope::Full => true,
+            ControlsScope::Contextual(active, _) => active == subject,
+        };
         egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .scroll_bar_visibility(
-                egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
-            )
+            // A scroll position per subject: switching what the card describes
+            // should start at the top of the new thing, not halfway down it,
+            // and a shared offset also made the scrollbar's presence depend on
+            // whatever was shown last.
+            .id_salt(match scope {
+                ControlsScope::Full => "controls_full",
+                ControlsScope::Contextual(subject, _) => subject.title(),
+            })
+            .auto_shrink([false, contextual])
+            .max_height(match scope {
+                ControlsScope::Full => f32::INFINITY,
+                ControlsScope::Contextual(_, height) => height,
+            })
+            .scroll_bar_visibility(if contextual {
+                egui::containers::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+            } else {
+                egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible
+            })
             .show(ui, |ui| {
                 ui.add_space(5.0);
-                collapsible_card(ui, "material_and_mass", "MATERIAL", true, |ui| {
-                    self.material_card(ui);
-                });
-                ui.add_space(5.0);
+                // Material and mass are facts about the document, true whether
+                // or not anything is selected, so they belong in the document
+                // dialog rather than hovering over the model forever.
+                if !contextual {
+                    collapsible_card(ui, "material_and_mass", "MATERIAL", true, |ui| {
+                        self.material_card(ui);
+                    });
+                    ui.add_space(5.0);
+                }
                 let measured_geometry = self.measured_edge_geometry();
                 let measured_face = self.measured_face_area();
                 let active_component = self.active_component_instance().map(|component| {
@@ -11571,7 +11849,8 @@ impl KernelLabApp {
                         joint,
                     )
                 });
-                if let Some((
+                if shows(ContextualSubject::Component)
+                    && let Some((
                     component_id,
                     label,
                     definition_key,
@@ -11582,7 +11861,7 @@ impl KernelLabApp {
                     joint,
                 )) = active_component
                 {
-                    collapsible_card(ui, "component_occurrence", "COMPONENT", true, |ui| {
+                    once_card(ui, contextual, "component_occurrence", "COMPONENT", |ui| {
                         status_line(
                             ui,
                             &format!("{label} · C{}", component_id.get()),
@@ -11707,11 +11986,12 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
-                if self.active_tool == ActiveTool::Measure
-                    || !measured_geometry.is_empty()
-                    || measured_face.is_some()
+                if shows(ContextualSubject::Measurement)
+                    && (self.active_tool == ActiveTool::Measure
+                        || !measured_geometry.is_empty()
+                        || measured_face.is_some())
                 {
-                    collapsible_card(ui, "edge_measurement", "MEASURE", true, |ui| {
+                    card(ui, "edge_measurement", "MEASURE", &mut |ui| {
                         status_line(
                             ui,
                             match (measured_face, measured_geometry.len()) {
@@ -11794,11 +12074,12 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
-                if self.selected_face.is_some()
-                    || self.selected_edge.is_some()
-                    || self.selected_vertex.is_some()
+                if shows(ContextualSubject::Selection)
+                    && (self.selected_face.is_some()
+                        || self.selected_edge.is_some()
+                        || self.selected_vertex.is_some())
                 {
-                    collapsible_card(ui, "selection_properties", "SELECTION", true, |ui| {
+                    card(ui, "selection_properties", "SELECTION", &mut |ui| {
                         // Name/value rows, with the sentence explaining what the
                         // selection is good for moved onto the row's hover. A
                         // professional doing this two hundred times a day wants
@@ -11852,40 +12133,29 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
-                if (self.sketch.entities().is_empty() && self.selected_face.is_some())
-                    || matches!(
-                        self.pending_operation,
-                        Some(PendingOperation::PushPullFace { .. })
-                    )
+                if shows(ContextualSubject::PendingOperation)
+                    && ((self.sketch.entities().is_empty() && self.selected_face.is_some())
+                        || matches!(
+                            self.pending_operation,
+                            Some(PendingOperation::PushPullFace { .. })
+                        ))
                 {
-                    collapsible_card(ui, "face_feature", "FACE FEATURE", true, |ui| {
+                    card(ui, "face_feature", "FACE FEATURE", &mut |ui| {
                         self.push_pull_controls(ui);
                     });
                     ui.add_space(5.0);
                 }
 
-                if !self.sketch.entities().is_empty() || self.sketch_finished {
-                    collapsible_card(ui, "sketch_feature", "SKETCH FEATURE", true, |ui| {
+                if shows(ContextualSubject::PendingOperation)
+                    && (!self.sketch.entities().is_empty() || self.sketch_finished)
+                {
+                    card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
                         self.extrusion_controls(ui);
                     });
                     ui.add_space(5.0);
                 }
 
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("NATIVE RUST ONLY")
-                            .font(FontId::proportional(10.0))
-                            .strong()
-                            .color(theme::accent()),
-                    );
-                    ui.separator();
-                    ui.label(
-                        RichText::new("60 FPS GOAL")
-                            .font(FontId::proportional(10.0))
-                            .color(theme::good()),
-                    );
-                });
-                self.compact_attempt_status(ui);
+
             });
     }
 
@@ -13481,11 +13751,9 @@ impl KernelLabApp {
                                 self.measured_edges.clear();
                             }
                             self.measured_edges.push(edge);
-                            self.show_properties_tab();
                         } else if let Some(face) = output.selected_face {
                             self.measured_edges.clear();
                             self.measured_face = Some(face);
-                            self.show_properties_tab();
                         }
                     } else if let Some(region) = output.selected_sketch_region {
                         if self.activate_committed_sketch(region.sketch_index) {
@@ -13499,7 +13767,6 @@ impl KernelLabApp {
                                     "Committed sketch region selected · choose Extrude, Add, or Cut"
                                         .to_owned(),
                                 );
-                                self.show_properties_tab();
                             }
                         }
                     } else if let Some(vertex) = output.selected_vertex
@@ -13520,7 +13787,6 @@ impl KernelLabApp {
                         let additive = ui.input(|input| input.modifiers.shift);
                         self.activate_body(index);
                         self.select_model_edge(edge, additive);
-                        self.show_properties_tab();
                     } else if let Some(selection) = output.selected_face
                         && !matches!(
                             self.pending_operation,
@@ -13951,6 +14217,26 @@ impl KernelLabApp {
                                 .color(theme::warn()),
                         );
                     }
+                });
+                // The outcome of the last transaction, and the claim the
+                // product makes about itself, are both true whether or not a
+                // palette happens to be open — so they live with the rest of
+                // the status rather than inside one. One line, not three: this
+                // chip floats over the model, and every row it grows is model
+                // the user cannot see.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("NATIVE RUST ONLY")
+                            .font(FontId::proportional(10.0))
+                            .strong()
+                            .color(theme::accent()),
+                    );
+                    ui.label(
+                        RichText::new("60 FPS GOAL")
+                            .font(FontId::proportional(10.0))
+                            .color(theme::good()),
+                    );
+                    self.compact_attempt_status(ui);
                 });
             });
     }
@@ -14462,7 +14748,7 @@ impl eframe::App for KernelLabApp {
         // Both anchor to the right edge, and letting them stack put the
         // dialog on top of the dock — the inspector's controls stayed in the
         // accessibility tree but a pointer could no longer reach them.
-        if self.inspector_open && !self.document_properties_open {
+        if self.inspector_open() && !self.document_properties_open {
             egui::Panel::right("contextual_inspector")
                 // Fixed width, deliberately not resizable. A width the content
                 // can influence lets one long diagnostic line shift the
@@ -14507,6 +14793,8 @@ impl eframe::App for KernelLabApp {
                 .show(ui, |ui| self.collapsed_browser_rail(ui));
         }
 
+        // The contextual card floats over the viewport, so it is raised after
+        // the central panel has told us where the viewport actually is.
         let central_panel = egui::CentralPanel::default()
             .frame(Frame::new().fill(theme::bg()).inner_margin(Margin::ZERO))
             .show(ui, |ui| match self.workbench_mode {
@@ -14519,6 +14807,8 @@ impl eframe::App for KernelLabApp {
                     }
                 }
             });
+
+        self.contextual_card(ui.ctx(), central_panel.response.rect);
 
         // Above `handle_shortcuts`, so the Escape that dismisses the menu is
         // read here first. The shortcut pass sees it too, but with no pending
