@@ -86,7 +86,11 @@ missing from the other. The two never show together, because two controls with
 the same name on screen is a name that identifies nothing.
 
 The operation's acceptance controls are the foot of the card, so the inputs an
-operation needs and the tick that commits it are one surface.
+operation needs and the tick that commits it are one surface. No bar exists
+solely to hold a tick and a cross: the docked palette grows the same foot, and
+the sketch workspace's Finish and Exit live there. Whichever right-hand surface
+is showing owns the controls; the floating chip is the fallback for the frames
+when none is.
 
 **The card is suppressed whenever another surface owns the screen** — the
 docked palette, the document dialog, the context menu, the Part Library — and
@@ -140,15 +144,31 @@ moves with the surface that owns the screen; the gate itself, from [ADR
 The rule these follow: a fact appears in exactly one place, and that place is
 decided by what the fact is about — the moment, the document, or the session.
 
-### The sketch workspace keeps its palette, for now
+### The sketch workspace keeps a docked palette, and this is not provisional
 
-`ACTIVE TOOL`, `LIVE DIMENSIONS` and `SELECTED FEATURE` are relevant on every
-frame while drawing, so the palette is not dead weight there. [ADR
-0027](0027-sketch-edits-commit-on-acceptance.md) showed the way out — typed
-dimensions now edit on the curve — and when the remaining sketch inputs move
-onto the canvas the same way, the sketch palette can go too. Until then the two
-workspaces hold separate visibility flags, because one flag had to be wrong for
-one of them.
+A contextual card cannot float over a sketch canvas. This was recorded as
+"until the sketch inputs move onto the canvas" and then tested by building it,
+which is how the real reason turned up: a floating panel eats the part of the
+canvas it covers, and on a drawing surface that part is not spare.
+
+Concretely, with the card in place at x 792–1028, a sketch click at (804, 408)
+landed on the card rather than the sketch, and
+`both_polygon_and_both_slot_variants_commit_atomic_closed_profiles` committed
+16 entities where it should have committed 20.
+
+The model viewport can afford a floating surface because the user points *at a
+body* in it, and a body is somewhere specific. A sketch canvas is a drawing
+surface everywhere, so the space a panel occupies has to be space the canvas
+never had. Reserving it is exactly what guarantees that the canvas you can see
+is the canvas you can draw on.
+
+So the two workspaces are deliberately different, and their difference is a
+property of what they are for rather than a stage on the way to consistency.
+They hold separate palette-visibility flags for the same reason.
+
+`ACTIVE TOOL`, `LIVE DIMENSIONS`, `SELECTED FEATURE` and `PROFILE DIAGNOSTICS`
+are relevant on every frame while drawing, so the palette is not dead weight
+there either.
 
 ### Themes are values, not constants
 
@@ -186,6 +206,10 @@ Every theme is measured, not just the one that ships active.
   occlusion, as a control that could be seen and not pressed.
 - `canonical_cuboid_snapshot` — commit stays visually stationary over the model
   region, which is what caught the status chip growing over the geometry.
+- `both_polygon_and_both_slot_variants_commit_atomic_closed_profiles` and
+  `both_arc_variants_remain_exact_open_profile_curves` — sketch clicks reach the
+  canvas. These are what refuted a floating card in the sketch workspace, by
+  counting the entities a covered canvas failed to commit.
 - `workbench_ribbon_model_tab_1280.png`, `workbench_ribbon_view_tab_1280.png`,
   `workbench_ribbon_sketch_tab_1280.png`, `workbench_ribbon_dark_theme_1280.png`
   — every tab and both themes under pixel review.

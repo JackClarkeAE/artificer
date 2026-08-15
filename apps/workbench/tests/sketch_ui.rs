@@ -533,6 +533,7 @@ fn unfocused_dimension_editor_does_not_steal_global_confirm_or_cancel() {
                 .is_some()
         );
 
+        click_button(&mut harness, "Properties");
         harness
             .get_by_role_and_label(Role::CheckBox, "Enable snapping")
             .focus();
@@ -561,6 +562,7 @@ fn tab_from_an_inspector_control_does_not_activate_a_draft_dimension() {
             .is_none()
     );
 
+    click_button(&mut harness, "Properties");
     harness
         .get_by_role_and_label(Role::CheckBox, "Enable snapping")
         .focus();

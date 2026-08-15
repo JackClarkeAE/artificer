@@ -1444,6 +1444,11 @@ enum ContextualSubject {
     Component,
     Measurement,
     Selection,
+    /// The sketch tool wants something from the user — a numeric input, or a
+    /// selection it has not been given yet.
+    SketchTool,
+    /// A committed sketch feature is selected and its recipe is editable.
+    SketchFeature,
 }
 
 impl ContextualSubject {
@@ -1453,6 +1458,11 @@ impl ContextualSubject {
             Self::Component => "COMPONENT",
             Self::Measurement => "MEASURE",
             Self::Selection => "SELECTION",
+            // The names the docked cards already had: this is the same content
+            // on a different surface, and a control that moves should not also
+            // be renamed.
+            Self::SketchTool => "ACTIVE TOOL",
+            Self::SketchFeature => "SELECTED FEATURE",
         }
     }
 }
@@ -1691,11 +1701,10 @@ pub struct KernelLabApp {
     /// Whether the floating context inspector is showing. It carries the
     /// active tool's options, so it opens with a command and stays until the
     /// user dismisses it.
-    /// Whether the docked palette is open in each workspace. Two flags, not
-    /// one: the model workspace opens without it — its facts arrive as a
-    /// contextual card over the viewport — while sketching genuinely does want
-    /// the tool inputs on screen for every frame, so the two must not share a
-    /// default and undo each other on every workspace change.
+    /// Whether the docked palette is open in each workspace. Two flags rather
+    /// than one so a preference in one workspace cannot be undone by entering
+    /// the other; both now open closed, with facts arriving as a contextual
+    /// card over the canvas.
     model_inspector_open: bool,
     sketch_inspector_open: bool,
     /// The model camera as it stood before a plane sketch reframed it, so
@@ -6142,7 +6151,6 @@ impl KernelLabApp {
         self.extrusion_distance = 4.0;
         self.feature_preview.begin_new_sketch();
         self.workbench_mode = WorkbenchMode::Sketch;
-        self.show_properties_tab();
     }
 
     fn enter_sketch_mode(&mut self) {
@@ -6219,7 +6227,6 @@ impl KernelLabApp {
             return;
         }
         self.workbench_mode = WorkbenchMode::Sketch;
-        self.show_properties_tab();
     }
 
     /// Frames the camera onto a sketch plane, the way starting a sketch on a
@@ -6266,7 +6273,6 @@ impl KernelLabApp {
         self.extrusion_mode = ExtrusionMode::NewBody;
         self.extrusion_mode_explicit = false;
         self.workbench_mode = WorkbenchMode::Sketch;
-        self.show_properties_tab();
     }
 
     fn start_face_sketch_camera_transition(&mut self, support: PlanarFaceSupport) -> bool {
@@ -6505,7 +6511,6 @@ impl KernelLabApp {
         self.extrusion_mode_explicit = false;
         self.extrusion_distance = 1.0;
         self.feature_preview.begin_new_sketch();
-        self.show_properties_tab();
     }
 
     fn enter_model_mode(&mut self) {
@@ -10723,6 +10728,13 @@ impl KernelLabApp {
     /// list. They are true whether or not anything is selected, so they live in
     /// File ▸ Document properties rather than hovering over the model forever.
     fn contextual_card_subject(&self) -> Option<ContextualSubject> {
+        // Deliberately model-only. A card that floats over a *drawing* canvas
+        // eats the part of it underneath: a sketch click at the card's
+        // position lands on the card, not the sketch. The model viewport can
+        // afford a floating surface because you point at a body in it; a
+        // sketch canvas cannot, because you draw everywhere on it. The sketch
+        // workspace keeps a docked palette, which is what guarantees the
+        // canvas you can see is the canvas you can draw on.
         if self.workbench_mode != WorkbenchMode::Model {
             return None;
         }
@@ -10930,7 +10942,7 @@ impl KernelLabApp {
         });
     }
 
-    fn contextual_inspector_panel(&mut self, ui: &mut egui::Ui) {
+    fn contextual_inspector_panel(&mut self, ui: &mut egui::Ui) -> Option<ConfirmationAction> {
         let title = match self.workbench_mode {
             WorkbenchMode::Model => "PROPERTIES",
             WorkbenchMode::Sketch => "SKETCH",
@@ -10948,14 +10960,26 @@ impl KernelLabApp {
             });
         });
         ui.separator();
+        let foot_height =
+            if self.workbench_mode == WorkbenchMode::Sketch || self.pending_operation.is_some() {
+                42.0
+            } else {
+                0.0
+            };
         // Reserve the exact contents rectangle in the parent, then render into
         // a detached clipped child. egui clamps oversized panel content after
         // layout, and without this isolation one long diagnostic line moves the
         // panel's inner edge — which shifts the viewport beside it and takes
         // every model coordinate under the pointer with it.
-        let content_rect = ui.available_rect_before_wrap();
+        let mut content_rect = ui.available_rect_before_wrap();
+        let foot_rect = egui::Rect::from_min_max(
+            egui::pos2(content_rect.left(), content_rect.bottom() - foot_height),
+            content_rect.max,
+        );
+        content_rect.max.y -= foot_height;
         let _ = ui.allocate_rect(content_rect, egui::Sense::hover());
-        let mut ui = ui.new_child(
+        let parent = ui;
+        let mut ui = parent.new_child(
             egui::UiBuilder::new()
                 .id_salt("contextual_inspector_contents")
                 .max_rect(content_rect)
@@ -10974,6 +10998,17 @@ impl KernelLabApp {
                 WorkbenchMode::Model => self.controls(ui, ControlsScope::Full),
                 WorkbenchMode::Sketch => self.sketch_inspector(ui),
             });
+        if foot_height > 0.0 {
+            let mut foot_ui = parent.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("inspector_confirmation_foot")
+                    .max_rect(foot_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            foot_ui.set_clip_rect(foot_rect);
+            return self.confirmation_slot(&mut foot_ui);
+        }
+        None
     }
 
     fn edge_finish_editor(&mut self, context: &egui::Context) {
@@ -11155,12 +11190,20 @@ impl KernelLabApp {
     }
 
     fn sketch_inspector(&mut self, ui: &mut egui::Ui) {
+        let contextual = false;
+        let shows = |_subject: ContextualSubject| true;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_bar_visibility(
                 egui::containers::scroll_area::ScrollBarVisibility::AlwaysVisible,
             )
             .show(ui, |ui| {
+                // The plane, the live dimensions, the profile status and the
+                // snapping options are all on the canvas already — in the
+                // breadcrumb, as dimension widgets, in the overlay's status
+                // line, and as ribbon commands. The palette keeps them for the
+                // reader who wants them written down.
+                if !contextual {
                 collapsible_card(ui, "sketch_plane", "SKETCH PLANE", true, |ui| {
                     ui.label(
                         RichText::new(self.sketch_support.label())
@@ -11195,7 +11238,9 @@ impl KernelLabApp {
                 });
 
                 ui.add_space(7.0);
-                collapsible_card(ui, "active_sketch_tool", "ACTIVE TOOL", true, |ui| {
+                }
+                if shows(ContextualSubject::SketchTool) {
+                scoped_card(ui, contextual, "active_sketch_tool", "ACTIVE TOOL", |ui| {
                     let descriptor = self.active_sketch_tool.descriptor();
                     ui.horizontal(|ui| {
                         let (icon_rect, _) =
@@ -11478,17 +11523,20 @@ impl KernelLabApp {
                     );
                 });
 
+                }
                 ui.add_space(7.0);
-                if matches!(
-                    self.active_sketch_tool,
-                    ToolVariant::Select | ToolVariant::Dimension
-                ) && let Some(editor) = self.sketch.selected_recipe_editor()
+                if shows(ContextualSubject::SketchFeature)
+                    && matches!(
+                        self.active_sketch_tool,
+                        ToolVariant::Select | ToolVariant::Dimension
+                    )
+                    && let Some(editor) = self.sketch.selected_recipe_editor()
                 {
-                    collapsible_card(
+                    scoped_card(
                         ui,
+                        contextual,
                         "selected_sketch_feature",
                         "SELECTED FEATURE",
-                        true,
                         |ui| {
                             ui.label(RichText::new(editor.title).color(theme::accent()).strong());
                             ui.label(
@@ -11629,6 +11677,7 @@ impl KernelLabApp {
                     ui.add_space(7.0);
                 }
 
+                if !contextual {
                 collapsible_card(ui, "live_dimensions", "LIVE DIMENSIONS", true, |ui| {
                     let readouts = self.sketch.dimension_readouts();
                     if readouts.is_empty() {
@@ -11683,7 +11732,13 @@ impl KernelLabApp {
                         );
                     }
                 });
+                }
 
+                // Whether the profile is closed, self-intersecting, or how many
+                // regions it has, is a permanent question while sketching — the
+                // canvas overlay carries the headline, and this carries the
+                // detail behind it. It is in the card for that reason, not
+                // because everything else is.
                 ui.add_space(7.0);
                 collapsible_card(
                     ui,
@@ -11793,13 +11848,14 @@ impl KernelLabApp {
                 ui.add_space(12.0);
                 ui.label(
                     RichText::new(
-                        "Strokes and typed dimensions commit as you make them; undo steps back. Finish from the rail below or the ribbon; only certified closed regions can extrude.",
+                        "Strokes and typed dimensions commit as you make them; undo steps back. Finish from the tick beneath this panel or from the ribbon; only certified closed regions can extrude.",
                     )
                     .small()
                     .color(theme::muted()),
                 );
 
                 ui.add_space(7.0);
+                if !contextual {
                 collapsible_card(ui, "snapping_view", "SNAPPING AND VIEW", true, |ui| {
                     let mut settings = self.sketch.snap_settings();
                     let mut changed = ui.checkbox(&mut settings.enabled, "Enable snapping").changed();
@@ -11823,6 +11879,7 @@ impl KernelLabApp {
                         self.frame_active_sketch();
                     }
                 });
+                }
             });
     }
 
@@ -14770,20 +14827,21 @@ impl eframe::App for KernelLabApp {
         // pending model operation floats its tick/cross over the canvas
         // instead: staging an operation must never move or resize the
         // viewport under a live drag.
-        let mut confirmation_action = if self.workbench_mode == WorkbenchMode::Sketch {
-            egui::Panel::bottom("operation_confirmation")
-                .exact_size(38.0)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(
-                    Frame::new()
-                        .fill(theme::panel())
-                        .inner_margin(Margin::symmetric(6, 3))
-                        .stroke(Stroke::new(1.0, theme::border())),
-                )
-                .show(ui, |ui| self.confirmation_slot(ui))
-                .inner
-        } else if self.pending_operation.is_some() && !self.contextual_card_visible() {
+        // No docked bar exists just to hold a tick and a cross. Completion
+        // controls — Finish and Exit while idle, the pending tick and cross
+        // while an operation is staged — are the foot of the contextual card,
+        // beside whatever the operation needs. The floating chip below is the
+        // fallback for frames where that card is suppressed.
+        // Sketching always has completion controls, whether or not there is a
+        // staged operation: Finish and Exit are the sketch's own two answers.
+        // So the fallback covers every sketch frame the card is not up for,
+        // not only the pending ones.
+        let hosts_confirmation = self.contextual_card_visible()
+            || (self.inspector_open() && !self.document_properties_open);
+        let mut confirmation_action = if (self.pending_operation.is_some()
+            || self.workbench_mode == WorkbenchMode::Sketch)
+            && !hosts_confirmation
+        {
             // The contextual card hosts these controls whenever it is on
             // screen. This floating chip is the fallback for the frames where
             // it is not — the docked palette open, the context menu up — so a
@@ -14839,7 +14897,7 @@ impl eframe::App for KernelLabApp {
         // dialog on top of the dock — the inspector's controls stayed in the
         // accessibility tree but a pointer could no longer reach them.
         if self.inspector_open() && !self.document_properties_open {
-            egui::Panel::right("contextual_inspector")
+            let panel_action = egui::Panel::right("contextual_inspector")
                 // Fixed width, deliberately not resizable. A width the content
                 // can influence lets one long diagnostic line shift the
                 // viewport beside it, which moves every model coordinate under
@@ -14853,7 +14911,11 @@ impl eframe::App for KernelLabApp {
                         .inner_margin(Margin::symmetric(6, 6))
                         .stroke(Stroke::new(1.0, theme::border())),
                 )
-                .show(ui, |ui| self.contextual_inspector_panel(ui));
+                .show(ui, |ui| self.contextual_inspector_panel(ui))
+                .inner;
+            if confirmation_action.is_none() {
+                confirmation_action = panel_action;
+            }
         }
 
         if self.shell.visibility().model_browser {
@@ -17108,6 +17170,23 @@ fn browser_text_row(ui: &mut egui::Ui, text: &str, color: Color32) {
         .truncate(),
     )
     .on_hover_text(text);
+}
+
+/// Draws a card body bare when it sits inside a contextual card that already
+/// carries the title, and as a collapsible section otherwise. Without this the
+/// card says its own name twice.
+fn scoped_card<R>(
+    ui: &mut egui::Ui,
+    contextual: bool,
+    id: &'static str,
+    title: &'static str,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    if contextual {
+        body(ui);
+    } else {
+        collapsible_card(ui, id, title, true, body);
+    }
 }
 
 fn collapsible_card<R>(
