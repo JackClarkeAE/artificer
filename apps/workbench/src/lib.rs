@@ -1449,6 +1449,10 @@ enum ContextualSubject {
     SketchTool,
     /// A committed sketch feature is selected and its recipe is editable.
     SketchFeature,
+    /// A sketch is ready to extrude, or a face is selected and can be pushed
+    /// and pulled: the operation has not been staged yet, but its controls are
+    /// what the user came for.
+    Feature,
 }
 
 impl ContextualSubject {
@@ -1463,6 +1467,7 @@ impl ContextualSubject {
             // be renamed.
             Self::SketchTool => "ACTIVE TOOL",
             Self::SketchFeature => "SELECTED FEATURE",
+            Self::Feature => "FEATURE",
         }
     }
 }
@@ -10741,6 +10746,12 @@ impl KernelLabApp {
         if self.pending_operation.is_some() {
             return Some(ContextualSubject::PendingOperation);
         }
+        // A ready sketch, or a selected face that can be pushed and pulled, is
+        // a feature waiting to happen. Its controls used to live in a separate
+        // floating window in this same slot, which the card then covered.
+        if self.extrusion_controls_wanted() || self.push_pull_controls_wanted() {
+            return Some(ContextualSubject::Feature);
+        }
         if self.active_component_instance().is_some() {
             return Some(ContextualSubject::Component);
         }
@@ -10766,6 +10777,7 @@ impl KernelLabApp {
         !self.inspector_open()
             && !self.document_properties_open
             && !self.part_library.is_open()
+            && !self.edge_finish_editor_open()
             && self.model_context_menu.is_none()
             && self.contextual_card_subject().is_some()
     }
@@ -11120,73 +11132,47 @@ impl KernelLabApp {
             });
     }
 
-    fn extrusion_feature_editor(&mut self, context: &egui::Context) {
+    /// Whether the standalone extrusion editor is on screen.
+    ///
+    /// It is a predicate rather than an inline guard because the contextual
+    /// card has to know: both take the right-hand slot, and the one drawn on
+    /// top swallows the other's clicks even though both are in the tree.
+    fn extrusion_controls_wanted(&self) -> bool {
         let active_sketch_consumed = self
             .active_sketch_index
             .and_then(|index| self.sketches.get(index))
             .is_some_and(|sketch| sketch.consumed);
-        // The inspector already carries the extrusion controls for a ready
+        // The palette already carries the extrusion controls for a ready
         // sketch. Showing this editor at the same time would put two live
         // Distance fields on screen, which is confusing to use and ambiguous
         // to drive.
-        if self.document_properties_open
-            || self.inspector_open()
-            || self.workbench_mode != WorkbenchMode::Model
-            || self.sketch_extrusion_eligibility() != SketchExtrusionEligibility::Ready
-            || self.pending_operation.is_some()
-            || active_sketch_consumed
-            || self.extruded_sketch_revision == Some(self.sketch_revision)
-        {
-            return;
-        }
-        let face_supported = self.sketch_support.body().is_some();
-        egui::Window::new("EXTRUSION")
-            .id(egui::Id::new("extrusion_feature_editor"))
-            // Command editors share the centre-right slot below the inspector.
-            // Extrude and the edge finishes cannot both be live: one requires
-            // no pending operation, the other requires one.
-            .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-18.0, 0.0))
-            .default_width(230.0)
-            .resizable(false)
-            .collapsible(true)
-            .show(context, |ui| {
-                ui.label(RichText::new("OPERATION").small().color(theme::muted()));
-                ui.horizontal(|ui| {
-                    let modes: &[_] = if face_supported {
-                        &[ExtrusionMode::Add, ExtrusionMode::Cut]
-                    } else {
-                        &[ExtrusionMode::NewBody]
-                    };
-                    for &mode in modes {
-                        if ui
-                            .add(
-                                egui::Button::new(mode.label())
-                                    .selected(self.extrusion_mode == mode)
-                                    .corner_radius(3),
-                            )
-                            .on_hover_text(format!(
-                                "{} this face sketch without changing its direction",
-                                mode.label()
-                            ))
-                            .clicked()
-                        {
-                            self.select_extrusion_mode(mode);
-                        }
-                    }
-                });
-                ui.add(
-                    egui::DragValue::new(&mut self.extrusion_distance)
-                        .speed(0.1)
-                        .range(if face_supported {
-                            -1_000.0..=1_000.0
-                        } else {
-                            0.01..=1_000.0
-                        })
-                        .max_decimals(3)
-                        .prefix("Distance ")
-                        .suffix(" mm"),
-                );
-            });
+        !self.document_properties_open
+            && !self.inspector_open()
+            && self.workbench_mode == WorkbenchMode::Model
+            && self.sketch_extrusion_eligibility() == SketchExtrusionEligibility::Ready
+            && self.pending_operation.is_none()
+            && !active_sketch_consumed
+            && self.extruded_sketch_revision != Some(self.sketch_revision)
+    }
+
+    /// Whether a selected face can host push/pull controls before anything is
+    /// staged.
+    fn push_pull_controls_wanted(&self) -> bool {
+        self.workbench_mode == WorkbenchMode::Model
+            && self.pending_operation.is_none()
+            && self.sketch.entities().is_empty()
+            && self.selected_face.is_some()
+    }
+
+    /// Whether the chamfer/fillet editor is on screen. Same slot, same reason.
+    fn edge_finish_editor_open(&self) -> bool {
+        matches!(
+            self.pending_operation,
+            Some(PendingOperation::PresetFeature {
+                preset: SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet,
+                ..
+            })
+        )
     }
 
     fn sketch_inspector(&mut self, ui: &mut egui::Ui) {
@@ -12264,7 +12250,8 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
-                if shows(ContextualSubject::PendingOperation)
+                if (shows(ContextualSubject::PendingOperation)
+                    || shows(ContextualSubject::Feature))
                     && ((self.sketch.entities().is_empty() && self.selected_face.is_some())
                         || matches!(
                             self.pending_operation,
@@ -12277,7 +12264,8 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
-                if shows(ContextualSubject::PendingOperation)
+                if (shows(ContextualSubject::PendingOperation)
+                    || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
                 {
                     card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
@@ -14970,7 +14958,6 @@ impl eframe::App for KernelLabApp {
         // other binding in the model workspace.
         self.show_model_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
-        self.extrusion_feature_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
 
         if let Some(staging_id) = self

@@ -624,7 +624,15 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
         base_attempts + 3
     );
     assert_eq!(harness.state().last_error_code(), None);
-    assert!(harness.query_by_label("EXTRUSION COMMITTED").is_some());
+    // "EXTRUSION COMMITTED" was the palette's headline for this, and the
+    // palette is no longer open by default. The workbench still reports the
+    // commit — from the status chip, which is visible whichever surface is up.
+    // The chain ends on an Add, and the chip names the mode it committed.
+    assert!(
+        harness
+            .query_by_label("Added extrusion committed")
+            .is_some()
+    );
     assert!(harness.query_by_label("Solid · valid").is_some());
 
     let history = vec![

@@ -92,6 +92,21 @@ the sketch workspace's Finish and Exit live there. Whichever right-hand surface
 is showing owns the controls; the floating chip is the fallback for the frames
 when none is.
 
+**One surface owns the right-hand slot at a time.** The workbench had grown
+three things that wanted it: the docked palette, this card, and a standalone
+`EXTRUSION` window that existed only because the palette used to be closable.
+That window carried a subset of the palette's extrusion controls in the same
+place, so with the card over it, `Auto` was reachable from nowhere and clicks
+aimed at `Cut` landed on the card — present in the accessibility tree, pressed
+by the test, and swallowed.
+
+The rule that follows: when two surfaces contend for one slot, ask first
+whether one is a subset of the other. If it is, delete it rather than
+arbitrating between them. The window is gone and the card carries the complete
+controls under a `Feature` subject — a sketch ready to extrude, or a face that
+can be pushed and pulled. Only genuinely different surfaces earn a suppression
+entry.
+
 **The card is suppressed whenever another surface owns the screen** — the
 docked palette, the document dialog, the context menu, the Part Library — and
 the confirmation controls fall back to a floating chip on those frames. This is
@@ -206,6 +221,13 @@ Every theme is measured, not just the one that ships active.
   occlusion, as a control that could be seen and not pressed.
 - `canonical_cuboid_snapshot` — commit stays visually stationary over the model
   region, which is what caught the status chip growing over the geometry.
+- `repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation` —
+  counts the solid rather than checking a button exists, which is how a covered
+  control was caught: it committed 25.25 mm³ where the chain should have given
+  24.875, because `Cut` and its distance had been clicked into a surface that
+  was underneath another one.
+- `face_operation_override_preserves_direction_and_auto_restores_sign_inference`
+  — the `Auto` override, which the standalone window never carried.
 - `both_polygon_and_both_slot_variants_commit_atomic_closed_profiles` and
   `both_arc_variants_remain_exact_open_profile_curves` — sketch clicks reach the
   canvas. These are what refuted a floating card in the sketch workspace, by
