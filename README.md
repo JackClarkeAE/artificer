@@ -25,9 +25,13 @@ Mainstream kernels approximate: surfaces meet within a tolerance, booleans heal 
 
 Prebuilt binaries are on the [releases page](https://github.com/JackClarkeAE/artificer/releases):
 
-- **Windows** (x86-64) — unzip and run `Artificer.exe`. The binary is unsigned, so SmartScreen will ask once: *More info → Run anyway*.
-- **macOS** (Apple Silicon) — unzip and open `Artificer.app`. Gatekeeper requires right-click → Open on first launch.
-- **Linux** — build from source below.
+- **Windows** (x86-64) — run the `Setup.exe`. It installs for the current user and updates itself from this page. The installer is unsigned, so SmartScreen will ask once: *More info → Run anyway*.
+- **Linux** (x86-64) — download the `.AppImage`, make it executable (`chmod +x`), and run it. It updates itself in place.
+- **macOS** (Apple Silicon) — unzip and open `Artificer.app`. Gatekeeper requires right-click → Open on first launch. This build does not update itself: macOS requires notarisation for that, which is not in place yet, so watch the releases page for new versions.
+
+Artificer checks the releases page for a new version when it starts, and never installs one without being asked. **File → About Artificer** shows what is available, downloads it, and installs it on an explicit restart.
+
+If you are running a build from before 0.3.0, upgrading to the installer is a one-time manual download — the old archives have no way to update themselves. Plain archives are published alongside the installers for this release only.
 
 ## Build from source
 
@@ -36,8 +40,11 @@ Requires stable Rust (1.95+).
 ```sh
 cargo run --release -p artificer-workbench     # launch the workbench
 cargo test --workspace --all-targets           # full test suite
-./scripts/build-standalone.sh                  # packaged app bundle
+./scripts/build-standalone.sh                  # unsigned app bundle (macOS) or executable
+./scripts/pack-release.sh                      # Velopack installer (Windows, Linux)
 ```
+
+`pack-release.sh` needs the [`vpk`](https://docs.velopack.io) CLI, a .NET global tool: install the .NET 8 SDK, then `dotnet tool install -g vpk`.
 
 ## How it fits together
 

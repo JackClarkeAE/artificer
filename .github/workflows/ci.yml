@@ -112,30 +112,69 @@ jobs:
           cargo test --package artificer-workbench $suites \
             -- --skip document_properties_units_and_interchange_snapshot
 
+  release-prepare:
+    # The release object is created once, up front, and as a draft. Three
+    # packaging jobs used to race to create the same tag on their way to
+    # uploading, which is how a release ends up half-populated in public while
+    # the slowest runner is still linking. Now they only ever upload into a
+    # release that already exists, and `release-publish` makes it visible after
+    # every asset has landed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag and the workspace version must agree
+        # Velopack keys every install on the pack version, and a release whose
+        # tag disagrees with the binary inside it cannot be reasoned about
+        # afterwards. Cheap check, permanent class of bug removed.
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
+                          found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
+          if [ "$tagged" != "$declared" ]; then
+            printf 'error: tag %s does not match the workspace version %s\n' \
+              "$GITHUB_REF_NAME" "$declared" >&2
+            exit 1
+          fi
+      - name: Open the release as a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --draft \
+                 --title "Artificer $GITHUB_REF_NAME" --generate-notes
+
   release:
-    # The releases page is the product's front door, and until now nothing
-    # published to it: the Windows job uploads a run artifact, which expires
-    # and lives behind the Actions tab. A tag now builds all three platforms
-    # and attaches them to the release itself, named as the existing assets
-    # are so the page stays consistent.
+    needs: release-prepare
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     strategy:
-      # One failing platform must not withdraw the others from a release that
-      # is already public.
+      # One failing platform must not stop the others from being built; the
+      # release stays a draft until they all land, so a partial failure is
+      # visible to a maintainer rather than to users.
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
-            platform: macos-arm64
-            archive: zip
-          - os: ubuntu-24.04
-            platform: linux-x86_64
-            archive: tar
+          # Windows and Linux ship Velopack packages: an installer and an
+          # AppImage that can update themselves from this same releases page.
           - os: windows-latest
             platform: windows-x86_64
-            archive: zip
+            packaging: velopack
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            packaging: velopack
+          # macOS ships the unsigned `.app` bundle it always has. Velopack
+          # requires notarisation there, and until the Apple Developer
+          # certificates exist that build cannot update itself — About says so
+          # rather than offering a button that would fail.
+          - os: macos-15
+            platform: macos-arm64
+            packaging: bundle
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -150,47 +189,132 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
-      - name: Release executable
-        run: cargo build --release --package artificer-workbench --bin artificer-workbench
-      - name: Package
-        # Bash on every runner, Windows included, so there is one packaging
-        # path to reason about rather than three.
+
+      # --- Velopack packages (Windows, Linux) ------------------------------
+      - uses: actions/setup-dotnet@v4
+        if: matrix.packaging == 'velopack'
+        with:
+          dotnet-version: 8.0.x
+      - name: Install the Velopack CLI
+        if: matrix.packaging == 'velopack'
         shell: bash
-        run: |
-          set -euo pipefail
-          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
-          binary="artificer-workbench"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            binary="artificer-workbench.exe"
-          fi
-          mkdir -p dist
-          cp "target/release/$binary" dist/
-          cp README.md LICENSE dist/ 2>/dev/null || cp README.md dist/
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd dist && 7z a -tzip "../$name.zip" . >/dev/null || zip -r "../$name.zip" .)
-            echo "asset=$name.zip" >> "$GITHUB_ENV"
-          else
-            tar -czf "$name.tar.gz" -C dist .
-            echo "asset=$name.tar.gz" >> "$GITHUB_ENV"
-          fi
-      - name: Attach to the release
+        # Pinned to the `velopack` crate version the workbench links against:
+        # the packaging tool and the runtime library are two halves of one
+        # format, and they are only guaranteed to agree at the same version.
+        run: dotnet tool install -g vpk --version 1.2.0
+      - name: Fetch the previous release
+        if: matrix.packaging == 'velopack'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Three jobs race to publish the same tag, so creating the release is
-          # best-effort and uploading is idempotent.
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" \
-                 --title "Artificer $GITHUB_REF_NAME" --generate-notes \
-            || true
+          mkdir -p artifacts/releases
+          # Deltas are computed against the last full package, so it has to be
+          # on disk before packing. The very first Velopack release has no
+          # predecessor, and that is not a failure — it just ships whole.
+          vpk download github \
+            --repoUrl "https://github.com/${{ github.repository }}" \
+            --token "$GH_TOKEN" \
+            --outputDir artifacts/releases \
+            || echo "no previous Velopack release found; packing a full release"
+      - name: Pack
+        if: matrix.packaging == 'velopack'
+        shell: bash
+        run: bash scripts/pack-release.sh "${GITHUB_REF_NAME#v}"
+      - name: Upload the Velopack release
+        if: matrix.packaging == 'velopack'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # `--merge` is what allows two platform jobs and the macOS bundle to
+        # share one release; without it the second uploader refuses. The
+        # channel defaults to the target OS, so `releases.win.json` and
+        # `releases.linux.json` never collide.
+        run: |
+          set -euo pipefail
+          vpk upload github \
+            --repoUrl "https://github.com/${{ github.repository }}" \
+            --token "$GH_TOKEN" \
+            --outputDir artifacts/releases \
+            --tag "$GITHUB_REF_NAME" \
+            --releaseName "Artificer $GITHUB_REF_NAME" \
+            --merge
+      - name: Attach a plain archive as well
+        if: matrix.packaging == 'velopack'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A migration aid for one release cycle. Everyone currently running
+        # Artificer has a zip or a tarball, and nothing can upgrade them into
+        # the installer automatically; they need one manual download, and it
+        # should be the same shape as the asset they already have.
+        run: |
+          set -euo pipefail
+          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/artificer-workbench.exe dist/Artificer.exe
+            cp README.md dist/
+            (cd dist && 7z a -tzip "../$name.zip" . >/dev/null)
+            asset="$name.zip"
+          else
+            cp target/release/artificer-workbench dist/Artificer
+            cp README.md dist/
+            tar -czf "$name.tar.gz" -C dist .
+            asset="$name.tar.gz"
+          fi
           gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          echo "asset=$asset" >> "$GITHUB_ENV"
+
+      # --- macOS bundle ----------------------------------------------------
+      - name: Build the macOS bundle
+        if: matrix.packaging == 'bundle'
+        shell: bash
+        # The same script a developer runs locally, so the published bundle
+        # cannot differ from the one that gets tested by hand. Until now this
+        # job shipped the bare executable while the README promised an
+        # `Artificer.app`.
+        env:
+          ARTIFICER_TARGET_DIR: target
+        run: bash scripts/build-standalone.sh
+      - name: Package and attach the macOS bundle
+        if: matrix.packaging == 'bundle'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          release_dir="artifacts/standalone/release"
+          cp README.md "$release_dir/"
+          (cd "$release_dir" && zip -qry "$GITHUB_WORKSPACE/$name.zip" Artificer.app README.md)
+          gh release upload "$GITHUB_REF_NAME" "$name.zip" --clobber
+          echo "asset=$name.zip" >> "$GITHUB_ENV"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
           path: ${{ env.asset }}
           if-no-files-found: error
+
+  release-publish:
+    # Every asset is attached, so the draft becomes the release. A failed
+    # platform leaves it as a draft instead: an installer release that is
+    # missing its feed file would leave update checks failing for everyone who
+    # installed it, which is worse than a release that lands an hour late.
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" \
+            --draft=false --latest
 
   nightly-benches:
     if: github.event_name == 'schedule'

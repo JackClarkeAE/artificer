@@ -8,6 +8,8 @@
     <string>Artificer</string>
     <key>CFBundleExecutable</key>
     <string>Artificer</string>
+    <key>CFBundleIconFile</key>
+    <string>artificer</string>
     <key>CFBundleIdentifier</key>
     <string>org.artificer.workbench</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -16,8 +18,11 @@
     <string>Artificer</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <!-- Both version keys are rewritten from the crate version by
+         scripts/build-standalone.sh; the values here are only what an
+         unbuilt template carries. -->
     <key>CFBundleShortVersionString</key>
-    <string>0.1.1</string>
+    <string>0.3.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>LSMinimumSystemVersion</key>

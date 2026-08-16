@@ -39,6 +39,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
 | [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
+| [0029](0029-velopack-installers-and-in-app-updates.md) | Velopack installers and in-app updates | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

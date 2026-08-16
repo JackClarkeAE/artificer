@@ -27,6 +27,7 @@ artificer-ui-core = { path = "../../crates/ui-core" }
 artificer-viewport = { path = "../../crates/viewport" }
 serde.workspace = true
 serde_json.workspace = true
+velopack.workspace = true
 
 [dev-dependencies]
 egui_kittest.workspace = true

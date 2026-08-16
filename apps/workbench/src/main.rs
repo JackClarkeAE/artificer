@@ -1,6 +1,13 @@
 use artificer_workbench::KernelLabApp;
 
 fn main() -> eframe::Result<()> {
+    // First, before the window, the logger, or anything that touches a file.
+    // The installer and the updater re-run this executable with their own
+    // arguments to perform install, uninstall, and post-update steps, and this
+    // call is what performs them — it can exit or restart the process, so
+    // anything above it would run at moments the user never asked for.
+    velopack::VelopackApp::build().run();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Artificer · Workbench")

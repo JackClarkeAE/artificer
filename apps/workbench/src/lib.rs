@@ -20,6 +20,7 @@ pub mod material;
 pub mod part_library;
 mod ribbon;
 pub mod shell;
+pub mod update;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -1612,6 +1613,8 @@ pub struct KernelLabApp {
     next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
     document_properties_open: bool,
+    about_open: bool,
+    updates: update::UpdateService,
     stl_export_path_text: String,
     step_export_path_text: String,
     feature_reports: Vec<(FeatureId, OperationReport)>,
@@ -1761,6 +1764,8 @@ impl Default for KernelLabApp {
             next_construction_plane_id: 1,
             selected_construction_plane: None,
             document_properties_open: false,
+            about_open: false,
+            updates: update::UpdateService::new(),
             stl_export_path_text,
             step_export_path_text,
             feature_reports: Vec::new(),
@@ -9693,6 +9698,16 @@ impl KernelLabApp {
                     self.document_properties_open = true;
                     ui.close();
                 }
+                // Version and updates: always available, never gated on a
+                // pending operation, because neither touches the document.
+                if ui
+                    .button("About Artificer")
+                    .on_hover_text("Version, and whether a newer release is available")
+                    .clicked()
+                {
+                    self.about_open = true;
+                    ui.close();
+                }
             })
             .response;
         response
@@ -9765,6 +9780,7 @@ impl KernelLabApp {
             ui.add_space(2.0);
             self.ribbon_tab_strip(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.update_header_button(ui);
                 let properties =
                     ui.add_enabled(!operation_pending, egui::Button::new("Properties"));
                 if properties.clicked() {
@@ -14728,6 +14744,7 @@ impl KernelLabApp {
 
 impl eframe::App for KernelLabApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.updates.poll(context);
         self.poll_async_sketch_extrusion_commit(context);
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
@@ -14959,6 +14976,7 @@ impl eframe::App for KernelLabApp {
         self.show_model_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
+        self.about_window(ui.ctx());
 
         if let Some(staging_id) = self
             .part_library
