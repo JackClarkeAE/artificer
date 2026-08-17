@@ -65,8 +65,15 @@ impl Scalar {
 }
 
 enum Property {
-    Scalar { name: String, kind: Scalar },
-    List { name: String, count: Scalar, item: Scalar },
+    Scalar {
+        name: String,
+        kind: Scalar,
+    },
+    List {
+        name: String,
+        count: Scalar,
+        item: Scalar,
+    },
 }
 
 struct Element {
@@ -90,7 +97,9 @@ pub fn read_ply(bytes: &[u8]) -> Result<TriangleMesh, PlyError> {
     let mut triangles = Vec::new();
     for polygon in faces {
         if polygon.len() < 3 {
-            return Err(PlyError::Malformed("face with fewer than 3 vertices".into()));
+            return Err(PlyError::Malformed(
+                "face with fewer than 3 vertices".into(),
+            ));
         }
         for i in 1..polygon.len() - 1 {
             triangles.push([polygon[0], polygon[i], polygon[i + 1]]);
@@ -339,7 +348,12 @@ mod tests {
               property list uchar int vertex_indices\n\
               end_header\n",
         );
-        for (x, y, z) in [(0.0f32, 0.0f32, 0.0f32), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)] {
+        for (x, y, z) in [
+            (0.0f32, 0.0f32, 0.0f32),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+        ] {
             bytes.extend_from_slice(&x.to_le_bytes());
             bytes.extend_from_slice(&y.to_le_bytes());
             bytes.extend_from_slice(&z.to_le_bytes());

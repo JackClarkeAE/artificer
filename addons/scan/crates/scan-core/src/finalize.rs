@@ -28,9 +28,12 @@ const ROUND_REACH: f64 = 2.5;
 /// An edge-round group must reach this area (mm^2) to become a feature.
 const ROUND_MIN_AREA: f64 = 8.0;
 const ROUND_MIN_FACES: usize = 30;
+/// The widest gap (mm, summed over both supports) a round may bridge.
+/// Twice the widest blend the discriminator will name.
+const ROUND_MAX_SPAN: f64 = 24.0;
 
 /// A short human label for notes that reference another feature.
-pub(crate) fn feature_label(surface: &SurfaceClass) -> String {
+pub fn feature_label(surface: &SurfaceClass) -> String {
     match surface {
         SurfaceClass::Plane(fit) => format!("plane z {:+.1}", fit.origin.z),
         SurfaceClass::Cylinder(fit) => format!("cylinder d {:.1}", fit.radius * 2.0),
@@ -60,11 +63,7 @@ struct LooseFace {
 /// Whether a component actually sits near a surface (mean probe distance
 /// within round reach). Unprobeable surfaces (the pattern) pass — the
 /// topology is the only evidence available there, and it suffices.
-fn component_near(
-    surface: &SurfaceClass,
-    member_loose: &[usize],
-    loose: &[LooseFace],
-) -> bool {
+fn component_near(surface: &SurfaceClass, member_loose: &[usize], loose: &[LooseFace]) -> bool {
     let mut total = 0.0;
     let mut count = 0usize;
     for &loose_index in member_loose {
@@ -79,6 +78,11 @@ fn component_near(
 pub struct FinalizeStats {
     pub claimed_faces: usize,
     pub edge_rounds: usize,
+    /// Components pulled back out of the residue as analytic surfaces.
+    pub recovered: usize,
+    /// Components with no analytic form, kept as measured geometry.
+    pub organic: usize,
+    pub organic_area: f64,
     pub residue_area: f64,
 }
 
@@ -89,12 +93,16 @@ pub fn finalize_features(
     features: &mut Vec<FeatureRecord>,
     alignment: Option<&DatumAlignment>,
     tolerance: f64,
+    noise_sigma: f64,
 ) -> FinalizeStats {
     let identity = RigidTransform::IDENTITY;
     let to_frame = alignment.map_or(&identity, |a| &a.transform);
     let mut stats = FinalizeStats {
         claimed_faces: 0,
         edge_rounds: 0,
+        recovered: 0,
+        organic: 0,
+        organic_area: 0.0,
         residue_area: 0.0,
     };
     // Implausible fits become residue input: a sphere whose centre sits far
@@ -135,6 +143,9 @@ pub fn finalize_features(
     let mut rounds: std::collections::HashMap<(usize, usize), RoundGroup> =
         std::collections::HashMap::new();
     let mut residue_faces: Vec<u32> = Vec::new();
+    // Components the residue turned out to owe an answer to.
+    let mut recovered: Vec<FeatureRecord> = Vec::new();
+    let mut organic: Vec<Vec<u32>> = Vec::new();
     // Pass 1: a face lying on a recognized surface joins it.
     let mut unresolved: Vec<usize> = Vec::new();
     for (loose_index, item) in loose.iter().enumerate() {
@@ -145,9 +156,7 @@ pub fn finalize_features(
                 continue;
             };
             let magnitude = distance.abs();
-            let align = item
-                .normal
-                .map_or(1.0, |n| n.dot(surface_normal).abs());
+            let align = item.normal.map_or(1.0, |n| n.dot(surface_normal).abs());
             if nearest.is_none_or(|(_, best, _)| magnitude < best) {
                 nearest = Some((index, magnitude, align));
             }
@@ -250,7 +259,9 @@ pub fn finalize_features(
                         {
                             let key = (a.min(b), a.max(b));
                             let entry =
-                                rounds.entry(key).or_insert((Vec::new(), 0.0, 0.0, 0.0, 0.0));
+                                rounds
+                                    .entry(key)
+                                    .or_insert((Vec::new(), 0.0, 0.0, 0.0, 0.0));
                             entry.0.push(item.face);
                             entry.1 += item.area;
                             entry.2 += item.area * (d1 + d2);
@@ -276,11 +287,75 @@ pub fn finalize_features(
                 claimed_counts[index] += member_loose.len();
                 stats.claimed_faces += member_loose.len();
             } else {
+                // Being bordered by two features is not evidence of being
+                // the round between them. Ask the component what it is
+                // before labelling it: on the test pump the whole rough
+                // cast sheet is one component, and taking the border at
+                // its word made a third of the part into a single "round"
+                // 77 mm wide.
+                let component: Vec<u32> = member_loose
+                    .iter()
+                    .map(|&index| loose[index].face)
+                    .collect();
+                let verdicts = crate::blend::decompose(
+                    mesh,
+                    &adjacency,
+                    &component,
+                    tolerance,
+                    to_frame,
+                    // Windows widen with the noise floor, anchored
+                    // at 1.0 for a quiet scan: sqrt because noise
+                    // curvature in a window r falls like 1/r^2.
+                    (10.0 * noise_sigma.sqrt()).clamp(1.0, 3.0),
+                );
+                let mut band: Vec<u32> = Vec::new();
+                for (piece, kind) in verdicts {
+                    match kind {
+                        crate::blend::Kind::Missed(surface) => {
+                            let area: f64 = piece
+                                .iter()
+                                .map(|&face| mesh.face_area(face as usize))
+                                .sum();
+                            recovered.push(FeatureRecord {
+                                id: 0,
+                                surface,
+                                face_count: piece.len(),
+                                area,
+                                faces: piece,
+                                notes: vec![format!(
+                                    "{}: it fits an analytic surface the region pass missed",
+                                    crate::report::RECOVERED_NOTE
+                                )],
+                            });
+                            stats.recovered += 1;
+                        }
+                        crate::blend::Kind::Freeform => organic.push(piece),
+                        // Only a genuine band goes on to be labelled by
+                        // the pair of features it lies between.
+                        crate::blend::Kind::Blend { .. } => band.extend(piece),
+                    }
+                }
+                if band.is_empty() {
+                    continue;
+                }
+                if ranked.len() < 2 {
+                    // A round is the material between two surfaces; a band
+                    // bordered by one feature has no pair to be the round
+                    // of, so it takes the freeform path instead.
+                    organic.push(band);
+                    continue;
+                }
                 let (first, second) = (ranked[0].0 as usize, ranked[1].0 as usize);
                 let key = (first.min(second), first.max(second));
-                let entry = rounds.entry(key).or_insert((Vec::new(), 0.0, 0.0, 0.0, 0.0));
+                let entry = rounds
+                    .entry(key)
+                    .or_insert((Vec::new(), 0.0, 0.0, 0.0, 0.0));
+                let in_band: std::collections::HashSet<u32> = band.into_iter().collect();
                 for &loose_index in &member_loose {
                     let item = &loose[loose_index];
+                    if !in_band.contains(&item.face) {
+                        continue;
+                    }
                     let d1 = features[key.0]
                         .surface
                         .probe(item.centroid)
@@ -326,6 +401,14 @@ pub fn finalize_features(
             continue;
         }
         let span = span_sum / area;
+        // A round bridges the gap between its two supports, so its span
+        // is a couple of radii. A group standing 74 mm off both of them
+        // is not the round between them however it was reached, and
+        // saying so is the whole reason this stage exists.
+        if span > ROUND_MAX_SPAN {
+            organic.push(faces);
+            continue;
+        }
         let rms = (dev_sum / area).sqrt();
         round_records.push(FeatureRecord {
             id: 0,
@@ -350,6 +433,34 @@ pub fn finalize_features(
     // Drop the emptied freeform features and collapse the residue.
     features.retain(|feature| !matches!(feature.surface, SurfaceClass::Freeform));
     features.extend(round_records);
+    features.extend(recovered);
+    // Cast and organic surface, kept whole and kept separate. It has no
+    // analytic form to fit, so the only honest thing to do is carry it as
+    // what it is — measured — rather than fold it into a residue nobody
+    // reports or a round it plainly is not.
+    for component in organic {
+        let area: f64 = component
+            .iter()
+            .map(|&face| mesh.face_area(face as usize))
+            .sum();
+        if area < ROUND_MIN_AREA {
+            residue_faces.extend(component);
+            continue;
+        }
+        stats.organic += 1;
+        stats.organic_area += area;
+        features.push(FeatureRecord {
+            id: 0,
+            surface: SurfaceClass::Freeform,
+            face_count: component.len(),
+            area,
+            faces: component,
+            notes: vec![
+                "no analytic form: cast or organic surface, carried as measured geometry"
+                    .to_owned(),
+            ],
+        });
+    }
     if !residue_faces.is_empty() {
         stats.residue_area = residue_faces
             .iter()
@@ -371,6 +482,85 @@ pub fn finalize_features(
 /// features: in profile space `(radius, z)` about the datum axis a
 /// revolved fillet is an arc and a revolved chamfer is a line, chosen by
 /// description length. Non-revolved rounds (a tooth edge) stay rounds.
+/// Area-weighted profile-space line fit: `rho = intercept + slope * z`.
+/// Returns `(slope, intercept, rms)`.
+fn profile_line(samples: &[(f64, f64, f64)]) -> Option<(f64, f64, f64)> {
+    let (mut sw, mut sz, mut sr, mut szz, mut szr) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(radial, z, area) in samples {
+        sw += area;
+        sz += area * z;
+        sr += area * radial;
+        szz += area * z * z;
+        szr += area * z * radial;
+    }
+    let denominator = sw * szz - sz * sz;
+    if sw <= 0.0 || denominator.abs() < 1e-9 {
+        return None;
+    }
+    let slope = (sw * szr - sz * sr) / denominator;
+    let intercept = (sr - slope * sz) / sw;
+    let rms = (samples
+        .iter()
+        .map(|&(radial, z, area)| {
+            let error = radial - (intercept + slope * z);
+            area * error * error
+        })
+        .sum::<f64>()
+        / sw)
+        .sqrt();
+    Some((slope, intercept, rms))
+}
+
+/// Profile-space circle fit. Returns `(rho_center, z_center, radius, rms)`.
+fn profile_arc(samples: &[(f64, f64, f64)]) -> Option<(f64, f64, f64, f64)> {
+    let profile: Vec<(f64, f64)> = samples.iter().map(|&(r, z, _)| (r, z)).collect();
+    let (rho_c, z_c, radius) = crate::fit::fit_circle_2d(&profile)?;
+    let weight: f64 = samples.iter().map(|s| s.2).sum();
+    if weight <= 0.0 {
+        return None;
+    }
+    let rms = (samples
+        .iter()
+        .map(|&(radial, z, area)| {
+            let error = (radial - rho_c).hypot(z - z_c) - radius;
+            area * error * error
+        })
+        .sum::<f64>()
+        / weight)
+        .sqrt();
+    Some((rho_c, z_c, radius, rms))
+}
+
+/// Samples within `factor` times the median absolute residual of a model.
+///
+/// An edge-round bucket is not a pure arc: the claiming pass hands it
+/// whatever lay within reach of two features, which at a corner where
+/// several rounds meet is a mix of surfaces. Fitting over all of it
+/// reports the mixture's spread — the test gear has rounds at rms 1.1 and
+/// 3.4 mm against a 0.15 mm tolerance — and the round is rejected even
+/// though most of its area is a clean arc. Trimming against the median
+/// finds that core, the same way the pattern folds do.
+fn trimmed<F>(samples: &[(f64, f64, f64)], residual: F, factor: f64) -> Vec<(f64, f64, f64)>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    let mut magnitudes: Vec<f64> = samples
+        .iter()
+        .map(|&(radial, z, _)| residual(radial, z).abs())
+        .collect();
+    if magnitudes.is_empty() {
+        return Vec::new();
+    }
+    magnitudes.sort_by(f64::total_cmp);
+    let median = magnitudes[magnitudes.len() / 2];
+    let cutoff = (factor * median).max(1e-6);
+    samples
+        .iter()
+        .copied()
+        .filter(|&(radial, z, _)| residual(radial, z).abs() <= cutoff)
+        .collect()
+}
+
 pub fn refine_rounds(
     mesh: &TriangleMesh,
     features: &mut [FeatureRecord],
@@ -401,51 +591,53 @@ pub fn refine_rounds(
         if bins.iter().filter(|b| **b).count() < 8 || samples.len() < 24 {
             continue;
         }
-        // Weighted line fit rho = a + s z.
-        let (mut sw, mut sz, mut sr, mut szz, mut szr) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        for &(radial, z, area) in &samples {
-            sw += area;
-            sz += area * z;
-            sr += area * radial;
-            szz += area * z * z;
-            szr += area * z * radial;
-        }
-        let denom = sw * szz - sz * sz;
-        let line = if denom.abs() > 1e-9 {
-            let slope = (sw * szr - sz * sr) / denom;
-            let intercept = (sr - slope * sz) / sw;
-            let rms = (samples
-                .iter()
-                .map(|&(radial, z, area)| {
-                    let e = radial - (intercept + slope * z);
-                    area * e * e
-                })
-                .sum::<f64>()
-                / sw)
-                .sqrt();
-            Some((slope, intercept, rms))
-        } else {
-            None
+        let sw: f64 = samples.iter().map(|s| s.2).sum();
+        // Each model is fitted over everything, then re-fitted over the
+        // core its own median identifies, and the better of the two is
+        // kept. A round whose bucket is pure is unaffected; one carrying
+        // a corner's worth of other surfaces is judged on the arc it
+        // actually has. At least this much of the area must survive the
+        // trim, or the bucket was never mostly a round.
+        const KEEP_FRACTION: f64 = 0.55;
+        let refit = |first: Option<(f64, f64, f64)>| -> Option<(f64, f64, f64)> {
+            let (slope, intercept, rms) = first?;
+            let core = trimmed(&samples, |radial, z| radial - (intercept + slope * z), 3.0);
+            if core.iter().map(|s| s.2).sum::<f64>() < KEEP_FRACTION * sw {
+                return Some((slope, intercept, rms));
+            }
+            match profile_line(&core) {
+                Some(better) if better.2 < rms => Some(better),
+                _ => Some((slope, intercept, rms)),
+            }
         };
-        // Arc fit in profile space.
-        let profile: Vec<(f64, f64)> = samples.iter().map(|&(radial, z, _)| (radial, z)).collect();
-        let arc = crate::fit::fit_circle_2d(&profile).map(|(rho_c, z_c, radius)| {
-            let rms = (samples
-                .iter()
-                .map(|&(radial, z, area)| {
-                    let e = (radial - rho_c).hypot(z - z_c) - radius;
-                    area * e * e
-                })
-                .sum::<f64>()
-                / sw)
-                .sqrt();
-            (rho_c, z_c, radius, rms)
-        });
+        let line = refit(profile_line(&samples));
+        let arc = {
+            let first = profile_arc(&samples);
+            match first {
+                Some((rho_c, z_c, radius, rms)) => {
+                    let core = trimmed(
+                        &samples,
+                        |radial, z| (radial - rho_c).hypot(z - z_c) - radius,
+                        3.0,
+                    );
+                    if core.iter().map(|s| s.2).sum::<f64>() < KEEP_FRACTION * sw {
+                        first
+                    } else {
+                        match profile_arc(&core) {
+                            Some(better) if better.3 < rms => Some(better),
+                            _ => first,
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
         // Description-length choice, tolerance-capped.
         let n = samples.len() as f64;
         let cost = |rms: f64, params: f64| 2.0 * n * rms.max(1e-3).ln() + params * n.ln();
-        let line_ok = line
-            .filter(|(slope, _, rms)| *rms <= 1.5 * tolerance && (0.08..=8.0).contains(&slope.abs()));
+        let line_ok = line.filter(|(slope, _, rms)| {
+            *rms <= 1.5 * tolerance && (0.08..=8.0).contains(&slope.abs())
+        });
         let arc_ok = arc.filter(|(_, _, radius, rms)| {
             *rms <= 1.5 * tolerance && *radius >= tolerance && *radius <= 8.0
         });
@@ -482,7 +674,9 @@ pub fn refine_rounds(
                     minor_radius: radius,
                     deviation: DeviationStats { rms, max_abs: rms },
                 });
-                feature.notes.push(format!("circular fillet, r {radius:.2}"));
+                feature
+                    .notes
+                    .push(format!("circular fillet, r {radius:.2}"));
                 fillets += 1;
             }
             _ => {}

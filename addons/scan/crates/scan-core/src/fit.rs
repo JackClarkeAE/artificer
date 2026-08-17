@@ -362,9 +362,11 @@ pub fn fit_revolved_blend(
             max_abs: 0.0,
         },
     };
-    let deviation = stats(profile.iter().map(|(radial, h)| {
-        (radial - major).hypot(h - height) - minor
-    }));
+    let deviation = stats(
+        profile
+            .iter()
+            .map(|(radial, h)| (radial - major).hypot(h - height) - minor),
+    );
     Some(RevolvedBlendFit { deviation, ..fit })
 }
 
@@ -520,7 +522,8 @@ mod tests {
         for i in 0..20 {
             for j in 0..20 {
                 let noise = (((i * 7 + j * 13) % 11) as f64 - 5.0) * 1e-4;
-                points.push(origin + e1 * (i as f64 * 0.5) + e2 * (j as f64 * 0.5) + normal * noise);
+                points
+                    .push(origin + e1 * (i as f64 * 0.5) + e2 * (j as f64 * 0.5) + normal * noise);
             }
         }
         let fit = fit_plane(&points, Some(normal)).unwrap();

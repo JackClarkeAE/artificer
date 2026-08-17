@@ -67,14 +67,21 @@ pub fn open_cylinder(radius: f64, height: f64, segments: usize, rings: usize) ->
 }
 
 /// Triangle fan disk in the plane through `center` with the given normal.
-pub fn disk_soup(center: Point3, normal: Vector3, radius: f64, segments: usize) -> Vec<[Point3; 3]> {
+pub fn disk_soup(
+    center: Point3,
+    normal: Vector3,
+    radius: f64,
+    segments: usize,
+) -> Vec<[Point3; 3]> {
     let unit = normalize(normal).expect("disk normal must be nonzero");
     let (e1, e2) = orthonormal_basis(unit);
     let rim = |s: usize| {
         let angle = std::f64::consts::TAU * s as f64 / segments as f64;
         center + e1 * (radius * angle.cos()) + e2 * (radius * angle.sin())
     };
-    (0..segments).map(|s| [center, rim(s), rim(s + 1)]).collect()
+    (0..segments)
+        .map(|s| [center, rim(s), rim(s + 1)])
+        .collect()
 }
 
 /// Axis-aligned box with each face subdivided so segmentation sees
@@ -88,11 +95,11 @@ pub fn box_soup(min: Point3, size: Vector3, subdivisions: usize) -> Vec<[Point3;
     let max = min + size;
     // (origin, u edge, v edge) per face, chosen so u x v points outward.
     let faces = [
-        (min, y, x),                      // bottom (-Z)
+        (min, y, x),                              // bottom (-Z)
         (Point3::new(min.x, min.y, max.z), x, y), // top (+Z)
-        (min, x, z),                      // front (-Y)
+        (min, x, z),                              // front (-Y)
         (Point3::new(min.x, max.y, min.z), z, x), // back (+Y)
-        (min, z, y),                      // left (-X)
+        (min, z, y),                              // left (-X)
         (Point3::new(max.x, min.y, min.z), y, z), // right (+X)
     ];
     for (origin, u, v) in faces {
@@ -214,11 +221,7 @@ pub fn sphere_patch_samples(
         let phi = std::f64::consts::PI * i as f64 / stacks as f64;
         for j in 0..slices {
             let theta = std::f64::consts::TAU * j as f64 / slices as f64;
-            let normal = Vector3::new(
-                phi.sin() * theta.cos(),
-                phi.sin() * theta.sin(),
-                phi.cos(),
-            );
+            let normal = Vector3::new(phi.sin() * theta.cos(), phi.sin() * theta.sin(), phi.cos());
             points.push(center + normal * radius);
             normals.push((normal, 1.0));
         }
@@ -282,10 +285,7 @@ pub fn cone_patch_samples(
 
 /// Revolves an open profile polyline `(radial distance, z)` fully about
 /// +Z, outward winding.
-pub fn revolved_profile_soup(
-    profile: &[(f64, f64)],
-    segments: usize,
-) -> Vec<[Point3; 3]> {
+pub fn revolved_profile_soup(profile: &[(f64, f64)], segments: usize) -> Vec<[Point3; 3]> {
     let mut soup = Vec::new();
     let point = |s: usize, p: (f64, f64)| {
         let angle = std::f64::consts::TAU * s as f64 / segments as f64;

@@ -149,11 +149,7 @@ pub fn refine_least_squares(
                 lambda *= 10.0;
                 continue;
             };
-            let trial: Vec<f64> = params
-                .iter()
-                .zip(&delta)
-                .map(|(p, d)| p + d)
-                .collect();
+            let trial: Vec<f64> = params.iter().zip(&delta).map(|(p, d)| p + d).collect();
             let trial_res = residuals(&trial);
             let trial_ss: f64 = trial_res.iter().map(|r| r * r).sum();
             if trial_ss.is_finite() && trial_ss < current_ss {

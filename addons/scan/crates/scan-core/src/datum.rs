@@ -81,20 +81,75 @@ fn feature_direction(surface: &SurfaceClass) -> Option<Vector3> {
 
 /// Derives a datum frame from classified features. Returns `None` when no
 /// analytic feature offers a usable direction.
+/// A direction the part could be datumed on, with the area backing it.
+///
+/// The automatic choice takes the heaviest, which is right on most parts
+/// and wrong on some: a part with a large face and a functionally
+/// important small bore is datumed by a machinist on the bore. The
+/// commercial packages settle this by asking, so the candidates are
+/// published rather than silently collapsed to one.
+#[derive(Clone, Copy, Debug)]
+pub struct DatumCandidate {
+    pub direction: Vector3,
+    /// Feature area supporting this direction (mm²).
+    pub weight: f64,
+}
+
+/// The datum directions a part offers, heaviest first.
+pub fn datum_candidates(features: &[FeatureRecord]) -> Vec<DatumCandidate> {
+    cluster_directions(
+        features
+            .iter()
+            .filter_map(|f| feature_direction(&f.surface).map(|direction| (direction, f.area))),
+    )
+    .into_iter()
+    .map(|cluster| DatumCandidate {
+        direction: cluster.representative,
+        weight: cluster.weight,
+    })
+    .collect()
+}
+
 pub fn auto_datum_alignment(features: &[FeatureRecord]) -> Option<DatumAlignment> {
-    let clusters = cluster_directions(features.iter().filter_map(|f| {
-        feature_direction(&f.surface).map(|direction| (direction, f.area))
-    }));
-    let primary = clusters.first()?;
+    datum_alignment_on(features, 0)
+}
+
+/// Builds the datum frame on the `choice`-th ranked candidate direction.
+///
+/// Choosing a different primary is not a cosmetic re-labelling: every
+/// stage downstream — the revolved profile, band extraction, patterns —
+/// asks whether a surface is "about the datum axis", so this is the one
+/// decision that changes what the pipeline is able to recognize at all.
+pub fn datum_alignment_on(features: &[FeatureRecord], choice: usize) -> Option<DatumAlignment> {
+    let clusters = cluster_directions(
+        features
+            .iter()
+            .filter_map(|f| feature_direction(&f.surface).map(|direction| (direction, f.area))),
+    );
+    if choice >= clusters.len() {
+        return None;
+    }
+    let primary = &clusters[choice];
     let z = primary.representative;
     let mut notes = vec![format!(
-        "primary datum Z from {:.0} mm^2 of aligned features, direction ({:+.3} {:+.3} {:+.3})",
-        primary.weight, z.x, z.y, z.z
+        "primary datum Z from {:.0} mm^2 of aligned features, direction ({:+.3} {:+.3} {:+.3}){}",
+        primary.weight,
+        z.x,
+        z.y,
+        z.z,
+        if choice == 0 {
+            String::new()
+        } else {
+            format!(" (candidate {choice}, chosen over the heaviest)")
+        }
     )];
     // Secondary: heaviest cluster roughly perpendicular to Z.
     let max_dot = PERPENDICULAR_SLACK_DEG.to_radians().sin();
-    let x_hint = match clusters[1..]
+    let x_hint = match clusters
         .iter()
+        .enumerate()
+        .filter(|&(index, _)| index != choice)
+        .map(|(_, cluster)| cluster)
         .find(|c| c.representative.dot(z).abs() <= max_dot)
     {
         Some(secondary) => {
@@ -147,9 +202,7 @@ pub fn auto_datum_alignment(features: &[FeatureRecord]) -> Option<DatumAlignment
     let level_plane = features
         .iter()
         .filter_map(|f| match &f.surface {
-            SurfaceClass::Plane(fit) if fit.normal.dot(z).abs() >= cos_near => {
-                Some((f.area, fit))
-            }
+            SurfaceClass::Plane(fit) if fit.normal.dot(z).abs() >= cos_near => Some((f.area, fit)),
             _ => None,
         })
         .max_by(|a, b| a.0.total_cmp(&b.0));
@@ -162,7 +215,9 @@ pub fn auto_datum_alignment(features: &[FeatureRecord]) -> Option<DatumAlignment
             lateral_point + z * height
         }
         None => {
-            notes.push(format!("origin: {lateral_label} (no perpendicular plane found)"));
+            notes.push(format!(
+                "origin: {lateral_label} (no perpendicular plane found)"
+            ));
             lateral_point
         }
     };

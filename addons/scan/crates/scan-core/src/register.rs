@@ -150,9 +150,7 @@ pub fn best_fit_align(
     let mut transform = if params.prealign {
         pca_prealign(source.positions(), &target_points, &tree)
     } else {
-        RigidTransform::from_translation(
-            centroid(&target_points) - centroid(source.positions()),
-        )
+        RigidTransform::from_translation(centroid(&target_points) - centroid(source.positions()))
     };
     let mut rms = f64::INFINITY;
     let mut inlier_fraction = 0.0;
@@ -258,7 +256,9 @@ mod tests {
     fn icp_recovers_a_known_pose() {
         let pose = RigidTransform::from_axis_angle(Vector3::new(0.3, 1.0, 0.2), 0.35)
             .unwrap()
-            .then(&RigidTransform::from_translation(Vector3::new(7.0, -4.0, 2.5)));
+            .then(&RigidTransform::from_translation(Vector3::new(
+                7.0, -4.0, 2.5,
+            )));
         // A plate breaks the cylinder's rotational symmetry and a top cap
         // supplies axial normals, so the pose is fully constrained.
         let mut soup = synth::open_cylinder_soup(12.0, 40.0, 96, 24);
@@ -292,8 +292,12 @@ mod tests {
     #[test]
     fn datum_alignment_levels_a_tilted_plane() {
         let normal = Vector3::new(0.1, 0.2, 0.97);
-        let t = datum_alignment(Point3::new(3.0, 1.0, 2.0), normal, Vector3::new(1.0, 0.0, 0.0))
-            .unwrap();
+        let t = datum_alignment(
+            Point3::new(3.0, 1.0, 2.0),
+            normal,
+            Vector3::new(1.0, 0.0, 0.0),
+        )
+        .unwrap();
         let mapped = t.apply_vector(normal);
         assert!(mapped.x.abs() < 1e-12 && mapped.y.abs() < 1e-12 && mapped.z > 0.0);
     }

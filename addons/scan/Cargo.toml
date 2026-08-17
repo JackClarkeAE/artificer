@@ -2,7 +2,7 @@
 # workspace so scan tooling builds without touching the main tree's
 # lockfile or target directory.
 [workspace]
-members = ["crates/scan-core", "apps/scan-cli"]
+members = ["crates/scan-core", "apps/scan-cli", "apps/scan-lab"]
 resolver = "3"
 
 [workspace.package]

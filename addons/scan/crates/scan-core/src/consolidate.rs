@@ -82,6 +82,7 @@ pub fn consolidate_features(
     mesh: &TriangleMesh,
     features: &mut Vec<FeatureRecord>,
     tolerance: f64,
+    alignment: Option<&DatumAlignment>,
 ) -> ConsolidateOutcome {
     let adjacency = mesh.face_adjacency();
     let mut outcome = ConsolidateOutcome {
@@ -163,7 +164,15 @@ pub fn consolidate_features(
             let Some(refit) = refit_like(mesh, &union_faces, &features[a].surface) else {
                 continue;
             };
-            let Some(union_rms) = refit.rms() else { continue };
+            // refit_like fits raw mesh points; after the datum stage every
+            // stored surface is datum-frame, so the union must follow.
+            let refit = match alignment {
+                Some(alignment) => refit.transformed(&alignment.transform),
+                None => refit,
+            };
+            let Some(union_rms) = refit.rms() else {
+                continue;
+            };
             if union_rms > MERGE_RMS_CAP * tolerance {
                 continue;
             }
@@ -201,6 +210,10 @@ pub fn consolidate_features(
                 let mut leftovers = Vec::new();
                 for face in round_faces {
                     let centroid = mesh.face_centroid(face as usize);
+                    let centroid = match alignment {
+                        Some(alignment) => alignment.transform.apply_point(centroid),
+                        None => centroid,
+                    };
                     let fits = features[a]
                         .surface
                         .probe(centroid)
@@ -258,6 +271,230 @@ pub fn consolidate_features(
     outcome
 }
 
+/// Rung 2.5: non-adjacent same-surface unification. RANSAC peeling and
+/// band stitching can leave one interrupted surface of revolution as
+/// several azimuthal arcs whose per-arc fits drift apart (an 8.5, a 9.5
+/// and a 10.5 degree cone tiling one taper); the arcs never share a mesh
+/// edge, so adjacency-driven consolidation cannot see the pair. Here the
+/// candidate screen is geometric — axis-true revolved features (or level
+/// planes) whose (z, radius) bands overlap — and the decision is the
+/// usual one: the union refit meets tolerance, stays axis-true, and
+/// costs less to describe than two parameter sets.
+pub fn unify_coaxial_families(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    tolerance: f64,
+) -> usize {
+    const SLACK: f64 = 0.5;
+    let mut merges = 0;
+    'passes: loop {
+        struct Band {
+            index: usize,
+            kind: u8,
+            z0: f64,
+            z1: f64,
+            r0: f64,
+            r1: f64,
+        }
+        let mut bands: Vec<Band> = Vec::new();
+        for (index, feature) in features.iter().enumerate() {
+            let (z0, z1, r0, r1) = crate::reconstruct::extents(mesh, &feature.faces, alignment);
+            let kind = match &feature.surface {
+                SurfaceClass::Cylinder(fit)
+                    if fit.axis.z.abs() > 0.999
+                        && fit.axis_point.x.hypot(fit.axis_point.y) < 3.0 =>
+                {
+                    0u8
+                }
+                SurfaceClass::Cone(fit)
+                    if fit.axis.z.abs() > 0.999
+                        && crate::reconstruct::cone_axis_offset(fit, (z0 + z1) / 2.0) < 3.0 =>
+                {
+                    1
+                }
+                SurfaceClass::Plane(fit) if fit.normal.z.abs() > 0.999 => 2,
+                _ => continue,
+            };
+            bands.push(Band {
+                index,
+                kind,
+                z0,
+                z1,
+                r0,
+                r1,
+            });
+        }
+        let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
+        for i in 0..bands.len() {
+            for j in i + 1..bands.len() {
+                let (a, b) = (&bands[i], &bands[j]);
+                if a.kind != b.kind {
+                    continue;
+                }
+                let z_overlap = a.z0.max(b.z0) <= a.z1.min(b.z1) + SLACK;
+                let r_overlap = a.r0.max(b.r0) <= a.r1.min(b.r1) + SLACK;
+                if z_overlap && r_overlap {
+                    pairs.push((
+                        a.index,
+                        b.index,
+                        features[a.index].area + features[b.index].area,
+                    ));
+                }
+            }
+        }
+        pairs.sort_by(|x, y| y.2.total_cmp(&x.2));
+        for (a, b, _) in pairs {
+            let mut union_faces = features[a].faces.clone();
+            union_faces.extend(&features[b].faces);
+            // Arcs of one interrupted surface under-constrain a free fit
+            // (a cone fit over two same-side arcs happily tilts), so the
+            // union is judged axis-locked, in profile space: a cylinder
+            // is a constant radius, a cone a line rho(z), a level plane a
+            // constant z — the same reading the band extractor uses.
+            let mut sw = 0.0;
+            let (mut sz, mut sr, mut szz, mut szr) = (0.0, 0.0, 0.0, 0.0);
+            for &face in &union_faces {
+                let c = alignment
+                    .transform
+                    .apply_point(mesh.face_centroid(face as usize));
+                let w = mesh.face_area(face as usize);
+                let radial = c.x.hypot(c.y);
+                sw += w;
+                sz += w * c.z;
+                sr += w * radial;
+                szz += w * c.z * c.z;
+                szr += w * c.z * radial;
+            }
+            if sw <= 0.0 {
+                continue;
+            }
+            let template = if features[a].area >= features[b].area {
+                features[a].surface.clone()
+            } else {
+                features[b].surface.clone()
+            };
+            let mut squared = 0.0;
+            let mut max_abs = 0.0f64;
+            let mut residual = |value: f64, reference: f64, w: f64| {
+                let r = value - reference;
+                squared += w * r * r;
+                max_abs = max_abs.max(r.abs());
+            };
+            let refit = match &template {
+                SurfaceClass::Cylinder(fit) => {
+                    let radius = sr / sw;
+                    for &face in &union_faces {
+                        let c = alignment
+                            .transform
+                            .apply_point(mesh.face_centroid(face as usize));
+                        residual(c.x.hypot(c.y), radius, mesh.face_area(face as usize));
+                    }
+                    let mut fit = *fit;
+                    fit.axis_point = Point3::new(0.0, 0.0, sz / sw);
+                    fit.axis = artificer_geometry::Vector3::new(0.0, 0.0, 1.0);
+                    fit.radius = radius;
+                    fit.deviation = DeviationStats {
+                        rms: (squared / sw).sqrt(),
+                        max_abs,
+                    };
+                    SurfaceClass::Cylinder(fit)
+                }
+                SurfaceClass::Cone(fit) => {
+                    let denom = sw * szz - sz * sz;
+                    if denom.abs() < 1e-9 {
+                        continue;
+                    }
+                    let slope = (sw * szr - sz * sr) / denom;
+                    let intercept = (sr - slope * sz) / sw;
+                    if !(0.02..=12.0).contains(&slope.abs()) {
+                        continue;
+                    }
+                    for &face in &union_faces {
+                        let c = alignment
+                            .transform
+                            .apply_point(mesh.face_centroid(face as usize));
+                        residual(
+                            c.x.hypot(c.y),
+                            intercept + slope * c.z,
+                            mesh.face_area(face as usize),
+                        );
+                    }
+                    let mut fit = *fit;
+                    fit.apex = Point3::new(0.0, 0.0, -intercept / slope);
+                    fit.axis = artificer_geometry::Vector3::new(0.0, 0.0, slope.signum());
+                    fit.half_angle = slope.abs().atan();
+                    fit.deviation = DeviationStats {
+                        rms: (squared / sw).sqrt(),
+                        max_abs,
+                    };
+                    SurfaceClass::Cone(fit)
+                }
+                SurfaceClass::Plane(fit) => {
+                    let level = sz / sw;
+                    for &face in &union_faces {
+                        let c = alignment
+                            .transform
+                            .apply_point(mesh.face_centroid(face as usize));
+                        residual(c.z, level, mesh.face_area(face as usize));
+                    }
+                    let mut fit = *fit;
+                    fit.origin = Point3::new(0.0, 0.0, level);
+                    fit.normal = artificer_geometry::Vector3::new(0.0, 0.0, fit.normal.z.signum());
+                    fit.deviation = DeviationStats {
+                        rms: (squared / sw).sqrt(),
+                        max_abs,
+                    };
+                    SurfaceClass::Plane(fit)
+                }
+                _ => continue,
+            };
+            let Some(union_rms) = refit.rms() else {
+                continue;
+            };
+            if union_rms > MERGE_RMS_CAP * tolerance {
+                continue;
+            }
+            let cost_two = description_cost(
+                features[a].face_count,
+                features[a].surface.rms().unwrap_or(tolerance),
+                parameter_count(&features[a].surface),
+            ) + description_cost(
+                features[b].face_count,
+                features[b].surface.rms().unwrap_or(tolerance),
+                parameter_count(&features[b].surface),
+            );
+            let cost_one = description_cost(
+                features[a].face_count + features[b].face_count,
+                union_rms,
+                parameter_count(&refit),
+            );
+            if cost_one > cost_two {
+                continue;
+            }
+            let absorbed_label = crate::finalize::feature_label(&features[b].surface);
+            let b_faces = std::mem::take(&mut features[b].faces);
+            features[a].faces.extend(b_faces);
+            features[a].surface = refit;
+            features[a].notes.push(format!(
+                "coaxial family unified with {absorbed_label} (union rms {union_rms:.3})"
+            ));
+            let merged = &mut features[a];
+            merged.face_count = merged.faces.len();
+            merged.area = merged
+                .faces
+                .iter()
+                .map(|&face| mesh.face_area(face as usize))
+                .sum();
+            features.retain(|feature| !feature.faces.is_empty());
+            merges += 1;
+            continue 'passes;
+        }
+        break;
+    }
+    merges
+}
+
 /// Rung 3: the joint solve. Coaxial features share one axis solved over
 /// all their sample points simultaneously; level planes share the datum
 /// direction; equal radii unify. Returns the shared-parameter entities
@@ -279,7 +516,17 @@ pub fn solve_shared_parameters(
                 fit.axis.z.abs() > 0.999 && fit.axis_point.x.hypot(fit.axis_point.y) < 2.0
             }
             SurfaceClass::Cone(fit) => {
-                fit.axis.z.abs() > 0.999 && fit.apex.x.hypot(fit.apex.y) < 2.0
+                let faces = &features[index].faces;
+                let z_mid = if faces.is_empty() {
+                    fit.apex.z
+                } else {
+                    faces
+                        .iter()
+                        .map(|&f| to_frame.apply_point(mesh.face_centroid(f as usize)).z)
+                        .sum::<f64>()
+                        / faces.len() as f64
+                };
+                fit.axis.z.abs() > 0.999 && crate::reconstruct::cone_axis_offset(fit, z_mid) < 2.0
             }
             SurfaceClass::Blend(fit) => {
                 fit.axis.z.abs() > 0.999 && fit.axis_point.x.hypot(fit.axis_point.y) < 2.0
@@ -351,10 +598,7 @@ pub fn solve_shared_parameters(
         // Refresh cylinder radii and deviations against the shared axis.
         for (&index, group) in cylinder_members.iter().zip(&groups) {
             if let SurfaceClass::Cylinder(fit) = &mut features[index].surface {
-                let radii: Vec<f64> = group
-                    .iter()
-                    .map(|(x, y)| (x - x0).hypot(y - y0))
-                    .collect();
+                let radii: Vec<f64> = group.iter().map(|(x, y)| (x - x0).hypot(y - y0)).collect();
                 let mean = radii.iter().sum::<f64>() / radii.len().max(1) as f64;
                 let rms = (radii.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>()
                     / radii.len().max(1) as f64)
@@ -424,8 +668,8 @@ pub fn solve_shared_parameters(
 mod tests {
     use super::*;
     use crate::fit::{CylinderFit, EdgeRoundFit};
-    use artificer_geometry::Vector3;
     use crate::synth;
+    use artificer_geometry::Vector3;
 
     fn cylinder_feature(
         mesh: &TriangleMesh,
@@ -486,7 +730,7 @@ mod tests {
                 notes: Vec::new(),
             },
         ];
-        let outcome = consolidate_features(&mesh, &mut features, 0.05);
+        let outcome = consolidate_features(&mesh, &mut features, 0.05, None);
         assert!(outcome.merges >= 1, "no merge happened");
         assert_eq!(outcome.rounds_dissolved, 1);
         let cylinders = features
@@ -522,7 +766,7 @@ mod tests {
             cylinder_feature(&mesh, lower, Point3::new(0.0, 0.0, 0.0), 10.0, 0.01),
             cylinder_feature(&mesh, upper, Point3::new(0.0, 0.0, 15.0), 10.8, 0.01),
         ];
-        let outcome = consolidate_features(&mesh, &mut features, 0.05);
+        let outcome = consolidate_features(&mesh, &mut features, 0.05, None);
         assert_eq!(outcome.merges, 0, "distinct radii were wrongly merged");
         assert_eq!(features.len(), 2);
     }

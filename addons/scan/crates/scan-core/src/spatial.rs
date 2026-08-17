@@ -187,6 +187,10 @@ mod tests {
 
     #[test]
     fn empty_tree_returns_none() {
-        assert!(KdTree3::build(Vec::new()).nearest(Point3::default()).is_none());
+        assert!(
+            KdTree3::build(Vec::new())
+                .nearest(Point3::default())
+                .is_none()
+        );
     }
 }

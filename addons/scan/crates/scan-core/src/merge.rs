@@ -33,8 +33,7 @@ const SPHERE_CENTER_TOL: f64 = 1.5;
 fn compatible(a: &SurfaceClass, b: &SurfaceClass) -> bool {
     match (a, b) {
         (SurfaceClass::Cylinder(x), SurfaceClass::Cylinder(y)) => {
-            let parallel =
-                x.axis.dot(y.axis).abs() >= AXIS_ANGLE_TOL_DEG.to_radians().cos();
+            let parallel = x.axis.dot(y.axis).abs() >= AXIS_ANGLE_TOL_DEG.to_radians().cos();
             let separation = (y.axis_point - x.axis_point).cross(x.axis).length();
             let radius_tol = RADIUS_TOL_MIN.max(RADIUS_TOL_FRACTION * x.radius);
             parallel
@@ -50,8 +49,7 @@ fn compatible(a: &SurfaceClass, b: &SurfaceClass) -> bool {
         }
         (SurfaceClass::Sphere(x), SurfaceClass::Sphere(y)) => {
             (y.center - x.center).length() <= SPHERE_CENTER_TOL
-                && (x.radius - y.radius).abs()
-                    <= RADIUS_TOL_MIN.max(RADIUS_TOL_FRACTION * x.radius)
+                && (x.radius - y.radius).abs() <= RADIUS_TOL_MIN.max(RADIUS_TOL_FRACTION * x.radius)
         }
         _ => false,
     }
@@ -316,19 +314,29 @@ mod tests {
                 }
             })
             .collect();
-        assert!(features
-            .iter()
-            .all(|f| matches!(f.surface, SurfaceClass::Cylinder(_))));
+        assert!(
+            features
+                .iter()
+                .all(|f| matches!(f.surface, SurfaceClass::Cylinder(_)))
+        );
         let area_before: f64 = features.iter().map(|f| f.area).sum();
         let merged = merge_fragments(&mesh, features, 0.05);
         let area_after: f64 = merged.iter().map(|f| f.area).sum();
-        assert!((area_before - area_after).abs() < 1e-6, "area not conserved");
+        assert!(
+            (area_before - area_after).abs() < 1e-6,
+            "area not conserved"
+        );
         assert_eq!(merged.len(), 1, "halves did not merge");
         let SurfaceClass::Cylinder(fit) = &merged[0].surface else {
             panic!("merged feature is not a cylinder");
         };
         assert!((fit.radius - 9.0).abs() < 0.01);
-        assert!(merged[0].notes.iter().any(|n| n.contains("merged 1 fragment")));
+        assert!(
+            merged[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("merged 1 fragment"))
+        );
     }
 
     #[test]
@@ -475,7 +483,10 @@ mod tests {
         let area_before: f64 = features.iter().map(|f| f.area).sum();
         let merged = merge_fragments(&mesh, features, 0.05);
         let area_after: f64 = merged.iter().map(|f| f.area).sum();
-        assert!((area_before - area_after).abs() < 1e-6, "area not conserved");
+        assert!(
+            (area_before - area_after).abs() < 1e-6,
+            "area not conserved"
+        );
         let cylinders_after = merged
             .iter()
             .filter(|f| matches!(f.surface, SurfaceClass::Cylinder(_)))

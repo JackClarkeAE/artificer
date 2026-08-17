@@ -54,7 +54,11 @@ impl SnapPolicy {
             if angle <= self.angle_tolerance_deg
                 && best.is_none_or(|(_, best_angle)| angle < best_angle)
             {
-                let oriented = if dot < 0.0 { datum_unit * -1.0 } else { datum_unit };
+                let oriented = if dot < 0.0 {
+                    datum_unit * -1.0
+                } else {
+                    datum_unit
+                };
                 best = Some((oriented, angle));
             }
         }
@@ -164,10 +168,7 @@ pub fn snap_surface(surface: &mut SurfaceClass, policy: &SnapPolicy) -> Vec<Stri
 /// Harmonizes families across surfaces: planes with matching normals and
 /// nearly equal offsets become exactly coplanar, and cylinders with nearly
 /// identical axes become exactly coaxial. Returns one note per surface.
-pub fn harmonize_surfaces(
-    surfaces: &mut [SurfaceClass],
-    policy: &SnapPolicy,
-) -> Vec<Vec<String>> {
+pub fn harmonize_surfaces(surfaces: &mut [SurfaceClass], policy: &SnapPolicy) -> Vec<Vec<String>> {
     let mut notes = vec![Vec::new(); surfaces.len()];
     let cos_tolerance = policy.angle_tolerance_deg.to_radians().cos();
     // Coplanar groups: same (signed) normal, offsets within tolerance.

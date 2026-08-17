@@ -4,16 +4,17 @@ use artificer_geometry::Point3;
 
 use artificer_geometry::Vector3;
 
-use crate::consolidate::{consolidate_features, solve_shared_parameters};
-use crate::datum::{DatumAlignment, auto_datum_alignment};
+use crate::consolidate::{consolidate_features, solve_shared_parameters, unify_coaxial_families};
+use crate::datum::DatumAlignment;
 use crate::finalize::{finalize_features, refine_rounds};
 use crate::merge::{absorb_into_anchors, merge_fragments};
 use crate::mesh::TriangleMesh;
 use crate::ransac::{RansacParams, extract_primitives};
 use crate::reconstruct::{
-    MasterProfile, PatternProposal, ReconstructionPlan, axis_lock_refit,
-    detect_circular_pattern, extract_revolved_bands, plan_summary, plan_to_history_json,
-    recognize_blends, recognize_pattern_feature, reconstruct,
+    MasterProfile, PatternProposal, ReconstructionPlan, axis_lock_refit, detect_circular_pattern,
+    extract_revolved_bands, lock_revolved_surfaces, plan_summary, plan_to_history_json,
+    recognize_blends, recognize_pattern_feature, recognize_ring_patterns, reconstruct,
+    split_disjoint_bands,
 };
 use crate::segment::{SegmentationParams, SurfaceClass, classify_region, segment};
 use crate::snap::{SnapPolicy, harmonize_surfaces, snap_surface};
@@ -37,8 +38,17 @@ pub struct ReverseOptions {
     /// Re-express all features in an automatically detected datum frame
     /// (dominant feature direction becomes +Z) before canonicalization.
     pub auto_datum: bool,
+    /// Which ranked datum candidate to build the frame on. `None` takes
+    /// the heaviest, which is the automatic choice.
+    pub datum_choice: Option<usize>,
     /// Canonicalization policy; `None` reports raw fitted values.
     pub snap: Option<SnapPolicy>,
+    /// Raise the working tolerance to five estimated noise sigmas when
+    /// the scan is noisier than the tolerance assumes. A fixed 0.15 on
+    /// a sigma 0.07 scan starves every fit and the whole part ships as
+    /// one organic photocopy; scaling it recovered 75% analytic on the
+    /// same scan. Off restores fixed-tolerance behaviour.
+    pub adaptive_tolerance: bool,
     /// Complete the decomposition: claim on-surface faces, recognize edge
     /// rounds between features, collapse the rest into one residue record.
     pub finalize: bool,
@@ -55,10 +65,12 @@ impl Default for ReverseOptions {
         Self {
             tolerance: 0.05,
             segmentation: SegmentationParams::default(),
+            adaptive_tolerance: true,
             ransac: Some(RansacParams::default()),
             merge_fragments: true,
             min_feature_area: 25.0,
             auto_datum: true,
+            datum_choice: None,
             snap: Some(SnapPolicy::default()),
             finalize: true,
             consolidate: true,
@@ -77,6 +89,31 @@ pub struct FeatureRecord {
     pub faces: Vec<u32>,
     /// Canonicalization notes: what was snapped and by how much.
     pub notes: Vec<String>,
+}
+
+/// Opening words of the note that marks a feature the discriminator
+/// pulled back out of the unnamed residue.
+pub const RECOVERED_NOTE: &str = "recovered from the unnamed residue";
+
+/// Recovered fragments smaller than this (mm²) are summarised in the
+/// printed listing rather than named one by one.
+pub const FRAGMENT_AREA: f64 = 25.0;
+
+impl FeatureRecord {
+    /// Whether this feature came back from the residue rather than from
+    /// the region pass.
+    ///
+    /// The distinction is not cosmetic. A recovered surface is a
+    /// fragment: it earned the right to carry its own measured area and
+    /// nothing more. Treating fragments as evidence let the gear fold
+    /// thousands of them into a 120-fold ring pattern and invent
+    /// 19,903 mm² of material that was never scanned — three times the
+    /// invention the whole model had before.
+    pub fn is_recovered(&self) -> bool {
+        self.notes
+            .iter()
+            .any(|note| note.starts_with(RECOVERED_NOTE))
+    }
 }
 
 /// Feature count and classified coverage captured after one pipeline stage.
@@ -101,17 +138,53 @@ pub struct ReverseReport {
     pub datum: Option<DatumAlignment>,
     /// When auto-datum ran: the revolved-profile reconstruction plan.
     pub plan: Option<ReconstructionPlan>,
+    /// The scan's estimated noise sigma (mm), from the residual floor
+    /// of local plane fits — what the adaptive stages scaled by.
+    pub noise_sigma: f64,
+    /// The tolerance the run was performed at, so later stages (rebuild)
+    /// can reason in the same noise units rather than re-guessing.
+    pub tolerance: f64,
 }
 
 /// Segments the mesh, fits analytic surfaces, and canonicalizes the result.
 pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> ReverseReport {
+    // The scan's own noise floor, measured before anything else needs
+    // it: the discriminator widens its windows by it, and every later
+    // consumer reasons in the same units.
+    let noise_sigma = crate::noise::estimate_noise(mesh);
+    // The scan sets the floor: fits judged tighter than the noise can
+    // possibly satisfy refuse everything, and the part ships as a
+    // photocopy. RANSAC's default epsilon inherits the tolerance, so
+    // the floor reaches it too.
+    let mut effective = options.clone();
+    if std::env::var_os("ARTIFICER_NOISE_DEBUG").is_some() {
+        eprintln!(
+            "noise-debug: sigma {noise_sigma:.4} tolerance {:.3}",
+            options.tolerance
+        );
+    }
+    // Scan-sized meshes only: on a small synthetic the estimator's
+    // patches inevitably straddle features and read geometry as
+    // noise, and a clean synthetic needs no floor. Every real scan
+    // fixture is hundreds of thousands of faces.
+    if effective.adaptive_tolerance && mesh.triangles().len() >= 100_000 {
+        // Seven, not five: the estimator's edge-difference statistic
+        // under-reads sliver-refined simulations by about half (their
+        // garbage vertex normals scatter injected noise off-normal),
+        // and 7 sigma-hat empirically matches the hand-tuned optimum
+        // on the sigma 0.07 fixture (75% analytic vs 41% at five).
+        let floor = 7.0 * noise_sigma;
+        if floor > effective.tolerance {
+            effective.tolerance = floor;
+        }
+    }
+    let options = &effective;
     let regions = segment(mesh, &options.segmentation);
     let mut features: Vec<FeatureRecord> = regions
         .into_iter()
         .enumerate()
         .map(|(id, region)| {
-            let surface =
-                classify_region(mesh, &region, options.tolerance, &options.segmentation);
+            let surface = classify_region(mesh, &region, options.tolerance, &options.segmentation);
             FeatureRecord {
                 id,
                 surface,
@@ -188,7 +261,11 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         }
     }
     let merge_epsilon = options.ransac.as_ref().map_or(options.tolerance, |r| {
-        if r.epsilon > 0.0 { r.epsilon } else { options.tolerance }
+        if r.epsilon > 0.0 {
+            r.epsilon
+        } else {
+            options.tolerance
+        }
     });
     record_stage(&mut stages, "ransac-peel", &features);
     if options.merge_fragments {
@@ -196,13 +273,34 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         features = absorb_into_anchors(mesh, features, merge_epsilon);
     }
     record_stage(&mut stages, "merge+absorb", &features);
+    // Publish what the part offers before saying which was taken: the
+    // datum is the decision every later stage is expressed in, and a
+    // reader cannot judge it without seeing what else was available.
+    let candidates = crate::datum::datum_candidates(&features);
+    let mut datum_notes: Vec<String> = Vec::new();
+    if options.auto_datum && candidates.len() > 1 {
+        for (rank, candidate) in candidates.iter().take(4).enumerate() {
+            datum_notes.push(format!(
+                "datum candidate {rank}: ({:+.4} {:+.4} {:+.4}) backed by {:.0} mm^2{}",
+                candidate.direction.x,
+                candidate.direction.y,
+                candidate.direction.z,
+                candidate.weight,
+                if rank == options.datum_choice.unwrap_or(0) {
+                    "  <- chosen"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
     let datum = if options.auto_datum {
-        auto_datum_alignment(&features)
+        crate::datum::datum_alignment_on(&features, options.datum_choice.unwrap_or(0))
     } else {
         None
     };
     let mut detected_pattern: Option<PatternProposal> = None;
-    let mut master_profile: Option<MasterProfile> = None;
+    let mut master_profiles: Vec<MasterProfile> = Vec::new();
     if let Some(alignment) = &datum {
         // With a datum axis known, near-axis cylinders refit with the axis
         // locked: noisy patch axes stop wobbling, radii cluster, and a
@@ -219,11 +317,24 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         }
         recognize_blends(mesh, &mut features, alignment, options.tolerance);
         extract_revolved_bands(mesh, &mut features, alignment, options.tolerance);
+        // Only after the band extractor has had its say: it reads a
+        // tilted axis as the signature of a misfit worth dismantling and
+        // re-stitching, so locking axes any earlier hides its donors from
+        // it and leaves the fragments it would have stitched.
+        lock_revolved_surfaces(mesh, &mut features, alignment, options.tolerance);
         record_stage(&mut stages, "datum+lock+bands", &features);
         detected_pattern = detect_circular_pattern(mesh, &features, alignment);
-        if let Some(pattern) = &detected_pattern {
-            master_profile =
-                recognize_pattern_feature(mesh, &mut features, alignment, pattern, options.tolerance);
+        if let Some(pattern) = &detected_pattern
+            && let Some(mut profile) = recognize_pattern_feature(
+                mesh,
+                &mut features,
+                alignment,
+                pattern,
+                options.tolerance,
+            )
+        {
+            profile.feature_id = features.len() - 1;
+            master_profiles.push(profile);
         }
     }
     record_stage(&mut stages, "pattern", &features);
@@ -245,30 +356,46 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         feature.id = id;
     }
     if let Some(policy) = &options.snap {
-        let mut surfaces: Vec<SurfaceClass> =
-            features.iter().map(|f| f.surface.clone()).collect();
+        let mut surfaces: Vec<SurfaceClass> = features.iter().map(|f| f.surface.clone()).collect();
         for (feature, surface) in features.iter_mut().zip(surfaces.iter_mut()) {
             feature.notes.extend(snap_surface(surface, policy));
         }
         let harmonize_notes = harmonize_surfaces(&mut surfaces, policy);
-        for ((feature, surface), notes) in
-            features.iter_mut().zip(surfaces).zip(harmonize_notes)
-        {
+        for ((feature, surface), notes) in features.iter_mut().zip(surfaces).zip(harmonize_notes) {
             feature.surface = surface;
             feature.notes.extend(notes);
         }
     }
     record_stage(&mut stages, "snap+harmonize", &features);
+    // Frames are discovered mid-pipeline but reported with the other
+    // shared parameters, which are collected further down.
+    let mut frame_notes: Vec<String> = Vec::new();
+    let mut datum = datum;
+    if let Some(alignment) = datum.as_mut() {
+        let mut published = datum_notes;
+        published.append(&mut alignment.notes);
+        alignment.notes = published;
+    }
+    let mut parameters_late: Vec<String> = Vec::new();
     if options.finalize {
-        finalize_features(mesh, &mut features, datum.as_ref(), options.tolerance);
+        finalize_features(
+            mesh,
+            &mut features,
+            datum.as_ref(),
+            options.tolerance,
+            noise_sigma,
+        );
         features.sort_by(|a, b| b.area.total_cmp(&a.area));
         for (id, feature) in features.iter_mut().enumerate() {
             feature.id = id;
         }
         record_stage(&mut stages, "finalize", &features);
     }
+    // Profiles were stamped with pre-sort indices; re-stamp them against
+    // the final ids by matching each pattern feature's count and band.
+    restamp_profiles(&mut master_profiles, &features);
     if options.consolidate {
-        consolidate_features(mesh, &mut features, options.tolerance);
+        consolidate_features(mesh, &mut features, options.tolerance, datum.as_ref());
         features.sort_by(|a, b| b.area.total_cmp(&a.area));
         for (id, feature) in features.iter_mut().enumerate() {
             feature.id = id;
@@ -276,11 +403,81 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         record_stage(&mut stages, "mdl-consolidate", &features);
         refine_rounds(mesh, &mut features, datum.as_ref(), options.tolerance);
         record_stage(&mut stages, "round-refine", &features);
+        // What a designer specified is a small set of directions, not one
+        // per face. Recover them and re-solve to them — but offer, never
+        // impose: a surface joins its frame only if it still explains its
+        // own samples afterwards.
+        let constrained = crate::constrain::constrain_features(
+            mesh,
+            &mut features,
+            datum.as_ref(),
+            options.tolerance,
+        );
+        for frame in &constrained.frames {
+            frame_notes.push(format!(
+                "frame of {} surface(s), {:.0} mm^2: ({:+.4} {:+.4} {:+.4}) / ({:+.4} {:+.4} {:+.4}) /                  ({:+.4} {:+.4} {:+.4}); worst correction {:.3} deg",
+                frame.members.len(),
+                frame.area,
+                frame.axes[0].x, frame.axes[0].y, frame.axes[0].z,
+                frame.axes[1].x, frame.axes[1].y, frame.axes[1].z,
+                frame.axes[2].x, frame.axes[2].y, frame.axes[2].z,
+                frame.worst_correction
+            ));
+        }
+        if constrained.refused > 0 {
+            frame_notes.push(format!(
+                "{} surface(s) totalling {:.0} mm^2 were offered a frame and their own samples                  refused it: the part is genuinely skew there",
+                constrained.refused, constrained.refused_area
+            ));
+        }
+        record_stage(&mut stages, "constrain", &features);
+        if let Some(alignment) = datum.as_ref() {
+            // Again, now that merging has made features whole. A surface
+            // that only fits as an absurd sphere while it is scattered
+            // across fragments reads as the plain cone it is once its
+            // pieces are one feature, and the fits that matter for the
+            // rebuild are the ones that survive to this point.
+            lock_revolved_surfaces(mesh, &mut features, alignment, options.tolerance);
+            // Before unifying: a band that spans a gap in height is two
+            // surfaces, and every judgement made about it — solidity,
+            // family membership, what to emit — is wrong while it is one.
+            split_disjoint_bands(mesh, &mut features, alignment, 2.0);
+            unify_coaxial_families(mesh, &mut features, alignment, options.tolerance);
+            // A fillet sliced into concentric strips is not a failure any
+            // single fit can see — every strip is a genuinely good cone.
+            // The judgement has to be made over the chain.
+            parameters_late.extend(crate::reconstruct::unify_blend_chains(
+                mesh,
+                &mut features,
+                alignment,
+                options.tolerance,
+            ));
+            for (id, feature) in features.iter_mut().enumerate() {
+                feature.id = id;
+            }
+            record_stage(&mut stages, "coaxial-unify", &features);
+            let mut ring_profiles =
+                recognize_ring_patterns(mesh, &mut features, alignment, options.tolerance);
+            master_profiles.append(&mut ring_profiles);
+            // Folds drop consumed features and append patterns, so ids —
+            // which labels, skip notes, and the viewer all key on — must
+            // be renumbered and every profile re-stamped.
+            for (id, feature) in features.iter_mut().enumerate() {
+                feature.id = id;
+            }
+            restamp_profiles(&mut master_profiles, &features);
+            record_stage(&mut stages, "ring-patterns", &features);
+        }
     }
-    let mut parameters: Vec<String> = Vec::new();
+    let mut parameters: Vec<String> = std::mem::take(&mut frame_notes);
+    parameters.append(&mut parameters_late);
     if options.shared_parameters {
-        parameters =
-            solve_shared_parameters(mesh, &mut features, datum.as_ref(), options.tolerance);
+        parameters.extend(solve_shared_parameters(
+            mesh,
+            &mut features,
+            datum.as_ref(),
+            options.tolerance,
+        ));
         record_stage(&mut stages, "shared-parameters", &features);
     }
     let total_area: f64 = features.iter().map(|f| f.area).sum();
@@ -289,19 +486,33 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         .filter(|f| !matches!(f.surface, SurfaceClass::Freeform))
         .map(|f| f.area)
         .sum();
-    let plan = datum
-        .as_ref()
-        .map(|alignment| {
-            reconstruct(
-                mesh,
-                &features,
-                alignment,
-                options.tolerance,
-                detected_pattern,
-                master_profile.clone(),
-            )
-        });
+    let plan = datum.as_ref().map(|alignment| {
+        let mut plan = reconstruct(
+            mesh,
+            &features,
+            alignment,
+            options.tolerance,
+            detected_pattern,
+            master_profiles.clone(),
+        );
+        // The wizard layer: what several surfaces are *together*.
+        plan.instances = crate::instance::recognize_instances(
+            mesh,
+            &features,
+            Some(alignment),
+            options.tolerance,
+        );
+        // A bag of operations is not a model. Order them.
+        let organic: f64 = features
+            .iter()
+            .filter(|feature| matches!(feature.surface, SurfaceClass::Freeform))
+            .map(|feature| feature.area)
+            .sum();
+        plan.tree = crate::tree::order_tree(mesh, &features, &plan, Some(alignment), organic);
+        plan
+    });
     ReverseReport {
+        noise_sigma,
         features,
         total_area,
         classified_area,
@@ -309,6 +520,32 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         parameters,
         datum,
         plan,
+        tolerance: options.tolerance,
+    }
+}
+
+/// Points every master profile at the pattern feature carrying its fold:
+/// same repeat count, closest band midpoint. Runs again after any pass
+/// that renumbers or rewrites the feature list.
+fn restamp_profiles(
+    profiles: &mut [crate::reconstruct::MasterProfile],
+    features: &[FeatureRecord],
+) {
+    for profile in profiles {
+        let profile_mid = (profile.z_range.0 + profile.z_range.1) / 2.0;
+        let matched = features
+            .iter()
+            .filter_map(|f| match &f.surface {
+                SurfaceClass::Pattern(fit) if fit.count == profile.count => Some((
+                    f.id,
+                    ((fit.z_range.0 + fit.z_range.1) / 2.0 - profile_mid).abs(),
+                )),
+                _ => None,
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((id, _)) = matched {
+            profile.feature_id = id;
+        }
     }
 }
 
@@ -442,8 +679,8 @@ pub fn report_to_json(report: &ReverseReport) -> String {
         out.push_str("]}");
     }
     out.push_str(&format!(
-        "],\"total_area\":{:.6},\"classified_area\":{:.6}",
-        report.total_area, report.classified_area
+        "],\"total_area\":{:.6},\"classified_area\":{:.6},\"noise_sigma\":{:.6}",
+        report.total_area, report.classified_area, report.noise_sigma
     ));
     out.push_str(",\"stages\":[");
     for (index, stage) in report.stages.iter().enumerate() {
@@ -506,7 +743,20 @@ pub fn report_summary(report: &ReverseReport) -> String {
             0.0
         }
     ));
+    // Fragments recovered from the residue are listed as a group, not
+    // one by one. On the test pump 2,000 of them hold under five percent
+    // of the area between them and bury the hundred features anyone
+    // actually wants to read. They stay in the model exactly as they
+    // are — this is how the list is printed, not what is in it, and the
+    // two must not be confused: demoting them for real cost the gear a
+    // phantom 120-fold ring and seven times its triangle count.
+    let (mut fragments, mut fragment_area) = (0usize, 0.0);
     for feature in &report.features {
+        if feature.is_recovered() && feature.area < FRAGMENT_AREA {
+            fragments += 1;
+            fragment_area += feature.area;
+            continue;
+        }
         let description = match &feature.surface {
             SurfaceClass::Plane(fit) => format!(
                 "plane    normal ({:+.3} {:+.3} {:+.3}) offset {:+.3}",
@@ -566,6 +816,11 @@ pub fn report_summary(report: &ReverseReport) -> String {
             out.push_str(&format!("       - {note}\n"));
         }
     }
+    if fragments > 0 {
+        out.push_str(&format!(
+            "  ... and {fragments} recovered fragment(s) under {FRAGMENT_AREA:.0} mm^2,              {fragment_area:.0} mm^2 in total (in the model, folded here)\n"
+        ));
+    }
     if let Some(plan) = &report.plan {
         out.push_str(&plan_summary(plan));
     }
@@ -585,7 +840,9 @@ mod tests {
         // part's own frame and snap against it.
         let pose = RigidTransform::from_axis_angle(Vector3::new(1.0, 0.5, 0.0), 0.4)
             .unwrap()
-            .then(&RigidTransform::from_translation(Vector3::new(30.0, -10.0, 5.0)));
+            .then(&RigidTransform::from_translation(Vector3::new(
+                30.0, -10.0, 5.0,
+            )));
         let tilted = synth::plate_with_boss().transformed(&pose);
         let report = reverse_engineer(&tilted, &ReverseOptions::default());
         assert!(report.datum.is_some());

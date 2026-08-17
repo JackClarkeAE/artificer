@@ -123,7 +123,9 @@ fn parse_ascii(bytes: &[u8]) -> Result<Vec<[Point3; 3]>, StlError> {
         }
     }
     if !corners.is_empty() {
-        return Err(StlError::Malformed("dangling vertices at end of file".into()));
+        return Err(StlError::Malformed(
+            "dangling vertices at end of file".into(),
+        ));
     }
     Ok(soup)
 }

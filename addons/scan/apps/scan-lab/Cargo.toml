@@ -1,0 +1,24 @@
+[package]
+name = "artificer-scan-lab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "scan-lab"
+path = "src/main.rs"
+
+[dependencies]
+artificer-scan-core = { path = "../../crates/scan-core" }
+artificer-geometry = { path = "../../../../crates/geometry" }
+# Pinned to the exact version the main workspace uses so the addon
+# reuses the already-cached crates instead of resolving new ones.
+eframe = { version = "=0.35.0", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+] }
+egui = "=0.35.0"
+
+[lints]
+workspace = true

@@ -76,10 +76,24 @@ impl SplitMix64 {
 /// Candidate primitive before refinement: geometry only, no statistics.
 #[derive(Clone, Copy, Debug)]
 enum Primitive {
-    Plane { origin: Point3, normal: Vector3 },
-    Sphere { center: Point3, radius: f64 },
-    Cylinder { point: Point3, axis: Vector3, radius: f64 },
-    Cone { apex: Point3, axis: Vector3, half_angle: f64 },
+    Plane {
+        origin: Point3,
+        normal: Vector3,
+    },
+    Sphere {
+        center: Point3,
+        radius: f64,
+    },
+    Cylinder {
+        point: Point3,
+        axis: Vector3,
+        radius: f64,
+    },
+    Cone {
+        apex: Point3,
+        axis: Vector3,
+        half_angle: f64,
+    },
 }
 
 impl Primitive {
@@ -93,20 +107,32 @@ impl Primitive {
                 let len = radial.length();
                 (len > 1e-12).then(|| (len - radius, radial / len))
             }
-            Self::Cylinder { point, axis, radius } => {
+            Self::Cylinder {
+                point,
+                axis,
+                radius,
+            } => {
                 let v = p - *point;
                 let radial = v - *axis * v.dot(*axis);
                 let len = radial.length();
                 (len > 1e-12).then(|| (len - radius, radial / len))
             }
-            Self::Cone { apex, axis, half_angle } => {
+            Self::Cone {
+                apex,
+                axis,
+                half_angle,
+            } => {
                 let v = p - *apex;
                 let h = v.dot(*axis);
                 let radial = v - *axis * h;
                 let len = radial.length();
                 let (sin_a, cos_a) = half_angle.sin_cos();
-                (len > 1e-12)
-                    .then(|| (len * cos_a - h * sin_a, radial / len * cos_a - *axis * sin_a))
+                (len > 1e-12).then(|| {
+                    (
+                        len * cos_a - h * sin_a,
+                        radial / len * cos_a - *axis * sin_a,
+                    )
+                })
             }
         }
     }
@@ -175,12 +201,14 @@ fn sphere_from_two(
     if (c1 - c2).length() > scale * 0.05 {
         return None;
     }
-    let center = Point3::new((c1.x + c2.x) / 2.0, (c1.y + c2.y) / 2.0, (c1.z + c2.z) / 2.0);
+    let center = Point3::new(
+        (c1.x + c2.x) / 2.0,
+        (c1.y + c2.y) / 2.0,
+        (c1.z + c2.z) / 2.0,
+    );
     let radius = ((p1 - center).length() + (p2 - center).length()) / 2.0;
-    (radius.is_finite() && radius > 1e-6 && radius < scale * 10.0).then_some(Primitive::Sphere {
-        center,
-        radius,
-    })
+    (radius.is_finite() && radius > 1e-6 && radius < scale * 10.0)
+        .then_some(Primitive::Sphere { center, radius })
 }
 
 /// Cylinder through two oriented points: the axis is orthogonal to both
@@ -227,10 +255,7 @@ fn cylinder_from_two(
 /// Cone through three oriented points: apex from the tangent planes, axis
 /// normal to the circle the apex-to-point directions trace on the sphere.
 fn cone_from_three(samples: [(Point3, Vector3); 3], scale: f64) -> Option<Primitive> {
-    let a: Vec<Vec<f64>> = samples
-        .iter()
-        .map(|(_, n)| vec![n.x, n.y, n.z])
-        .collect();
+    let a: Vec<Vec<f64>> = samples.iter().map(|(_, n)| vec![n.x, n.y, n.z]).collect();
     let b: Vec<f64> = samples
         .iter()
         .map(|(p, n)| n.dot(*p - Point3::default()))
@@ -287,19 +312,16 @@ fn supports(
     epsilon: f64,
     min_alignment: f64,
 ) -> bool {
-    primitive.probe(centroid).is_some_and(|(distance, surface_normal)| {
-        distance.abs() <= epsilon && face_normal.dot(surface_normal).abs() >= min_alignment
-    })
+    primitive
+        .probe(centroid)
+        .is_some_and(|(distance, surface_normal)| {
+            distance.abs() <= epsilon && face_normal.dot(surface_normal).abs() >= min_alignment
+        })
 }
 
 /// Breadth-first neighbourhood of unassigned faces around a seed, for
 /// localized candidate sampling.
-fn neighbourhood(
-    seed: u32,
-    adjacency: &[Vec<u32>],
-    assigned: &[bool],
-    cap: usize,
-) -> Vec<u32> {
+fn neighbourhood(seed: u32, adjacency: &[Vec<u32>], assigned: &[bool], cap: usize) -> Vec<u32> {
     let mut out = vec![seed];
     let mut cursor = 0;
     while cursor < out.len() && out.len() < cap {
@@ -402,7 +424,11 @@ pub fn extract_primitives(
     let face_count = mesh.triangles().len();
     let data = FaceData::build(mesh);
     let scale = mesh.bounds_diagonal().max(1.0);
-    let epsilon = if params.epsilon > 0.0 { params.epsilon } else { 0.05 };
+    let epsilon = if params.epsilon > 0.0 {
+        params.epsilon
+    } else {
+        0.05
+    };
     let min_alignment = params.normal_tolerance_deg.to_radians().cos();
     let mut rng = SplitMix64(params.seed);
     let mut assigned = vec![true; face_count];
@@ -455,8 +481,13 @@ pub fn extract_primitives(
                 let Some(normal) = data.normal[face as usize] else {
                     continue;
                 };
-                if supports(&candidate, data.centroid[face as usize], normal, epsilon, min_alignment)
-                {
+                if supports(
+                    &candidate,
+                    data.centroid[face as usize],
+                    normal,
+                    epsilon,
+                    min_alignment,
+                ) {
                     score += data.area[face as usize];
                 }
             }
@@ -477,7 +508,13 @@ pub fn extract_primitives(
                 .copied()
                 .filter(|&f| {
                     data.normal[f as usize].is_some_and(|n| {
-                        supports(primitive, data.centroid[f as usize], n, epsilon, min_alignment)
+                        supports(
+                            primitive,
+                            data.centroid[f as usize],
+                            n,
+                            epsilon,
+                            min_alignment,
+                        )
                     })
                 })
                 .collect();

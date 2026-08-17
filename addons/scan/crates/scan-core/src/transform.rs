@@ -118,7 +118,13 @@ impl RigidTransform {
 
     /// Re-orthonormalizes the rotation after accumulated composition drift.
     pub fn renormalized(&self) -> Self {
-        let row = |i: usize| Vector3::new(self.rotation[i][0], self.rotation[i][1], self.rotation[i][2]);
+        let row = |i: usize| {
+            Vector3::new(
+                self.rotation[i][0],
+                self.rotation[i][1],
+                self.rotation[i][2],
+            )
+        };
         let x = normalize(row(0)).unwrap_or(Vector3::new(1.0, 0.0, 0.0));
         let mut y = row(1) - x * row(1).dot(x);
         y = normalize(y).unwrap_or(Vector3::new(0.0, 1.0, 0.0));
@@ -144,8 +150,11 @@ mod tests {
 
     #[test]
     fn axis_angle_rotates_quarter_turn() {
-        let t = RigidTransform::from_axis_angle(Vector3::new(0.0, 0.0, 1.0), std::f64::consts::FRAC_PI_2)
-            .unwrap();
+        let t = RigidTransform::from_axis_angle(
+            Vector3::new(0.0, 0.0, 1.0),
+            std::f64::consts::FRAC_PI_2,
+        )
+        .unwrap();
         let p = t.apply_point(Point3::new(1.0, 0.0, 0.0));
         assert!((p.x).abs() < 1e-12 && (p.y - 1.0).abs() < 1e-12);
     }
@@ -154,7 +163,9 @@ mod tests {
     fn inverse_round_trips() {
         let t = RigidTransform::from_axis_angle(Vector3::new(1.0, 2.0, 3.0), 0.7)
             .unwrap()
-            .then(&RigidTransform::from_translation(Vector3::new(4.0, -2.0, 9.0)));
+            .then(&RigidTransform::from_translation(Vector3::new(
+                4.0, -2.0, 9.0,
+            )));
         let p = Point3::new(0.3, -1.2, 5.5);
         let back = t.inverse().apply_point(t.apply_point(p));
         assert!((back - p).length() < 1e-12);

@@ -74,6 +74,313 @@ pub fn axis_lock_refit(
     locked
 }
 
+/// Splits revolved walls that are really two surfaces sharing one line.
+/// Returns how many features were split off.
+///
+/// The band extractor claims every candidate within tolerance of a
+/// profile-space line, and a line has no opinion about height: a hub cone
+/// running from z -8 to +4 and a separate ring 13 mm above it lie on the
+/// same line and come back as one feature. Nothing downstream then works
+/// — its measured extent spans the empty gap, so its solidity reads a
+/// fraction of a revolution and the rebuild drops the whole thing, and
+/// emitting it as one element would web material across a gap that is
+/// not there.
+///
+/// A z gap is not azimuthal interruption; it is two surfaces. Splitting
+/// them is also what the consolidation rungs already conclude about a
+/// cylinder cut by a groove — two faces, one shared parameter set.
+pub fn split_disjoint_bands(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    gap: f64,
+) -> usize {
+    const MIN_RUN_AREA: f64 = 25.0;
+    let mut produced = Vec::new();
+    let mut split = 0;
+    for feature in features.iter_mut() {
+        if !matches!(
+            feature.surface,
+            SurfaceClass::Cylinder(_) | SurfaceClass::Cone(_)
+        ) {
+            continue;
+        }
+        // Density, not literal gaps: a handful of stray faces strung
+        // between two clusters is enough to defeat a nearest-neighbour
+        // test, and claiming passes leave exactly that kind of trail. Bin
+        // the height, call a bin occupied only when it carries real area,
+        // and split where the empty stretch is wider than `gap`.
+        const BIN: f64 = 0.5;
+        let heights: Vec<(f64, u32)> = feature
+            .faces
+            .iter()
+            .map(|&face| {
+                let c = alignment
+                    .transform
+                    .apply_point(mesh.face_centroid(face as usize));
+                (c.z, face)
+            })
+            .collect();
+        let low = heights.iter().map(|h| h.0).fold(f64::INFINITY, f64::min);
+        let high = heights
+            .iter()
+            .map(|h| h.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !low.is_finite() || high - low <= gap {
+            continue;
+        }
+        let bin_count = (((high - low) / BIN).ceil() as usize).max(1);
+        let bin_of = |z: f64| (((z - low) / BIN) as usize).min(bin_count - 1);
+        let mut per_bin = vec![0.0f64; bin_count];
+        for &(z, face) in &heights {
+            per_bin[bin_of(z)] += mesh.face_area(face as usize);
+        }
+        let peak = per_bin.iter().copied().fold(0.0f64, f64::max);
+        let occupied: Vec<bool> = per_bin.iter().map(|&a| a >= 0.02 * peak).collect();
+        // Label each occupied stretch, then hand every face to the label
+        // of the nearest occupied bin so the strays travel with their
+        // cluster rather than forming spurious runs of their own.
+        let mut label = vec![usize::MAX; bin_count];
+        let mut runs_found = 0usize;
+        let mut empty_since = usize::MAX;
+        for bin in 0..bin_count {
+            if occupied[bin] {
+                if runs_found == 0
+                    || (empty_since != usize::MAX && (bin - empty_since) as f64 * BIN > gap)
+                {
+                    runs_found += 1;
+                }
+                label[bin] = runs_found - 1;
+                empty_since = usize::MAX;
+            } else if empty_since == usize::MAX {
+                empty_since = bin;
+            }
+        }
+        if runs_found < 2 {
+            continue;
+        }
+        let nearest_label = |bin: usize| -> usize {
+            (0..bin_count)
+                .filter(|&b| label[b] != usize::MAX)
+                .min_by_key(|&b| b.abs_diff(bin))
+                .map(|b| label[b])
+                .unwrap_or(0)
+        };
+        let mut runs: Vec<Vec<u32>> = vec![Vec::new(); runs_found];
+        for &(z, face) in &heights {
+            let bin = bin_of(z);
+            let index = if label[bin] == usize::MAX {
+                nearest_label(bin)
+            } else {
+                label[bin]
+            };
+            runs[index].push(face);
+        }
+        // Keep the largest run on the original feature so its identity and
+        // notes stay with the bulk of the surface.
+        let areas: Vec<f64> = runs
+            .iter()
+            .map(|run| run.iter().map(|&f| mesh.face_area(f as usize)).sum())
+            .collect();
+        let Some(main) = (0..runs.len()).max_by(|&a, &b| areas[a].total_cmp(&areas[b])) else {
+            continue;
+        };
+        for (index, run) in runs.iter().enumerate() {
+            if index == main || areas[index] < MIN_RUN_AREA {
+                continue;
+            }
+            produced.push(FeatureRecord {
+                id: 0,
+                surface: feature.surface.clone(),
+                face_count: run.len(),
+                area: areas[index],
+                faces: run.clone(),
+                notes: vec![
+                    "split from a band sharing its profile line across a gap in height".to_owned(),
+                ],
+            });
+            split += 1;
+        }
+        let dropped: std::collections::HashSet<u32> = runs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != main && areas[*index] >= MIN_RUN_AREA)
+            .flat_map(|(_, run)| run.iter().copied())
+            .collect();
+        feature.faces.retain(|face| !dropped.contains(face));
+        feature.face_count = feature.faces.len();
+        feature.area = feature
+            .faces
+            .iter()
+            .map(|&face| mesh.face_area(face as usize))
+            .sum();
+    }
+    features.append(&mut produced);
+    features.retain(|feature| !feature.faces.is_empty());
+    split
+}
+
+/// Re-fits cones and spheres as axis-true surfaces of revolution about
+/// the datum axis. Returns how many features were replaced.
+///
+/// `axis_lock_refit` does this for cylinders before the datum transform,
+/// but cones and spheres never got the same treatment, and they need it
+/// more. A cone fitted freely over interleaved azimuthal arcs of one
+/// physical taper has six free parameters and far too little azimuthal
+/// spread to pin them: the axis tilts and slides, and the result is a
+/// 1600 mm^2 surface whose axis line misses the datum axis by 5 mm and
+/// which therefore cannot be emitted as a revolution at all. A sphere is
+/// the same failure wearing a different hat — a shallow taper fits an
+/// absurd sphere whenever the vocabulary offers one.
+///
+/// Locking only the axis *direction* — and letting its *position* float,
+/// exactly the freedom `fit_cylinder_with_axis` already gives cylinders —
+/// collapses the problem to four linear parameters. Radius measured about
+/// the datum axis is
+///
+/// ```text
+/// rho = intercept + slope * z + cx * cos(theta) + cy * sin(theta)
+/// ```
+///
+/// where `(cx, cy)` is the true axis position: to first order, shifting
+/// the axis by `c` changes the measured radius by `-c` projected onto the
+/// radial direction. Dropping those two terms forces every surface to be
+/// concentric with the datum, which is wrong on real parts — the test
+/// gear has a group of hub cones running a genuine 0.37 mm eccentric to
+/// its bore, and forcing them concentric inflates their residual from
+/// 0.06 mm to 0.29 mm and loses them from the model entirely.
+///
+/// Corners rather than centroids, so a triangle fan does not collapse the
+/// radial spread. The fit only replaces the free one when it meets
+/// tolerance, so a genuinely tilted surface keeps its honest tilted fit.
+pub fn lock_revolved_surfaces(
+    mesh: &TriangleMesh,
+    features: &mut [FeatureRecord],
+    alignment: &DatumAlignment,
+    tolerance: f64,
+) -> usize {
+    /// Below this profile slope the surface is a cylinder, not a cone.
+    const CYLINDER_SLOPE: f64 = 0.02;
+    /// Above this it is effectively a flat annulus; leave it alone.
+    const MAX_SLOPE: f64 = 12.0;
+    let mut locked = 0;
+    for feature in features.iter_mut() {
+        // Deliberately unconditional for these kinds: gating on whether
+        // the existing fit already looks axis-true would decide using the
+        // very fit this pass exists to distrust. Snapping rewrites a
+        // cone's half angle after the event without recomputing its
+        // deviation, so a stale fit can look both plausible and axis-true
+        // while being neither. Re-fitting is cheap; the tolerance gate
+        // below decides, and the result is idempotent.
+        if !matches!(
+            feature.surface,
+            SurfaceClass::Cone(_) | SurfaceClass::Sphere(_)
+        ) {
+            continue;
+        }
+        // Normal equations for [intercept, slope, cx, cy] against the
+        // basis [1, z, cos(theta), sin(theta)], area weighted.
+        let mut normal = [[0.0f64; 4]; 4];
+        let mut rhs = [0.0f64; 4];
+        let mut total_weight = 0.0;
+        let mut z_sum = 0.0;
+        for &face in &feature.faces {
+            let weight = mesh.face_area(face as usize) / 3.0;
+            for corner in mesh.triangle_points(face as usize) {
+                let c = alignment.transform.apply_point(corner);
+                let radial = c.x.hypot(c.y);
+                if radial < 1e-9 {
+                    continue;
+                }
+                let basis = [1.0, c.z, c.x / radial, c.y / radial];
+                for row in 0..4 {
+                    for column in 0..4 {
+                        normal[row][column] += weight * basis[row] * basis[column];
+                    }
+                    rhs[row] += weight * basis[row] * radial;
+                }
+                total_weight += weight;
+                z_sum += weight * c.z;
+            }
+        }
+        if total_weight <= 0.0 {
+            continue;
+        }
+        let Some([intercept, slope, cx, cy]) = solve_4x4(normal, rhs) else {
+            continue;
+        };
+        if slope.abs() > MAX_SLOPE {
+            continue;
+        }
+        let (mut squared, mut max_abs) = (0.0f64, 0.0f64);
+        for &face in &feature.faces {
+            let weight = mesh.face_area(face as usize) / 3.0;
+            for corner in mesh.triangle_points(face as usize) {
+                let c = alignment.transform.apply_point(corner);
+                let radial = c.x.hypot(c.y);
+                if radial < 1e-9 {
+                    continue;
+                }
+                let predicted = intercept + slope * c.z + (cx * c.x + cy * c.y) / radial;
+                let residual = radial - predicted;
+                squared += weight * residual * residual;
+                max_abs = max_abs.max(residual.abs());
+            }
+        }
+        let rms = (squared / total_weight).sqrt();
+        if rms > tolerance {
+            // Declining is a real verdict — the surface is genuinely not a
+            // revolution about the datum direction — so say so rather than
+            // leaving a feature that later stages cannot emit and cannot
+            // explain.
+            if feature.area >= 100.0 {
+                feature.notes.push(format!(
+                    "not a surface of revolution about the datum direction \
+                     (axis-locked refit rms {rms:.3} mm against a {tolerance:.3} mm tolerance)"
+                ));
+            }
+            continue;
+        }
+        // Meeting tolerance is the whole criterion. Comparing against the
+        // existing fit's recorded rms would be the same mistake again —
+        // that number is stale after snapping, and a free fit scores
+        // lower anyway because it has six parameters to this one's four.
+        // On a revolved part the axis-true reading is the better model
+        // even when it scores marginally worse, which is the same
+        // parsimony argument the MDL stage makes everywhere else.
+        let deviation = crate::fit::DeviationStats { rms, max_abs };
+        let was = crate::finalize::feature_label(&feature.surface);
+        let z_mid = z_sum / total_weight;
+        feature.surface = if slope.abs() < CYLINDER_SLOPE {
+            SurfaceClass::Cylinder(crate::fit::CylinderFit {
+                axis_point: Point3::new(cx, cy, z_mid),
+                axis: Vector3::new(0.0, 0.0, 1.0),
+                radius: intercept + slope * z_mid,
+                deviation,
+            })
+        } else {
+            SurfaceClass::Cone(crate::fit::ConeFit {
+                apex: Point3::new(cx, cy, -intercept / slope),
+                axis: Vector3::new(0.0, 0.0, slope.signum()),
+                half_angle: slope.abs().atan(),
+                deviation,
+            })
+        };
+        let eccentricity = cx.hypot(cy);
+        feature.notes.push(format!(
+            "re-fitted as a surface of revolution about the datum direction \
+             (was {was}, rms {rms:.3} mm)"
+        ));
+        if eccentricity > 2.0 * tolerance {
+            feature.notes.push(format!(
+                "axis runs {eccentricity:.3} mm eccentric to the datum axis"
+            ));
+        }
+        locked += 1;
+    }
+    locked
+}
+
 /// Recognizes revolved fillets among freeform patches: in profile space
 /// about the datum axis a fillet ring is a circular arc. Surfaces are
 /// replaced in place; returns how many blends were recognized.
@@ -174,9 +481,7 @@ pub fn extract_revolved_bands(
         SurfaceClass::Cylinder(fit) => {
             feature.area < MAX_DONOR_AREA || fit.axis.z.abs() < tilt_donor
         }
-        SurfaceClass::Cone(fit) => {
-            feature.area < MAX_DONOR_AREA || fit.axis.z.abs() < tilt_donor
-        }
+        SurfaceClass::Cone(fit) => feature.area < MAX_DONOR_AREA || fit.axis.z.abs() < tilt_donor,
         SurfaceClass::Sphere(_) => true,
         SurfaceClass::Plane(_) => feature.area < MAX_DONOR_AREA,
     };
@@ -222,7 +527,10 @@ pub fn extract_revolved_bands(
     let mut stolen = vec![false; mesh.triangles().len()];
     let mut extracted = 0usize;
     // Phase one: vertical ridges (cylinders).
-    let r_min = candidates.iter().map(|c| c.radial).fold(f64::INFINITY, f64::min);
+    let r_min = candidates
+        .iter()
+        .map(|c| c.radial)
+        .fold(f64::INFINITY, f64::min);
     let r_max = candidates
         .iter()
         .map(|c| c.radial)
@@ -264,9 +572,7 @@ pub fn extract_revolved_bands(
     for (band_low, band_high) in bands {
         let members: Vec<&Candidate> = candidates
             .iter()
-            .filter(|c| {
-                !stolen[c.face as usize] && (band_low..=band_high).contains(&c.radial)
-            })
+            .filter(|c| !stolen[c.face as usize] && (band_low..=band_high).contains(&c.radial))
             .collect();
         if members.is_empty() {
             continue;
@@ -274,13 +580,14 @@ pub fn extract_revolved_bands(
         let points: Vec<Point3> = members
             .iter()
             .flat_map(|c| {
-                mesh.triangles()[c.face as usize]
-                    .into_iter()
-                    .map(|v| alignment.transform.apply_point(mesh.positions()[v as usize]))
+                mesh.triangles()[c.face as usize].into_iter().map(|v| {
+                    alignment
+                        .transform
+                        .apply_point(mesh.positions()[v as usize])
+                })
             })
             .collect();
-        let Some(fit) =
-            crate::fit::fit_cylinder_with_axis(&points, Vector3::new(0.0, 0.0, 1.0))
+        let Some(fit) = crate::fit::fit_cylinder_with_axis(&points, Vector3::new(0.0, 0.0, 1.0))
         else {
             continue;
         };
@@ -345,7 +652,9 @@ pub fn extract_revolved_bands(
                 best = Some((support, slope, intercept));
             }
         }
-        let Some((support, slope, intercept)) = best else { break };
+        let Some((support, slope, intercept)) = best else {
+            break;
+        };
         if support < BAND_MIN_AREA {
             break;
         }
@@ -414,10 +723,7 @@ pub fn extract_revolved_bands(
             half_angle: slope.abs().atan(),
             deviation: crate::fit::DeviationStats { rms, max_abs },
         };
-        let faces: Vec<u32> = final_members
-            .iter()
-            .map(|&i| candidates[i].face)
-            .collect();
+        let faces: Vec<u32> = final_members.iter().map(|&i| candidates[i].face).collect();
         for &face in &faces {
             stolen[face as usize] = true;
         }
@@ -427,9 +733,7 @@ pub fn extract_revolved_bands(
             face_count: faces.len(),
             area,
             faces,
-            notes: vec![
-                "interrupted revolved cone band stitched across the axis".to_owned(),
-            ],
+            notes: vec!["interrupted revolved cone band stitched across the axis".to_owned()],
         });
         extracted += 1;
     }
@@ -455,13 +759,37 @@ pub fn extract_revolved_bands(
 /// height-field of an accepted pattern. Sweeping it helically at
 /// `helix_rate` over `z_range` and repeating it `count` times about the
 /// axis regenerates the toothing.
+/// Sector height-field for an axial (castellated) pattern: `z` over a
+/// uniform `(azimuth, radius)` grid, NaN where unobserved.
+#[derive(Clone, Debug)]
+pub struct AxialGrid {
+    pub theta_cells: usize,
+    pub rho_cells: usize,
+    pub rho0: f64,
+    pub rho1: f64,
+    pub z: Vec<f64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MasterProfile {
+    /// The pattern feature this profile regenerates.
+    pub feature_id: usize,
     pub count: usize,
     pub helix_rate: f64,
+    /// Height the helix unwrap was referenced to. Sweeping with any other
+    /// reference rotates the rebuilt pattern against the scan.
+    pub z_reference: f64,
     pub z_range: (f64, f64),
-    /// `(azimuth radians within the sector, radius mm)`, azimuth ascending.
+    /// Radial band of the pattern (used by the axial form).
+    pub rho_range: (f64, f64),
+    /// Radial pattern: points are `(azimuth, radius)` and sweep
+    /// helically. Axial pattern (a castellated ring viewed from above):
+    /// points are `(azimuth, height)` and extrude between the rho band.
+    pub axial: bool,
+    /// `(azimuth radians within the sector, value)`, azimuth ascending.
     pub points: Vec<(f64, f64)>,
+    /// Present for axial patterns: the sector height-field.
+    pub grid: Option<AxialGrid>,
 }
 
 /// Douglas-Peucker polyline simplification in scaled coordinates.
@@ -510,16 +838,7 @@ pub fn recognize_pattern_feature(
     tolerance: f64,
 ) -> Option<MasterProfile> {
     const MAX_DONOR_AREA: f64 = 150.0;
-    const MIN_MEMBER_AREA: f64 = 300.0;
-    const THETA_CELLS: usize = 96;
-    const Z_CELLS: usize = 24;
-    const MIN_CELL_WEIGHT: f64 = 1e-9;
-    let sector = std::f64::consts::TAU / pattern.count as f64;
-    let z_low = pattern.z_range.0 - 1.0;
-    let z_high = pattern.z_range.1 + 1.0;
-    let rho_floor = pattern.radius_range.0 * 0.8;
-    let rho_ceil = pattern.radius_range.1 * 1.1;
-    let donor = |feature: &FeatureRecord| {
+    let donor = |_: usize, feature: &FeatureRecord| {
         matches!(feature.surface, SurfaceClass::Freeform)
             || (feature.area < MAX_DONOR_AREA
                 && !matches!(
@@ -527,6 +846,46 @@ pub fn recognize_pattern_feature(
                     SurfaceClass::Blend(_) | SurfaceClass::Pattern(_)
                 ))
     };
+    fold_pattern_band(
+        mesh,
+        features,
+        alignment,
+        pattern.count,
+        pattern.z_range.0 - 1.0,
+        pattern.z_range.1 + 1.0,
+        pattern.radius_range.0 * 0.8,
+        pattern.radius_range.1 * 1.1,
+        tolerance,
+        0.08,
+        &donor,
+    )
+}
+
+/// The fold core, band-parameterized: estimates the band's helix rate,
+/// folds every donor face into one sector, trims outliers against the
+/// median, gates on the fold RMS, claims the surviving faces into one
+/// `Pattern` feature, and returns its sweepable master profile. Works
+/// for the primary toothing and for any interrupted ring family (a
+/// synchro dog ring) alike — the donor predicate decides who may join.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_pattern_band(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    count: usize,
+    z_low: f64,
+    z_high: f64,
+    rho_floor: f64,
+    rho_ceil: f64,
+    tolerance: f64,
+    helix_limit: f64,
+    donor: &dyn Fn(usize, &FeatureRecord) -> bool,
+) -> Option<MasterProfile> {
+    const MIN_MEMBER_AREA: f64 = 300.0;
+    const THETA_CELLS: usize = 96;
+    const Z_CELLS: usize = 24;
+    const MIN_CELL_WEIGHT: f64 = 1e-9;
+    let sector = std::f64::consts::TAU / count as f64;
     struct Sample {
         face: u32,
         theta: f64,
@@ -536,8 +895,8 @@ pub fn recognize_pattern_feature(
     }
     let mut samples: Vec<Sample> = Vec::new();
     let mut member_area = 0.0;
-    for feature in features.iter() {
-        if !donor(feature) {
+    for (feature_index, feature) in features.iter().enumerate() {
+        if !donor(feature_index, feature) {
             continue;
         }
         for &face in &feature.faces {
@@ -591,18 +950,22 @@ pub fn recognize_pattern_feature(
             let folded = unwrapped.rem_euclid(sector);
             let cell = (((folded / sector) * CELLS as f64) as usize).min(CELLS - 1);
             if weight[cell] > sample.area + MIN_CELL_WEIGHT {
-                let reference = (radius_sum[cell] - sample.area * sample.radial)
-                    / (weight[cell] - sample.area);
+                let reference =
+                    (radius_sum[cell] - sample.area * sample.radial) / (weight[cell] - sample.area);
                 let residual = sample.radial - reference;
                 squared += sample.area * residual * residual;
                 counted += sample.area;
             }
         }
-        if counted > 0.0 { (squared / counted).sqrt() } else { f64::INFINITY }
+        if counted > 0.0 {
+            (squared / counted).sqrt()
+        } else {
+            f64::INFINITY
+        }
     };
     let mut helix_rate = 0.0;
     let mut best_rms = f64::INFINITY;
-    let mut step = 0.004;
+    let mut step = (helix_limit / 20.0).max(1e-5);
     for i in -20..=20 {
         let rate = i as f64 * step;
         let rms = fold_rms_at(rate);
@@ -632,9 +995,9 @@ pub fn recognize_pattern_feature(
     let members: Vec<Member> = samples
         .iter()
         .map(|sample| {
-            let unwrapped = (sample.theta - helix_rate * (sample.z - z_mid))
-                .rem_euclid(std::f64::consts::TAU);
-            let instance = ((unwrapped / sector) as usize).min(pattern.count - 1);
+            let unwrapped =
+                (sample.theta - helix_rate * (sample.z - z_mid)).rem_euclid(std::f64::consts::TAU);
+            let instance = ((unwrapped / sector) as usize).min(count - 1);
             let folded = unwrapped - instance as f64 * sector;
             let theta_cell = ((folded / sector) * THETA_CELLS as f64) as usize;
             let z_cell = (((sample.z - z_low) / (z_high - z_low)) * Z_CELLS as f64) as usize;
@@ -674,11 +1037,7 @@ pub fn recognize_pattern_feature(
         .iter()
         .map(|m| residual_of(m, &weight, &radius_sum))
         .collect();
-    let mut magnitudes: Vec<f64> = first_residuals
-        .iter()
-        .flatten()
-        .map(|r| r.abs())
-        .collect();
+    let mut magnitudes: Vec<f64> = first_residuals.iter().flatten().map(|r| r.abs()).collect();
     if magnitudes.is_empty() {
         return None;
     }
@@ -706,8 +1065,8 @@ pub fn recognize_pattern_feature(
     let mut squared = 0.0;
     let mut max_abs = 0.0f64;
     let mut counted = 0.0;
-    let mut instance_squared = vec![0.0f64; pattern.count];
-    let mut instance_weight = vec![0.0f64; pattern.count];
+    let mut instance_squared = vec![0.0f64; count];
+    let mut instance_weight = vec![0.0f64; count];
     let mut member_area = 0.0;
     for member in &kept {
         member_area += member.area;
@@ -727,7 +1086,7 @@ pub fn recognize_pattern_feature(
     if rms > 2.5 * tolerance {
         return None;
     }
-    let worst_instance_rms = (0..pattern.count)
+    let worst_instance_rms = (0..count)
         .filter(|&k| instance_weight[k] > 0.0)
         .map(|k| (instance_squared[k] / instance_weight[k]).sqrt())
         .fold(0.0f64, f64::max);
@@ -737,8 +1096,8 @@ pub fn recognize_pattern_feature(
     for &face in &faces {
         stolen[face as usize] = true;
     }
-    for feature in features.iter_mut() {
-        if donor(feature) {
+    for (feature_index, feature) in features.iter_mut().enumerate() {
+        if donor(feature_index, feature) {
             feature.faces.retain(|&face| !stolen[face as usize]);
             feature.face_count = feature.faces.len();
             feature.area = feature
@@ -754,7 +1113,7 @@ pub fn recognize_pattern_feature(
         surface: SurfaceClass::Pattern(crate::fit::PatternFit {
             axis_point: Point3::default(),
             axis: Vector3::new(0.0, 0.0, 1.0),
-            count: pattern.count,
+            count,
             z_range: (z_low, z_high),
             radius_range: (rho_floor, rho_ceil),
             deviation: crate::fit::DeviationStats { rms, max_abs },
@@ -767,10 +1126,12 @@ pub fn recognize_pattern_feature(
         notes: vec![format!(
             "master surface x {} circular pattern; fold rms {:.3} mm, worst instance {:.3} mm, \
              helix angle {:.2} deg at d {:.1}",
-            pattern.count,
+            count,
             rms,
             worst_instance_rms,
-            (helix_rate * (rho_floor + rho_ceil) / 2.0).atan().to_degrees(),
+            (helix_rate * (rho_floor + rho_ceil) / 2.0)
+                .atan()
+                .to_degrees(),
             rho_floor + rho_ceil
         )],
     });
@@ -806,16 +1167,659 @@ pub fn recognize_pattern_feature(
     // Simplify in arc-length scale so the epsilon is millimetres in both axes.
     let scaled: Vec<(f64, f64)> = raw.iter().map(|(t, r)| (t * r_mid, *r)).collect();
     let simplified = simplify_polyline(&scaled, tolerance * 0.75);
-    let points: Vec<(f64, f64)> = simplified
-        .iter()
-        .map(|(x, r)| (x / r_mid, *r))
-        .collect();
+    let points: Vec<(f64, f64)> = simplified.iter().map(|(x, r)| (x / r_mid, *r)).collect();
     Some(MasterProfile {
-        count: pattern.count,
+        feature_id: 0, // stamped by the caller once the feature id is final
+        count,
         helix_rate,
+        z_reference: z_mid,
         z_range: (z_low + z_margin, z_high - z_margin),
+        rho_range: (rho_floor, rho_ceil),
+        axial: false,
         points,
+        grid: None,
     })
+}
+
+/// Axial fold for castellated rings: viewed along the axis the band is a
+/// single-valued height-field `z(azimuth)`. Top-facing faces in the
+/// band's dominant radial window fold into one sector; on acceptance the
+/// whole band (walls included) claims into a `Pattern` feature and the
+/// master returns as an extrudable `(azimuth, height)` outline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fold_axial_ring(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    count: usize,
+    z_low: f64,
+    z_high: f64,
+    rho_floor: f64,
+    rho_ceil: f64,
+    tolerance: f64,
+) -> Option<MasterProfile> {
+    const THETA_CELLS: usize = 96;
+    const RHO_CELLS: usize = 24;
+    const MIN_MEMBER_AREA: f64 = 150.0;
+    let sector = std::f64::consts::TAU / count as f64;
+    struct Sample {
+        theta: f64,
+        z: f64,
+        rho: f64,
+        area: f64,
+    }
+    let mut tops: Vec<Sample> = Vec::new();
+    // The grid is the band's representation seen from above, so every
+    // surface inside the box feeds it — gap floors owned by cones
+    // stitched across the whole axis, shoulder planes, edge rounds —
+    // not only the low-solidity ring members. Established patterns keep
+    // their own faces.
+    for feature in features.iter() {
+        if matches!(feature.surface, SurfaceClass::Pattern(_)) {
+            continue;
+        }
+        for &face in &feature.faces {
+            let Some(normal) = mesh.face_normal(face as usize) else {
+                continue;
+            };
+            let n = alignment.transform.apply_vector(normal);
+            if n.z.abs() < 0.6 {
+                continue;
+            }
+            let c = alignment
+                .transform
+                .apply_point(mesh.face_centroid(face as usize));
+            let rho = c.x.hypot(c.y);
+            if !(rho_floor..=rho_ceil).contains(&rho) || !(z_low..=z_high).contains(&c.z) {
+                continue;
+            }
+            let theta = (c.y.atan2(c.x) + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
+            tops.push(Sample {
+                theta,
+                z: c.z,
+                rho,
+                area: mesh.face_area(face as usize),
+            });
+        }
+    }
+    let top_area: f64 = tops.iter().map(|s| s.area).sum();
+    if top_area < MIN_MEMBER_AREA {
+        return None;
+    }
+    // A castellated ring must actually fill its own band. Accepting one
+    // that does not is the most expensive mistake this stage can make,
+    // because a pattern is swept the whole way round without ever facing
+    // the solidity test that guards ordinary revolved surfaces: on the
+    // test pump a band spanning radius 7 to 128 mm was accepted from
+    // 3,287 mm^2 of scattered material and swept into 49,000 mm^2 of
+    // geometry that is not on the part — five sixths of everything that
+    // rebuild invented. Real rings clear this comfortably; the gear's
+    // toothing fills 2.4 times its annulus and its dog ring 1.4 times,
+    // against 0.06 for the pump's phantom.
+    const MIN_BAND_FILL: f64 = 0.35;
+    let annulus = std::f64::consts::PI * (rho_ceil * rho_ceil - rho_floor * rho_floor).abs();
+    if top_area < MIN_BAND_FILL * annulus {
+        return None;
+    }
+    // 2D sector height-field: floors and lands own separate rho cells, so
+    // multi-level castellations stay single-valued.
+    let rho_span = (rho_ceil - rho_floor).max(1e-9);
+    let cell_of = |theta: f64, rho: f64| -> usize {
+        let folded = theta.rem_euclid(sector);
+        let t = (((folded / sector) * THETA_CELLS as f64) as usize).min(THETA_CELLS - 1);
+        let r = ((((rho - rho_floor) / rho_span) * RHO_CELLS as f64) as usize).min(RHO_CELLS - 1);
+        r * THETA_CELLS + t
+    };
+    let cells = THETA_CELLS * RHO_CELLS;
+    let mut weight = vec![0.0f64; cells];
+    let mut z_sum = vec![0.0f64; cells];
+    for sample in &tops {
+        let cell = cell_of(sample.theta, sample.rho);
+        weight[cell] += sample.area;
+        z_sum[cell] += sample.area * sample.z;
+    }
+    let residual_of = |sample: &Sample, weight: &[f64], z_sum: &[f64]| -> Option<f64> {
+        let cell = cell_of(sample.theta, sample.rho);
+        if weight[cell] <= sample.area + 1e-9 {
+            return None;
+        }
+        let reference = (z_sum[cell] - sample.area * sample.z) / (weight[cell] - sample.area);
+        Some(sample.z - reference)
+    };
+    let mut magnitudes: Vec<f64> = tops
+        .iter()
+        .filter_map(|s| residual_of(s, &weight, &z_sum))
+        .map(f64::abs)
+        .collect();
+    if magnitudes.is_empty() {
+        return None;
+    }
+    magnitudes.sort_by(f64::total_cmp);
+    let median = magnitudes[magnitudes.len() / 2];
+    let cutoff = (4.0 * median).max(2.0 * tolerance);
+    let kept: Vec<&Sample> = tops
+        .iter()
+        .filter(|s| residual_of(s, &weight, &z_sum).is_some_and(|r| r.abs() <= cutoff))
+        .collect();
+    if kept.len() < tops.len() / 4 {
+        return None;
+    }
+    let mut weight2 = vec![0.0f64; cells];
+    let mut z_sum2 = vec![0.0f64; cells];
+    for sample in &kept {
+        let cell = cell_of(sample.theta, sample.rho);
+        weight2[cell] += sample.area;
+        z_sum2[cell] += sample.area * sample.z;
+    }
+    let mut squared = 0.0;
+    let mut counted = 0.0;
+    for sample in &kept {
+        if let Some(residual) = residual_of(sample, &weight2, &z_sum2) {
+            squared += sample.area * residual * residual;
+            counted += sample.area;
+        }
+    }
+    if counted <= 0.0 {
+        return None;
+    }
+    let rms = (squared / counted).sqrt();
+    if rms > 2.5 * tolerance {
+        return None;
+    }
+    let mut grid_z: Vec<f64> = (0..cells)
+        .map(|cell| {
+            if weight2[cell] > 1e-9 {
+                z_sum2[cell] / weight2[cell]
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    // Quantize the field onto the levels the ring actually uses. A dog
+    // ring is prismatic: two or three flat levels — the lands either side
+    // of the teeth, the tooth tops, the gap floors — joined by walls.
+    // Left as measured cell means, every cell carries its own tenth of a
+    // millimetre of scanner noise and the ring rebuilds as a rough field
+    // instead of the flat polygons it is, which is what makes a rebuilt
+    // dog ring look chewed next to the main toothing.
+    //
+    // Snapping is deliberately conservative: only cells already within a
+    // few noise widths of a level move, so a genuine ramp or chamfer
+    // between levels keeps its measured shape.
+    {
+        const LEVEL_BINS: usize = 256;
+        let occupied: Vec<f64> = grid_z.iter().copied().filter(|v| v.is_finite()).collect();
+        let low = occupied.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = occupied.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if high > low {
+            let width = (high - low) / LEVEL_BINS as f64;
+            let mut histogram = vec![0usize; LEVEL_BINS];
+            for value in &occupied {
+                histogram[(((value - low) / width) as usize).min(LEVEL_BINS - 1)] += 1;
+            }
+            // A level is a bin holding a real share of the field, kept
+            // apart from its neighbours by more than the tolerance.
+            let floor_count = (occupied.len() / 20).max(3);
+            let mut levels: Vec<f64> = Vec::new();
+            let mut order: Vec<usize> = (0..LEVEL_BINS).collect();
+            order.sort_by_key(|&bin| std::cmp::Reverse(histogram[bin]));
+            for bin in order {
+                if histogram[bin] < floor_count {
+                    break;
+                }
+                let height = low + (bin as f64 + 0.5) * width;
+                if levels
+                    .iter()
+                    .all(|existing: &f64| (existing - height).abs() > 4.0 * tolerance)
+                {
+                    levels.push(height);
+                }
+            }
+            for value in grid_z.iter_mut() {
+                if !value.is_finite() {
+                    continue;
+                }
+                if let Some(level) = levels
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| (a - *value).abs().total_cmp(&(b - *value).abs()))
+                    && (level - *value).abs() <= 4.0 * tolerance
+                {
+                    *value = level;
+                }
+            }
+        }
+    }
+    // Close the small voids the fold leaves where a flank faces away from
+    // the axis and contributes no top-facing sample, so the emitted
+    // surface is continuous and its facets meet.
+    for _ in 0..8 {
+        let snapshot = grid_z.clone();
+        let mut changed = false;
+        for r in 0..RHO_CELLS {
+            for t in 0..THETA_CELLS {
+                if snapshot[r * THETA_CELLS + t].is_finite() {
+                    continue;
+                }
+                let mut neighbours: Vec<f64> = [
+                    Some(snapshot[r * THETA_CELLS + (t + 1) % THETA_CELLS]),
+                    Some(snapshot[r * THETA_CELLS + (t + THETA_CELLS - 1) % THETA_CELLS]),
+                    (r > 0).then(|| snapshot[(r - 1) * THETA_CELLS + t]),
+                    (r + 1 < RHO_CELLS).then(|| snapshot[(r + 1) * THETA_CELLS + t]),
+                ]
+                .into_iter()
+                .flatten()
+                .filter(|v| v.is_finite())
+                .collect();
+                if neighbours.len() >= 2 {
+                    neighbours.sort_by(f64::total_cmp);
+                    grid_z[r * THETA_CELLS + t] = neighbours[neighbours.len() / 2];
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // A coarse 1D outline for the summary line.
+    let points: Vec<(f64, f64)> = (0..THETA_CELLS)
+        .filter_map(|t| {
+            let mut w = 0.0;
+            let mut z = 0.0;
+            for r in 0..RHO_CELLS {
+                let cell = r * THETA_CELLS + t;
+                if weight2[cell] > 1e-9 {
+                    w += weight2[cell];
+                    z += z_sum2[cell];
+                }
+            }
+            (w > 1e-9).then(|| ((t as f64 + 0.5) / THETA_CELLS as f64 * sector, z / w))
+        })
+        .collect();
+    if points.len() < 4 {
+        return None;
+    }
+    // Claim every face in the whole band box, walls included; features
+    // extending past the box (the bore, a synchro cone running beneath
+    // the gaps) keep their outside portion and rebuild to their new
+    // extents.
+    let mut faces: Vec<u32> = Vec::new();
+    let mut stolen = vec![false; mesh.triangles().len()];
+    for feature in features.iter() {
+        if matches!(feature.surface, SurfaceClass::Pattern(_)) {
+            continue;
+        }
+        for &face in &feature.faces {
+            let c = alignment
+                .transform
+                .apply_point(mesh.face_centroid(face as usize));
+            let rho = c.x.hypot(c.y);
+            if (rho_floor - 1.0..=rho_ceil + 1.0).contains(&rho) && (z_low..=z_high).contains(&c.z)
+            {
+                stolen[face as usize] = true;
+                faces.push(face);
+            }
+        }
+    }
+    let area: f64 = faces.iter().map(|&f| mesh.face_area(f as usize)).sum();
+    for feature in features.iter_mut() {
+        if !matches!(feature.surface, SurfaceClass::Pattern(_)) {
+            feature.faces.retain(|&face| !stolen[face as usize]);
+            feature.face_count = feature.faces.len();
+            feature.area = feature
+                .faces
+                .iter()
+                .map(|&face| mesh.face_area(face as usize))
+                .sum();
+        }
+    }
+    features.retain(|feature| !feature.faces.is_empty());
+    let z_lo_measured = kept.iter().map(|s| s.z).fold(f64::INFINITY, f64::min);
+    let z_hi_measured = kept.iter().map(|s| s.z).fold(f64::NEG_INFINITY, f64::max);
+    features.push(FeatureRecord {
+        id: 0,
+        surface: SurfaceClass::Pattern(crate::fit::PatternFit {
+            axis_point: Point3::default(),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            count,
+            z_range: (z_low, z_high),
+            radius_range: (rho_floor, rho_ceil),
+            deviation: crate::fit::DeviationStats {
+                rms,
+                max_abs: cutoff,
+            },
+            worst_instance_rms: rms,
+            helix_rate: 0.0,
+        }),
+        face_count: faces.len(),
+        area,
+        faces,
+        notes: vec![format!(
+            "castellated ring x {count}; axial fold rms {rms:.3} mm"
+        )],
+    });
+    Some(MasterProfile {
+        feature_id: 0,
+        count,
+        helix_rate: 0.0,
+        z_reference: (z_lo_measured + z_hi_measured) / 2.0,
+        z_range: (z_lo_measured, z_hi_measured),
+        rho_range: (rho_floor, rho_ceil),
+        axial: true,
+        points,
+        grid: Some(AxialGrid {
+            theta_cells: THETA_CELLS,
+            rho_cells: RHO_CELLS,
+            rho0: rho_floor,
+            rho1: rho_ceil,
+            z: grid_z,
+        }),
+    })
+}
+
+/// Finds and folds *secondary* ring patterns: interrupted revolved rings
+/// (a synchro dog-tooth ring, a castellated flange) whose solidity says
+/// they are not full revolutions. Bands are attempted one at a time and
+/// membership is re-detected after every fold — a fold rewrites the
+/// feature list, so indices held across folds would dangle.
+pub fn recognize_ring_patterns(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    tolerance: f64,
+) -> Vec<MasterProfile> {
+    const SOLID: f64 = 0.70;
+    const MIN_RING_AREA: f64 = 30.0;
+    const MIN_INSTANCE_AREA: f64 = 8.0;
+    let mut profiles = Vec::new();
+    let mut blocked: Vec<(f64, f64)> = Vec::new();
+    'bands: loop {
+        struct Ring {
+            index: usize,
+            z0: f64,
+            z1: f64,
+            r0: f64,
+            r1: f64,
+        }
+        let mut rings: Vec<Ring> = Vec::new();
+        let mut absorb: Vec<(usize, usize)> = Vec::new();
+        type PatternBand = (usize, (f64, f64), (f64, f64));
+        let pattern_bands: Vec<PatternBand> = features
+            .iter()
+            .enumerate()
+            .filter_map(|(index, f)| match &f.surface {
+                SurfaceClass::Pattern(fit) => Some((index, fit.z_range, fit.radius_range)),
+                _ => None,
+            })
+            .collect();
+        for (index, feature) in features.iter().enumerate() {
+            if feature.area < MIN_RING_AREA || feature.is_recovered() {
+                continue;
+            }
+            let solidity = match &feature.surface {
+                SurfaceClass::Cylinder(fit)
+                    if fit.axis.z.abs() > 0.999
+                        && fit.axis_point.x.hypot(fit.axis_point.y) < 3.0 =>
+                {
+                    let (z0, z1, _, _) = extents(mesh, &feature.faces, alignment);
+                    let expected = std::f64::consts::TAU * fit.radius * (z1 - z0).max(1e-9);
+                    Some(feature.area / expected)
+                }
+                SurfaceClass::Plane(fit) if fit.normal.z.abs() > 0.999 => {
+                    let (_, _, r0, r1) = extents(mesh, &feature.faces, alignment);
+                    let expected = std::f64::consts::PI * (r1 * r1 - r0 * r0).max(1e-9);
+                    Some(feature.area / expected)
+                }
+                SurfaceClass::Cone(fit) if fit.axis.z.abs() > 0.999 => {
+                    let (z0, z1, r0, r1) = extents(mesh, &feature.faces, alignment);
+                    if cone_axis_offset(fit, (z0 + z1) / 2.0) >= 3.0 {
+                        continue;
+                    }
+                    let slant = ((z1 - z0).powi(2) + (r1 - r0).powi(2)).sqrt();
+                    let expected = std::f64::consts::TAU * (r0 + r1) / 2.0 * slant.max(1e-9);
+                    Some(feature.area / expected)
+                }
+                _ => None,
+            };
+            let Some(solidity) = solidity else { continue };
+            if solidity >= SOLID {
+                continue;
+            }
+            let (z0, z1, r0, r1) = extents(mesh, &feature.faces, alignment);
+            // A castellated ring is a short band; tall skinny slivers are
+            // leftovers of other surfaces and would glue unrelated bands
+            // together during clustering.
+            if z1 - z0 > 8.0 {
+                continue;
+            }
+            // A low-solidity ring lying inside a pattern's band IS that
+            // pattern's material — a tooth-top ring interrupted by the
+            // gullets, a land sliver the fold's trim left behind. It
+            // transfers into the pattern feature instead of becoming a
+            // band of its own.
+            let owner = pattern_bands.iter().find(|(_, (pz0, pz1), (pr0, pr1))| {
+                z0 >= pz0 - 0.5 && z1 <= pz1 + 0.5 && r0 >= pr0 - 0.5 && r1 <= pr1 + 0.5
+            });
+            if let Some(&(pattern_index, _, _)) = owner {
+                absorb.push((index, pattern_index));
+                continue;
+            }
+            rings.push(Ring {
+                index,
+                z0,
+                z1,
+                r0,
+                r1,
+            });
+        }
+        if !absorb.is_empty() {
+            for &(source, target) in &absorb {
+                let moved = std::mem::take(&mut features[source].faces);
+                let area: f64 = moved
+                    .iter()
+                    .map(|&face| mesh.face_area(face as usize))
+                    .sum();
+                features[target].faces.extend(moved);
+                features[target].face_count = features[target].faces.len();
+                features[target].area += area;
+                features[target].notes.push(format!(
+                    "absorbed an interrupted ring inside the pattern band ({area:.0} mm^2)"
+                ));
+                features[source].face_count = 0;
+                features[source].area = 0.0;
+            }
+            features.retain(|feature| !feature.faces.is_empty());
+            continue 'bands;
+        }
+        rings.sort_by(|a, b| a.z0.total_cmp(&b.z0));
+        let mut bands: Vec<Vec<usize>> = Vec::new();
+        let mut band_boxes: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (ring_index, ring) in rings.iter().enumerate() {
+            match band_boxes
+                .iter_mut()
+                .position(|(z0, z1, _, _)| ring.z0 <= *z1 + 0.75 && ring.z1 >= *z0 - 0.75)
+            {
+                Some(slot) => {
+                    bands[slot].push(ring_index);
+                    let bx = &mut band_boxes[slot];
+                    bx.1 = bx.1.max(ring.z1);
+                    bx.2 = bx.2.min(ring.r0);
+                    bx.3 = bx.3.max(ring.r1);
+                }
+                None => {
+                    bands.push(vec![ring_index]);
+                    band_boxes.push((ring.z0, ring.z1, ring.r0, ring.r1));
+                }
+            }
+        }
+        let Some(slot) = band_boxes
+            .iter()
+            .position(|bx| !blocked.iter().any(|(b0, b1)| bx.0 <= *b1 && bx.1 >= *b0))
+        else {
+            break;
+        };
+        let (band, bx) = (&bands[slot], &band_boxes[slot]);
+        blocked.push((bx.0, bx.1));
+        let (z_low, z_high) = (bx.0 - 0.75, bx.1 + 0.75);
+        let (rho_floor, rho_ceil) = ((bx.2 - 1.5).max(1.0), bx.3 + 1.5);
+        let member_set: std::collections::HashSet<usize> =
+            band.iter().map(|&r| rings[r].index).collect();
+        let mut samples: Vec<(f64, f64, f64, f64)> = Vec::new();
+        for (index, feature) in features.iter().enumerate() {
+            let participates =
+                member_set.contains(&index) || matches!(feature.surface, SurfaceClass::Freeform);
+            if !participates {
+                continue;
+            }
+            for &face in &feature.faces {
+                let c = alignment
+                    .transform
+                    .apply_point(mesh.face_centroid(face as usize));
+                let radial = c.x.hypot(c.y);
+                if !(rho_floor..=rho_ceil).contains(&radial) || !(z_low..=z_high).contains(&c.z) {
+                    continue;
+                }
+                let theta =
+                    (c.y.atan2(c.x) + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
+                samples.push((theta, c.z, radial, mesh.face_area(face as usize)));
+            }
+        }
+        let Some(count) = ring_count_from_samples(&samples) else {
+            continue 'bands;
+        };
+        // A real castellation instance has workable area; a high count
+        // "detected" over confetti folds noise into 3-degree slivers.
+        let sample_area: f64 = samples.iter().map(|s| s.3).sum();
+        if sample_area / (count as f64) < MIN_INSTANCE_AREA {
+            continue 'bands;
+        }
+        let donor = |index: usize, feature: &FeatureRecord| {
+            member_set.contains(&index) || matches!(feature.surface, SurfaceClass::Freeform)
+        };
+        // A ring band is either radial (a helical-tooth band) or axial
+        // (a castellated ring, single-valued only from above): try both
+        // readings, keep whichever folds.
+        let folded = fold_pattern_band(
+            mesh, features, alignment, count, z_low, z_high, rho_floor, rho_ceil, tolerance, 0.01,
+            &donor,
+        )
+        .or_else(|| {
+            fold_axial_ring(
+                mesh, features, alignment, count, z_low, z_high, rho_floor, rho_ceil, tolerance,
+            )
+        });
+        if let Some(mut profile) = folded {
+            if let Some(last) = features.last_mut() {
+                last.notes
+                    .push("secondary ring pattern (castellated band)".to_owned());
+            }
+            profile.feature_id = features.len() - 1;
+            profiles.push(profile);
+        }
+    }
+    profiles
+}
+
+/// Repeat count of a ring band from its azimuthal area and mean-radius
+/// signals: slabbed, fractionally-shifted autocorrelation with the
+/// harmonic climb — the compact form of the primary pattern detector.
+fn ring_count_from_samples(samples: &[(f64, f64, f64, f64)]) -> Option<usize> {
+    const BINS: usize = 720;
+    const SLABS: usize = 4;
+    const MIN_AREA: f64 = 25.0;
+    const MIN_STRENGTH: f64 = 0.35;
+    const MAX_COUNT: usize = 120;
+    let total: f64 = samples.iter().map(|s| s.3).sum();
+    if total < MIN_AREA {
+        return None;
+    }
+    let z_low = samples.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+    let z_high = samples
+        .iter()
+        .map(|s| s.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let slab_height = ((z_high - z_low) / SLABS as f64).max(1e-9);
+    let mut weight = vec![vec![0.0f64; BINS]; SLABS];
+    let mut radius_sum = vec![vec![0.0f64; BINS]; SLABS];
+    for &(theta, z, rho, area) in samples {
+        let slab = (((z - z_low) / slab_height) as usize).min(SLABS - 1);
+        let bin = ((theta / std::f64::consts::TAU * BINS as f64) as usize).min(BINS - 1);
+        weight[slab][bin] += area;
+        radius_sum[slab][bin] += area * rho;
+    }
+    let mut area_signal = vec![vec![0.0f64; BINS]; SLABS];
+    let mut radius_signal = vec![vec![0.0f64; BINS]; SLABS];
+    for slab in 0..SLABS {
+        let slab_area: f64 = weight[slab].iter().sum();
+        if slab_area <= 0.0 {
+            continue;
+        }
+        let area_mean = slab_area / BINS as f64;
+        let radius_mean = radius_sum[slab].iter().sum::<f64>() / slab_area;
+        for bin in 0..BINS {
+            area_signal[slab][bin] = weight[slab][bin] - area_mean;
+            if weight[slab][bin] > 0.0 {
+                radius_signal[slab][bin] = radius_sum[slab][bin] / weight[slab][bin] - radius_mean;
+            }
+        }
+    }
+    let correlation = |signals: &[Vec<f64>], count: usize| -> f64 {
+        let denominator: f64 = signals.iter().flat_map(|s| s.iter()).map(|v| v * v).sum();
+        if denominator < 1e-12 {
+            return 0.0;
+        }
+        let shift = BINS as f64 / count as f64;
+        let base = shift.floor() as usize;
+        let fraction = shift - base as f64;
+        signals
+            .iter()
+            .map(|slab| {
+                slab.iter()
+                    .enumerate()
+                    .map(|(b, v)| {
+                        let lower = slab[(b + base) % BINS];
+                        let upper = slab[(b + base + 1) % BINS];
+                        v * (lower * (1.0 - fraction) + upper * fraction)
+                    })
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / denominator
+    };
+    let scores: Vec<f64> = (0..=MAX_COUNT)
+        .map(|count| {
+            if count < 3 {
+                0.0
+            } else {
+                correlation(&area_signal, count).max(correlation(&radius_signal, count))
+            }
+        })
+        .collect();
+    let mut count = (3..=MAX_COUNT).max_by(|&a, &b| scores[a].total_cmp(&scores[b]))?;
+    if scores[count] < MIN_STRENGTH {
+        return None;
+    }
+    loop {
+        let climb = (2..)
+            .map(|k| count * k)
+            .take_while(|&m| m <= MAX_COUNT)
+            .filter(|&m| scores[m] >= 0.85 * scores[count])
+            .max();
+        match climb {
+            Some(higher) if higher != count => count = higher,
+            _ => break,
+        }
+    }
+    // A count at the ladder's own cap is the detector reporting its
+    // ceiling, not the part reporting its teeth: broadband noise
+    // correlates a little at every lag and the climb rides it to the
+    // top. Two organic parts and a rectangular plate all "detected"
+    // exactly the cap before this guard.
+    if count >= MAX_COUNT {
+        return None;
+    }
+    Some(count)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -875,16 +1879,70 @@ impl PlanCoverage {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReconstructionPlan {
+    /// Extrude and revolve operations recovered as motion-invariant
+    /// surface groups — the wizard layer of the feature tree.
+    pub instances: crate::instance::Instances,
+    /// Those operations put in replay order, with what each one does.
+    pub tree: crate::tree::FeatureTree,
     pub segments: Vec<ProfileSegment>,
     pub fillets: Vec<FilletProposal>,
     pub chamfers: Vec<ChamferProposal>,
     pub pattern: Option<PatternProposal>,
-    pub master_profile: Option<MasterProfile>,
+    pub master_profiles: Vec<MasterProfile>,
     pub coverage: PlanCoverage,
     pub notes: Vec<String>,
 }
 
-/// z and radial extent of a feature's faces in the datum frame.
+/// Gauss-Jordan solve of a small symmetric normal-equation system, with
+/// partial pivoting. `None` when the system is singular.
+fn solve_4x4(mut matrix: [[f64; 4]; 4], mut rhs: [f64; 4]) -> Option<[f64; 4]> {
+    for column in 0..4 {
+        let pivot = (column..4)
+            .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))?;
+        if matrix[pivot][column].abs() < 1e-12 {
+            return None;
+        }
+        matrix.swap(column, pivot);
+        rhs.swap(column, pivot);
+        let divisor = matrix[column][column];
+        for entry in matrix[column].iter_mut() {
+            *entry /= divisor;
+        }
+        rhs[column] /= divisor;
+        for row in 0..4 {
+            if row == column {
+                continue;
+            }
+            let factor = matrix[row][column];
+            if factor == 0.0 {
+                continue;
+            }
+            let pivot_row = matrix[column];
+            for (entry, pivot) in matrix[row].iter_mut().zip(pivot_row) {
+                *entry -= factor * pivot;
+            }
+            rhs[row] -= factor * rhs[column];
+        }
+    }
+    Some(rhs)
+}
+
+/// Radial offset of a cone's axis line from the datum axis, measured at
+/// height `z` rather than at the apex.
+///
+/// A shallow cone's apex sits hundreds of millimetres from its material:
+/// a 5-degree cone of radius 29 has its apex 325 mm away, so half a
+/// degree of residual axis tilt throws the apex 3 mm off the datum axis
+/// and an apex-offset test rejects a perfectly good axis-true cone. The
+/// offset that means anything is the one where the surface actually is.
+pub(crate) fn cone_axis_offset(fit: &crate::fit::ConeFit, z: f64) -> f64 {
+    if fit.axis.z.abs() < 1e-9 {
+        return f64::INFINITY;
+    }
+    let t = (z - fit.apex.z) / fit.axis.z;
+    (fit.apex.x + fit.axis.x * t).hypot(fit.apex.y + fit.axis.y * t)
+}
+
 pub(crate) fn extents(
     mesh: &TriangleMesh,
     faces: &[u32],
@@ -981,41 +2039,43 @@ pub(crate) fn detect_circular_pattern(
     // whole part, and only the concentrated band (a gear's teeth, a lug
     // ring) carries the pattern. Keep the 10th..90th area-weighted
     // percentile window in height and radius.
-    let percentile_window = |key: fn(&(f64, f64, f64, f64)) -> f64,
-                             samples: &[(f64, f64, f64, f64)],
-                             total: f64| {
-        let mut sorted: Vec<(f64, f64)> = samples.iter().map(|s| (key(s), s.3)).collect();
-        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut cumulative = 0.0;
-        let mut low = sorted.first().map_or(0.0, |s| s.0);
-        let mut high = sorted.last().map_or(0.0, |s| s.0);
-        let mut low_set = false;
-        for (value, area) in &sorted {
-            cumulative += area;
-            if !low_set && cumulative >= 0.10 * total {
-                low = *value;
-                low_set = true;
+    let percentile_window =
+        |key: fn(&(f64, f64, f64, f64)) -> f64, samples: &[(f64, f64, f64, f64)], total: f64| {
+            let mut sorted: Vec<(f64, f64)> = samples.iter().map(|s| (key(s), s.3)).collect();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut cumulative = 0.0;
+            let mut low = sorted.first().map_or(0.0, |s| s.0);
+            let mut high = sorted.last().map_or(0.0, |s| s.0);
+            let mut low_set = false;
+            for (value, area) in &sorted {
+                cumulative += area;
+                if !low_set && cumulative >= 0.10 * total {
+                    low = *value;
+                    low_set = true;
+                }
+                if cumulative <= 0.90 * total {
+                    high = *value;
+                }
             }
-            if cumulative <= 0.90 * total {
-                high = *value;
-            }
-        }
-        (low, high)
-    };
+            (low, high)
+        };
     // Radius first, as a mode-centred window: the pattern band (teeth,
     // lugs) is the densest radius family, and percentiles would blur it
     // together with unexplained rings at other radii.
     const RADIUS_BINS: usize = 48;
     let r_min = samples.iter().map(|s| s.2).fold(f64::INFINITY, f64::min);
-    let r_max = samples.iter().map(|s| s.2).fold(f64::NEG_INFINITY, f64::max);
+    let r_max = samples
+        .iter()
+        .map(|s| s.2)
+        .fold(f64::NEG_INFINITY, f64::max);
     let span = (r_max - r_min).max(1e-9);
     let mut radius_histogram = [0.0f64; RADIUS_BINS];
     for &(_, _, radial, area) in &samples {
         let bin = (((radial - r_min) / span) * RADIUS_BINS as f64) as usize;
         radius_histogram[bin.min(RADIUS_BINS - 1)] += area;
     }
-    let peak = (0..RADIUS_BINS)
-        .max_by(|&a, &b| radius_histogram[a].total_cmp(&radius_histogram[b]))?;
+    let peak =
+        (0..RADIUS_BINS).max_by(|&a, &b| radius_histogram[a].total_cmp(&radius_histogram[b]))?;
     let floor = 0.2 * radius_histogram[peak];
     let mut low_bin = peak;
     while low_bin > 0 && radius_histogram[low_bin - 1] >= floor {
@@ -1114,6 +2174,12 @@ pub(crate) fn detect_circular_pattern(
             _ => break,
         }
     }
+    // Same cap tell as the ring counter: a detection AT the ladder's
+    // ceiling is the noise floor answering, and it has invented five
+    // sixths of a rebuild before.
+    if count >= MAX_COUNT {
+        return None;
+    }
     Some(PatternProposal {
         count,
         strength: scores[count],
@@ -1193,7 +2259,7 @@ pub fn reconstruct(
     alignment: &DatumAlignment,
     tolerance: f64,
     pattern: Option<PatternProposal>,
-    master_profile: Option<MasterProfile>,
+    master_profiles: Vec<MasterProfile>,
 ) -> ReconstructionPlan {
     let mut plan = ReconstructionPlan::default();
     // Gather profile evidence.
@@ -1209,8 +2275,7 @@ pub fn reconstruct(
     for feature in features {
         match &feature.surface {
             SurfaceClass::Cylinder(fit)
-                if fit.axis.z.abs() > 0.999
-                    && fit.axis_point.x.hypot(fit.axis_point.y) < 3.0 =>
+                if fit.axis.z.abs() > 0.999 && fit.axis_point.x.hypot(fit.axis_point.y) < 3.0 =>
             {
                 let (z0, z1, _, _) = extents(mesh, &feature.faces, alignment);
                 cylinders.push(AxisCylinder {
@@ -1248,7 +2313,8 @@ pub fn reconstruct(
             continue;
         }
         let mid = (z0 + z1) / 2.0;
-        let covering = |c: &&AxisCylinder| c.z0 - LEVEL_MERGE_TOL <= mid && mid <= c.z1 + LEVEL_MERGE_TOL;
+        let covering =
+            |c: &&AxisCylinder| c.z0 - LEVEL_MERGE_TOL <= mid && mid <= c.z1 + LEVEL_MERGE_TOL;
         let outer = cylinders
             .iter()
             .filter(|c| c.outward)
@@ -1328,6 +2394,31 @@ pub fn reconstruct(
                 if fit.axis.z.abs() > 0.999
                     && (fit.half_angle.to_degrees() - 45.0).abs() <= 3.0 =>
             {
+                // A datum chamfer is a ring about the datum: its cone's
+                // apex sits on the axis and its material runs the way
+                // around. A drilled hole's chamfer is ALSO a 45-degree
+                // cone parallel to Z — apex at the hole, material an
+                // arc — and without these two gates every lug hole on
+                // a wheel spacer becomes a phantom "chamfer ring" at
+                // the hole circle's diameter.
+                if fit.apex.x.hypot(fit.apex.y) > 2.0 {
+                    continue;
+                }
+                let mut bins = [false; 24];
+                let to_frame = &alignment.transform;
+                for &face in &feature.faces {
+                    let c = to_frame.apply_point(mesh.face_centroid(face as usize));
+                    if c.x.hypot(c.y) < 1.0 {
+                        continue;
+                    }
+                    let angle = c.y.atan2(c.x);
+                    let bin =
+                        ((angle + std::f64::consts::PI) / std::f64::consts::TAU * 24.0) as usize;
+                    bins[bin.min(23)] = true;
+                }
+                if bins.iter().filter(|filled| **filled).count() < 8 {
+                    continue;
+                }
                 let (z0, z1, r0, r1) = extents(mesh, &feature.faces, alignment);
                 plan.chamfers.push(ChamferProposal {
                     distance: z1 - z0,
@@ -1339,7 +2430,7 @@ pub fn reconstruct(
         }
     }
     plan.pattern = pattern;
-    plan.master_profile = master_profile;
+    plan.master_profiles = master_profiles;
     if let Some(pattern) = &plan.pattern {
         plan.notes.push(format!(
             "unexplained band (z {:.1}..{:.1}, d {:.1}..{:.1}) repeats {} times around the axis \
@@ -1400,6 +2491,85 @@ pub fn plan_to_history_json(plan: &ReconstructionPlan) -> String {
             segment.z1 - segment.z0
         ));
     }
+    // The tree comes first in the replay: it says what order the
+    // operations below must be applied in, and what each one does.
+    if !plan.tree.steps.is_empty() {
+        separate(&mut out);
+        out.push_str("{\"type\":\"feature_tree\",\"steps\":[");
+        for (order, step) in plan.tree.steps.iter().enumerate() {
+            if order > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"order\":{},\"role\":\"{}\",\"operation\":\"{}\",\"index\":{}}}",
+                order + 1,
+                step.role.label(),
+                step.operation,
+                step.index
+            ));
+        }
+        out.push_str("]}");
+    }
+    for instance in &plan.instances.extrusions {
+        separate(&mut out);
+        out.push_str(&format!(
+            "{{\"type\":\"extrude_instance_proposal\",\"direction\":[{:.6},{:.6},{:.6}],\"draft_deg\":{:.4},\"span\":[{:.6},{:.6}],\"area\":{:.3},\"residual\":{:.5},",
+            instance.direction.x,
+            instance.direction.y,
+            instance.direction.z,
+            instance.draft_deg,
+            instance.span.0,
+            instance.span.1,
+            instance.area,
+            instance.residual
+        ));
+        out.push_str("\"sketch_lines\":[");
+        for (index, line) in instance.lines.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"from\":[{:.6},{:.6}],\"to\":[{:.6},{:.6}],\"feature\":{}}}",
+                line.from.0, line.from.1, line.to.0, line.to.1, line.feature
+            ));
+        }
+        out.push_str("],\"sketch_circles\":[");
+        for (index, circle) in instance.circles.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"center\":[{:.6},{:.6}],\"radius\":{:.6},\"arc_fraction\":{:.4},\"feature\":{}}}",
+                circle.center.0, circle.center.1, circle.radius, circle.arc_fraction, circle.feature
+            ));
+        }
+        out.push_str(&format!("],\"members\":{:?}}}", instance.members));
+    }
+    for instance in &plan.instances.revolves {
+        separate(&mut out);
+        out.push_str(&format!(
+            "{{\"type\":\"revolve_instance_proposal\",\"axis_point\":[{:.6},{:.6},{:.6}],\"axis\":[{:.6},{:.6},{:.6}],\"area\":{:.3},\"residual\":{:.5},",
+            instance.axis_point.x,
+            instance.axis_point.y,
+            instance.axis_point.z,
+            instance.axis.x,
+            instance.axis.y,
+            instance.axis.z,
+            instance.area,
+            instance.residual
+        ));
+        out.push_str("\"profile\":[");
+        for (index, run) in instance.profile.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"from\":[{:.6},{:.6}],\"to\":[{:.6},{:.6}],\"feature\":{}}}",
+                run.from.0, run.from.1, run.to.0, run.to.1, run.feature
+            ));
+        }
+        out.push_str(&format!("],\"members\":{:?}}}", instance.members));
+    }
     for fillet in &plan.fillets {
         separate(&mut out);
         out.push_str(&format!(
@@ -1432,7 +2602,7 @@ pub fn plan_to_history_json(plan: &ReconstructionPlan) -> String {
             pattern.area
         ));
     }
-    if let Some(profile) = &plan.master_profile {
+    for profile in &plan.master_profiles {
         separate(&mut out);
         out.push_str(&format!(
             "{{\"type\":\"helical_sweep_pattern_proposal\",\"count\":{},\"helix_rate\":{:.8},\"z_range\":[{:.6},{:.6}],\"profile\":[",
@@ -1454,7 +2624,66 @@ pub fn plan_to_history_json(plan: &ReconstructionPlan) -> String {
 }
 
 pub fn plan_summary(plan: &ReconstructionPlan) -> String {
-    let mut out = String::new();
+    let mut instances_out = String::new();
+    if !plan.instances.extrusions.is_empty()
+        || !plan.instances.revolves.is_empty()
+        || plan.instances.refused > 0
+    {
+        instances_out.push_str(&format!(
+            "feature instances: {} extrusion(s), {} revolve(s){}\n",
+            plan.instances.extrusions.len(),
+            plan.instances.revolves.len(),
+            if plan.instances.refused > 0 {
+                format!(
+                    " ({} group(s) refused by the kinematic fit)",
+                    plan.instances.refused
+                )
+            } else {
+                String::new()
+            }
+        ));
+        if !plan.instances.refused_residuals.is_empty() {
+            let residuals = &plan.instances.refused_residuals;
+            instances_out.push_str(&format!(
+                "  refused on residual alone: {} group(s), best {:.3} mm, median {:.3} mm\n",
+                residuals.len(),
+                residuals[0],
+                residuals[residuals.len() / 2]
+            ));
+        }
+        for instance in plan.instances.extrusions.iter().take(6) {
+            instances_out.push_str(&format!(
+                "  extrude along ({:+.3} {:+.3} {:+.3}), draft {:.2} deg, {:.1} mm deep:                  {} surface(s), {:.0} mm^2, sketch {} line(s) + {} circle(s), residual {:.3}\n",
+                instance.direction.x,
+                instance.direction.y,
+                instance.direction.z,
+                instance.draft_deg,
+                instance.span.1 - instance.span.0,
+                instance.members.len(),
+                instance.area,
+                instance.lines.len(),
+                instance.circles.len(),
+                instance.residual
+            ));
+        }
+        for instance in plan.instances.revolves.iter().take(6) {
+            instances_out.push_str(&format!(
+                "  revolve about ({:+.3} {:+.3} {:+.3}) through ({:+.1} {:+.1} {:+.1}):                  {} surface(s), {:.0} mm^2, {} profile run(s), residual {:.3}\n",
+                instance.axis.x,
+                instance.axis.y,
+                instance.axis.z,
+                instance.axis_point.x,
+                instance.axis_point.y,
+                instance.axis_point.z,
+                instance.members.len(),
+                instance.area,
+                instance.profile.len(),
+                instance.residual
+            ));
+        }
+    }
+    let mut out = crate::tree::tree_summary(&plan.tree);
+    out.push_str(&instances_out);
     if plan.segments.is_empty() && plan.fillets.is_empty() && plan.chamfers.is_empty() {
         return out;
     }
@@ -1504,12 +2733,14 @@ pub fn plan_summary(plan: &ReconstructionPlan) -> String {
             pattern.count, pattern.strength
         ));
     }
-    if let Some(profile) = &plan.master_profile {
+    for profile in &plan.master_profiles {
         let radii: Vec<f64> = profile.points.iter().map(|(_, r)| *r).collect();
         let low = radii.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let high = radii.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         out.push_str(&format!(
-            "  master profile: {} points, d {:.2}..{:.2}, helical sweep rate {:.4} rad/mm\n",
+            "  master profile (feature #{}): x {}, {} points, d {:.2}..{:.2}, sweep rate {:.4} rad/mm\n",
+            profile.feature_id,
+            profile.count,
             profile.points.len(),
             low * 2.0,
             high * 2.0,
@@ -1528,6 +2759,318 @@ pub fn plan_summary(plan: &ReconstructionPlan) -> String {
     out
 }
 
+/// Collapses chains of coaxial surfaces that together trace a circular
+/// arc back into the single fillet they came from.
+///
+/// A narrow band of a torus is fitted very well by a cone, so a fillet
+/// sliced into concentric strips is not a failure any single fit can
+/// detect — every strip is a genuinely good cone, RANSAC and the region
+/// pass both accept them, and no blend is ever proposed. On the gear the
+/// rim bullnose came back as cones of half-angle 9.86, 9.44 and 9.24
+/// degrees with their apexes marching up the axis, which is exactly the
+/// signature of one curved surface cut into rings: the slope changes a
+/// little at a time and the apex slides. The recognised fillet beside
+/// them held 122 of the 1,132 mm² its own revolution covers; the other
+/// 89 percent was in the strips.
+///
+/// So the test has to be made over a *chain*, not a surface. In profile
+/// space a cylinder is a vertical segment, a cone a slanted one and a
+/// level plane a horizontal one; abutting segments that all lie on one
+/// circle are one arc, and the arc is the fillet. The line-versus-arc
+/// judgement already exists for the edge-round bucket — these strips
+/// never reach it precisely because they fitted.
+pub fn unify_blend_chains(
+    mesh: &TriangleMesh,
+    features: &mut Vec<FeatureRecord>,
+    alignment: &DatumAlignment,
+    tolerance: f64,
+) -> Vec<String> {
+    /// Profile-space gap (mm) across which two segments still abut.
+    const JOIN_REACH: f64 = 1.2;
+    /// A blend outside this range of radii is not a round-over.
+    const MIN_RADIUS: f64 = 0.3;
+    const MAX_RADIUS: f64 = 15.0;
+    /// The arc must actually turn; below this it is a straight segment
+    /// that a huge circle happens to pass through.
+    const MIN_SWEEP_DEG: f64 = 20.0;
+    /// ...and it must stop turning. Past a half-round the arc has wrapped
+    /// its own circle and is no longer a round-over: a chain that reported
+    /// 360 degrees had swallowed eight of the dog ring's flat lands.
+    const MAX_SWEEP_DEG: f64 = 190.0;
+    /// Chains below this area are not worth rewriting.
+    const MIN_CHAIN_AREA: f64 = 40.0;
+    /// The share of a round's own arc a single strip may cover. A strip
+    /// is by definition part of the arc; the faces a round *joins* are
+    /// not, and without this a plate and the boss standing on it chain
+    /// straight through their own fillet and are rewritten as one.
+    const MEMBER_SPAN: f64 = 0.8;
+    let axis = Vector3::new(0.0, 0.0, 1.0);
+    let origin = Point3::default();
+    // Rounds already recognized, in profile space. A partial fillet and
+    // the strips around it are usually the SAME round: the recognizer
+    // caught a tenth of the gear's bullnose and the rest fitted as cones
+    // beside it. When a chain's circle agrees with one of these, the two
+    // are merged rather than one rejecting the other.
+    let known: Vec<(usize, f64, f64, f64)> = features
+        .iter()
+        .enumerate()
+        .filter_map(|(index, feature)| match &feature.surface {
+            SurfaceClass::Blend(fit) if fit.axis.z.abs() > 0.999 => {
+                Some((index, fit.major_radius, fit.axis_point.z, fit.minor_radius))
+            }
+            _ => None,
+        })
+        .collect();
+    // Profile-space segments of every axis-true surface.
+    struct Segment {
+        index: usize,
+        ends: [(f64, f64); 2],
+        area: f64,
+    }
+    let mut segments: Vec<Segment> = Vec::new();
+    for (index, feature) in features.iter().enumerate() {
+        let axis_true = match &feature.surface {
+            SurfaceClass::Cylinder(fit) => {
+                fit.axis.z.abs() > 0.999 && fit.axis_point.x.hypot(fit.axis_point.y) < 3.0
+            }
+            SurfaceClass::Cone(fit) => fit.axis.z.abs() > 0.999,
+            SurfaceClass::Plane(fit) => fit.normal.z.abs() > 0.999,
+            _ => false,
+        };
+        if !axis_true {
+            continue;
+        }
+        // Take the ends from the samples themselves. A bounding box in
+        // (radius, height) cannot say which radius belongs to which
+        // height, so a cone that narrows as it rises gets its segment
+        // drawn backwards and abuts nothing.
+        let stride = (feature.faces.len() / 400).max(1);
+        let profile: Vec<(f64, f64)> = feature
+            .faces
+            .iter()
+            .step_by(stride)
+            .flat_map(|&face| mesh.triangle_points(face as usize))
+            .map(|corner| {
+                let p = alignment.transform.apply_point(corner);
+                (p.x.hypot(p.y), p.z)
+            })
+            .collect();
+        if profile.len() < 3 {
+            continue;
+        }
+        let mut ends = [profile[0], profile[0]];
+        let mut widest = -1.0;
+        for a in &profile {
+            for b in &profile {
+                let span = (a.0 - b.0).hypot(a.1 - b.1);
+                if span > widest {
+                    widest = span;
+                    ends = [*a, *b];
+                }
+            }
+        }
+        segments.push(Segment {
+            index,
+            ends,
+            area: feature.area,
+        });
+    }
+    // Chain segments whose ends meet.
+    let touching = |a: &Segment, b: &Segment| {
+        a.ends.iter().any(|p| {
+            b.ends
+                .iter()
+                .any(|q| (p.0 - q.0).hypot(p.1 - q.1) <= JOIN_REACH)
+        })
+    };
+    let mut used = vec![false; segments.len()];
+    let mut notes = Vec::new();
+    let mut consumed: Vec<usize> = Vec::new();
+    let mut additions: Vec<FeatureRecord> = Vec::new();
+    for seed in 0..segments.len() {
+        if used[seed] {
+            continue;
+        }
+        // Grow the chain one strip at a time and keep it only while the
+        // arc still holds. Adjacency alone is transitive and would sweep
+        // every coaxial surface on the part into one chain that fits no
+        // circle at all — the same trap the frame grouping fell into.
+        let sample = |chain: &[usize]| -> Vec<Point3> {
+            chain
+                .iter()
+                .flat_map(|&slot| features[segments[slot].index].faces.iter().copied())
+                .flat_map(|face| mesh.triangle_points(face as usize))
+                .map(|corner| alignment.transform.apply_point(corner))
+                .collect()
+        };
+        let mut chain = vec![seed];
+        used[seed] = true;
+        let mut held: Option<crate::fit::RevolvedBlendFit> = None;
+        loop {
+            let mut best: Option<(usize, f64, crate::fit::RevolvedBlendFit)> = None;
+            for candidate in 0..segments.len() {
+                if used[candidate]
+                    || !chain
+                        .iter()
+                        .any(|&member| touching(&segments[member], &segments[candidate]))
+                {
+                    continue;
+                }
+                let mut trial = chain.clone();
+                trial.push(candidate);
+                let Some(fit) = crate::fit::fit_revolved_blend(&sample(&trial), origin, axis)
+                else {
+                    continue;
+                };
+                if fit.deviation.rms > tolerance
+                    || !(MIN_RADIUS..=MAX_RADIUS).contains(&fit.minor_radius)
+                {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, rms, _)| fit.deviation.rms < *rms)
+                {
+                    best = Some((candidate, fit.deviation.rms, fit));
+                }
+            }
+            let Some((candidate, _, fit)) = best else {
+                break;
+            };
+            used[candidate] = true;
+            chain.push(candidate);
+            held = Some(fit);
+        }
+        let Some(fit) = held else {
+            // Nothing joined it; let it seed nothing and stay as it is.
+            continue;
+        };
+        if chain.len() < 2 {
+            continue;
+        }
+        let area: f64 = chain.iter().map(|&slot| segments[slot].area).sum();
+        if area < MIN_CHAIN_AREA {
+            for &slot in &chain[1..] {
+                used[slot] = false;
+            }
+            continue;
+        }
+        let faces: Vec<u32> = chain
+            .iter()
+            .flat_map(|&slot| features[segments[slot].index].faces.iter().copied())
+            .collect();
+        let points = sample(&chain);
+        // Does it turn? A straight run of cones lies on an enormous
+        // circle just as well as on a line, and rewriting it as a fillet
+        // would be a lie told within tolerance.
+        let sweep = points
+            .iter()
+            .map(|p| {
+                let v = *p - fit.axis_point;
+                let h = v.dot(axis);
+                let radial = (v - axis * h).length();
+                (h).atan2(radial - fit.major_radius)
+            })
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), angle| {
+                (low.min(angle), high.max(angle))
+            });
+        let turn = (sweep.1 - sweep.0).to_degrees();
+        // A strip may only be a fraction of the arc it belongs to. Judged
+        // against the arc's own length rather than its radius, this is
+        // what keeps a plate and the boss standing on it from chaining
+        // straight through their fillet and being rewritten as one.
+        let arc = fit.minor_radius * (sweep.1 - sweep.0).abs();
+        let too_long = chain.iter().any(|&slot| {
+            let ends = segments[slot].ends;
+            (ends[0].0 - ends[1].0).hypot(ends[0].1 - ends[1].1) > MEMBER_SPAN * arc
+        });
+        if too_long || !(MIN_SWEEP_DEG..=MAX_SWEEP_DEG).contains(&turn) {
+            for &slot in &chain[1..] {
+                used[slot] = false;
+            }
+            continue;
+        }
+        // Merge in any partial fillet that agrees with this circle: it is
+        // the same round, found twice.
+        let absorbed: Vec<usize> = known
+            .iter()
+            .filter(|&&(_, major, height, minor)| {
+                (major - fit.major_radius).hypot(height - fit.axis_point.z) <= fit.minor_radius
+                    && (minor - fit.minor_radius).abs() <= 0.5 * fit.minor_radius
+            })
+            .map(|&(index, ..)| index)
+            .collect();
+        let mut faces = faces;
+        let mut area = area;
+        let mut fit = fit;
+        if !absorbed.is_empty() {
+            for &index in &absorbed {
+                faces.extend(features[index].faces.iter().copied());
+                area += features[index].area;
+            }
+            let joined: Vec<Point3> = faces
+                .iter()
+                .flat_map(|&face| mesh.triangle_points(face as usize))
+                .map(|corner| alignment.transform.apply_point(corner))
+                .collect();
+            match crate::fit::fit_revolved_blend(&joined, origin, axis) {
+                Some(better) if better.deviation.rms <= tolerance => fit = better,
+                // The union does not hold as one circle after all.
+                _ => {
+                    for &slot in &chain[1..] {
+                        used[slot] = false;
+                    }
+                    continue;
+                }
+            }
+        }
+        let labels: Vec<String> = chain
+            .iter()
+            .map(|&slot| crate::finalize::feature_label(&features[segments[slot].index].surface))
+            .collect();
+        notes.push(format!(
+            "fillet r {:.2} recovered from {} coaxial strip(s){} ({}) spanning {:.0} deg, rms {:.3}",
+            fit.minor_radius,
+            chain.len(),
+            if absorbed.is_empty() {
+                String::new()
+            } else {
+                format!(" merged with {} partial fillet(s)", absorbed.len())
+            },
+            labels.join(" + "),
+            turn,
+            fit.deviation.rms
+        ));
+        additions.push(FeatureRecord {
+            id: 0,
+            surface: SurfaceClass::Blend(fit),
+            face_count: faces.len(),
+            area,
+            faces,
+            notes: vec![format!(
+                "one fillet, re-read from {} coaxial strips that each fitted as a \
+                 separate surface",
+                chain.len()
+            )],
+        });
+        consumed.extend(chain.iter().map(|&slot| segments[slot].index));
+        consumed.extend(absorbed);
+    }
+    if additions.is_empty() {
+        return notes;
+    }
+    let drop: std::collections::HashSet<usize> = consumed.into_iter().collect();
+    let mut kept: Vec<FeatureRecord> = Vec::new();
+    for (index, feature) in features.drain(..).enumerate() {
+        if !drop.contains(&index) {
+            kept.push(feature);
+        }
+    }
+    kept.extend(additions);
+    *features = kept;
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1542,8 +3085,7 @@ mod tests {
         for triangle in soup.iter_mut() {
             for point in triangle.iter_mut() {
                 let quantize = |v: f64| (v * 512.0).round() as i64 as u64;
-                let mut seed = quantize(point.x)
-                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                let mut seed = quantize(point.x).wrapping_mul(0x9e37_79b9_7f4a_7c15)
                     ^ quantize(point.y).wrapping_mul(0xbf58_476d_1ce4_e5b9)
                     ^ quantize(point.z).wrapping_mul(0x94d0_49bb_1331_11eb);
                 seed ^= seed >> 31;
@@ -1589,7 +3131,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(cylinders.len(), 1, "arcs did not stitch: {}", cylinders.len());
+        assert_eq!(
+            cylinders.len(),
+            1,
+            "arcs did not stitch: {}",
+            cylinders.len()
+        );
         assert!((cylinders[0].1.radius - 15.0).abs() < 0.05);
         assert!(
             report
@@ -1655,7 +3202,10 @@ mod tests {
             plan.segments[0].outer_radius
         );
         assert_eq!(plan.fillets.len(), 1);
-        assert!(plan.fillets[0].matched_corner, "fillet not tied to a corner");
+        assert!(
+            plan.fillets[0].matched_corner,
+            "fillet not tied to a corner"
+        );
         let history = plan_to_history_json(plan);
         assert!(history.contains("\"type\":\"make_revolved_annulus\""));
         assert!(history.contains("\"kind\":\"fillet\""));
@@ -1736,11 +3286,19 @@ mod tests {
             })
             .collect();
         assert_eq!(cylinders.len(), 1);
-        assert!((cylinders[0].1.radius - 15.0).abs() < 0.02, "radius {}", cylinders[0].1.radius);
+        assert!(
+            (cylinders[0].1.radius - 15.0).abs() < 0.02,
+            "radius {}",
+            cylinders[0].1.radius
+        );
         assert_eq!(cylinders[0].0.face_count, arc_face_count);
         // The disk faces point axially, not radially, and must stay put.
-        assert!(features.iter().any(|f| matches!(f.surface, SurfaceClass::Freeform)
-            && f.face_count == mesh.triangles().len() - arc_face_count));
+        assert!(
+            features
+                .iter()
+                .any(|f| matches!(f.surface, SurfaceClass::Freeform)
+                    && f.face_count == mesh.triangles().len() - arc_face_count)
+        );
     }
 
     #[test]
@@ -1760,8 +3318,8 @@ mod tests {
                     (triangle[0].y + triangle[1].y + triangle[2].y) / 3.0,
                     0.0,
                 );
-                let angle = (c.y.atan2(c.x) + std::f64::consts::PI)
-                    .rem_euclid(std::f64::consts::TAU);
+                let angle =
+                    (c.y.atan2(c.x) + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
                 if angle >= start && angle < start + std::f64::consts::TAU / 18.0 {
                     soup.push(*triangle);
                 }
@@ -1822,7 +3380,11 @@ mod tests {
         );
         assert!(cones[0].axis.z.abs() > 1.0 - 1e-9);
         // Apex where rho = 20 + 0.5 z crosses zero: z = -40.
-        assert!((cones[0].apex.z - -40.0).abs() < 0.5, "apex {}", cones[0].apex.z);
+        assert!(
+            (cones[0].apex.z - -40.0).abs() < 0.5,
+            "apex {}",
+            cones[0].apex.z
+        );
     }
 
     #[test]
@@ -1861,7 +3423,11 @@ mod tests {
             .as_ref()
             .and_then(|p| p.pattern)
             .expect("pattern detected");
-        assert_eq!(pattern.count, 12, "count {} strength {}", pattern.count, pattern.strength);
+        assert_eq!(
+            pattern.count, 12,
+            "count {} strength {}",
+            pattern.count, pattern.strength
+        );
         assert!(pattern.strength > 0.5);
         // The twelve identical lugs must also unify into one master-pattern
         // feature with a tight fold residual.
@@ -1883,7 +3449,7 @@ mod tests {
         let profile = report
             .plan
             .as_ref()
-            .and_then(|p| p.master_profile.as_ref())
+            .and_then(|p| p.master_profiles.first())
             .expect("master profile present");
         assert_eq!(profile.count, 12);
         assert!(profile.points.len() >= 4, "{} points", profile.points.len());
