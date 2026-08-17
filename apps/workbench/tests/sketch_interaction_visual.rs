@@ -265,12 +265,6 @@ fn three_point_arc_tab_sweep_validation_snapshot() {
     assert!(readouts[0].value.is_finite() && readouts[0].value > 0.0);
     assert_eq!(readouts[1].kind, SketchDimensionKind::SweepDegrees);
     assert!(readouts[1].editable);
-    assert!(
-        harness
-            .query_all_by_label("Sweep must be greater than 0 and less than 360 degrees")
-            .count()
-            >= 1
-    );
     settle_hover_snapshot(
         &mut harness,
         "workbench_three_point_arc_tab_sweep_validation_1040",
@@ -328,7 +322,9 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
 }
 
 /// The reported symptom, as pixels: typing a new width shows one rectangle at
-/// the typed size, not a red original beside a green replacement.
+/// the typed size, not a red original beside a green replacement. A plain
+/// rectangle's width is a dimension of its own geometry, so it is typed
+/// through the dimension tool on the canvas — no panel field carries it.
 #[test]
 fn typed_dimension_live_preview_snapshot() {
     let mut harness = harness();
@@ -337,11 +333,16 @@ fn typed_dimension_live_preview_snapshot() {
     click_sketch_point(&mut harness, SketchPoint::new(-2.0, -1.5));
     click_sketch_point(&mut harness, SketchPoint::new(2.0, 1.5));
 
-    click_button(&mut harness, "Select sketch geometry");
+    click_button(&mut harness, "Sketch dimension");
     click_sketch_point(&mut harness, SketchPoint::new(0.0, 1.5));
-    harness.get_by_label("SELECTED FEATURE");
+    assert!(
+        harness
+            .get_by_role_and_label(Role::TextInput, "Rectangle width")
+            .is_focused(),
+        "picking the top edge arms the caret on the width box"
+    );
 
-    replace_tool_input(&mut harness, "Width", "6");
+    replace_tool_input(&mut harness, "Rectangle width", "6");
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
     assert!(!harness.state().operation_confirmation_pending());
     settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1040");

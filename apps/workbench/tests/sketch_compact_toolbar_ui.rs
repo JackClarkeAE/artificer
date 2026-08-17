@@ -1,3 +1,7 @@
+use artificer_sketch_ui::sketch_toolbar::{
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
+    ROW_GAP,
+};
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
 use egui::accesskit::Role;
 use egui_kittest::{
@@ -59,15 +63,21 @@ fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     click_button(harness, "XY Plane");
     click_button(harness, "Sketch mode");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
-    click_button(harness, "Properties");
+    // No palette to raise: the sketch workspace has none. The active tool is
+    // the lit ribbon tile and the canvas instruction line.
 }
 
 fn choose_variant(harness: &mut Harness<'static, KernelLabApp>, chooser: &str, variant: &str) {
     click_button(harness, chooser);
     click_button(harness, variant);
     assert!(
-        harness.query_all_by_label(variant).count() >= 2,
-        "{variant} should be visible both as the primary icon action and in the ACTIVE TOOL palette"
+        harness.query_all_by_label(variant).count() >= 1,
+        "{variant} must remain reachable as the family's primary action after being chosen"
+    );
+    assert_eq!(
+        harness.state().active_sketch_tool_label(),
+        variant,
+        "choosing a variant must actually drive the active tool, not just close the menu"
     );
 }
 
@@ -75,13 +85,30 @@ fn canvas_point(harness: &Harness<'static, KernelLabApp>, offset: egui::Vec2) ->
     harness.get_by_label("Sketch viewport").rect().center() + offset
 }
 
+/// Click the sketch canvas at `offset` from the current viewport centre.
+///
+/// Resolved at click time because the parameter panel reserves width only
+/// while the armed tool has input fields, and the canvas is centre-anchored:
+/// a tool switch that changes panel visibility shifts the whole drawing
+/// sideways. A screen position cached across such a switch aims at where the
+/// geometry used to draw, not where it is.
+fn click_canvas(harness: &mut Harness<'static, KernelLabApp>, offset: egui::Vec2) {
+    let position = canvas_point(harness, offset);
+    click_at(harness, position);
+}
+
 #[test]
 fn compact_dropdown_variants_drive_the_active_tool_palette_at_minimum_size() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
 
-    harness.get_by_label("ACTIVE TOOL");
-    assert!(harness.query_all_by_label("Select sketch geometry").count() >= 2);
+    // The palette that used to name the active tool is gone; the tile itself
+    // carries it, and the canvas says what to do next.
+    assert_eq!(
+        harness.state().active_sketch_tool_label(),
+        "Select sketch geometry"
+    );
+    assert!(harness.query_all_by_label("Select sketch geometry").count() >= 1);
 
     choose_variant(
         &mut harness,
@@ -154,14 +181,20 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
         for (column, label) in row.into_iter().enumerate() {
             let rect = harness.get_by_role_and_label(Role::Button, label).rect();
             assert!(rect.is_positive(), "{label} must have a hit target");
+            // A family with variants yields the chooser column; one without owns
+            // the full tile. Both are complete — neither is squeezed by the
+            // ribbon running out of width, which is what this guards.
+            let split_width = PRIMARY_CELL_WIDTH - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET;
             assert!(
-                (rect.width() - 30.0).abs() <= 0.1 && (rect.height() - 30.0).abs() <= 0.1,
-                "{label} must remain a complete 30 px square: {rect:?}"
+                ((rect.width() - PRIMARY_CELL_WIDTH).abs() <= 0.1
+                    || (rect.width() - split_width).abs() <= 0.1)
+                    && (rect.height() - PRIMARY_CELL_SIZE).abs() <= 0.1,
+                "{label} must remain a complete tile: {rect:?}"
             );
             assert_eq!(rect.center().y, first.center().y, "{label} row drifted");
             assert_eq!(
                 rect.left(),
-                first.left() + column as f32 * 34.0,
+                first.left() + column as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
                 "{label} column drifted"
             );
             assert!(
@@ -178,7 +211,7 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
                 .rect()
                 .center()
                 .y;
-            assert_eq!(first.center().y - first_row_y, 32.0);
+            assert_eq!(first.center().y - first_row_y, PRIMARY_CELL_SIZE + ROW_GAP);
         }
     }
 
@@ -222,13 +255,21 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
         let chooser = harness
             .get_by_role_and_label(Role::Button, chooser_label)
             .rect();
-        assert_eq!(chooser.size(), egui::vec2(12.0, 12.0));
-        assert!(
-            primary.contains_rect(chooser),
-            "{chooser_label} escaped its family tile"
+        assert_eq!(
+            chooser.size(),
+            egui::vec2(
+                CHEVRON_CELL_WIDTH,
+                PRIMARY_CELL_SIZE - CHEVRON_CELL_INSET * 2.0
+            )
         );
-        assert!(chooser.right() < primary.right());
-        assert!(chooser.bottom() < primary.bottom());
+        // The chooser sits beside the primary, not on top of it. It used to be a
+        // square in the corner overlapping the icon, so the invariant that
+        // matters is that these two rects are disjoint.
+        assert!(
+            chooser.left() >= primary.right(),
+            "{chooser_label} overlaps its own tool button"
+        );
+        assert_eq!(chooser.top(), primary.top() + CHEVRON_CELL_INSET);
     }
 }
 
@@ -256,10 +297,16 @@ fn compound_rectangle_commits_at_its_final_click_and_keeps_the_toolbar_live() {
             .is_disabled(),
         "drawing must not lock the toolbar; the next tool is one click away"
     );
+    // Finishing and leaving a sketch are ribbon commands in COMPLETE now, not a
+    // square tick and cross on a rail. What still has to hold is that both stay
+    // pressable while a draft is in progress.
     for label in ["Finish sketch", "Exit sketch"] {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
-        assert_eq!(rect.width(), rect.height(), "{label} must stay square");
-        assert!((24.0..=30.0).contains(&rect.width()), "{label}: {rect:?}");
+        assert!(rect.is_positive(), "{label} must have a hit region");
+        assert!(
+            rect.width() >= 24.0 && rect.height() >= 24.0,
+            "{label} is below the minimum hit target: {rect:?}"
+        );
     }
 
     // Escape abandons the draft without consuming a revision.
@@ -375,12 +422,15 @@ fn analytic_fillet_and_maximum_rectangular_pattern_commit_as_complete_strokes() 
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
 
+    // The drawn corner sits at the view centre, so every canvas anchor below
+    // is an offset from the centre resolved when the click lands — Select has
+    // no input fields, so arming it drops the parameter panel and re-centres
+    // the drawing under the seed click.
     click_button(&mut harness, "Single line");
-    let corner = canvas_point(&harness, egui::Vec2::ZERO);
-    click_at(&mut harness, corner + egui::vec2(-100.0, 0.0));
-    click_at(&mut harness, corner);
-    click_at(&mut harness, corner);
-    click_at(&mut harness, corner + egui::vec2(0.0, -100.0));
+    click_canvas(&mut harness, egui::vec2(-100.0, 0.0));
+    click_canvas(&mut harness, egui::Vec2::ZERO);
+    click_canvas(&mut harness, egui::Vec2::ZERO);
+    click_canvas(&mut harness, egui::vec2(0.0, -100.0));
     assert_eq!(harness.state().sketch_entity_count(), 2);
     assert_eq!(harness.state().sketch_revision(), 2);
 
@@ -388,15 +438,15 @@ fn analytic_fillet_and_maximum_rectangular_pattern_commit_as_complete_strokes() 
     // two trimmed lines plus the arc replace the sharp corner.
     click_button(&mut harness, "2D fillet");
     replace_tool_input(&mut harness, "Fillet radius", "0.4");
-    click_at(&mut harness, corner + egui::vec2(-50.0, 0.0));
-    click_at(&mut harness, corner + egui::vec2(0.0, -50.0));
+    click_canvas(&mut harness, egui::vec2(-50.0, 0.0));
+    click_canvas(&mut harness, egui::vec2(0.0, -50.0));
     assert!(harness.state().pending_operation_label().is_none());
     assert_eq!(harness.state().sketch_entity_count(), 3);
     assert_eq!(harness.state().sketch_revision(), 3);
 
     // Seed the pattern from the vertical leg explicitly.
     click_button(&mut harness, "Select sketch geometry");
-    click_at(&mut harness, corner + egui::vec2(0.0, -50.0));
+    click_canvas(&mut harness, egui::vec2(0.0, -50.0));
     click_button(&mut harness, "Rectangular sketch pattern");
     replace_tool_input(&mut harness, "First count", "16");
     replace_tool_input(&mut harness, "First spacing", "0.25");
@@ -406,7 +456,7 @@ fn analytic_fillet_and_maximum_rectangular_pattern_commit_as_complete_strokes() 
     harness.run();
     replace_tool_input(&mut harness, "Second count", "16");
     replace_tool_input(&mut harness, "Second spacing", "-0.25");
-    click_at(&mut harness, corner + egui::vec2(80.0, 0.0));
+    click_canvas(&mut harness, egui::vec2(80.0, 0.0));
 
     // The bounded 16x16 placement commits all 255 generated instances.
     assert!(harness.state().pending_operation_label().is_none());

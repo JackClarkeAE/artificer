@@ -155,7 +155,10 @@ impl WorkbenchTheme {
 /// reason to know about application state, and a `Relaxed` load of a `u8` is
 /// cheaper than the plumbing would be. Changing it is a user action, so no
 /// ordering between the write and the next frame's reads is required.
-static ACTIVE_THEME: AtomicU8 = AtomicU8::new(0);
+/// The theme in force. Dark is the default: a CAD viewport is a lit object on a
+/// dark ground, and a light chrome around it makes the model the dimmer half of
+/// its own window.
+static ACTIVE_THEME: AtomicU8 = AtomicU8::new(1);
 
 #[must_use]
 pub fn active_theme() -> WorkbenchTheme {

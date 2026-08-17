@@ -341,7 +341,7 @@ fn feature_timeline_changes_only_after_committed_sketch_and_extrusion_edits() {
             .is_some()
     );
 
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     assert_eq!(harness.state().feature_timeline_entries(), sketch_timeline);
 
     assert!(harness.state().sketch_finished());

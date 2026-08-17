@@ -180,7 +180,7 @@ fn reloaded_rectangle_is_dimensionable() {
     let mut source = harness();
     enter_xy_sketch(&mut source);
     create_two_point_rectangle(&mut source);
-    click_button(&mut source, "Finish sketch command");
+    click_button(&mut source, "Finish sketch");
     let saved = source.state().native_document_json().unwrap();
 
     let mut restored = harness();
@@ -256,11 +256,11 @@ fn circle_diameter_edits_on_the_canvas_without_losing_the_caret() {
     );
 }
 
-/// The honest negative. A plain line measures itself: nothing in its recipe
-/// drives that number, so its boxes stay labels — and the canvas says so
-/// instead of leaving the tool looking broken.
+/// A line stores two points, so its length and angle are derived on the way out
+/// and turned back into an end point on the way in. Driving the length has to
+/// move the end and leave the start where it was.
 #[test]
-fn line_without_a_driving_literal_stays_a_label() {
+fn line_length_is_driven_and_moves_only_the_end_point() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     click_button(&mut harness, "Single line");
@@ -272,11 +272,21 @@ fn line_without_a_driving_literal_stays_a_label() {
     assert!(
         harness
             .query_by_role_and_label(Role::TextInput, LENGTH_BOX)
-            .is_none(),
-        "a line's length is measured, not driven"
+            .is_some(),
+        "clicking a line with the dimension tool must offer its length to type into"
     );
+    let editor = harness
+        .state()
+        .selected_sketch_recipe_editor()
+        .expect("the line stays selected");
+    let keys = editor
+        .parameters
+        .iter()
+        .map(|parameter| parameter.stable_key)
+        .collect::<Vec<_>>();
     assert_eq!(
-        harness.state().sketch_canvas_instruction(),
-        "This feature has no driving dimension · see SELECTED FEATURE"
+        keys,
+        vec!["length", "angle"],
+        "a line is drivable by exactly the two numbers that define it"
     );
 }

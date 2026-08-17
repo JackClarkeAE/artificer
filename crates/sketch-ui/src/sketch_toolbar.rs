@@ -10,14 +10,42 @@ use std::array;
 use std::f32::consts::{PI, TAU};
 
 use egui::{
-    Align, Button, Color32, Direction, Key, Layout, Modifiers, Painter, Pos2, Rect, Response,
-    Sense, Stroke, StrokeKind, Ui, UiBuilder, WidgetInfo, WidgetType, pos2, vec2,
+    Align, Align2, Button, Color32, Direction, Key, Layout, Modifiers, Painter, Pos2, Rect,
+    Response, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo, WidgetType, pos2,
+    vec2,
 };
 
-/// Side length of every persistent primary icon cell.
-pub const PRIMARY_CELL_SIZE: f32 = 30.0;
+/// Height of every family tile.
+///
+/// Two rows of this plus the gap and padding come to exactly the ribbon's
+/// content height, which is what puts the `SKETCH` caption on the ribbon's
+/// bottom edge. A shorter tile leaves the caption floating in dead space with
+/// the icons bunched above it.
+pub const PRIMARY_CELL_SIZE: f32 = 33.0;
+/// Width of every family tile: icon column, label, and chooser.
+///
+/// Uniform rather than fitted per label, because a ribbon row of ragged tiles
+/// reads as a mistake. Sized so the longest label — `Rectangle`, which measures
+/// 51 px at [`TextStyle::Small`] — clears the chooser column with room to spare.
+/// At 88 px it did not, and ran into the chevron.
+pub const PRIMARY_CELL_WIDTH: f32 = 98.0;
+/// Left column of a tile, holding the icon.
+pub const TILE_ICON_COLUMN: f32 = 26.0;
+/// Side length of the icon painted inside that column.
+pub const TILE_ICON_SIZE: f32 = 22.0;
+/// Gap between the icon column and the start of the label.
+pub const TILE_LABEL_GAP: f32 = 2.0;
 /// Side length of the separately focusable chooser contained by a family tile.
-pub const CHEVRON_CELL_WIDTH: f32 = 12.0;
+///
+/// A full-height column at the tile's right edge. It used to be a 12 px square
+/// tucked into the bottom-right corner *over* the icon, which is what made the
+/// chooser and the glyph collide.
+pub const CHEVRON_CELL_WIDTH: f32 = 13.0;
+// The label has to clear the chooser column: `Rectangle` is the longest at
+// 51 px, and at the old 88 px tile it ran into the chevron. A tile geometry
+// that breaks this does not compile.
+const _: () =
+    assert!(PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH >= 56.0);
 /// Inset that keeps the chooser visibly inside its family tile.
 pub const CHEVRON_CELL_INSET: f32 = 1.0;
 /// Horizontal space between tool families.
@@ -27,17 +55,34 @@ pub const ROW_GAP: f32 = 2.0;
 /// Padding between the group caption and the first row of tool tiles.
 pub const TOOLBAR_TOP_PADDING: f32 = 4.0;
 /// Reserved clearance below the second row before the ribbon divider.
-pub const TOOLBAR_BOTTOM_PADDING: f32 = 8.0;
-/// Width of the uniform six-column toolbar grid.
-pub const SKETCH_TOOLBAR_WIDTH: f32 = PRIMARY_CELL_SIZE * 7.0 + FAMILY_GAP * 6.0;
-/// Height required by the padded two-row icon grid.
+pub const TOOLBAR_BOTTOM_PADDING: f32 = 4.0;
+/// Width of the uniform seven-column toolbar grid.
+pub const SKETCH_TOOLBAR_WIDTH: f32 = PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 6.0;
+/// Height required by the padded two-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 =
     PRIMARY_CELL_SIZE * 2.0 + ROW_GAP + TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING;
 
 const _: () = {
-    assert!(CHEVRON_CELL_WIDTH + CHEVRON_CELL_INSET < PRIMARY_CELL_SIZE);
+    // The chooser is a column beside the label now, not an overlay on the icon,
+    // so it has to leave the icon column and a readable label behind it.
+    assert!(TILE_ICON_COLUMN + TILE_LABEL_GAP + CHEVRON_CELL_WIDTH < PRIMARY_CELL_WIDTH);
+    assert!(TILE_ICON_SIZE < TILE_ICON_COLUMN);
     assert!(TOOLBAR_TOP_PADDING >= 4.0);
-    assert!(TOOLBAR_BOTTOM_PADDING >= TOOLBAR_TOP_PADDING);
+    assert!(TOOLBAR_BOTTOM_PADDING >= 4.0);
+    // The grid must fill the ribbon's content height exactly: short leaves the
+    // caption floating, tall clips the bottom row.
+    assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
+};
+
+/// Left column of a variant-menu row, holding the icon.
+pub const MENU_ICON_COLUMN: f32 = 30.0;
+/// Side length of the icon painted inside that column.
+pub const MENU_ICON_SIZE: f32 = 18.0;
+/// Gap between the menu icon column and the start of the row label.
+pub const MENU_LABEL_GAP: f32 = 4.0;
+
+const _: () = {
+    assert!(MENU_ICON_SIZE < MENU_ICON_COLUMN);
 };
 
 /// The reason used when the universal tick/cross rail owns keyboard input.
@@ -333,6 +378,13 @@ pub struct ToolFamilyDescriptor {
     pub family: ToolFamily,
     pub stable_key: &'static str,
     pub accessible_name: &'static str,
+    /// The name drawn on the tile, beside the icon.
+    ///
+    /// Separate from `accessible_name` for the same reason the model ribbon
+    /// separates them: the tile is width-constrained and the accessible name is
+    /// not, so shortening what is drawn must never rename the control a user has
+    /// learned or a test drives. Where the two agree the label simply repeats it.
+    pub tile_label: &'static str,
     pub shortcut: Option<ToolShortcut>,
     pub variants: &'static [ToolVariant],
     pub default_variant: ToolVariant,
@@ -421,6 +473,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Select,
         "select",
         "Select",
+        "Select",
         Some(SHORTCUT_V),
         SELECT_VARIANTS,
         ToolVariant::Select,
@@ -428,6 +481,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Point,
         "point",
+        "Point",
         "Point",
         Some(SHORTCUT_P),
         POINT_VARIANTS,
@@ -437,6 +491,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Line,
         "line",
         "Line",
+        "Line",
         Some(SHORTCUT_L),
         LINE_VARIANTS,
         ToolVariant::SingleLine,
@@ -444,6 +499,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Rectangle,
         "rectangle",
+        "Rectangle",
         "Rectangle",
         Some(SHORTCUT_R),
         RECTANGLE_VARIANTS,
@@ -453,6 +509,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Circle,
         "circle",
         "Circle",
+        "Circle",
         Some(SHORTCUT_C),
         CIRCLE_VARIANTS,
         ToolVariant::CentrePointCircle,
@@ -460,6 +517,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Arc,
         "arc",
+        "Arc",
         "Arc",
         Some(SHORTCUT_A),
         ARC_VARIANTS,
@@ -469,6 +527,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Polygon,
         "polygon",
         "Polygon",
+        "Polygon",
         None,
         POLYGON_VARIANTS,
         ToolVariant::OuterDiameterPolygon,
@@ -476,6 +535,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Slot,
         "slot",
+        "Slot",
         "Slot",
         None,
         SLOT_VARIANTS,
@@ -485,6 +545,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Trim,
         "trim",
         "Trim",
+        "Trim",
         Some(SHORTCUT_T),
         TRIM_VARIANTS,
         ToolVariant::Trim,
@@ -492,6 +553,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Fillet,
         "fillet",
+        "Fillet",
         "Fillet",
         None,
         FILLET_VARIANTS,
@@ -501,6 +563,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Chamfer,
         "chamfer",
         "Chamfer",
+        "Chamfer",
         None,
         CHAMFER_VARIANTS,
         ToolVariant::Chamfer,
@@ -508,6 +571,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
     family(
         ToolFamily::Pattern,
         "pattern",
+        "Pattern",
         "Pattern",
         None,
         PATTERN_VARIANTS,
@@ -517,6 +581,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Relation,
         "relation",
         "Sketch relation",
+        "Relation",
         Some(SHORTCUT_G),
         RELATION_VARIANTS,
         ToolVariant::HorizontalRelation,
@@ -525,6 +590,7 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         ToolFamily::Dimension,
         "dimension",
         "Sketch dimension",
+        "Dimension",
         Some(SHORTCUT_D),
         DIMENSION_VARIANTS,
         ToolVariant::Dimension,
@@ -535,6 +601,7 @@ const fn family(
     family: ToolFamily,
     stable_key: &'static str,
     accessible_name: &'static str,
+    tile_label: &'static str,
     shortcut: Option<ToolShortcut>,
     variants: &'static [ToolVariant],
     default_variant: ToolVariant,
@@ -543,6 +610,7 @@ const fn family(
         family,
         stable_key,
         accessible_name,
+        tile_label,
         shortcut,
         variants,
         default_variant,
@@ -1866,20 +1934,35 @@ fn render_family(
     capabilities: &SketchToolCapabilities,
 ) -> FamilyRenderResult {
     let split = family.variants().len() > 1;
-    let (_, cell_rect) = ui.allocate_space(vec2(PRIMARY_CELL_SIZE, PRIMARY_CELL_SIZE));
+    let (_, cell_rect) = ui.allocate_space(vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE));
     let mut family_ui = ui.new_child(
         UiBuilder::new()
             .id_salt(("sketch_tool_family", family))
             .max_rect(cell_rect),
     );
     let ui = &mut family_ui;
+    // The chooser owns a column at the right edge, so the primary stops short of
+    // it. Nothing overlaps: the icon, the label and the chevron each have their
+    // own horizontal band.
+    let primary_rect = if split {
+        Rect::from_min_max(
+            cell_rect.min,
+            pos2(
+                cell_rect.max.x - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET,
+                cell_rect.max.y,
+            ),
+        )
+    } else {
+        cell_rect
+    };
     let primary_reason = gate
         .disabled_reason()
         .or_else(|| capabilities.disabled_reason(current));
     let primary = icon_button(
         ui,
-        cell_rect,
+        primary_rect,
         current.descriptor(),
+        family.descriptor().tile_label,
         active == current,
         primary_reason,
     );
@@ -1898,10 +1981,12 @@ fn render_family(
         let chooser_reason = gate.disabled_reason().or_else(|| {
             (!family_has_enabled_variant).then_some(current.descriptor().disabled_reason)
         });
-        let chooser_max = cell_rect.max - vec2(CHEVRON_CELL_INSET, CHEVRON_CELL_INSET);
         let contained_chooser_rect = Rect::from_min_max(
-            chooser_max - vec2(CHEVRON_CELL_WIDTH, CHEVRON_CELL_WIDTH),
-            chooser_max,
+            pos2(
+                cell_rect.max.x - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET,
+                cell_rect.min.y + CHEVRON_CELL_INSET,
+            ),
+            cell_rect.max - vec2(CHEVRON_CELL_INSET, CHEVRON_CELL_INSET),
         );
         let chooser = chooser_button(
             ui,
@@ -1971,6 +2056,7 @@ fn icon_button(
     ui: &mut Ui,
     rect: Rect,
     descriptor: &'static ToolDescriptor,
+    label: &'static str,
     selected: bool,
     disabled_reason: Option<&str>,
 ) -> Response {
@@ -1997,10 +2083,27 @@ fn icon_button(
     } else {
         ui.visuals().weak_text_color()
     };
+    // The icon sits centred in its own left column and the label starts where
+    // that column ends, so neither can drift into the other however long the
+    // label or wide the glyph.
+    let icon_centre = pos2(
+        response.rect.left() + TILE_ICON_COLUMN / 2.0,
+        response.rect.center().y,
+    );
     paint_tool_icon(
         ui.painter(),
-        Rect::from_center_size(response.rect.center(), vec2(21.0, 21.0)),
+        Rect::from_center_size(icon_centre, vec2(TILE_ICON_SIZE, TILE_ICON_SIZE)),
         descriptor.icon,
+        icon_color,
+    );
+    ui.painter().text(
+        pos2(
+            response.rect.left() + TILE_ICON_COLUMN + TILE_LABEL_GAP,
+            response.rect.center().y,
+        ),
+        Align2::LEFT_CENTER,
+        label,
+        TextStyle::Small.resolve(ui.style()),
         icon_color,
     );
     if selected {
@@ -2124,8 +2227,12 @@ fn render_variant_menu(
     for variant in family.variants() {
         let descriptor = variant.descriptor();
         let enabled = capabilities.is_enabled(*variant);
-        let text = format!("      {}", descriptor.accessible_name);
-        let mut button = Button::new(text)
+        // The row carries no button text at all: the icon and the label are both
+        // painted at fixed offsets below, so neither can move relative to the
+        // other. The previous row indented its label with six ordinary spaces,
+        // which are proportional — the reserved width changed with the font and
+        // theme, and wherever it fell short of the icon the two overlapped.
+        let mut button = Button::new("")
             .selected(*variant == current)
             .min_size(vec2(236.0, 30.0));
         if let Some(shortcut) = descriptor.shortcut {
@@ -2133,8 +2240,11 @@ fn render_variant_menu(
         }
         let mut response = ui.add_enabled(enabled, button);
         let icon_rect = Rect::from_center_size(
-            pos2(response.rect.left() + 16.0, response.rect.center().y),
-            vec2(18.0, 18.0),
+            pos2(
+                response.rect.left() + MENU_ICON_COLUMN / 2.0,
+                response.rect.center().y,
+            ),
+            vec2(MENU_ICON_SIZE, MENU_ICON_SIZE),
         );
         let icon_color = if enabled {
             ui.style()
@@ -2145,6 +2255,16 @@ fn render_variant_menu(
             ui.visuals().weak_text_color()
         };
         paint_tool_icon(ui.painter(), icon_rect, descriptor.icon, icon_color);
+        ui.painter().text(
+            pos2(
+                response.rect.left() + MENU_ICON_COLUMN + MENU_LABEL_GAP,
+                response.rect.center().y,
+            ),
+            Align2::LEFT_CENTER,
+            descriptor.accessible_name,
+            TextStyle::Button.resolve(ui.style()),
+            icon_color,
+        );
         if enabled {
             response = response.on_hover_ui(|tooltip| descriptor_tooltip(tooltip, descriptor));
         } else if let Some(reason) = capabilities.disabled_reason(*variant) {
@@ -2593,15 +2713,18 @@ mod tests {
     #[test]
     fn fixed_layout_is_two_rows_and_fits_the_supported_ribbon() {
         let row_width = |row: &[ToolFamily]| {
-            PRIMARY_CELL_SIZE * row.len() as f32 + FAMILY_GAP * row.len().saturating_sub(1) as f32
+            PRIMARY_CELL_WIDTH * row.len() as f32 + FAMILY_GAP * row.len().saturating_sub(1) as f32
         };
         assert_eq!(FIRST_ROW.len(), 7);
         assert_eq!(SECOND_ROW.len(), 7);
         assert!(row_width(FIRST_ROW) <= SKETCH_TOOLBAR_WIDTH);
         assert_eq!(row_width(SECOND_ROW), SKETCH_TOOLBAR_WIDTH);
-        assert!((28.0..=34.0).contains(&PRIMARY_CELL_SIZE));
-        assert_eq!(SKETCH_TOOLBAR_HEIGHT, 74.0);
-        assert_eq!(CHEVRON_CELL_WIDTH, 12.0);
+        assert!((28.0..=36.0).contains(&PRIMARY_CELL_SIZE));
+        // Two rows fill the ribbon's content box exactly, which is what puts
+        // the group caption on its bottom edge rather than above a gap.
+        assert_eq!(SKETCH_TOOLBAR_HEIGHT, 76.0);
+        // The label-clears-the-chooser bound is a compile-time assertion
+        // beside the constants; a geometry that breaks it does not build.
 
         let mut all = FIRST_ROW
             .iter()

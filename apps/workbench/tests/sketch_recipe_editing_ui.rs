@@ -453,7 +453,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
     let mut source = harness();
     enter_xy_sketch(&mut source);
     create_two_point_rectangle(&mut source);
-    click_button(&mut source, "Finish sketch command");
+    click_button(&mut source, "Finish sketch");
     assert_eq!(source.state().workbench_mode(), WorkbenchMode::Model);
     let saved = source.state().native_document_json().unwrap();
 
@@ -469,7 +469,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
     assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Sketch);
     select_rectangle_top(&mut restored);
     accept_selected_parameter(&mut restored, "Width", "3");
-    click_button(&mut restored, "Finish sketch command");
+    click_button(&mut restored, "Finish sketch");
     assert_eq!(restored.state().document_feature_count(), feature_count);
     assert_eq!(restored.state().document_dirty_feature_count(), 1);
     click_button(&mut restored, "Rebuild selected branch");
@@ -520,7 +520,7 @@ fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
     );
 
     accept_selected_parameter(&mut harness, "Width", "3");
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(
         harness.state().document_feature_count(),

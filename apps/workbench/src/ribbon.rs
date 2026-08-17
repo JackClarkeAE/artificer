@@ -515,6 +515,7 @@ impl KernelLabApp {
             // The properties palette has no hidden state of its own; the
             // command raises and focuses it, so it is never "on".
             ModelCommand::ShowHistory => self.shell.visibility().feature_timeline,
+            ModelCommand::ToggleOriginPlanes => self.show_origin_planes,
             ModelCommand::ToggleTheme => theme::active_theme() == theme::WorkbenchTheme::Dark,
             ModelCommand::PlayMotion => self.motion.playing,
             _ => false,
@@ -661,6 +662,13 @@ impl KernelLabApp {
                     CommandAvailability::disabled("Select a body to scale.")
                 }
             }
+            ModelCommand::ExitSketch => {
+                if self.pending_operation.is_some() {
+                    CommandAvailability::disabled("Confirm or cancel the pending operation first.")
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
             ModelCommand::FinishSketch => {
                 if self.pending_operation.is_some() {
                     return CommandAvailability::disabled(
@@ -694,10 +702,21 @@ impl KernelLabApp {
                     CommandAvailability::Enabled
                 }
             }
+            // There is no sketch properties palette to show. A control that
+            // looks live and does nothing is worse than one that says why.
+            ModelCommand::ShowProperties => {
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    CommandAvailability::disabled(
+                        "The sketch workspace has no properties palette. Dimensions are on the canvas, and the dimension tool edits committed ones.",
+                    )
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
             ModelCommand::ToggleShaded
             | ModelCommand::ShowBrowser
-            | ModelCommand::ShowProperties
             | ModelCommand::ShowHistory
+            | ModelCommand::ToggleOriginPlanes
             | ModelCommand::ToggleTheme => CommandAvailability::Enabled,
         }
     }
@@ -855,6 +874,12 @@ impl KernelLabApp {
             }
             ModelCommand::FinishSketch => {
                 self.finish_sketch_now();
+            }
+            ModelCommand::ExitSketch => {
+                self.enter_model_mode();
+            }
+            ModelCommand::ToggleOriginPlanes => {
+                self.show_origin_planes = !self.show_origin_planes;
             }
             ModelCommand::FrameSketch => self.frame_active_sketch(),
             ModelCommand::ToggleSnap => {

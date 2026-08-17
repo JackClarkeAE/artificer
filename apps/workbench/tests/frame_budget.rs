@@ -85,7 +85,7 @@ fn finish_centered_face_rectangle(
     press_key(harness, egui::Key::Tab);
     type_dimension(harness, "Rectangle height", height);
     press_key(harness, egui::Key::Enter);
-    activate_button(harness, "Finish sketch command");
+    activate_button(harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }
 

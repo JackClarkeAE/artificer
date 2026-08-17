@@ -10,6 +10,7 @@ pub use artificer_ui_core::{drag_handle, navigation, presentation, theme};
 pub use artificer_viewport as viewport;
 
 pub mod assembly;
+mod browser;
 mod command_icons;
 pub mod commands;
 mod development_log;
@@ -89,10 +90,10 @@ use crate::shell::{WorkbenchShellState, WorkbenchShellVisibility};
 use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
     DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
-    SketchCanvasState, SketchContextCurve, SketchContextEdge, SketchContextFitKey,
-    SketchContextTriangle, SketchCurveDirection, SketchDimensionKind, SketchEditError,
-    SketchEntity, SketchEntityId, SketchGeometry, SketchPlane, SketchPoint, SketchView,
-    SketchViewportContext,
+    SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
+    SketchContextFitKey, SketchContextTriangle, SketchCurveDirection, SketchDimensionKind,
+    SketchEditError, SketchEntity, SketchEntityId, SketchGeometry, SketchPlane, SketchPoint,
+    SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
@@ -768,7 +769,7 @@ impl SolidFeaturePreset {
             Self::Revolve => "Create an exact full-turn annular revolve as a new body",
             Self::Hole => "Cut an exact cylindrical hole normal to the selected planar face",
             Self::Rib => "Add a straight rectangular rib to the selected planar face",
-            Self::Mirror => "Mirror the active all-planar body across the world YZ plane",
+            Self::Mirror => "Mirror the browser-selected bodies across the selected plane",
             Self::LinearPattern => "Create three separated +X copies as one multi-solid body group",
             Self::Chamfer => {
                 "Finish one or more compatible cuboid edges with exact planar chamfers"
@@ -1714,10 +1715,11 @@ pub struct KernelLabApp {
     /// the other; both now open closed, with facts arriving as a contextual
     /// card over the canvas.
     model_inspector_open: bool,
-    sketch_inspector_open: bool,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
+    /// Show the origin planes even once a sketch has retired them.
+    show_origin_planes: bool,
     /// A plane sketch waiting for its camera flight to land. Opening the 2D
     /// canvas immediately would replace the very viewport the animation
     /// plays in, which reads as a snap even though the camera is flying.
@@ -1728,6 +1730,13 @@ pub struct KernelLabApp {
     sketch_orbit_peek: bool,
     /// The open model context menu, if one is open.
     model_context_menu: Option<ModelContextMenu>,
+    /// The open Browser context menu, if one is open. At most one of the two
+    /// right-click menus exists at a time.
+    browser_context_menu: Option<browser::BrowserContextMenu>,
+    /// Ordinals of the bodies selected in the Browser tree. Multi-body
+    /// commands such as Mirror act on this set; the active body remains the
+    /// single-body fallback when the set is empty.
+    browser_selected_bodies: BTreeSet<u32>,
     /// The ribbon tab the user explicitly picked, and the workspace they picked
     /// it in. `None` means the tab follows the workspace, which is what makes
     /// the Sketch tab appear the moment a sketch opens; storing the workspace
@@ -1850,11 +1859,13 @@ impl Default for KernelLabApp {
             edge_finish_distance_text: "0.400".to_owned(),
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
-            sketch_inspector_open: true,
             camera_before_plane_sketch: None,
+            show_origin_planes: false,
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
             model_context_menu: None,
+            browser_context_menu: None,
+            browser_selected_bodies: BTreeSet::new(),
             ribbon_tab: None,
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
@@ -2554,6 +2565,14 @@ impl KernelLabApp {
     /// The single line of prose the sketch canvas is showing for the active
     /// tool, so a test can assert what the user is told.
     #[must_use]
+    /// The accessible name of the sketch tool currently armed.
+    ///
+    /// The palette that used to spell this out is gone, so the tile and this
+    /// are what say which tool is live.
+    pub fn active_sketch_tool_label(&self) -> &'static str {
+        self.active_sketch_tool.descriptor().accessible_name
+    }
+
     pub fn sketch_canvas_instruction(&self) -> &'static str {
         self.sketch.canvas_instruction()
     }
@@ -3012,6 +3031,7 @@ impl KernelLabApp {
         self.displayed = None;
         self.bodies.clear();
         self.sketches.clear();
+        self.browser_selected_bodies.clear();
         self.active_body_ordinal = 1;
         self.next_body_ordinal = 1;
         self.selected_history_feature = self.document.features().first().map(|node| node.id);
@@ -3093,6 +3113,7 @@ impl KernelLabApp {
         self.selected_history_feature = Some(base.feature);
         self.document_status = Some("Parametric document ready".to_owned());
         self.bodies.clear();
+        self.browser_selected_bodies.clear();
         self.active_body_ordinal = 1;
         self.next_body_ordinal = 2;
         self.bodies.push(WorkbenchBody {
@@ -5039,15 +5060,18 @@ impl KernelLabApp {
         if self.workbench_mode == WorkbenchMode::Sketch {
             return false;
         }
-        // A committed sketch is not a solid feature: it answers "where", not
-        // "what". Retiring the datum planes for it left a finished sketch on a
-        // bodiless document with nothing on screen at all, and the viewport
-        // fell through to its "No committed body" placeholder — which reads as
-        // a failed commit when the commit in fact succeeded.
+        // An explicit request wins over every rule below: once the planes have
+        // been asked for they stay until they are dismissed again.
+        if self.show_origin_planes {
+            return true;
+        }
+        // The first sketch retires them. Their whole job is answering "on what
+        // surface", and a drawn sketch has answered it — after that they are
+        // three large translucent squares between the camera and the work.
         self.document
             .active_features()
             .iter()
-            .all(|feature| matches!(feature.kind, FeatureKind::Origin | FeatureKind::Sketch))
+            .all(|feature| matches!(feature.kind, FeatureKind::Origin))
     }
 
     fn construction_plane_is_active(&self, plane: &ConstructionPlane) -> bool {
@@ -6540,19 +6564,15 @@ impl KernelLabApp {
         self.restore_camera_after_plane_sketch();
     }
 
-    /// Hands back the model camera a plane sketch borrowed.
+    /// Releases the camera a plane sketch borrowed, without moving it.
+    ///
+    /// Leaving a sketch used to snap the view back to wherever it stood before
+    /// the sketch opened. That throws away the orientation the user just spent
+    /// the sketch establishing, and it happens at the exact moment they want to
+    /// look at what they made. Wherever the camera ends up is where it stays;
+    /// Home and Frame are how a view is deliberately reset.
     fn restore_camera_after_plane_sketch(&mut self) {
-        let Some(view) = self.camera_before_plane_sketch.take() else {
-            return;
-        };
-        if self.animate_face_camera_transitions
-            && let Some(transition) = CameraTransition::to_view(self.view, view)
-        {
-            self.face_camera_transition = Some(transition);
-            self.last_face_camera_time = None;
-            return;
-        }
-        self.view = view;
+        self.camera_before_plane_sketch = None;
     }
 
     fn frame_active_sketch(&mut self) {
@@ -7482,7 +7502,23 @@ impl KernelLabApp {
                         return true;
                     }
                 }
-                self.execute_preset_feature(preset, base_snapshot, body, target_face, frame);
+                if preset == SolidFeaturePreset::Mirror {
+                    // Mirror applies to every browser-selected body, gathered
+                    // at confirmation the same way an edge finish gathers
+                    // `selected_edges`; the staged body is the fallback.
+                    for (target_body, snapshot) in self.browser_mirror_targets(body, base_snapshot)
+                    {
+                        self.execute_preset_feature(
+                            preset,
+                            snapshot,
+                            Some(target_body),
+                            None,
+                            frame,
+                        );
+                    }
+                } else {
+                    self.execute_preset_feature(preset, base_snapshot, body, target_face, frame);
+                }
             }
             PendingOperation::SketchEdit { entity, .. } => {
                 let staged_entity = self.sketch.pending().map(|edit| edit.subject());
@@ -8825,6 +8861,44 @@ impl KernelLabApp {
         })
     }
 
+    /// The mirror plane chosen in the Browser: the selected construction
+    /// plane when there is one, the selected origin plane otherwise.
+    fn browser_mirror_plane(&self) -> (PlanarFrame3, String) {
+        if let Some(id) = self.selected_construction_plane
+            && let Some(plane) = self.construction_planes.iter().find(|plane| plane.id == id)
+        {
+            return (plane.frame, plane.name.clone());
+        }
+        (
+            sketch_plane_frame(self.selected_origin_plane),
+            origin_plane_label(self.selected_origin_plane).to_owned(),
+        )
+    }
+
+    /// The bodies one confirmed Mirror applies to, with the snapshots to
+    /// mirror: every browser-selected body, or the staged body when the
+    /// Browser holds no selection.
+    fn browser_mirror_targets(
+        &self,
+        staged_body: Option<BodyId>,
+        staged_snapshot: SnapshotId,
+    ) -> Vec<(BodyId, SnapshotId)> {
+        let selected = self.browser_selected_body_indices();
+        if selected.is_empty() {
+            return staged_body
+                .map(|body| (body, staged_snapshot))
+                .into_iter()
+                .collect();
+        }
+        selected
+            .iter()
+            .map(|&index| {
+                let body = &self.bodies[index];
+                (body.id, body.body.snapshot.id())
+            })
+            .collect()
+    }
+
     fn stage_preset_feature(&mut self, preset: SolidFeaturePreset) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
@@ -8894,6 +8968,15 @@ impl KernelLabApp {
                     format!("Preview staged · {}", support.detail())
                 });
                 (Some(selected[0].edge), None)
+            } else if preset == SolidFeaturePreset::Mirror {
+                let (plane_frame, plane_name) = self.browser_mirror_plane();
+                let target_count = self.browser_selected_body_indices().len().max(1);
+                self.document_status = Some(if target_count > 1 {
+                    format!("Mirror staged across {plane_name} for {target_count} bodies")
+                } else {
+                    format!("Mirror staged across {plane_name}")
+                });
+                (None, Some(plane_frame))
             } else {
                 (None, None)
             };
@@ -9061,10 +9144,15 @@ impl KernelLabApp {
                 thickness: 0.5,
                 height: 1.0,
             },
-            SolidFeaturePreset::Mirror => KernelCommand::MirrorSnapshot {
-                plane_origin: Point3::new(0.0, 0.0, 0.0),
-                plane_normal: Vector3::new(1.0, 0.0, 0.0),
-            },
+            SolidFeaturePreset::Mirror => {
+                let (plane_origin, plane_normal) = frame
+                    .and_then(planar_frame_origin_normal)
+                    .unwrap_or((Point3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0)));
+                KernelCommand::MirrorSnapshot {
+                    plane_origin,
+                    plane_normal,
+                }
+            }
             SolidFeaturePreset::LinearPattern => {
                 let spacing = input
                     .measures()
@@ -9973,373 +10061,6 @@ impl KernelLabApp {
         }
     }
 
-    fn model_browser(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.spacing_mut().interact_size.y = 24.0;
-                egui::CollapsingHeader::new(
-                    RichText::new("Document 1 · Root")
-                        .font(FontId::proportional(12.5))
-                        .color(theme::text())
-                        .strong(),
-                )
-                .id_salt("browser_document")
-                .default_open(true)
-                .show(ui, |ui| {
-                    egui::CollapsingHeader::new(
-                        RichText::new("Origin")
-                            .font(FontId::proportional(12.0))
-                            .color(theme::text())
-                            .strong(),
-                    )
-                    .id_salt("browser_origin")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for plane in SketchPlane::ALL {
-                            let has_other_plane_sketch =
-                                !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
-                            let enabled =
-                                self.pending_operation.is_none() && !has_other_plane_sketch;
-                            let selected = self.selected_origin_plane == plane;
-                            let response = ui.add_enabled(
-                                enabled,
-                                egui::Button::new(origin_plane_label(plane))
-                                    .frame(false)
-                                    .selected(selected)
-                                    .corner_radius(2)
-                                    .min_size(egui::vec2(ui.available_width(), 24.0)),
-                            );
-                            if response.clicked() {
-                                self.selected_origin_plane = plane;
-                                self.selected_construction_plane = None;
-                                if self.sketch.entities().is_empty() {
-                                    let _ = self.sketch.set_plane(plane);
-                                }
-                            }
-                            if has_other_plane_sketch {
-                                response.on_disabled_hover_text(
-                                    "This first profile slice owns one plane per document.",
-                                );
-                            }
-                        }
-                    });
-                    if !self.construction_planes.is_empty() {
-                        let rows = self
-                            .construction_planes
-                            .iter()
-                            .filter(|plane| self.construction_plane_is_active(plane))
-                            .map(|plane| {
-                                (
-                                    plane.id,
-                                    plane.name.clone(),
-                                    plane.visible,
-                                    self.selected_construction_plane == Some(plane.id),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        let mut visibility_change = None;
-                        let mut selected_plane = None;
-                        egui::CollapsingHeader::new(
-                            RichText::new(format!("Construction ({})", rows.len()))
-                                .font(FontId::proportional(12.0))
-                                .color(theme::text())
-                                .strong(),
-                        )
-                        .id_salt("browser_construction_planes")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for (id, name, visible, selected) in rows {
-                                ui.horizontal(|ui| {
-                                    if ui
-                                        .add_sized(
-                                            [22.0, 22.0],
-                                            egui::Button::new(if visible { "●" } else { "○" })
-                                                .frame(false),
-                                        )
-                                        .on_hover_text(if visible {
-                                            format!("Hide {name}")
-                                        } else {
-                                            format!("Show {name}")
-                                        })
-                                        .clicked()
-                                    {
-                                        visibility_change = Some((id, !visible));
-                                    }
-                                    if ui
-                                        .add_sized(
-                                            [(ui.available_width() - 2.0).max(24.0), 22.0],
-                                            egui::Button::new(format!("▱  {name}"))
-                                                .frame(false)
-                                                .selected(selected)
-                                                .truncate(),
-                                        )
-                                        .on_hover_text(format!(
-                                            "Select {name} as a sketch support plane"
-                                        ))
-                                        .clicked()
-                                    {
-                                        selected_plane = Some(id);
-                                    }
-                                });
-                            }
-                        });
-                        if let Some((id, visible)) = visibility_change
-                            && let Some(plane) = self
-                                .construction_planes
-                                .iter_mut()
-                                .find(|plane| plane.id == id)
-                        {
-                            plane.visible = visible;
-                        }
-                        if let Some(id) = selected_plane {
-                            self.selected_construction_plane = Some(id);
-                            self.clear_model_entity_selection();
-                        }
-                    }
-                    let body_rows = self
-                        .bodies
-                        .iter()
-                        .enumerate()
-                        .map(|(index, body)| {
-                            let component = self
-                                .document
-                                .component_instances()
-                                .iter()
-                                .find(|component| component.bodies.contains(&body.id))
-                                .map(|component| (component.id.get(), component.label.clone()));
-                            (
-                                index,
-                                body.ordinal,
-                                body.kind,
-                                body.body.report.topology.solids,
-                                body.visible,
-                                body.ordinal == self.active_body_ordinal,
-                                component,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let mut body_visibility_change = None;
-                    let mut activate_body = None;
-                    for (index, ordinal, kind, solid_count, visible, active, component) in body_rows
-                    {
-                        ui.horizontal(|ui| {
-                            let object_name = browser_body_object_name(ordinal, solid_count);
-                            let visibility_label = if visible {
-                                format!("Hide {object_name}")
-                            } else {
-                                format!("Show {object_name}")
-                            };
-                            let eye = ui.add_sized(
-                                [22.0, 22.0],
-                                egui::Button::new(if visible { "●" } else { "○" })
-                                    .frame(false)
-                                    .corner_radius(2),
-                            );
-                            eye.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    &visibility_label,
-                                )
-                            });
-                            if eye.clicked() {
-                                body_visibility_change = Some((index, !visible));
-                            }
-                            let (body_icon, body_label, visible_body_label) = component
-                                .map_or_else(
-                                    || {
-                                        let label =
-                                            format!("{object_name} · {}", kind.browser_label());
-                                        ("◆", label.clone(), label)
-                                    },
-                                    |(instance, label)| {
-                                        (
-                                            "◇",
-                                            format!("{label} · component {instance}"),
-                                            format!("C{instance} · {label}"),
-                                        )
-                                    },
-                                );
-                            let accessible_label = format!("{body_icon}  {body_label}");
-                            let label_width = (ui.available_width() - 6.0).max(24.0);
-                            let response = ui.add_sized(
-                                [label_width, 22.0],
-                                egui::Button::new(format!("{body_icon}  {visible_body_label}"))
-                                    .frame(false)
-                                    .selected(active)
-                                    .corner_radius(2)
-                                    .truncate(),
-                            );
-                            response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    &accessible_label,
-                                )
-                            });
-                            let response = response.on_hover_text(&body_label);
-                            if response.clicked() {
-                                activate_body = Some(index);
-                            }
-                        });
-                    }
-                    if let Some((index, visible)) = body_visibility_change {
-                        self.set_body_visibility(index, visible);
-                    }
-                    if let Some(index) = activate_body {
-                        self.activate_body(index);
-                        self.clear_model_entity_selection();
-                    }
-
-                    let sketch_rows = self
-                        .sketches
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, sketch)| {
-                            sketch
-                                .id
-                                .is_none_or(|id| self.document.sketch(id).is_some())
-                        })
-                        .map(|(index, sketch)| {
-                            (
-                                index,
-                                sketch.ordinal,
-                                sketch.support.label(),
-                                sketch.finished,
-                                sketch.visible,
-                                sketch.consumed,
-                                self.active_sketch_index == Some(index),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    let mut sketch_visibility_change = None;
-                    let mut activate_sketch = None;
-                    for (index, ordinal, support, finished, visible, consumed, active) in
-                        sketch_rows
-                    {
-                        ui.horizontal(|ui| {
-                            let visibility_label = if visible {
-                                format!("Hide Sketch {ordinal}")
-                            } else {
-                                format!("Show Sketch {ordinal}")
-                            };
-                            let eye = ui.add_sized(
-                                [22.0, 22.0],
-                                egui::Button::new(if visible { "●" } else { "○" })
-                                    .frame(false)
-                                    .corner_radius(2),
-                            );
-                            eye.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    &visibility_label,
-                                )
-                            });
-                            if eye.clicked() {
-                                sketch_visibility_change = Some((index, !visible));
-                            }
-                            let state = if finished || consumed {
-                                "finished"
-                            } else {
-                                "editing"
-                            };
-                            let label = format!("└  Sketch {ordinal} · {support} · {state}");
-                            let response = ui.add_sized(
-                                [(ui.available_width() - 2.0).max(24.0), 22.0],
-                                egui::Button::new(RichText::new(&label).color(if visible {
-                                    theme::accent()
-                                } else {
-                                    theme::muted()
-                                }))
-                                .frame(false)
-                                .selected(active)
-                                .corner_radius(2)
-                                .truncate(),
-                            );
-                            response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    format!("Select Sketch {ordinal}"),
-                                )
-                            });
-                            if response.clicked() {
-                                activate_sketch = Some(index);
-                            }
-                        });
-                    }
-                    if self.workbench_mode == WorkbenchMode::Sketch
-                        && self.active_sketch_index.is_none()
-                        && self.sketch.entities().is_empty()
-                    {
-                        browser_text_row(
-                            ui,
-                            &format!(
-                                "└  Sketch {} · {} · empty",
-                                self.feature_preview.current_sketch_ordinal(),
-                                self.sketch_support.label()
-                            ),
-                            theme::accent(),
-                        );
-                    }
-                    if let Some((index, visible)) = sketch_visibility_change {
-                        self.set_sketch_visibility(index, visible);
-                    }
-                    if let Some(index) = activate_sketch {
-                        self.activate_committed_sketch(index);
-                    }
-
-                    let joint_rows = self
-                        .document
-                        .joints()
-                        .iter()
-                        .map(|joint| {
-                            (
-                                joint.id,
-                                joint.name.clone(),
-                                joint.child,
-                                joint.kind,
-                                joint.enabled,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    if !joint_rows.is_empty() {
-                        egui::CollapsingHeader::new(
-                            RichText::new(format!("Joints ({})", joint_rows.len()))
-                                .font(FontId::proportional(12.0))
-                                .color(theme::text())
-                                .strong(),
-                        )
-                        .id_salt("browser_joints")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            for (id, name, child, kind, enabled) in joint_rows {
-                                let kind = match kind {
-                                    JointKind::Fixed => "Fixed",
-                                    JointKind::Revolute { .. } => "Revolute",
-                                };
-                                browser_text_row(
-                                    ui,
-                                    &format!(
-                                        "{}  {name} · {kind} · C{} · {id}",
-                                        if enabled { "↻" } else { "○" },
-                                        child.get()
-                                    ),
-                                    if enabled {
-                                        theme::good()
-                                    } else {
-                                        theme::muted()
-                                    },
-                                );
-                            }
-                        });
-                    }
-                });
-            });
-    }
-
     /// The left dock holds the document tree and nothing else.
     ///
     /// Tool options and feature editors float over the viewport instead. A
@@ -10369,18 +10090,44 @@ impl KernelLabApp {
     }
 
     /// Whether the docked palette is showing in the active workspace.
+    ///
+    /// The sketch workspace has none, and this is not a default that can be
+    /// toggled back on. Every section it used to hold is either already on the
+    /// canvas — the plane and the step prompt read top-left, snap state and
+    /// profile status read bottom-left — or on the ribbon, where Frame sketch
+    /// and Snap live. What remained was the live dimension readout, and a
+    /// committed dimension is changed with the dimension tool, on the geometry
+    /// it belongs to. Restating those numbers in a panel gave the same value
+    /// two homes and cost the canvas 268 px on every drawing frame.
     const fn inspector_open(&self) -> bool {
         match self.workbench_mode {
             WorkbenchMode::Model => self.model_inspector_open,
-            WorkbenchMode::Sketch => self.sketch_inspector_open,
+            WorkbenchMode::Sketch => false,
         }
     }
 
     fn set_inspector_open(&mut self, open: bool) {
         match self.workbench_mode {
             WorkbenchMode::Model => self.model_inspector_open = open,
-            WorkbenchMode::Sketch => self.sketch_inspector_open = open,
+            // Nothing to open. `Properties` is disabled while sketching rather
+            // than silently doing nothing.
+            WorkbenchMode::Sketch => {}
         }
+    }
+
+    /// Dismisses the document settings dialog.
+    ///
+    /// It is anchored over the centre of the window, so while it is open the
+    /// model underneath cannot be picked or dragged. That is deliberate for a
+    /// stop-and-configure surface, and it means anything that wants the model
+    /// has to close this first.
+    pub fn close_document_properties(&mut self) {
+        self.document_properties_open = false;
+    }
+
+    /// Raises the document settings dialog again.
+    pub fn open_document_properties(&mut self) {
+        self.document_properties_open = true;
     }
 
     fn show_properties_tab(&mut self) {
@@ -10583,13 +10330,14 @@ impl KernelLabApp {
         let mut open = self.document_properties_open;
         egui::Window::new("DOCUMENT PROPERTIES")
             .id(egui::Id::new("document_properties_window"))
-            // Keep the persistent navigation cube unobstructed.
-            // Kept off the centre of the viewport: a window there intercepts
-            // the drags that orbit and move the model. The inspector is docked
-            // now, so this no longer has anything to collide with.
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 252.0))
-            .default_width(340.0)
-            .max_height(510.0)
+            // Centred and wide. This was tucked against the right edge to keep
+            // orbit drags reachable behind it, but it is a dialog the user opens
+            // deliberately and closes when done — not something to work around.
+            // At 340 px its options wrapped into a column too narrow to scan.
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(640.0)
+            .min_width(560.0)
+            .max_height(620.0)
             .resizable(false)
             .open(&mut open)
             .frame(
@@ -10605,6 +10353,45 @@ impl KernelLabApp {
                     // that used to be open on every frame: they are facts
                     // about the document, and this is where the document's
                     // facts are.
+                    collapsible_card(ui, "workspace_appearance", "APPEARANCE", true, |ui| {
+                        ui.label(
+                            RichText::new("Theme").small().color(theme::muted()),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            let active = theme::active_theme();
+                            for candidate in theme::WorkbenchTheme::ALL {
+                                let response = ui.selectable_label(
+                                    candidate == active,
+                                    RichText::new(candidate.label()),
+                                );
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::selected(
+                                        egui::WidgetType::Button,
+                                        true,
+                                        candidate == active,
+                                        format!("{} theme", candidate.label()),
+                                    )
+                                });
+                                if response.clicked() && candidate != active {
+                                    theme::set_active_theme(candidate);
+                                    // Every widget drawn after this reads the
+                                    // palette through the accessors, so the
+                                    // style has to be rebuilt before the next
+                                    // one paints.
+                                    theme::install_style(ui.ctx());
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "Every theme is contrast-measured; the ribbon's Appearance button flips between the two most recent.",
+                            )
+                            .small()
+                            .color(theme::muted()),
+                        );
+                    });
+                    ui.add_space(5.0);
                     collapsible_card(ui, "document_material_and_mass", "MATERIAL", true, |ui| {
                         self.material_card(ui);
                     });
@@ -10968,6 +10755,367 @@ impl KernelLabApp {
                 }
             }
         });
+    }
+
+    /// Draws the editable fields for one selected sketch recipe.
+    ///
+    /// Shared by the docked palette and the sketch parameter popup so a
+    /// parameter behaves identically wherever it is reached: same live preview,
+    /// same Enter-applies contract, same validation text.
+    fn sketch_recipe_parameter_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        parameters: &[SelectedRecipeParameter],
+    ) {
+        for parameter in parameters {
+            let enabled =
+                parameter.editable && self.pending_operation.is_none() && self.history_is_at_end();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(parameter.label).small().color(if enabled {
+                    theme::muted()
+                } else {
+                    theme::muted().gamma_multiply(0.62)
+                }));
+                let mut text = parameter.text.clone();
+                let response = ui.add_enabled(
+                    enabled,
+                    egui::TextEdit::singleline(&mut text)
+                        .id(egui::Id::new((
+                            "selected_sketch_recipe_parameter",
+                            parameter.stable_key,
+                        )))
+                        .desired_width(82.0)
+                        .font(FontId::monospace(11.0)),
+                );
+                let hover = parameter.read_only_reason.unwrap_or(
+                    "Enter or clicking away applies this value; Escape reverts. \
+                     Edits rebuild this recipe and every dependent curve exactly.",
+                );
+                let response = if enabled {
+                    response.on_hover_text(hover)
+                } else {
+                    response.on_disabled_hover_text(hover)
+                };
+                response.ctx.accesskit_node_builder(response.id, |node| {
+                    node.set_label(parameter.label);
+                    node.set_description(hover);
+                });
+                if response.has_focus() {
+                    self.recipe_parameter_field = Some(RecipeParameterField {
+                        id: response.id,
+                        rect: response.rect,
+                    });
+                }
+                if response.changed() {
+                    // Typing previews live. The candidate is
+                    // presentation only until the value is
+                    // accepted, so a keystroke costs no
+                    // revision, no identity, and no undo entry.
+                    self.sketch
+                        .set_selected_recipe_parameter_text(parameter.stable_key, text);
+                }
+                let owns_keyboard = response.has_focus() || response.lost_focus();
+                let enter = ui.ctx().input(|state| {
+                    state.raw.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: egui::Key::Enter,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if *modifiers == egui::Modifiers::NONE
+                        )
+                    })
+                });
+                if owns_keyboard && enter {
+                    // Acceptance is same-frame so the value
+                    // is committed truth for every panel
+                    // drawn after this one; the frame-start
+                    // settle then finds nothing armed.
+                    self.sketch_dimension_keys.enter = true;
+                    if self.sketch.selected_recipe_parameter_issue().is_none() {
+                        self.accept_selected_recipe_parameter_edit();
+                        response.surrender_focus();
+                    }
+                }
+                // Escape is not handled here: egui clears
+                // focus in `Focus::begin_pass` before any
+                // widget renders, so the frame-start settle
+                // has already reverted by the time this card
+                // is drawn, and reverting again would fight it.
+                if !parameter.unit.is_empty() {
+                    ui.label(RichText::new(parameter.unit).small().color(theme::muted()));
+                }
+            });
+            if let Some(error) = parameter.error {
+                ui.add(
+                    egui::Label::new(RichText::new(error.label()).small().color(theme::bad()))
+                        .wrap(),
+                );
+            } else if let Some(reason) = parameter.read_only_reason {
+                ui.label(RichText::new(reason).small().color(theme::muted()));
+            }
+        }
+    }
+
+    /// Keys a canvas dimension box can already reach.
+    ///
+    /// `committed_dimension_parameter` binds each dimension kind to one of
+    /// these, so anything here is editable on the geometry itself and must not
+    /// be repeated in a panel.
+    const CANVAS_REACHABLE_PARAMETERS: &'static [&'static str] = &[
+        "length", "angle", "side", "width", "height", "diameter", "radius",
+    ];
+
+    /// The parameters of the selected sketch feature that no dimension box can
+    /// show: a polygon's side count, a pattern's rows and spacing, a chamfer's
+    /// two distances. They are not dimensions of a curve, so no amount of
+    /// clicking geometry will ever surface them.
+    fn orphaned_sketch_parameters(&self) -> Vec<SelectedRecipeParameter> {
+        if self.workbench_mode != WorkbenchMode::Sketch {
+            return Vec::new();
+        }
+        self.selected_sketch_recipe_editor()
+            .map(|editor| {
+                editor
+                    .parameters
+                    .into_iter()
+                    .filter(|parameter| {
+                        !Self::CANVAS_REACHABLE_PARAMETERS.contains(&parameter.stable_key)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A surface for exactly those parameters, and only on the frames that have
+    /// any.
+    ///
+    /// Docked, not floating — and that distinction is the whole point. A
+    /// floating panel over a drawing canvas eats the part it covers, and on a
+    /// drawing surface that part is not spare: the first attempt at this
+    /// committed sixteen entities where twenty were expected, because clicks
+    /// aimed at the canvas landed on the panel. Reserving width is what
+    /// guarantees the canvas you can see is the canvas you can draw on.
+    ///
+    /// It still comes and goes: a line, a circle or a plain rectangle never
+    /// summons it, so the canvas keeps the full window on every frame that does
+    /// not need it.
+    fn sketch_parameter_panel(&mut self, ui: &mut egui::Ui) {
+        if self.workbench_mode != WorkbenchMode::Sketch {
+            return;
+        }
+        let parameters = self.orphaned_sketch_parameters();
+        let descriptor = self.active_sketch_tool.descriptor();
+        if parameters.is_empty() && descriptor.inputs.is_empty() {
+            return;
+        }
+        egui::Panel::right("sketch_parameter_panel")
+            .exact_size(232.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel())
+                    .inner_margin(Margin::symmetric(8, 7))
+                    .stroke(Stroke::new(1.0, theme::border())),
+            )
+            .show(ui, |ui| {
+                // One subject at a time, and the armed tool says which. Select
+                // and Dimension mean "I am working on what is already there",
+                // so the selected recipe wins. Any creation tool means "I am
+                // about to draw", so its own inputs win — otherwise a stale
+                // selection hides the settings for the shape being lined up.
+                let inspecting = matches!(
+                    self.active_sketch_tool,
+                    ToolVariant::Select | ToolVariant::Dimension
+                );
+                if inspecting && !parameters.is_empty() {
+                    ui.label(
+                        RichText::new("SELECTED FEATURE")
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    ui.add_space(3.0);
+                    self.sketch_recipe_parameter_fields(ui, &parameters);
+                } else {
+                    ui.label(
+                        RichText::new(descriptor.accessible_name)
+                            .color(theme::accent())
+                            .strong(),
+                    );
+                    self.sketch_active_tool_inputs(ui, descriptor);
+                }
+            });
+    }
+
+    /// The active sketch tool's own input fields.
+    ///
+    /// A fillet radius or a pattern count is not a dimension of any existing
+    /// curve, so no dimension box will ever carry it — it is an input to the
+    /// operation about to run. These used to sit in the docked palette; they
+    /// live in the sketch parameter panel now, which is the surface for exactly
+    /// what the canvas cannot show.
+    fn sketch_active_tool_inputs(
+        &mut self,
+        ui: &mut egui::Ui,
+        descriptor: &'static crate::sketch_toolbar::ToolDescriptor,
+    ) {
+        // A typed parameter preview is not an operation in flight,
+        // so it must not grey the tool's own inputs.
+        let operation_pending = self.pending_operation.is_some()
+            || (self.sketch.has_pending_edit() && !self.sketch.selected_recipe_edit_pending());
+        let mut individual_input_error_visible = false;
+        for input in descriptor.inputs {
+            let conditionally_enabled = match (self.active_sketch_tool, input.stable_key) {
+                (ToolVariant::RectangularPattern, "count_v" | "spacing_v") => self
+                    .sketch
+                    .active_tool_flag("second_direction")
+                    .unwrap_or(false),
+                (ToolVariant::CircularPattern, "extent") => {
+                    !self.sketch.active_tool_flag("full_circle").unwrap_or(true)
+                }
+                _ => true,
+            };
+            let enabled = !operation_pending && conditionally_enabled;
+            if input.kind == ToolInputKind::Boolean {
+                let mut value = self
+                    .sketch
+                    .active_tool_flag(input.stable_key)
+                    .unwrap_or(false);
+                let response = ui.add_enabled(
+                    !operation_pending,
+                    egui::Checkbox::new(&mut value, input.label),
+                );
+                let response = response.on_hover_text(input.domain);
+                response.ctx.accesskit_node_builder(response.id, |node| {
+                    node.set_label(input.label);
+                    node.set_description(input.domain);
+                });
+                if response.changed() {
+                    self.sketch.set_active_tool_flag(input.stable_key, value);
+                }
+                continue;
+            }
+
+            if let Some(mut text) = self.sketch.active_tool_input_text(input.stable_key) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(input.label).small().color(if enabled {
+                        theme::muted()
+                    } else {
+                        theme::muted().gamma_multiply(0.58)
+                    }));
+                    let response = ui.add_enabled(
+                        enabled,
+                        egui::TextEdit::singleline(&mut text)
+                            .id(egui::Id::new((
+                                "active_sketch_tool_input",
+                                descriptor.stable_key,
+                                input.stable_key,
+                            )))
+                            .desired_width(86.0)
+                            .font(FontId::monospace(11.0)),
+                    );
+                    let response = response.on_hover_text(if conditionally_enabled {
+                        input.domain
+                    } else {
+                        "Inactive for the current distribution mode"
+                    });
+                    response.ctx.accesskit_node_builder(response.id, |node| {
+                        node.set_label(input.label);
+                        node.set_description(format!(
+                            "{}. Invalid text keeps the last valid preview and blocks staging.",
+                            input.domain
+                        ));
+                    });
+                    if response.changed() {
+                        self.sketch
+                            .set_active_tool_input_text(input.stable_key, text.clone());
+                    }
+                    let owns_keyboard = response.has_focus() || response.lost_focus();
+                    let (enter, escape) = ui.ctx().input(|state| {
+                        let pressed = |wanted: egui::Key| {
+                            state.raw.events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    egui::Event::Key {
+                                        key,
+                                        pressed: true,
+                                        repeat: false,
+                                        modifiers,
+                                        ..
+                                    } if *key == wanted
+                                        && *modifiers == egui::Modifiers::NONE
+                                )
+                            })
+                        };
+                        (pressed(egui::Key::Enter), pressed(egui::Key::Escape))
+                    });
+                    if owns_keyboard && escape {
+                        self.sketch.restore_active_tool_input(input.stable_key);
+                        self.sketch_dimension_keys.escape = true;
+                        response.surrender_focus();
+                    }
+                    if owns_keyboard && enter {
+                        self.sketch_dimension_keys.enter = true;
+                        if self
+                            .sketch
+                            .active_tool_input_error(input.stable_key)
+                            .is_none()
+                        {
+                            response.surrender_focus();
+                        }
+                    }
+                    let unit = match input.kind {
+                        ToolInputKind::Length | ToolInputKind::SignedLength => "mm",
+                        ToolInputKind::Angle => "°",
+                        ToolInputKind::Integer | ToolInputKind::Choice | ToolInputKind::Boolean => {
+                            ""
+                        }
+                    };
+                    if !unit.is_empty() {
+                        ui.label(RichText::new(unit).small().color(theme::muted()));
+                    }
+                });
+                if let Some(error) = self.sketch.active_tool_input_error(input.stable_key) {
+                    individual_input_error_visible = true;
+                    ui.label(RichText::new(error.label()).small().color(theme::bad()));
+                } else if !conditionally_enabled {
+                    ui.label(
+                        RichText::new("Inactive in current mode")
+                            .small()
+                            .color(theme::muted()),
+                    );
+                }
+            } else {
+                ui.label(
+                    RichText::new(format!("{} · live on canvas", input.label))
+                        .small()
+                        .color(theme::muted()),
+                )
+                .on_hover_text(input.domain);
+            }
+        }
+        if let Some(issue) = self.sketch.active_tool_parameter_issue() {
+            self.sketch_dimension_keys.confirmation_blocked = true;
+            if !individual_input_error_visible {
+                ui.label(RichText::new(issue.label()).small().color(theme::bad()));
+            }
+        }
+        ui.label(
+            RichText::new(
+                if descriptor.commit_contract == CommitContract::CommitsOnAcceptance {
+                    // This tool has no tick to press (ADR 0027).
+                    "Click a curve, then type on it or here · Enter applies · Esc reverts"
+                } else {
+                    "Tab / Shift-Tab moves fields · Enter accepts · tick commits"
+                },
+            )
+            .small()
+            .color(theme::good()),
+        );
     }
 
     fn contextual_inspector_panel(&mut self, ui: &mut egui::Ui) -> Option<ConfirmationAction> {
@@ -11358,171 +11506,7 @@ impl KernelLabApp {
                         }
                     }
 
-                    // A typed parameter preview is not an operation in flight,
-                    // so it must not grey the tool's own inputs.
-                    let operation_pending = self.pending_operation.is_some()
-                        || (self.sketch.has_pending_edit()
-                            && !self.sketch.selected_recipe_edit_pending());
-                    let mut individual_input_error_visible = false;
-                    for input in descriptor.inputs {
-                        let conditionally_enabled = match (
-                            self.active_sketch_tool,
-                            input.stable_key,
-                        ) {
-                            (ToolVariant::RectangularPattern, "count_v" | "spacing_v") => self
-                                .sketch
-                                .active_tool_flag("second_direction")
-                                .unwrap_or(false),
-                            (ToolVariant::CircularPattern, "extent") => !self
-                                .sketch
-                                .active_tool_flag("full_circle")
-                                .unwrap_or(true),
-                            _ => true,
-                        };
-                        let enabled = !operation_pending && conditionally_enabled;
-                        if input.kind == ToolInputKind::Boolean {
-                            let mut value = self
-                                .sketch
-                                .active_tool_flag(input.stable_key)
-                                .unwrap_or(false);
-                            let response = ui.add_enabled(
-                                !operation_pending,
-                                egui::Checkbox::new(&mut value, input.label),
-                            );
-                            let response = response.on_hover_text(input.domain);
-                            response.ctx.accesskit_node_builder(response.id, |node| {
-                                node.set_label(input.label);
-                                node.set_description(input.domain);
-                            });
-                            if response.changed() {
-                                self.sketch
-                                    .set_active_tool_flag(input.stable_key, value);
-                            }
-                            continue;
-                        }
-
-                        if let Some(mut text) =
-                            self.sketch.active_tool_input_text(input.stable_key)
-                        {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(input.label).small().color(if enabled {
-                                    theme::muted()
-                                } else {
-                                    theme::muted().gamma_multiply(0.58)
-                                }));
-                                let response = ui.add_enabled(
-                                    enabled,
-                                    egui::TextEdit::singleline(&mut text)
-                                        .id(egui::Id::new((
-                                            "active_sketch_tool_input",
-                                            descriptor.stable_key,
-                                            input.stable_key,
-                                        )))
-                                        .desired_width(86.0)
-                                        .font(FontId::monospace(11.0)),
-                                );
-                                let response = response.on_hover_text(if conditionally_enabled {
-                                    input.domain
-                                } else {
-                                    "Inactive for the current distribution mode"
-                                });
-                                response.ctx.accesskit_node_builder(response.id, |node| {
-                                    node.set_label(input.label);
-                                    node.set_description(format!(
-                                        "{}. Invalid text keeps the last valid preview and blocks staging.",
-                                        input.domain
-                                    ));
-                                });
-                                if response.changed() {
-                                    self.sketch.set_active_tool_input_text(
-                                        input.stable_key,
-                                        text.clone(),
-                                    );
-                                }
-                                let owns_keyboard = response.has_focus() || response.lost_focus();
-                                let (enter, escape) = ui.ctx().input(|state| {
-                                    let pressed = |wanted: egui::Key| {
-                                        state.raw.events.iter().any(|event| {
-                                            matches!(
-                                                event,
-                                                egui::Event::Key {
-                                                    key,
-                                                    pressed: true,
-                                                    repeat: false,
-                                                    modifiers,
-                                                    ..
-                                                } if *key == wanted
-                                                    && *modifiers == egui::Modifiers::NONE
-                                            )
-                                        })
-                                    };
-                                    (pressed(egui::Key::Enter), pressed(egui::Key::Escape))
-                                });
-                                if owns_keyboard && escape {
-                                    self.sketch.restore_active_tool_input(input.stable_key);
-                                    self.sketch_dimension_keys.escape = true;
-                                    response.surrender_focus();
-                                }
-                                if owns_keyboard && enter {
-                                    self.sketch_dimension_keys.enter = true;
-                                    if self
-                                        .sketch
-                                        .active_tool_input_error(input.stable_key)
-                                        .is_none()
-                                    {
-                                        response.surrender_focus();
-                                    }
-                                }
-                                let unit = match input.kind {
-                                    ToolInputKind::Length | ToolInputKind::SignedLength => "mm",
-                                    ToolInputKind::Angle => "°",
-                                    ToolInputKind::Integer
-                                    | ToolInputKind::Choice
-                                    | ToolInputKind::Boolean => "",
-                                };
-                                if !unit.is_empty() {
-                                    ui.label(RichText::new(unit).small().color(theme::muted()));
-                                }
-                            });
-                            if let Some(error) =
-                                self.sketch.active_tool_input_error(input.stable_key)
-                            {
-                                individual_input_error_visible = true;
-                                ui.label(RichText::new(error.label()).small().color(theme::bad()));
-                            } else if !conditionally_enabled {
-                                ui.label(
-                                    RichText::new("Inactive in current mode")
-                                        .small()
-                                        .color(theme::muted()),
-                                );
-                            }
-                        } else {
-                            ui.label(
-                                RichText::new(format!("{} · live on canvas", input.label))
-                                    .small()
-                                    .color(theme::muted()),
-                            )
-                            .on_hover_text(input.domain);
-                        }
-                    }
-                    if let Some(issue) = self.sketch.active_tool_parameter_issue() {
-                        self.sketch_dimension_keys.confirmation_blocked = true;
-                        if !individual_input_error_visible {
-                            ui.label(RichText::new(issue.label()).small().color(theme::bad()));
-                        }
-                    }
-                    ui.label(
-                        RichText::new(if descriptor.commit_contract
-                            == CommitContract::CommitsOnAcceptance
-                        {
-                            // This tool has no tick to press (ADR 0027).
-                            "Click a curve, then type on it or here · Enter applies · Esc reverts"
-                        } else {
-                            "Tab / Shift-Tab moves fields · Enter accepts · tick commits"
-                        })
-                            .small()
-                            .color(theme::good()),
-                    );
+                    self.sketch_active_tool_inputs(ui, descriptor);
                 });
 
                 }
@@ -11557,107 +11541,7 @@ impl KernelLabApp {
                                         .color(theme::muted()),
                                 );
                             }
-                            for parameter in editor.parameters {
-                                let enabled = parameter.editable
-                                    && self.pending_operation.is_none()
-                                    && self.history_is_at_end();
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(parameter.label).small().color(if enabled {
-                                            theme::muted()
-                                        } else {
-                                            theme::muted().gamma_multiply(0.62)
-                                        }),
-                                    );
-                                    let mut text = parameter.text.clone();
-                                    let response = ui.add_enabled(
-                                        enabled,
-                                        egui::TextEdit::singleline(&mut text)
-                                            .id(egui::Id::new((
-                                                "selected_sketch_recipe_parameter",
-                                                parameter.stable_key,
-                                            )))
-                                            .desired_width(82.0)
-                                            .font(FontId::monospace(11.0)),
-                                    );
-                                    let hover = parameter.read_only_reason.unwrap_or(
-                                        "Enter or clicking away applies this value; Escape reverts. \
-                                         Edits rebuild this recipe and every dependent curve exactly.",
-                                    );
-                                    let response = if enabled {
-                                        response.on_hover_text(hover)
-                                    } else {
-                                        response.on_disabled_hover_text(hover)
-                                    };
-                                    response.ctx.accesskit_node_builder(response.id, |node| {
-                                        node.set_label(parameter.label);
-                                        node.set_description(hover);
-                                    });
-                                    if response.has_focus() {
-                                        self.recipe_parameter_field = Some(RecipeParameterField {
-                                            id: response.id,
-                                            rect: response.rect,
-                                        });
-                                    }
-                                    if response.changed() {
-                                        // Typing previews live. The candidate is
-                                        // presentation only until the value is
-                                        // accepted, so a keystroke costs no
-                                        // revision, no identity, and no undo entry.
-                                        self.sketch.set_selected_recipe_parameter_text(
-                                            parameter.stable_key,
-                                            text,
-                                        );
-                                    }
-                                    let owns_keyboard =
-                                        response.has_focus() || response.lost_focus();
-                                    let enter = ui.ctx().input(|state| {
-                                        state.raw.events.iter().any(|event| {
-                                            matches!(
-                                                event,
-                                                egui::Event::Key {
-                                                    key: egui::Key::Enter,
-                                                    pressed: true,
-                                                    repeat: false,
-                                                    modifiers,
-                                                    ..
-                                                } if *modifiers == egui::Modifiers::NONE
-                                            )
-                                        })
-                                    });
-                                    if owns_keyboard && enter {
-                                        // Acceptance is same-frame so the value
-                                        // is committed truth for every panel
-                                        // drawn after this one; the frame-start
-                                        // settle then finds nothing armed.
-                                        self.sketch_dimension_keys.enter = true;
-                                        if self.sketch.selected_recipe_parameter_issue().is_none() {
-                                            self.accept_selected_recipe_parameter_edit();
-                                            response.surrender_focus();
-                                        }
-                                    }
-                                    // Escape is not handled here: egui clears
-                                    // focus in `Focus::begin_pass` before any
-                                    // widget renders, so the frame-start settle
-                                    // has already reverted by the time this card
-                                    // is drawn, and reverting again would fight it.
-                                    if !parameter.unit.is_empty() {
-                                        ui.label(
-                                            RichText::new(parameter.unit).small().color(theme::muted()),
-                                        );
-                                    }
-                                });
-                                if let Some(error) = parameter.error {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(error.label()).small().color(theme::bad()),
-                                        )
-                                        .wrap(),
-                                    );
-                                } else if let Some(reason) = parameter.read_only_reason {
-                                    ui.label(RichText::new(reason).small().color(theme::muted()));
-                                }
-                            }
+                            self.sketch_recipe_parameter_fields(ui, &editor.parameters);
                             if self.sketch.selected_recipe_parameter_issue().is_some() {
                                 self.sketch_dimension_keys.confirmation_blocked = true;
                             }
@@ -13292,7 +13176,7 @@ impl KernelLabApp {
             egui::pos2(overlay.left(), overlay.bottom() - 24.0),
             egui::vec2(150.0, 24.0),
         );
-        canvas_overlay_label(
+        let plane_status = canvas_overlay_label(
             ui,
             "sketch_plane_status",
             plane_status_rect,
@@ -13307,6 +13191,18 @@ impl KernelLabApp {
             },
             theme::muted(),
         );
+        // A face sketch's frame provenance used to be a line under SKETCH PLANE
+        // in the palette. It is a property of the plane, so it rides on the chip
+        // that names the plane rather than earning pixels of its own.
+        if self.sketch_is_face_supported() {
+            plane_status.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    true,
+                    "Authoritative face-local frame · reference boundary",
+                )
+            });
+        }
 
         if let Some(entity) = self.sketch.selected() {
             let selection_rect = egui::Rect::from_min_size(
@@ -13985,6 +13881,9 @@ impl KernelLabApp {
             }
             viewport::ViewportContextTarget::Empty => {}
         }
+        // One right-click menu at a time: the viewport menu replaces the
+        // Browser menu and vice versa.
+        self.browser_context_menu = None;
         self.model_context_menu = Some(ModelContextMenu {
             position: context_click.position,
             target: context_click.target,
@@ -14012,98 +13911,23 @@ impl KernelLabApp {
             return;
         };
         let commands = self.model_context_commands(menu);
-        let item_height = 22.0;
-        let item_spacing = 2.0;
-        let margin = 5.0;
-        let inner = egui::vec2(
-            208.0,
-            commands.len() as f32 * item_height
-                + (commands.len().saturating_sub(1)) as f32 * item_spacing,
+        let labels = commands
+            .iter()
+            .map(|command| command.label())
+            .collect::<Vec<_>>();
+        let outcome = browser::floating_context_menu(
+            context,
+            "model_context_menu",
+            menu.position,
+            &labels,
+            menu.just_opened,
         );
-        let size = inner + egui::Vec2::splat(margin * 2.0);
-        let screen = context.content_rect();
-        let origin = egui::pos2(
-            menu.position
-                .x
-                .clamp(screen.left(), (screen.right() - size.x).max(screen.left())),
-            menu.position
-                .y
-                .clamp(screen.top(), (screen.bottom() - size.y).max(screen.top())),
-        );
-        let area = egui::Area::new(egui::Id::new("model_context_menu"))
-            .fixed_pos(origin)
-            // Without a size hint the first frame runs egui's constrain pass
-            // against an unknown size and lands the menu mid-screen; the very
-            // first click aimed at an item then misses.
-            .default_size(size)
-            .constrain(false)
-            .order(egui::Order::Foreground)
-            .show(context, |ui| {
-                // The margin and the gaps between rows sense nothing, so
-                // without this backstop a click on the menu's own padding falls
-                // through to the viewport and reopens a different menu.
-                ui.interact(
-                    egui::Rect::from_min_size(origin, size),
-                    egui::Id::new("model_context_menu_backstop"),
-                    egui::Sense::click(),
-                );
-                Frame::new()
-                    .fill(theme::panel())
-                    .stroke(Stroke::new(1.0, theme::border()))
-                    .corner_radius(4)
-                    .inner_margin(Margin::same(margin as i8))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = item_spacing;
-                        ui.set_min_size(inner);
-                        ui.set_max_width(inner.x);
-                        let mut chosen = None;
-                        let mut first_item = None;
-                        for command in &commands {
-                            let response = ui.add_sized(
-                                [inner.x, item_height],
-                                egui::Button::new(
-                                    RichText::new(command.label())
-                                        .font(FontId::proportional(12.0))
-                                        .color(theme::text()),
-                                )
-                                .frame(false),
-                            );
-                            response.widget_info(|| {
-                                egui::WidgetInfo::labeled(
-                                    egui::WidgetType::Button,
-                                    true,
-                                    command.label(),
-                                )
-                            });
-                            first_item.get_or_insert(response.id);
-                            if response.clicked() {
-                                chosen = Some(*command);
-                            }
-                        }
-                        // A menu nobody can reach from the keyboard is not a
-                        // menu. Focus the first command as it opens so Tab,
-                        // arrows, and a screen reader all start inside it
-                        // rather than at the far end of the shell.
-                        if menu.just_opened
-                            && let Some(id) = first_item
-                        {
-                            ui.ctx().memory_mut(|memory| memory.request_focus(id));
-                        }
-                        chosen
-                    })
-                    .inner
-            });
-        let chosen = area.inner;
-        // `Response` pointer queries read the context's input themselves, so
-        // they are sampled before the keyboard read rather than inside it.
-        let clicked_elsewhere = area.response.clicked_elsewhere();
-        let dismissed = context.input(|input| input.key_pressed(egui::Key::Escape));
-        if let Some(command) = chosen {
+        if let Some(chosen) = outcome.chosen {
             self.model_context_menu = None;
-            self.run_model_context_command(command, menu, context);
+            self.run_model_context_command(commands[chosen], menu, context);
             return;
         }
-        if dismissed || (!menu.just_opened && clicked_elsewhere) {
+        if outcome.escape || (!menu.just_opened && outcome.clicked_elsewhere) {
             self.model_context_menu = None;
             return;
         }
@@ -14148,19 +13972,7 @@ impl KernelLabApp {
                     }
                 }
             }
-            ModelContextCommand::ShowAllBodies => {
-                for index in 0..self.bodies.len() {
-                    // A body inside a hidden or suppressed component stays
-                    // hidden: that visibility is the component's to grant.
-                    let eligible = !self.bodies[index].visible
-                        && self
-                            .component_for_body(self.bodies[index].id)
-                            .is_none_or(|component| component.visible && !component.suppressed);
-                    if eligible {
-                        self.set_body_visibility(index, true);
-                    }
-                }
-            }
+            ModelContextCommand::ShowAllBodies => self.show_all_eligible_bodies(),
             ModelContextCommand::ClearSelection => self.clear_model_entity_selection(),
         }
     }
@@ -14837,16 +14649,13 @@ impl eframe::App for KernelLabApp {
         // while an operation is staged — are the foot of the contextual card,
         // beside whatever the operation needs. The floating chip below is the
         // fallback for frames where that card is suppressed.
-        // Sketching always has completion controls, whether or not there is a
-        // staged operation: Finish and Exit are the sketch's own two answers.
-        // So the fallback covers every sketch frame the card is not up for,
-        // not only the pending ones.
+        // Finish and Exit are ribbon commands in the Sketch tab's COMPLETE
+        // group, so the sketch no longer needs a permanent bar to hold them.
+        // This chip is now what its name says: the fallback for a *staged*
+        // operation when no other surface is up to host the gate.
         let hosts_confirmation = self.contextual_card_visible()
             || (self.inspector_open() && !self.document_properties_open);
-        let mut confirmation_action = if (self.pending_operation.is_some()
-            || self.workbench_mode == WorkbenchMode::Sketch)
-            && !hosts_confirmation
-        {
+        let mut confirmation_action = if self.pending_operation.is_some() && !hosts_confirmation {
             // The contextual card hosts these controls whenever it is on
             // screen. This floating chip is the fallback for the frames where
             // it is not — the docked palette open, the context menu up — so a
@@ -14901,6 +14710,7 @@ impl eframe::App for KernelLabApp {
         // Both anchor to the right edge, and letting them stack put the
         // dialog on top of the dock — the inspector's controls stayed in the
         // accessibility tree but a pointer could no longer reach them.
+        self.sketch_parameter_panel(ui);
         if self.inspector_open() && !self.document_properties_open {
             let panel_action = egui::Panel::right("contextual_inspector")
                 // Fixed width, deliberately not resizable. A width the content
@@ -14974,6 +14784,7 @@ impl eframe::App for KernelLabApp {
         // operation `cancel_pending_operation` is a no-op and Escape has no
         // other binding in the model workspace.
         self.show_model_context_menu(ui.ctx());
+        self.show_browser_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.about_window(ui.ctx());
@@ -16183,6 +15994,63 @@ const fn reverse_arc_direction(direction: ArcDirection) -> ArcDirection {
     }
 }
 
+/// Appends one standalone 2×2×2 cuboid base body, for unit tests that need a
+/// second all-planar body to select and operate on.
+#[cfg(test)]
+fn push_test_cuboid_body(app: &mut KernelLabApp, label: &str, origin: Point3) -> BodyId {
+    let empty = NativeKernel::empty();
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new(format!("ui-test-cuboid-{label}")),
+        expected_snapshot: empty.id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::MakeCuboid {
+            origin,
+            size_x: 2.0,
+            size_y: 2.0,
+            size_z: 2.0,
+        },
+    };
+    let outcome =
+        NativeKernel::execute(&empty, &request, &CancellationToken::new()).expect("tool body");
+    let association = SnapshotAssociation::new(
+        outcome.report.input_snapshot,
+        outcome.report.output_snapshot,
+        outcome.report.semantic_digest,
+    );
+    let appended = app
+        .document
+        .append_feature(
+            FeatureDraft::new(
+                FeatureKind::BaseBody,
+                label,
+                ReplayAction::Kernel(request.command),
+            )
+            .with_output(OutputDraft::CreateBody {
+                label: label.to_owned(),
+            })
+            .with_commit(association),
+        )
+        .expect("tool history");
+    let id = appended.created_bodies[0];
+    let ordinal = app.next_body_ordinal;
+    app.next_body_ordinal += 1;
+    app.bodies.push(WorkbenchBody {
+        id,
+        last_feature: appended.feature,
+        ordinal,
+        body: DisplayedBody {
+            scene: NativeKernel::debug_scene(&outcome.snapshot),
+            snapshot: outcome.snapshot,
+            report: outcome.report,
+        },
+        kind: ModelBodyKind::Cuboid,
+        visible: true,
+        material: None,
+    });
+    id
+}
+
 #[cfg(test)]
 fn classify_sketch_extrusion_vertices(
     vertices: &[SketchPoint],
@@ -16560,6 +16428,24 @@ const fn sketch_plane_frame(plane: SketchPlane) -> PlanarFrame3 {
         SketchPlane::XZ => (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
     };
     PlanarFrame3::new(Point3::new(0.0, 0.0, 0.0), axis_u, axis_v)
+}
+
+/// The origin and unit normal of a planar frame's plane, or `None` when the
+/// axes are degenerate. The normal follows the right-handed `u × v`.
+fn planar_frame_origin_normal(frame: PlanarFrame3) -> Option<(Point3, Vector3)> {
+    let normal = Vector3::new(
+        frame.u.y * frame.v.z - frame.u.z * frame.v.y,
+        frame.u.z * frame.v.x - frame.u.x * frame.v.z,
+        frame.u.x * frame.v.y - frame.u.y * frame.v.x,
+    );
+    let length = normal.x.hypot(normal.y).hypot(normal.z);
+    if !length.is_finite() || length <= f64::EPSILON {
+        return None;
+    }
+    Some((
+        frame.origin,
+        Vector3::new(normal.x / length, normal.y / length, normal.z / length),
+    ))
 }
 
 fn sketch_plane_for_frame(frame: PlanarFrame3) -> SketchPlane {
@@ -17164,19 +17050,6 @@ fn shell_toggle_button(
     });
 }
 
-fn browser_text_row(ui: &mut egui::Ui, text: &str, color: Color32) {
-    ui.add_sized(
-        [ui.available_width(), 24.0],
-        egui::Label::new(
-            RichText::new(text)
-                .font(FontId::proportional(11.5))
-                .color(color),
-        )
-        .truncate(),
-    )
-    .on_hover_text(text);
-}
-
 /// Draws a card body bare when it sits inside a contextual card that already
 /// carries the title, and as a collapsible section otherwise. Without this the
 /// card says its own name twice.
@@ -17540,13 +17413,19 @@ mod extrusion_workbench_tests {
                 .expect("a plane always has a camera target");
             assert_eq!(app.view, expected, "{plane:?} should look straight at it");
 
-            // Leaving the sketch hands the model camera back, so a solid
-            // extruded off the plane is not left being viewed edge-on.
+            // Leaving the sketch keeps the camera where the sketch put it:
+            // snapping back would discard the orientation the user just
+            // established, at the exact moment they want to look at what they
+            // made. Home and Frame are how a view is deliberately reset.
             app.enter_model_mode();
             assert_eq!(app.workbench_mode, WorkbenchMode::Model);
             assert_eq!(
-                app.view, before,
-                "{plane:?} should restore the camera the sketch borrowed"
+                app.view, expected,
+                "{plane:?} should leave the camera where the sketch put it"
+            );
+            assert!(
+                app.camera_before_plane_sketch.is_none(),
+                "{plane:?} should release the borrowed camera without moving it"
             );
 
             // With animation on, the flight is scheduled and the sketch
@@ -20152,57 +20031,7 @@ mod extrusion_workbench_tests {
 
     /// Appends one committed cuboid body to the workspace and its history.
     fn push_boolean_operand(app: &mut KernelLabApp, label: &str, origin: Point3) -> BodyId {
-        let empty = NativeKernel::empty();
-        let request = ExecuteRequest {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            request_id: RequestId::new(format!("ui-boolean-{label}")),
-            expected_snapshot: empty.id(),
-            precision: PrecisionPolicy::default(),
-            command: KernelCommand::MakeCuboid {
-                origin,
-                size_x: 2.0,
-                size_y: 2.0,
-                size_z: 2.0,
-            },
-        };
-        let outcome =
-            NativeKernel::execute(&empty, &request, &CancellationToken::new()).expect("tool body");
-        let association = SnapshotAssociation::new(
-            outcome.report.input_snapshot,
-            outcome.report.output_snapshot,
-            outcome.report.semantic_digest,
-        );
-        let appended = app
-            .document
-            .append_feature(
-                FeatureDraft::new(
-                    FeatureKind::BaseBody,
-                    label,
-                    ReplayAction::Kernel(request.command),
-                )
-                .with_output(OutputDraft::CreateBody {
-                    label: label.to_owned(),
-                })
-                .with_commit(association),
-            )
-            .expect("tool history");
-        let id = appended.created_bodies[0];
-        let ordinal = app.next_body_ordinal;
-        app.next_body_ordinal += 1;
-        app.bodies.push(WorkbenchBody {
-            id,
-            last_feature: appended.feature,
-            ordinal,
-            body: DisplayedBody {
-                scene: NativeKernel::debug_scene(&outcome.snapshot),
-                snapshot: outcome.snapshot,
-                report: outcome.report,
-            },
-            kind: ModelBodyKind::Cuboid,
-            visible: true,
-            material: None,
-        });
-        id
+        crate::push_test_cuboid_body(app, label, origin)
     }
 
     fn boolean_feature_count(app: &KernelLabApp) -> usize {
@@ -20449,6 +20278,9 @@ mod extrusion_workbench_tests {
         assert_eq!(revolve.body_count(), bodies_before + 1);
 
         let mut mirror = KernelLabApp::default();
+        // Mirror follows the Browser's plane selection; pick YZ explicitly so
+        // the flip lands on the X axis.
+        mirror.select_origin_plane(SketchPlane::YZ);
         mirror.stage_preset_feature(SolidFeaturePreset::Mirror);
         assert!(mirror.confirm_pending_operation());
         assert!(mirror.displayed_measures().unwrap().centroid.unwrap().x < 0.0);

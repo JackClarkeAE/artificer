@@ -49,6 +49,20 @@ fn diagnostic_harness() -> Harness<'static, KernelLabApp> {
     harness
 }
 
+/// The settings dialog is anchored over the centre of the window, so the model
+/// beneath it cannot be picked or dragged while it is up. Tests that do both
+/// put it away for the part that touches the model, exactly as a user would.
+fn with_model_reachable(
+    harness: &mut Harness<'static, KernelLabApp>,
+    body: impl FnOnce(&mut Harness<'static, KernelLabApp>),
+) {
+    harness.state_mut().close_document_properties();
+    harness.run();
+    body(harness);
+    harness.state_mut().open_document_properties();
+    harness.run();
+}
+
 fn minimum_diagnostic_harness() -> Harness<'static, KernelLabApp> {
     let mut harness = minimum_window_harness();
     harness.run();
@@ -77,8 +91,21 @@ fn click_tool(harness: &mut Harness<'static, KernelLabApp>, shortcut: &str, labe
     assert_eq!(harness.state().active_tool_label(), label);
 }
 
+/// A grab point inside the model viewport that is not its dead centre.
+///
+/// Centred dialogs land on the middle of the screen, so a drag that starts
+/// there is grabbing whatever floats above the model rather than the model.
+/// Quarter-width in is still comfortably over the body and owned by nothing.
+fn viewport_grab_point(harness: &Harness<'static, KernelLabApp>) -> egui::Pos2 {
+    let viewport = harness.get_by_label("Model viewport").rect();
+    egui::pos2(
+        viewport.left() + viewport.width() * 0.25,
+        viewport.center().y,
+    )
+}
+
 fn drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: egui::Vec2) {
-    let start = harness.get_by_label("Model viewport").rect().center();
+    let start = viewport_grab_point(harness);
     let end = start + delta;
     harness.drag_at(start);
     harness.step();
@@ -89,7 +116,7 @@ fn drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: egui::Vec2
 }
 
 fn secondary_drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: egui::Vec2) {
-    let start = harness.get_by_label("Model viewport").rect().center();
+    let start = viewport_grab_point(harness);
     let end = start + delta;
     harness.hover_at(start);
     harness.step();
@@ -544,9 +571,11 @@ fn modified_enter_cannot_bypass_the_bare_enter_contract() {
 #[test]
 fn successful_case_confirmation_clears_the_pending_operation() {
     let mut harness = diagnostic_harness();
-    click_tool(&mut harness, "M", "Move");
-    drag_viewport(&mut harness, egui::vec2(24.0, -10.0));
-    confirm_with_tick(&mut harness);
+    with_model_reachable(&mut harness, |harness| {
+        click_tool(harness, "M", "Move");
+        drag_viewport(harness, egui::vec2(24.0, -10.0));
+        confirm_with_tick(harness);
+    });
     assert_eq!(
         harness.state().feature_timeline_entries(),
         vec![
@@ -777,8 +806,10 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
             .is_none()
     );
 
-    click_tool(&mut harness, "M", "Move");
-    drag_viewport(&mut harness, egui::vec2(45.0, -18.0));
+    with_model_reachable(&mut harness, |harness| {
+        click_tool(harness, "M", "Move");
+        drag_viewport(harness, egui::vec2(45.0, -18.0));
+    });
 
     assert!(harness.state().operation_confirmation_pending());
     assert_compact_confirmation_controls(&harness);
@@ -1082,8 +1113,10 @@ fn rejected_transform_retains_preview_model_selection_camera_and_motion() {
 fn case_commands_are_blocked_while_a_preview_is_dirty() {
     let mut harness = diagnostic_harness();
     let snapshot = harness.state().displayed_snapshot_id();
-    click_tool(&mut harness, "M", "Move");
-    drag_viewport(&mut harness, egui::vec2(60.0, 20.0));
+    with_model_reachable(&mut harness, |harness| {
+        click_tool(harness, "M", "Move");
+        drag_viewport(harness, egui::vec2(60.0, 20.0));
+    });
 
     harness
         .get_by_role_and_label(Role::Button, "Zero width")

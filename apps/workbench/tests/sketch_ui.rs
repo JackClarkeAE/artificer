@@ -196,7 +196,7 @@ fn commit_exact_xy_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
 
 fn finish_exact_xy_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
     commit_exact_xy_rectangle(harness);
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
 
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -247,11 +247,7 @@ fn startup_shell_selects_each_origin_plane_without_touching_the_kernel() {
             .query_by_role_and_label(Role::Button, "Origin")
             .is_some()
     );
-    assert!(
-        harness
-            .query_by_label("◆  Body 1 · native cuboid")
-            .is_some()
-    );
+    assert!(harness.query_by_label("Body 1 · native cuboid").is_some());
 
     for (label, plane) in [
         ("YZ Plane", SketchPlane::YZ),
@@ -533,10 +529,9 @@ fn unfocused_dimension_editor_does_not_steal_global_confirm_or_cancel() {
                 .is_some()
         );
 
-        click_button(&mut harness, "Properties");
-        harness
-            .get_by_role_and_label(Role::CheckBox, "Enable snapping")
-            .focus();
+        // Sketch mode has no side panel; the ribbon's Snap toggle is the
+        // control outside the canvas that can hold focus.
+        harness.get_by_role_and_label(Role::Button, "Snap").focus();
         harness.run();
         press_key(&mut harness, key);
 
@@ -562,10 +557,7 @@ fn tab_from_an_inspector_control_does_not_activate_a_draft_dimension() {
             .is_none()
     );
 
-    click_button(&mut harness, "Properties");
-    harness
-        .get_by_role_and_label(Role::CheckBox, "Enable snapping")
-        .focus();
+    harness.get_by_role_and_label(Role::Button, "Snap").focus();
     harness.run();
     press_key(&mut harness, egui::Key::Tab);
 
@@ -718,12 +710,6 @@ fn crossing_cells_require_selection_and_extrude_the_exact_selected_union() {
         SketchExtrusionEligibility::RegionSelectionRequired { available: 3 }
     );
     assert!(harness.state().sketch_planar_profile_payload().is_none());
-    assert!(harness.query_by_label("0 selected · 3 available").is_some());
-    assert!(
-        harness
-            .query_by_label("Click inside a bounded profile cell · Shift-click adds")
-            .is_some()
-    );
 
     let left = canvas_sketch_point(&harness, SketchPoint::new(-3.0, 0.0));
     click_at(&mut harness, left);
@@ -754,7 +740,7 @@ fn crossing_cells_require_selection_and_extrude_the_exact_selected_union() {
             .len(),
         1
     );
-    assert!(harness.query_by_label("2 selected · 3 available").is_some());
+    assert_eq!(harness.state().available_sketch_region_count(), 3);
 
     let attempts = harness.state().transaction_attempt_count();
     click_button(&mut harness, "Extrude");
@@ -863,7 +849,7 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
     click_button(&mut harness, "Browser");
     assert!(
         harness
-            .query_by_label("◆  Body 1 · native sketch extrusion")
+            .query_by_label("Body 1 · native sketch extrusion")
             .is_some()
     );
     assert!(
@@ -927,7 +913,7 @@ fn concave_finished_loop_extrudes_as_an_exact_native_linear_profile() {
     );
 
     choose_sketch_tool(&mut harness, "Select sketch geometry");
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     press_key(&mut harness, egui::Key::Enter);
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert!(harness.state().sketch_finished());
@@ -992,13 +978,13 @@ fn separately_drawn_reversed_square_is_visibly_certified_and_extrude_ready() {
         harness.state().sketch_profile_status(),
         CertifiedProfileStatus::Closed { .. }
     ));
-    assert!(
-        harness
-            .query_by_label("1 regions · 1 closed loops · 0 holes")
-            .is_some(),
-        "the profile inspector should explain the extracted region"
-    );
-    click_button(&mut harness, "Finish sketch command");
+    let payload = harness
+        .state()
+        .sketch_planar_profile_payload()
+        .expect("a certified closed square extracts one region");
+    assert_eq!(payload.regions.len(), 1);
+    assert!(payload.regions[0].holes.is_empty());
+    click_button(&mut harness, "Finish sketch");
     press_key(&mut harness, egui::Key::Enter);
     assert_eq!(
         harness.state().sketch_extrusion_eligibility(),
@@ -1099,13 +1085,8 @@ fn rectangle_is_certified_counter_clockwise_and_finish_is_itself_confirmed() {
             winding: ProfileWinding::CounterClockwise,
         }
     );
-    assert!(
-        harness
-            .query_by_label("PROFILE CLOSED · COUNTER-CLOCKWISE")
-            .is_some()
-    );
 
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     // Finishing is one action: the sketch saves and the mode returns.
     assert!(harness.state().sketch_finished());
     assert_kernel_unchanged(&harness, snapshot, attempts);
@@ -1149,7 +1130,7 @@ fn connected_line_loop_is_certified_and_finishes_through_the_global_gate() {
     assert_kernel_unchanged(&harness, snapshot, attempts);
 
     choose_sketch_tool(&mut harness, "Select sketch geometry");
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
 
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert!(harness.state().sketch_finished());
@@ -1365,7 +1346,7 @@ fn finish_saves_an_open_line_but_keeps_extrude_unavailable() {
     // Open authoring geometry is a valid saved sketch even though it cannot
     // define material until later edits close it.
     choose_sketch_tool(&mut harness, "Select sketch geometry");
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     press_key(&mut harness, egui::Key::Enter);
 
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -1415,14 +1396,9 @@ fn finish_saves_self_intersecting_authoring_and_exposes_the_selected_bounded_cel
         harness.state().sketch_profile_status(),
         CertifiedProfileStatus::SelfIntersecting
     );
-    assert!(
-        harness
-            .query_by_label("PROFILE SELF-INTERSECTING")
-            .is_some()
-    );
 
     choose_sketch_tool(&mut harness, "Select sketch geometry");
-    click_button(&mut harness, "Finish sketch command");
+    click_button(&mut harness, "Finish sketch");
     press_key(&mut harness, egui::Key::Enter);
 
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);

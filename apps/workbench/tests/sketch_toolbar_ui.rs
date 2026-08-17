@@ -9,10 +9,10 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, ROW_GAP, SKETCH_TOOLBAR_HEIGHT,
-    SKETCH_TOOLBAR_WIDTH, SketchOperationGate, SketchToolCapabilities, SketchToolbarOutput,
-    SketchToolbarState, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
-    render_sketch_toolbar,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
+    ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate,
+    SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN,
+    TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant, render_sketch_toolbar,
 };
 
 struct ToolbarHarness {
@@ -79,24 +79,36 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
     let mut fixture = ToolbarHarness::new();
     fixture.run();
 
+    // A family without variants has no chooser, so its primary owns the whole
+    // tile. One with variants gives the chooser a column and stops short of it.
     for label in [
         "Select sketch geometry",
         "Sketch point",
+        "Trim curve span",
+        "2D fillet",
+        "Sketch dimension",
+    ] {
+        let node = fixture.harness.get_by_role_and_label(Role::Button, label);
+        assert_eq!(node.rect().width(), PRIMARY_CELL_WIDTH, "{label}");
+        assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
+    }
+    for label in [
         "Single line",
         "Two-point rectangle",
         "Centre-point circle",
         "Centre-start-end arc",
         "Outer-diameter polygon",
         "Two-point centre-to-centre slot",
-        "Trim curve span",
-        "2D fillet",
         "Equal-distance chamfer",
         "Rectangular sketch pattern",
         "Horizontal relation",
-        "Sketch dimension",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
-        assert_eq!(node.rect().width(), PRIMARY_CELL_SIZE, "{label}");
+        assert_eq!(
+            node.rect().width(),
+            PRIMARY_CELL_WIDTH - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET,
+            "{label}"
+        );
         assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
     }
 
@@ -112,9 +124,16 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Choose relation; current default: Horizontal.",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
-        assert!(node.rect().width() < PRIMARY_CELL_SIZE, "{label}");
+        assert!(node.rect().width() < PRIMARY_CELL_WIDTH, "{label}");
         assert_eq!(node.rect().width(), CHEVRON_CELL_WIDTH, "{label}");
-        assert_eq!(node.rect().height(), CHEVRON_CELL_WIDTH, "{label}");
+        // Full height, not a square in the corner. The chooser used to be a
+        // 12 px box sitting on top of the icon it belonged to, which is how a
+        // chevron and a glyph came to occupy the same pixels.
+        assert_eq!(
+            node.rect().height(),
+            PRIMARY_CELL_SIZE - CHEVRON_CELL_INSET * 2.0,
+            "{label}"
+        );
     }
 
     let output = fixture.output.borrow();
@@ -157,17 +176,24 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
             let layout = output.controls[family as usize].expect("family layout");
             assert_eq!(
                 layout.primary.size(),
-                egui::vec2(PRIMARY_CELL_SIZE, PRIMARY_CELL_SIZE)
+                egui::vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE)
             );
             assert_eq!(layout.primary.center().y, first.center().y);
             assert_eq!(
                 layout.primary.left(),
-                first.left() + column as f32 * (PRIMARY_CELL_SIZE + FAMILY_GAP)
+                first.left() + column as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP)
             );
             if let Some(chooser) = layout.chooser {
                 assert!(layout.primary.contains_rect(chooser));
-                assert!(chooser.right() < layout.primary.right());
-                assert!(chooser.bottom() < layout.primary.bottom());
+                // The chooser is a column at the tile's trailing edge. Asserting
+                // where it *starts* is the point: it must clear the icon column
+                // and the label, because the two overlapping is the bug this
+                // layout replaced.
+                assert!(
+                    chooser.left() >= layout.primary.left() + TILE_ICON_COLUMN,
+                    "chooser for {family:?} overlaps the icon column"
+                );
+                assert!(chooser.right() <= layout.primary.right());
             }
         }
         if row_index == 1 {

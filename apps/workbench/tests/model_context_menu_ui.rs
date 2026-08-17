@@ -108,7 +108,7 @@ fn create_extruded_body(harness: &mut Harness<'static, KernelLabApp>) {
     click_button(harness, "XY Plane");
     click_button(harness, "Sketch mode");
     commit_centered_rectangle(harness, 4.0, 2.0);
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     click_button(harness, "Extrude");
     click_button(harness, "Confirm operation");

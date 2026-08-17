@@ -141,7 +141,7 @@ fn commit_centered_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
 }
 
 fn finish_active_sketch(harness: &mut Harness<'static, KernelLabApp>) {
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }
@@ -681,13 +681,13 @@ fn identical_new_bodies_keep_independent_history_branches() {
     assert_ne!(modified_second_snapshot, shared_snapshot);
 
     click_button(&mut harness, "Browser");
-    activate_button(&mut harness, "◆  Body 1 · native sketch extrusion");
+    activate_button(&mut harness, "Body 1 · native sketch extrusion");
     assert_eq!(
         harness.state().displayed_snapshot_id(),
         Some(shared_snapshot),
         "editing Body 2 must not move Body 1's branch cursor"
     );
-    activate_button(&mut harness, "◆  Body 2 · native added boss");
+    activate_button(&mut harness, "Body 2 · native added boss");
     assert_eq!(
         harness.state().displayed_snapshot_id(),
         Some(modified_second_snapshot),

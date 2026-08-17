@@ -1,8 +1,9 @@
-//! Vector icons for the workbench command ribbon.
+//! Vector icons for the workbench command ribbon and the Browser's row
+//! markers.
 //!
 //! Authored in normalized 0..1 coordinates and painted at whatever size the
-//! ribbon asks for, so one definition serves both the large captioned buttons
-//! and the small grid buttons. This mirrors `sketch_toolbar::paint_tool_icon`
+//! caller asks for, so one definition serves the large captioned ribbon
+//! buttons, the small grid buttons, and the Browser's row markers. This mirrors `sketch_toolbar::paint_tool_icon`
 //! deliberately rather than sharing it: the sketch crate owns drawing-tool
 //! iconography and must not grow a dependency on model-command vocabulary.
 
@@ -40,6 +41,7 @@ pub enum CommandIcon {
     Stop,
     Library,
     Finish,
+    Discard,
     Snap,
     Browser,
     Properties,
@@ -49,6 +51,12 @@ pub enum CommandIcon {
     Rebuild,
     Material,
     Theme,
+    Visible,
+    Hidden,
+    Body,
+    Component,
+    Joint,
+    JointDisabled,
 }
 
 pub fn paint_command_icon(painter: &Painter, rect: Rect, icon: CommandIcon, color: Color32) {
@@ -364,6 +372,10 @@ impl IconPainter<'_> {
             CommandIcon::Finish => {
                 self.path(&[(0.16, 0.52), (0.40, 0.78), (0.86, 0.22)]);
             }
+            CommandIcon::Discard => {
+                self.line((0.22, 0.22), (0.78, 0.78));
+                self.line((0.78, 0.22), (0.22, 0.78));
+            }
             CommandIcon::Snap => {
                 for index in 0..3 {
                     let offset = 0.22 + index as f32 * 0.28;
@@ -429,6 +441,62 @@ impl IconPainter<'_> {
                 self.circle((0.50, 0.50), 0.36);
                 self.arc((0.50, 0.50), 0.36, TAU * 0.06, TAU * 0.20);
                 self.arc((0.36, 0.36), 0.10, 0.0, TAU);
+            }
+            CommandIcon::Visible => {
+                // An open eye: two lids meeting at the corners, iris, pupil.
+                self.arc((0.50, 0.87), 0.56, -2.42, 1.69);
+                self.arc((0.50, 0.13), 0.56, 0.73, 1.69);
+                self.circle((0.50, 0.50), 0.13);
+                self.dot((0.50, 0.50), 0.055);
+            }
+            CommandIcon::Hidden => {
+                // The same eye shut: only the lower lid remains, with lashes.
+                self.arc((0.50, 0.13), 0.56, 0.73, 1.69);
+                self.line((0.21, 0.61), (0.12, 0.74));
+                self.line((0.50, 0.69), (0.50, 0.85));
+                self.line((0.79, 0.61), (0.88, 0.74));
+            }
+            CommandIcon::Body => {
+                // A native body: a shaded solid, filled because the document
+                // owns its geometry. Its hollow twin below marks a component.
+                self.painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        self.p(0.12, 0.32),
+                        self.p(0.38, 0.12),
+                        self.p(0.90, 0.12),
+                        self.p(0.64, 0.32),
+                    ],
+                    self.color.gamma_multiply(0.55),
+                    Stroke::NONE,
+                ));
+                self.filled_rectangle((0.12, 0.32), (0.64, 0.86));
+                self.painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        self.p(0.64, 0.32),
+                        self.p(0.90, 0.12),
+                        self.p(0.90, 0.66),
+                        self.p(0.64, 0.86),
+                    ],
+                    self.color.gamma_multiply(0.35),
+                    Stroke::NONE,
+                ));
+            }
+            CommandIcon::Component => {
+                // The same solid as a wireframe: an instance that references
+                // a library part rather than owning its geometry.
+                self.rectangle((0.12, 0.32), (0.64, 0.86));
+                self.path(&[(0.12, 0.32), (0.38, 0.12), (0.90, 0.12), (0.64, 0.32)]);
+                self.path(&[(0.90, 0.12), (0.90, 0.66), (0.64, 0.86)]);
+            }
+            CommandIcon::Joint => {
+                // An enabled joint: rotation around a pivot.
+                self.arc((0.50, 0.52), 0.34, -TAU * 0.42, TAU * 0.76);
+                self.arrowhead((0.74, 0.22), (0.7, -0.7), 0.13);
+                self.dot((0.50, 0.52), 0.09);
+            }
+            CommandIcon::JointDisabled => {
+                // The same joint inert: the bare pivot ring, no motion.
+                self.circle((0.50, 0.50), 0.30);
             }
         }
     }

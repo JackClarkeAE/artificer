@@ -62,9 +62,15 @@ fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
 fn choose_variant(harness: &mut Harness<'static, KernelLabApp>, chooser: &str, variant: &str) {
     click_button(harness, chooser);
     click_button(harness, variant);
+    // The palette that echoed the tool's name is gone; the lit tile carries it.
     assert!(
-        harness.query_all_by_label(variant).count() >= 2,
-        "{variant} should be both the compact primary action and ACTIVE TOOL"
+        harness.query_all_by_label(variant).count() >= 1,
+        "{variant} must remain the family's primary action after being chosen"
+    );
+    assert_eq!(
+        harness.state().active_sketch_tool_label(),
+        variant,
+        "choosing a variant must drive the active tool, not just close the menu"
     );
 }
 
@@ -116,7 +122,7 @@ fn assert_committed(harness: &Harness<'static, KernelLabApp>, entities: usize, r
 }
 
 fn finish_sketch(harness: &mut Harness<'static, KernelLabApp>) {
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert_eq!(harness.state().pending_operation_label(), None);
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);

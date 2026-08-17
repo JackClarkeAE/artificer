@@ -109,11 +109,11 @@ fn prepare_active_one_by_one_face_rectangle(harness: &mut Harness<'static, Kerne
         .expect("face sketch should retain its projected body context");
     assert!(triangles >= 2);
     assert!(edges >= 4);
-    click_button(harness, "Properties");
     assert!(
         harness
             .query_by_label("Authoritative face-local frame · reference boundary")
-            .is_some()
+            .is_some(),
+        "a face sketch must still say its frame is authoritative, now on the canvas"
     );
 
     click_button(harness, "Two-point rectangle");
@@ -138,7 +138,7 @@ fn prepare_active_one_by_one_face_rectangle(harness: &mut Harness<'static, Kerne
 fn prepare_one_by_one_face_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
     prepare_active_one_by_one_face_rectangle(harness);
     // Finishing is one action now; no confirmation step follows.
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }
@@ -163,7 +163,7 @@ fn finish_centered_face_rectangle(
     press_key(harness, egui::Key::Enter);
     assert_eq!(harness.state().sketch_entity_count(), 1);
 
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     press_key(harness, egui::Key::Enter);
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -433,7 +433,7 @@ fn selected_face_add_and_cut_preview_then_publish_only_through_global_confirmati
         click_button(&mut harness, "Sketch on selected face");
         assert!(harness.state().sketch_is_face_supported());
         let browser_sketch = format!(
-            "└  Sketch 2 · {} · empty",
+            "Sketch 2 · {} · empty",
             harness.state().sketch_support_label()
         );
         click_button(&mut harness, "Browser");
@@ -489,7 +489,7 @@ fn selected_face_extrudes_directly_and_signed_distance_switches_to_cut() {
     click_button(&mut harness, "Browser");
     assert!(
         harness
-            .query_by_label("◆  Body 1 · native pushed/pulled solid")
+            .query_by_label("Body 1 · native pushed/pulled solid")
             .is_some()
     );
 }
@@ -664,7 +664,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     click_button(&mut harness, "Browser");
     assert!(
         harness
-            .query_by_label("◆  Body 1 · native added boss")
+            .query_by_label("Body 1 · native added boss")
             .is_some()
     );
     assert_eq!(harness.state().sketch_count(), 3);

@@ -200,7 +200,7 @@ fn finish_exact_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
     press_enter(harness);
     // Strokes commit as they are drawn, and finishing is one action.
     assert_eq!(harness.state().pending_operation_label(), None);
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert!(harness.state().sketch_finished());
 }
 
@@ -251,7 +251,7 @@ fn finish_centered_face_rectangle(
     height: &str,
 ) {
     commit_centered_face_rectangle(harness, width, height);
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     press_enter(harness);
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -271,7 +271,7 @@ fn finish_offset_rectangle(
     type_active_dimension(harness, "Rectangle height", height);
     press_enter(harness);
     assert_eq!(harness.state().pending_operation_label(), None);
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     press_enter(harness);
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -923,11 +923,6 @@ fn workbench_sketch_xy_rectangle_snapshot() {
             winding: ProfileWinding::CounterClockwise,
         }
     );
-    assert!(
-        harness
-            .query_by_label("PROFILE CLOSED · COUNTER-CLOCKWISE")
-            .is_some()
-    );
     assert_eq!(
         harness.get_by_label("Sketch viewport").rect(),
         committed_viewport,
@@ -983,10 +978,9 @@ fn workbench_sketch_self_intersection_snapshot() {
         stable_viewport
     );
     click_button(&mut harness, "Select sketch geometry");
-    assert!(
-        harness
-            .query_by_label("PROFILE SELF-INTERSECTING")
-            .is_some()
+    assert_eq!(
+        harness.state().sketch_profile_status(),
+        CertifiedProfileStatus::SelfIntersecting
     );
     assert_eq!(
         harness.get_by_label("Sketch viewport").rect(),

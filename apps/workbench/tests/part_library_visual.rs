@@ -126,7 +126,7 @@ fn committed_parametric_component_snapshot() {
     assert!((harness.state().displayed_measures().unwrap().volume - 32_000.0).abs() <= 1.0e-8);
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "◇  20 × 20 Aluminium Extrusion · component 1")
+            .query_by_role_and_label(Role::Button, "20 × 20 Aluminium Extrusion · component 1")
             .is_some()
     );
 

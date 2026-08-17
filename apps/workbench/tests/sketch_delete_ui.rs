@@ -134,7 +134,7 @@ fn saved_v6_sketch_delete_replaces_one_logical_feature_and_rebuilds() {
     let mut source = harness();
     enter_xy_sketch(&mut source);
     draw_rectangle(&mut source);
-    click_button(&mut source, "Finish sketch command");
+    click_button(&mut source, "Finish sketch");
     assert_eq!(source.state().workbench_mode(), WorkbenchMode::Model);
     let saved = source
         .state()
@@ -178,7 +178,7 @@ fn saved_v6_sketch_delete_replaces_one_logical_feature_and_rebuilds() {
     assert_eq!(restored.state().sketch_revision(), 4);
     assert_eq!(restored.state().visible_model_sketch_overlay_count(), 0);
 
-    click_button(&mut restored, "Finish sketch command");
+    click_button(&mut restored, "Finish sketch");
     assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(restored.state().document_feature_count(), feature_count);
     assert_eq!(restored.state().sketch_revision(), 2);

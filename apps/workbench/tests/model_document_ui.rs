@@ -102,7 +102,7 @@ fn commit_rectangle(
 }
 
 fn finish_active_sketch(harness: &mut Harness<'static, KernelLabApp>) {
-    click_button(harness, "Finish sketch command");
+    click_button(harness, "Finish sketch");
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }

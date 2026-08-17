@@ -53,6 +53,13 @@ fn click_sketch_point(harness: &mut Harness<'static, KernelLabApp>, point: Sketc
     click_at(harness, canvas_sketch_point(harness, point));
 }
 
+fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
+    harness.key_down(key);
+    harness.step();
+    harness.key_up(key);
+    harness.step();
+}
+
 fn replace_tool_input(harness: &mut Harness<'static, KernelLabApp>, label: &str, value: &str) {
     {
         let input = harness.get_by_role_and_label(Role::TextInput, label);
@@ -254,19 +261,20 @@ fn explicit_finish_chain_commits_one_atomic_polyline() {
     click_button(&mut harness, "Chained polyline");
 
     click_sketch_point(&mut harness, SketchPoint::new(-1.0, -1.0));
-    assert!(
-        harness
-            .get_by_role_and_label(Role::Button, "Finish chained polyline")
-            .accesskit_node()
-            .is_disabled()
-    );
+    // One vertex is not a chain: an explicit finish here has nothing to
+    // stage, and the draft stays open for the next vertex.
+    press_key(&mut harness, egui::Key::Enter);
+    assert!(harness.state().sketch_creation_draft_active());
+    assert_eq!(harness.state().sketch_entity_count(), 0);
     click_sketch_point(&mut harness, SketchPoint::new(1.0, -1.0));
     click_sketch_point(&mut harness, SketchPoint::new(1.0, 1.0));
     assert!(!harness.state().operation_confirmation_pending());
     assert_eq!(harness.state().sketch_entity_count(), 0);
     assert_eq!(harness.state().sketch_revision(), 0);
 
-    click_button(&mut harness, "Finish chained polyline");
+    // Enter is the explicit finish: the same `finish_polyline_draft` the
+    // palette's button used to reach, now that the palette is gone.
+    press_key(&mut harness, egui::Key::Enter);
     // Finishing the chain commits the whole polyline as one atomic stroke.
     assert_eq!(harness.state().pending_operation_label(), None);
     assert!(!harness.state().operation_confirmation_pending());

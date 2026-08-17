@@ -91,7 +91,7 @@ const MAX_ABS_SKETCH_COORDINATE: f64 = 1.0e9;
 const CONTEXT_FIT_PADDING_POINTS: f32 = 42.0;
 const MIN_ARC_SWEEP_DEGREES: f64 = 1.0e-6;
 const MAX_ARC_SWEEP_DEGREES: f64 = 360.0 - MIN_ARC_SWEEP_DEGREES;
-const DIMENSION_WIDGET_SIZE: Vec2 = Vec2::new(112.0, 24.0);
+const DIMENSION_WIDGET_SIZE: Vec2 = Vec2::new(96.0, 20.0);
 const DEFAULT_POLYGON_SIDES: u16 = 6;
 const DEFAULT_RECTANGULAR_PATTERN_COLUMNS: u16 = 3;
 const DEFAULT_RECTANGULAR_PATTERN_ROWS: u16 = 2;
@@ -878,6 +878,25 @@ impl SketchDimensionKind {
         }
     }
 
+    /// Whether this dimension earns a box on the canvas, as opposed to a row in
+    /// the sketch panel.
+    ///
+    /// A line has two degrees of freedom, and the canvas was showing four
+    /// numbers for them: length and angle describe it in polar terms, delta U
+    /// and delta V describe the same line in Cartesian ones. Painting both
+    /// parameterisations draws the line twice and stacks four boxes over the
+    /// geometry being drawn.
+    ///
+    /// So the canvas carries one complete set and the panel carries everything.
+    /// Nothing is lost — the deltas stay editable under LIVE DIMENSIONS — and
+    /// the rule generalises: a kind that restates what another kind already
+    /// says belongs in the panel. Every other geometry is already minimal (a
+    /// point is U and V, a rectangle is width and height), so only the line's
+    /// redundant pair is suppressed here.
+    const fn shows_on_canvas(self) -> bool {
+        !matches!(self, Self::DeltaU | Self::DeltaV)
+    }
+
     const fn is_angle(self) -> bool {
         matches!(self, Self::AngleDegrees | Self::SweepDegrees)
     }
@@ -1411,6 +1430,10 @@ fn selected_recipe_editor_for(
                     CORE_MAX_POLYGON_SIDES,
                 ),
                 literal_length_parameter("inner_diameter", "Inner diameter", inner_diameter),
+                // A drafter dimensions a side, not a diameter. Offered beside
+                // the diameter rather than instead of it: both drive the same
+                // single number, so either can be typed.
+                polygon_side_parameter(inner_diameter, sides, true),
                 literal_angle_parameter("rotation", "Rotation", rotation),
             ],
             BOUND_REFERENCE_NOTE,
@@ -1431,6 +1454,10 @@ fn selected_recipe_editor_for(
                     CORE_MAX_POLYGON_SIDES,
                 ),
                 literal_length_parameter("outer_diameter", "Outer diameter", outer_diameter),
+                // A drafter dimensions a side, not a diameter. Offered beside
+                // the diameter rather than instead of it: both drive the same
+                // single number, so either can be typed.
+                polygon_side_parameter(outer_diameter, sides, false),
                 literal_angle_parameter("rotation", "Rotation", rotation),
             ],
             BOUND_REFERENCE_NOTE,
@@ -1520,9 +1547,42 @@ fn selected_recipe_editor_for(
             Vec::new(),
             "Imported compatibility geometry has no recoverable primitive parameters.",
         ),
+        // A line stores two points, not a length and a bearing, so those two
+        // numbers have to be derived here and turned back into an end point on
+        // apply. They are only *drivable* when the end is a literal position:
+        // an end bound to an existing point takes its length from that binding,
+        // and letting a typed value fight the reference would silently break
+        // one of them.
+        CoreRecipe::Line { start, end } | CoreRecipe::CentreLine { start, end } => {
+            match (start, end) {
+                (CorePointInput::Position(start), CorePointInput::Position(end)) => (
+                    "Authored line",
+                    vec![
+                        RetainedRecipeParameter::literal(
+                            "length",
+                            "Length",
+                            (end.u - start.u).hypot(end.v - start.v),
+                            "mm",
+                            ToolNumberDomain::Positive,
+                        ),
+                        RetainedRecipeParameter::literal(
+                            "angle",
+                            "Angle",
+                            (end.v - start.v).atan2(end.u - start.u).to_degrees(),
+                            "\u{b0}",
+                            ToolNumberDomain::Finite,
+                        ),
+                    ],
+                    "The start point stays fixed; Length and Angle move the end point.",
+                ),
+                _ => (
+                    "Authored line",
+                    Vec::new(),
+                    "An end point bound to existing geometry takes its length and angle from that reference.",
+                ),
+            }
+        }
         CoreRecipe::Point { .. }
-        | CoreRecipe::Line { .. }
-        | CoreRecipe::CentreLine { .. }
         | CoreRecipe::Polyline { .. }
         | CoreRecipe::TwoPointCircle { .. }
         | CoreRecipe::CentreStartEndArc { .. }
@@ -1586,6 +1646,64 @@ fn replace_literal_angle(
     Ok(())
 }
 
+/// A regular polygon's side length, from the diameter that actually drives it.
+///
+/// The recipe stores a diameter because that is what the tool draws with, but a
+/// drafter dimensions a *side*. The two are rigidly related for a regular
+/// n-gon, so the side is offered as a driver and converted back here — which is
+/// why changing one side changes all of them. It cannot do anything else: there
+/// is one number underneath.
+///
+/// Circumradius form (outer): `side = 2 R sin(pi/n)`, so `D = side / sin(pi/n)`.
+/// Apothem form (inner): `side = 2 a tan(pi/n)`, so `d = side / tan(pi/n)`.
+/// The `side` driver for a polygon, derived from whichever diameter it stores.
+fn polygon_side_parameter(
+    diameter: &CoreValue<CoreLength>,
+    sides: &CoreValue<CoreInteger>,
+    inner: bool,
+) -> RetainedRecipeParameter {
+    let derived = match (diameter, sides) {
+        (CoreValue::Literal(diameter), CoreValue::Literal(sides)) => {
+            polygon_side_from_diameter(diameter.get(), u32::from(sides.get()), inner)
+        }
+        _ => None,
+    };
+    derived.map_or_else(
+        || RetainedRecipeParameter::bound("side", "Side", "mm", ToolNumberDomain::Positive),
+        |side| {
+            RetainedRecipeParameter::literal("side", "Side", side, "mm", ToolNumberDomain::Positive)
+        },
+    )
+}
+
+fn polygon_side_from_diameter(diameter: f64, sides: u32, inner: bool) -> Option<f64> {
+    let n = f64::from(sides);
+    if !(3.0..=1024.0).contains(&n) || !diameter.is_finite() {
+        return None;
+    }
+    let quarter_turn = std::f64::consts::PI / n;
+    let factor = if inner {
+        quarter_turn.tan()
+    } else {
+        quarter_turn.sin()
+    };
+    (factor.is_finite() && factor > 0.0).then_some(diameter * factor)
+}
+
+fn polygon_diameter_from_side(side: f64, sides: u32, inner: bool) -> Option<f64> {
+    let n = f64::from(sides);
+    if !(3.0..=1024.0).contains(&n) || !side.is_finite() || side <= 0.0 {
+        return None;
+    }
+    let quarter_turn = std::f64::consts::PI / n;
+    let factor = if inner {
+        quarter_turn.tan()
+    } else {
+        quarter_turn.sin()
+    };
+    (factor.is_finite() && factor > 0.0).then(|| side / factor)
+}
+
 fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, ()> {
     let mut recipe = editor.original_recipe.clone();
     match &mut recipe {
@@ -1596,6 +1714,24 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         CoreRecipe::CentrePointRectangle { width, height, .. } => {
             replace_literal_length(width, recipe_parameter_value(editor, "width"))?;
             replace_literal_length(height, recipe_parameter_value(editor, "height"))?;
+        }
+        CoreRecipe::Line { start, end } | CoreRecipe::CentreLine { start, end } => {
+            if let (CorePointInput::Position(origin), CorePointInput::Position(tip)) =
+                (&*start, &mut *end)
+            {
+                let current_length = (tip.u - origin.u).hypot(tip.v - origin.v);
+                let current_angle = (tip.v - origin.v).atan2(tip.u - origin.u);
+                let length = recipe_parameter_value(editor, "length").unwrap_or(current_length);
+                let angle =
+                    recipe_parameter_value(editor, "angle").map_or(current_angle, f64::to_radians);
+                if !length.is_finite() || !angle.is_finite() || length <= 0.0 {
+                    return Err(());
+                }
+                *tip = CorePoint2::new(
+                    origin.u + length * angle.cos(),
+                    origin.v + length * angle.sin(),
+                );
+            }
         }
         CoreRecipe::CentrePointCircle { radius, .. } => {
             replace_literal_length(
@@ -1610,10 +1746,26 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             ..
         } => {
             replace_literal_integer(sides, recipe_parameter_value(editor, "sides"));
-            replace_literal_length(
-                inner_diameter,
-                recipe_parameter_value(editor, "inner_diameter"),
-            )?;
+            // `side` and `inner_diameter` drive the same single number, and nothing
+            // records which box was typed into. Whichever now disagrees with
+            // what the other implies is the edit — the untouched one still
+            // holds the value it was derived from.
+            let side_count = match sides {
+                CoreValue::Literal(count) => Some(u32::from(count.get())),
+                CoreValue::Input(_) => None,
+            };
+            let typed_side = recipe_parameter_value(editor, "side");
+            let typed_diameter = recipe_parameter_value(editor, "inner_diameter");
+            let implied_side = side_count
+                .zip(typed_diameter)
+                .and_then(|(count, diameter)| polygon_side_from_diameter(diameter, count, true));
+            let driven = match (typed_side, implied_side, side_count) {
+                (Some(side), Some(implied), Some(count)) if (side - implied).abs() > 1.0e-9 => {
+                    polygon_diameter_from_side(side, count, true)
+                }
+                _ => typed_diameter,
+            };
+            replace_literal_length(inner_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
         CoreRecipe::OuterDiameterPolygon {
@@ -1623,10 +1775,26 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             ..
         } => {
             replace_literal_integer(sides, recipe_parameter_value(editor, "sides"));
-            replace_literal_length(
-                outer_diameter,
-                recipe_parameter_value(editor, "outer_diameter"),
-            )?;
+            // `side` and `outer_diameter` drive the same single number, and nothing
+            // records which box was typed into. Whichever now disagrees with
+            // what the other implies is the edit — the untouched one still
+            // holds the value it was derived from.
+            let side_count = match sides {
+                CoreValue::Literal(count) => Some(u32::from(count.get())),
+                CoreValue::Input(_) => None,
+            };
+            let typed_side = recipe_parameter_value(editor, "side");
+            let typed_diameter = recipe_parameter_value(editor, "outer_diameter");
+            let implied_side = side_count
+                .zip(typed_diameter)
+                .and_then(|(count, diameter)| polygon_side_from_diameter(diameter, count, false));
+            let driven = match (typed_side, implied_side, side_count) {
+                (Some(side), Some(implied), Some(count)) if (side - implied).abs() > 1.0e-9 => {
+                    polygon_diameter_from_side(side, count, false)
+                }
+                _ => typed_diameter,
+            };
+            replace_literal_length(outer_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
         CoreRecipe::TwoPointSlot { width, .. } => {
@@ -1695,8 +1863,6 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         }
         CoreRecipe::LegacyImportedProfile { .. }
         | CoreRecipe::Point { .. }
-        | CoreRecipe::Line { .. }
-        | CoreRecipe::CentreLine { .. }
         | CoreRecipe::Polyline { .. }
         | CoreRecipe::TwoPointCircle { .. }
         | CoreRecipe::CentreStartEndArc { .. }
@@ -10533,9 +10699,14 @@ fn paint_overlay(
         .pointer_preview
         .map_or("Snap: inactive", |snap| snap.kind.label());
     let profile_label = state.certified_profile_status().label();
+    // Second line under the instruction, not the bottom edge. Three things want
+    // the bottom-left corner — the projection chip, this line, and the floating
+    // confirmation chip that became the sketch's only tick and cross when the
+    // right-hand panel went away — and this line lost. `PROFILE EMPTY` read as
+    // `FILE EMP`, which is the one status that says whether Extrude can run.
     painter.text(
-        rect.left_bottom() + Vec2::new(13.0, -12.0),
-        Align2::LEFT_BOTTOM,
+        rect.left_top() + Vec2::new(13.0, 28.0),
+        Align2::LEFT_TOP,
         format!("{snap_label} · {profile_label}"),
         FontId::monospace(10.0),
         Color32::from_rgb(91, 102, 114),
@@ -10547,6 +10718,13 @@ struct DimensionWidgetLayout {
     readout: DimensionReadout,
     rect: Rect,
     leader_start: Pos2,
+    /// The two feature points this dimension spans, in screen space.
+    ///
+    /// A leader to a midpoint says "this number is about that thing"; a drafted
+    /// dimension says *what it measures* — witness lines standing off the two
+    /// ends, a dimension line between them, arrowheads closing on both. Kinds
+    /// that measure a span carry it; kinds that measure a position do not.
+    span: Option<(Pos2, Pos2)>,
     id: Id,
 }
 
@@ -10637,9 +10815,24 @@ fn committed_dimension_parameter(
         SketchDimensionKind::Height => "height",
         SketchDimensionKind::Diameter => "diameter",
         SketchDimensionKind::Radius => "radius",
+        // A line calls it "length"; a polygon edge is one of n equal "side"s.
+        // Both are the same question asked of the shape the user clicked, so
+        // the kind resolves to whichever key that shape actually offers.
+        SketchDimensionKind::Length => "length",
+        SketchDimensionKind::AngleDegrees => "angle",
         _ => return None,
     };
     let editor = state.selected_recipe_editor.as_ref()?;
+    let stable_key = if stable_key == "length"
+        && !editor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.stable_key == "length")
+    {
+        "side"
+    } else {
+        stable_key
+    };
     if state
         .pending
         .as_ref()
@@ -10726,6 +10919,7 @@ fn dimension_widget_layouts(
 
     readouts
         .into_iter()
+        .filter(|readout| readout.kind.shows_on_canvas())
         .filter_map(|readout| {
             dimension_widget_position(geometry, readout.kind, state.view, canvas_rect).and_then(
                 |(center, leader_start)| {
@@ -10738,6 +10932,7 @@ fn dimension_widget_layouts(
                             readout,
                             rect,
                             leader_start,
+                            span: dimension_span(geometry, readout.kind, state.view, canvas_rect),
                             id: Id::new(("sketch-dimension", live, serial, readout.kind)),
                         },
                     )
@@ -10779,11 +10974,17 @@ fn dimension_widget_position(
             } else {
                 Vec2::new(-direction.y, direction.x)
             };
+            // Straddle the line rather than cascade down one side of it. The
+            // box is 24 px tall, so an offset of 20 left it overlapping the
+            // geometry by all but eight pixels — close enough to read as
+            // covering the line you are drawing. The deltas no longer appear
+            // here at all, which is what collapses the old four-box stack.
             let offset = match kind {
-                SketchDimensionKind::Length => 20.0,
-                SketchDimensionKind::AngleDegrees => -20.0,
-                SketchDimensionKind::DeltaU => 48.0,
-                SketchDimensionKind::DeltaV => 76.0,
+                SketchDimensionKind::Length => 46.0,
+                SketchDimensionKind::AngleDegrees => -46.0,
+                SketchDimensionKind::DeltaU | SketchDimensionKind::DeltaV => {
+                    unreachable!("deltas are panel-only; shows_on_canvas filters them")
+                }
                 _ => unreachable!("the match arm filters line dimension kinds"),
             };
             Some((midpoint + normal * offset, midpoint))
@@ -10883,12 +11084,130 @@ fn clamp_dimension_rect(rect: Rect, canvas_rect: Rect) -> Rect {
     rect.translate(delta)
 }
 
+/// The two points a dimension of this kind measures between, in screen space.
+///
+/// Only span kinds have one. An angle is measured about a vertex and a
+/// coordinate is measured from an axis, so neither gets witness lines.
+fn dimension_span(
+    geometry: SketchGeometry,
+    kind: SketchDimensionKind,
+    view: SketchView,
+    canvas_rect: Rect,
+) -> Option<(Pos2, Pos2)> {
+    let screen = |point| view.sketch_to_screen(canvas_rect, point);
+    match (kind, geometry) {
+        (SketchDimensionKind::Length, SketchGeometry::Segment { start, end }) => {
+            Some((screen(start), screen(end)))
+        }
+        (SketchDimensionKind::Diameter, SketchGeometry::Circle { center, rim }) => {
+            let centre = screen(center);
+            let edge = screen(rim);
+            let radius = (edge - centre).length();
+            (radius.is_finite() && radius > 0.0).then(|| {
+                let offset = Vec2::new(radius, 0.0);
+                (centre - offset, centre + offset)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Draws a dimension the way a drawing does: witness lines standing off the
+/// measured ends, a dimension line between them offset to where the value sits,
+/// and arrowheads closing inward on both.
+///
+/// The whole annotation is built in the feature's own frame — the dimension
+/// line runs parallel to what it measures and the witness lines run
+/// perpendicular — so it rotates with the geometry instead of staying
+/// stubbornly axis-aligned.
+fn paint_dimension_annotation(
+    painter: &egui::Painter,
+    layout: &DimensionWidgetLayout,
+    stroke: Stroke,
+) -> bool {
+    let Some((start, end)) = layout.span else {
+        return false;
+    };
+    let along = end - start;
+    let length = along.length();
+    if !length.is_finite() || length < 1.0 {
+        return false;
+    }
+    let along = along / length;
+    let normal = Vec2::new(-along.y, along.x);
+
+    // Project the value box onto the feature normal: the dimension line passes
+    // through the box, so the annotation follows the box wherever it is placed
+    // rather than assuming a fixed side.
+    let offset = (layout.rect.center() - start).dot(normal);
+    let dimension_start = start + normal * offset;
+    let dimension_end = end + normal * offset;
+
+    // Witness lines stop short of the geometry and overrun the dimension line,
+    // which is what keeps them readable where they meet the feature.
+    const WITNESS_GAP: f32 = 3.0;
+    const WITNESS_OVERRUN: f32 = 5.0;
+    let sign = if offset >= 0.0 { 1.0 } else { -1.0 };
+    for (foot, head) in [(start, dimension_start), (end, dimension_end)] {
+        let span = head - foot;
+        let reach = span.length();
+        if reach <= WITNESS_GAP + WITNESS_OVERRUN {
+            continue;
+        }
+        let direction = span / reach;
+        painter.line_segment(
+            [
+                foot + direction * WITNESS_GAP,
+                head + normal * (WITNESS_OVERRUN * sign),
+            ],
+            stroke,
+        );
+    }
+
+    // The dimension line breaks either side of the value rather than running
+    // under it: text sitting on a line is the thing that makes a drawing hard
+    // to read.
+    let gap = layout.rect.width() * 0.5 + 4.0;
+    let centre = dimension_start + (dimension_end - dimension_start) * 0.5;
+    for direction in [-1.0_f32, 1.0] {
+        let inner = centre + along * (gap * direction);
+        let outer = if direction < 0.0 {
+            dimension_start
+        } else {
+            dimension_end
+        };
+        if (outer - inner).dot(along) * direction > 0.0 {
+            painter.line_segment([inner, outer], stroke);
+        }
+    }
+
+    for (tip, direction) in [(dimension_start, along), (dimension_end, -along)] {
+        paint_dimension_arrowhead(painter, tip, direction, stroke.color);
+    }
+    true
+}
+
+fn paint_dimension_arrowhead(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color32) {
+    const LENGTH: f32 = 9.0;
+    const HALF_WIDTH: f32 = 3.0;
+    let normal = Vec2::new(-direction.y, direction.x);
+    let base = tip + direction * LENGTH;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, base + normal * HALF_WIDTH, base - normal * HALF_WIDTH],
+        color,
+        Stroke::NONE,
+    ));
+}
+
 fn paint_dimension_leaders(painter: &egui::Painter, layouts: &[DimensionWidgetLayout]) {
     for layout in layouts {
-        painter.line_segment(
-            [layout.leader_start, layout.rect.center()],
-            Stroke::new(1.0, DIMENSION.gamma_multiply(0.72)),
-        );
+        let stroke = Stroke::new(1.0, DIMENSION.gamma_multiply(0.72));
+        // A span kind gets the drafted annotation. Everything else — an angle
+        // about a vertex, a coordinate from an axis — keeps the plain leader,
+        // because witness lines would be claiming a span that is not there.
+        if !paint_dimension_annotation(painter, layout, stroke) {
+            painter.line_segment([layout.leader_start, layout.rect.center()], stroke);
+        }
     }
 }
 
@@ -13964,11 +14283,12 @@ mod tests {
             (
                 DimensionPhase::Line,
                 SketchGeometry::segment(SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)),
+                // Length and angle only. The deltas describe the same line a
+                // second way, so the canvas would be drawing it twice; they
+                // stay in the readouts, asserted below.
                 vec![
                     SketchDimensionKind::Length,
                     SketchDimensionKind::AngleDegrees,
-                    SketchDimensionKind::DeltaU,
-                    SketchDimensionKind::DeltaV,
                 ],
             ),
             (
@@ -13999,6 +14319,28 @@ mod tests {
                 ],
             ),
         ];
+
+        // Suppressing a box must never mean losing the number. A kind kept off
+        // the canvas still has to be readable and editable somewhere, and the
+        // session readouts are what the sketch panel and the dimension tool
+        // both draw from.
+        let line = DimensionSession::new(
+            DimensionTarget::Draft,
+            DimensionPhase::Line,
+            SketchGeometry::segment(SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)),
+            1,
+        );
+        let offered = line
+            .readouts()
+            .map(|readout| readout.kind)
+            .collect::<Vec<_>>();
+        for kind in [SketchDimensionKind::DeltaU, SketchDimensionKind::DeltaV] {
+            assert!(!kind.shows_on_canvas(), "{kind:?} should be panel-only");
+            assert!(
+                offered.contains(&kind),
+                "{kind:?} vanished from the readouts"
+            );
+        }
 
         for (phase, geometry, expected) in cases {
             let state = SketchCanvasState {

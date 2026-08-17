@@ -169,7 +169,7 @@ fn add_stages_then_tick_commits_separate_parameterized_intents() {
     assert!((harness.state().displayed_measures().unwrap().volume - 182_000.0).abs() <= 1.0e-8);
     assert!(
         harness
-            .query_all_by_label("◇  20 × 20 Aluminium Extrusion · component 1")
+            .query_all_by_label("20 × 20 Aluminium Extrusion · component 1")
             .next()
             .is_some()
     );
@@ -411,10 +411,7 @@ fn rolled_back_history_reloads_at_saved_cursor_and_can_roll_forward() {
     click_button(&mut restored, "Step history forward");
     assert_eq!(restored.state().history_position(), 4);
     assert_eq!(restored.state().body_count(), 3);
-    click_button(
-        &mut restored,
-        "◇  20 × 20 Aluminium Extrusion · component 2",
-    );
+    click_button(&mut restored, "20 × 20 Aluminium Extrusion · component 2");
     assert!((restored.state().displayed_measures().unwrap().volume - 182_000.0).abs() <= 1.0e-8);
 }
 
