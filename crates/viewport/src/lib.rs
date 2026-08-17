@@ -2417,7 +2417,10 @@ fn prepare_edge_frame_cache(
                         screen,
                         depths,
                         body.key,
-                        LineOwnership::Edge(key),
+                        LineOwnership::Edge {
+                            key,
+                            faces: edge.incident_faces,
+                        },
                         &occlusion,
                     )
                 } else {
@@ -3200,11 +3203,11 @@ fn paint_measurement_annotation(
         return;
     };
     let label_position = anchor + Vec2::new(10.0, -10.0);
-    let galley = painter.layout_no_wrap(
-        label.clone(),
-        FontId::monospace(12.0),
-        Color32::from_rgb(31, 38, 46),
-    );
+    // Both were hard-coded: near-black text on an opaque white plate. That is a
+    // light-theme decision baked into the viewport, and on a dark ground the
+    // plate glared while the text under it vanished. The palette answers both.
+    let text = artificer_ui_core::theme::text();
+    let galley = painter.layout_no_wrap(label.clone(), FontId::monospace(12.0), text);
     let background = Rect::from_min_size(
         label_position - Vec2::new(5.0, 3.0),
         galley.size() + Vec2::new(10.0, 6.0),
@@ -3212,7 +3215,7 @@ fn paint_measurement_annotation(
     painter.rect_filled(
         background,
         4.0,
-        Color32::from_rgba_unmultiplied(255, 255, 255, 242),
+        artificer_ui_core::theme::card().gamma_multiply(0.94),
     );
     painter.rect_stroke(
         background,
@@ -3220,7 +3223,7 @@ fn paint_measurement_annotation(
         Stroke::new(1.0, SELECTED),
         egui::StrokeKind::Inside,
     );
-    painter.galley(label_position, galley, Color32::from_rgb(31, 38, 46));
+    painter.galley(label_position, galley, text);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3418,7 +3421,10 @@ fn visible_edge_intervals(
         edge,
         depths,
         body,
-        LineOwnership::Edge(edge_key),
+        LineOwnership::Edge {
+            key: edge_key,
+            faces: [None, None],
+        },
         &TriangleOcclusionIndex::new(triangles),
     )
 }
@@ -3429,7 +3435,20 @@ fn visible_edge_intervals(
 enum LineOwnership {
     /// A B-rep edge: its own incident facets are coplanar with it by
     /// construction and would otherwise self-occlude.
-    Edge(ModelEdgeKey),
+    ///
+    /// Carries the faces as well as the endpoints because matching endpoints
+    /// alone is not enough. Two faces meeting along a *curved* boundary may
+    /// tessellate it into different chord sets, so a chord belonging to one is
+    /// not an edge of any triangle on the other — leaving those near-coplanar
+    /// neighbours free to occlude it, decided by a two-parts-per-million depth
+    /// bias against a chord error orders of magnitude larger. On a filleted slot
+    /// 64 of 278 display edges were carried by only one of their two faces, and
+    /// each survived or vanished chord by chord according to which side landed
+    /// nearer: an arc that renders partway and stops.
+    Edge {
+        key: ModelEdgeKey,
+        faces: [Option<EntityRef>; 2],
+    },
     /// A carrier silhouette: it lies *on* its face, so that whole face is
     /// excluded rather than three facets of it.
     Silhouette(EntityRef),
@@ -3520,7 +3539,10 @@ fn triangle_carries_line(
         return false;
     }
     match ownership {
-        LineOwnership::Edge(edge) => triangle.model_edges.contains(&edge),
+        LineOwnership::Edge { key, faces } => {
+            triangle.model_edges.contains(&key)
+                || faces.iter().flatten().any(|face| *face == triangle.source)
+        }
         LineOwnership::Silhouette(face) => triangle.source == face,
     }
 }
@@ -3648,12 +3670,26 @@ fn paint_model_sketch_overlays(
                 }
             }
         }
+        let dark = artificer_ui_core::theme::palette().dark;
         let color = if overlay.consumed {
-            Color32::from_rgb(96, 128, 158)
+            // Lifted on a dark ground: the light theme's mid-blue has almost no
+            // separation from a dark viewport.
+            if dark {
+                Color32::from_rgb(150, 186, 220)
+            } else {
+                Color32::from_rgb(96, 128, 158)
+            }
         } else {
             Color32::from_rgb(206, 128, 16)
         };
-        let shadow = Stroke::new(3.8, Color32::WHITE.gamma_multiply(0.78));
+        // A halo that separates the line from whatever is behind it, so it has
+        // to be the ground's colour rather than a fixed white. Hard-coded white
+        // is a light-theme decision, and on a dark viewport it drew a bright
+        // outline around every plane and sketch edge.
+        let shadow = Stroke::new(
+            3.8,
+            artificer_ui_core::theme::viewport_bottom().gamma_multiply(0.78),
+        );
         let stroke = Stroke::new(if overlay.consumed { 1.6 } else { 2.2 }, color);
         for segment in &overlay.segments {
             let projected =
