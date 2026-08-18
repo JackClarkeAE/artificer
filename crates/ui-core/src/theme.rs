@@ -346,7 +346,6 @@ pub fn ribbon_group<R>(
                     content.inner
                 })
                 .inner;
-            ui.add_space(3.0);
             ui.separator();
             output
         })

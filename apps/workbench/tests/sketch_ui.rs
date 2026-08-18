@@ -1517,24 +1517,26 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
     choose_sketch_tool(&mut harness, "Sketch point");
     let point = canvas_point(&harness, egui::vec2(0.0, 0.0));
     click_at(&mut harness, point);
-    // The point committed itself; the idle rail keeps the sketch actions
-    // reachable at the minimum window.
+    // The point committed itself; the ribbon's COMPLETE group keeps the sketch
+    // actions reachable at the minimum window, as large captioned buttons.
     assert!(!harness.state().operation_confirmation_pending());
     assert_eq!(harness.get_by_label("Sketch viewport").rect(), clean_canvas);
 
     for label in ["Finish sketch", "Exit sketch"] {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must have a visible hit target");
-        assert_eq!(rect.width(), rect.height(), "{label} must be square");
-        assert!(rect.width() <= 30.0, "{label} is too bulky: {rect:?}");
-        assert!(rect.width() >= 24.0, "{label} is too small: {rect:?}");
+        assert!(rect.height() >= 24.0, "{label} is too small: {rect:?}");
         assert!(
             rect.min.x >= 0.0 && rect.max.x <= 1040.0 && rect.min.y >= 0.0 && rect.max.y <= 700.0,
             "{label} escaped the supported window: {rect:?}"
         );
+        assert!(
+            rect.max.y <= ribbon_bottom,
+            "{label} overlaps the sketch canvas below the command ribbon: {rect:?}"
+        );
     }
 
-    // Exiting the sketch from the rail keeps the canvas geometry intact.
+    // Exiting the sketch from the ribbon keeps the canvas geometry intact.
     click_button(&mut harness, "Exit sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(harness.state().sketch_entity_count(), 1);

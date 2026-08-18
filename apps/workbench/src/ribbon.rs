@@ -50,7 +50,10 @@ const LARGE_BUTTON: Vec2 = vec2(62.0, 54.0);
 const SMALL_ICON: f32 = 16.0;
 // 24 px is the smallest hit target the workbench allows itself; the
 // minimum-window guard in `tests/ui.rs` holds every ribbon button to it.
-const SMALL_BUTTON: Vec2 = vec2(86.0, 24.0);
+// The width is the widest small caption — `Properties`, 49 px at 10.5 pt —
+// after the 24 px icon column, with 2 px to spare. At 86 the sketch tab did
+// not fit the 1040 px minimum window: its last button ended at 1081.
+const SMALL_BUTTON: Vec2 = vec2(78.0, 24.0);
 
 impl KernelLabApp {
     pub(crate) fn command_ribbon(&mut self, ui: &mut egui::Ui) {
@@ -83,6 +86,11 @@ impl KernelLabApp {
         // one above the other — workspace above, ribbon below — was the jarring
         // part, and they were always the same choice said twice.
         ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            // Groups already end in a separator and carry their own caption
+            // row; the panel's 5 px item spacing on both sides of every
+            // separator was 19 px of air per boundary, the single largest
+            // consumer of width at the 1040 px minimum window.
+            ui.spacing_mut().item_spacing.x = 2.0;
             let response = ui
                 .add_sized([24.0, 22.0], egui::Button::new("−").frame(false))
                 .on_hover_text("Collapse command ribbon");

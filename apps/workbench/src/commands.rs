@@ -496,7 +496,10 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         RibbonGroupId::SketchView,
         CommandIcon::Frame,
         CommandSize::Small,
-        "Frame sketch",
+        // The caption matches the View tab's "Frame"; the accessible name keeps
+        // the sketch in it. "Frame sketch" measured 62 px at the caption size,
+        // wider than the text room of any small button.
+        "Frame",
         "Frame sketch",
         "Fit the sketch to the canvas.",
         None,

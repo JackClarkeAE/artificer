@@ -70,7 +70,10 @@ fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
 fn choose_variant(harness: &mut Harness<'static, KernelLabApp>, chooser: &str, variant: &str) {
     click_button(harness, chooser);
     click_button(harness, variant);
-    assert!(harness.query_all_by_label(variant).count() >= 2);
+    // The chosen variant becomes the family's primary tile; the palette that
+    // used to name it a second time is gone.
+    assert!(harness.query_all_by_label(variant).count() >= 1);
+    assert_eq!(harness.state().active_sketch_tool_label(), variant);
 }
 
 fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPoint) -> egui::Pos2 {
@@ -105,14 +108,16 @@ fn replace_tool_input(harness: &mut Harness<'static, KernelLabApp>, label: &str,
     harness.run();
 }
 
+/// With nothing staged, the sketch's Finish and Exit stay reachable: the
+/// ribbon's COMPLETE group holds them as large captioned buttons.
 fn assert_idle_sketch_rail(harness: &Harness<'static, KernelLabApp>) {
     assert!(!harness.state().operation_confirmation_pending());
     for label in ["Finish sketch", "Exit sketch"] {
         let node = harness.get_by_role_and_label(Role::Button, label);
         assert!(!node.accesskit_node().is_disabled());
         let rect = node.rect();
-        assert_eq!(rect.width(), rect.height(), "{label} should remain square");
-        assert!((24.0..=30.0).contains(&rect.width()), "{label}: {rect:?}");
+        assert!(rect.is_positive(), "{label} must have a visible hit target");
+        assert!(rect.height() >= 24.0, "{label} is too small: {rect:?}");
     }
 }
 
@@ -257,7 +262,9 @@ fn three_point_arc_live_measurement_snapshot() {
     );
     assert!(!readouts[0].editable, "derived radius stays read-only");
     assert!(readouts[1].editable, "Tab owns the arc sweep field");
-    assert!(harness.query_all_by_label("Arc radius").count() >= 2);
-    assert!(harness.query_all_by_label("Arc sweep").count() >= 2);
+    // Each readout has one home now, its dimension widget on the canvas; the
+    // palette that used to restate them is gone.
+    assert!(harness.query_all_by_label("Arc radius").count() >= 1);
+    assert!(harness.query_all_by_label("Arc sweep").count() >= 1);
     settle_live_hover_snapshot(&mut harness, "workbench_three_point_arc_live_1040");
 }

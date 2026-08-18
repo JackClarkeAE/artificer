@@ -357,8 +357,18 @@ fn workbench_live_rectangle_dimensions_snapshot() {
             .query_by_role_and_label(Role::TextInput, "Rectangle height")
             .is_some()
     );
-    assert!(harness.query_by_label("4.000 mm").is_some());
-    assert!(harness.query_by_label("2.000 mm").is_some());
+    // The live readouts have one home, the dimension widgets on the canvas;
+    // the palette that restated them in millimetres is gone.
+    let readouts = harness.state().sketch_dimension_readouts();
+    let value_of = |kind: SketchDimensionKind| {
+        readouts
+            .iter()
+            .find(|readout| readout.kind == kind)
+            .unwrap_or_else(|| panic!("missing live readout {kind:?}"))
+            .value
+    };
+    assert!((value_of(SketchDimensionKind::Width) - 4.0).abs() <= 1.0e-12);
+    assert!((value_of(SketchDimensionKind::Height) - 2.0).abs() <= 1.0e-12);
 
     harness.remove_cursor();
     harness.run();
@@ -381,11 +391,17 @@ fn workbench_compact_sketch_toolbar_at_minimum_size_snapshot() {
         "Equal-distance chamfer",
         "Rectangular sketch pattern",
     ] {
+        // Every family keeps a whole, unclipped tile at the minimum window;
+        // the tile geometry itself is held by `sketch_compact_toolbar_ui`.
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
-        assert_eq!(rect.width(), rect.height(), "{label} must remain square");
+        assert!(rect.is_positive(), "{label} must have a visible hit target");
         assert!(
-            (28.0..=34.0).contains(&rect.width()),
-            "{label} lost its compact accessible hit target: {rect:?}"
+            rect.height() >= 24.0,
+            "{label} lost its accessible hit target: {rect:?}"
+        );
+        assert!(
+            rect.min.x >= 0.0 && rect.max.x <= 1040.0,
+            "{label} escaped the supported window: {rect:?}"
         );
     }
 

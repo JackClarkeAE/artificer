@@ -48,8 +48,11 @@ const _: () =
     assert!(PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH >= 56.0);
 /// Inset that keeps the chooser visibly inside its family tile.
 pub const CHEVRON_CELL_INSET: f32 = 1.0;
-/// Horizontal space between tool families.
-pub const FAMILY_GAP: f32 = 4.0;
+/// Horizontal space between tool families: the same 2 px that separates the
+/// two rows, so the block reads as one grid of tiles rather than a row of
+/// pairs. At 4 px the seven-family strip was 12 px wider than the 1040 px
+/// minimum window could give it.
+pub const FAMILY_GAP: f32 = 2.0;
 /// Vertical space between the two persistent toolbar rows.
 pub const ROW_GAP: f32 = 2.0;
 /// Padding between the group caption and the first row of tool tiles.
