@@ -33,12 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install native UI build libraries
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          ripgrep
-          libegl1-mesa-dev libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
-          libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev
-          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        # One script for every Ubuntu job: apt against a degraded mirror hangs
+        # rather than fails, so it carries transfer timeouts and retries.
+        run: bash scripts/install-linux-ui-libraries.sh ripgrep
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -97,11 +94,7 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install headless graphics libraries
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libegl1-mesa-dev libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
-          libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev
-          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: bash scripts/install-linux-ui-libraries.sh
       - name: Verify focused UI snapshots
         # The document-properties baseline prints absolute paths from the
         # recording machine's home directory, so it cannot match here. Every
@@ -180,11 +173,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install native UI build libraries
         if: runner.os == 'Linux'
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libegl1-mesa-dev libgl1-mesa-dri libvulkan1 mesa-vulkan-drivers
-          libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev
-          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+        run: bash scripts/install-linux-ui-libraries.sh
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
