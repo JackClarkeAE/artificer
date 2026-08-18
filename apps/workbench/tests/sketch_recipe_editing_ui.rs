@@ -9,6 +9,9 @@ use egui_kittest::{
 };
 
 const CONFIRM_OPERATION: &str = "Confirm operation";
+/// The Dimension tool's driving boxes for a picked rectangle.
+const WIDTH_BOX: &str = "Rectangle width";
+const HEIGHT_BOX: &str = "Rectangle height";
 
 fn harness() -> Harness<'static, KernelLabApp> {
     Harness::builder()
@@ -117,10 +120,14 @@ fn create_two_point_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
     ));
 }
 
+/// A rectangle's width and height are dimensions of its own geometry, so the
+/// Dimension tool is where they are typed: picking the top edge selects the
+/// rectangle and turns both driving boxes into real fields on the canvas.
 fn select_rectangle_top(harness: &mut Harness<'static, KernelLabApp>) {
-    click_button(harness, "Select sketch geometry");
+    click_button(harness, "Sketch dimension");
     click_sketch_point(harness, SketchPoint::new(0.0, 1.0));
-    harness.get_by_label("SELECTED FEATURE");
+    harness.get_by_role_and_label(Role::TextInput, WIDTH_BOX);
+    harness.get_by_role_and_label(Role::TextInput, HEIGHT_BOX);
 }
 
 fn create_right_angle(harness: &mut Harness<'static, KernelLabApp>) {
@@ -150,8 +157,11 @@ fn rectangle_recipe_edit_applies_on_accept_and_drives_exact_new_body_volume() {
     select_rectangle_top(&mut harness);
 
     let revision = harness.state().sketch_revision();
-    accept_selected_parameter(&mut harness, "Width", "3");
-    accept_selected_parameter(&mut harness, "Height", "2");
+    accept_selected_parameter(&mut harness, WIDTH_BOX, "3");
+    // An accepted edit rebuilds the rectangle's presentation; pick it again
+    // to arm the boxes for the second dimension.
+    select_rectangle_top(&mut harness);
+    accept_selected_parameter(&mut harness, HEIGHT_BOX, "2");
     assert!(!harness.state().operation_confirmation_pending());
     assert_eq!(harness.state().sketch_revision(), revision + 2);
     assert_eq!(harness.state().sketch_pending_entity_count(), 0);
@@ -184,7 +194,7 @@ fn typed_dimension_applies_on_enter_with_no_confirmation_rail() {
     select_rectangle_top(&mut harness);
 
     let revision = harness.state().sketch_revision();
-    replace_selected_parameter(&mut harness, "Width", "3");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "3");
     assert!(!harness.state().operation_confirmation_pending());
     assert!(
         harness
@@ -220,7 +230,7 @@ fn typed_dimension_applies_when_the_canvas_takes_the_click() {
     select_rectangle_top(&mut harness);
 
     let revision = harness.state().sketch_revision();
-    replace_selected_parameter(&mut harness, "Width", "3");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "3");
     click_sketch_point(&mut harness, SketchPoint::new(3.5, 3.0));
     assert_eq!(harness.state().sketch_revision(), revision + 1);
     assert_eq!(harness.state().sketch_pending_entity_count(), 0);
@@ -235,7 +245,7 @@ fn accepted_dimension_is_one_local_undo_step() {
     create_two_point_rectangle(&mut harness);
     select_rectangle_top(&mut harness);
 
-    accept_selected_parameter(&mut harness, "Width", "3");
+    accept_selected_parameter(&mut harness, WIDTH_BOX, "3");
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
     harness.run();
     assert_eq!(harness.state().sketch_entity_count(), 4);
@@ -262,10 +272,10 @@ fn invalid_selected_parameter_keeps_last_preview_and_escape_reverts_neutrally() 
     select_rectangle_top(&mut harness);
 
     let revision = harness.state().sketch_revision();
-    replace_selected_parameter(&mut harness, "Width", "3");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "3");
     assert!(!harness.state().operation_confirmation_pending());
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
-    replace_selected_parameter(&mut harness, "Width", "not-a-number");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "not-a-number");
     // The last value that parsed keeps previewing; unparseable text never
     // replaces it and never publishes.
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
@@ -408,7 +418,30 @@ fn fillet_and_both_chamfer_parameter_forms_replay_exactly() {
         "2D fillet"
     );
     let fillet_ids = fillet.state().selected_sketch_recipe_output_ids();
-    accept_selected_parameter(&mut fillet, "Radius", "0.5");
+    // A fillet's radius is the radius of its own arc, so the Dimension tool
+    // drives it from the arc: the 0.75 mm blend at the corner is centred on
+    // (-0.75, 0.75) and its midpoint faces the corner it replaced.
+    click_button(&mut fillet, "Sketch dimension");
+    let midpoint = 0.75 - 0.75 / std::f64::consts::SQRT_2;
+    click_sketch_point(&mut fillet, SketchPoint::new(-midpoint, midpoint));
+    assert_eq!(
+        fillet
+            .state()
+            .selected_sketch_recipe_editor()
+            .expect("the dimension pick lands on the fillet")
+            .title,
+        "2D fillet"
+    );
+    accept_selected_parameter(&mut fillet, "Arc radius", "0.5");
+    assert_eq!(
+        fillet
+            .state()
+            .selected_sketch_recipe_editor()
+            .expect("the fillet stays selected after its edit")
+            .parameters[0]
+            .text,
+        "0.5"
+    );
     assert_eq!(
         fillet.state().selected_sketch_recipe_output_ids(),
         fillet_ids
@@ -468,7 +501,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
     click_button(&mut restored, "Sketch 1 feature");
     assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Sketch);
     select_rectangle_top(&mut restored);
-    accept_selected_parameter(&mut restored, "Width", "3");
+    accept_selected_parameter(&mut restored, WIDTH_BOX, "3");
     click_button(&mut restored, "Finish sketch");
     assert_eq!(restored.state().document_feature_count(), feature_count);
     assert_eq!(restored.state().document_dirty_feature_count(), 1);
@@ -508,8 +541,8 @@ fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
     click_button(&mut harness, "Sketch 1 feature");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     select_rectangle_top(&mut harness);
-    replace_selected_parameter(&mut harness, "Width", "3");
-    replace_selected_parameter(&mut harness, "Width", "invalid");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "3");
+    replace_selected_parameter(&mut harness, WIDTH_BOX, "invalid");
     harness.key_press(egui::Key::Escape);
     harness.run();
     assert_eq!(harness.state().document_dirty_feature_count(), 0);
@@ -519,7 +552,7 @@ fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
         original_feature_count
     );
 
-    accept_selected_parameter(&mut harness, "Width", "3");
+    accept_selected_parameter(&mut harness, WIDTH_BOX, "3");
     click_button(&mut harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(

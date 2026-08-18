@@ -1704,6 +1704,64 @@ fn polygon_diameter_from_side(side: f64, sides: u32, inner: bool) -> Option<f64>
     (factor.is_finite() && factor > 0.0).then(|| side / factor)
 }
 
+fn literal_side_count(sides: &CoreValue<CoreInteger>) -> Option<u32> {
+    match sides {
+        CoreValue::Literal(count) => Some(u32::from(count.get())),
+        CoreValue::Input(_) => None,
+    }
+}
+
+fn literal_length_value(length: &CoreValue<CoreLength>) -> Option<f64> {
+    match length {
+        CoreValue::Literal(value) => Some(value.get()),
+        CoreValue::Input(_) => None,
+    }
+}
+
+/// The diameter a polygon should now carry, given that its `side` and its
+/// diameter drive the same single number and nothing records which box was
+/// typed into.
+///
+/// The editor's texts were derived from the recipe as it was, so a text that
+/// still says what the recipe implied was not typed into, and the one that
+/// moved is the edit. Comparing the two texts against *each other* — as this
+/// used to — misreads every edit: a typed diameter leaves the derived side
+/// text stale, so the side looked edited and the diameter snapped back; and a
+/// changed side count made the untouched side text disagree with the new
+/// implication, so the diameter was recomputed from a side nobody typed. A
+/// side count on its own keeps the diameter — a diameter polygon is stored by
+/// its diameter — and `None` leaves the literal exactly as it was, so a
+/// six-decimal round trip through the text never drifts it either.
+fn polygon_driven_diameter(
+    original_diameter: Option<f64>,
+    original_count: Option<u32>,
+    new_count: Option<u32>,
+    typed_diameter: Option<f64>,
+    typed_side: Option<f64>,
+    inner: bool,
+) -> Option<f64> {
+    // Texts carry six decimals, so an untouched value round-trips to within
+    // 5e-7 of its origin; anything past this is a hand on the keyboard.
+    const UNCHANGED: f64 = 5.0e-6;
+    let moved = |typed: Option<f64>, origin: Option<f64>| {
+        typed
+            .zip(origin)
+            .is_some_and(|(typed, origin)| (typed - origin).abs() > UNCHANGED)
+    };
+    let original_side = original_diameter
+        .zip(original_count)
+        .and_then(|(diameter, count)| polygon_side_from_diameter(diameter, count, inner));
+    if moved(typed_diameter, original_diameter) {
+        typed_diameter
+    } else if moved(typed_side, original_side) {
+        typed_side
+            .zip(new_count)
+            .and_then(|(side, count)| polygon_diameter_from_side(side, count, inner))
+    } else {
+        None
+    }
+}
+
 fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, ()> {
     let mut recipe = editor.original_recipe.clone();
     match &mut recipe {
@@ -1745,26 +1803,17 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             rotation,
             ..
         } => {
+            let original_count = literal_side_count(sides);
+            let original_diameter = literal_length_value(inner_diameter);
             replace_literal_integer(sides, recipe_parameter_value(editor, "sides"));
-            // `side` and `inner_diameter` drive the same single number, and nothing
-            // records which box was typed into. Whichever now disagrees with
-            // what the other implies is the edit — the untouched one still
-            // holds the value it was derived from.
-            let side_count = match sides {
-                CoreValue::Literal(count) => Some(u32::from(count.get())),
-                CoreValue::Input(_) => None,
-            };
-            let typed_side = recipe_parameter_value(editor, "side");
-            let typed_diameter = recipe_parameter_value(editor, "inner_diameter");
-            let implied_side = side_count
-                .zip(typed_diameter)
-                .and_then(|(count, diameter)| polygon_side_from_diameter(diameter, count, true));
-            let driven = match (typed_side, implied_side, side_count) {
-                (Some(side), Some(implied), Some(count)) if (side - implied).abs() > 1.0e-9 => {
-                    polygon_diameter_from_side(side, count, true)
-                }
-                _ => typed_diameter,
-            };
+            let driven = polygon_driven_diameter(
+                original_diameter,
+                original_count,
+                literal_side_count(sides),
+                recipe_parameter_value(editor, "inner_diameter"),
+                recipe_parameter_value(editor, "side"),
+                true,
+            );
             replace_literal_length(inner_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
@@ -1774,26 +1823,17 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             rotation,
             ..
         } => {
+            let original_count = literal_side_count(sides);
+            let original_diameter = literal_length_value(outer_diameter);
             replace_literal_integer(sides, recipe_parameter_value(editor, "sides"));
-            // `side` and `outer_diameter` drive the same single number, and nothing
-            // records which box was typed into. Whichever now disagrees with
-            // what the other implies is the edit — the untouched one still
-            // holds the value it was derived from.
-            let side_count = match sides {
-                CoreValue::Literal(count) => Some(u32::from(count.get())),
-                CoreValue::Input(_) => None,
-            };
-            let typed_side = recipe_parameter_value(editor, "side");
-            let typed_diameter = recipe_parameter_value(editor, "outer_diameter");
-            let implied_side = side_count
-                .zip(typed_diameter)
-                .and_then(|(count, diameter)| polygon_side_from_diameter(diameter, count, false));
-            let driven = match (typed_side, implied_side, side_count) {
-                (Some(side), Some(implied), Some(count)) if (side - implied).abs() > 1.0e-9 => {
-                    polygon_diameter_from_side(side, count, false)
-                }
-                _ => typed_diameter,
-            };
+            let driven = polygon_driven_diameter(
+                original_diameter,
+                original_count,
+                literal_side_count(sides),
+                recipe_parameter_value(editor, "outer_diameter"),
+                recipe_parameter_value(editor, "side"),
+                false,
+            );
             replace_literal_length(outer_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
@@ -4960,6 +5000,21 @@ impl SketchCanvasState {
                     .collect(),
                 reference_note: editor.reference_note,
             })
+    }
+
+    /// The stable keys of the selected recipe's parameters that the Dimension
+    /// tool can drive from the canvas, so a host knows which ones no dimension
+    /// box will ever show. The tool arms a box only for the kinds the clicked
+    /// geometry carries (`committed_dimension_parameter`): a rectangle's width
+    /// and height, a circle's diameter, a line's length and angle, a fillet's
+    /// radius, and a polygon edge's side. A slot's width, a chamfer's two
+    /// distances, a polygon's diameter, side count and rotation, and a
+    /// pattern's counts have no such box, and are reachable only elsewhere.
+    #[must_use]
+    pub fn selected_recipe_canvas_dimensionable_keys(&self) -> &'static [&'static str] {
+        self.selected_recipe_editor.as_ref().map_or(&[], |editor| {
+            canvas_dimensionable_keys(&editor.original_recipe)
+        })
     }
 
     /// Stable core curve-output IDs owned by the selected recipe operation.
@@ -10788,6 +10843,27 @@ fn rectangle_from_operation_siblings(
             SketchPoint::new(max_u, max_v),
         )
     })
+}
+
+/// The recipe keys `committed_dimension_parameter` can ever resolve for one
+/// recipe: the kinds its geometry offers, mapped to the keys it carries. A
+/// rectangle's chip yields width and height; a circle, its diameter; a line,
+/// length and angle; a fillet is an arc, so radius; a polygon edge is a line
+/// whose length falls through to `"side"`. A slot's edges and arcs resolve to
+/// keys the slot does not have, so nothing on a slot is drivable from a box.
+const fn canvas_dimensionable_keys(recipe: &CoreRecipe) -> &'static [&'static str] {
+    match recipe {
+        CoreRecipe::TwoPointRectangle { .. } | CoreRecipe::CentrePointRectangle { .. } => {
+            &["width", "height"]
+        }
+        CoreRecipe::CentrePointCircle { .. } => &["diameter"],
+        CoreRecipe::Line { .. } | CoreRecipe::CentreLine { .. } => &["length", "angle"],
+        CoreRecipe::InnerDiameterPolygon { .. } | CoreRecipe::OuterDiameterPolygon { .. } => {
+            &["side"]
+        }
+        CoreRecipe::Fillet { .. } | CoreRecipe::FilletWithHints { .. } => &["radius"],
+        _ => &[],
+    }
 }
 
 /// The recipe literal a committed dimension box drives, if the Dimension tool

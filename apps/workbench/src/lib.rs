@@ -10860,34 +10860,48 @@ impl KernelLabApp {
         }
     }
 
-    /// Keys a canvas dimension box can already reach.
-    ///
-    /// `committed_dimension_parameter` binds each dimension kind to one of
-    /// these, so anything here is editable on the geometry itself and must not
-    /// be repeated in a panel.
-    const CANVAS_REACHABLE_PARAMETERS: &'static [&'static str] = &[
-        "length", "angle", "side", "width", "height", "diameter", "radius",
-    ];
-
     /// The parameters of the selected sketch feature that no dimension box can
     /// show: a polygon's side count, a pattern's rows and spacing, a chamfer's
-    /// two distances. They are not dimensions of a curve, so no amount of
-    /// clicking geometry will ever surface them.
+    /// two distances, a slot's width. They are not dimensions of a curve the
+    /// Dimension tool can pick, so no amount of clicking geometry will ever
+    /// surface them. The sketch says which keys its boxes reach for the
+    /// selected recipe — a fixed list of key names hid a slot's width, which
+    /// shares its name with a rectangle's but has no box of its own.
     fn orphaned_sketch_parameters(&self) -> Vec<SelectedRecipeParameter> {
         if self.workbench_mode != WorkbenchMode::Sketch {
             return Vec::new();
         }
+        let reachable = self.sketch.selected_recipe_canvas_dimensionable_keys();
         self.selected_sketch_recipe_editor()
             .map(|editor| {
                 editor
                     .parameters
                     .into_iter()
-                    .filter(|parameter| {
-                        !Self::CANVAS_REACHABLE_PARAMETERS.contains(&parameter.stable_key)
-                    })
+                    .filter(|parameter| !reachable.contains(&parameter.stable_key))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether every input of a creation tool is one of its draft's Tab
+    /// dimension boxes — U and V for a point, length and angle for a line,
+    /// width and height for a rectangle, diameter for a circle, radius and
+    /// sweep for an arc — so a panel listing them would only restate the
+    /// canvas.
+    const fn tool_inputs_are_dimension_boxes(tool: ToolVariant) -> bool {
+        matches!(
+            tool,
+            ToolVariant::Point
+                | ToolVariant::SingleLine
+                | ToolVariant::ChainedPolyline
+                | ToolVariant::Centreline
+                | ToolVariant::TwoPointRectangle
+                | ToolVariant::CentrePointRectangle
+                | ToolVariant::CentrePointCircle
+                | ToolVariant::TwoPointCircle
+                | ToolVariant::CentreStartEndArc
+                | ToolVariant::ThreePointArc
+        )
     }
 
     /// A surface for exactly those parameters, and only on the frames that have
@@ -10909,7 +10923,26 @@ impl KernelLabApp {
         }
         let parameters = self.orphaned_sketch_parameters();
         let descriptor = self.active_sketch_tool.descriptor();
-        if parameters.is_empty() && descriptor.inputs.is_empty() {
+        // One subject at a time, and the armed tool says which. Select and
+        // Dimension mean "I am working on what is already there", so the
+        // selected recipe wins. Any creation tool means "I am about to draw",
+        // so its own inputs win — otherwise a stale selection hides the
+        // settings for the shape being lined up.
+        let inspecting = matches!(
+            self.active_sketch_tool,
+            ToolVariant::Select | ToolVariant::Dimension
+        );
+        let shows_selected = inspecting && !parameters.is_empty();
+        // A point, line, rectangle, circle or arc carries every one of its
+        // inputs as a Tab dimension box the moment the draft exists, so the
+        // panel would only restate the canvas; it stays away and the drawing
+        // keeps the full window. A polygon's side count, a slot's width, a
+        // fillet's radius, a chamfer's distances and a pattern's counts have
+        // no box, and those tools bring the panel with them.
+        let shows_tool = !inspecting
+            && !descriptor.inputs.is_empty()
+            && !Self::tool_inputs_are_dimension_boxes(self.active_sketch_tool);
+        if !shows_selected && !shows_tool {
             return;
         }
         egui::Panel::right("sketch_parameter_panel")
@@ -10923,16 +10956,7 @@ impl KernelLabApp {
                     .stroke(Stroke::new(1.0, theme::border())),
             )
             .show(ui, |ui| {
-                // One subject at a time, and the armed tool says which. Select
-                // and Dimension mean "I am working on what is already there",
-                // so the selected recipe wins. Any creation tool means "I am
-                // about to draw", so its own inputs win — otherwise a stale
-                // selection hides the settings for the shape being lined up.
-                let inspecting = matches!(
-                    self.active_sketch_tool,
-                    ToolVariant::Select | ToolVariant::Dimension
-                );
-                if inspecting && !parameters.is_empty() {
+                if shows_selected {
                     ui.label(
                         RichText::new("SELECTED FEATURE")
                             .small()
