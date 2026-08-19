@@ -341,6 +341,7 @@ dependencies = [
  "artificer-protocol",
  "egui",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

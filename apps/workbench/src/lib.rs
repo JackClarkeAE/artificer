@@ -1629,6 +1629,11 @@ pub struct KernelLabApp {
     next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
     document_properties_open: bool,
+    /// The Theme tab's colour editor window.
+    theme_editor_open: bool,
+    /// Where the theme choice and edited palettes are written; `None` in
+    /// tests and harnesses, which must not touch the user's preferences.
+    theme_preferences_path: Option<PathBuf>,
     about_open: bool,
     updates: update::UpdateService,
     stl_export_path_text: String,
@@ -1788,6 +1793,8 @@ impl Default for KernelLabApp {
             next_construction_plane_id: 1,
             selected_construction_plane: None,
             document_properties_open: false,
+            theme_editor_open: false,
+            theme_preferences_path: None,
             about_open: false,
             updates: update::UpdateService::new(),
             stl_export_path_text,
@@ -1904,6 +1911,8 @@ impl KernelLabApp {
             ..Self::default()
         };
         app.reset_to_blank_workspace();
+        app.theme_preferences_path = Some(theme_preferences_path());
+        app.load_theme_preferences(&creation_context.egui_ctx);
         if let Err(error) = app.open_catalog_store(default_catalog_root()) {
             app.document_status = Some(format!(
                 "Local Part Library is using its verified built-in fallback: {error}"
@@ -10386,6 +10395,213 @@ impl KernelLabApp {
             });
         });
     }
+    /// Switches the theme in force, rebuilds egui's derived widget defaults,
+    /// and remembers the choice.
+    pub(crate) fn choose_theme(&mut self, theme: theme::WorkbenchTheme, context: &egui::Context) {
+        theme::set_active_theme(theme);
+        self.theme_changed(context);
+    }
+
+    /// After any palette or theme change: egui derives its own widget
+    /// defaults from the palette, so the style has to be rebuilt before
+    /// anything else paints, and the preferences file follows the change so
+    /// the next launch looks the same.
+    pub(crate) fn theme_changed(&mut self, context: &egui::Context) {
+        theme::install_style(context);
+        context.request_repaint();
+        self.save_theme_preferences();
+    }
+
+    fn load_theme_preferences(&mut self, context: &egui::Context) {
+        let Some(path) = self.theme_preferences_path.as_ref() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        match serde_json::from_str::<theme::ThemePreferences>(&text) {
+            Ok(preferences) => {
+                preferences.apply();
+                theme::install_style(context);
+            }
+            Err(error) => {
+                eprintln!(
+                    "Artificer ignored the theme preferences at {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn save_theme_preferences(&self) {
+        let Some(path) = self.theme_preferences_path.as_ref() else {
+            return;
+        };
+        let preferences = theme::ThemePreferences::capture();
+        let Ok(text) = serde_json::to_string_pretty(&preferences) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(path, text) {
+            eprintln!(
+                "Artificer could not save the theme preferences to {}: {error}",
+                path.display()
+            );
+        }
+    }
+
+    /// The Theme tab's colour editor: one picker per role, grouped the way
+    /// the palette is, editing the active theme live. Light and Dark each
+    /// keep their own edits.
+    fn theme_editor_window(&mut self, context: &egui::Context) {
+        if !self.theme_editor_open {
+            return;
+        }
+        let mut open = self.theme_editor_open;
+        let active = theme::active_theme();
+        let mut palette = theme::palette_for(active);
+        let mut changed = false;
+        egui::Window::new(format!("{} THEME COLOURS", active.label().to_uppercase()))
+            .id(egui::Id::new("theme_editor_window"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 150.0))
+            .default_width(300.0)
+            .max_height(560.0)
+            .resizable(false)
+            .open(&mut open)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(context, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Edits apply as you pick and are kept for the next launch. Reset in the ribbon restores the built-in colours.",
+                    )
+                    .small()
+                    .color(theme::muted()),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    let mut section = |ui: &mut egui::Ui,
+                                       key: &'static str,
+                                       title: &'static str,
+                                       rows: &mut [(&'static str, &mut Color32)]| {
+                        collapsible_card(ui, key, title, true, |ui| {
+                            for (name, colour) in rows.iter_mut() {
+                                ui.horizontal(|ui| {
+                                    let response = ui.color_edit_button_srgba(colour);
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::ColorButton,
+                                            true,
+                                            format!("{} colour", name.replace('_', " ")),
+                                        )
+                                    });
+                                    changed |= response.changed();
+                                    ui.label(
+                                        RichText::new(name.replace('_', " "))
+                                            .small()
+                                            .color(theme::text()),
+                                    );
+                                });
+                            }
+                        });
+                        ui.add_space(5.0);
+                    };
+                    let sketch = &mut palette.sketch;
+                    section(
+                        ui,
+                        "theme_sketch_canvas",
+                        "SKETCH CANVAS",
+                        &mut [
+                            ("background", &mut sketch.background),
+                            ("grid_minor", &mut sketch.grid_minor),
+                            ("grid_major", &mut sketch.grid_major),
+                            ("axis_first", &mut sketch.axis_first),
+                            ("axis_second", &mut sketch.axis_second),
+                            ("overlay_text", &mut sketch.overlay_text),
+                        ],
+                    );
+                    section(
+                        ui,
+                        "theme_sketch_geometry",
+                        "SKETCH GEOMETRY",
+                        &mut [
+                            ("entity", &mut sketch.entity),
+                            ("construction", &mut sketch.construction),
+                            ("hovered", &mut sketch.hovered),
+                            ("selected", &mut sketch.selected),
+                            ("pending", &mut sketch.pending),
+                            ("invalid", &mut sketch.invalid),
+                            ("trim_hover", &mut sketch.trim_hover),
+                            ("snap", &mut sketch.snap),
+                            ("snap_support", &mut sketch.snap_support),
+                            ("region_fill", &mut sketch.region_fill),
+                            ("region_hover", &mut sketch.region_hover),
+                        ],
+                    );
+                    section(
+                        ui,
+                        "theme_sketch_dimensions",
+                        "SKETCH DIMENSIONS AND FACE CONTEXT",
+                        &mut [
+                            ("dimension", &mut sketch.dimension),
+                            ("dimension_locked", &mut sketch.dimension_locked),
+                            ("dimension_background", &mut sketch.dimension_background),
+                            ("context_face", &mut sketch.context_face),
+                            ("context_edge", &mut sketch.context_edge),
+                            (
+                                "context_selected_boundary",
+                                &mut sketch.context_selected_boundary,
+                            ),
+                        ],
+                    );
+                    section(
+                        ui,
+                        "theme_viewport",
+                        "MODEL VIEWPORT",
+                        &mut [
+                            ("viewport_top", &mut palette.viewport_top),
+                            ("viewport_bottom", &mut palette.viewport_bottom),
+                        ],
+                    );
+                    section(
+                        ui,
+                        "theme_chrome",
+                        "CHROME",
+                        &mut [
+                            ("bg", &mut palette.bg),
+                            ("panel", &mut palette.panel),
+                            ("card", &mut palette.card),
+                            ("border", &mut palette.border),
+                            ("text", &mut palette.text),
+                            ("muted", &mut palette.muted),
+                            ("accent", &mut palette.accent),
+                            ("good", &mut palette.good),
+                            ("warn", &mut palette.warn),
+                            ("bad", &mut palette.bad),
+                            ("ribbon_fill", &mut palette.ribbon_fill),
+                            ("timeline_fill", &mut palette.timeline_fill),
+                            ("hover_fill", &mut palette.hover_fill),
+                            ("active_fill", &mut palette.active_fill),
+                            ("selected_fill", &mut palette.selected_fill),
+                            ("good_fill", &mut palette.good_fill),
+                        ],
+                    );
+                });
+            });
+        self.theme_editor_open = open;
+        if changed {
+            theme::set_palette(active, palette);
+            self.theme_changed(context);
+        }
+    }
+
     fn document_properties_window(&mut self, context: &egui::Context) {
         if !self.document_properties_open {
             return;
@@ -10436,13 +10652,7 @@ impl KernelLabApp {
                                     )
                                 });
                                 if response.clicked() && candidate != active {
-                                    theme::set_active_theme(candidate);
-                                    // Every widget drawn after this reads the
-                                    // palette through the accessors, so the
-                                    // style has to be rebuilt before the next
-                                    // one paints.
-                                    theme::install_style(ui.ctx());
-                                    ui.ctx().request_repaint();
+                                    self.choose_theme(candidate, ui.ctx());
                                 }
                             }
                         });
@@ -14887,6 +15097,7 @@ impl eframe::App for KernelLabApp {
         self.show_browser_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
+        self.theme_editor_window(ui.ctx());
         self.about_window(ui.ctx());
 
         if let Some(staging_id) = self
@@ -15258,6 +15469,18 @@ fn default_catalog_root() -> PathBuf {
         }
     }
     std::env::temp_dir().join("artificer-catalog")
+}
+
+/// The theme choice and edited palettes live beside the catalog, in the
+/// per-user Artificer data directory.
+fn theme_preferences_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("ARTIFICER_THEME_PATH").filter(|value| !value.is_empty()) {
+        return PathBuf::from(path);
+    }
+    default_catalog_root()
+        .parent()
+        .map_or_else(default_catalog_root, Path::to_path_buf)
+        .join("theme.json")
 }
 
 fn default_document_path() -> PathBuf {

@@ -29,17 +29,25 @@ pub enum RibbonTab {
     Model,
     Sketch,
     View,
+    Theme,
 }
 
 impl RibbonTab {
-    pub const ALL: [Self; 3] = [Self::Model, Self::Sketch, Self::View];
+    pub const ALL: [Self; 4] = [Self::Model, Self::Sketch, Self::View, Self::Theme];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Model => "Model",
             Self::Sketch => "Sketch",
             Self::View => "View",
+            Self::Theme => "Theme",
         }
+    }
+
+    /// Whether picking the tab enters a workspace, or only changes what the
+    /// ribbon shows. The latter is reachable while an operation is pending.
+    pub const fn switches_workspace(self) -> bool {
+        matches!(self, Self::Model | Self::Sketch)
     }
 
     /// Model and Sketch keep the names the workspace buttons they replaced
@@ -51,6 +59,7 @@ impl RibbonTab {
             Self::Model => "Model mode",
             Self::Sketch => "Sketch mode",
             Self::View => "View ribbon tab",
+            Self::Theme => "Theme ribbon tab",
         }
     }
 }
@@ -73,6 +82,8 @@ pub enum RibbonGroupId {
     Motion,
     Panels,
     Appearance,
+    ThemeChoice,
+    ThemeColours,
 }
 
 impl RibbonGroupId {
@@ -91,6 +102,8 @@ impl RibbonGroupId {
             Self::Motion => "MOTION",
             Self::Panels => "PANELS",
             Self::Appearance => "APPEARANCE",
+            Self::ThemeChoice => "THEME",
+            Self::ThemeColours => "COLOURS",
         }
     }
 
@@ -113,6 +126,8 @@ impl RibbonGroupId {
             Self::Motion => "group_motion",
             Self::Panels => "group_panels",
             Self::Appearance => "group_appearance",
+            Self::ThemeChoice => "group_theme_choice",
+            Self::ThemeColours => "group_theme_colours",
         }
     }
 }
@@ -161,6 +176,10 @@ pub enum ModelCommand {
     ShowHistory,
     ToggleTheme,
     ToggleOriginPlanes,
+    ThemeLight,
+    ThemeDark,
+    ThemeColours,
+    ThemeReset,
     FinishSketch,
     ExitSketch,
     FrameSketch,
@@ -635,6 +654,55 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Theme",
         "Switch theme",
         "Switch between the light and dark workbench themes.",
+        None,
+    ),
+    // ---- Theme tab -------------------------------------------------------
+    command(
+        ModelCommand::ThemeLight,
+        "theme.light",
+        RibbonTab::Theme,
+        RibbonGroupId::ThemeChoice,
+        CommandIcon::ThemeLight,
+        CommandSize::Large,
+        "Light",
+        "Light theme",
+        "Light chrome and a near-white sketch canvas.",
+        None,
+    ),
+    command(
+        ModelCommand::ThemeDark,
+        "theme.dark",
+        RibbonTab::Theme,
+        RibbonGroupId::ThemeChoice,
+        CommandIcon::ThemeDark,
+        CommandSize::Large,
+        "Dark",
+        "Dark theme",
+        "Dark chrome and a dark sketch canvas, the model as the lit surface.",
+        None,
+    ),
+    command(
+        ModelCommand::ThemeColours,
+        "theme.colours",
+        RibbonTab::Theme,
+        RibbonGroupId::ThemeColours,
+        CommandIcon::Palette,
+        CommandSize::Large,
+        "Colours",
+        "Edit theme colours",
+        "Open the colour editor for the active theme: chrome, viewport, and sketch canvas.",
+        None,
+    ),
+    command(
+        ModelCommand::ThemeReset,
+        "theme.reset",
+        RibbonTab::Theme,
+        RibbonGroupId::ThemeColours,
+        CommandIcon::Rebuild,
+        CommandSize::Small,
+        "Reset",
+        "Reset theme colours",
+        "Restore the active theme's built-in colours.",
         None,
     ),
 ];

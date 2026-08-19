@@ -47,33 +47,20 @@ use artificer_ui_core::drag_handle::{DragHandlePhase, DragHandleState, PointerSa
 
 use crate::sketch_toolbar::ToolVariant;
 
-const CANVAS_BACKGROUND: Color32 = Color32::from_rgb(252, 253, 254);
-const GRID_MINOR: Color32 = Color32::from_rgb(228, 233, 239);
-const GRID_MAJOR: Color32 = Color32::from_rgb(206, 214, 223);
-const ENTITY: Color32 = Color32::from_rgb(36, 82, 148);
-const HOVERED: Color32 = Color32::from_rgb(52, 148, 226);
-const SELECTED: Color32 = Color32::from_rgb(206, 128, 16);
-const PENDING: Color32 = Color32::from_rgb(23, 122, 67);
-const INVALID: Color32 = Color32::from_rgb(189, 57, 52);
-const TRIM_HOVER: Color32 = Color32::from_rgb(222, 104, 30);
-const SNAP: Color32 = Color32::from_rgb(182, 136, 10);
-/// Reference snaps read the support rather than authored sketch geometry, so
-/// they get their own marker colour the way model-edge snaps do elsewhere.
-const SNAP_SUPPORT: Color32 = Color32::from_rgb(20, 132, 138);
 /// Lying on a support edge captures inside a tighter band than its named
 /// points, keeping the pull "light" while tracing an outline.
 const SUPPORT_EDGE_RADIUS_RATIO: f32 = 0.6;
-const AXIS_FIRST: Color32 = Color32::from_rgb(214, 69, 69);
-const AXIS_SECOND: Color32 = Color32::from_rgb(52, 158, 106);
-const DIMENSION: Color32 = Color32::from_rgb(24, 112, 172);
-const DIMENSION_LOCKED: Color32 = Color32::from_rgb(23, 122, 67);
-const DIMENSION_BACKGROUND: Color32 = Color32::from_rgb(255, 255, 255);
-// Face-sketch context represents the still-present solid, not an X-ray or
-// construction ghost. Keep its surface fully opaque; the quieter value and
-// edge colors provide contrast without implying transparency.
-const CONTEXT_FACE: Color32 = Color32::from_rgb(226, 233, 240);
-const CONTEXT_EDGE: Color32 = Color32::from_rgba_unmultiplied_const(96, 116, 140, 185);
-const CONTEXT_SELECTED_BOUNDARY: Color32 = Color32::from_rgb(18, 102, 189);
+
+/// The sketch canvas paints from the workbench palette, so it follows the
+/// chrome's theme and the same colour editor. Each role is read at paint
+/// time; see `artificer_ui_core::theme::SketchColours` for what each is.
+fn sketch_colours() -> artificer_ui_core::theme::SketchColours {
+    artificer_ui_core::theme::sketch()
+}
+
+fn translucent(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
 
 const MIN_POINTS_PER_UNIT: f64 = 4.0;
 const MAX_POINTS_PER_UNIT: f64 = 4_000.0;
@@ -3826,7 +3813,7 @@ impl CertifiedProfileStatus {
                 winding: ProfileWinding::Clockwise,
             } => "PROFILE CLOSED · CLOCKWISE (REVERSED)",
             Self::SelfIntersecting => "PROFILE SELF-INTERSECTING",
-            Self::Invalid => "PROFILE INVALID",
+            Self::Invalid => "PROFILE sketch_colours().invalid",
             Self::Indeterminate => "PROFILE INDETERMINATE",
             Self::ClosedAnalyticCircle => "PROFILE CLOSED · ANALYTIC CIRCLE",
             Self::ClosedAnalyticCurves => "PROFILE CLOSED · ANALYTIC CURVES",
@@ -3838,7 +3825,9 @@ impl CertifiedProfileStatus {
             Self::TooManyLoops { .. } => "PROFILE LOOP LIMIT EXCEEDED",
             Self::TooManyRegions { .. } => "PROFILE REGION LIMIT EXCEEDED",
             Self::LinearLoopTooLarge { .. } => "LINEAR LOOP LIMIT EXCEEDED",
-            Self::CurvesNeedCertification => "PROFILE CURVES · CERTIFICATION PENDING",
+            Self::CurvesNeedCertification => {
+                "PROFILE CURVES · CERTIFICATION sketch_colours().pending"
+            }
             Self::MultipleProfiles => "PROFILE MULTI-LOOP · AMBIGUOUS",
         }
     }
@@ -6365,7 +6354,7 @@ impl SketchCanvasState {
             // The honest negative: a plain line, a point, or a free arc measures
             // itself, so nothing here drives a literal. Say so on the canvas
             // rather than leaving the tool looking broken.
-            "This feature has no driving dimension · see SELECTED FEATURE"
+            "This feature has no driving dimension · see sketch_colours().selected FEATURE"
         } else if matches!(
             state.exact_tool,
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern
@@ -9345,7 +9334,7 @@ pub fn show_with_context(
     // start of the key event just as importantly as `has_focus` does.
     let canvas_owned_keyboard = response.has_focus() || response.lost_focus();
 
-    painter.rect_filled(response.rect, 0.0, CANVAS_BACKGROUND);
+    painter.rect_filled(response.rect, 0.0, sketch_colours().background);
     // Snapping runs below against state, so the frame's support curves are
     // mirrored first. A plane sketch has none and falls back to sketch-only
     // snapping.
@@ -9689,7 +9678,7 @@ fn paint_viewport_context(
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    let edge_stroke = Stroke::new(1.0, CONTEXT_EDGE);
+    let edge_stroke = Stroke::new(1.0, sketch_colours().context_edge);
     for edge in context.edges {
         let [first, second] = edge.endpoints;
         if !first.is_finite() || !second.is_finite() {
@@ -9706,7 +9695,7 @@ fn paint_viewport_context(
 
     let boundary = context.selected_face_boundary;
     if boundary.len() >= 2 {
-        let boundary_stroke = Stroke::new(1.8, CONTEXT_SELECTED_BOUNDARY);
+        let boundary_stroke = Stroke::new(1.8, sketch_colours().context_selected_boundary);
         for index in 0..boundary.len() {
             let first = boundary[index];
             let second = boundary[(index + 1) % boundary.len()];
@@ -9722,7 +9711,7 @@ fn paint_viewport_context(
             }
         }
     }
-    let boundary_stroke = Stroke::new(1.8, CONTEXT_SELECTED_BOUNDARY);
+    let boundary_stroke = Stroke::new(1.8, sketch_colours().context_selected_boundary);
     for inner in context.selected_face_inner_boundaries {
         if inner.len() < 2 {
             continue;
@@ -9764,7 +9753,7 @@ fn projected_context_mesh(
         }
         let first = mesh.vertices.len() as u32;
         for point in points {
-            mesh.colored_vertex(point, CONTEXT_FACE);
+            mesh.colored_vertex(point, sketch_colours().context_face);
         }
         mesh.add_triangle(first, first + 1, first + 2);
     }
@@ -9813,7 +9802,7 @@ fn paint_grid(
             rect,
             view,
             spacing.minor_world_step(),
-            GRID_MINOR,
+            sketch_colours().grid_minor,
             1.0,
         );
         paint_grid_family(
@@ -9821,7 +9810,7 @@ fn paint_grid(
             rect,
             view,
             spacing.major_world_step(),
-            GRID_MAJOR,
+            sketch_colours().grid_major,
             1.15,
         );
     }
@@ -9832,14 +9821,14 @@ fn paint_grid(
             view.sketch_to_screen(rect, SketchPoint::new(min_u, 0.0)),
             view.sketch_to_screen(rect, SketchPoint::new(max_u, 0.0)),
         ],
-        Stroke::new(1.35, AXIS_FIRST),
+        Stroke::new(1.35, sketch_colours().axis_first),
     );
     painter.line_segment(
         [
             view.sketch_to_screen(rect, SketchPoint::new(0.0, min_v)),
             view.sketch_to_screen(rect, SketchPoint::new(0.0, max_v)),
         ],
-        Stroke::new(1.35, AXIS_SECOND),
+        Stroke::new(1.35, sketch_colours().axis_second),
     );
 
     let origin = view.sketch_to_screen(rect, SketchPoint::default());
@@ -9851,14 +9840,14 @@ fn paint_grid(
         Align2::CENTER_CENTER,
         axis_labels[0],
         FontId::monospace(10.0),
-        AXIS_FIRST,
+        sketch_colours().axis_first,
     );
     painter.text(
         axis_label_position(rect, v_direction, false),
         Align2::CENTER_CENTER,
         axis_labels[1],
         FontId::monospace(10.0),
-        AXIS_SECOND,
+        sketch_colours().axis_second,
     );
 }
 
@@ -10050,7 +10039,7 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
     // and each separately selectable region reads as its own patch. A pending
     // edit shows the live arrangement, so the standing tint stays out of it.
     if state.pending.is_none() {
-        let standing_fill = Color32::from_rgba_unmultiplied(18, 102, 189, 12);
+        let standing_fill = translucent(sketch_colours().region_fill, 12);
         for cell in &arrangement.cells {
             if state.analytic_regions.selected.contains(&cell.signature)
                 || state.analytic_regions.hovered.as_ref() == Some(&cell.signature)
@@ -10061,9 +10050,9 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
         }
     }
     let selected_fill = if state.pending.is_some() {
-        Color32::from_rgba_unmultiplied(23, 122, 67, 34)
+        translucent(sketch_colours().pending, 34)
     } else {
-        Color32::from_rgba_unmultiplied(18, 102, 189, 44)
+        translucent(sketch_colours().region_fill, 44)
     };
     for signature in &state.analytic_regions.selected {
         if let Some(cell) = arrangement.cell(signature) {
@@ -10079,7 +10068,7 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
             rect,
             state.view,
             cell,
-            Color32::from_rgba_unmultiplied(206, 128, 16, 42),
+            translucent(sketch_colours().region_hover, 42),
         );
     }
 }
@@ -10287,13 +10276,13 @@ fn paint_entities(
 ) {
     for entity in entities {
         let (color, width) = if Some(entity.id) == selected {
-            (SELECTED, 2.5)
+            (sketch_colours().selected, 2.5)
         } else if Some(entity.id) == hovered {
-            (HOVERED, 2.2)
+            (sketch_colours().hovered, 2.2)
         } else if entity.role == SketchEntityRole::Construction {
-            (Color32::from_rgb(122, 136, 154), 1.45)
+            (sketch_colours().construction, 1.45)
         } else {
-            (ENTITY, 1.7)
+            (sketch_colours().entity, 1.7)
         };
         let stroke = Stroke::new(width, color);
         if entity.role == SketchEntityRole::Construction {
@@ -10329,7 +10318,7 @@ fn paint_modifier_sources(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 rect,
                 state.view,
                 legacy_geometry_from_core(curve),
-                Stroke::new(3.1, SELECTED),
+                Stroke::new(3.1, sketch_colours().selected),
             );
         }
     }
@@ -10344,7 +10333,7 @@ fn paint_trim_hover(painter: &egui::Painter, rect: Rect, state: &SketchCanvasSta
         rect,
         state.view,
         legacy_geometry_from_core(fragment),
-        Stroke::new(3.4, TRIM_HOVER),
+        Stroke::new(3.4, sketch_colours().trim_hover),
     );
 }
 
@@ -10373,16 +10362,16 @@ fn paint_pending(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState)
                 rect,
                 state.view,
                 source.geometry,
-                Stroke::new(3.0, INVALID.gamma_multiply(0.72)),
+                Stroke::new(3.0, sketch_colours().invalid.gamma_multiply(0.72)),
             );
         }
     }
     for entity in pending.entities() {
         let geometry = entity.geometry;
         let color = if geometry.is_degenerate() {
-            INVALID
+            sketch_colours().invalid
         } else {
-            PENDING
+            sketch_colours().pending
         };
         if entity.role == SketchEntityRole::Construction {
             paint_dashed_geometry(painter, rect, state.view, geometry, Stroke::new(2.2, color));
@@ -10406,7 +10395,7 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         if state.exact_tool == ToolVariant::RectangularPattern {
             painter.line_segment(
                 [anchor_screen, pointer_screen],
-                Stroke::new(1.6, PENDING.gamma_multiply(0.82)),
+                Stroke::new(1.6, sketch_colours().pending.gamma_multiply(0.82)),
             );
             let delta_u = pointer.u - anchor.u;
             let delta_v = pointer.v - anchor.v;
@@ -10454,7 +10443,7 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
                         painter.circle_filled(
                             state.view.sketch_to_screen(rect, marker),
                             3.0,
-                            PENDING,
+                            sketch_colours().pending,
                         );
                     }
                 }
@@ -10465,11 +10454,11 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 painter.circle_stroke(
                     pointer_screen,
                     radius,
-                    Stroke::new(1.4, PENDING.gamma_multiply(0.72)),
+                    Stroke::new(1.4, sketch_colours().pending.gamma_multiply(0.72)),
                 );
                 painter.line_segment(
                     [pointer_screen, anchor_screen],
-                    Stroke::new(1.2, PENDING.gamma_multiply(0.72)),
+                    Stroke::new(1.2, sketch_colours().pending.gamma_multiply(0.72)),
                 );
                 let count = state.active_tool_number("count").unwrap_or(4.0) as u16;
                 let complete = state.active_tool_flag("full_circle").unwrap_or(true);
@@ -10494,14 +10483,18 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
                         seed_u.mul_add(angle.cos(), (-seed_v).mul_add(angle.sin(), pointer.u)),
                         seed_u.mul_add(angle.sin(), seed_v.mul_add(angle.cos(), pointer.v)),
                     );
-                    painter.circle_filled(state.view.sketch_to_screen(rect, marker), 3.0, PENDING);
+                    painter.circle_filled(
+                        state.view.sketch_to_screen(rect, marker),
+                        3.0,
+                        sketch_colours().pending,
+                    );
                 }
             }
         }
         let handle_fill = if manipulator.dragging {
-            SELECTED
+            sketch_colours().selected
         } else {
-            PENDING
+            sketch_colours().pending
         };
         painter.rect_filled(
             Rect::from_center_size(pointer_screen, Vec2::splat(9.0)),
@@ -10511,7 +10504,7 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         painter.rect_stroke(
             Rect::from_center_size(pointer_screen, Vec2::splat(13.0)),
             2.0,
-            Stroke::new(1.4, Color32::from_rgba_unmultiplied(60, 72, 86, 210)),
+            Stroke::new(1.4, translucent(sketch_colours().overlay_text, 210)),
             egui::StrokeKind::Outside,
         );
         paint_snap_marker(painter, rect, state);
@@ -10524,7 +10517,7 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 rect,
                 state.view,
                 SketchGeometry::segment(vertices[0], vertices[1]),
-                Stroke::new(2.1, PENDING),
+                Stroke::new(2.1, sketch_colours().pending),
             );
         }
         if state.polyline_current_segment_active
@@ -10539,18 +10532,22 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 rect,
                 state.view,
                 session.geometry,
-                Stroke::new(1.5, PENDING.gamma_multiply(0.72)),
+                Stroke::new(1.5, sketch_colours().pending.gamma_multiply(0.72)),
             );
         }
         if let Some(first) = state.polyline_vertices.first().copied() {
             painter.circle_stroke(
                 state.view.sketch_to_screen(rect, first),
                 5.0,
-                Stroke::new(1.5, PENDING),
+                Stroke::new(1.5, sketch_colours().pending),
             );
         }
         if let Some(last) = state.polyline_vertices.last().copied() {
-            painter.circle_filled(state.view.sketch_to_screen(rect, last), 3.5, PENDING);
+            painter.circle_filled(
+                state.view.sketch_to_screen(rect, last),
+                3.5,
+                sketch_colours().pending,
+            );
         }
         paint_snap_marker(painter, rect, state);
         return;
@@ -10558,17 +10555,25 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
     if let Some(geometries) = exact_creation_preview_geometries(state) {
         for geometry in geometries {
             let color = if geometry.is_degenerate() {
-                INVALID.gamma_multiply(0.82)
+                sketch_colours().invalid.gamma_multiply(0.82)
             } else {
-                PENDING.gamma_multiply(0.72)
+                sketch_colours().pending.gamma_multiply(0.72)
             };
             paint_geometry(painter, rect, state.view, geometry, Stroke::new(1.5, color));
         }
         if let Some(anchor) = state.creation_anchor {
-            painter.circle_filled(state.view.sketch_to_screen(rect, anchor), 3.5, PENDING);
+            painter.circle_filled(
+                state.view.sketch_to_screen(rect, anchor),
+                3.5,
+                sketch_colours().pending,
+            );
         }
         if let Some(second) = state.arc_start {
-            painter.circle_filled(state.view.sketch_to_screen(rect, second), 3.5, PENDING);
+            painter.circle_filled(
+                state.view.sketch_to_screen(rect, second),
+                3.5,
+                sketch_colours().pending,
+            );
         }
         paint_snap_marker(painter, rect, state);
         return;
@@ -10579,9 +10584,9 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         .filter(|session| session.target == DimensionTarget::Draft)
     {
         let color = if session.geometry.is_degenerate() {
-            INVALID.gamma_multiply(0.82)
+            sketch_colours().invalid.gamma_multiply(0.82)
         } else {
-            PENDING.gamma_multiply(0.72)
+            sketch_colours().pending.gamma_multiply(0.72)
         };
         let stroke = Stroke::new(1.5, color);
         if state.tool == SketchTool::CentreLine {
@@ -10590,7 +10595,11 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
             paint_geometry(painter, rect, state.view, session.geometry, stroke);
         }
         if let Some(anchor) = state.creation_anchor {
-            painter.circle_filled(state.view.sketch_to_screen(rect, anchor), 3.5, PENDING);
+            painter.circle_filled(
+                state.view.sketch_to_screen(rect, anchor),
+                3.5,
+                sketch_colours().pending,
+            );
         }
         paint_snap_marker(painter, rect, state);
         return;
@@ -10616,9 +10625,9 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         }
     };
     let color = if geometry.is_degenerate() {
-        INVALID.gamma_multiply(0.82)
+        sketch_colours().invalid.gamma_multiply(0.82)
     } else {
-        PENDING.gamma_multiply(0.72)
+        sketch_colours().pending.gamma_multiply(0.72)
     };
     let stroke = Stroke::new(1.5, color);
     if state.tool == SketchTool::CentreLine {
@@ -10627,7 +10636,7 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         paint_geometry(painter, rect, state.view, geometry, stroke);
     }
     let anchor_screen = state.view.sketch_to_screen(rect, anchor);
-    painter.circle_filled(anchor_screen, 3.5, PENDING);
+    painter.circle_filled(anchor_screen, 3.5, sketch_colours().pending);
     paint_snap_marker(painter, rect, state);
 }
 
@@ -10637,9 +10646,9 @@ fn paint_snap_marker(painter: &egui::Painter, rect: Rect, state: &SketchCanvasSt
     };
     let position = state.view.sketch_to_screen(rect, snap.point);
     let color = if snap.kind.is_support_reference() {
-        SNAP_SUPPORT
+        sketch_colours().snap_support
     } else {
-        SNAP
+        sketch_colours().snap
     };
     let stroke = Stroke::new(1.3, color);
     match snap.kind {
@@ -10801,7 +10810,7 @@ fn paint_overlay(
         Align2::LEFT_TOP,
         format!("{plane_label} · {instruction}"),
         FontId::monospace(10.0),
-        Color32::from_rgb(84, 96, 108),
+        sketch_colours().overlay_text,
     );
 
     let snap_label = state
@@ -10818,7 +10827,7 @@ fn paint_overlay(
         Align2::LEFT_TOP,
         format!("{snap_label} · {profile_label}"),
         FontId::monospace(10.0),
-        Color32::from_rgb(91, 102, 114),
+        sketch_colours().overlay_text,
     );
 }
 
@@ -10845,7 +10854,7 @@ struct DimensionWidgetLayout {
 /// rebuilds it the same way. Measuring whichever side happened to be picked
 /// would then show a line's length where the recipe says Width — so the
 /// composite is reassembled from every sibling the same authored operation
-/// owns, which is what the SELECTED FEATURE card is already describing.
+/// owns, which is what the sketch_colours().selected FEATURE card is already describing.
 fn dimension_target(state: &SketchCanvasState) -> Option<(SketchGeometry, u64)> {
     let selected = state.selected?;
     let entity = state.presented_entity(selected)?;
@@ -11331,7 +11340,7 @@ fn paint_dimension_arrowhead(painter: &egui::Painter, tip: Pos2, direction: Vec2
 
 fn paint_dimension_leaders(painter: &egui::Painter, layouts: &[DimensionWidgetLayout]) {
     for layout in layouts {
-        let stroke = Stroke::new(1.0, DIMENSION.gamma_multiply(0.72));
+        let stroke = Stroke::new(1.0, sketch_colours().dimension.gamma_multiply(0.72));
         // A span kind gets the drafted annotation. Everything else — an angle
         // about a vertex, a coordinate from an axis — keeps the plain leader,
         // because witness lines would be claiming a span that is not there.
@@ -11396,15 +11405,15 @@ fn show_dimension_widgets(
             ui.painter().rect(
                 layout.rect,
                 4.0,
-                DIMENSION_BACKGROUND,
+                sketch_colours().dimension_background,
                 Stroke::new(
                     if focused { 1.8 } else { 1.0 },
                     if error.is_some() {
-                        INVALID
+                        sketch_colours().invalid
                     } else if focused {
-                        SELECTED
+                        sketch_colours().selected
                     } else {
-                        DIMENSION
+                        sketch_colours().dimension
                     },
                 ),
                 egui::StrokeKind::Inside,
@@ -11418,9 +11427,9 @@ fn show_dimension_widgets(
                     .background_color(Color32::TRANSPARENT)
                     .font(FontId::monospace(11.0))
                     .text_color(if error.is_some() {
-                        INVALID
+                        sketch_colours().invalid
                     } else {
-                        DIMENSION_LOCKED
+                        sketch_colours().dimension_locked
                     }),
             );
             response.ctx.accesskit_node_builder(response.id, |node| {
@@ -11442,7 +11451,7 @@ fn show_dimension_widgets(
                     Align2::LEFT_TOP,
                     error,
                     FontId::monospace(9.0),
-                    INVALID,
+                    sketch_colours().invalid,
                 );
             }
             if response.has_focus() {
@@ -11484,9 +11493,9 @@ fn show_dimension_widgets(
                     .desired_width(layout.rect.width())
                     .font(FontId::monospace(11.0))
                     .text_color(if state.dimension_error().is_some() {
-                        INVALID
+                        sketch_colours().invalid
                     } else {
-                        DIMENSION_LOCKED
+                        sketch_colours().dimension_locked
                     }),
             );
             response.ctx.accesskit_node_builder(response.id, |node| {
@@ -11531,14 +11540,14 @@ fn show_dimension_widgets(
                 )
             });
             let color = if layout.readout.locked {
-                DIMENSION_LOCKED
+                sketch_colours().dimension_locked
             } else {
-                DIMENSION
+                sketch_colours().dimension
             };
             ui.painter().rect(
                 layout.rect,
                 4.0,
-                DIMENSION_BACKGROUND,
+                sketch_colours().dimension_background,
                 Stroke::new(1.0, color),
                 egui::StrokeKind::Inside,
             );
@@ -11679,7 +11688,7 @@ fn show_dimension_widgets(
                 Align2::LEFT_TOP,
                 error.label(),
                 FontId::monospace(9.0),
-                INVALID,
+                sketch_colours().invalid,
             );
         }
     }
@@ -12292,10 +12301,10 @@ mod tests {
         assert!(
             mesh.vertices
                 .iter()
-                .all(|vertex| vertex.color == CONTEXT_FACE)
+                .all(|vertex| vertex.color == sketch_colours().context_face)
         );
         assert_eq!(
-            CONTEXT_FACE.a(),
+            sketch_colours().context_face.a(),
             255,
             "a committed body must remain an opaque solid in face-sketch mode"
         );

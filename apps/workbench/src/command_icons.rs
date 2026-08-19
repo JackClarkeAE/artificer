@@ -51,6 +51,9 @@ pub enum CommandIcon {
     Rebuild,
     Material,
     Theme,
+    ThemeLight,
+    ThemeDark,
+    Palette,
     Visible,
     Hidden,
     Body,
@@ -436,6 +439,31 @@ impl IconPainter<'_> {
                     self.color,
                     Stroke::NONE,
                 ));
+            }
+            CommandIcon::ThemeLight => {
+                // A sun: disc and eight rays.
+                self.circle((0.50, 0.50), 0.20);
+                for index in 0..8 {
+                    let angle = TAU * index as f32 / 8.0;
+                    let (sin, cos) = angle.sin_cos();
+                    self.line(
+                        (0.50 + 0.30 * cos, 0.50 + 0.30 * sin),
+                        (0.50 + 0.42 * cos, 0.50 + 0.42 * sin),
+                    );
+                }
+            }
+            CommandIcon::ThemeDark => {
+                // A crescent: the disc, less a disc offset toward the corner.
+                self.circle((0.50, 0.50), 0.36);
+                self.arc((0.64, 0.40), 0.26, 0.0, TAU);
+            }
+            CommandIcon::Palette => {
+                // An artist's palette: the board, a thumb hole, three wells.
+                self.circle((0.50, 0.52), 0.38);
+                self.circle((0.62, 0.66), 0.07);
+                self.arc((0.34, 0.40), 0.06, 0.0, TAU);
+                self.arc((0.50, 0.30), 0.06, 0.0, TAU);
+                self.arc((0.66, 0.40), 0.06, 0.0, TAU);
             }
             CommandIcon::Material => {
                 self.circle((0.50, 0.50), 0.36);

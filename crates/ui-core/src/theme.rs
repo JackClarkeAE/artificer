@@ -9,6 +9,8 @@
 //! kernel or the model document.
 
 use egui::{Color32, FontId, RichText, Stroke};
+use serde::{Deserialize, Serialize};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -58,7 +60,120 @@ pub struct Palette {
     pub viewport_bottom: Color32,
     /// Whether egui should build its own widget defaults from a dark base.
     pub dark: bool,
+    /// The sketch canvas: ground, grid, strokes, and markers.
+    pub sketch: SketchColours,
 }
+
+/// Everything the sketch canvas paints. Kept as one block so the canvas can
+/// follow the chrome's theme and be recoloured from the same editor, while
+/// the canvas code still names its colours by role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SketchColours {
+    /// Canvas ground.
+    pub background: Color32,
+    /// Minor grid lines.
+    pub grid_minor: Color32,
+    /// Major grid lines.
+    pub grid_major: Color32,
+    /// Committed entity strokes.
+    pub entity: Color32,
+    /// Construction geometry: dashed, quieter than profile strokes.
+    pub construction: Color32,
+    /// The entity under the pointer.
+    pub hovered: Color32,
+    /// The selected entity, and a live (unconsumed) sketch's strokes.
+    pub selected: Color32,
+    /// A staged, not yet committed, candidate.
+    pub pending: Color32,
+    /// Geometry that cannot commit.
+    pub invalid: Color32,
+    /// The span Trim would remove.
+    pub trim_hover: Color32,
+    /// Snap markers on authored geometry.
+    pub snap: Color32,
+    /// Snap markers on the face-sketch support.
+    pub snap_support: Color32,
+    /// The sketch plane's first axis.
+    pub axis_first: Color32,
+    /// The sketch plane's second axis.
+    pub axis_second: Color32,
+    /// Dimension leaders, arrows, and text.
+    pub dimension: Color32,
+    /// A dimension that is driven by a typed value.
+    pub dimension_locked: Color32,
+    /// Fill behind dimension readouts.
+    pub dimension_background: Color32,
+    /// The host face of a face sketch.
+    pub context_face: Color32,
+    /// Edges of the host body behind a face sketch.
+    pub context_edge: Color32,
+    /// The selected face's boundary in a face sketch.
+    pub context_selected_boundary: Color32,
+    /// Fill of bounded profile cells; selected cells use it stronger.
+    pub region_fill: Color32,
+    /// Fill of the cell under the pointer.
+    pub region_hover: Color32,
+    /// Canvas overlay text: the plane prompt and the status line.
+    pub overlay_text: Color32,
+}
+
+/// The sketch colours that match the light chrome: a near-white ground, the
+/// same command blue for strokes, and the amber the selection always used.
+pub const LIGHT_SKETCH: SketchColours = SketchColours {
+    background: Color32::from_rgb(252, 253, 254),
+    grid_minor: Color32::from_rgb(228, 233, 239),
+    grid_major: Color32::from_rgb(206, 214, 223),
+    entity: Color32::from_rgb(36, 82, 148),
+    construction: Color32::from_rgb(122, 136, 154),
+    hovered: Color32::from_rgb(52, 148, 226),
+    selected: Color32::from_rgb(206, 128, 16),
+    pending: Color32::from_rgb(23, 122, 67),
+    invalid: Color32::from_rgb(189, 57, 52),
+    trim_hover: Color32::from_rgb(222, 104, 30),
+    snap: Color32::from_rgb(182, 136, 10),
+    snap_support: Color32::from_rgb(20, 132, 138),
+    axis_first: Color32::from_rgb(214, 69, 69),
+    axis_second: Color32::from_rgb(52, 158, 106),
+    dimension: Color32::from_rgb(24, 112, 172),
+    dimension_locked: Color32::from_rgb(23, 122, 67),
+    dimension_background: Color32::from_rgb(255, 255, 255),
+    context_face: Color32::from_rgb(226, 233, 240),
+    context_edge: Color32::from_rgba_unmultiplied_const(96, 116, 140, 185),
+    context_selected_boundary: Color32::from_rgb(18, 102, 189),
+    region_fill: Color32::from_rgb(18, 102, 189),
+    region_hover: Color32::from_rgb(206, 128, 16),
+    overlay_text: Color32::from_rgb(84, 96, 108),
+};
+
+/// The sketch colours that match the dark chrome. The ground sits between
+/// the viewport gradient's ends so the two workspaces read as one window,
+/// the grid is a step above it, and every stroke and marker is lifted until
+/// it carries on that ground.
+pub const DARK_SKETCH: SketchColours = SketchColours {
+    background: Color32::from_rgb(30, 35, 42),
+    grid_minor: Color32::from_rgb(40, 46, 55),
+    grid_major: Color32::from_rgb(54, 62, 73),
+    entity: Color32::from_rgb(142, 186, 236),
+    construction: Color32::from_rgb(132, 146, 164),
+    hovered: Color32::from_rgb(120, 196, 255),
+    selected: Color32::from_rgb(236, 168, 64),
+    pending: Color32::from_rgb(90, 196, 138),
+    invalid: Color32::from_rgb(233, 118, 111),
+    trim_hover: Color32::from_rgb(242, 142, 72),
+    snap: Color32::from_rgb(226, 184, 64),
+    snap_support: Color32::from_rgb(72, 194, 200),
+    axis_first: Color32::from_rgb(236, 98, 98),
+    axis_second: Color32::from_rgb(92, 204, 142),
+    dimension: Color32::from_rgb(124, 180, 236),
+    dimension_locked: Color32::from_rgb(90, 196, 138),
+    dimension_background: Color32::from_rgb(42, 48, 57),
+    context_face: Color32::from_rgb(46, 53, 62),
+    context_edge: Color32::from_rgba_unmultiplied_const(150, 168, 192, 185),
+    context_selected_boundary: Color32::from_rgb(93, 165, 240),
+    region_fill: Color32::from_rgb(93, 165, 240),
+    region_hover: Color32::from_rgb(225, 173, 88),
+    overlay_text: Color32::from_rgb(155, 167, 181),
+};
 
 /// The light professional-CAD chrome: near-white ribbon and panels, dark
 /// legible text, a restrained command-blue accent, and a pale blue-gray
@@ -83,6 +198,7 @@ pub const LIGHT: Palette = Palette {
     viewport_top: Color32::from_rgb(251, 252, 253),
     viewport_bottom: Color32::from_rgb(195, 206, 219),
     dark: false,
+    sketch: LIGHT_SKETCH,
 };
 
 /// The dark chrome. Not an inversion of the light one: the neutrals keep a
@@ -110,6 +226,7 @@ pub const DARK: Palette = Palette {
     viewport_top: Color32::from_rgb(46, 53, 62),
     viewport_bottom: Color32::from_rgb(20, 24, 29),
     dark: true,
+    sketch: DARK_SKETCH,
 };
 
 /// A theme the user can choose.
@@ -131,11 +248,26 @@ impl WorkbenchTheme {
         }
     }
 
+    /// The theme's built-in palette, before any user edits.
     #[must_use]
-    pub const fn palette(self) -> Palette {
+    pub const fn default_palette(self) -> Palette {
         match self {
             Self::Light => LIGHT,
             Self::Dark => DARK,
+        }
+    }
+
+    /// The theme's palette as currently in force: the built-in one, or the
+    /// user's edited copy.
+    #[must_use]
+    pub fn palette(self) -> Palette {
+        palette_for(self)
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Light => 0,
+            Self::Dark => 1,
         }
     }
 
@@ -171,16 +303,237 @@ pub fn active_theme() -> WorkbenchTheme {
 /// Chooses the theme. Callers must re-run [`install_style`] afterwards so the
 /// widget defaults egui derives from the palette are rebuilt too.
 pub fn set_active_theme(theme: WorkbenchTheme) {
-    let index = match theme {
-        WorkbenchTheme::Light => 0,
-        WorkbenchTheme::Dark => 1,
-    };
-    ACTIVE_THEME.store(index, Ordering::Relaxed);
+    ACTIVE_THEME.store(theme.index() as u8, Ordering::Relaxed);
 }
+
+/// The palette in force for each theme: the built-in values until the user
+/// edits a colour. Read on every paint call; an uncontended read lock on a
+/// `Copy` value is the price of letting colours change at run time.
+static PALETTES: RwLock<[Palette; 2]> = RwLock::new([LIGHT, DARK]);
 
 #[must_use]
 pub fn palette() -> Palette {
-    active_theme().palette()
+    palette_for(active_theme())
+}
+
+#[must_use]
+pub fn palette_for(theme: WorkbenchTheme) -> Palette {
+    PALETTES
+        .read()
+        .map_or(theme.default_palette(), |palettes| palettes[theme.index()])
+}
+
+/// Replaces one theme's palette. The change is visible to the next paint
+/// call; callers must re-run [`install_style`] when the active theme is the
+/// one edited so egui's derived widget defaults follow.
+pub fn set_palette(theme: WorkbenchTheme, palette: Palette) {
+    if let Ok(mut palettes) = PALETTES.write() {
+        palettes[theme.index()] = palette;
+    }
+}
+
+/// Restores one theme's built-in palette.
+pub fn reset_palette(theme: WorkbenchTheme) {
+    set_palette(theme, theme.default_palette());
+}
+
+/// Whether a theme's palette differs from its built-in values.
+#[must_use]
+pub fn palette_is_customised(theme: WorkbenchTheme) -> bool {
+    palette_for(theme) != theme.default_palette()
+}
+
+// ---------------------------------------------------------------------------
+// Persistence. Colours travel as RGBA bytes, so the file is plain to read and
+// hand-edit and does not depend on egui's own serialisation.
+// ---------------------------------------------------------------------------
+
+/// The theme choice and any edited palettes, as written to disk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemePreferences {
+    #[serde(default = "current_theme_preferences_version")]
+    pub version: u32,
+    pub active: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<PaletteRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dark: Option<PaletteRecord>,
+}
+
+pub const CURRENT_THEME_PREFERENCES_VERSION: u32 = 1;
+
+const fn current_theme_preferences_version() -> u32 {
+    CURRENT_THEME_PREFERENCES_VERSION
+}
+
+impl ThemePreferences {
+    /// Captures the theme in force and every palette that differs from its
+    /// built-in values.
+    #[must_use]
+    pub fn capture() -> Self {
+        let record = |theme: WorkbenchTheme| {
+            palette_is_customised(theme).then(|| PaletteRecord::from_palette(palette_for(theme)))
+        };
+        Self {
+            version: CURRENT_THEME_PREFERENCES_VERSION,
+            active: active_theme().label().to_owned(),
+            light: record(WorkbenchTheme::Light),
+            dark: record(WorkbenchTheme::Dark),
+        }
+    }
+
+    /// Installs the recorded theme and palettes. A palette the file does not
+    /// carry is the built-in one. Callers re-run [`install_style`] after.
+    pub fn apply(&self) {
+        for (theme, record) in [
+            (WorkbenchTheme::Light, &self.light),
+            (WorkbenchTheme::Dark, &self.dark),
+        ] {
+            set_palette(
+                theme,
+                record.as_ref().map_or(theme.default_palette(), |record| {
+                    record.to_palette(theme.default_palette())
+                }),
+            );
+        }
+        let active = WorkbenchTheme::ALL
+            .into_iter()
+            .find(|theme| theme.label().eq_ignore_ascii_case(&self.active))
+            .unwrap_or_default();
+        set_active_theme(active);
+    }
+}
+
+/// One palette as RGBA bytes per role. Every field is optional on the way
+/// in, so a file from an earlier release that lacks a newer role still
+/// applies; the missing role keeps the built-in value.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PaletteRecord {
+    pub chrome: std::collections::BTreeMap<String, [u8; 4]>,
+    pub sketch: std::collections::BTreeMap<String, [u8; 4]>,
+}
+
+fn rgba(color: Color32) -> [u8; 4] {
+    color.to_srgba_unmultiplied()
+}
+
+fn color(bytes: [u8; 4]) -> Color32 {
+    Color32::from_rgba_unmultiplied(bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+impl PaletteRecord {
+    #[must_use]
+    pub fn from_palette(palette: Palette) -> Self {
+        let mut record = Self::default();
+        for (name, value) in palette.chrome_roles() {
+            record.chrome.insert(name.to_owned(), rgba(value));
+        }
+        for (name, value) in palette.sketch.roles() {
+            record.sketch.insert(name.to_owned(), rgba(value));
+        }
+        record
+    }
+
+    /// The recorded colours laid over `base`.
+    #[must_use]
+    pub fn to_palette(&self, base: Palette) -> Palette {
+        let mut palette = base;
+        for (name, bytes) in &self.chrome {
+            if let Some(slot) = palette.chrome_role_mut(name) {
+                *slot = color(*bytes);
+            }
+        }
+        for (name, bytes) in &self.sketch {
+            if let Some(slot) = palette.sketch.role_mut(name) {
+                *slot = color(*bytes);
+            }
+        }
+        palette
+    }
+}
+
+macro_rules! colour_roles {
+    ($type:ty, $roles:ident, $role_mut:ident, [$($name:ident),* $(,)?]) => {
+        impl $type {
+            /// Every colour role by its stable name, in declaration order.
+            #[must_use]
+            pub fn $roles(&self) -> Vec<(&'static str, Color32)> {
+                vec![$((stringify!($name), self.$name)),*]
+            }
+
+            /// Mutable access to one colour role by its stable name.
+            pub fn $role_mut(&mut self, name: &str) -> Option<&mut Color32> {
+                match name {
+                    $(stringify!($name) => Some(&mut self.$name),)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+colour_roles!(
+    Palette,
+    chrome_roles,
+    chrome_role_mut,
+    [
+        bg,
+        panel,
+        card,
+        border,
+        text,
+        muted,
+        accent,
+        good,
+        warn,
+        bad,
+        ribbon_fill,
+        timeline_fill,
+        hover_fill,
+        active_fill,
+        selected_fill,
+        good_fill,
+        viewport_top,
+        viewport_bottom,
+    ]
+);
+
+colour_roles!(
+    SketchColours,
+    roles,
+    role_mut,
+    [
+        background,
+        grid_minor,
+        grid_major,
+        entity,
+        construction,
+        hovered,
+        selected,
+        pending,
+        invalid,
+        trim_hover,
+        snap,
+        snap_support,
+        axis_first,
+        axis_second,
+        dimension,
+        dimension_locked,
+        dimension_background,
+        context_face,
+        context_edge,
+        context_selected_boundary,
+        region_fill,
+        region_hover,
+        overlay_text,
+    ]
+);
+
+/// The sketch canvas colours of the theme in force.
+#[must_use]
+pub fn sketch() -> SketchColours {
+    palette().sketch
 }
 
 macro_rules! palette_accessors {
@@ -451,7 +804,7 @@ mod tests {
     #[test]
     fn chrome_text_meets_wcag_aa_contrast_in_every_theme() {
         for theme in WorkbenchTheme::ALL {
-            let palette = theme.palette();
+            let palette = theme.default_palette();
             for background in [
                 palette.bg,
                 palette.panel,
@@ -481,7 +834,7 @@ mod tests {
     #[test]
     fn state_colors_stay_legible_in_every_theme() {
         for theme in WorkbenchTheme::ALL {
-            let palette = theme.palette();
+            let palette = theme.default_palette();
             for state in [palette.good, palette.warn, palette.bad] {
                 assert!(
                     contrast_ratio(state, palette.panel) >= 3.0,
@@ -498,7 +851,7 @@ mod tests {
     #[test]
     fn every_theme_separates_its_chrome_surfaces() {
         for theme in WorkbenchTheme::ALL {
-            let palette = theme.palette();
+            let palette = theme.default_palette();
             for (name, first, second) in [
                 ("bg/panel", palette.bg, palette.panel),
                 ("panel/card", palette.panel, palette.card),
@@ -523,5 +876,81 @@ mod tests {
         set_active_theme(WorkbenchTheme::Light);
         assert_eq!(text(), LIGHT.text);
         assert!(!palette().dark);
+    }
+
+    /// The sketch canvas follows the chrome: its strokes must carry on its
+    /// ground in both themes, and the ground must sit with the viewport.
+    #[test]
+    fn sketch_strokes_carry_on_their_canvas_in_every_theme() {
+        for theme in WorkbenchTheme::ALL {
+            let palette = theme.default_palette();
+            let sketch = palette.sketch;
+            for (name, stroke) in [
+                ("entity", sketch.entity),
+                ("hovered", sketch.hovered),
+                ("selected", sketch.selected),
+                ("pending", sketch.pending),
+                ("invalid", sketch.invalid),
+                ("dimension", sketch.dimension),
+                ("overlay_text", sketch.overlay_text),
+                ("axis_first", sketch.axis_first),
+                ("axis_second", sketch.axis_second),
+            ] {
+                let ratio = contrast_ratio(stroke, sketch.background);
+                assert!(
+                    ratio >= 3.0,
+                    "{}: sketch {name} contrast {ratio:.2} on the canvas",
+                    theme.label()
+                );
+            }
+            assert_eq!(
+                relative_luminance(sketch.background) < 0.5,
+                palette.dark,
+                "{}: the canvas ground must be on the chrome's side of mid-grey",
+                theme.label()
+            );
+            assert!(
+                relative_luminance(sketch.grid_minor) != relative_luminance(sketch.background),
+                "{}: the grid must be visible",
+                theme.label()
+            );
+        }
+    }
+
+    #[test]
+    fn edited_palettes_round_trip_through_preferences_and_missing_roles_keep_defaults() {
+        let original = WorkbenchTheme::Dark.default_palette();
+        let mut edited = original;
+        edited.sketch.background = Color32::from_rgb(1, 2, 3);
+        edited.accent = Color32::from_rgb(200, 20, 20);
+        set_palette(WorkbenchTheme::Dark, edited);
+        assert!(palette_is_customised(WorkbenchTheme::Dark));
+        assert!(!palette_is_customised(WorkbenchTheme::Light));
+
+        let captured = ThemePreferences::capture();
+        assert!(captured.dark.is_some());
+        assert!(captured.light.is_none(), "an unedited theme is not written");
+        let json = serde_json::to_string(&captured).unwrap();
+
+        reset_palette(WorkbenchTheme::Dark);
+        assert_eq!(palette_for(WorkbenchTheme::Dark), original);
+        let restored: ThemePreferences = serde_json::from_str(&json).unwrap();
+        restored.apply();
+        assert_eq!(palette_for(WorkbenchTheme::Dark), edited);
+
+        // A file from an earlier release that names fewer roles, or one that
+        // names an unknown role, still applies what it has.
+        let mut sparse = captured.clone();
+        let record = sparse.dark.as_mut().unwrap();
+        record.sketch.retain(|name, _| name == "background");
+        record.chrome.clear();
+        record
+            .chrome
+            .insert("not_a_role".to_owned(), [9, 9, 9, 255]);
+        sparse.apply();
+        let applied = palette_for(WorkbenchTheme::Dark);
+        assert_eq!(applied.sketch.background, Color32::from_rgb(1, 2, 3));
+        assert_eq!(applied.accent, original.accent);
+        reset_palette(WorkbenchTheme::Dark);
     }
 }

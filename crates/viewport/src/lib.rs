@@ -3709,17 +3709,15 @@ fn paint_model_sketch_overlays(
                 }
             }
         }
-        let dark = artificer_ui_core::theme::palette().dark;
+        let sketch_colours = artificer_ui_core::theme::sketch();
         let color = if overlay.consumed {
-            // Lifted on a dark ground: the light theme's mid-blue has almost no
-            // separation from a dark viewport.
-            if dark {
-                Color32::from_rgb(150, 186, 220)
-            } else {
-                Color32::from_rgb(96, 128, 158)
-            }
+            // A consumed sketch is a record, not live geometry: its committed
+            // stroke colour, quietened.
+            sketch_colours.entity.gamma_multiply(0.75)
         } else {
-            Color32::from_rgb(206, 128, 16)
+            // A live sketch wears the same colour the canvas uses for what
+            // is selected, which is what it is: the profile Extrude will use.
+            sketch_colours.selected
         };
         // A halo that separates the line from whatever is behind it, so it has
         // to be the ground's colour rather than a fixed white. Hard-coded white
@@ -6177,14 +6175,16 @@ mod tests {
                     },
                 );
             harness.run();
+            // A live sketch wears the canvas's selection colour, whichever
+            // theme is in force.
+            let live = artificer_ui_core::theme::sketch().selected;
+            let near = |value: u8, target: u8| (i16::from(value) - i16::from(target)).abs() <= 14;
             harness
                 .render()
                 .expect("model overlay frame should render")
                 .pixels()
                 .filter(|pixel| {
-                    (195..=220).contains(&pixel[0])
-                        && (115..=145).contains(&pixel[1])
-                        && (5..=40).contains(&pixel[2])
+                    near(pixel[0], live.r()) && near(pixel[1], live.g()) && near(pixel[2], live.b())
                 })
                 .count()
         }

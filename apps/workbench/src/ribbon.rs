@@ -117,8 +117,7 @@ impl KernelLabApp {
         ui.spacing_mut().item_spacing.x = 1.0;
         for tab in RibbonTab::ALL {
             let selected = tab == active;
-            let switches_workspace = tab != RibbonTab::View;
-            let enabled = !switches_workspace || !operation_pending;
+            let enabled = !tab.switches_workspace() || !operation_pending;
             let response = ui.add_enabled(
                 enabled,
                 egui::Button::new(
@@ -165,7 +164,9 @@ impl KernelLabApp {
                         self.ribbon_tab = None;
                         self.enter_sketch_mode();
                     }
-                    RibbonTab::View => self.ribbon_tab = Some((self.workbench_mode, tab)),
+                    RibbonTab::View | RibbonTab::Theme => {
+                        self.ribbon_tab = Some((self.workbench_mode, tab));
+                    }
                 }
             }
         }
@@ -525,6 +526,9 @@ impl KernelLabApp {
             ModelCommand::ShowHistory => self.shell.visibility().feature_timeline,
             ModelCommand::ToggleOriginPlanes => self.show_origin_planes,
             ModelCommand::ToggleTheme => theme::active_theme() == theme::WorkbenchTheme::Dark,
+            ModelCommand::ThemeLight => theme::active_theme() == theme::WorkbenchTheme::Light,
+            ModelCommand::ThemeDark => theme::active_theme() == theme::WorkbenchTheme::Dark,
+            ModelCommand::ThemeColours => self.theme_editor_open,
             ModelCommand::PlayMotion => self.motion.playing,
             _ => false,
         }
@@ -725,7 +729,19 @@ impl KernelLabApp {
             | ModelCommand::ShowBrowser
             | ModelCommand::ShowHistory
             | ModelCommand::ToggleOriginPlanes
-            | ModelCommand::ToggleTheme => CommandAvailability::Enabled,
+            | ModelCommand::ToggleTheme
+            | ModelCommand::ThemeLight
+            | ModelCommand::ThemeDark
+            | ModelCommand::ThemeColours => CommandAvailability::Enabled,
+            ModelCommand::ThemeReset => {
+                if theme::palette_is_customised(theme::active_theme()) {
+                    CommandAvailability::Enabled
+                } else {
+                    CommandAvailability::disabled(
+                        "The active theme already has its built-in colours.",
+                    )
+                }
+            }
         }
     }
 
@@ -886,11 +902,16 @@ impl KernelLabApp {
             ModelCommand::ShowProperties => self.show_properties_tab(),
             ModelCommand::ShowHistory => self.shell.set_feature_timeline(true),
             ModelCommand::ToggleTheme => {
-                theme::set_active_theme(theme::active_theme().other());
-                // egui derives its own widget defaults from the palette, so the
-                // style has to be rebuilt before anything else paints.
-                theme::install_style(context);
-                context.request_repaint();
+                self.choose_theme(theme::active_theme().other(), context);
+            }
+            ModelCommand::ThemeLight => self.choose_theme(theme::WorkbenchTheme::Light, context),
+            ModelCommand::ThemeDark => self.choose_theme(theme::WorkbenchTheme::Dark, context),
+            ModelCommand::ThemeColours => {
+                self.theme_editor_open = !self.theme_editor_open;
+            }
+            ModelCommand::ThemeReset => {
+                theme::reset_palette(theme::active_theme());
+                self.theme_changed(context);
             }
             ModelCommand::FinishSketch => {
                 self.finish_sketch_now();

@@ -1072,8 +1072,15 @@ fn workbench_blank_document_keeps_its_first_committed_sketch_visible() {
 
     let image = harness.render().expect("model frame should render");
     let viewport = harness.get_by_label("Model viewport").rect();
-    // The unconsumed committed-sketch stroke colour.
-    let amber = pixels_near_colour(image.as_raw(), IMAGE_WIDTH, viewport, [206, 128, 16]);
+    // The unconsumed committed-sketch stroke colour is the canvas's selection
+    // colour, whichever theme is in force.
+    let live = artificer_workbench::theme::sketch().selected;
+    let amber = pixels_near_colour(
+        image.as_raw(),
+        IMAGE_WIDTH,
+        viewport,
+        [live.r(), live.g(), live.b()],
+    );
     assert!(
         amber > 200,
         "the committed circle must be drawn in the model viewport ({amber} amber pixels)"

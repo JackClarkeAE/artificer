@@ -46,6 +46,8 @@ cargo test --workspace --all-targets           # full test suite
 
 `pack-release.sh` needs the [`vpk`](https://docs.velopack.io) CLI, a .NET global tool: install the .NET 8 SDK, then `dotnet tool install -g vpk`.
 
+If test binaries start taking tens of seconds to *launch* on macOS (0 % CPU, stuck before the first test), the dev build's kept object files have piled up in `target/debug/deps` and Gatekeeper is scanning that directory before each start. Run `./scripts/prune-build-objects.sh` (or `cargo clean --profile dev`), and add your terminal or editor to System Settings → Privacy & Security → Developer Tools so locally built binaries skip the assessment altogether.
+
 ## How it fits together
 
 | Crate | What it holds |
