@@ -35,8 +35,9 @@ pub(crate) enum RimBlendError {
 
 /// A coaxial revolved solid as its (r, z) section.
 ///
-/// The chain is closed through the axis: both ends sit at `r = 0`, and the
-/// implicit axis segment joining them emits no face.
+/// The chain either closes through the axis — both ends sit at `r = 0`, and
+/// the implicit axis segment joining them emits no face — or, for a tube,
+/// closes on itself clear of the axis (`closed`).
 #[derive(Debug)]
 pub(crate) struct RzSection {
     center: Point3,
@@ -94,15 +95,16 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                     return Err(RimBlendError::DomainUnsupported);
                 }
                 let height = (plane.origin - center).dot(axis);
-                let radius = cap_radius(topology, &face.value)?;
-                // A cap is a full disk from the axis outward; its outward
-                // normal decides which way the section travels.
+                let (inner, outer) = cap_radii(topology, &face.value)?;
+                // A cap is a full disk from the axis outward, or an annulus
+                // between two rims; its outward normal decides which way the
+                // section travels.
                 let outward = plane.normal.dot(axis);
                 if outward >= 0.0 {
                     (
                         Segment::Line {
-                            start: Point2::new(radius, height),
-                            end: Point2::new(0.0, height),
+                            start: Point2::new(outer, height),
+                            end: Point2::new(inner, height),
                         },
                         face.value.role,
                         1,
@@ -110,8 +112,8 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 } else {
                     (
                         Segment::Line {
-                            start: Point2::new(0.0, height),
-                            end: Point2::new(radius, height),
+                            start: Point2::new(inner, height),
+                            end: Point2::new(outer, height),
                         },
                         face.value.role,
                         1,
@@ -258,7 +260,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
         segments.push((segment, role));
     }
 
-    let chained = chain_section(segments, agreement)?;
+    let (chained, closed) = chain_section(segments, agreement)?;
     let (segments, roles) = chained.into_iter().unzip();
     Ok(RzSection {
         center,
@@ -267,9 +269,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
         radial_v,
         segments,
         roles,
-        // Recovered sections always close through the axis: `chain_section`
-        // starts and ends on it.
-        closed: false,
+        closed,
     })
 }
 
@@ -320,14 +320,27 @@ fn on_axis(point: Point3, center: Point3, axis: Vector3, agreement: f64) -> bool
     (offset - axis * offset.dot(axis)).length() <= agreement
 }
 
-/// The outer radius of a full-disk cap face.
-fn cap_radius(topology: &Topology, face: &Face) -> Result<f64, RimBlendError> {
-    if !face.inner_loops.is_empty() {
-        // An annulus cap needs two section lines; v1 keeps to full disks.
-        return Err(RimBlendError::DomainUnsupported);
+/// The `(inner, outer)` radii of a cap face: `(0, r)` for a full disk, and
+/// the two rim radii for the washer face of a tube.
+fn cap_radii(topology: &Topology, face: &Face) -> Result<(f64, f64), RimBlendError> {
+    let outer = loop_circle_radius(topology, face.outer_loop)?;
+    match face.inner_loops.as_slice() {
+        [] => Ok((0.0, outer)),
+        [hole] => {
+            let inner = loop_circle_radius(topology, *hole)?;
+            if inner >= outer {
+                return Err(RimBlendError::DomainUnsupported);
+            }
+            Ok((inner, outer))
+        }
+        _ => Err(RimBlendError::DomainUnsupported),
     }
+}
+
+/// The radius of a loop made of one circle's coedges.
+fn loop_circle_radius(topology: &Topology, loop_key: LoopKey) -> Result<f64, RimBlendError> {
     let loop_record = topology
-        .loop_record(face.outer_loop)
+        .loop_record(loop_key)
         .ok_or(RimBlendError::DomainUnsupported)?;
     let mut radius: Option<f64> = None;
     for coedge_key in &loop_record.value.coedges {
@@ -417,26 +430,37 @@ fn segments_agree(first: Segment, second: Segment, agreement: f64) -> bool {
     }
 }
 
-/// Orders the section pieces into one chain running from the axis, around the
-/// profile, and back to the axis, oriented counter-clockwise in (r, z).
+/// Orders the section pieces into one chain, oriented counter-clockwise in
+/// (r, z). A solid's chain runs from the axis, around the profile, and back
+/// to the axis; a tube's touches the axis nowhere and closes on itself, which
+/// the returned flag reports.
 fn chain_section(
     mut pieces: Vec<(Segment, FaceRole)>,
     agreement: f64,
-) -> Result<Vec<(Segment, FaceRole)>, RimBlendError> {
+) -> Result<(Vec<(Segment, FaceRole)>, bool), RimBlendError> {
     if pieces.len() < 2 {
         return Err(RimBlendError::DomainUnsupported);
     }
     let same_point = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= agreement;
+    let touches_axis = |segment: &Segment| {
+        segment.start().x.abs() <= agreement || segment.end().x.abs() <= agreement
+    };
+    let closed = !pieces.iter().any(|(segment, _)| touches_axis(segment));
 
-    // Start from the piece whose start lies on the axis.
-    let start_index = pieces
-        .iter()
-        .position(|(segment, _)| segment.start().x.abs() <= agreement)
-        .ok_or(RimBlendError::DomainUnsupported)?;
+    // Start from the piece whose start lies on the axis; a tube may start
+    // anywhere.
+    let start_index = if closed {
+        0
+    } else {
+        pieces
+            .iter()
+            .position(|(segment, _)| segment.start().x.abs() <= agreement)
+            .ok_or(RimBlendError::DomainUnsupported)?
+    };
     let mut chain = vec![pieces.remove(start_index)];
     while !pieces.is_empty() {
         let tail = chain.last().expect("chain is never empty").0.end();
-        if tail.x.abs() <= agreement {
+        if !closed && tail.x.abs() <= agreement {
             break;
         }
         let next = pieces
@@ -459,18 +483,24 @@ fn chain_section(
     if !pieces.is_empty() {
         return Err(RimBlendError::DomainUnsupported);
     }
-    if chain.last().expect("chain is never empty").0.end().x.abs() > agreement {
+    let tail = chain.last().expect("chain is never empty").0.end();
+    let head = chain.first().expect("chain is never empty").0.start();
+    if closed {
+        if !same_point(tail, head) {
+            return Err(RimBlendError::DomainUnsupported);
+        }
+    } else if tail.x.abs() > agreement {
         return Err(RimBlendError::DomainUnsupported);
     }
-    // Orient counter-clockwise: the closed section (through the axis) must
-    // have positive signed area with r as x and z as y.
+    // Orient counter-clockwise: the closed section (through the axis, or on
+    // itself) must have positive signed area with r as x and z as y.
     if section_signed_area(&chain) < 0.0 {
         chain.reverse();
         for entry in &mut chain {
             entry.0 = reversed(entry.0);
         }
     }
-    Ok(chain)
+    Ok((chain, closed))
 }
 
 fn reversed(segment: Segment) -> Segment {
@@ -566,7 +596,7 @@ pub(crate) fn build_rim_blend(
                     && (segment.start().y - height).abs() <= agreement
             })
             .ok_or(RimBlendError::DomainUnsupported)?;
-        if located == 0 {
+        if located == 0 && !section.closed {
             // The first section vertex sits on the axis, not on a rim.
             return Err(RimBlendError::DomainUnsupported);
         }
@@ -611,16 +641,19 @@ fn blend_section(
     let mut consumed = vec![false; count];
     let mut connectors: Vec<(usize, Segment)> = Vec::with_capacity(vertices.len());
     for vertex in vertices {
-        if *vertex == 0 || *vertex >= count {
+        if (*vertex == 0 && !section.closed) || *vertex >= count {
             return Err(RimBlendError::DomainUnsupported);
         }
-        let incoming = section.segments[*vertex - 1];
+        // A tube's chain is cyclic: the rim at its first vertex is the corner
+        // between the last segment and the first.
+        let incoming_index = if *vertex == 0 { count - 1 } else { *vertex - 1 };
+        let incoming = section.segments[incoming_index];
         let outgoing = section.segments[*vertex];
         let blend = corner_blend(incoming, outgoing, kind, distance, &probe, precision)
             .map_err(map_corner_error)?;
-        new_end[*vertex - 1] = Some(blend.trimmed_incoming.end());
+        new_end[incoming_index] = Some(blend.trimmed_incoming.end());
         new_start[*vertex] = Some(blend.trimmed_outgoing.start());
-        consumed[*vertex - 1] |= blend.consumed.incoming;
+        consumed[incoming_index] |= blend.consumed.incoming;
         consumed[*vertex] |= blend.consumed.outgoing;
         connectors.push((*vertex, blend.connector));
     }
@@ -679,13 +712,14 @@ fn blend_section(
     Ok((segments, roles))
 }
 
-/// The section closed through the axis, for material queries.
+/// The section closed through the axis, for material queries. A tube's
+/// section already meets itself, so it gains no closing chord.
 fn closed_section_loop(section: &RzSection) -> Vec<Segment> {
     let mut closed = section.segments.clone();
     if let (Some(first), Some(last)) = (section.segments.first(), section.segments.last()) {
         let start = last.end();
         let end = first.start();
-        if (start.x - end.x).hypot(start.y - end.y) > 0.0 {
+        if (start.x - end.x).hypot(start.y - end.y) > axis_agreement(section) {
             closed.push(Segment::Line { start, end });
         }
     }

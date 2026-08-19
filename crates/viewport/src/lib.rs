@@ -426,6 +426,40 @@ impl ModelSketchOverlay {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
+
+    /// World-space extent of the overlay's own lines and points. A reference
+    /// plane's corners are reported by the shell separately.
+    #[must_use]
+    pub fn bounds(&self) -> Option<Aabb3> {
+        let mut points = self
+            .points
+            .iter()
+            .copied()
+            .chain(self.segments.iter().flat_map(|segment| *segment))
+            .filter(|point| point.is_finite());
+        let first = points.next()?;
+        let mut min = first;
+        let mut max = first;
+        for point in points {
+            min.x = min.x.min(point.x);
+            min.y = min.y.min(point.y);
+            min.z = min.z.min(point.z);
+            max.x = max.x.max(point.x);
+            max.y = max.y.max(point.y);
+            max.z = max.z.max(point.z);
+        }
+        Some(Aabb3::new(min, max))
+    }
+}
+
+/// The union of every overlay's extent, for scenes whose only geometry is a
+/// committed sketch.
+#[must_use]
+pub fn sketch_overlay_bounds(overlays: &[ModelSketchOverlay]) -> Option<Aabb3> {
+    overlays
+        .iter()
+        .filter_map(ModelSketchOverlay::bounds)
+        .reduce(union_bounds)
 }
 
 /// Stable renderer-side identity for one body occurrence in a document.
@@ -1380,8 +1414,13 @@ fn show_document_impl(
 
     // Per-body committed poses make snapshot-local aggregate bounds stale.
     // Prefer occurrence-aware bounds whenever display geometry is available;
-    // retain the reported value only as a legacy/empty-scene fallback.
-    let bounds = document_scene_bounds(bodies).or(reported_bounds);
+    // retain the reported value only as a legacy/empty-scene fallback. A
+    // committed sketch with no solid yet is display geometry too: without it
+    // the first sketch of a blank document vanished behind the placeholder
+    // the moment its origin planes retired.
+    let bounds = document_scene_bounds(bodies)
+        .or(reported_bounds)
+        .or_else(|| sketch_overlay_bounds(sketch_overlays));
     let Some(bounds) = bounds else {
         painter.text(
             canvas.rect.center(),

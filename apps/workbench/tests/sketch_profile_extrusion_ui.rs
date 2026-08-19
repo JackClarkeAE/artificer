@@ -281,3 +281,70 @@ fn explicit_finish_chain_commits_one_atomic_polyline() {
     assert_eq!(harness.state().sketch_entity_count(), 2);
     assert_eq!(harness.state().sketch_revision(), 1);
 }
+
+#[test]
+fn a_circle_resting_on_a_square_side_still_offers_the_disc_to_extrude() {
+    // With grid snap on, "a circle inside a square" lands tangent to a side
+    // more often than not. That used to void every region: nothing filled,
+    // Extrude greyed out. Now it is two profiles, and Extrude hands the
+    // canvas to Select so the click that picks one cannot start a new stroke.
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, -2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 2.0));
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(-1.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, 0.0));
+
+    assert_eq!(harness.state().sketch_entity_count(), 2);
+    assert_eq!(harness.state().available_sketch_region_count(), 2);
+    // The square's selection survives as the surround, which the tangent
+    // point pinches into a loop no solid can be built from — and the tool is
+    // still Circle, so Extrude must not simply refuse.
+    assert_eq!(harness.state().sketch_tool_label(), "Circle");
+    assert_eq!(
+        harness.state().sketch_extrusion_eligibility(),
+        SketchExtrusionEligibility::PinchedRegion
+    );
+    assert!(
+        !harness
+            .get_by_role_and_label(Role::Button, "Extrude")
+            .accesskit_node()
+            .is_disabled(),
+        "Extrude stays live so it can ask for the profile"
+    );
+    click_button(&mut harness, "Extrude");
+    assert_eq!(harness.state().pending_operation_label(), None);
+    assert_eq!(harness.state().sketch_tool_label(), "Select");
+
+    click_sketch_point(&mut harness, SketchPoint::new(-1.0, 0.0));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+    let volume = extrude_and_measure(&mut harness);
+    assert!(
+        (volume - 4.0 * std::f64::consts::PI).abs() <= 1.0e-9,
+        "{volume}"
+    );
+}
+
+#[test]
+fn an_inscribed_circle_leaves_four_corner_profiles_and_the_disc() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, -2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 2.0));
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 0.0));
+
+    assert_eq!(harness.state().available_sketch_region_count(), 5);
+    click_button(&mut harness, "Select sketch geometry");
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+    let volume = extrude_and_measure(&mut harness);
+    assert!(
+        (volume - 16.0 * std::f64::consts::PI).abs() <= 1.0e-9,
+        "{volume}"
+    );
+}

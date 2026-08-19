@@ -30,6 +30,11 @@ pub enum ProfileCompileError {
     MissingRegion { signature: RegionSignature },
     #[error("selected cell union left an open or branching boundary")]
     OpenOrBranchingBoundary,
+    /// The material touches itself at a point: a circle resting on a side, or
+    /// cells that meet only at a corner. A face boundary that returns to the
+    /// same junction is not a simple loop, so the kernel never sees it.
+    #[error("selected cell union touches itself at a point")]
+    PinchedBoundary,
     #[error("selected cell union produced a zero-area boundary")]
     ZeroAreaBoundary,
     #[error("a clockwise boundary was not contained by any material outer loop")]
@@ -189,8 +194,8 @@ fn stitch_boundary_loops(
             .push(directed.key.clone());
         ordinary.insert(directed.key.clone(), directed);
     }
-    if outgoing.values().any(|outputs| outputs.len() != 1) {
-        return Err(ProfileCompileError::OpenOrBranchingBoundary);
+    if outgoing.values().any(|outputs| outputs.len() > 1) {
+        return Err(ProfileCompileError::PinchedBoundary);
     }
     for outputs in outgoing.values_mut() {
         outputs.sort();
@@ -403,5 +408,110 @@ mod tests {
         let compiled = compile_selected_profile(&arrangement, &selected, &precision).unwrap();
         assert_eq!(compiled.profile.regions.len(), 1);
         assert_eq!(compiled.profile.curve_count(), 6);
+    }
+
+    #[test]
+    fn both_halves_of_a_chord_split_disc_compile_to_the_whole_disc() {
+        // The chord cancels; the two arcs are different fragments of the
+        // same circle and must both survive, not cancel each other.
+        let precision = PrecisionPolicy::default();
+        let curves = [
+            ArrangementInputCurve::circle(
+                eid(1),
+                SketchPoint2::new(0.0, 0.0),
+                2.0,
+                CurveDirection::CounterClockwise,
+            ),
+            ArrangementInputCurve::line(
+                eid(2),
+                pid(1),
+                pid(2),
+                SketchPoint2::new(-3.0, 0.5),
+                SketchPoint2::new(3.0, 0.5),
+            ),
+        ];
+        let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        let selected: Vec<_> = arrangement
+            .cells
+            .iter()
+            .map(|cell| cell.signature.clone())
+            .collect();
+        let compiled = compile_selected_profile(&arrangement, &selected, &precision).unwrap();
+        assert_eq!(compiled.profile.regions.len(), 1);
+        assert_eq!(compiled.profile.curve_count(), 2);
+        assert!(compiled.profile.regions[0].holes.is_empty());
+        let area: f64 = compiled.profile.regions[0]
+            .outer
+            .curves
+            .iter()
+            .map(|curve| match *curve {
+                artificer_protocol::PlanarCurve2::CircularArc {
+                    center,
+                    start,
+                    end,
+                    direction,
+                } => EvaluatedCurve2::CircularArc {
+                    center: SketchPoint2::new(center.x, center.y),
+                    start: SketchPoint2::new(start.x, start.y),
+                    end: SketchPoint2::new(end.x, end.y),
+                    direction: match direction {
+                        artificer_protocol::ArcDirection::CounterClockwise => {
+                            CurveDirection::CounterClockwise
+                        }
+                        artificer_protocol::ArcDirection::Clockwise => CurveDirection::Clockwise,
+                    },
+                }
+                .signed_area_contribution(),
+                _ => panic!("the disc is bounded by arcs alone"),
+            })
+            .sum();
+        assert!((area - 4.0 * std::f64::consts::PI).abs() < 1.0e-9, "{area}");
+    }
+
+    #[test]
+    fn a_compiled_cell_chains_bit_exactly_where_an_arc_meets_a_line() {
+        // The kernel reads a loop whose uses do not share endpoint bits as
+        // open. An arc endpoint is trigonometry and a line's is arithmetic;
+        // both must land on the junction's one point.
+        let precision = PrecisionPolicy::default();
+        let curves = [
+            ArrangementInputCurve::circle(
+                eid(1),
+                SketchPoint2::new(0.3, -0.7),
+                2.0,
+                CurveDirection::CounterClockwise,
+            ),
+            ArrangementInputCurve::line(
+                eid(2),
+                pid(1),
+                pid(2),
+                SketchPoint2::new(-3.0, 0.5),
+                SketchPoint2::new(3.0, 0.1),
+            ),
+        ];
+        let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        for cell in &arrangement.cells {
+            let compiled = compile_selected_profile(
+                &arrangement,
+                std::slice::from_ref(&cell.signature),
+                &precision,
+            )
+            .unwrap();
+            let loop_curves = &compiled.profile.regions[0].outer.curves;
+            assert_eq!(loop_curves.len(), 2);
+            let endpoints = |curve: &artificer_protocol::PlanarCurve2| match *curve {
+                artificer_protocol::PlanarCurve2::Line { start, end }
+                | artificer_protocol::PlanarCurve2::CircularArc { start, end, .. } => (start, end),
+                artificer_protocol::PlanarCurve2::Circle { .. } => panic!("no full circles here"),
+            };
+            for index in 0..loop_curves.len() {
+                let (_, end) = endpoints(&loop_curves[index]);
+                let (next_start, _) = endpoints(&loop_curves[(index + 1) % loop_curves.len()]);
+                assert_eq!(end.x.to_bits(), next_start.x.to_bits());
+                assert_eq!(end.y.to_bits(), next_start.y.to_bits());
+            }
+        }
     }
 }

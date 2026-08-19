@@ -1008,3 +1008,74 @@ fn workbench_sketch_self_intersection_snapshot() {
     harness.run();
     harness.snapshot("workbench_sketch_self_intersection");
 }
+
+fn blank_harness() -> Harness<'static, KernelLabApp> {
+    Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .with_theme(egui::Theme::Dark)
+        .with_os(egui::os::OperatingSystem::Nix)
+        .wgpu()
+        .build_eframe(|creation_context| KernelLabApp::new_paused_blank(creation_context))
+}
+
+/// Pixels in `rect` within a small distance of `target`.
+fn pixels_near_colour(
+    image: &[u8],
+    image_width: usize,
+    rect: egui::Rect,
+    target: [u8; 3],
+) -> usize {
+    let image_height = image.len() / 4 / image_width;
+    let min_x = rect.min.x.floor().max(0.0) as usize;
+    let min_y = rect.min.y.floor().max(0.0) as usize;
+    let max_x = rect.max.x.ceil().min(image_width as f32) as usize;
+    let max_y = rect.max.y.ceil().min(image_height as f32) as usize;
+    let mut count = 0;
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let index = (y * image_width + x) * 4;
+            let close = (0..3).all(|channel| {
+                (i32::from(image[index + channel]) - i32::from(target[channel])).abs() <= 24
+            });
+            if close {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn workbench_blank_document_keeps_its_first_committed_sketch_visible() {
+    // Production starts blank: reference planes, no solid. Committing the
+    // first sketch retires the planes, and with no body either the renderer
+    // used to decide there was nothing to look at and paint a placeholder
+    // over the sketch it had just been handed.
+    let mut harness = blank_harness();
+    enter_xy_sketch(&mut harness);
+    commit_circle(
+        &mut harness,
+        SketchPoint::new(0.0, 0.0),
+        SketchPoint::new(6.0, 0.0),
+    );
+    click_button(&mut harness, "Finish sketch");
+    assert!(harness.state().sketch_finished());
+    assert_eq!(harness.state().displayed_snapshot_id(), None);
+    assert_eq!(harness.state().visible_model_sketch_overlay_count(), 1);
+    // The sketch is what there is; Frame must find it, not fall back to a
+    // camera radius sized for planes that are no longer shown.
+    click_button(&mut harness, "Frame all visible bodies");
+    harness.remove_cursor();
+    harness.run();
+
+    let image = harness.render().expect("model frame should render");
+    let viewport = harness.get_by_label("Model viewport").rect();
+    // The unconsumed committed-sketch stroke colour.
+    let amber = pixels_near_colour(image.as_raw(), IMAGE_WIDTH, viewport, [206, 128, 16]);
+    assert!(
+        amber > 200,
+        "the committed circle must be drawn in the model viewport ({amber} amber pixels)"
+    );
+}

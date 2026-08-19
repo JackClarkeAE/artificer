@@ -530,13 +530,15 @@ The evaluated profile-role curves are compiled into a bounded analytic arrangeme
 3. Classify intersections and collect bounded split events.
 4. Split curves into exact analytic fragments at canonical junctions.
 5. Build directed half-edges and twins.
-6. Sort outgoing half-edges by certified tangent direction.
+6. Sort outgoing half-edges by certified tangent direction, breaking a tie between tangent departures by signed curvature (left-bending after straight after right-bending), so a tangent contact is an ordinary junction rather than an ambiguity.
 7. Walk bounded cells with a DCEL-style rotation system.
-8. accept ordinary shared endpoints—including the G1 rail/cap and fillet joins—while rejecting zero-area cells, coincident overlap, loop-to-loop kissing, ambiguous interior tangency, or numerically indeterminate ordering with typed diagnostics;
+8. accept ordinary shared endpoints—including the G1 rail/cap and fillet joins—and interior tangencies (a circle resting on a side splits both carriers there, and pinches the surround into a loop that may visit that junction twice), while rejecting zero-area cells, coincident overlap, loop-to-loop kissing at authored endpoints, or numerically indeterminate ordering with typed diagnostics;
 9. canonicalize every cell into a stable `RegionSignature`; and
 10. cache the arrangement by sketch revision and dirty-curve set.
 
 Open or dangling profile geometry does not suppress an unrelated valid bounded cell. A T-junction splits its carrier and may leave a dangling half-edge; it is not confused with an invalid kissing loop. Construction and reference curves are excluded from cell formation. Crossing profile curves may form several selectable cells even before the source curves are physically trimmed.
+
+Every bounded cell is separately selectable by a click inside it with the Select family of tools (Shift-click adds), and every cell wears a faint standing tint on the canvas so a closed profile is visible before it is hovered or picked; the hovered cell tints amber and selected cells tint stronger. A lone cell selects itself. Extrude pressed with cells present but none usable hands the canvas to Select rather than refusing.
 
 Junction identity is semantic rather than coordinate-hash based:
 
@@ -548,9 +550,14 @@ JunctionKey =
         second_entity: max(SketchEntityId),
         branch: IntersectionBranch,
     }
+  | PeriodicSplit { source_entity }   -- the antipode a circle with exactly one
+                                       -- junction receives, so it still yields
+                                       -- two non-degenerate arc fragments
 
 JunctionClusterKey = canonical sorted set of coincident JunctionKey values
 ```
+
+Every fragment ends on its junction's one point: an evaluated arc endpoint is trigonometry and a line's is arithmetic, and the kernel reads a profile whose uses do not chain bit-exactly as open. Fragments of a circle also carry the sense in which they run round it, because two junctions cut a circle into two arcs with the same endpoint pair; a signature written before that field existed still resolves through a sense-agnostic comparison.
 
 `IntersectionBranch` is the deterministic analytic solution order after canonical operand ordering and parameter normalization; it is not the order returned by a floating-point solver. A multi-curve junction uses the complete cluster key. After an upstream edit, operation provenance first remaps source entity IDs, then the intersection is recomputed and the same branch key is resolved. Missing, changed-multiplicity, one-to-many, or coincident-overlap outcomes are `Missing` or `Ambiguous`; no nearest-coordinate fallback silently retargets a feature.
 

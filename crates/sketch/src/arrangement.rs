@@ -8,9 +8,8 @@ use artificer_protocol::PrecisionPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CurveDirection, CurveGeometryError, CurveIntersections, EvaluatedCurve2, IntersectionClass,
-    JunctionClusterKey, JunctionKey, SketchEntityId, SketchPoint2, SketchPointId,
-    intersect_entities,
+    CurveDirection, CurveGeometryError, CurveIntersections, EvaluatedCurve2, JunctionClusterKey,
+    JunctionKey, SketchEntityId, SketchPoint2, SketchPointId, intersect_entities,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -128,6 +127,14 @@ pub struct FragmentKey {
     pub start: FragmentEndpointKey,
     pub end: FragmentEndpointKey,
     pub direction: FragmentDirection,
+    /// Which way round its carrier a fragment of a *circle* runs. Two
+    /// junctions cut a circle into two arcs with the same endpoints; without
+    /// this the second arc's key was the first arc's reversal, so the pair
+    /// cancelled as a shared boundary and read as a dangling bridge. Straight
+    /// and open-arc fragments cannot repeat an endpoint pair and carry `None`,
+    /// as does the seam key of an unsplit circle, so their keys are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sense: Option<CurveDirection>,
 }
 
 impl FragmentKey {
@@ -138,6 +145,19 @@ impl FragmentKey {
             start: self.end.clone(),
             end: self.start.clone(),
             direction: self.direction.reversed(),
+            sense: self.sense.map(|sense| match sense {
+                CurveDirection::CounterClockwise => CurveDirection::Clockwise,
+                CurveDirection::Clockwise => CurveDirection::CounterClockwise,
+            }),
+        }
+    }
+
+    /// The key as written before `sense` existed. Signatures persisted by
+    /// earlier releases resolve through this view.
+    fn without_sense(&self) -> Self {
+        Self {
+            sense: None,
+            ..self.clone()
         }
     }
 }
@@ -182,6 +202,19 @@ pub struct RegionSignature {
     pub holes: Vec<Vec<FragmentKey>>,
 }
 
+impl RegionSignature {
+    fn without_sense(&self) -> Self {
+        Self {
+            outer: self.outer.iter().map(FragmentKey::without_sense).collect(),
+            holes: self
+                .holes
+                .iter()
+                .map(|hole| hole.iter().map(FragmentKey::without_sense).collect())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArrangementLoop {
     pub half_edges: Vec<usize>,
@@ -208,9 +241,30 @@ pub struct SketchArrangement {
 }
 
 impl SketchArrangement {
+    /// Resolves a signature to its cell. A signature written before circle
+    /// fragments carried [`FragmentKey::sense`] still names one cell: with the
+    /// sense stripped from both sides the earlier scheme was unambiguous
+    /// within any one loop, so that comparison is tried when the exact one
+    /// finds nothing.
     #[must_use]
     pub fn cell(&self, signature: &RegionSignature) -> Option<&ArrangementCell> {
-        self.cells.iter().find(|cell| &cell.signature == signature)
+        self.cells
+            .iter()
+            .find(|cell| &cell.signature == signature)
+            .or_else(|| {
+                if signature.outer.iter().any(|key| key.sense.is_some())
+                    || signature
+                        .holes
+                        .iter()
+                        .flatten()
+                        .any(|key| key.sense.is_some())
+                {
+                    return None;
+                }
+                self.cells
+                    .iter()
+                    .find(|cell| &cell.signature.without_sense() == signature)
+            })
     }
 
     /// Resolves the minimal bounded cell containing a sketch-plane point.
@@ -254,10 +308,6 @@ pub enum ArrangementDiagnostic {
         entity: SketchEntityId,
     },
     CoincidentOrOverlapping {
-        first: SketchEntityId,
-        second: SketchEntityId,
-    },
-    InteriorTangency {
         first: SketchEntityId,
         second: SketchEntityId,
     },
@@ -430,19 +480,11 @@ pub fn build_arrangement_with_pool(
                             canonical_event.first_parameter,
                         )
                     };
-                    let at_explicit_shared_endpoint =
-                        canonical_event.class == IntersectionClass::EndpointEndpoint;
-                    if canonical_event.is_tangent && !at_explicit_shared_endpoint {
-                        arrangement
-                            .diagnostics
-                            .push(ArrangementDiagnostic::InteriorTangency {
-                                first: first.entity.min(second.entity),
-                                second: first.entity.max(second.entity),
-                            });
-                        invalid_curves.insert(first_index);
-                        invalid_curves.insert(second_index);
-                        continue;
-                    }
+                    // A tangent contact is an ordinary junction: both curves
+                    // split there, and `link_half_edges` orders the parallel
+                    // departures by curvature. A circle resting on a square's
+                    // side therefore yields the disc and the surrounding cell
+                    // instead of no cells at all.
                     raw_events.push(RawEvent {
                         curve_index: first_index,
                         parameter: first_parameter,
@@ -494,7 +536,7 @@ pub fn build_arrangement_with_pool(
     raw_events.retain(|event| {
         !invalid_curves.contains(&event.curve_index)
             && match &event.key {
-                JunctionKey::Endpoint(_) => true,
+                JunctionKey::Endpoint(_) | JunctionKey::PeriodicSplit { .. } => true,
                 JunctionKey::Intersection {
                     first_entity,
                     second_entity,
@@ -531,6 +573,12 @@ pub fn build_arrangement_with_pool(
                 && first.junction == second.junction
         });
     }
+    split_single_junction_circles(
+        curves,
+        &invalid_curves,
+        &mut events_by_curve,
+        &mut arrangement,
+    );
 
     let mut unsplit_circles = Vec::new();
     for (curve_index, input) in curves.iter().enumerate() {
@@ -581,6 +629,7 @@ pub fn build_arrangement_with_pool(
             start: seam.clone(),
             end: seam,
             direction: FragmentDirection::Forward,
+            sense: None,
         };
         let curve = match input.curve {
             EvaluatedCurve2::Circle {
@@ -650,6 +699,45 @@ fn broad_phase_pairs(
             })
     });
     pairs
+}
+
+/// A circle carrying exactly one junction — a line ending on its rim, or a
+/// side it rests against — cannot become fragments on its own: one split of
+/// a closed curve is a full-turn arc, which is degenerate. Give it a second,
+/// synthetic junction at the antipode of the real one so it splits into two
+/// half-turn arcs and the disc stays a bounded cell.
+fn split_single_junction_circles(
+    curves: &[ArrangementInputCurve],
+    invalid_curves: &BTreeSet<usize>,
+    events_by_curve: &mut [Vec<CurveEvent>],
+    arrangement: &mut SketchArrangement,
+) {
+    for (curve_index, input) in curves.iter().enumerate() {
+        if invalid_curves.contains(&curve_index) || !input.curve.is_periodic() {
+            continue;
+        }
+        let [only] = events_by_curve[curve_index].as_slice() else {
+            continue;
+        };
+        let parameter = (only.parameter + 0.5).rem_euclid(1.0);
+        let Ok(point) = input.curve.evaluate(parameter) else {
+            continue;
+        };
+        let key = JunctionClusterKey::new(vec![JunctionKey::PeriodicSplit {
+            source_entity: input.entity,
+        }])
+        .expect("one key is a non-empty cluster");
+        let junction = arrangement.junctions.len();
+        arrangement
+            .junctions
+            .push(ArrangementJunction { key, point });
+        let events = &mut events_by_curve[curve_index];
+        events.push(CurveEvent {
+            parameter,
+            junction,
+        });
+        events.sort_by(|first, second| first.parameter.total_cmp(&second.parameter));
+    }
 }
 
 fn cluster_events(
@@ -727,7 +815,20 @@ fn add_curve_fragments(
             let wraps = index + 1 == events.len();
             let curve = periodic_fragment(input.curve, start.parameter, end.parameter, wraps);
             if let Ok(curve) = curve {
-                push_fragment(input.entity, start, end, curve, wraps, junctions, fragments);
+                let sense = match curve {
+                    EvaluatedCurve2::CircularArc { direction, .. }
+                    | EvaluatedCurve2::Circle { direction, .. } => Some(direction),
+                    EvaluatedCurve2::Line { .. } => None,
+                };
+                push_fragment(
+                    input.entity,
+                    (start, end),
+                    curve,
+                    sense,
+                    wraps,
+                    junctions,
+                    fragments,
+                );
             }
         }
         return;
@@ -742,9 +843,9 @@ fn add_curve_fragments(
         if let Ok(curve) = input.curve.subcurve(pair[0].parameter, pair[1].parameter) {
             push_fragment(
                 input.entity,
-                &pair[0],
-                &pair[1],
+                (&pair[0], &pair[1]),
                 curve,
+                None,
                 false,
                 junctions,
                 fragments,
@@ -780,9 +881,9 @@ fn periodic_fragment(
 
 fn push_fragment(
     entity: SketchEntityId,
-    start: &CurveEvent,
-    end: &CurveEvent,
+    (start, end): (&CurveEvent, &CurveEvent),
     curve: EvaluatedCurve2,
+    sense: Option<CurveDirection>,
     wraps: bool,
     junctions: &[ArrangementJunction],
     fragments: &mut Vec<ArrangementFragment>,
@@ -794,12 +895,24 @@ fn push_fragment(
     } else {
         FragmentDirection::Reverse
     };
+    // Every fragment meeting at a junction ends on the junction's one point.
+    // An evaluated arc endpoint is trigonometry and a line's is arithmetic,
+    // so left to themselves the two agree only to rounding — and the kernel
+    // reads a profile whose uses do not chain bit-exactly as open. The move
+    // is at most the junction cluster tolerance, which is also what an arc's
+    // radius agreement allows.
+    let curve = retarget_endpoints(
+        curve,
+        junctions[start.junction].point,
+        junctions[end.junction].point,
+    );
     fragments.push(ArrangementFragment {
         key: FragmentKey {
             source_entity: entity,
             start: start_key,
             end: end_key,
             direction: semantic_direction,
+            sense,
         },
         curve,
         start_junction: start.junction,
@@ -810,6 +923,25 @@ fn push_fragment(
             wraps_periodic_seam: wraps,
         },
     });
+}
+
+fn retarget_endpoints(
+    curve: EvaluatedCurve2,
+    start: SketchPoint2,
+    end: SketchPoint2,
+) -> EvaluatedCurve2 {
+    match curve {
+        EvaluatedCurve2::Line { .. } => EvaluatedCurve2::Line { start, end },
+        EvaluatedCurve2::CircularArc {
+            center, direction, ..
+        } => EvaluatedCurve2::CircularArc {
+            center,
+            start,
+            end,
+            direction,
+        },
+        EvaluatedCurve2::Circle { .. } => curve,
+    }
 }
 
 fn build_half_edges(fragments: &[ArrangementFragment]) -> Vec<ArrangementHalfEdge> {
@@ -850,15 +982,9 @@ fn link_half_edges(
     }
     let mut ambiguous_junctions = BTreeSet::new();
     for (junction, edges) in &mut outgoing {
-        edges.sort_by(|&first, &second| {
-            tangent_angle(&half_edges[first])
-                .total_cmp(&tangent_angle(&half_edges[second]))
-                .then_with(|| half_edges[first].key.cmp(&half_edges[second].key))
-        });
+        sort_departures(edges, half_edges);
         for pair in edges.windows(2) {
-            let angle_a = tangent_angle(&half_edges[pair[0]]);
-            let angle_b = tangent_angle(&half_edges[pair[1]]);
-            if (angle_a - angle_b).abs() <= f64::EPSILON * 64.0
+            if departures_coincide(&half_edges[pair[0]], &half_edges[pair[1]])
                 && half_edges[pair[0]].key.source_entity != half_edges[pair[1]].key.source_entity
             {
                 diagnostics.push(ArrangementDiagnostic::AmbiguousJunctionOrder);
@@ -899,6 +1025,85 @@ fn link_half_edges(
             twin_position - 1
         };
         edge.next = Some(at_destination[next_position]);
+    }
+}
+
+const DEPARTURE_ANGLE_TOLERANCE: f64 = f64::EPSILON * 64.0;
+
+/// Orders the half-edges leaving one junction counter-clockwise.
+///
+/// The primary key is the departure tangent. Two curves that touch
+/// tangentially leave along the same tangent, so a run of equal angles is
+/// ordered by signed curvature: after an infinitesimal advance the departure
+/// bending left has turned further counter-clockwise than a straight one,
+/// which in turn is further round than one bending right. Only equal tangent
+/// *and* equal curvature is a genuine tie, and that is a coincident carrier.
+fn sort_departures(edges: &mut [usize], half_edges: &[ArrangementHalfEdge]) {
+    edges.sort_by(|&first, &second| {
+        departure_angle(&half_edges[first])
+            .total_cmp(&departure_angle(&half_edges[second]))
+            .then_with(|| half_edges[first].key.cmp(&half_edges[second].key))
+    });
+    let mut start = 0;
+    while start < edges.len() {
+        let mut end = start + 1;
+        while end < edges.len()
+            && (departure_angle(&half_edges[edges[end]])
+                - departure_angle(&half_edges[edges[end - 1]]))
+            .abs()
+                <= DEPARTURE_ANGLE_TOLERANCE
+        {
+            end += 1;
+        }
+        if end - start > 1 {
+            edges[start..end].sort_by(|&first, &second| {
+                signed_curvature(&half_edges[first])
+                    .total_cmp(&signed_curvature(&half_edges[second]))
+                    .then_with(|| half_edges[first].key.cmp(&half_edges[second].key))
+            });
+        }
+        start = end;
+    }
+}
+
+/// Whether two departures from one junction cannot be told apart to second
+/// order: same tangent direction and same signed curvature.
+fn departures_coincide(first: &ArrangementHalfEdge, second: &ArrangementHalfEdge) -> bool {
+    let first_curvature = signed_curvature(first);
+    let second_curvature = signed_curvature(second);
+    (departure_angle(first) - departure_angle(second)).abs() <= DEPARTURE_ANGLE_TOLERANCE
+        && (first_curvature - second_curvature).abs()
+            <= f64::EPSILON * 64.0 * (1.0 + first_curvature.abs() + second_curvature.abs())
+}
+
+/// The departure tangent angle with the seam folded: an angle within
+/// tolerance below `2π` reads as slightly negative, so tangent departures
+/// that straddle the `0`/`2π` seam still sort adjacent.
+fn departure_angle(edge: &ArrangementHalfEdge) -> f64 {
+    let angle = tangent_angle(edge);
+    if angle >= TAU - DEPARTURE_ANGLE_TOLERANCE {
+        angle - TAU
+    } else {
+        angle
+    }
+}
+
+/// Signed curvature at the departure: positive bends left (counter-clockwise),
+/// negative bends right, zero for a straight carrier.
+fn signed_curvature(edge: &ArrangementHalfEdge) -> f64 {
+    match edge.curve {
+        EvaluatedCurve2::Line { .. } => 0.0,
+        EvaluatedCurve2::CircularArc { direction, .. }
+        | EvaluatedCurve2::Circle { direction, .. } => {
+            let radius = edge
+                .curve
+                .radius()
+                .expect("a circular carrier has a radius");
+            match direction {
+                CurveDirection::CounterClockwise => 1.0 / radius,
+                CurveDirection::Clockwise => -1.0 / radius,
+            }
+        }
     }
 }
 
@@ -1137,6 +1342,10 @@ fn interior_sample(
     Some(point + tangent.left_normal() * offset)
 }
 
+/// Slope of the parity ray in [`point_in_loop`]: an unremarkable number, so
+/// that no authored direction is likely to run along it.
+const RAY_LEAN: f64 = 0.003_713;
+
 fn point_in_loop(
     point: SketchPoint2,
     profile_loop: &ArrangementLoop,
@@ -1147,7 +1356,13 @@ fn point_in_loop(
         .iter()
         .map(|curve| curve.bounds().max.u)
         .fold(point.u + 1.0, f64::max);
-    let ray_end = SketchPoint2::new(max_u + (max_u - point.u).abs().max(1.0) * 2.0, point.v);
+    // The ray leans a little rather than running level: sketches are full of
+    // horizontal sides and quadrant points, and a level ray from a snapped
+    // point runs straight through them, where a crossing and a touch count
+    // the same. The lean is small enough that the far end still clears the
+    // loop's extent in `u`.
+    let reach = max_u + (max_u - point.u).abs().max(1.0) * 2.0 - point.u;
+    let ray_end = SketchPoint2::new(point.u + reach, point.v + reach * RAY_LEAN);
     let ray = EvaluatedCurve2::Line {
         start: point,
         end: ray_end,
@@ -1285,5 +1500,252 @@ mod tests {
         );
         assert_eq!(arrangement.cells.len(), 2);
         assert!(arrangement.cells.iter().any(|cell| cell.holes.len() == 1));
+    }
+
+    fn cell_areas(arrangement: &SketchArrangement) -> Vec<f64> {
+        let mut areas: Vec<_> = arrangement
+            .cells
+            .iter()
+            .map(|cell| cell.signed_area)
+            .collect();
+        areas.sort_by(f64::total_cmp);
+        areas
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1.0e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn a_circle_resting_on_a_square_side_yields_the_disc_and_the_surround() {
+        // With grid snap on, a circle drawn inside a square lands exactly
+        // tangent to a side more often than not. That is two regions, not
+        // an unusable sketch.
+        let mut curves = rectangle(1, 1, (-2.0, -2.0), (2.0, 2.0));
+        curves.push(ArrangementInputCurve::circle(
+            entity(10),
+            SketchPoint2::new(0.0, -1.0),
+            1.0,
+            CurveDirection::CounterClockwise,
+        ));
+        let arrangement = build_arrangement(
+            &curves,
+            &PrecisionPolicy::default(),
+            ArrangementLimits::default(),
+        );
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        assert!(
+            arrangement.diagnostics.is_empty(),
+            "{:?}",
+            arrangement.diagnostics
+        );
+        let areas = cell_areas(&arrangement);
+        assert_close(areas[0], std::f64::consts::PI);
+        assert_close(areas[1], 16.0 - std::f64::consts::PI);
+        // The tangent point pinches the surround into one loop; the disc is
+        // no hole of it, so a point in the disc resolves to the disc alone.
+        let disc = arrangement
+            .cell_at_point(SketchPoint2::new(0.3, -1.2), &PrecisionPolicy::default())
+            .expect("the disc is a cell");
+        assert_close(disc.signed_area, std::f64::consts::PI);
+        let surround = arrangement
+            .cell_at_point(SketchPoint2::new(1.5, 1.5), &PrecisionPolicy::default())
+            .expect("the surround is a cell");
+        assert_close(surround.signed_area, 16.0 - std::f64::consts::PI);
+    }
+
+    #[test]
+    fn an_inscribed_circle_pinches_the_surround_into_four_corner_cells() {
+        // Four tangent points leave four corner regions that meet the disc
+        // only at points; each is its own minimal cell.
+        let mut curves = rectangle(1, 1, (-2.0, -2.0), (2.0, 2.0));
+        curves.push(ArrangementInputCurve::circle(
+            entity(10),
+            SketchPoint2::new(0.0, 0.0),
+            2.0,
+            CurveDirection::CounterClockwise,
+        ));
+        let arrangement = build_arrangement(
+            &curves,
+            &PrecisionPolicy::default(),
+            ArrangementLimits::default(),
+        );
+        assert_eq!(arrangement.cells.len(), 5, "{:?}", arrangement.diagnostics);
+        assert!(
+            arrangement.diagnostics.is_empty(),
+            "{:?}",
+            arrangement.diagnostics
+        );
+        let areas = cell_areas(&arrangement);
+        for corner in &areas[..4] {
+            assert_close(*corner, 4.0 - std::f64::consts::PI);
+        }
+        assert_close(areas[4], 4.0 * std::f64::consts::PI);
+    }
+
+    #[test]
+    fn the_two_arcs_of_a_chord_split_circle_have_distinct_keys() {
+        let curves = [
+            ArrangementInputCurve::circle(
+                entity(1),
+                SketchPoint2::new(0.0, 0.0),
+                2.0,
+                CurveDirection::CounterClockwise,
+            ),
+            ArrangementInputCurve::line(
+                entity(2),
+                point(1),
+                point(2),
+                SketchPoint2::new(-3.0, 0.5),
+                SketchPoint2::new(3.0, 0.5),
+            ),
+        ];
+        let arrangement = build_arrangement(
+            &curves,
+            &PrecisionPolicy::default(),
+            ArrangementLimits::default(),
+        );
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        let arcs: Vec<_> = arrangement
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.key.source_entity == entity(1))
+            .map(|fragment| fragment.key.clone())
+            .collect();
+        assert_eq!(arcs.len(), 2);
+        assert_ne!(arcs[0], arcs[1]);
+        assert_ne!(arcs[0].reversed(), arcs[1]);
+        assert!(arcs.iter().all(|key| key.sense.is_some()));
+        // Straight fragments and unsplit circles keep their earlier keys.
+        assert!(
+            arrangement
+                .fragments
+                .iter()
+                .filter(|fragment| fragment.key.source_entity == entity(2))
+                .all(|fragment| fragment.key.sense.is_none())
+        );
+        // A signature written before `sense` existed still resolves.
+        let legacy = RegionSignature {
+            outer: arrangement.cells[0]
+                .signature
+                .outer
+                .iter()
+                .map(FragmentKey::without_sense)
+                .collect(),
+            holes: Vec::new(),
+        };
+        assert_eq!(
+            arrangement.cell(&legacy).map(|cell| &cell.signature),
+            Some(&arrangement.cells[0].signature)
+        );
+    }
+
+    #[test]
+    fn a_line_ending_on_a_circle_leaves_the_disc_as_a_cell() {
+        // One junction on a closed curve used to drop the circle entirely.
+        for line_start in [SketchPoint2::new(0.0, 0.0), SketchPoint2::new(5.0, 0.0)] {
+            let curves = [
+                ArrangementInputCurve::circle(
+                    entity(1),
+                    SketchPoint2::new(0.0, 0.0),
+                    2.0,
+                    CurveDirection::CounterClockwise,
+                ),
+                ArrangementInputCurve::line(
+                    entity(2),
+                    point(1),
+                    point(2),
+                    line_start,
+                    SketchPoint2::new(2.0, 0.0),
+                ),
+            ];
+            let arrangement = build_arrangement(
+                &curves,
+                &PrecisionPolicy::default(),
+                ArrangementLimits::default(),
+            );
+            assert_eq!(arrangement.cells.len(), 1, "{:?}", arrangement.diagnostics);
+            assert_close(arrangement.cells[0].signed_area, 4.0 * std::f64::consts::PI);
+            assert_eq!(arrangement.cells[0].outer.curves.len(), 2);
+            assert!(arrangement.junctions.iter().any(|junction| {
+                junction
+                    .key
+                    .keys()
+                    .iter()
+                    .any(|key| matches!(key, JunctionKey::PeriodicSplit { .. }))
+            }));
+        }
+    }
+
+    #[test]
+    fn two_lines_tangent_to_a_circle_close_a_teardrop_beside_the_disc() {
+        // Apex (0, 4), circle radius 2 at the origin: the tangent points are
+        // at (±√3, 1) and both lines meet the rim tangentially at their ends.
+        let root = 3.0_f64.sqrt();
+        let curves = [
+            ArrangementInputCurve::circle(
+                entity(1),
+                SketchPoint2::new(0.0, 0.0),
+                2.0,
+                CurveDirection::CounterClockwise,
+            ),
+            ArrangementInputCurve::line(
+                entity(2),
+                point(1),
+                point(2),
+                SketchPoint2::new(0.0, 4.0),
+                SketchPoint2::new(-root, 1.0),
+            ),
+            ArrangementInputCurve::line(
+                entity(3),
+                point(1),
+                point(3),
+                SketchPoint2::new(0.0, 4.0),
+                SketchPoint2::new(root, 1.0),
+            ),
+        ];
+        let arrangement = build_arrangement(
+            &curves,
+            &PrecisionPolicy::default(),
+            ArrangementLimits::default(),
+        );
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        let areas = cell_areas(&arrangement);
+        // Kite (0,4)-(√3,1)-(0,0)-(-√3,1) minus the 120° sector.
+        let kite = 4.0 * root;
+        let sector = 4.0 * std::f64::consts::PI / 3.0;
+        assert_close(areas[0], kite - sector);
+        assert_close(areas[1], 4.0 * std::f64::consts::PI);
+    }
+
+    #[test]
+    fn externally_tangent_circles_are_two_separate_discs() {
+        let curves = [
+            ArrangementInputCurve::circle(
+                entity(1),
+                SketchPoint2::new(0.0, 0.0),
+                1.0,
+                CurveDirection::CounterClockwise,
+            ),
+            ArrangementInputCurve::circle(
+                entity(2),
+                SketchPoint2::new(3.0, 0.0),
+                2.0,
+                CurveDirection::CounterClockwise,
+            ),
+        ];
+        let arrangement = build_arrangement(
+            &curves,
+            &PrecisionPolicy::default(),
+            ArrangementLimits::default(),
+        );
+        assert_eq!(arrangement.cells.len(), 2, "{:?}", arrangement.diagnostics);
+        let areas = cell_areas(&arrangement);
+        assert_close(areas[0], std::f64::consts::PI);
+        assert_close(areas[1], 4.0 * std::f64::consts::PI);
+        assert!(arrangement.cells.iter().all(|cell| cell.holes.is_empty()));
     }
 }

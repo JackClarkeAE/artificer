@@ -30,13 +30,14 @@ use artificer_sketch::{
     FilletBranchHints as CoreFilletBranchHints, Integer as CoreInteger, Length as CoreLength,
     MAX_CURVE_EDITS_PER_TRANSACTION, MAX_POLYGON_SIDES as CORE_MAX_POLYGON_SIDES,
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
-    RegionSignature as CoreRegionSignature, RetirementPolicy as CoreRetirementPolicy,
-    SignedLength as CoreSignedLength, SketchArrangement as CoreSketchArrangement,
-    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
-    SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
-    SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
-    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
-    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    ProfileCompileError as CoreProfileCompileError, RegionSignature as CoreRegionSignature,
+    RetirementPolicy as CoreRetirementPolicy, SignedLength as CoreSignedLength,
+    SketchArrangement as CoreSketchArrangement, SketchConstraintKind as CoreConstraintKind,
+    SketchCurve2 as CoreCurve2, SketchDefinition as CoreSketchDefinition,
+    SketchEntityId as CoreEntityId, SketchEntityRole as CoreEntityRole,
+    SketchOperationId as CoreOperationId, SketchOutputRef as CoreOutputRef,
+    SketchPoint2 as CorePoint2, SketchPointId as CorePointId, SketchRecipe as CoreRecipe,
+    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
     SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
@@ -4792,14 +4793,30 @@ impl SketchCanvasState {
     /// arrangement. Pending UI geometry and display sampling are excluded.
     #[must_use]
     pub fn selected_planar_profile(&self) -> Option<PlanarProfile2> {
+        self.compile_selected_planar_profile()?
+            .ok()
+            .map(|selection| selection.profile)
+    }
+
+    /// Why the selected cell union does not compile, when it does not.
+    #[must_use]
+    pub fn selected_planar_profile_error(&self) -> Option<CoreProfileCompileError> {
+        self.compile_selected_planar_profile()?.err()
+    }
+
+    fn compile_selected_planar_profile(
+        &self,
+    ) -> Option<Result<artificer_sketch::CompiledProfileSelection, CoreProfileCompileError>> {
         if self.pending.is_some() {
             return None;
         }
         let arrangement = self.analytic_regions.arrangement.as_ref()?;
         let signatures = self.selected_region_signatures();
-        compile_selected_profile(arrangement, &signatures, &PrecisionPolicy::default())
-            .ok()
-            .map(|selection| selection.profile)
+        Some(compile_selected_profile(
+            arrangement,
+            &signatures,
+            &PrecisionPolicy::default(),
+        ))
     }
 
     /// Whether selected analytic material cells should be painted. A
@@ -6360,6 +6377,15 @@ impl SketchCanvasState {
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern
         ) {
             "Drag square direction/centre handle · release to stage · Shift-click edits seeds"
+        } else if state.exact_tool == ToolVariant::Select
+            && state.pending.is_none()
+            && (state.available_region_count() > 1 || state.selected_region_count() == 0)
+            && state.available_region_count() > 0
+        {
+            // Several bounded cells, or none picked yet: the profile choice
+            // is the thing this tool is for right now, and the fill only
+            // follows a click, so say where to click.
+            "Click inside a profile · Shift-click adds more"
         } else if descriptor.acquisition_phases.is_empty() {
             descriptor.prompt
         } else {
@@ -8909,6 +8935,10 @@ fn curves_intersect_beyond_shared_endpoints(
     let tolerance_squared = (256.0 * f64::EPSILON * scale).powi(2);
     match exact_curve_intersections(first, second) {
         CurveIntersections::Coincident => coincident_curves_overlap(first, second),
+        // A circle resting on a side is two regions meeting at a point, not
+        // a self-intersecting profile; the arrangement splits both carriers
+        // there and the cells stay selectable.
+        CurveIntersections::Tangent => false,
         CurveIntersections::Points(points) => points.into_iter().any(|point| {
             !allowed
                 .iter()
@@ -8928,6 +8958,9 @@ fn curve_intersection_scale(first: CertifiedSketchCurve, second: CertifiedSketch
 
 enum CurveIntersections {
     Points(Vec<SketchPoint>),
+    /// One coalesced contact where the carriers share a tangent. The curves
+    /// touch without crossing, so the loops on either side share no area.
+    Tangent,
     Coincident,
 }
 
@@ -9051,6 +9084,9 @@ fn line_circular_curve_intersections(
         .collect::<Vec<_>>();
     points.sort_by_key(|point| PointKey::new(*point));
     points.dedup_by(|left, right| left.distance_squared(*right) <= f64::EPSILON.powi(2));
+    if discriminant == 0.0 && points.len() == 1 {
+        return CurveIntersections::Tangent;
+    }
     CurveIntersections::Points(points)
 }
 
@@ -9106,6 +9142,9 @@ fn circular_curve_intersections(
     .collect::<Vec<_>>();
     points.sort_by_key(|point| PointKey::new(*point));
     points.dedup_by(|left, right| left.distance_squared(*right) <= f64::EPSILON.powi(2));
+    if height == 0.0 && points.len() == 1 {
+        return CurveIntersections::Tangent;
+    }
     CurveIntersections::Points(points)
 }
 
@@ -10006,6 +10045,21 @@ fn paint_profile_fill(painter: &egui::Painter, rect: Rect, state: &SketchCanvasS
     let Some(arrangement) = state.analytic_regions.arrangement.as_ref() else {
         return;
     };
+    // Every bounded cell wears a faint standing tint: that the sketch has
+    // found a closed profile is visible before anything is hovered or picked,
+    // and each separately selectable region reads as its own patch. A pending
+    // edit shows the live arrangement, so the standing tint stays out of it.
+    if state.pending.is_none() {
+        let standing_fill = Color32::from_rgba_unmultiplied(18, 102, 189, 12);
+        for cell in &arrangement.cells {
+            if state.analytic_regions.selected.contains(&cell.signature)
+                || state.analytic_regions.hovered.as_ref() == Some(&cell.signature)
+            {
+                continue;
+            }
+            paint_analytic_cell_fill(painter, rect, state.view, cell, standing_fill);
+        }
+    }
     let selected_fill = if state.pending.is_some() {
         Color32::from_rgba_unmultiplied(23, 122, 67, 34)
     } else {
@@ -13872,6 +13926,47 @@ mod tests {
                 !point_in_triangle(hole_center, triangle[0], triangle[1], triangle[2], winding)
             }),
             "a hole center must never receive a profile-fill triangle"
+        );
+    }
+
+    #[test]
+    fn a_circle_resting_on_a_square_side_is_two_cells_not_a_self_intersection() {
+        // Grid snap makes this the common way to draw "a circle inside a
+        // square". The touch is not a crossing: the headline stays closed,
+        // and the arrangement offers the disc and the pinched surround.
+        let mut state = SketchCanvasState::default();
+        for geometry in [
+            SketchGeometry::rectangle(SketchPoint::new(-2.0, -2.0), SketchPoint::new(2.0, 2.0)),
+            SketchGeometry::circle(SketchPoint::new(-1.0, 0.0), SketchPoint::new(-2.0, 0.0)),
+        ] {
+            state
+                .stage_geometry(geometry)
+                .expect("geometry should stage");
+            state.commit_pending().expect("geometry should commit");
+        }
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::ClosedRegions {
+                regions: 1,
+                loops: 2,
+                holes: 1,
+                analytic: true,
+            }
+        );
+        assert_eq!(state.available_region_count(), 2);
+        assert!(state.select_region_at_point(SketchPoint::new(-1.0, 0.0), false));
+        let disc = state
+            .selected_planar_profile()
+            .expect("the disc compiles on its own");
+        assert_eq!(disc.regions.len(), 1);
+        assert!(disc.regions[0].holes.is_empty());
+        // The surround's boundary returns to the touch point, which no face
+        // loop may do; the refusal names that rather than a generic failure.
+        assert!(state.select_region_at_point(SketchPoint::new(1.5, 1.5), false));
+        assert!(state.selected_planar_profile().is_none());
+        assert_eq!(
+            state.selected_planar_profile_error(),
+            Some(CoreProfileCompileError::PinchedBoundary)
         );
     }
 

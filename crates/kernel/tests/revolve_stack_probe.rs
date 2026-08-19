@@ -449,3 +449,165 @@ fn rim_blend_seams_present_no_hard_meridian_edges() {
         );
     }
 }
+
+const BORE: f64 = 10.0;
+
+/// A tube: the annulus between `BORE` and `RADIUS`, extruded `HEIGHT`. Its
+/// section closes on itself clear of the axis.
+fn tube() -> Snapshot {
+    let profile = PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: PlanarLoop2 {
+                curves: vec![PlanarCurve2::Circle {
+                    center: Point2::new(0.0, 0.0),
+                    radius: RADIUS,
+                    direction: ArcDirection::CounterClockwise,
+                }],
+            },
+            holes: vec![PlanarLoop2 {
+                curves: vec![PlanarCurve2::Circle {
+                    center: Point2::new(0.0, 0.0),
+                    radius: BORE,
+                    direction: ArcDirection::Clockwise,
+                }],
+            }],
+        }],
+    };
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("tube-base"),
+        expected_snapshot: NativeKernel::empty().id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::ExtrudePlanarProfile {
+            frame: PlanarFrame3::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+            profile,
+            distance: HEIGHT,
+        },
+    };
+    NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+        .expect("tube should build")
+        .snapshot
+}
+
+/// The rectangular tube section with one convex corner rounded by `fillet`.
+/// Corners are named by radius and height; the section runs
+/// bore-bottom → outer-bottom → outer-top → bore-top, counter-clockwise.
+fn tube_section_with_fillet(corner_radius: f64, corner_height: f64, fillet: f64) -> Vec<Piece> {
+    let corners = [(BORE, 0.0), (RADIUS, 0.0), (RADIUS, HEIGHT), (BORE, HEIGHT)];
+    let mut pieces = Vec::new();
+    for index in 0..4 {
+        let from = corners[index];
+        let to = corners[(index + 1) % 4];
+        let next = corners[(index + 2) % 4];
+        let rounded_here =
+            (to.0 - corner_radius).abs() < 1.0e-12 && (to.1 - corner_height).abs() < 1.0e-12;
+        if !rounded_here {
+            // Trim the start if the previous corner was rounded.
+            let previous_rounded = (from.0 - corner_radius).abs() < 1.0e-12
+                && (from.1 - corner_height).abs() < 1.0e-12;
+            let start = if previous_rounded {
+                step(from, to, fillet)
+            } else {
+                from
+            };
+            pieces.push(Piece::Line { from: start, to });
+            continue;
+        }
+        let end = step(to, from, fillet);
+        pieces.push(Piece::Line { from, to: end });
+        // Blend centre: `fillet` in from both walls, on the material side.
+        let along_next = step(to, next, fillet);
+        let center = (end.0 + along_next.0 - to.0, end.1 + along_next.1 - to.1);
+        let start_angle = (end.1 - center.1).atan2(end.0 - center.0);
+        let mut end_angle = (along_next.1 - center.1).atan2(along_next.0 - center.0);
+        // A convex corner traversed counter-clockwise turns left: sweep +90°.
+        while end_angle < start_angle {
+            end_angle += std::f64::consts::TAU;
+        }
+        pieces.push(Piece::Arc {
+            center,
+            radius: fillet,
+            start: start_angle,
+            end: end_angle,
+        });
+    }
+    pieces
+}
+
+/// The point `distance` along the way from `from` to `to`.
+fn step(from: (f64, f64), to: (f64, f64), distance: f64) -> (f64, f64) {
+    let length = (to.0 - from.0).hypot(to.1 - from.1);
+    (
+        from.0 + (to.0 - from.0) / length * distance,
+        from.1 + (to.1 - from.1) / length * distance,
+    )
+}
+
+#[test]
+fn a_tube_fillets_its_outer_and_bore_rims_as_exact_torus_blends() {
+    // A washer-capped tube used to fail every exact rim path: the annular cap
+    // was refused as "not a full disk". Its section is a closed rectangle
+    // clear of the axis, and each of its four rims is an ordinary corner.
+    let base = tube();
+    let fillet = 3.0_f64;
+    for (radius, height) in [(RADIUS, HEIGHT), (BORE, HEIGHT), (RADIUS, 0.0), (BORE, 0.0)] {
+        let filleted = finish(
+            &base,
+            vec![rim_at(&base, radius, height)],
+            EdgeFinishKind::Fillet,
+            fillet,
+            "tube-fillet",
+        )
+        .unwrap_or_else(|error| panic!("rim at ({radius}, {height}) must fillet: {error}"));
+        assert!(NativeKernel::validate(&filleted, ValidationProfile::Solid).valid);
+        let section = tube_section_with_fillet(radius, height, fillet);
+        assert_close(
+            filleted.measures().volume,
+            section_volume(&section),
+            "tube fillet volume",
+        );
+        assert_close(
+            filleted.measures().surface_area,
+            section_area(&section),
+            "tube fillet area",
+        );
+    }
+}
+
+#[test]
+fn a_tube_fillet_stacks_onto_the_opposite_rim() {
+    let base = tube();
+    let fillet = 3.0_f64;
+    let outer = finish(
+        &base,
+        vec![rim_at(&base, RADIUS, HEIGHT)],
+        EdgeFinishKind::Fillet,
+        fillet,
+        "tube-outer",
+    )
+    .expect("outer rim fillets");
+    let both = finish(
+        &outer,
+        vec![rim_at(&outer, BORE, HEIGHT)],
+        EdgeFinishKind::Fillet,
+        fillet,
+        "tube-bore",
+    )
+    .expect("the bore rim fillets on the already-filleted tube");
+    assert!(NativeKernel::validate(&both, ValidationProfile::Solid).valid);
+    // Volume: the plain tube minus two revolved corner slivers, one at each
+    // rim. `tube_section_with_fillet` gives each single-rim body; the
+    // removed volumes add.
+    let plain = std::f64::consts::PI * (RADIUS * RADIUS - BORE * BORE) * HEIGHT;
+    let outer_only = section_volume(&tube_section_with_fillet(RADIUS, HEIGHT, fillet));
+    let bore_only = section_volume(&tube_section_with_fillet(BORE, HEIGHT, fillet));
+    assert_close(
+        both.measures().volume,
+        plain - (plain - outer_only) - (plain - bore_only),
+        "double tube fillet volume",
+    );
+}

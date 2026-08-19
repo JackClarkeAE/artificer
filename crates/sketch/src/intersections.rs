@@ -27,6 +27,13 @@ pub enum JunctionKey {
         second_entity: SketchEntityId,
         branch: IntersectionBranch,
     },
+    /// The synthetic antipode a circle receives when exactly one authored
+    /// junction lies on it. A closed curve needs two junctions to become two
+    /// non-degenerate fragments; this one is derived from the single real
+    /// event, so it is as stable as that event.
+    PeriodicSplit {
+        source_entity: SketchEntityId,
+    },
 }
 
 /// A canonical set of semantic events which evaluate to one point.

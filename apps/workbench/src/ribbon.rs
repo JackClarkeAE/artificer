@@ -775,13 +775,19 @@ impl KernelLabApp {
         let distance_valid = self.extrusion_distance_is_valid();
         let sketch_edit_complete =
             !self.sketch.has_pending_edit() && !self.sketch_creation_draft_active();
+        // With bounded profiles drawn but none picked — or a pick that cannot
+        // become a solid — Extrude is still the right button to press: it
+        // hands the canvas to Select and says where to click, instead of
+        // greying out behind a tooltip.
+        let awaiting_profile_pick =
+            self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick();
         let sketch_enabled = self.pending_operation.is_none()
             && self.history_is_at_end()
             && !already_extruded
             && distance_valid
             && sketch_edit_complete
             && !linked_sketch_support
-            && eligibility.can_stage();
+            && (eligibility.can_stage() || awaiting_profile_pick);
         let active_sketch_consumed = self
             .active_sketch_index
             .and_then(|index| self.sketches.get(index))
@@ -831,7 +837,13 @@ impl KernelLabApp {
             }
             ModelCommand::ConstructionPlane => self.stage_construction_plane(),
             ModelCommand::Extrude => {
-                let staged = if self.sketch_extrusion_eligibility().can_stage()
+                let eligibility = self.sketch_extrusion_eligibility();
+                if self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick()
+                {
+                    self.begin_profile_pick_for_extrusion(eligibility);
+                    return;
+                }
+                let staged = if eligibility.can_stage()
                     && self.extruded_sketch_revision != Some(self.sketch_revision)
                 {
                     self.stage_sketch_extrusion()

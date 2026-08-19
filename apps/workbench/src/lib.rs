@@ -67,9 +67,9 @@ use artificer_protocol::{
 };
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
-    CurveIntersections, EvaluatedCurve2 as AuthoringCurve2, RegionSignature, SketchArrangement,
-    SketchDefinition, SketchPoint2 as AuthoringPoint2, build_arrangement, compile_selected_profile,
-    intersect_curves,
+    CurveIntersections, EvaluatedCurve2 as AuthoringCurve2, ProfileCompileError, RegionSignature,
+    SketchArrangement, SketchDefinition, SketchPoint2 as AuthoringPoint2, build_arrangement,
+    compile_selected_profile, intersect_curves,
 };
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Frame, Margin, RichText, Stroke};
@@ -1276,6 +1276,7 @@ pub enum SketchExtrusionEligibility {
     Ready,
     SketchNotFinished,
     RegionSelectionRequired { available: usize },
+    PinchedRegion,
     InactiveHistorySketch,
     StaleFaceSupport,
     UnsupportedProfile,
@@ -1296,6 +1297,15 @@ impl SketchExtrusionEligibility {
         matches!(self, Self::Ready)
     }
 
+    /// The sketch has bounded profiles, and what stands between it and an
+    /// extrusion is which of them the user means.
+    const fn wants_profile_pick(self) -> bool {
+        matches!(
+            self,
+            Self::RegionSelectionRequired { .. } | Self::PinchedRegion
+        )
+    }
+
     fn visible_reason(self) -> Option<String> {
         match self {
             Self::Ready => None,
@@ -1305,6 +1315,10 @@ impl SketchExtrusionEligibility {
             Self::RegionSelectionRequired { available } => Some(format!(
                 "Extrusion requires an explicit profile selection · click inside one of the {available} bounded regions; Shift-click adds more."
             )),
+            Self::PinchedRegion => Some(
+                "The selected material touches itself at a single point — a circle resting on a side, or regions that meet only at a corner. A solid needs material across the touch: select the regions on one side of it, or move the geometry apart."
+                    .to_owned(),
+            ),
             Self::InactiveHistorySketch => Some(
                 "This sketch is suppressed or unavailable in the active history. Restore it before extruding."
                     .to_owned(),
@@ -1367,6 +1381,7 @@ impl SketchExtrusionEligibility {
             Self::Ready
             | Self::SketchNotFinished
             | Self::RegionSelectionRequired { .. }
+            | Self::PinchedRegion
             | Self::InactiveHistorySketch
             | Self::UnsupportedProfile
             | Self::Concave
@@ -1914,6 +1929,16 @@ impl KernelLabApp {
     pub fn new_paused(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_style(&creation_context.egui_ctx);
         Self::default()
+    }
+
+    /// Deterministic constructor shaped like production start-up: reference
+    /// planes, an origin feature, and no solid.
+    #[must_use]
+    pub fn new_paused_blank(creation_context: &eframe::CreationContext<'_>) -> Self {
+        install_style(&creation_context.egui_ctx);
+        let mut app = Self::default();
+        app.reset_to_blank_workspace();
+        app
     }
 
     /// Deterministic constructor that exercises the real persistent catalog
@@ -2779,7 +2804,14 @@ impl KernelLabApp {
                 };
             }
             let Some(profile) = self.sketch.selected_planar_profile() else {
-                return SketchExtrusionEligibility::UnsupportedProfile;
+                return if matches!(
+                    self.sketch.selected_planar_profile_error(),
+                    Some(ProfileCompileError::PinchedBoundary)
+                ) {
+                    SketchExtrusionEligibility::PinchedRegion
+                } else {
+                    SketchExtrusionEligibility::UnsupportedProfile
+                };
             };
             return classify_selected_planar_profile(&profile, &self.sketch_support);
         }
@@ -6795,6 +6827,24 @@ impl KernelLabApp {
         }
     }
 
+    /// Extrude was pressed with bounded profiles drawn but none picked. Hand
+    /// the canvas to Select — a creation tool would start a new stroke on the
+    /// click that was meant to choose a profile — and let the canvas prompt
+    /// say where to click.
+    fn begin_profile_pick_for_extrusion(&mut self, eligibility: SketchExtrusionEligibility) {
+        self.activate_sketch_tool_variant(ToolVariant::Select);
+        let available = self.sketch.available_region_count();
+        self.document_status = Some(match eligibility {
+            SketchExtrusionEligibility::PinchedRegion => {
+                "The selected profile touches itself at a point · click inside a profile on one side of the touch, then Extrude"
+                    .to_owned()
+            }
+            _ => format!(
+                "Click inside one of the {available} bounded profiles to select it · Shift-click adds · then Extrude"
+            ),
+        });
+    }
+
     fn stage_sketch_extrusion(&mut self) -> bool {
         if self.pending_operation.is_some()
             || !self.history_is_at_end()
@@ -8967,6 +9017,15 @@ impl KernelLabApp {
                 } else {
                     format!("Preview staged · {}", support.detail())
                 });
+                // A fresh staging is a fresh attempt: the editor shows the last
+                // refusal for this preset, and it must not inherit one from
+                // an earlier, cancelled staging.
+                if matches!(
+                    &self.last_attempt,
+                    Attempt::Rejected { operation, .. } if *operation == preset.label()
+                ) {
+                    self.last_attempt = Attempt::NotRun;
+                }
                 (Some(selected[0].edge), None)
             } else if preset == SolidFeaturePreset::Mirror {
                 let (plane_frame, plane_name) = self.browser_mirror_plane();
@@ -9403,8 +9462,12 @@ impl KernelLabApp {
         // A blank production document still has real construction geometry.
         // Frame its visible reference planes so increasing their physical size
         // also produces a matching initial camera scale instead of clipping a
-        // 50 mm datum against the old one-unit camera radius.
-        let bounds = bounds.or_else(|| self.visible_reference_plane_bounds());
+        // 50 mm datum against the old one-unit camera radius. With the planes
+        // retired and no solid yet, a committed sketch is what there is to
+        // frame.
+        let bounds = bounds
+            .or_else(|| self.visible_reference_plane_bounds())
+            .or_else(|| viewport::sketch_overlay_bounds(&self.visible_sketch_overlays()));
         if let Some(bounds) = bounds {
             self.view.frame(bounds);
         }
@@ -11261,6 +11324,19 @@ impl KernelLabApp {
                         .small()
                         .color(if support.can_commit() { theme::muted() } else { theme::bad() }),
                 );
+                // A refused commit leaves this window open with its picks, so
+                // the reason belongs here, beside the value to change — not in
+                // a status string that only a hover ever reveals.
+                if let Attempt::Rejected { operation, error } = &self.last_attempt
+                    && *operation == preset.label()
+                {
+                    ui.add_space(4.0);
+                    status_line(ui, "NOT APPLIED", theme::bad());
+                    ui.add(
+                        egui::Label::new(RichText::new(&error.message).small().color(theme::bad()))
+                            .wrap(),
+                    );
+                }
                 ui.separator();
                 ui.label(RichText::new(if preset == SolidFeaturePreset::Chamfer {
                     "Setback distance"
@@ -20564,6 +20640,140 @@ mod extrusion_workbench_tests {
                 artificer_protocol::ValidationProfile::Solid,
             )
             .valid
+        );
+    }
+
+    /// A tube — an annulus extruded as a new body — with the sketch left
+    /// behind, the way a user reaches one.
+    fn extruded_tube_app(outer: f64, bore: f64) -> KernelLabApp {
+        let mut app = KernelLabApp {
+            workbench_mode: WorkbenchMode::Sketch,
+            ..Default::default()
+        };
+        assert!(app.sketch.set_tool(crate::sketch::SketchTool::Circle));
+        for radius in [outer, bore] {
+            let entity = app
+                .sketch
+                .stage_geometry(SketchGeometry::circle(
+                    SketchPoint::new(0.0, 0.0),
+                    SketchPoint::new(radius, 0.0),
+                ))
+                .expect("circle stages");
+            app.commit_sketch_stroke(entity);
+        }
+        // Two nested circles are two cells; the washer is the one to extrude.
+        assert_eq!(app.sketch.available_region_count(), 2);
+        let _ = app
+            .sketch
+            .select_region_at_point(SketchPoint::new((outer + bore) / 2.0, 0.0), false);
+        assert_eq!(
+            app.sketch_extrusion_eligibility(),
+            SketchExtrusionEligibility::Ready
+        );
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        assert_eq!(app.last_error_code(), None);
+        app
+    }
+
+    #[test]
+    fn a_tube_fillets_either_rim_of_its_top_face_from_the_panel() {
+        // Reported from Windows: extrude a circle with a hole, pick a rim,
+        // Fillet, tick — nothing happened. The panel said EXACT RIM BLEND
+        // and enabled the tick, but every exact kernel path refused the
+        // washer-shaped cap, and the refusal went nowhere the user looked.
+        let outer = 4.0;
+        let bore = 2.0;
+        let height = 4.0;
+        let fillet = 0.2;
+        // The volume a convex 90° fillet removes, revolved at the rim.
+        let removed = |rim_radius: f64, inward: f64| {
+            let sliver = (1.0 - std::f64::consts::FRAC_PI_4) * fillet * fillet;
+            let centroid_offset =
+                fillet * (10.0 - 3.0 * std::f64::consts::PI) / (12.0 - 3.0 * std::f64::consts::PI);
+            std::f64::consts::TAU * (rim_radius + inward * centroid_offset) * sliver
+        };
+        let tube_volume = std::f64::consts::PI * (outer * outer - bore * bore) * height;
+        for (rim_radius, inward) in [(outer, -1.0), (bore, 1.0)] {
+            let mut app = extruded_tube_app(outer, bore);
+            let body_id = app.active_body_id().unwrap();
+            let body = viewport::BodyInstanceKey::new(body_id.get());
+            let scene = app.displayed.as_ref().unwrap().scene.clone();
+            let top = scene
+                .vertices
+                .iter()
+                .map(|vertex| vertex.point.z)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let rim = scene
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.endpoints.iter().all(|point| {
+                        (point.z - top).abs() < 1.0e-9
+                            && (point.x.hypot(point.y) - rim_radius).abs() < 1.0e-6
+                    })
+                })
+                .expect("a rim segment at the requested radius")
+                .source_edge;
+            app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+            app.apply_tangent_edge_chain();
+            assert_eq!(
+                app.edge_finish_selection_support(),
+                EdgeFinishSelectionSupport::ExactRimBlend
+            );
+            app.edge_finish_distance = fillet;
+            app.stage_preset_feature(SolidFeaturePreset::Fillet);
+            let before = app.displayed_snapshot_id();
+            assert!(app.confirm_pending_operation());
+            assert_eq!(app.last_error_code(), None, "rim at radius {rim_radius}");
+            assert!(
+                app.pending_operation.is_none(),
+                "a committed fillet closes its panel"
+            );
+            assert_ne!(app.displayed_snapshot_id(), before);
+            assert_close(
+                app.displayed_measures().unwrap().volume,
+                tube_volume - removed(rim_radius, inward),
+            );
+            assert!(
+                NativeKernel::validate(
+                    &app.displayed.as_ref().unwrap().snapshot,
+                    artificer_protocol::ValidationProfile::Solid,
+                )
+                .valid
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_edge_finish_is_reported_in_its_panel_and_forgotten_on_restage() {
+        let mut app = KernelLabApp::default();
+        let body_id = app.active_body_id().unwrap();
+        let body = viewport::BodyInstanceKey::new(body_id.get());
+        let edge = app.displayed.as_ref().unwrap().scene.edges[0];
+        app.selected_edges = vec![viewport::DocumentEdgeSelection {
+            body,
+            edge: edge.source_edge,
+        }];
+        app.selected_edge = app.selected_edges.last().copied();
+        // A radius larger than the cuboid cannot be blended.
+        app.edge_finish_distance = 1.0e6;
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(app.confirm_pending_operation());
+        assert!(matches!(
+            &app.last_attempt,
+            Attempt::Rejected { operation, .. } if *operation == SolidFeaturePreset::Fillet.label()
+        ));
+        assert!(
+            app.pending_operation.is_some(),
+            "the picks stay so the value can be corrected"
+        );
+        app.cancel_pending_operation();
+        app.edge_finish_distance = 0.2;
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(
+            matches!(app.last_attempt, Attempt::NotRun),
+            "a fresh staging must not show the earlier refusal"
         );
     }
 
