@@ -18,9 +18,23 @@ pub struct IcpParams {
     pub max_iterations: usize,
     /// Upper bound on source samples per iteration; vertices are strided.
     pub sample_budget: usize,
-    /// Stop when an iteration moves the sampled points less than this (mm).
-    pub convergence: f64,
-    /// Reject correspondences farther than this multiple of the median.
+    /// Stop when an iteration moves the sampled points less than this
+    /// fraction of the target's own extent.
+    ///
+    /// A length would only mean the same thing at one model scale: 1e-5 mm
+    /// is a reasonable floor on a 100 mm part and far too coarse on a scan
+    /// whose units are metres. Expressing it as a ratio makes convergence
+    /// independent of what the file measures in.
+    pub convergence_ratio: f64,
+    /// Keep this fraction of correspondences, best residual first.
+    ///
+    /// This is the trim in "trimmed ICP", and it is what makes partial
+    /// overlap work: the correspondences for source geometry the target
+    /// simply does not contain are discarded by rank rather than by
+    /// magnitude, so they cannot drag the fit however large they are.
+    pub keep_fraction: f64,
+    /// Reject correspondences farther than this multiple of the median, on
+    /// top of the trim above.
     pub rejection_scale: f64,
     /// Run PCA axis pre-alignment before iterating.
     pub prealign: bool,
@@ -31,7 +45,9 @@ impl Default for IcpParams {
         Self {
             max_iterations: 60,
             sample_budget: 4000,
-            convergence: 1e-5,
+            // 1e-7 of a 100 mm part is the 1e-5 mm this used to be.
+            convergence_ratio: 1e-7,
+            keep_fraction: 0.8,
             rejection_scale: 3.0,
             prealign: true,
         }
@@ -147,6 +163,15 @@ pub fn best_fit_align(
         return None;
     }
     let samples = subsample(source.positions(), params.sample_budget);
+    // Resolve the convergence ratio against the target's extent once, so
+    // every iteration below compares a length to a length at this model's
+    // own scale.
+    let extent = target.bounds_diagonal();
+    let convergence = if extent.is_finite() && extent > 0.0 {
+        params.convergence_ratio * extent
+    } else {
+        params.convergence_ratio
+    };
     let mut transform = if params.prealign {
         pca_prealign(source.positions(), &target_points, &tree)
     } else {
@@ -178,7 +203,21 @@ pub fn best_fit_align(
         }
         distances.sort_by(f64::total_cmp);
         let median = distances[distances.len() / 2];
-        let cutoff = (params.rejection_scale * median).max(params.convergence * 10.0);
+        // A trimmed fit has to actually trim. A multiple of the median does
+        // not: where the overlap is partial, the correspondences that ought
+        // to be excluded are themselves what inflates the median, the band
+        // widens to swallow them, and the run reports a 100% inlier
+        // fraction — the one number a caller would read to notice the
+        // alignment never took. Taking the best `keep_fraction` by rank
+        // bounds the accepted set no matter how the residuals are
+        // distributed; the median band then still rejects outliers inside
+        // that set when the fit is already good.
+        let keep = ((distances.len() as f64 * params.keep_fraction).round() as usize)
+            .clamp(6, distances.len());
+        let trimmed = distances[keep - 1];
+        let cutoff = trimmed
+            .min(params.rejection_scale * median)
+            .max(convergence * 10.0);
         // Point-to-plane linearization: rows [p x n; n], residual n . (p - q).
         let mut a = vec![vec![0.0; 6]; 6];
         let mut b = vec![0.0; 6];
@@ -224,7 +263,7 @@ pub fn best_fit_align(
             .unwrap_or(RigidTransform::IDENTITY)
             .then(&RigidTransform::from_translation(translation));
         transform = transform.then(&step).renormalized();
-        if omega.length() + translation.length() < params.convergence {
+        if omega.length() + translation.length() < convergence {
             break;
         }
     }
@@ -286,6 +325,101 @@ mod tests {
             let expected = pose.apply_point(*p);
             let actual = result.transform.apply_point(*p);
             assert!((expected - actual).length() < 5e-3);
+        }
+    }
+
+    #[test]
+    fn a_partial_overlap_reports_an_inlier_fraction_that_means_something() {
+        // The source carries a wing the target does not have at all. Those
+        // correspondences can never be satisfied, so a genuine trim has to
+        // throw them out and say it did. A cutoff taken as a multiple of the
+        // median instead widens to include them — they are what raises the
+        // median — and the run comes back claiming every correspondence was
+        // an inlier while the fit has been dragged off by the wing.
+        let mut soup = synth::open_cylinder_soup(12.0, 40.0, 96, 24);
+        soup.extend(synth::disk_soup(
+            Point3::new(0.0, 0.0, 40.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            12.0,
+            96,
+        ));
+        let target = TriangleMesh::from_triangle_soup(&soup, 1e-9).unwrap();
+
+        // The wing is deliberately the majority of the source. That is what
+        // makes this the failing case: with the unmatched points in the
+        // minority any sane band excludes them, but once they dominate they
+        // *are* the median, and a cutoff defined as a multiple of the median
+        // stretches to cover them.
+        let mut with_wing = soup.clone();
+        with_wing.extend(synth::plane_patch_soup(
+            Point3::new(400.0, 0.0, 20.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            120.0,
+            120.0,
+            80,
+            80,
+        ));
+        let source = TriangleMesh::from_triangle_soup(&with_wing, 1e-9).unwrap();
+
+        let result = best_fit_align(&source, &target, IcpParams::default())
+            .expect("a partial overlap still aligns");
+        assert!(
+            result.inlier_fraction < 0.95,
+            "most of the source has no counterpart in the target, so the \
+             inlier fraction must not read as a complete match: {}",
+            result.inlier_fraction
+        );
+    }
+
+    #[test]
+    fn convergence_is_a_ratio_so_it_survives_a_change_of_units() {
+        // The same part expressed in different units must take the same
+        // path. With an absolute millimetre threshold the metre-scale copy
+        // stops a hundred times too early.
+        let build = |scale: f64| {
+            let mut soup = synth::open_cylinder_soup(12.0 * scale, 40.0 * scale, 96, 24);
+            soup.extend(synth::disk_soup(
+                Point3::new(0.0, 0.0, 40.0 * scale),
+                Vector3::new(0.0, 0.0, 1.0),
+                12.0 * scale,
+                96,
+            ));
+            soup.extend(synth::plane_patch_soup(
+                Point3::new(12.0 * scale, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                18.0 * scale,
+                30.0 * scale,
+                12,
+                20,
+            ));
+            TriangleMesh::from_triangle_soup(&soup, 1e-12).unwrap()
+        };
+        let pose = |scale: f64| {
+            RigidTransform::from_axis_angle(Vector3::new(0.3, 1.0, 0.2), 0.35)
+                .unwrap()
+                .then(&RigidTransform::from_translation(Vector3::new(
+                    7.0 * scale,
+                    -4.0 * scale,
+                    2.5 * scale,
+                )))
+        };
+
+        for scale in [1.0, 0.001] {
+            let target = build(scale);
+            let source = target.transformed(&pose(scale).inverse());
+            let result =
+                best_fit_align(&source, &target, IcpParams::default()).expect("both scales align");
+            // The residual has to be small *relative to the part*, which is
+            // the only comparison that means anything across units.
+            let relative = result.rms / (40.0 * scale);
+            assert!(
+                relative < 1e-4,
+                "scale {scale}: relative rms {relative} (rms {}) — convergence \
+                 did not follow the model's units",
+                result.rms
+            );
         }
     }
 

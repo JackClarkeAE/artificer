@@ -238,6 +238,42 @@ impl SurfaceClass {
         }
     }
 
+    /// Re-measures the surface against `points` after its parameters have
+    /// been changed.
+    ///
+    /// Snapping and harmonizing move a fitted surface off the points it was
+    /// fitted to. The stored [`DeviationStats`] then describe geometry that
+    /// is no longer there, and every tolerance decision downstream reads
+    /// them — so a surface that was moved has to be re-measured, not just
+    /// re-parameterized.
+    ///
+    /// The variants absent below (`Pattern`, `EdgeRound`, `Freeform`) carry
+    /// no closed-form signed distance and are never mutated by snapping, so
+    /// their statistics stay valid.
+    pub(crate) fn recompute_deviation(&mut self, points: &[Point3]) {
+        if points.is_empty() {
+            return;
+        }
+        match self {
+            Self::Plane(f) => {
+                f.deviation = crate::fit::stats(points.iter().map(|p| f.signed_distance(*p)));
+            }
+            Self::Cylinder(f) => {
+                f.deviation = crate::fit::stats(points.iter().map(|p| f.signed_distance(*p)));
+            }
+            Self::Sphere(f) => {
+                f.deviation = crate::fit::stats(points.iter().map(|p| f.signed_distance(*p)));
+            }
+            Self::Cone(f) => {
+                f.deviation = crate::fit::stats(points.iter().map(|p| f.signed_distance(*p)));
+            }
+            Self::Blend(f) => {
+                f.deviation = crate::fit::stats(points.iter().map(|p| f.signed_distance(*p)));
+            }
+            Self::Pattern(_) | Self::EdgeRound(_) | Self::Freeform => {}
+        }
+    }
+
     pub fn rms(&self) -> Option<f64> {
         match self {
             Self::Plane(f) => Some(f.deviation.rms),

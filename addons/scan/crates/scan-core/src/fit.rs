@@ -16,7 +16,7 @@ pub struct DeviationStats {
     pub max_abs: f64,
 }
 
-fn stats(residuals: impl Iterator<Item = f64>) -> DeviationStats {
+pub(crate) fn stats(residuals: impl Iterator<Item = f64>) -> DeviationStats {
     let mut squared = 0.0;
     let mut max_abs = 0.0f64;
     let mut count = 0usize;
@@ -456,16 +456,20 @@ pub fn fit_cone(samples: &[(Point3, Vector3, f64)]) -> Option<ConeFit> {
     }
     let apex_solution = solve_linear(a, b)?;
     let apex = Point3::new(apex_solution[0], apex_solution[1], apex_solution[2]);
+    // One centroid for all three uses below. Recomputing it inside the map
+    // made the scale check quadratic, which at the 20 000-sample fit budget
+    // is four hundred million point operations to produce one scalar.
+    let center = centroid(points);
     let scale = points
         .iter()
-        .map(|p| (*p - centroid(points)).length())
+        .map(|p| (*p - center).length())
         .fold(0.0f64, f64::max)
         .max(1.0);
-    if (apex - centroid(points)).length() > 200.0 * scale {
+    if (apex - center).length() > 200.0 * scale {
         return None;
     }
     // Point the axis from the apex toward the sampled material.
-    if (centroid(points) - apex).dot(axis) < 0.0 {
+    if (center - apex).dot(axis) < 0.0 {
         axis = axis * -1.0;
     }
     let (e1, e2) = orthonormal_basis(axis);

@@ -16,6 +16,7 @@ pub mod commands;
 mod development_log;
 pub mod document_replay;
 mod export;
+pub mod feature_editor;
 pub mod library_catalog;
 pub mod material;
 pub mod part_library;
@@ -1643,6 +1644,13 @@ pub struct KernelLabApp {
     body_archive: Vec<ArchivedBody>,
     bootstrap_body: Option<BodyId>,
     selected_history_feature: Option<FeatureId>,
+    /// The feature dimension being dragged, and the value so far.
+    ///
+    /// Every applied edit replays the history branch below the feature, so
+    /// the value cannot be committed on each frame of a drag — the draft is
+    /// held here and written once the pointer is released or the field
+    /// surrenders focus.
+    feature_scalar_draft: Option<(FeatureId, usize, f64)>,
     history_scrub_position: usize,
     document_status: Option<String>,
     displayed: Option<DisplayedBody>,
@@ -1804,6 +1812,7 @@ impl Default for KernelLabApp {
             body_archive: Vec::new(),
             bootstrap_body: None,
             selected_history_feature: None,
+            feature_scalar_draft: None,
             history_scrub_position: 0,
             document_status: None,
             displayed: None,
@@ -4674,6 +4683,54 @@ impl KernelLabApp {
             Err(error) => {
                 self.history_scrub_position = self.document.history_position();
                 self.document_status = Some(format!("History rollback rejected: {error}"));
+                false
+            }
+        }
+    }
+
+    /// The numbers the selected feature lets the user change, if any.
+    fn selected_feature_scalars(&self) -> Vec<feature_editor::EditableScalar> {
+        self.selected_history_feature
+            .and_then(|feature| self.document.feature(feature))
+            .filter(|node| !node.state.read_only && !node.state.suppressed)
+            .map(|node| feature_editor::action_scalars(&node.action))
+            .unwrap_or_default()
+    }
+
+    /// Rewrites one of a committed feature's own dimensions and rebuilds the
+    /// history from it.
+    ///
+    /// This is the ordinary parametric edit — change a hole's diameter, get a
+    /// different hole — and it goes through exactly the path a suppression
+    /// does: swap the replay action, then replay the branch. The kernel is
+    /// what decides whether the new number is buildable, so a rejected edit
+    /// leaves the document on its previous state and says why.
+    fn edit_feature_scalar(&mut self, feature: FeatureId, index: usize, value: f64) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        let Some(node) = self.document.feature(feature) else {
+            return false;
+        };
+        if node.state.read_only {
+            self.document_status = Some("That feature cannot be edited".to_owned());
+            return false;
+        }
+        let Some(edited) = feature_editor::with_action_scalar(&node.action, index, value) else {
+            self.document_status =
+                Some("That value is not a dimension this feature can take".to_owned());
+            return false;
+        };
+        match self.document.replace_feature_action(feature, edited) {
+            // An edit that changes nothing is not a failure; it just does not
+            // need a rebuild.
+            Ok(false) => true,
+            Ok(true) => {
+                self.selected_history_feature = Some(feature);
+                self.rebuild_document_from(feature)
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Edit rejected: {error}"));
                 false
             }
         }
@@ -10004,6 +10061,72 @@ impl KernelLabApp {
     /// Material assignment for the active body, and the mass properties that
     /// follow from it. Anything the kernel could not certify is named as
     /// unavailable rather than filled in with a plausible number.
+    /// The selected feature's own dimensions, editable in place.
+    ///
+    /// Each field commits on release rather than on every frame of a drag,
+    /// because applying one replays the whole history branch below the
+    /// feature. Until then the draft is what the field shows, so the number
+    /// under the pointer is the number being typed.
+    fn feature_dimensions_card(&mut self, ui: &mut egui::Ui) {
+        let Some(feature) = self.selected_history_feature else {
+            return;
+        };
+        let scalars = self.selected_feature_scalars();
+        if scalars.is_empty() {
+            return;
+        }
+        let label = self
+            .document
+            .feature(feature)
+            .map(|node| node.label.clone())
+            .unwrap_or_default();
+        status_line(ui, &label, theme::accent());
+
+        let editable = self.pending_operation.is_none() && self.history_is_at_end();
+        let mut commit = None;
+        for (index, scalar) in scalars.iter().enumerate() {
+            let mut shown = match self.feature_scalar_draft {
+                Some((drafted, at, value)) if drafted == feature && at == index => value,
+                _ => scalar.value,
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(scalar.label).small().color(theme::muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let widget = match scalar.kind {
+                        feature_editor::ScalarKind::Length => egui::DragValue::new(&mut shown)
+                            .speed(0.1)
+                            .max_decimals(4)
+                            .range(0.0001..=f64::MAX)
+                            .suffix(" mm"),
+                        feature_editor::ScalarKind::Count => egui::DragValue::new(&mut shown)
+                            .speed(0.1)
+                            .max_decimals(0)
+                            .range(1.0..=f64::from(feature_editor::MAX_PATTERN_COUNT)),
+                    };
+                    let response = ui.add_enabled(editable, widget);
+                    if response.changed() {
+                        self.feature_scalar_draft = Some((feature, index, shown));
+                    }
+                    // One rebuild per gesture, not one per frame of a drag.
+                    if response.drag_stopped() || response.lost_focus() {
+                        commit = Some((index, shown));
+                    }
+                });
+            });
+        }
+        if !editable {
+            ui.label(
+                RichText::new("Roll the history to the end to edit dimensions.")
+                    .small()
+                    .color(theme::muted()),
+            );
+        }
+        if let Some((index, value)) = commit {
+            self.feature_scalar_draft = None;
+            self.edit_feature_scalar(feature, index, value);
+        }
+    }
+
     fn material_card(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.active_body_id() else {
             ui.label(
@@ -10126,6 +10249,21 @@ impl KernelLabApp {
                         unit.symbol()
                     ),
                 );
+                // Same rule as the approximation caveat above: the warning
+                // belongs beside the number it qualifies.
+                if properties.centre_mixes_unknown_density {
+                    ui.label(
+                        RichText::new("UNCERTIFIED · some bodies have no material")
+                            .small()
+                            .strong()
+                            .color(theme::warn()),
+                    )
+                    .on_hover_text(
+                        "Bodies with a material are weighted by mass and the rest by volume, \
+                         so this is neither the centre of mass nor the centroid. Assign a \
+                         material to every visible body to certify it.",
+                    );
+                }
             }
             None => {
                 theme::property_row_unavailable(ui, "Centre of mass", "unavailable for this body");
@@ -12144,6 +12282,17 @@ impl KernelLabApp {
                         self.material_card(ui);
                     });
                     ui.add_space(5.0);
+                    // The selected feature's own dimensions, when it has any
+                    // that stand on their own. A sketch feature's shape lives
+                    // in the sketch, so it offers nothing here and the card
+                    // stays out of the way rather than showing an empty
+                    // section.
+                    if !self.selected_feature_scalars().is_empty() {
+                        collapsible_card(ui, "feature_dimensions", "FEATURE", true, |ui| {
+                            self.feature_dimensions_card(ui);
+                        });
+                        ui.add_space(5.0);
+                    }
                 }
                 let measured_geometry = self.measured_edge_geometry();
                 let measured_face = self.measured_face_area();
@@ -20631,6 +20780,150 @@ mod extrusion_workbench_tests {
             let volume = app.displayed_measures().unwrap().volume;
             assert_eq!(volume > 24.0, adds_material, "{preset:?}: {volume}");
         }
+    }
+
+    #[test]
+    fn a_committed_hole_can_be_redrilled_to_a_different_diameter() {
+        // The parametric edit the workbench could not previously make: the
+        // ribbon commits a hole with fixed literal dimensions, and changing
+        // one afterwards has to replay the branch below it into a genuinely
+        // different solid.
+        let mut app = KernelLabApp::default();
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::Hole);
+        assert!(app.confirm_pending_operation());
+        let feature = app.selected_history_feature.expect("the hole is selected");
+        let drilled = app.displayed_measures().unwrap().volume;
+
+        let scalars = app.selected_feature_scalars();
+        assert_eq!(
+            scalars.iter().map(|s| s.label).collect::<Vec<_>>(),
+            vec!["Diameter", "Depth"],
+            "a hole has to offer its diameter and depth"
+        );
+        assert!(
+            (scalars[0].value - 1.0).abs() < 1e-12,
+            "the ribbon's literal diameter is what the panel starts from"
+        );
+
+        // A wider hole removes more material.
+        assert!(
+            app.edit_feature_scalar(feature, 0, 1.6),
+            "widening the hole should rebuild: {:?}",
+            app.document_status
+        );
+        let widened = app.displayed_measures().unwrap().volume;
+        assert!(
+            widened < drilled - 1e-9,
+            "a 1.6 mm hole must remove more than a 1 mm one: {drilled} then {widened}"
+        );
+        assert!(
+            (app.selected_feature_scalars()[0].value - 1.6).abs() < 1e-12,
+            "the panel must read back the committed diameter"
+        );
+
+        // And the edit is a history edit, not a new feature.
+        assert_eq!(
+            app.document
+                .features()
+                .iter()
+                .filter(|node| node.id == feature)
+                .count(),
+            1,
+            "editing must rewrite the feature, never append another"
+        );
+
+        // Narrowing again returns the volume, so the edit is not one-way.
+        assert!(app.edit_feature_scalar(feature, 0, 1.0));
+        let restored = app.displayed_measures().unwrap().volume;
+        assert!(
+            (restored - drilled).abs() < 1e-9,
+            "restoring the diameter must restore the solid: {drilled} then {restored}"
+        );
+    }
+
+    #[test]
+    fn a_feature_dimension_that_makes_no_sense_is_refused_without_touching_the_model() {
+        let mut app = KernelLabApp::default();
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::Hole);
+        assert!(app.confirm_pending_operation());
+        let feature = app.selected_history_feature.expect("the hole is selected");
+        let before = app.displayed_measures().unwrap().volume;
+
+        for bad in [0.0, -2.0, f64::NAN] {
+            assert!(
+                !app.edit_feature_scalar(feature, 0, bad),
+                "{bad} is not a diameter"
+            );
+        }
+        assert!(
+            !app.edit_feature_scalar(feature, 7, 3.0),
+            "there is no seventh dimension on a hole"
+        );
+        let after = app.displayed_measures().unwrap().volume;
+        assert!(
+            (before - after).abs() < 1e-12,
+            "a refused edit must leave the solid alone: {before} then {after}"
+        );
+        assert!(
+            app.document_status.is_some(),
+            "a refused edit has to say why"
+        );
+    }
+
+    #[test]
+    fn a_pattern_count_is_editable_and_changes_the_solid_count() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::LinearPattern);
+        assert!(app.confirm_pending_operation());
+        let feature = app
+            .selected_history_feature
+            .expect("the pattern is selected");
+        assert_eq!(
+            app.displayed.as_ref().unwrap().snapshot.counts().solids,
+            3,
+            "the ribbon's literal count"
+        );
+        let scalars = app.selected_feature_scalars();
+        assert_eq!(
+            scalars.iter().map(|s| s.label).collect::<Vec<_>>(),
+            vec!["Spacing", "Count"]
+        );
+
+        assert!(
+            app.edit_feature_scalar(feature, 1, 5.0),
+            "the count should rebuild: {:?}",
+            app.document_status
+        );
+        assert_eq!(
+            app.displayed.as_ref().unwrap().snapshot.counts().solids,
+            5,
+            "five copies were asked for"
+        );
+    }
+
+    #[test]
+    fn a_sketch_feature_offers_no_scalar_dimensions() {
+        // Its shape lives in the sketch, so the panel must not invite an edit
+        // that would mean nothing.
+        let app = KernelLabApp::default();
+        assert!(
+            app.selected_feature_scalars().is_empty()
+                || app
+                    .selected_history_feature
+                    .and_then(|feature| app.document.feature(feature))
+                    .is_some_and(|node| !feature_editor::action_scalars(&node.action).is_empty()),
+            "the default selection must not advertise dimensions it cannot write"
+        );
     }
 
     #[test]

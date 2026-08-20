@@ -496,7 +496,7 @@ impl eframe::App for LabApp {
             if let Some(texture) = &self.texture {
                 let available = ui.available_size();
                 let response = ui.add(
-                    egui::Image::from_texture(&*texture)
+                    egui::Image::from_texture(texture)
                         .fit_to_exact_size(available)
                         .sense(egui::Sense::drag()),
                 );

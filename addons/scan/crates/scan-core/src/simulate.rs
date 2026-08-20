@@ -54,7 +54,7 @@ impl Default for SimulateOptions {
             noise: 0.02,
             dropout: 0,
             dropout_size: 6.0,
-            seed: 0x5ca9_ed,
+            seed: 0x005c_a9ed,
         }
     }
 }
@@ -439,7 +439,7 @@ pub fn simulate_scan(mesh: &TriangleMesh, options: &SimulateOptions) -> Simulate
                 .fold(f64::INFINITY, f64::min);
             // Solid loss inside, ragged in the outer band — a scanner's
             // holes do not have clean rims.
-            let drop = nearest < radius * 0.7 || (nearest < radius && rng.next() % 2 == 0);
+            let drop = nearest < radius * 0.7 || (nearest < radius && rng.next().is_multiple_of(2));
             if !drop {
                 kept.push([a, b, c]);
             }

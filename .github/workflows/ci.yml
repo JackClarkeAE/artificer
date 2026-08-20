@@ -58,6 +58,36 @@ jobs:
       - name: Architecture boundaries
         run: bash scripts/check-architecture-boundaries.sh
 
+  scan-addon:
+    # `addons/scan` is a standalone workspace with its own lockfile, so no
+    # root-workspace job compiles it. Without a job of its own it drifts
+    # silently — it had already fallen a release behind on its path
+    # dependency before this existed. It needs no UI libraries: the addon is
+    # headless and depends only on `crates/geometry`.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: addons/scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: addons/scan
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets
+      - name: The lockfile must already be current
+        # `cargo test` above would happily update the lockfile in place and
+        # pass. Checking afterwards is what makes the drift visible.
+        run: git diff --exit-code Cargo.lock
+
   windows:
     runs-on: windows-latest
     steps:

@@ -823,3 +823,65 @@ fn diagonal_offset_cuboids_union_through_the_general_engine() {
         .expect("diagonally offset cubes union");
     assert_volume(&joined, 8.0 + 8.0 - 1.0, "diagonal union");
 }
+
+#[test]
+fn a_seam_crossing_cylindrical_face_keeps_both_of_its_generators() {
+    // A cylindrical face whose angular domain crosses the +/-pi seam, which
+    // is the case branch handling has to get right.
+    //
+    // The face is the arc wall of a circular segment swept from 3pi/4 to
+    // 5pi/4, so its parameter domain is [3pi/4, 5pi/4] — the upper half of
+    // it lies past the principal branch `atan2` returns. Cutting it with a
+    // plane parallel to the axis produces two generators, at 154.16 and
+    // 205.84 degrees. The first is principal-branch and lands in the domain
+    // directly; the second `atan2` reports as -154.16, which is outside
+    // [3pi/4, 5pi/4] and only lands once it is carried onto the face's own
+    // branch. Lose that second imprint and the cut cannot close, so an exact
+    // volume here is what says both generators survived.
+    let radius = 3.0_f64;
+    let height = 5.0_f64;
+    let chord_x = radius * (3.0 * std::f64::consts::FRAC_PI_4).cos();
+    let chord_y = radius * (3.0 * std::f64::consts::FRAC_PI_4).sin();
+
+    let segment = PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: PlanarLoop2 {
+                curves: vec![
+                    PlanarCurve2::CircularArc {
+                        center: Point2::new(0.0, 0.0),
+                        start: Point2::new(chord_x, chord_y),
+                        end: Point2::new(chord_x, -chord_y),
+                        direction: artificer_protocol::ArcDirection::CounterClockwise,
+                    },
+                    PlanarCurve2::Line {
+                        start: Point2::new(chord_x, -chord_y),
+                        end: Point2::new(chord_x, chord_y),
+                    },
+                ],
+            },
+            holes: vec![],
+        }],
+    };
+    let sliver = extrude_profile(segment, Point3::new(0.0, 0.0, 0.0), height, "seam-sliver");
+
+    // Independent closed form: area{x <= d} = r^2 acos(-d/r) + d sqrt(r^2-d^2).
+    let cap = |d: f64| radius.powi(2) * (-d / radius).acos() + d * (radius.powi(2) - d * d).sqrt();
+    assert_volume(&sliver, cap(chord_x) * height, "the segment sliver itself");
+
+    // Trim everything left of x = -2.7, which crosses the arc wall at the
+    // two generators above.
+    let cut_x = -2.7_f64;
+    let knife = extrude_profile(
+        rectangle((-radius - 1.0, -radius - 1.0), (cut_x, radius + 1.0)),
+        Point3::new(0.0, 0.0, -1.0),
+        height + 2.0,
+        "seam-knife",
+    );
+    let trimmed = boolean(&sliver, &knife, BooleanOperation::Difference, "seam-trim")
+        .expect("a plane parallel to the axis meets the cylinder in two generators");
+    assert_volume(
+        &trimmed,
+        (cap(chord_x) - cap(cut_x)) * height,
+        "the trimmed sliver",
+    );
+}

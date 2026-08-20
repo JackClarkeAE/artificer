@@ -207,6 +207,19 @@ fn is_face_list(name: &str) -> bool {
     name == "vertex_indices" || name == "vertex_index"
 }
 
+/// How much to reserve for a list whose length came out of the file.
+///
+/// The length still drives the read loop — a wrong one fails on the first
+/// entry that is not there. It must not drive the *allocation*, though: a
+/// sixty-byte file is free to declare a list of four billion, and
+/// `Vec::with_capacity` would ask the allocator for gigabytes and abort the
+/// process rather than return a `PlyError`. Reserving only what the bytes
+/// left in the body could possibly supply keeps a malformed file a parse
+/// error.
+fn reserve_for(count: usize, remaining_bytes: usize, bytes_per_entry: usize) -> usize {
+    count.min(remaining_bytes / bytes_per_entry.max(1))
+}
+
 fn read_ascii_body(
     body: &[u8],
     elements: &[Element],
@@ -223,6 +236,12 @@ fn read_ascii_body(
     let mut positions = Vec::new();
     let mut faces = Vec::new();
     for element in elements {
+        // An element with no properties reads no bytes, so its declared
+        // count would spin the loop for nothing — and a header is free to
+        // declare four billion of them.
+        if element.properties.is_empty() {
+            continue;
+        }
         for _ in 0..element.count {
             let mut xyz = [f64::NAN; 3];
             for property in &element.properties {
@@ -238,7 +257,10 @@ fn read_ascii_body(
                     }
                     Property::List { name, .. } => {
                         let count = next(&element.name)? as usize;
-                        let mut indices = Vec::with_capacity(count);
+                        // One ascii index costs at least a digit and a
+                        // separator, so the body length bounds how many can
+                        // still arrive.
+                        let mut indices = Vec::with_capacity(reserve_for(count, body.len(), 2));
                         for _ in 0..count {
                             indices.push(next(&element.name)? as u32);
                         }
@@ -281,6 +303,12 @@ fn read_binary_body(
     let mut positions = Vec::new();
     let mut faces = Vec::new();
     for element in elements {
+        // An element with no properties reads no bytes, so its declared
+        // count would spin the loop for nothing — and a header is free to
+        // declare four billion of them.
+        if element.properties.is_empty() {
+            continue;
+        }
         for _ in 0..element.count {
             let mut xyz = [f64::NAN; 3];
             for property in &element.properties {
@@ -296,7 +324,11 @@ fn read_binary_body(
                     }
                     Property::List { name, count, item } => {
                         let entries = read_scalar(*count, body)? as usize;
-                        let mut indices = Vec::with_capacity(entries);
+                        // Each entry occupies its scalar width, so the body
+                        // cannot hold more than that many however large the
+                        // declared count is.
+                        let mut indices =
+                            Vec::with_capacity(reserve_for(entries, body.len(), item.size()));
                         for _ in 0..entries {
                             indices.push(read_scalar(*item, body)? as u32);
                         }
@@ -317,6 +349,70 @@ fn read_binary_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_impossible_list_length_is_an_error_not_an_allocation() {
+        // The face list claims four billion indices and supplies three.
+        // Reserving from that count would ask the allocator for ~17 GB and
+        // abort the process, which no caller can catch.
+        let text = "ply\n\
+            format ascii 1.0\n\
+            element vertex 3\n\
+            property float x\nproperty float y\nproperty float z\n\
+            element face 1\n\
+            property list uint int vertex_indices\n\
+            end_header\n\
+            0 0 0\n1 0 0\n0 1 0\n\
+            4294967295 0 1 2\n";
+        assert!(
+            matches!(read_ply(text.as_bytes()), Err(PlyError::Malformed(_))),
+            "a list length the body cannot satisfy must be a parse error"
+        );
+    }
+
+    #[test]
+    fn a_binary_list_length_past_the_body_is_an_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            b"ply\nformat binary_little_endian 1.0\n\
+              element vertex 3\n\
+              property float x\nproperty float y\nproperty float z\n\
+              element face 1\n\
+              property list uint int vertex_indices\n\
+              end_header\n",
+        );
+        for (x, y, z) in [(0.0f32, 0.0f32, 0.0f32), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+            bytes.extend_from_slice(&y.to_le_bytes());
+            bytes.extend_from_slice(&z.to_le_bytes());
+        }
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        for index in [0i32, 1, 2] {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        assert!(
+            matches!(read_ply(&bytes), Err(PlyError::Truncated)),
+            "a binary list longer than the body must be truncation, not an abort"
+        );
+    }
+
+    #[test]
+    fn an_element_with_no_properties_does_not_spin_on_its_count() {
+        // A property-less element reads no bytes, so its declared count is
+        // pure loop iterations. Four billion of them would hang the import.
+        let text = "ply\n\
+            format ascii 1.0\n\
+            element meta 4294967295\n\
+            element vertex 3\n\
+            property float x\nproperty float y\nproperty float z\n\
+            element face 1\n\
+            property list uchar int vertex_indices\n\
+            end_header\n\
+            0 0 0\n1 0 0\n0 1 0\n\
+            3 0 1 2\n";
+        let mesh = read_ply(text.as_bytes()).expect("property-less element is skipped");
+        assert_eq!(mesh.triangles().len(), 1);
+    }
 
     #[test]
     fn ascii_quad_with_extras_parses() {

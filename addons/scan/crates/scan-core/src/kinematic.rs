@@ -352,16 +352,15 @@ pub fn fit_motion(samples: &[(Point3, Vector3, f64)]) -> Option<MotionFit> {
         }
         let (values, vectors) = eigen_symmetric(schur);
         let axis = Vector3::new(vectors[0][0], vectors[0][1], vectors[0][2]);
-        let mut rhs = Vector3::new(0.0, 0.0, 0.0);
-        for i in 0..3 {
-            let column = Vector3::new(b[0][i], b[1][i], b[2][i]);
-            let value = column.dot(axis);
-            match i {
-                0 => rhs.x = value,
-                1 => rhs.y = value,
-                _ => rhs.z = value,
-            }
-        }
+        // Each component of the right-hand side is one column of `b` read
+        // against the axis.
+        let column_against_axis =
+            |column: usize| Vector3::new(b[0][column], b[1][column], b[2][column]).dot(axis);
+        let rhs = Vector3::new(
+            column_against_axis(0),
+            column_against_axis(1),
+            column_against_axis(2),
+        );
         let moment = apply(&c_inv, rhs) * -1.0;
         let residual = (values[0].max(0.0) / weight_sum).sqrt();
         (axis, moment, residual)

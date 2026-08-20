@@ -511,6 +511,25 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         plan.tree = crate::tree::order_tree(mesh, &features, &plan, Some(alignment), organic);
         plan
     });
+    // Every stage above that moved a surface — snapping, harmonizing, the
+    // shared-parameter solve — left its `DeviationStats` describing where the
+    // surface used to be, and those numbers are what a tolerance decision
+    // downstream of this report reads. Re-measure once, here, for two
+    // reasons: this is past every decision the pipeline makes, so a corrected
+    // residual cannot feed back and change which merges were accepted; and
+    // the datum alignment is in scope, which it has to be. After the datum
+    // stage the stored surfaces are datum-frame while `mesh` is still in scan
+    // coordinates, so the points must be carried across before they can be
+    // measured against anything.
+    for feature in &mut features {
+        let mut points = crate::segment::fit_inputs(mesh, &feature.faces).points;
+        if let Some(alignment) = datum.as_ref() {
+            for point in &mut points {
+                *point = alignment.transform.apply_point(*point);
+            }
+        }
+        feature.surface.recompute_deviation(&points);
+    }
     ReverseReport {
         noise_sigma,
         features,

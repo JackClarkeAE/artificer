@@ -64,11 +64,18 @@ pub struct View {
     right: Vector3,
     up: Vector3,
     back: Vector3,
+    /// Depth of the near plane, in millimetres, scaled to the model.
+    near: f64,
 }
 
 impl View {
     pub fn new(camera: &Camera, center: Point3, diagonal: f64) -> Self {
         let radius = diagonal * camera.radius_scale;
+        // The near plane has to scale with the model: a fixed absolute one
+        // is either behind the geometry on a small part or in front of it on
+        // a large one, and a vertex clipped to a near plane a micron from
+        // the eye projects to coordinates in the hundreds of millions.
+        let near = radius * 1.0e-3;
         let (st, ct) = camera.theta.sin_cos();
         let (sp, cp) = camera.phi.sin_cos();
         let eye = center + Vector3::new(radius * sp * ct, radius * sp * st, radius * cp);
@@ -81,12 +88,59 @@ impl View {
             right,
             up,
             back,
+            near,
         }
     }
 
     pub fn to_view(&self, p: Point3) -> Vector3 {
         let d = p - self.eye;
         Vector3::new(d.dot(self.right), d.dot(self.up), d.dot(self.back))
+    }
+}
+
+/// Cuts a view-space triangle against the near plane, returning the up to
+/// two triangles in front of it and how many there are.
+///
+/// A triangle with a vertex behind the eye has no projection, so the whole
+/// triangle used to be skipped — which punches a hole in the surface the
+/// moment the camera comes close to it, exactly when the operator is
+/// inspecting something. Cutting keeps the part that is genuinely in view.
+/// The polygon that survives one plane has three or four corners, which is
+/// one or two triangles; nothing here allocates.
+fn clip_to_near(triangle: [Vector3; 3], near: f64) -> ([[Vector3; 3]; 2], usize) {
+    let ahead = |v: Vector3| -v.z - near;
+    let mut polygon = [Vector3::default(); 4];
+    let mut corners = 0usize;
+    for index in 0..3 {
+        let current = triangle[index];
+        let next = triangle[(index + 1) % 3];
+        let (from, to) = (ahead(current), ahead(next));
+        if from >= 0.0 {
+            polygon[corners] = current;
+            corners += 1;
+        }
+        if (from >= 0.0) != (to >= 0.0) {
+            // The edge crosses the plane exactly once; keep the crossing.
+            polygon[corners] = current + (next - current) * (from / (from - to));
+            corners += 1;
+        }
+    }
+    match corners {
+        3 => (
+            [
+                [polygon[0], polygon[1], polygon[2]],
+                [Vector3::default(); 3],
+            ],
+            1,
+        ),
+        4 => (
+            [
+                [polygon[0], polygon[1], polygon[2]],
+                [polygon[0], polygon[2], polygon[3]],
+            ],
+            2,
+        ),
+        _ => ([[Vector3::default(); 3]; 2], 0),
     }
 }
 
@@ -112,10 +166,13 @@ pub fn render_pane(
     let height = frame.height as f64;
     let width = pane_width as f64;
     let fov_scale = 1.0 / (0.4f64).tan();
-    // Perspective: screen x = vx / -vz * scale, with -vz the depth.
-    let project = |v: Vector3| -> Option<(f64, f64, f32)> {
+    // Perspective: screen x = vx / -vz * scale, with -vz the depth. The
+    // third component is the *reciprocal* of depth, because that is the
+    // quantity that varies linearly across the screen under a perspective
+    // projection — see the interpolation below.
+    let project = |v: Vector3| -> Option<(f64, f64, f64)> {
         let depth = -v.z;
-        if depth <= 1e-6 {
+        if depth <= 0.0 {
             return None;
         }
         let ndc_x = v.x / depth * fov_scale / (width / height);
@@ -123,16 +180,15 @@ pub fn render_pane(
         Some((
             (ndc_x * 0.5 + 0.5) * width,
             (0.5 - ndc_y * 0.5) * height,
-            depth as f32,
+            depth.recip(),
         ))
     };
     for face in 0..mesh.triangles().len() {
         let [pa, pb, pc] = mesh.triangle_points(face);
         let (va, vb, vc) = (view.to_view(pa), view.to_view(pb), view.to_view(pc));
-        let (Some(a), Some(b), Some(c)) = (project(va), project(vb), project(vc)) else {
-            continue;
-        };
-        // Face normal in view space for two-sided headlight shading.
+        // Face normal in view space for two-sided headlight shading. It
+        // comes off the original triangle, so a cut piece is shaded like the
+        // face it was cut from rather than like its own clipped corners.
         let normal = normalize((vb - va).cross(vc - va));
         let light = (0.30 + 0.62 * normal.z.abs() + 0.08 * normal.y.abs()).min(1.0);
         let base = colors.map_or(SCAN_GRAY, |c| c[face]);
@@ -141,29 +197,46 @@ pub fn render_pane(
             (base[1] as f64 * light) as u8,
             (base[2] as f64 * light) as u8,
         ];
-        let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as usize;
-        let max_x = (a.0.max(b.0).max(c.0).ceil() as usize).min(pane_width.saturating_sub(1));
-        let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as usize;
-        let max_y = (a.1.max(b.1).max(c.1).ceil() as usize).min(frame.height.saturating_sub(1));
-        let area = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
-        if area.abs() < 1e-9 {
-            continue;
-        }
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let py = y as f64 + 0.5;
-                let w0 = ((b.0 - a.0) * (py - a.1) - (px - a.0) * (b.1 - a.1)) / area;
-                let w1 = ((px - a.0) * (c.1 - a.1) - (c.0 - a.0) * (py - a.1)) / area;
-                let w2 = 1.0 - w0 - w1;
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                    continue;
-                }
-                let depth = (a.2 as f64 * w2 + b.2 as f64 * w1 + c.2 as f64 * w0) as f32;
-                let index = y * frame.width + x0 + x;
-                if depth < frame.depth[index] {
-                    frame.depth[index] = depth;
-                    frame.color[index] = shaded;
+        let (pieces, count) = clip_to_near([va, vb, vc], view.near);
+        for piece in pieces.iter().take(count) {
+            let (Some(a), Some(b), Some(c)) =
+                (project(piece[0]), project(piece[1]), project(piece[2]))
+            else {
+                continue;
+            };
+            let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as usize;
+            let max_x = (a.0.max(b.0).max(c.0).ceil() as usize).min(pane_width.saturating_sub(1));
+            let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as usize;
+            let max_y = (a.1.max(b.1).max(c.1).ceil() as usize).min(frame.height.saturating_sub(1));
+            let area = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
+            if area.abs() < 1e-9 {
+                continue;
+            }
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    let px = x as f64 + 0.5;
+                    let py = y as f64 + 0.5;
+                    let w0 = ((b.0 - a.0) * (py - a.1) - (px - a.0) * (b.1 - a.1)) / area;
+                    let w1 = ((px - a.0) * (c.1 - a.1) - (c.0 - a.0) * (py - a.1)) / area;
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                        continue;
+                    }
+                    // Depth itself is not linear in screen space under a
+                    // perspective projection; its reciprocal is. Averaging
+                    // the depths directly puts a steeply-angled triangle at
+                    // the wrong distance and lets it win the buffer against
+                    // a face that is genuinely nearer.
+                    let inverse_depth = a.2 * w2 + b.2 * w1 + c.2 * w0;
+                    if inverse_depth <= 0.0 {
+                        continue;
+                    }
+                    let depth = inverse_depth.recip() as f32;
+                    let index = y * frame.width + x0 + x;
+                    if depth < frame.depth[index] {
+                        frame.depth[index] = depth;
+                        frame.color[index] = shaded;
+                    }
                 }
             }
         }
@@ -284,4 +357,117 @@ pub fn encode_png(width: usize, height: usize, pixels: &[[u8; 3]]) -> Vec<u8> {
     png_chunk(&mut out, b"IDAT", &deflate);
     png_chunk(&mut out, b"IEND", &[]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth;
+
+    fn v(x: f64, y: f64, z: f64) -> Vector3 {
+        Vector3::new(x, y, z)
+    }
+
+    /// Depth is `-z`, so a vertex is in front of a near plane at `near` when
+    /// `-z >= near`.
+    #[test]
+    fn a_triangle_entirely_in_front_is_passed_through_whole() {
+        let triangle = [v(0.0, 0.0, -10.0), v(1.0, 0.0, -10.0), v(0.0, 1.0, -12.0)];
+        let (pieces, count) = clip_to_near(triangle, 1.0);
+        assert_eq!(count, 1);
+        assert_eq!(pieces[0], triangle);
+    }
+
+    #[test]
+    fn a_triangle_entirely_behind_is_dropped() {
+        let triangle = [v(0.0, 0.0, 1.0), v(1.0, 0.0, 2.0), v(0.0, 1.0, 0.5)];
+        assert_eq!(clip_to_near(triangle, 1.0).1, 0);
+    }
+
+    #[test]
+    fn one_vertex_behind_the_near_plane_becomes_two_triangles() {
+        // Two corners in front, one behind: the surviving polygon is a quad,
+        // which is two triangles. Dropping it whole is what used to put a
+        // hole in the surface when the camera came close.
+        let triangle = [v(0.0, 0.0, -10.0), v(4.0, 0.0, -10.0), v(0.0, 4.0, 4.0)];
+        let (pieces, count) = clip_to_near(triangle, 1.0);
+        assert_eq!(count, 2, "a quad is two triangles");
+        for piece in pieces.iter().take(count) {
+            for corner in piece {
+                assert!(
+                    -corner.z >= 1.0 - 1e-9,
+                    "every surviving corner must be in front of the near plane: {corner:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_vertices_behind_the_near_plane_leave_one_triangle() {
+        let triangle = [v(0.0, 0.0, -10.0), v(4.0, 0.0, 4.0), v(0.0, 4.0, 4.0)];
+        let (pieces, count) = clip_to_near(triangle, 1.0);
+        assert_eq!(count, 1);
+        for corner in &pieces[0] {
+            assert!(
+                -corner.z >= 1.0 - 1e-9,
+                "corner behind the plane: {corner:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clipping_lands_the_cut_exactly_on_the_near_plane() {
+        // The crossing point is what a naive drop-the-triangle renderer
+        // never computes, so its position is worth pinning.
+        let triangle = [v(0.0, 0.0, -3.0), v(0.0, 0.0, 1.0), v(0.0, 2.0, -3.0)];
+        let (pieces, count) = clip_to_near(triangle, 1.0);
+        assert!(count >= 1);
+        let on_plane = pieces
+            .iter()
+            .take(count)
+            .flatten()
+            .filter(|corner| (-corner.z - 1.0).abs() < 1e-9)
+            .count();
+        assert!(on_plane >= 1, "the cut has to sit on the plane");
+    }
+
+    #[test]
+    fn a_near_face_hides_a_far_one_whatever_angle_they_meet_at() {
+        // Perspective-correct depth matters most for steeply-angled
+        // geometry: interpolating depth linearly across the screen puts the
+        // middle of a slanted triangle nearer than it is, which is how a far
+        // surface used to punch through a near one.
+        let mesh = synth::plate_with_boss();
+        let bounds = mesh.bounds().expect("the fixture has extent");
+        let center = Point3::new(
+            (bounds.min.x + bounds.max.x) / 2.0,
+            (bounds.min.y + bounds.max.y) / 2.0,
+            (bounds.min.z + bounds.max.z) / 2.0,
+        );
+        let diagonal = (bounds.max - bounds.min).length();
+        let view = View::new(&Camera::default(), center, diagonal);
+        let mut frame = Framebuffer::new(96, 96);
+        render_pane(&mut frame, 0, 96, &mesh, &view, None);
+
+        let drawn = frame.depth.iter().filter(|d| d.is_finite()).count();
+        assert!(
+            drawn > 500,
+            "the plate should cover much of the frame: {drawn}"
+        );
+        assert!(
+            frame.depth.iter().all(|d| !d.is_nan() && *d > 0.0),
+            "no pixel may take a negative or NaN depth"
+        );
+        // Every written depth has to sit between the near plane and the far
+        // side of the model, which a mis-interpolated depth would not.
+        let far = diagonal * 4.0;
+        assert!(
+            frame
+                .depth
+                .iter()
+                .filter(|d| d.is_finite())
+                .all(|&d| f64::from(d) > 0.0 && f64::from(d) < far),
+            "a depth landed outside the model's own extent"
+        );
+    }
 }

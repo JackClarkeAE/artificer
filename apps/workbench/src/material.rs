@@ -148,6 +148,18 @@ pub struct MassProperties {
     /// when masses are unknown, and is `None` when the kernel could not
     /// certify a centroid for some body.
     pub centre: Option<[f64; 3]>,
+    /// True when [`Self::centre`] was accumulated over a mix of bodies that
+    /// do have a density and bodies that do not.
+    ///
+    /// Either weighting is meaningful on its own: with a density everywhere
+    /// the result is the centre of mass, and with a density nowhere the
+    /// density cancels and the result is the centroid. Mixing them is not —
+    /// a body weighted by `density x volume` outweighs one weighted by
+    /// `volume` alone by roughly its density, so the unassigned bodies drop
+    /// out of the average. The number stays available because it is still
+    /// the best estimate on hand, but it is not certified, and the panel
+    /// says so.
+    pub centre_mixes_unknown_density: bool,
 }
 
 /// Accumulates mass properties across bodies.
@@ -159,6 +171,7 @@ pub struct MassAccumulator {
     weighted: [f64; 3],
     weight: f64,
     every_body_has_centroid: bool,
+    any_body_has_density: bool,
     started: bool,
 }
 
@@ -172,6 +185,7 @@ impl MassAccumulator {
             weighted: [0.0; 3],
             weight: 0.0,
             every_body_has_centroid: true,
+            any_body_has_density: false,
             started: false,
         }
     }
@@ -183,13 +197,19 @@ impl MassAccumulator {
         self.started = true;
         self.volume += volume;
         match density {
-            Some(density) => self.mass += density * volume * 1.0e-6,
+            Some(density) => {
+                self.mass += density * volume * 1.0e-6;
+                self.any_body_has_density = true;
+            }
             None => self.every_body_has_mass = false,
         }
         match centroid {
             Some(centroid) => {
-                // Weight by mass when known, otherwise by volume; both reduce
-                // to the same centre for a single material.
+                // Weight by mass when known, otherwise by volume. Either is
+                // right on its own — with one density everywhere it cancels —
+                // but a mix of the two is not, which is what
+                // `any_body_has_density` alongside `every_body_has_mass`
+                // records for the caller.
                 let weight = density.map_or(volume, |density| density * volume);
                 self.weight += weight;
                 for (accumulated, coordinate) in self.weighted.iter_mut().zip(centroid) {
@@ -208,6 +228,9 @@ impl MassAccumulator {
             volume: self.volume,
             mass_grams: (self.started && self.every_body_has_mass).then_some(self.mass),
             centre,
+            centre_mixes_unknown_density: centre.is_some()
+                && self.any_body_has_density
+                && !self.every_body_has_mass,
         }
     }
 }
@@ -262,6 +285,41 @@ mod tests {
         let properties = accumulator.finish();
         assert_eq!(properties.centre, None);
         assert!(properties.mass_grams.is_some());
+    }
+
+    #[test]
+    fn a_centre_mixing_weighted_and_unweighted_bodies_says_it_is_uncertified() {
+        // One assigned body and one unassigned: the assigned body's weight is
+        // density x volume and the other's is volume alone, so the assigned
+        // one outweighs it ~2700:1 and the "centre" sits almost on top of it.
+        // The number stays, but it must not read as certified.
+        let mut mixed = MassAccumulator::new();
+        mixed.add(1000.0, Some([0.0, 0.0, 0.0]), Some(2700.0));
+        mixed.add(1000.0, Some([10.0, 0.0, 0.0]), None);
+        let properties = mixed.finish();
+        let centre = properties.centre.expect("still the best estimate on hand");
+        assert!(
+            centre[0] < 0.01,
+            "the unassigned body is all but ignored: {centre:?}"
+        );
+        assert!(
+            properties.centre_mixes_unknown_density,
+            "a mixed weighting has to declare itself"
+        );
+
+        // Densities everywhere is a real centre of mass.
+        let mut all_assigned = MassAccumulator::new();
+        all_assigned.add(1000.0, Some([0.0, 0.0, 0.0]), Some(2700.0));
+        all_assigned.add(1000.0, Some([10.0, 0.0, 0.0]), Some(2700.0));
+        assert!(!all_assigned.finish().centre_mixes_unknown_density);
+
+        // Densities nowhere cancels out, leaving the centroid.
+        let mut none_assigned = MassAccumulator::new();
+        none_assigned.add(1000.0, Some([0.0, 0.0, 0.0]), None);
+        none_assigned.add(1000.0, Some([10.0, 0.0, 0.0]), None);
+        let properties = none_assigned.finish();
+        assert!(!properties.centre_mixes_unknown_density);
+        assert!((properties.centre.expect("centroid")[0] - 5.0).abs() < 1.0e-12);
     }
 
     #[test]

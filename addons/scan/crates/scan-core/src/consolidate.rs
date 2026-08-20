@@ -71,6 +71,26 @@ fn same_kind(a: &SurfaceClass, b: &SurfaceClass) -> bool {
     )
 }
 
+/// One merge candidate: the two feature indices, the round they join
+/// through if any, and how many mesh edges they share.
+type MergeCandidate = (usize, usize, Option<usize>, usize);
+
+/// The order merge candidates are evaluated in.
+///
+/// Shared-edge count decides, but it ties constantly — symmetric parts are
+/// the normal case. The tie has to be broken on something intrinsic to the
+/// candidate, because the list is built by iterating a `HashMap` and that
+/// order is randomised per map instance. A stable sort would then hand the
+/// choice between two tied, mutually exclusive merges to the hash seed, and
+/// the pipeline promises a deterministic result. Appending the indices makes
+/// this a total order over distinct candidates.
+fn candidate_order(
+    candidate: &MergeCandidate,
+) -> (std::cmp::Reverse<usize>, usize, usize, Option<usize>) {
+    let &(a, b, via_round, count) = candidate;
+    (std::cmp::Reverse(count), a, b, via_round)
+}
+
 pub struct ConsolidateOutcome {
     pub merges: usize,
     pub rounds_dissolved: usize,
@@ -112,7 +132,7 @@ pub fn consolidate_features(
         }
         // Candidates: same-kind pairs touching directly, or joined only
         // through an edge round (the round's two biggest neighbours).
-        let mut candidates: Vec<(usize, usize, Option<usize>, usize)> = Vec::new();
+        let mut candidates: Vec<MergeCandidate> = Vec::new();
         for (&(a, b), &count) in &boundary {
             if count < MIN_SHARED_EDGES {
                 continue;
@@ -154,7 +174,7 @@ pub fn consolidate_features(
                 }
             }
         }
-        candidates.sort_by_key(|&(_, _, _, count)| std::cmp::Reverse(count));
+        candidates.sort_by_key(candidate_order);
         // Evaluate: union refit, safety cap, then the description-length
         // decision. First accepted merge restarts the pass.
         let mut applied = false;
@@ -740,6 +760,43 @@ mod tests {
         assert_eq!(cylinders, 1, "halves did not unify");
         let owned: usize = features.iter().map(|f| f.face_count).sum();
         assert_eq!(owned, mesh.triangles().len(), "faces lost");
+    }
+
+    #[test]
+    fn candidate_order_is_total_so_ties_cannot_follow_the_hash_seed() {
+        // Every candidate here shares the same edge count, which is the
+        // case that used to fall through a stable sort to HashMap order.
+        let tied: Vec<MergeCandidate> = vec![
+            (0, 1, None, 12),
+            (2, 3, None, 12),
+            (0, 3, Some(7), 12),
+            (0, 3, None, 12),
+            (1, 2, None, 12),
+        ];
+        let mut expected = tied.clone();
+        expected.sort_by_key(candidate_order);
+
+        // Whatever order the map handed them over in, the evaluation order
+        // must come out the same.
+        for rotation in 0..tied.len() {
+            let mut shuffled = tied.clone();
+            shuffled.rotate_left(rotation);
+            shuffled.sort_by_key(candidate_order);
+            assert_eq!(
+                shuffled, expected,
+                "rotation {rotation} sorted to a different evaluation order"
+            );
+        }
+        let mut reversed = tied.clone();
+        reversed.reverse();
+        reversed.sort_by_key(candidate_order);
+        assert_eq!(reversed, expected, "reversed input sorted differently");
+
+        // And the key must still put the strongest candidate first.
+        let mut mixed: Vec<MergeCandidate> =
+            vec![(9, 9, None, 3), (0, 1, None, 40), (4, 5, None, 12)];
+        mixed.sort_by_key(candidate_order);
+        assert_eq!(mixed[0].3, 40, "edge count must outrank the tie-break");
     }
 
     #[test]

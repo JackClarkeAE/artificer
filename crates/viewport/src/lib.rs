@@ -3061,6 +3061,7 @@ fn vertex_at_position(
     position: Pos2,
 ) -> Option<DocumentVertexSelection> {
     let mut closest = None::<(f32, DocumentVertexSelection)>;
+    let bias = occlusion_bias(triangles);
     for body in bodies {
         let presentation =
             InstancePresentation::for_body(body, active_body, active_transform, animation_phase);
@@ -3072,7 +3073,14 @@ fn vertex_at_position(
             let screen = projection.camera_point(camera);
             let distance = position.distance(screen);
             if distance > MODEL_VERTEX_HIT_RADIUS
-                || vertex_is_occluded(body.key, vertex.point, camera.depth, screen, triangles)
+                || vertex_is_occluded(
+                    body.key,
+                    vertex.point,
+                    camera.depth,
+                    screen,
+                    triangles,
+                    bias,
+                )
             {
                 continue;
             }
@@ -3091,21 +3099,33 @@ fn vertex_at_position(
     closest.map(|(_, selection)| selection)
 }
 
-fn vertex_is_occluded(
-    body: BodyInstanceKey,
-    point: Point3,
-    depth: f64,
-    screen: Pos2,
-    triangles: &[ProjectedTriangle],
-) -> bool {
-    let depth_span = triangles
+/// How far behind a vertex a face has to sit before it counts as covering it.
+///
+/// The tolerance is a fraction of the scene's own depth range rather than a
+/// fixed epsilon, so it means the same thing on a 2 mm part and a 2 m one.
+/// That range is a property of the frame, not of the vertex — computing it
+/// per vertex walked every triangle again for each one, which on a dense body
+/// is tens of millions of comparisons a frame to produce one number. Callers
+/// resolve it once and pass it down.
+fn occlusion_bias(triangles: &[ProjectedTriangle]) -> f64 {
+    let (minimum, maximum) = triangles
         .iter()
         .flat_map(|triangle| triangle.vertex_depths)
         .fold(
             (f64::INFINITY, f64::NEG_INFINITY),
             |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
         );
-    let bias = ((depth_span.1 - depth_span.0).abs() * 2.0e-6).max(1.0e-7);
+    ((maximum - minimum).abs() * 2.0e-6).max(1.0e-7)
+}
+
+fn vertex_is_occluded(
+    body: BodyInstanceKey,
+    point: Point3,
+    depth: f64,
+    screen: Pos2,
+    triangles: &[ProjectedTriangle],
+    bias: f64,
+) -> bool {
     triangles.iter().any(|triangle| {
         let incident = triangle.body == body
             && triangle.model_vertices.iter().any(|candidate| {
@@ -3138,6 +3158,7 @@ fn paint_vertices(
     if !interactive && selected.is_none() && selected_vertices.is_empty() {
         return;
     }
+    let bias = occlusion_bias(triangles);
     for body in bodies {
         let presentation =
             InstancePresentation::for_body(body, active_body, active_transform, animation_phase);
@@ -3157,7 +3178,14 @@ fn paint_vertices(
             }
             let camera = presentation.project_point(vertex.point, view);
             let screen = projection.camera_point(camera);
-            if vertex_is_occluded(body.key, vertex.point, camera.depth, screen, triangles) {
+            if vertex_is_occluded(
+                body.key,
+                vertex.point,
+                camera.depth,
+                screen,
+                triangles,
+                bias,
+            ) {
                 continue;
             }
             let color = if Some(identity) == selected || selected_vertices.contains(&identity) {

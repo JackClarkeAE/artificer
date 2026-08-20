@@ -83,6 +83,23 @@ struct Entity {
     args: Vec<Value>,
 }
 
+/// Stands in for an argument the file never wrote.
+static MISSING_ARGUMENT: Value = Value::Null;
+
+impl Entity {
+    /// Argument `index`, or `Null` when the entity carries fewer arguments
+    /// than this build expects.
+    ///
+    /// Indexing directly would panic on a short entity, and a STEP file is
+    /// free to write one. Every accessor on [`Value`] already reads `Null`
+    /// as absent, so a truncated entity flows into the same named
+    /// `StepError` a missing reference produces instead of taking the
+    /// process down.
+    fn arg(&self, index: usize) -> &Value {
+        self.args.get(index).unwrap_or(&MISSING_ARGUMENT)
+    }
+}
+
 /// The DATA section as an id-keyed entity graph.
 struct Graph {
     entities: std::collections::HashMap<u64, Entity>,
@@ -141,7 +158,8 @@ impl Graph {
     fn frame(&self, id: u64) -> Result<(Point3, Vector3, Vector3, Vector3), StepError> {
         let entity = self.get(id, "AXIS2_PLACEMENT_3D")?;
         let origin = self.point(
-            entity.args[1]
+            entity
+                .arg(1)
                 .as_ref()
                 .ok_or_else(|| StepError::Syntax(format!("placement #{id} lacks a location")))?,
         )?;
@@ -179,7 +197,24 @@ impl Graph {
 
 /// Parses the tokens inside one entity's argument parentheses.
 fn parse_arguments(text: &str) -> Result<Vec<Value>, StepError> {
-    fn parse_list(chars: &[u8], mut at: usize) -> Result<(Vec<Value>, usize), StepError> {
+    /// How deep argument lists may nest before the parse is refused.
+    ///
+    /// `parse_list` recurses once per `(`, so without a ceiling a file of
+    /// nothing but open parentheses overflows the stack — which aborts the
+    /// process rather than returning `StepError`. Real STEP arguments nest a
+    /// handful of levels; 64 is far past anything a writer emits.
+    const MAX_NESTING: u32 = 64;
+
+    fn parse_list(
+        chars: &[u8],
+        mut at: usize,
+        depth: u32,
+    ) -> Result<(Vec<Value>, usize), StepError> {
+        if depth > MAX_NESTING {
+            return Err(StepError::Syntax(format!(
+                "argument lists nest deeper than {MAX_NESTING} levels"
+            )));
+        }
         let mut values = Vec::new();
         loop {
             while at < chars.len() && (chars[at] as char).is_whitespace() {
@@ -194,7 +229,7 @@ fn parse_arguments(text: &str) -> Result<Vec<Value>, StepError> {
                     at += 1;
                 }
                 '(' => {
-                    let (inner, next) = parse_list(chars, at + 1)?;
+                    let (inner, next) = parse_list(chars, at + 1, depth + 1)?;
                     values.push(Value::List(inner));
                     at = next;
                 }
@@ -270,7 +305,7 @@ fn parse_arguments(text: &str) -> Result<Vec<Value>, StepError> {
         }
     }
     let chars = text.as_bytes();
-    let (values, _) = parse_list(chars, 0)?;
+    let (values, _) = parse_list(chars, 0, 0)?;
     Ok(values)
 }
 
@@ -341,23 +376,30 @@ struct EdgePoints {
 
 fn discretize_edge(graph: &Graph, edge_id: u64, chord: f64) -> Result<EdgePoints, StepError> {
     let edge = graph.get(edge_id, "EDGE_CURVE")?;
-    let start_vertex = edge.args[1]
+    let start_vertex = edge
+        .arg(1)
         .as_ref()
         .ok_or_else(|| StepError::Topology("edge without start vertex".into()))?;
-    let end_vertex = edge.args[2]
+    let end_vertex = edge
+        .arg(2)
         .as_ref()
         .ok_or_else(|| StepError::Topology("edge without end vertex".into()))?;
-    let curve_id = edge.args[3]
+    let curve_id = edge
+        .arg(3)
         .as_ref()
         .ok_or_else(|| StepError::Topology("edge without curve".into()))?;
-    let same_sense = edge.args[4].is_true();
+    let same_sense = edge.arg(4).is_true();
     let start = graph.point(
-        graph.get(start_vertex, "VERTEX_POINT")?.args[1]
+        graph
+            .get(start_vertex, "VERTEX_POINT")?
+            .arg(1)
             .as_ref()
             .ok_or_else(|| StepError::Topology("vertex without point".into()))?,
     )?;
     let end = graph.point(
-        graph.get(end_vertex, "VERTEX_POINT")?.args[1]
+        graph
+            .get(end_vertex, "VERTEX_POINT")?
+            .arg(1)
             .as_ref()
             .ok_or_else(|| StepError::Topology("vertex without point".into()))?,
     )?;
@@ -368,10 +410,12 @@ fn discretize_edge(graph: &Graph, edge_id: u64, chord: f64) -> Result<EdgePoints
     let mut points = match curve.kind.as_str() {
         "LINE" => vec![start, end],
         "CIRCLE" => {
-            let placement = curve.args[1]
+            let placement = curve
+                .arg(1)
                 .as_ref()
                 .ok_or_else(|| StepError::Syntax("circle without placement".into()))?;
-            let radius = curve.args[2]
+            let radius = curve
+                .arg(2)
                 .as_num()
                 .ok_or_else(|| StepError::Syntax("circle without radius".into()))?
                 * graph.scale;
@@ -441,7 +485,8 @@ fn loop_polyline(
     chord: f64,
 ) -> Result<Vec<Point3>, StepError> {
     let edge_loop = graph.get(loop_id, "EDGE_LOOP")?;
-    let oriented = edge_loop.args[1]
+    let oriented = edge_loop
+        .arg(1)
         .as_list()
         .ok_or_else(|| StepError::Topology("edge loop without edge list".into()))?;
     let mut polyline: Vec<Point3> = Vec::new();
@@ -450,13 +495,13 @@ fn loop_polyline(
             .as_ref()
             .ok_or_else(|| StepError::Topology("edge loop holds a non-reference".into()))?;
         let oriented_edge = graph.get(oriented_id, "ORIENTED_EDGE")?;
-        let edge_id = oriented_edge.args[3]
+        let edge_id = oriented_edge
+            .arg(3)
             .as_ref()
             .ok_or_else(|| StepError::Topology("oriented edge without edge".into()))?;
-        let forwards = oriented_edge.args[4].is_true();
-        if !cache.contains_key(&edge_id) {
-            let discretized = discretize_edge(graph, edge_id, chord)?;
-            cache.insert(edge_id, discretized);
+        let forwards = oriented_edge.arg(4).is_true();
+        if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(edge_id) {
+            slot.insert(discretize_edge(graph, edge_id, chord)?);
         }
         let points = &cache[&edge_id].points;
         let walk: Vec<Point3> = if forwards {
@@ -833,19 +878,23 @@ fn orient_revolved(
 /// discretized to it; seam lines lie on the surface exactly), so they
 /// never trip the test and the face's rim is left untouched — which is
 /// what keeps the joint with the neighbouring face exact.
+/// A point welded onto a 0.1 um lattice, so the two faces that share an
+/// edge agree on its midpoint exactly rather than to within rounding.
+type Quantized = (i64, i64, i64);
+
 fn refine_onto_surface(
     strip: Vec<[Point3; 3]>,
     project: &impl Fn(Point3) -> Point3,
     chord: f64,
 ) -> Vec<[Point3; 3]> {
-    let key = |p: Point3| -> (i64, i64, i64) {
+    let key = |p: Point3| -> Quantized {
         (
             (p.x * 1e7).round() as i64,
             (p.y * 1e7).round() as i64,
             (p.z * 1e7).round() as i64,
         )
     };
-    let mut midpoints: std::collections::HashMap<((i64, i64, i64), (i64, i64, i64)), Point3> =
+    let mut midpoints: std::collections::HashMap<(Quantized, Quantized), Point3> =
         std::collections::HashMap::new();
     let mut split_of = |a: Point3, b: Point3| -> Option<Point3> {
         let middle = Point3::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0, (a.z + b.z) / 2.0);
@@ -928,13 +977,15 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
     let mut refused: Vec<String> = Vec::new();
     for &face_id in &face_ids {
         let face = graph.get(face_id, "ADVANCED_FACE")?;
-        let bounds = face.args[1]
+        let bounds = face
+            .arg(1)
             .as_list()
             .ok_or_else(|| StepError::Topology("face without bounds".into()))?;
-        let surface_id = face.args[2]
+        let surface_id = face
+            .arg(2)
             .as_ref()
             .ok_or_else(|| StepError::Topology("face without surface".into()))?;
-        let same_sense = face.args[3].is_true();
+        let same_sense = face.arg(3).is_true();
         let surface = graph
             .entities
             .get(&surface_id)
@@ -950,7 +1001,8 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
                 .get(&bound_id)
                 .ok_or_else(|| StepError::Topology(format!("bound #{bound_id} absent")))?;
             let is_outer = bound.kind == "FACE_OUTER_BOUND";
-            let loop_id = bound.args[1]
+            let loop_id = bound
+                .arg(1)
                 .as_ref()
                 .ok_or_else(|| StepError::Topology("bound without loop".into()))?;
             let polyline = loop_polyline(&graph, loop_id, &mut cache, chord)?;
@@ -959,7 +1011,8 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
         loops.sort_by_key(|(is_outer, _)| std::cmp::Reverse(*is_outer));
         let face_triangles: Vec<[Point3; 3]> = match surface.kind.as_str() {
             "PLANE" => {
-                let placement = surface.args[1]
+                let placement = surface
+                    .arg(1)
                     .as_ref()
                     .ok_or_else(|| StepError::Syntax("plane without placement".into()))?;
                 let (origin, x, y, z) = graph.frame(placement)?;
@@ -1015,18 +1068,20 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
                 triangles
             }
             "CYLINDRICAL_SURFACE" | "CONICAL_SURFACE" => {
-                let placement = surface.args[1]
+                let placement = surface
+                    .arg(1)
                     .as_ref()
                     .ok_or_else(|| StepError::Syntax("surface without placement".into()))?;
                 let (origin, x, y, z) = graph.frame(placement)?;
-                let radius = surface.args[2]
-                    .as_num()
-                    .ok_or_else(|| StepError::Syntax("revolved surface without radius".into()))?
-                    * graph.scale;
+                let radius =
+                    surface.arg(2).as_num().ok_or_else(|| {
+                        StepError::Syntax("revolved surface without radius".into())
+                    })? * graph.scale;
                 // A cone's radius grows along +z by the tangent of its
                 // half angle; a cylinder's does not.
                 let slope = if surface.kind == "CONICAL_SURFACE" {
-                    surface.args[3]
+                    surface
+                        .arg(3)
                         .as_num()
                         .ok_or_else(|| StepError::Syntax("cone without a half angle".into()))?
                         .tan()
@@ -1197,6 +1252,38 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nesting_past_the_ceiling_is_refused_rather_than_overflowing() {
+        // parse_list recurses once per '(', so an all-parentheses file would
+        // take the stack down — an abort no caller can catch.
+        let deep = "(".repeat(10_000);
+        assert!(
+            matches!(parse_arguments(&deep), Err(StepError::Syntax(_))),
+            "deep nesting must be a syntax error, not a stack overflow"
+        );
+    }
+
+    #[test]
+    fn ordinary_nesting_still_parses() {
+        let values = parse_arguments("(1.,(2.,(3.))))").expect("three levels is ordinary");
+        assert!(matches!(values.first(), Some(Value::List(_))));
+    }
+
+    #[test]
+    fn a_short_entity_reads_as_missing_rather_than_panicking() {
+        // An EDGE_CURVE written with three arguments where this build reads
+        // five. Indexing directly would panic out of bounds.
+        let entity = Entity {
+            kind: "EDGE_CURVE".into(),
+            args: vec![Value::Null, Value::Ref(1), Value::Ref(2)],
+        };
+        assert_eq!(entity.arg(2).as_ref(), Some(2));
+        assert_eq!(*entity.arg(3), Value::Null);
+        assert_eq!(entity.arg(3).as_ref(), None);
+        assert!(!entity.arg(4).is_true());
+        assert_eq!(entity.arg(9_999).as_num(), None);
+    }
 
     #[test]
     fn arguments_parse_nested_lists_strings_and_enums() {
