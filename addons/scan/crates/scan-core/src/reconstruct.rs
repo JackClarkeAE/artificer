@@ -1201,6 +1201,10 @@ pub(crate) fn fold_axial_ring(
     const THETA_CELLS: usize = 96;
     const RHO_CELLS: usize = 24;
     const MIN_MEMBER_AREA: f64 = 150.0;
+    /// How much the folded height field must rise and fall across one
+    /// sector, in multiples of tolerance, for the fold to be describing
+    /// teeth rather than a surface of revolution.
+    const MIN_AZIMUTHAL_RELIEF: f64 = 2.0;
     let sector = std::f64::consts::TAU / count as f64;
     struct Sample {
         theta: f64,
@@ -1335,6 +1339,41 @@ pub(crate) fn fold_axial_ring(
             }
         })
         .collect();
+    // A castellated ring has teeth: its folded height field rises and falls
+    // with azimuth. A surface of revolution does not — and a field that is
+    // constant in azimuth folds *perfectly at every count*, because every
+    // sample agrees with every other one at the same radius no matter what
+    // sector width is used. The residual test above therefore cannot tell a
+    // ring of teeth from a plain fillet, and will report whichever count it
+    // was handed with a residual near zero.
+    //
+    // That is not hypothetical: the turned part in
+    // `filleted_corner_is_recognized_and_planned` has an axisymmetric fillet
+    // ring, and depending on where the datum estimate lands — which differs
+    // between platforms at the fourth decimal of a degree — the band was
+    // claimed here as a 16-fold castellation before blend recognition could
+    // read it as the revolved fillet it is.
+    //
+    // So the fold has to explain some real relief. Below that it is
+    // explaining nothing, the count is unidentifiable, and a surface of
+    // revolution is both the simpler description and one the pipeline
+    // already has a proper path for.
+    let azimuthal_relief = (0..RHO_CELLS)
+        .filter_map(|row| {
+            let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+            for column in 0..THETA_CELLS {
+                let z = grid_z[row * THETA_CELLS + column];
+                if z.is_finite() {
+                    low = low.min(z);
+                    high = high.max(z);
+                }
+            }
+            (low <= high).then_some(high - low)
+        })
+        .fold(0.0f64, f64::max);
+    if azimuthal_relief < MIN_AZIMUTHAL_RELIEF * tolerance {
+        return None;
+    }
     // Quantize the field onto the levels the ring actually uses. A dog
     // ring is prismatic: two or three flat levels — the lands either side
     // of the teeth, the tooth tops, the gap floors — joined by walls.
@@ -3146,6 +3185,70 @@ mod tests {
                 .any(|n| n.contains("axis locked")),
             "axis lock never engaged"
         );
+    }
+
+    #[test]
+    fn an_axisymmetric_band_is_never_folded_into_a_ring_pattern() {
+        use crate::transform::RigidTransform;
+
+        // A flat annulus is a surface of revolution: its height field does
+        // not vary with azimuth. Folding it at *any* count therefore leaves
+        // a residual of zero, because every sample agrees with every other
+        // one at the same radius whatever sector width is used — so the
+        // fold's own residual test cannot reject it and something else has
+        // to. Without that guard a plain fillet ring gets claimed as a
+        // castellation before blend recognition can read it.
+        let mut soup = synth::disk_soup(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+            20.0,
+            192,
+        );
+        // A wall so the band has some vertical extent to sit in.
+        soup.extend(synth::open_cylinder_soup(20.0, 2.0, 192, 4));
+        let mesh = crate::mesh::TriangleMesh::from_triangle_soup(&soup, 1e-9).unwrap();
+        let faces: Vec<u32> = (0..mesh.triangles().len() as u32).collect();
+        let alignment = DatumAlignment {
+            transform: RigidTransform::to_frame(
+                Point3::default(),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+            )
+            .unwrap(),
+            notes: Vec::new(),
+        };
+
+        for count in [4, 8, 12, 16, 24] {
+            let mut features = vec![FeatureRecord {
+                id: 0,
+                surface: SurfaceClass::Freeform,
+                face_count: faces.len(),
+                area: faces.iter().map(|&f| mesh.face_area(f as usize)).sum(),
+                faces: faces.clone(),
+                notes: Vec::new(),
+            }];
+            let folded = fold_axial_ring(
+                &mesh,
+                &mut features,
+                &alignment,
+                count,
+                -0.5,
+                0.5,
+                2.0,
+                20.0,
+                0.05,
+            );
+            assert!(
+                folded.is_none(),
+                "an axisymmetric annulus was folded as a {count}-fold ring"
+            );
+            assert!(
+                !features
+                    .iter()
+                    .any(|f| matches!(f.surface, SurfaceClass::Pattern(_))),
+                "a {count}-fold claim escaped into the feature list"
+            );
+        }
     }
 
     #[test]
