@@ -122,6 +122,11 @@ pub struct StageMetric {
     pub stage: String,
     pub features: usize,
     pub classified_fraction: f64,
+    /// Wall-clock seconds this stage took. A pipeline that answers in
+    /// fifteen seconds on one part and an hour on another is asking to
+    /// be measured, and the stage table is where a reader already
+    /// looks to see what each stage did.
+    pub seconds: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +146,11 @@ pub struct ReverseReport {
     /// The scan's estimated noise sigma (mm), from the residual floor
     /// of local plane fits — what the adaptive stages scaled by.
     pub noise_sigma: f64,
+    /// Fits demoted for not describing their own material. A demotion
+    /// is a finding — some stage produced a surface its own faces
+    /// disown — so it travels with the report rather than being
+    /// folded into the parameter notes, and every consumer can say so.
+    pub demotions: Vec<String>,
     /// The tolerance the run was performed at, so later stages (rebuild)
     /// can reason in the same noise units rather than re-guessing.
     pub tolerance: f64,
@@ -196,19 +206,25 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         })
         .collect();
     let mut stages: Vec<StageMetric> = Vec::new();
-    let record_stage = |stages: &mut Vec<StageMetric>, name: &str, features: &[FeatureRecord]| {
-        let total: f64 = features.iter().map(|f| f.area).sum();
-        let classified: f64 = features
-            .iter()
-            .filter(|f| !matches!(f.surface, SurfaceClass::Freeform))
-            .map(|f| f.area)
-            .sum();
-        stages.push(StageMetric {
-            stage: name.to_owned(),
-            features: features.len(),
-            classified_fraction: if total > 0.0 { classified / total } else { 0.0 },
-        });
-    };
+    let mut stage_mark = std::time::Instant::now();
+    let mut record_stage =
+        |stages: &mut Vec<StageMetric>, name: &str, features: &[FeatureRecord]| {
+            let total: f64 = features.iter().map(|f| f.area).sum();
+            let classified: f64 = features
+                .iter()
+                .filter(|f| !matches!(f.surface, SurfaceClass::Freeform))
+                .map(|f| f.area)
+                .sum();
+            let now = std::time::Instant::now();
+            let seconds = now.duration_since(stage_mark).as_secs_f64();
+            stage_mark = now;
+            stages.push(StageMetric {
+                stage: name.to_owned(),
+                features: features.len(),
+                classified_fraction: if total > 0.0 { classified / total } else { 0.0 },
+                seconds,
+            });
+        };
     record_stage(&mut stages, "segment+classify", &features);
     if let Some(ransac) = &options.ransac {
         let mut params = *ransac;
@@ -272,6 +288,27 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         features = merge_fragments(mesh, features, merge_epsilon);
         features = absorb_into_anchors(mesh, features, merge_epsilon);
     }
+    // Trust, then verify: every stage above hands its claims on without
+    // ever re-reading the scan, so a fit that stopped describing its own
+    // material travels the whole pipeline unchallenged. Ask each one
+    // whether its faces are still on it, and demote the ones that are
+    // not — freeform is where an honest second attempt can be made.
+    let mut support_notes: Vec<String> = Vec::new();
+    {
+        let support = crate::validate::demote_unsupported(
+            mesh,
+            &mut features,
+            &crate::transform::RigidTransform::IDENTITY,
+            options.tolerance,
+        );
+        if support.demoted > 0 {
+            support_notes.push(format!(
+                "{} fit(s) totalling {:.0} mm^2 did not describe their own material and were demoted",
+                support.demoted, support.demoted_area
+            ));
+            support_notes.extend(support.notes);
+        }
+    }
     record_stage(&mut stages, "merge+absorb", &features);
     // Publish what the part offers before saying which was taken: the
     // datum is the decision every later stage is expressed in, and a
@@ -294,14 +331,14 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             ));
         }
     }
-    let datum = if options.auto_datum {
+    let mut datum = if options.auto_datum {
         crate::datum::datum_alignment_on(&features, options.datum_choice.unwrap_or(0))
     } else {
         None
     };
     let mut detected_pattern: Option<PatternProposal> = None;
     let mut master_profiles: Vec<MasterProfile> = Vec::new();
-    if let Some(alignment) = &datum {
+    if let Some(alignment) = datum.as_mut() {
         // With a datum axis known, near-axis cylinders refit with the axis
         // locked: noisy patch axes stop wobbling, radii cluster, and a
         // second merge pass stitches interrupted bands into one surface.
@@ -322,6 +359,68 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         // re-stitching, so locking axes any earlier hides its donors from
         // it and leaves the fragments it would have stitched.
         lock_revolved_surfaces(mesh, &mut features, alignment, options.tolerance);
+        // Ask the datum again, now that the answer can be known.
+        //
+        // The frame has to be chosen before any of the stages above
+        // can run, which is exactly when the feature set is at its
+        // most fragmented: on a noisy scan it is hundreds of thousands
+        // of shards, and the part's own axis — carried by a wall that
+        // has not been stitched together yet — has no coherent
+        // representative among them, while one small chamfer cone is a
+        // whole, well-fitted feature that wins on its own. That put
+        // the origin on a lug hole, 40 mm out, and every revolved
+        // stage then reasoned about the wrong centre while reporting
+        // healthy residuals. Stitching has since made the part's own
+        // surfaces whole, so the question is worth re-asking here.
+        //
+        // Only the origin is revisited. The direction was settled by
+        // an area-weighted vote over every feature, which fragments do
+        // not fool, and the features are already expressed about it.
+        {
+            /// A correction smaller than this (mm) is not worth the
+            /// churn — and on a healthy part there is nothing to fix.
+            const ORIGIN_CORRECTION_MIN: f64 = 0.5;
+            let axis = Vector3::new(0.0, 0.0, 1.0);
+            if let Some((point, area, members)) =
+                crate::datum::dominant_axis_line(&features, axis)
+            {
+                let offset = Vector3::new(point.x, point.y, 0.0);
+                if offset.length() > ORIGIN_CORRECTION_MIN {
+                    let correction = crate::transform::RigidTransform {
+                        rotation: crate::transform::RigidTransform::IDENTITY.rotation,
+                        translation: offset * -1.0,
+                    };
+                    for feature in &mut features {
+                        feature.surface = feature.surface.transformed(&correction);
+                    }
+                    alignment.transform = alignment.transform.then(&correction);
+                    datum_notes.push(format!(
+                        "origin corrected by {:.2} mm once stitching matured the features: \
+                         the axis is now backed by {area:.0} mm^2 of {members} coaxial \
+                         feature(s)",
+                        offset.length()
+                    ));
+                }
+            }
+        }
+        // The second checkpoint. Everything since the first ran in the
+        // datum frame — a second merge, band stitching, axis locking —
+        // and each can move a surface off the material it stands for.
+        {
+            let support = crate::validate::demote_unsupported(
+                mesh,
+                &mut features,
+                &alignment.transform,
+                options.tolerance,
+            );
+            if support.demoted > 0 {
+                support_notes.push(format!(
+                    "after datum: {} fit(s) totalling {:.0} mm^2 no longer described their material",
+                    support.demoted, support.demoted_area
+                ));
+                support_notes.extend(support.notes);
+            }
+        }
         record_stage(&mut stages, "datum+lock+bands", &features);
         detected_pattern = detect_circular_pattern(mesh, &features, alignment);
         if let Some(pattern) = &detected_pattern
@@ -532,6 +631,7 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
     }
     ReverseReport {
         noise_sigma,
+        demotions: support_notes,
         features,
         total_area,
         classified_area,
@@ -664,6 +764,14 @@ pub fn report_to_json(report: &ReverseReport) -> String {
                     fit.axis.x, fit.axis.y, fit.axis.z, fit.major_radius, fit.minor_radius
                 ));
             }
+            SurfaceClass::Torus(fit) => {
+                out.push(',');
+                push_point(&mut out, "axis_point", fit.axis_point);
+                out.push_str(&format!(
+                    ",\"axis\":[{:.6},{:.6},{:.6}],\"major_radius\":{:.6},\"minor_radius\":{:.6}",
+                    fit.axis.x, fit.axis.y, fit.axis.z, fit.major_radius, fit.minor_radius
+                ));
+            }
             SurfaceClass::Pattern(fit) => {
                 out.push(',');
                 push_point(&mut out, "axis_point", fit.axis_point);
@@ -736,14 +844,21 @@ pub fn report_summary(report: &ReverseReport) -> String {
             out.push_str(&format!("  - {note}\n"));
         }
     }
+    if !report.demotions.is_empty() {
+        out.push_str("fits that did not describe their own material:\n");
+        for note in &report.demotions {
+            out.push_str(&format!("  - {note}\n"));
+        }
+    }
     if !report.stages.is_empty() {
-        out.push_str("stage progress (features / classified):\n");
+        out.push_str("stage progress (features / classified / seconds):\n");
         for stage in &report.stages {
             out.push_str(&format!(
-                "  {:<20} {:>6}   {:>5.1}%\n",
+                "  {:<20} {:>6}   {:>5.1}%   {:>7.1}s\n",
                 stage.stage,
                 stage.features,
-                stage.classified_fraction * 100.0
+                stage.classified_fraction * 100.0,
+                stage.seconds
             ));
         }
     }
@@ -807,6 +922,14 @@ pub fn report_summary(report: &ReverseReport) -> String {
                 fit.apex.x,
                 fit.apex.y,
                 fit.apex.z
+            ),
+            SurfaceClass::Torus(fit) => format!(
+                "torus    R {:.3} r {:.3} axis ({:+.3} {:+.3} {:+.3})",
+                fit.major_radius,
+                fit.minor_radius,
+                fit.axis.x,
+                fit.axis.y,
+                fit.axis.z
             ),
             SurfaceClass::Blend(fit) => format!(
                 "fillet   r {:.3} ring d {:.3} at z {:+.3}",

@@ -15,6 +15,9 @@ use crate::segment::SurfaceClass;
 use crate::transform::{RigidTransform, normalize, orthonormal_basis};
 
 /// Directions closer than this (degrees) merge into one direction cluster.
+/// Axis lines laterally closer than this (mm) are one line, and so
+/// vote together for the datum's lateral origin.
+const AXIS_LINE_TOL: f64 = 2.0;
 const CLUSTER_ANGLE_DEG: f64 = 5.0;
 /// A cluster is "perpendicular" to Z when within this many degrees of 90.
 const PERPENDICULAR_SLACK_DEG: f64 = 10.0;
@@ -75,7 +78,12 @@ fn feature_direction(surface: &SurfaceClass) -> Option<Vector3> {
         SurfaceClass::Cone(fit) => Some(fit.axis),
         SurfaceClass::Blend(fit) => Some(fit.axis),
         SurfaceClass::Pattern(fit) => Some(fit.axis),
-        SurfaceClass::Sphere(_) | SurfaceClass::EdgeRound(_) | SurfaceClass::Freeform => None,
+        // A moulded torus curves about wherever the tool left it, not
+        // about the part's axis, so it must not vote on the datum.
+        SurfaceClass::Sphere(_)
+        | SurfaceClass::Torus(_)
+        | SurfaceClass::EdgeRound(_)
+        | SurfaceClass::Freeform => None,
     }
 }
 
@@ -120,6 +128,94 @@ pub fn auto_datum_alignment(features: &[FeatureRecord]) -> Option<DatumAlignment
 /// stage downstream — the revolved profile, band extraction, patterns —
 /// asks whether a surface is "about the datum axis", so this is the one
 /// decision that changes what the pipeline is able to recognize at all.
+/// The axis line the most material agrees on, in whatever frame the
+/// features are expressed in: its point (axial component dropped), the
+/// area backing it, and how many features voted.
+///
+/// "Axis parallel to `z`" is not "is the part's own axis" — every
+/// hole, boss and chamfer on a plate is parallel to it too. Taking the
+/// single largest such feature therefore puts the frame wherever the
+/// biggest patch happens to lie. What distinguishes the part's own
+/// axis is that the most material is coaxial with it, so fragments
+/// vote together as a line and the heaviest line wins. Same idiom as
+/// the datum *direction*, which has always been an area-weighted vote
+/// rather than a single winner.
+pub fn dominant_axis_line(
+    features: &[FeatureRecord],
+    z: Vector3,
+) -> Option<(Point3, f64, usize)> {
+    let cos_near = CLUSTER_ANGLE_DEG.to_radians().cos();
+    struct AxisLine {
+        /// Where the line is: taken from the single best-conditioned
+        /// member, never averaged. A large cylinder pins an axis to a
+        /// fraction of the noise; a small cone's apex wanders, and a
+        /// shallow one's sits hundreds of millimetres from its own
+        /// material. Averaging them lets the weak locators drag the
+        /// strong one — on a turned synthetic that moved the origin
+        /// 0.02 mm and read a 1.5 mm fillet as 1.44.
+        point: Point3,
+        /// The area of the member that supplied `point`.
+        best: f64,
+        /// Total area agreeing with the line: this is what decides
+        /// which line wins.
+        area: f64,
+        members: usize,
+    }
+    let lateral_gap = |a: Point3, b: Point3| {
+        let offset = a - b;
+        (offset - z * offset.dot(z)).length()
+    };
+    let mut lines: Vec<AxisLine> = Vec::new();
+    for feature in features {
+        let candidate = match &feature.surface {
+            SurfaceClass::Cylinder(fit) if fit.axis.dot(z).abs() >= cos_near => {
+                Some(fit.axis_point)
+            }
+            SurfaceClass::Cone(fit) if fit.axis.dot(z).abs() >= cos_near => Some(fit.apex),
+            SurfaceClass::Sphere(fit) => Some(fit.center),
+            _ => None,
+        };
+        let Some(point) = candidate else { continue };
+        match lines
+            .iter_mut()
+            .find(|line| lateral_gap(line.point, point) <= AXIS_LINE_TOL)
+        {
+            Some(line) => {
+                if feature.area > line.best {
+                    line.point = point;
+                    line.best = feature.area;
+                }
+                line.area += feature.area;
+                line.members += 1;
+            }
+            None => lines.push(AxisLine {
+                point,
+                best: feature.area,
+                area: feature.area,
+                members: 1,
+            }),
+        }
+    }
+    // Heaviest line wins; ties break on position so the frame never
+    // depends on iteration order.
+    lines.sort_by(|a, b| {
+        b.area
+            .total_cmp(&a.area)
+            .then(a.point.x.total_cmp(&b.point.x))
+            .then(a.point.y.total_cmp(&b.point.y))
+    });
+    lines.first().map(|line| {
+        // Only the lateral part means anything — the height comes from
+        // the level plane — so drop the axial part rather than letting
+        // whichever feature voted decide the last bits of it.
+        (
+            line.point - z * (line.point - Point3::default()).dot(z),
+            line.area,
+            line.members,
+        )
+    })
+}
+
 pub fn datum_alignment_on(features: &[FeatureRecord], choice: usize) -> Option<DatumAlignment> {
     let clusters = cluster_directions(
         features
@@ -165,28 +261,30 @@ pub fn datum_alignment_on(features: &[FeatureRecord], choice: usize) -> Option<D
         }
     };
     let cos_near = CLUSTER_ANGLE_DEG.to_radians().cos();
-    // Lateral origin: the axis line of the largest cylinder or cone whose
-    // axis follows Z; spheres and plane centroids are weaker fallbacks.
-    let mut lateral: Option<(f64, Point3, &'static str)> = None;
-    for feature in features {
-        let candidate = match &feature.surface {
-            SurfaceClass::Cylinder(fit) if fit.axis.dot(z).abs() >= cos_near => {
-                Some((fit.axis_point, "cylinder axis"))
-            }
-            SurfaceClass::Cone(fit) if fit.axis.dot(z).abs() >= cos_near => {
-                Some((fit.apex, "cone apex"))
-            }
-            SurfaceClass::Sphere(fit) => Some((fit.center, "sphere center")),
-            _ => None,
-        };
-        if let Some((point, label)) = candidate
-            && lateral.is_none_or(|(best_area, _, _)| feature.area > best_area)
-        {
-            lateral = Some((feature.area, point, label));
-        }
-    }
-    let (lateral_point, lateral_label) = match lateral {
-        Some((_, point, label)) => (point, label),
+    // Lateral origin: the axis *line* the most material agrees on.
+    //
+    // "Axis parallel to Z" is not "is the part's own axis" — every
+    // hole, boss and chamfer on a plate is Z-parallel too. Taking the
+    // single largest such feature therefore puts the frame wherever
+    // the biggest patch happens to lie, and the datum is chosen when
+    // the feature set is at its most fragmented: the outer wall is
+    // still a dozen unstitched pieces while one chamfer cone is whole.
+    // On a noisy wheel spacer that landed the origin on a lug hole,
+    // 40 mm off the part's axis, and every revolved stage afterwards —
+    // band stitching, axis locking, pattern detection — reasoned about
+    // the wrong centre while reporting healthy residuals.
+    //
+    // What distinguishes the part's own axis is not any one feature's
+    // size but that the most material is coaxial with it, so fragments
+    // vote together as a line and the heaviest line wins. Same idiom
+    // as the datum *direction*, which has always been an area-weighted
+    // vote rather than a single winner.
+    let dominant = dominant_axis_line(features, z);
+    let (lateral_point, lateral_label) = match dominant {
+        Some((point, area, members)) => (
+            point,
+            format!("axis line backed by {area:.0} mm^2 of {members} coaxial feature(s)"),
+        ),
         None => {
             let fallback = features
                 .iter()
@@ -195,7 +293,7 @@ pub fn datum_alignment_on(features: &[FeatureRecord], choice: usize) -> Option<D
                     _ => None,
                 })
                 .unwrap_or_default();
-            (fallback, "largest plane centroid")
+            (fallback, "largest plane centroid".to_owned())
         }
     };
     // Height origin: the largest plane perpendicular to Z sets Z = 0.

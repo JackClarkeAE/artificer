@@ -1,0 +1,31 @@
+# artificer-scan bench fixtures
+#
+# One part per line. The scan is simulated from the source CAD at a
+# fixed seed, so any machine reproduces any row exactly and losing the
+# scratchpad costs only the time to regenerate.
+#
+# Ground truth is read off the source, never off the pipeline's own
+# output — scoring a fitter against its own answers proves nothing.
+# The wheel spacer's STEP carries 8 circles at r=5.0 (four bores, top
+# and bottom edge each), so its bores are d=10.00 exactly; the 8 at
+# r=6.0 are the chamfer mouths at d=12.00. The DIN rail carries no
+# circles at all, so it must find no bores — a fitter that invents one
+# there has regressed, and expecting zero is how the bench says so.
+#
+# keys: name source density smooth noise dropout dropout_size seed
+#       bores bore_d bore_tol
+#
+# smooth is the scanner spot radius. 0.35 is the simulator default and
+# the realistic case; the -sharp rows set it to 0 to isolate noise
+# handling from spot rounding, which is a different question.
+#
+# spacer-fast is the iteration fixture: coarse enough to answer in
+# seconds. The rest are the truth, and are slow on purpose.
+
+name=spacer-fast source=bench/parts/wheel-spacer.step density=0.6 smooth=0.35 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+name=spacer-clean source=bench/parts/wheel-spacer.step density=0.25 smooth=0.35 noise=0.0 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+name=spacer-n001 source=bench/parts/wheel-spacer.step density=0.25 smooth=0.35 noise=0.01 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+name=spacer-n003 source=bench/parts/wheel-spacer.step density=0.25 smooth=0.35 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+name=rail-n003 source=bench/parts/din-rail-200mm.step density=0.4 smooth=0 noise=0.03 seed=7 bores=0 bore_d=0
+name=spacer-n003-sharp source=bench/parts/wheel-spacer.step density=0.25 smooth=0 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+name=spacer-fast-sharp source=bench/parts/wheel-spacer.step density=0.6 smooth=0 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15

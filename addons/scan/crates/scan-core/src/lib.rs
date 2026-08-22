@@ -18,6 +18,7 @@
 //! [`report::reverse_engineer`] chains stages 3-5 and emits a structured
 //! report ready for feature reconstruction in the kernel.
 
+pub mod bench;
 pub mod blend;
 pub mod consolidate;
 pub mod constrain;
@@ -50,6 +51,7 @@ pub mod stl;
 pub mod synth;
 pub mod transform;
 pub mod tree;
+pub mod validate;
 
 pub use consolidate::{consolidate_features, solve_shared_parameters};
 pub use datum::{DatumAlignment, auto_datum_alignment};

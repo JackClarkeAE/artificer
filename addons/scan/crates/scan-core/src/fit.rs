@@ -580,3 +580,402 @@ mod tests {
         assert!(fit.axis.dot(axis) > 1.0 - 1e-8);
     }
 }
+
+/// Fits a torus to a patch without being told its axis.
+///
+/// [`fit_revolved_blend`] already fits a torus, but only when the
+/// revolve axis is known — it is how a fillet ring is recovered on a
+/// turned part. A moulded surface has no such axis to hand, and the
+/// primitive is needed for a different reason: a cast panel crowned
+/// unequally along its two principal directions is not a sphere, and
+/// the sphere the vocabulary currently offers is stretched over it and
+/// carries the mismatch as systematic residual. Over a 100 mm panel
+/// crowned at 2000 mm one way and 6000 mm the other, that residual is
+/// three times the measurement noise: the fit passes tolerance while
+/// describing a shape the part does not have. A torus has two
+/// independent principal radii and describes it exactly.
+///
+/// The axis is found rather than assumed. Over a shallow patch the
+/// surface is its own second-order expansion, so the frame comes from a
+/// plane fit, a quadric is fitted in that frame by linear least squares
+/// — stable, unlike a direct seven-parameter torus solve — and its
+/// Hessian's eigenvalues are the principal curvatures. At a torus's
+/// outer equator the tube curvature 1/r runs along the axis and the
+/// parallel curvature 1/(R+r) runs around it, so the sharper principal
+/// direction *is* the axis and the two radii fall out by inversion.
+///
+/// Returns `None` for saddles (the two curvatures disagree in sign),
+/// for a patch too near-spherical to have a meaningful major radius,
+/// and for one too near-cylindrical — each of those has a simpler
+/// primitive that fits it better, and offering a degenerate torus
+/// instead would only take work away from a model that deserves it.
+pub fn fit_torus(points: &[Point3]) -> Option<RevolvedBlendFit> {
+    // A/B switch for a primitive with no ground truth to score against.
+    // It lives here rather than at any one call site because the torus
+    // is reachable from two of them, and a switch that silences only
+    // one produces a comparison that looks clean and is not.
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("ARTIFICER_NO_TORUS").is_some()) {
+        return None;
+    }
+    /// Below this the major radius is noise and the patch is a sphere.
+    const MIN_MAJOR: f64 = 1e-3;
+    /// Above this the patch is a cylinder wearing a torus costume.
+    const MAX_MAJOR: f64 = 1.0e6;
+    if points.len() < 10 {
+        return None;
+    }
+    let plane = fit_plane(points, None)?;
+    let normal = plane.normal;
+    // Any pair spanning the plane will do; the quadric is diagonalized
+    // afterwards, so the frame's rotation about the normal is arbitrary.
+    let hint = if normal.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let u = {
+        let raw = hint - normal * hint.dot(normal);
+        let length = raw.length();
+        if length < 1e-9 {
+            return None;
+        }
+        raw / length
+    };
+    let v = normal.cross(u);
+    let centroid = plane.origin;
+    // z = a x^2 + b xy + c y^2 + d x + e y + f, in the plane's frame.
+    let mut matrix = vec![vec![0.0; 6]; 6];
+    let mut rhs = vec![0.0; 6];
+    for point in points {
+        let offset = Vector3::new(
+            point.x - centroid.x,
+            point.y - centroid.y,
+            point.z - centroid.z,
+        );
+        let (x, y, z) = (offset.dot(u), offset.dot(v), offset.dot(normal));
+        let row = [x * x, x * y, y * y, x, y, 1.0];
+        for i in 0..6 {
+            rhs[i] += row[i] * z;
+            for j in 0..6 {
+                matrix[i][j] += row[i] * row[j];
+            }
+        }
+    }
+    let quadric = solve_linear(matrix, rhs)?;
+    let (a, b, c) = (quadric[0], quadric[1], quadric[2]);
+    if !(a.is_finite() && b.is_finite() && c.is_finite()) {
+        return None;
+    }
+    // Principal curvatures: eigenvalues of [[2a, b], [b, 2c]].
+    let (h11, h12, h22) = (2.0 * a, b, 2.0 * c);
+    let mean = 0.5 * (h11 + h22);
+    let spread = (0.25 * (h11 - h22) * (h11 - h22) + h12 * h12).max(0.0).sqrt();
+    let (kappa_1, kappa_2) = (mean + spread, mean - spread);
+    // A saddle is not a torus patch at its outer equator, and the
+    // vocabulary should say so rather than fit something plausible.
+    if kappa_1 * kappa_2 <= 0.0 {
+        return None;
+    }
+    let (sharp, gentle) = if kappa_1.abs() >= kappa_2.abs() {
+        (kappa_1, kappa_2)
+    } else {
+        (kappa_2, kappa_1)
+    };
+    let minor_radius = 1.0 / sharp.abs();
+    let major_radius = 1.0 / gentle.abs() - minor_radius;
+    if !(major_radius.is_finite() && (MIN_MAJOR..=MAX_MAJOR).contains(&major_radius)) {
+        return None;
+    }
+    // The axis runs along the sharper principal direction: at the outer
+    // equator the tube's own curvature is the one measured along it.
+    let axis_angle = if h12.abs() < 1e-15 && (h11 - h22).abs() < 1e-15 {
+        0.0
+    } else {
+        0.5 * (2.0 * h12).atan2(h11 - h22)
+    };
+    let (first, second) = (
+        u * axis_angle.cos() + v * axis_angle.sin(),
+        u * -axis_angle.sin() + v * axis_angle.cos(),
+    );
+    let axis = if (kappa_1 - sharp).abs() < 1e-12 { first } else { second };
+    // The centre of curvature sits on whichever side the patch bends
+    // toward, and the axis passes through it.
+    let side = if sharp > 0.0 { 1.0 } else { -1.0 };
+    let axis_point = centroid + normal * (side * (major_radius + minor_radius));
+    let seed = RevolvedBlendFit {
+        axis_point,
+        axis,
+        major_radius,
+        minor_radius,
+        deviation: DeviationStats {
+            rms: 0.0,
+            max_abs: 0.0,
+        },
+    };
+    // The quadric is only the leading term, so finish on the true torus
+    // distance the same way every other fit here does.
+    let refined = refine_least_squares(
+        vec![
+            axis_point.x,
+            axis_point.y,
+            axis_point.z,
+            axis.x,
+            axis.y,
+            axis.z,
+            major_radius,
+            minor_radius,
+        ],
+        |p| {
+            let Some(direction) = normalize(Vector3::new(p[3], p[4], p[5])) else {
+                return points.iter().map(|_| 0.0).collect();
+            };
+            let candidate = RevolvedBlendFit {
+                axis_point: Point3::new(p[0], p[1], p[2]),
+                axis: direction,
+                major_radius: p[6],
+                minor_radius: p[7],
+                deviation: DeviationStats {
+                    rms: 0.0,
+                    max_abs: 0.0,
+                },
+            };
+            points.iter().map(|q| candidate.signed_distance(*q)).collect()
+        },
+        30,
+    );
+    let fit = match normalize(Vector3::new(refined[3], refined[4], refined[5])) {
+        Some(direction)
+            if refined[6].is_finite()
+                && refined[7].is_finite()
+                && refined[7] > 0.0
+                && (MIN_MAJOR..=MAX_MAJOR).contains(&refined[6]) =>
+        {
+            RevolvedBlendFit {
+                axis_point: Point3::new(refined[0], refined[1], refined[2]),
+                axis: direction,
+                major_radius: refined[6],
+                minor_radius: refined[7],
+                deviation: DeviationStats {
+                    rms: 0.0,
+                    max_abs: 0.0,
+                },
+            }
+        }
+        // Refinement wandered somewhere unusable; the seed still
+        // describes the patch, so report that rather than nothing.
+        _ => seed,
+    };
+    let deviation = stats(points.iter().map(|p| fit.signed_distance(*p)));
+    // The curvature has to be measurably there. A seven-parameter
+    // surface will fit almost any small noisy patch, and an absolute
+    // radius ceiling is no defence: on a prismatic part this produced
+    // tori across flat and cylindrical faces and cost twelve points of
+    // invented surface — geometry emitted where the scan has none. It
+    // is the same failure the revolved-band extractor already names,
+    // where a shallow taper fits an absurd sphere whenever the
+    // vocabulary offers one.
+    //
+    // So gate on evidence rather than on magnitude. Across a patch of
+    // this extent, the gentler principal radius bows the surface away
+    // from flat by roughly `(extent/2)^2 / 2R`. Unless that sagitta
+    // stands clear of the fit's own residual, nothing here distinguishes
+    // the curve from noise, and the honest answer is that this patch is
+    // not evidence of a torus. The same test set the flat-versus-crowned
+    // crossover at the noise floor, which is where it belongs.
+    if !torus_is_evidenced(&fit, points) {
+        return None;
+    }
+    Some(RevolvedBlendFit { deviation, ..fit })
+}
+
+/// Whether a patch actually evidences the torus fitted to it.
+///
+/// Across a patch of this extent the gentler principal radius bows the
+/// surface away from flat by roughly `(extent/2)^2 / 2R`. Unless that
+/// sagitta stands clear of the residual, nothing distinguishes the curve
+/// from noise and the patch is not evidence of a torus.
+///
+/// This is deliberately separate from the fit so it can be asked again
+/// later. A surface is fitted to one set of faces and then grows: merge,
+/// absorption and consolidation all change what a feature owns, and a
+/// torus that was evidenced by the patch it was born on may own
+/// something quite different by the end. Testing only at birth lets an
+/// unevidenced torus survive to the output wearing a freshly measured
+/// deviation that says nothing about whether it should exist.
+pub(crate) fn torus_is_evidenced(fit: &RevolvedBlendFit, points: &[Point3]) -> bool {
+    /// How far the bow must stand clear of the residual to count as
+    /// curvature rather than as noise.
+    const EVIDENCE: f64 = 3.0;
+    if points.len() < 10 {
+        return false;
+    }
+    let count = points.len() as f64;
+    let centroid = Point3::new(
+        points.iter().map(|p| p.x).sum::<f64>() / count,
+        points.iter().map(|p| p.y).sum::<f64>() / count,
+        points.iter().map(|p| p.z).sum::<f64>() / count,
+    );
+    // Each radius has to be evidenced by the direction it actually
+    // curves in, which one isotropic extent cannot express. A long thin
+    // band bends along its length and barely wraps the tube at all: a
+    // 69 mm^2 sliver 42 mm long survived an isotropic test claiming a
+    // 2548 mm sweep about a 6.6 mm tube, because its length alone
+    // carried the measure while the tube radius rested on a width of
+    // about a millimetre and a half. The tube's curvature runs along the
+    // axis and the sweep's runs around it, so measure the patch in both
+    // and ask each radius to earn its own.
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut across = 0.0f64;
+    for point in points {
+        let v = Vector3::new(
+            point.x - centroid.x,
+            point.y - centroid.y,
+            point.z - centroid.z,
+        );
+        let along = v.dot(fit.axis);
+        low = low.min(along);
+        high = high.max(along);
+        across = across.max((v - fit.axis * along).length());
+    }
+    let meridian = high - low;
+    let parallel = 2.0 * across;
+    let rms = stats(points.iter().map(|p| fit.signed_distance(*p))).rms;
+    let bar = EVIDENCE * rms;
+    let tube = (meridian * meridian) / (8.0 * fit.minor_radius.max(1e-9));
+    let sweep = (parallel * parallel) / (8.0 * (fit.major_radius + fit.minor_radius).max(1e-9));
+    tube >= bar && sweep >= bar
+}
+
+#[cfg(test)]
+mod torus_tests {
+    use super::*;
+
+    /// A patch of a real torus about +Z, sampled near its outer equator.
+    fn torus_patch(major: f64, minor: f64, span: f64, steps: usize) -> Vec<Point3> {
+        let mut points = Vec::new();
+        for i in 0..=steps {
+            for j in 0..=steps {
+                let theta = -span + 2.0 * span * i as f64 / steps as f64;
+                let phi = -span + 2.0 * span * j as f64 / steps as f64;
+                let ring = major + minor * phi.cos();
+                points.push(Point3::new(
+                    ring * theta.cos(),
+                    ring * theta.sin(),
+                    minor * phi.sin(),
+                ));
+            }
+        }
+        points
+    }
+
+    #[test]
+    fn a_torus_patch_gives_back_its_own_radii_without_being_told_the_axis() {
+        let points = torus_patch(50.0, 10.0, 0.45, 24);
+        let fit = fit_torus(&points).expect("a torus patch fits a torus");
+        assert!(
+            (fit.major_radius - 50.0).abs() < 0.5,
+            "major {} should be 50",
+            fit.major_radius
+        );
+        assert!(
+            (fit.minor_radius - 10.0).abs() < 0.2,
+            "minor {} should be 10",
+            fit.minor_radius
+        );
+        // The axis was never supplied: it has to fall out of the patch.
+        assert!(
+            fit.axis.z.abs() > 0.99,
+            "axis {:?} should be +Z",
+            (fit.axis.x, fit.axis.y, fit.axis.z)
+        );
+        assert!(fit.deviation.rms < 1e-3, "rms {}", fit.deviation.rms);
+    }
+
+    #[test]
+    fn an_unequally_crowned_panel_fits_to_its_two_principal_radii() {
+        // The moulded case: a 100 mm panel crowned 2000 mm one way and
+        // 6000 mm the other. A sphere stretched over this carries the
+        // mismatch as systematic residual; a torus should not.
+        let (rx, ry, half) = (2000.0f64, 6000.0f64, 50.0);
+        let mut points = Vec::new();
+        for i in 0..=60 {
+            for j in 0..=60 {
+                let x = -half + 2.0 * half * i as f64 / 60.0;
+                let y = -half + 2.0 * half * j as f64 / 60.0;
+                points.push(Point3::new(x, y, -(x * x) / (2.0 * rx) - (y * y) / (2.0 * ry)));
+            }
+        }
+        let sphere = fit_sphere(&points).expect("a sphere always fits something");
+        let torus = fit_torus(&points).expect("an unequal crown is a torus patch");
+        // Principal radii, recovered: the tube is the sharper one.
+        assert!(
+            (torus.minor_radius - rx).abs() < 0.05 * rx,
+            "minor {} should be near {rx}",
+            torus.minor_radius
+        );
+        assert!(
+            (torus.major_radius + torus.minor_radius - ry).abs() < 0.05 * ry,
+            "major+minor {} should be near {ry}",
+            torus.major_radius + torus.minor_radius
+        );
+        // And it describes the panel far better than the sphere does.
+        assert!(
+            torus.deviation.rms < 0.2 * sphere.deviation.rms,
+            "torus rms {} against sphere rms {}",
+            torus.deviation.rms,
+            sphere.deviation.rms
+        );
+    }
+
+    #[test]
+    fn a_torus_that_outgrows_its_evidence_stops_being_one() {
+        // Born on a patch that genuinely curves: a real torus patch.
+        let born = torus_patch(50.0, 10.0, 0.45, 24);
+        let fit = fit_torus(&born).expect("a torus patch fits a torus");
+        assert!(
+            torus_is_evidenced(&fit, &born),
+            "the patch it was fitted to must evidence it"
+        );
+        // Then it grows. Merge, absorption and consolidation all change
+        // what a feature owns, and here it ends up holding a flat sheet
+        // sitting where the tube's outer equator was. The stored fit is
+        // untouched and would still report its old radii; only asking
+        // the question again catches it.
+        let mut grown = Vec::new();
+        for i in 0..=30 {
+            for j in 0..=30 {
+                grown.push(Point3::new(
+                    60.0 + 0.02 * i as f64,
+                    -3.0 + 0.2 * j as f64,
+                    0.0,
+                ));
+            }
+        }
+        assert!(
+            !torus_is_evidenced(&fit, &grown),
+            "a flat sheet is not evidence of a torus"
+        );
+        // And the demotion actually happens on the surface itself.
+        let mut surface = crate::segment::SurfaceClass::Torus(fit);
+        surface.recompute_deviation(&grown);
+        assert!(
+            matches!(surface, crate::segment::SurfaceClass::Freeform),
+            "an unevidenced torus demotes rather than surviving to output"
+        );
+    }
+
+    #[test]
+    fn a_saddle_is_refused_rather_than_fitted_plausibly() {
+        let mut points = Vec::new();
+        for i in 0..=40 {
+            for j in 0..=40 {
+                let x = -50.0 + 100.0 * i as f64 / 40.0;
+                let y = -50.0 + 100.0 * j as f64 / 40.0;
+                // Opposite signs: no outer-equator torus patch has this.
+                points.push(Point3::new(x, y, x * x / 4000.0 - y * y / 4000.0));
+            }
+        }
+        assert!(fit_torus(&points).is_none(), "a saddle is not a torus patch");
+    }
+}

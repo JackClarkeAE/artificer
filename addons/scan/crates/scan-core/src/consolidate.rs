@@ -48,6 +48,8 @@ fn parameter_count(surface: &SurfaceClass) -> usize {
         SurfaceClass::Sphere(_) => 4,
         SurfaceClass::Cylinder(_) => 5,
         SurfaceClass::Blend(_) => 5,
+        // Two independent radii and a free axis: the most a fit here buys.
+        SurfaceClass::Torus(_) => 7,
         SurfaceClass::Cone(_) => 6,
         SurfaceClass::Pattern(_) | SurfaceClass::EdgeRound(_) | SurfaceClass::Freeform => 8,
     }
@@ -308,6 +310,17 @@ pub fn unify_coaxial_families(
 ) -> usize {
     const SLACK: f64 = 0.5;
     let mut merges = 0;
+    // Every candidate pair walks the union of two bands' faces several
+    // times over, and each walk was recomputing the same centroid and
+    // area from vertices. On a 1.18 M-triangle rail that is where the
+    // entire run went — a sampled profile put ~100% of two hours in
+    // this function, nearly all of it inside face_area_vector and
+    // face_centroid. Neither depends on the pass, so pay for them once.
+    let faces = mesh.triangles().len();
+    let centroids: Vec<Point3> = (0..faces)
+        .map(|face| alignment.transform.apply_point(mesh.face_centroid(face)))
+        .collect();
+    let areas: Vec<f64> = (0..faces).map(|face| mesh.face_area(face)).collect();
     'passes: loop {
         struct Band {
             index: usize,
@@ -375,10 +388,8 @@ pub fn unify_coaxial_families(
             let mut sw = 0.0;
             let (mut sz, mut sr, mut szz, mut szr) = (0.0, 0.0, 0.0, 0.0);
             for &face in &union_faces {
-                let c = alignment
-                    .transform
-                    .apply_point(mesh.face_centroid(face as usize));
-                let w = mesh.face_area(face as usize);
+                let c = centroids[face as usize];
+                let w = areas[face as usize];
                 let radial = c.x.hypot(c.y);
                 sw += w;
                 sz += w * c.z;
@@ -405,10 +416,8 @@ pub fn unify_coaxial_families(
                 SurfaceClass::Cylinder(fit) => {
                     let radius = sr / sw;
                     for &face in &union_faces {
-                        let c = alignment
-                            .transform
-                            .apply_point(mesh.face_centroid(face as usize));
-                        residual(c.x.hypot(c.y), radius, mesh.face_area(face as usize));
+                        let c = centroids[face as usize];
+                        residual(c.x.hypot(c.y), radius, areas[face as usize]);
                     }
                     let mut fit = *fit;
                     fit.axis_point = Point3::new(0.0, 0.0, sz / sw);
@@ -431,13 +440,11 @@ pub fn unify_coaxial_families(
                         continue;
                     }
                     for &face in &union_faces {
-                        let c = alignment
-                            .transform
-                            .apply_point(mesh.face_centroid(face as usize));
+                        let c = centroids[face as usize];
                         residual(
                             c.x.hypot(c.y),
                             intercept + slope * c.z,
-                            mesh.face_area(face as usize),
+                            areas[face as usize],
                         );
                     }
                     let mut fit = *fit;
@@ -453,10 +460,8 @@ pub fn unify_coaxial_families(
                 SurfaceClass::Plane(fit) => {
                     let level = sz / sw;
                     for &face in &union_faces {
-                        let c = alignment
-                            .transform
-                            .apply_point(mesh.face_centroid(face as usize));
-                        residual(c.z, level, mesh.face_area(face as usize));
+                        let c = centroids[face as usize];
+                        residual(c.z, level, areas[face as usize]);
                     }
                     let mut fit = *fit;
                     fit.origin = Point3::new(0.0, 0.0, level);
@@ -504,7 +509,7 @@ pub fn unify_coaxial_families(
             merged.area = merged
                 .faces
                 .iter()
-                .map(|&face| mesh.face_area(face as usize))
+                .map(|&face| areas[face as usize])
                 .sum();
             features.retain(|feature| !feature.faces.is_empty());
             merges += 1;

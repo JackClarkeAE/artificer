@@ -95,12 +95,45 @@ pub struct RebuiltModel {
     /// Edge ends no corner adopted, each with the reason it is open —
     /// the watertightness work list, located in space.
     pub open_ends: Vec<crate::sew::OpenEnd>,
+    /// Bores emitted as exact tubes. Structured rather than only
+    /// narrated, so a bench can score them against a known part: a
+    /// diameter that drifts from 10.00 to 11.29 is invisible in the
+    /// coverage totals but is exactly the regression worth catching.
+    pub bores: Vec<EmittedBore>,
+}
+
+/// One bore the rebuild emitted exactly, as measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmittedBore {
+    pub diameter: f64,
+    pub centre: Point3,
+    pub run: (f64, f64),
+    pub chamfers: usize,
+    /// Found by fitting the scan rather than by recognizing a feature.
+    pub discovered: bool,
 }
 
 /// Rebuilds the sharp idealized model from a finished report. Requires a
 /// datum frame; returns `None` without one.
 pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<RebuiltModel> {
     let alignment = report.datum.as_ref()?;
+    // Where the time goes, when asked. A rebuild that takes an hour on
+    // one part and fifteen seconds on another is a question no amount
+    // of reading answers as fast as one measured run.
+    let timing = std::env::var_os("ARTIFICER_TIME").is_some();
+    let started = std::time::Instant::now();
+    let mut mark = started;
+    let mut lap = |stage: &str| {
+        if timing {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "time: {stage:<26} {:>8.2}s   (total {:>8.2}s)",
+                now.duration_since(mark).as_secs_f64(),
+                now.duration_since(started).as_secs_f64()
+            );
+            mark = now;
+        }
+    };
     // Pattern bands: each master profile regenerates its band, so revolved
     // elements inside any of them are already covered.
     struct Band<'a> {
@@ -188,6 +221,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
     const FAMILY_REVOLUTION: f64 = 0.60;
     let mut skipped: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
+    let mut bores: Vec<EmittedBore> = Vec::new();
     // Filled once the faces have been trimmed to each other.
     let mut edges: Vec<SharedEdge>;
     let corners: Vec<crate::sew::Corner>;
@@ -848,6 +882,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                         | SurfaceClass::Cone(_)
                         | SurfaceClass::Sphere(_)
                         | SurfaceClass::Blend(_)
+                        | SurfaceClass::Torus(_)
                 )
             {
                 continue;
@@ -1345,7 +1380,9 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // Build every footprint first, so adjacent faces can be grown to
         // meet each other before any of them is emitted.
         // Scan occupancy first: the patch footprints below read it.
+        lap("revolved elements");
         scan_cells.extend(scan_occupancy(mesh, alignment));
+        lap("scan occupancy");
         let mut patched: Vec<PatchedFace> = Vec::new();
         for feature in &report.features {
             if expressed.contains(&feature.id)
@@ -1356,6 +1393,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                         | SurfaceClass::Cylinder(_)
                         | SurfaceClass::Cone(_)
                         | SurfaceClass::Sphere(_)
+                        | SurfaceClass::Torus(_)
                 )
             {
                 continue;
@@ -1400,13 +1438,65 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                         .unwrap_or(0.0)
                 })
                 .collect();
+            // Where each carrier's material actually is, bucketed, so
+            // a cell only asks the surfaces that could plausibly own
+            // it. A carrier is an unbounded surface — an infinite
+            // plane will happily answer for a cell on the far side of
+            // the part — so without this the assignment is every cell
+            // against every surface: on a part with thousands of
+            // features that is hundreds of millions of probes, it
+            // dominates the whole rebuild, and it can hand a cell to a
+            // surface whose own material is nowhere near it.
+            const REACH: f64 = 3.0;
+            const BUCKET: f64 = 8.0;
+            let cell_of = |point: Point3| {
+                (
+                    (point.x / BUCKET).floor() as i32,
+                    (point.y / BUCKET).floor() as i32,
+                    (point.z / BUCKET).floor() as i32,
+                )
+            };
+            let mut nearby: std::collections::HashMap<(i32, i32, i32), Vec<usize>> =
+                std::collections::HashMap::new();
+            for (slot, (id, ..)) in patched.iter().enumerate() {
+                let Some(feature) = report.features.iter().find(|f| f.id == *id) else {
+                    continue;
+                };
+                let stride = (feature.faces.len() / 400).max(1);
+                let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+                for &face in feature.faces.iter().step_by(stride) {
+                    let p = alignment
+                        .transform
+                        .apply_point(mesh.face_centroid(face as usize));
+                    for (axis, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                        low[axis] = low[axis].min(value - REACH);
+                        high[axis] = high[axis].max(value + REACH);
+                    }
+                }
+                if !low[0].is_finite() {
+                    continue;
+                }
+                let from = cell_of(Point3::new(low[0], low[1], low[2]));
+                let to = cell_of(Point3::new(high[0], high[1], high[2]));
+                for x in from.0..=to.0 {
+                    for y in from.1..=to.1 {
+                        for z in from.2..=to.2 {
+                            nearby.entry((x, y, z)).or_default().push(slot);
+                        }
+                    }
+                }
+            }
+            lap("footprints + index");
+            let empty: Vec<usize> = Vec::new();
             for &(point, normal) in scan_cells.values() {
                 // Distance decides in coarse buckets and AREA breaks
                 // the tie: a micro-fragment's locally tighter fit must
                 // not steal single cells out of the lid it sits on, or
                 // the patch comes out as confetti.
                 let mut best: Option<(usize, i64, f64)> = None;
-                for (slot, surface) in surfaces.iter().enumerate() {
+                let candidates = nearby.get(&cell_of(point)).unwrap_or(&empty);
+                for &slot in candidates {
+                    let surface = surfaces[slot];
                     let Some((distance, surface_normal)) = surface.probe(point) else {
                         continue;
                     };
@@ -1440,8 +1530,10 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                 }
             }
         }
+        lap("one-owner assignment");
         const PRESENCE_CELL: f64 = 0.6;
         let presence = feature_presence(&patched, report, mesh, alignment, PRESENCE_CELL);
+        lap("  presence");
         sharpen_planar_faces(
             &patched_planes(&patched, report),
             &mut patched,
@@ -1461,6 +1553,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                     .map(|f| (*id, f.surface.clone()))
             })
             .collect();
+        lap("  sharpen");
         let trimmed_overlap = trim_at_intersections(
             &mut patched,
             &carriers,
@@ -1480,6 +1573,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // where the physical round is, which is invention for a benefit
         // the edge already gives without it.
         let mut probing = patched.clone();
+        lap("  trim");
         let grown = grow_to_neighbours(
             &mut probing,
             &carriers,
@@ -1493,7 +1587,9 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                  the scan's own face ownership stopped short of"
             ));
         }
+        lap("  grow");
         edges = extract_edges(&probing, &carriers, &presence, PRESENCE_CELL, PATCH_STEP);
+        lap("  extract edges");
         // The smooth boundaries the crossing extractor cannot see.
         let tangent =
             extract_tangent_boundaries(&probing, &carriers, &presence, PRESENCE_CELL, PATCH_STEP);
@@ -1583,7 +1679,9 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // prismatic extrusions emit true surfaces about their own axes
         // and directions, and the features they express skip the patch
         // floor below.
+        lap("sharpen + trim + sew");
         let hole_stacks = build_hole_stacks(mesh, report, alignment, report.tolerance, &scan_cells);
+        lap("hole stacks");
         exact_range.0 = triangles.len();
         let mut exact_covered = emit_exact_holes(
             &hole_stacks,
@@ -1591,7 +1689,9 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
             &mut triangles,
             &mut feature_of_face,
             &mut notes,
+            &mut bores,
         );
+        lap("exact holes");
         let (extrusion_covered, extrusion_volumes) = emit_exact_extrusions(
             mesh,
             report,
@@ -1645,6 +1745,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                     wall_run: (0.0, 0.0),
                     cones: Vec::new(),
                     mouths: Vec::new(),
+                    discovered: false,
                 }));
             }
         }
@@ -1664,7 +1765,16 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                 .iter()
                 .find(|f| f.id == *id)
                 .expect("feature");
-            let soup = footprint_soup(carrier, cells, PATCH_STEP);
+            // A flat face gets to be a face: one polygon on its own
+            // plane, with the lattice staircase simplified off its rim.
+            // Curved carriers keep the raster, whose facets they need
+            // anyway, and any footprint the outline cannot honestly
+            // close falls back to it too.
+            let soup = match carrier {
+                Carrier::Plane { .. } => planar_face_soup(carrier, cells, PATCH_STEP)
+                    .unwrap_or_else(|| footprint_soup(carrier, cells, PATCH_STEP)),
+                _ => footprint_soup(carrier, cells, PATCH_STEP),
+            };
             if soup.is_empty() {
                 continue;
             }
@@ -1799,6 +1909,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
     // evidence inside each stack is what keeps a blind hole's floor,
     // and true walls and chamfers sit ON the envelope, never inside
     // it, so honest geometry survives its own hole being opened.
+    lap("patches + organic carry");
     punch_volumes(
         &cut_volumes,
         &scan_cells,
@@ -1809,6 +1920,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         report.tolerance,
         &mut notes,
     );
+    lap("punch");
     let mesh = TriangleMesh::new(positions, triangles)?;
     Some(RebuiltModel {
         mesh,
@@ -1818,6 +1930,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         edges,
         corners,
         open_ends,
+        bores,
     })
 }
 
@@ -2920,7 +3033,11 @@ impl Carrier {
                     radius: fit.radius.max(1e-6),
                 }
             }
-            SurfaceClass::Blend(fit) => {
+            // Same geometry, same carrier: a fillet ring and a moulded
+            // crown differ in where their axis came from, not in what
+            // they are. Without this arm a recognized torus falls into
+            // the catch-all below and is silently never emitted.
+            SurfaceClass::Blend(fit) | SurfaceClass::Torus(fit) => {
                 let (u, v, w) = frame_about(fit.axis);
                 Carrier::Torus {
                     center: fit.axis_point,
@@ -3092,6 +3209,10 @@ struct HoleStack {
     /// Exact chamfer rings: (feature id, narrow z, wide z, narrow r,
     /// wide r) — the z order tells which way the funnel opens.
     cones: Vec<(usize, f64, f64, f64, f64)>,
+    /// True when nothing recognized this hole and it stands on the
+    /// scan's own evidence: a wall covering its circumference with a
+    /// hollow inside. Worth saying out loud in the report.
+    discovered: bool,
     /// Mouths where a ring meets a lid: (lid feature id, lid station,
     /// outward sign, ring radius at the lid). Each earns an exact flat
     /// collar bridging ring to lid, and a rim-band punch that clears
@@ -3152,6 +3273,583 @@ fn scan_occupancy(
     occupied
 }
 
+/// Whether a tube's interior is genuinely empty of scan material.
+///
+/// This is the licence a discovered bore stands on. Recognition can
+/// tell us a cylinder was fitted; only the scan can tell us there is a
+/// hole there, and a hole is exactly a tube whose inside nothing
+/// occupies. Probes the axis and a ring at half radius over the run.
+fn tube_is_hollow(
+    occupied: &std::collections::HashMap<(i32, i32, i32), (Point3, Vector3)>,
+    origin: Point3,
+    axis: Vector3,
+    radius: f64,
+    run: (f64, f64),
+) -> bool {
+    const CELL: f64 = 1.0;
+    /// A probe finding scan within this (mm) is blocked.
+    const REACH: f64 = 0.9;
+    let (u, v) = {
+        let aside = if axis.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        let across = axis.cross(aside);
+        let x = across / across.length().max(1e-12);
+        (x, axis.cross(x))
+    };
+    let probe_radius = radius * 0.5;
+    let steps = (((run.1 - run.0) / 1.0).ceil() as usize).clamp(3, 40);
+    let (mut clear, mut total) = (0usize, 0usize);
+    for step in 0..=steps {
+        let s = run.0 + (run.1 - run.0) * step as f64 / steps as f64;
+        let centre = origin + axis * s;
+        for k in 0..6 {
+            let angle = std::f64::consts::TAU * k as f64 / 6.0;
+            let point = if k == 0 {
+                centre
+            } else {
+                centre + (u * angle.cos() + v * angle.sin()) * probe_radius
+            };
+            total += 1;
+            let base = (
+                (point.x / CELL).floor() as i32,
+                (point.y / CELL).floor() as i32,
+                (point.z / CELL).floor() as i32,
+            );
+            let mut blocked = false;
+            'cells: for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(&(q, _)) =
+                            occupied.get(&(base.0 + dx, base.1 + dy, base.2 + dz))
+                            && (q - point).length() <= REACH
+                        {
+                            blocked = true;
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+            if !blocked {
+                clear += 1;
+            }
+        }
+    }
+    // Most of the inside must be empty. Not all: a scan of a small
+    // hole catches stray points down its throat.
+    total > 0 && clear as f64 / total as f64 >= 0.85
+}
+
+/// Bores fitted from the scan itself, owing nothing to recognition.
+///
+/// The last resort, and the only one that works when a hole's wall
+/// never became a surface at all. On a sigma 0.03 spacer two of four
+/// lug walls had no cylinder fit of any size anywhere in the feature
+/// set — not a small one, not a fragment — so no amount of searching
+/// the fits could find them. But the scan still holds them: material
+/// whose normals lie across the datum axis, arranged on a circle,
+/// with nothing inside. That is a bore, stated without reference to
+/// any earlier stage's opinion.
+///
+/// Returns synthetic cylinder features carrying the faces they were
+/// built from, so the ordinary hole path can take them from here.
+fn bores_from_occupancy(
+    mesh: &TriangleMesh,
+    alignment: &crate::datum::DatumAlignment,
+    occupied: &std::collections::HashMap<(i32, i32, i32), (Point3, Vector3)>,
+    tolerance: f64,
+    first_id: usize,
+) -> Vec<crate::report::FeatureRecord> {
+    /// Bore radii worth looking for (mm).
+    const MIN_RADIUS: f64 = 1.5;
+    const MAX_RADIUS: f64 = 20.0;
+    /// Radius step the normal-ray vote walks (mm).
+    const VOTE_STEP: f64 = 0.25;
+    /// Accumulator cell for centre votes (mm).
+    const VOTE_CELL: f64 = 1.0;
+    /// Votes a cell needs before it is worth fitting.
+    const MIN_VOTES: usize = 40;
+    /// Strongest peaks examined, so a noisy scan cannot cost the run.
+    const MAX_PEAKS: usize = 256;
+    /// Candidate rings tried per peak before giving the peak up.
+    const RING_TRIES: usize = 6;
+    /// A ring this shallow is a chamfer mouth, not a bore wall (mm).
+    const MIN_RING_DEPTH: f64 = 2.0;
+    /// Slabs a ring's run is divided into to test how it is filled.
+    const Z_SLABS: usize = 12;
+    /// A wall fills its run; a pair of chamfer slivers does not.
+    const MIN_RING_COVERAGE: f64 = 0.6;
+    /// Gather widths, in multiples of the band, as the fit settles.
+    const ANNEAL: [f64; 8] = [5.0, 4.0, 3.0, 2.0, 1.5, 1.0, 1.0, 1.0];
+    let axis = Vector3::new(0.0, 0.0, 1.0);
+    // Material facing across the axis: a bore's wall does, a lid does
+    // not.
+    let mut walls: Vec<(Point3, Vector3)> = occupied
+        .values()
+        .filter(|(_, normal)| normal.dot(axis).abs() <= 0.35)
+        .copied()
+        .collect();
+    if walls.is_empty() {
+        return Vec::new();
+    }
+    // A round trip through this pipeline costs half an hour, which is
+    // no way to develop a fitter. Dumping the fitter's whole input lets
+    // the algorithm be tried offline in seconds against the same
+    // points the real run sees.
+    if let Some(path) = std::env::var_os("ARTIFICER_WALL_DUMP") {
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::File::create(path) {
+            let _ = writeln!(file, "x,y,z,nx,ny,nz");
+            for (point, normal) in &walls {
+                let _ = writeln!(
+                    file,
+                    "{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+                    point.x, point.y, point.z, normal.x, normal.y, normal.z
+                );
+            }
+        }
+    }
+    // The cells arrive in hash order; everything below reaches output.
+    walls.sort_by(|a, b| {
+        a.0.x
+            .total_cmp(&b.0.x)
+            .then(a.0.y.total_cmp(&b.0.y))
+            .then(a.0.z.total_cmp(&b.0.z))
+    });
+    // Connected components cannot find these rings. At noise the
+    // lateral cells of one bore wall scatter into islands: a real scan
+    // gave 12 786 wall points in 1 223 groups averaging ten points
+    // each, and every group died on the population gate. So vote
+    // instead of grouping. Each wall point's inward normal points at
+    // its own centre, so stepping along it through the plausible radii
+    // and tallying where the steps land makes true centres pile up
+    // whether or not their material is connected. Bosses step away
+    // from themselves and never accumulate.
+    let vote_key =
+        |x: f64, y: f64| ((x / VOTE_CELL).floor() as i32, (y / VOTE_CELL).floor() as i32);
+    let mut votes: std::collections::HashMap<(i32, i32), usize> =
+        std::collections::HashMap::new();
+    for (point, normal) in &walls {
+        let lateral = Vector3::new(normal.x, normal.y, 0.0);
+        let length = lateral.length();
+        if length < 1e-9 {
+            continue;
+        }
+        let step = lateral / length;
+        let mut radius = MIN_RADIUS;
+        while radius <= MAX_RADIUS {
+            *votes
+                .entry(vote_key(point.x + step.x * radius, point.y + step.y * radius))
+                .or_default() += 1;
+            radius += VOTE_STEP;
+        }
+    }
+    // Lateral buckets so a peak collects its own material without
+    // walking every wall point.
+    let bucket =
+        |p: Point3| ((p.x / MAX_RADIUS).floor() as i32, (p.y / MAX_RADIUS).floor() as i32);
+    let mut buckets: std::collections::HashMap<(i32, i32), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, (point, _)) in walls.iter().enumerate() {
+        buckets.entry(bucket(*point)).or_default().push(index);
+    }
+    let mut peaks: Vec<((i32, i32), usize)> = votes
+        .iter()
+        .filter(|(_, count)| **count >= MIN_VOTES)
+        .map(|(cell, count)| (*cell, *count))
+        .collect();
+    // Strongest first, so the best-evidenced centre claims a ring
+    // before a neighbouring cell can.
+    peaks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let considered = peaks.len();
+    peaks.truncate(MAX_PEAKS);
+    let mut found: Vec<(Point3, f64, (f64, f64))> = Vec::new();
+    let debug = std::env::var_os("ARTIFICER_BORE_DEBUG").is_some();
+    // Why a candidate died is the whole diagnosis; a bare count says
+    // nothing about which gate to loosen.
+    let mut rejects: Vec<(usize, f64, f64, f64, &'static str)> = Vec::new();
+    for (cell, _) in &peaks {
+        let cx0 = (cell.0 as f64 + 0.5) * VOTE_CELL;
+        let cy0 = (cell.1 as f64 + 0.5) * VOTE_CELL;
+        // Inside a bore already accepted: that ring is spoken for.
+        if found
+            .iter()
+            .any(|(centre, radius, _)| (centre.x - cx0).hypot(centre.y - cy0) <= *radius)
+        {
+            continue;
+        }
+        let home = bucket(Point3::new(cx0, cy0, 0.0));
+        let mut nearby: Vec<usize> = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(list) = buckets.get(&(home.0 + dx, home.1 + dy)) {
+                    nearby.extend(list.iter().copied());
+                }
+            }
+        }
+        // A peak can sit inside a counterbore and see two rings, so let
+        // the radius histogram say which one this is.
+        let mut histogram: std::collections::HashMap<i32, usize> =
+            std::collections::HashMap::new();
+        for &index in &nearby {
+            let (point, normal) = walls[index];
+            let arm = Vector3::new(cx0 - point.x, cy0 - point.y, 0.0);
+            let length = arm.length();
+            if !(MIN_RADIUS..=MAX_RADIUS).contains(&length)
+                || normal.dot(arm / length) < 0.5
+            {
+                continue;
+            }
+            *histogram.entry((length / VOTE_STEP).floor() as i32).or_default() += 1;
+        }
+        // A chamfer mouth is nearly lateral too, so it passes the wall
+        // filter and can out-vote the bore it belongs to: two holes
+        // here fitted d=13.7 and d=15.1 against a true 10.0, each
+        // spanning the whole part while the correctly-fitted pair
+        // stopped a millimetre short of both faces. Depth tells them
+        // apart. A bore's wall holds one radius all the way down; a
+        // chamfer only touches a given radius in a thin slice of z. So
+        // rank the well-supported bins by how deep each one runs and
+        // take the deepest, not the most populous.
+        let mut ranked: Vec<(i32, usize)> = histogram.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        ranked.truncate(RING_TRIES);
+        // Span alone is not the measure. A radius just wider than the
+        // bore catches no wall at all — only a chamfer sliver at each
+        // mouth — and two thin slices at opposite ends of the part
+        // span the whole of it, so ranking on span picked exactly the
+        // rings it was meant to reject (d=10.35 and d=11.29 against a
+        // true 10.0). What separates them is how the material is
+        // spread between those ends: a wall occupies every slab of its
+        // run, a pair of slivers occupies two.
+        let profile_of = |candidate: f64| -> (f64, f64) {
+            let mut zs: Vec<f64> = Vec::new();
+            for &index in &nearby {
+                let point = walls[index].0;
+                if ((cx0 - point.x).hypot(cy0 - point.y) - candidate).abs() <= VOTE_STEP * 2.0
+                {
+                    zs.push(point.z);
+                }
+            }
+            if zs.len() < Z_SLABS {
+                return (0.0, 0.0);
+            }
+            let lo = zs.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let span = hi - lo;
+            if span <= 1e-9 {
+                return (0.0, 0.0);
+            }
+            let mut slabs = [false; Z_SLABS];
+            for z in &zs {
+                let slab = (((z - lo) / span) * Z_SLABS as f64) as usize;
+                slabs[slab.min(Z_SLABS - 1)] = true;
+            }
+            let filled = slabs.iter().filter(|slab| **slab).count() as f64 / Z_SLABS as f64;
+            (span, filled)
+        };
+        let Some(ring) = ranked
+            .iter()
+            .map(|(bin, count)| ((*bin as f64 + 0.5) * VOTE_STEP, *count))
+            .map(|(candidate, count)| {
+                let (span, filled) = profile_of(candidate);
+                (candidate, span, filled, count)
+            })
+            .filter(|(_, span, filled, _)| {
+                *span >= MIN_RING_DEPTH && *filled >= MIN_RING_COVERAGE
+            })
+            .max_by(|a, b| {
+                a.1.total_cmp(&b.1)
+                    .then(a.3.cmp(&b.3))
+                    .then(b.0.total_cmp(&a.0))
+            })
+            .map(|(candidate, ..)| candidate)
+        else {
+            continue;
+        };
+        // A peak names a 1 mm cell, and the strongest cell near a hole
+        // is routinely a millimetre or two off its true centre: this
+        // part carries 27 peaks within 3 mm of every hole and the
+        // strongest is rarely the truest. One refit cannot recover
+        // from that — a tight band around a displaced centre holds an
+        // arc of the wall, and the circle through an arc is displaced
+        // too, which is how true 10 mm bores came back as 11.29 and
+        // 13.69. So anneal: open wide enough to hold the whole wall
+        // despite the offset, refit, and close the band down. From
+        // 2.1 mm out this settles within 0.01 mm.
+        let band = (3.0 * tolerance).max(0.5);
+        let (mut cx0, mut cy0, mut ring) = (cx0, cy0, ring);
+        let mut members: Vec<usize> = Vec::new();
+        for reach in ANNEAL {
+            members = nearby
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    let point = walls[index].0;
+                    ((cx0 - point.x).hypot(cy0 - point.y) - ring).abs() <= band * reach
+                })
+                .collect();
+            if members.len() < 24 {
+                break;
+            }
+            let sample: Vec<(f64, f64)> = members
+                .iter()
+                .map(|&index| (walls[index].0.x, walls[index].0.y))
+                .collect();
+            let Some((moved_x, moved_y, moved_r)) = crate::fit::fit_circle_2d(&sample) else {
+                break;
+            };
+            cx0 = moved_x;
+            cy0 = moved_y;
+            ring = moved_r;
+        }
+        if members.len() < 24 {
+            continue;
+        }
+        let samples: Vec<(f64, f64)> = members
+            .iter()
+            .map(|&index| (walls[index].0.x, walls[index].0.y))
+            .collect();
+        let Some((cx, cy, radius)) = crate::fit::fit_circle_2d(&samples) else {
+            if debug {
+                rejects.push((members.len(), cx0, cy0, ring, "no circle"));
+            }
+            continue;
+        };
+        if !(MIN_RADIUS..=MAX_RADIUS).contains(&radius) {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "radius"));
+            }
+            continue;
+        }
+        // The material must actually sit on that circle...
+        let rms = (samples
+            .iter()
+            .map(|&(x, y)| {
+                let deviation = ((x - cx).hypot(y - cy)) - radius;
+                deviation * deviation
+            })
+            .sum::<f64>()
+            / samples.len() as f64)
+            .sqrt();
+        if rms > (3.0 * tolerance).max(0.5) {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "rms"));
+            }
+            continue;
+        }
+        // ...face inward, or it is a boss...
+        let mut inward = 0.0;
+        let mut bins = [false; 24];
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &index in &members {
+            let (point, normal) = walls[index];
+            let arm = Vector3::new(cx - point.x, cy - point.y, 0.0);
+            let length = arm.length();
+            if length > 1e-9 {
+                inward += normal.dot(arm / length);
+            }
+            let angle = (point.y - cy).atan2(point.x - cx);
+            let bin = (((angle + std::f64::consts::PI) / std::f64::consts::TAU * 24.0)
+                as usize)
+                .min(23);
+            bins[bin] = true;
+            lo = lo.min(point.z);
+            hi = hi.max(point.z);
+        }
+        if inward / members.len() as f64 <= 0.5 {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "faces outward"));
+            }
+            continue;
+        }
+        // ...ring most of the way round, and be hollow.
+        if bins.iter().filter(|filled| **filled).count() * 100 < 55 * bins.len() {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "arc, not a ring"));
+            }
+            continue;
+        }
+        if hi - lo < 2.0 * tolerance {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "too shallow"));
+            }
+            continue;
+        }
+        let centre = Point3::new(cx, cy, (lo + hi) / 2.0);
+        if !tube_is_hollow(occupied, centre, axis, radius, (lo, hi)) {
+            if debug {
+                rejects.push((members.len(), cx, cy, radius, "not hollow"));
+            }
+            continue;
+        }
+        // The pre-check tests the peak cell, but a peak well outside a
+        // ring can still fit it, so the same bore arrives repeatedly
+        // under different peaks. Settle it on the fitted centre.
+        if found.iter().any(|(seen, seen_radius, _)| {
+            (seen.x - cx).hypot(seen.y - cy) <= (radius * 0.5).max(1.0)
+                && (seen_radius - radius).abs() <= (radius * 0.25).max(0.5)
+        }) {
+            continue;
+        }
+        found.push((centre, radius, (lo, hi)));
+    }
+    if std::env::var_os("ARTIFICER_BORE_DEBUG").is_some() {
+        eprintln!(
+            "bore-debug: occupancy fitting saw {} lateral point(s), {} centre peak(s) \
+             ({} examined), accepted {}",
+            walls.len(),
+            considered,
+            peaks.len(),
+            found.len()
+        );
+        for (centre, radius, run) in &found {
+            eprintln!(
+                "bore-debug:   accepted d={:.2} at ({:+.2} {:+.2}) z {:.2}..{:.2}",
+                radius * 2.0,
+                centre.x,
+                centre.y,
+                run.0,
+                run.1
+            );
+        }
+        rejects.sort_by(|a, b| b.0.cmp(&a.0).then(a.4.cmp(b.4)));
+        for (members, cx, cy, radius, why) in rejects.iter().take(8) {
+            eprintln!(
+                "bore-debug:   rejected d={:.2} at ({:+.2} {:+.2}) members={} — {}",
+                radius * 2.0,
+                cx,
+                cy,
+                members,
+                why
+            );
+        }
+    }
+    if found.is_empty() {
+        return Vec::new();
+    }
+    // One pass over the mesh gives each discovered bore its real face
+    // set — the occupancy cells only located it.
+    let band = (2.0 * tolerance).max(0.3);
+    let mut faces: Vec<Vec<u32>> = vec![Vec::new(); found.len()];
+    for face in 0..mesh.triangles().len() {
+        let centroid = alignment.transform.apply_point(mesh.face_centroid(face));
+        let Some(normal) = mesh.face_normal(face) else {
+            continue;
+        };
+        if alignment.transform.apply_vector(normal).dot(axis).abs() > 0.35 {
+            continue;
+        }
+        for (slot, &(centre, radius, run)) in found.iter().enumerate() {
+            if centroid.z < run.0 - band || centroid.z > run.1 + band {
+                continue;
+            }
+            let radial = (centroid.x - centre.x).hypot(centroid.y - centre.y);
+            if (radial - radius).abs() <= band {
+                faces[slot].push(face as u32);
+                break;
+            }
+        }
+    }
+    found
+        .into_iter()
+        .zip(faces)
+        .enumerate()
+        .filter(|(_, (_, faces))| faces.len() >= 12)
+        .map(|(slot, ((centre, radius, _), faces))| {
+            let area = faces
+                .iter()
+                .map(|&face| mesh.face_area(face as usize))
+                .sum();
+            crate::report::FeatureRecord {
+                id: first_id + slot,
+                surface: SurfaceClass::Cylinder(crate::fit::CylinderFit {
+                    axis_point: centre,
+                    axis,
+                    radius,
+                    deviation: crate::fit::DeviationStats {
+                        rms: 0.0,
+                        max_abs: 0.0,
+                    },
+                }),
+                face_count: faces.len(),
+                area,
+                faces,
+                notes: vec![
+                    "fitted from scan occupancy: a ring of inward-facing material \
+                     with nothing inside it"
+                        .to_owned(),
+                ],
+            }
+        })
+        .collect()
+}
+
+/// Bores found in the feature set directly, without asking the
+/// instance layer.
+///
+/// The instance layer is the right place to license a hole when it
+/// can: it asks whether several surfaces share one motion. But it
+/// needs the wall to survive as coherent features, and at scan noise
+/// the wall arrives as arc fragments scattered through hundreds of
+/// thousands of shards — on a sigma 0.03 spacer the four lug walls
+/// were fitted beautifully (rms 0.03 mm) and still formed no
+/// instance. So bores are also gathered straight from the fits that
+/// look like bore walls, clustered by the axis line they share, and
+/// licensed downstream by the scan itself rather than by membership.
+fn discover_bore_clusters(
+    features: &[&crate::report::FeatureRecord],
+    tolerance: f64,
+) -> Vec<Vec<usize>> {
+    /// Bore radii worth looking for (mm). Anything larger is a part
+    /// feature the revolved path owns.
+    const MIN_RADIUS: f64 = 1.0;
+    const MAX_RADIUS: f64 = 20.0;
+    let mut walls: Vec<(usize, Point3, Vector3, f64, f64)> = Vec::new();
+    for feature in features.iter().copied() {
+        let SurfaceClass::Cylinder(fit) = &feature.surface else {
+            continue;
+        };
+        if !(MIN_RADIUS..=MAX_RADIUS).contains(&fit.radius)
+            || feature.area < 20.0
+        {
+            continue;
+        }
+        walls.push((
+            feature.id,
+            fit.axis_point,
+            fit.axis,
+            fit.radius,
+            feature.area,
+        ));
+    }
+    // Largest first, so a cluster's lead is its best-fitted member and
+    // the whole downstream path reads that fit as the hole's.
+    walls.sort_by(|a, b| b.4.total_cmp(&a.4).then(a.0.cmp(&b.0)));
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut leads: Vec<(Point3, Vector3, f64)> = Vec::new();
+    for (id, point, axis, radius, _) in walls {
+        let joined = leads.iter().position(|&(lead_point, lead_axis, lead_radius)| {
+            if lead_axis.dot(axis).abs() < 0.999 {
+                return false;
+            }
+            let offset = point - lead_point;
+            (offset - lead_axis * offset.dot(lead_axis)).length() <= 1.5
+                && (radius - lead_radius).abs() <= (2.5 * tolerance).max(0.6)
+        });
+        match joined {
+            Some(slot) => clusters[slot].push(id),
+            None => {
+                leads.push((point, axis, radius));
+                clusters.push(vec![id]);
+            }
+        }
+    }
+    clusters
+}
+
 /// Reads recognized drilled holes out of the cut extrusion instances:
 /// each inward-facing off-datum bore with its coaxial cones, its punch
 /// envelope, and the exact tube and rings it will emit.
@@ -3168,7 +3866,13 @@ fn build_hole_stacks(
     let Some(plan) = report.plan.as_ref() else {
         return Vec::new();
     };
-    let feature_by_id = |id: usize| report.features.iter().find(|f| f.id == id);
+    // Bores the scan holds that no earlier stage named. Their ids
+    // continue past every real feature so nothing collides.
+    let next_id = report.features.iter().map(|f| f.id).max().unwrap_or(0) + 1;
+    let scan_bores = bores_from_occupancy(mesh, alignment, occupied, tolerance, next_id);
+    let known: Vec<&crate::report::FeatureRecord> =
+        report.features.iter().chain(scan_bores.iter()).collect();
+    let feature_by_id = |id: usize| known.iter().copied().find(|f| f.id == id);
     let faces_inward =
         |feature: &crate::report::FeatureRecord, origin: Point3, axis: Vector3| -> bool {
             let stride = (feature.faces.len() / 400).max(1);
@@ -3208,7 +3912,15 @@ fn build_hole_stacks(
         };
     // Level lids the stack may pierce: planes square to the stack axis
     // snap tube and ring ends to the surface they meet.
-    let mut stacks: Vec<HoleStack> = Vec::new();
+    // Two sources, one path. A recognized cut instance is the stronger
+    // licence and comes first; bores discovered straight from the fits
+    // follow, and carry the burden of proving themselves against the
+    // scan because nothing else vouched for them.
+    struct BoreCandidate {
+        members: Vec<usize>,
+        discovered: bool,
+    }
+    let mut candidates: Vec<BoreCandidate> = Vec::new();
     for instance in &plan.instances.extrusions {
         // A drilled hole: one circle, no lines, and every member a
         // cylinder coaxial with the lead — at noise the wall arrives
@@ -3217,13 +3929,33 @@ fn build_hole_stacks(
         if instance.circles.len() != 1 || !instance.lines.is_empty() {
             continue;
         }
-        let Some(feature) = feature_by_id(instance.members[0]) else {
+        candidates.push(BoreCandidate {
+            members: instance.members.clone(),
+            discovered: false,
+        });
+    }
+    for members in discover_bore_clusters(&known, tolerance) {
+        // Already spoken for by an instance? Then that licence stands.
+        let claimed = candidates
+            .iter()
+            .any(|known| known.members.iter().any(|id| members.contains(id)));
+        if !claimed {
+            candidates.push(BoreCandidate {
+                members,
+                discovered: true,
+            });
+        }
+    }
+    let mut stacks: Vec<HoleStack> = Vec::new();
+    for candidate in &candidates {
+        let instance = &candidate.members;
+        let Some(feature) = feature_by_id(instance[0]) else {
             continue;
         };
         let SurfaceClass::Cylinder(fit) = &feature.surface else {
             continue;
         };
-        let all_coaxial = instance.members.iter().all(|&id| {
+        let all_coaxial = instance.iter().all(|&id| {
             feature_by_id(id).is_some_and(|member| match &member.surface {
                 SurfaceClass::Cylinder(other) => {
                     other.axis.dot(fit.axis).abs() >= AXIS_AGREE && {
@@ -3243,7 +3975,6 @@ fn build_hole_stacks(
             continue;
         }
         let inward_votes: Vec<bool> = instance
-            .members
             .iter()
             .filter_map(|&id| feature_by_id(id))
             .map(|member| faces_inward(member, fit.axis_point, fit.axis))
@@ -3252,7 +3983,7 @@ fn build_hole_stacks(
             continue;
         }
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for &id in &instance.members {
+        for &id in instance {
             let Some(member) = feature_by_id(id) else {
                 continue;
             };
@@ -3262,6 +3993,65 @@ fn build_hole_stacks(
         }
         if !(lo.is_finite() && hi.is_finite()) || hi - lo < 2.0 * tolerance {
             continue;
+        }
+        if candidate.discovered {
+            // Nothing vouched for this one, so it proves itself twice
+            // over. First that it is a wall and not a sliver: the
+            // union of its members must cover most of a circumference
+            // about their shared axis.
+            let (around_u, around_v) = {
+                let aside = if fit.axis.x.abs() < 0.9 {
+                    Vector3::new(1.0, 0.0, 0.0)
+                } else {
+                    Vector3::new(0.0, 1.0, 0.0)
+                };
+                let across = fit.axis.cross(aside);
+                let x = across / across.length().max(1e-12);
+                (x, fit.axis.cross(x))
+            };
+            let mut bins = [false; 24];
+            for &id in instance {
+                let Some(member) = feature_by_id(id) else {
+                    continue;
+                };
+                let stride = (member.faces.len() / 400).max(1);
+                for &face in member.faces.iter().step_by(stride) {
+                    let centroid = alignment
+                        .transform
+                        .apply_point(mesh.face_centroid(face as usize));
+                    let arm = centroid - fit.axis_point;
+                    let radial = arm - fit.axis * arm.dot(fit.axis);
+                    if radial.length() <= 1e-9 {
+                        continue;
+                    }
+                    let angle = radial.dot(around_v).atan2(radial.dot(around_u));
+                    let bin = (((angle + std::f64::consts::PI)
+                        / std::f64::consts::TAU
+                        * bins.len() as f64) as usize)
+                        .min(bins.len() - 1);
+                    bins[bin] = true;
+                }
+            }
+            let filled = bins.iter().filter(|filled| **filled).count();
+            // And second that it is a hole: the scan must find its
+            // inside empty. A fitted cylinder is a claim about a
+            // surface; only the void behind it makes it a bore.
+            let hollow =
+                tube_is_hollow(occupied, fit.axis_point, fit.axis, fit.radius, (lo, hi));
+            if std::env::var_os("ARTIFICER_BORE_DEBUG").is_some() {
+                eprintln!(
+                    "bore-debug: lead #{} d={:.2} at ({:+.2} {:+.2}) members={} \
+                     bins={filled}/24 run={lo:+.2}..{hi:+.2} hollow={hollow}",
+                    feature.id,
+                    2.0 * fit.radius,
+                    fit.axis_point.x,
+                    fit.axis_point.y,
+                    instance.len()
+                );
+            }
+            if filled * 100 < 55 * bins.len() || !hollow {
+                continue;
+            }
         }
         let mut pieces = vec![(lo, hi, fit.radius, fit.radius)];
         let mut cones: Vec<(usize, f64, f64, f64, f64)> = Vec::new();
@@ -3584,6 +4374,7 @@ fn build_hole_stacks(
             wall_run,
             cones,
             mouths,
+            discovered: candidate.discovered,
         });
     }
     // Follow the void: a hole's measured wall can stop short of the
@@ -3693,6 +4484,7 @@ fn emit_exact_holes(
     triangles: &mut Vec<[u32; 3]>,
     feature_of_face: &mut Vec<usize>,
     notes: &mut Vec<String>,
+    bores: &mut Vec<EmittedBore>,
 ) -> std::collections::HashSet<usize> {
     let mut covered = std::collections::HashSet::new();
     for stack in stacks {
@@ -3809,8 +4601,15 @@ fn emit_exact_holes(
                 }
             }
         }
+        bores.push(EmittedBore {
+            diameter: stack.bore_diameter,
+            centre: stack.origin,
+            run: stack.wall_run,
+            chamfers: stack.cones.len(),
+            discovered: stack.discovered,
+        });
         notes.push(format!(
-            "bore d {:.2} at ({:+.2} {:+.2}) emitted exact: tube z {:+.2}..{:+.2}{}",
+            "bore d {:.2} at ({:+.2} {:+.2}) emitted exact: tube z {:+.2}..{:+.2}{}{}",
             stack.bore_diameter,
             stack.origin.x,
             stack.origin.y,
@@ -3820,6 +4619,11 @@ fn emit_exact_holes(
                 String::new()
             } else {
                 format!(" + {} chamfer ring(s)", stack.cones.len())
+            },
+            if stack.discovered {
+                " (found in the scan, not recognized)"
+            } else {
+                ""
             }
         ));
     }
@@ -4717,6 +5521,243 @@ fn punch_volumes(
     }
 }
 
+/// A flat face as one polygon on its own plane, instead of a raster of
+/// cells.
+///
+/// A footprint is a lattice of sub-millimetre cells, and drawing it cell
+/// by cell gives a surface that is exact in its interior and quantized
+/// at its rim: a sawtooth boundary, thousands of triangles, and a raster
+/// where the part has a face. A plane's parameter space is millimetres,
+/// so the region's own outline maps onto the plane exactly — trace the
+/// boundary, simplify away the lattice staircase, and triangulate it.
+///
+/// Real footprints are ragged, so the two situations a first attempt
+/// wants to refuse are in fact the common case and both are handled:
+/// **pinches**, where the region touches itself diagonally and a corner
+/// carries two outgoing edges, resolved by always taking the sharpest
+/// available turn so the walk hugs one component at a time; and
+/// **several disjoint pieces**, each triangulated with the holes that
+/// fall inside it. Answers `None` only when the result would not
+/// account for the material the cells did, and the caller falls back to
+/// the raster, which is never wrong, only coarse.
+fn planar_face_soup(
+    carrier: &Carrier,
+    cells: &std::collections::HashSet<(i64, i64)>,
+    step: f64,
+) -> Option<Vec<[Point3; 3]>> {
+    if cells.len() < 8 {
+        return None;
+    }
+    // Tidy the lattice before tracing it. A footprint's rim is ragged
+    // at cell scale — the scan decided each cell independently — and
+    // every notch in it is a pinch, every spur a ring of its own, so
+    // an outline traced from the raw region shatters into fragments
+    // and the face comes out worse than the raster it replaced. Fill
+    // the notches, drop the spurs: a cell surrounded on three sides is
+    // interior whatever its own sample said, and a cell clinging by
+    // one side is rim noise. Both move the boundary by less than one
+    // cell, which is under the quantization it already carries.
+    let mut cells = cells.clone();
+    for _ in 0..2 {
+        let neighbours = |set: &std::collections::HashSet<(i64, i64)>, i: i64, j: i64| {
+            [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                .into_iter()
+                .filter(|&(di, dj)| set.contains(&(i + di, j + dj)))
+                .count()
+        };
+        let mut fill: Vec<(i64, i64)> = Vec::new();
+        let mut drop: Vec<(i64, i64)> = Vec::new();
+        for &(i, j) in &cells {
+            if neighbours(&cells, i, j) <= 1 {
+                drop.push((i, j));
+            }
+            for (di, dj) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let empty = (i + di, j + dj);
+                if !cells.contains(&empty) && neighbours(&cells, empty.0, empty.1) >= 3 {
+                    fill.push(empty);
+                }
+            }
+        }
+        if fill.is_empty() && drop.is_empty() {
+            break;
+        }
+        for cell in fill {
+            cells.insert(cell);
+        }
+        for cell in drop {
+            cells.remove(&cell);
+        }
+    }
+    let cells = &cells;
+    if cells.len() < 8 {
+        return None;
+    }
+    // Boundary edges, directed so the region stays on one side: a cell
+    // contributes a side wherever it has no neighbour there. A corner
+    // may carry two of them, which is a pinch.
+    let mut edges: std::collections::HashMap<(i64, i64), Vec<(i64, i64)>> =
+        std::collections::HashMap::new();
+    for &(i, j) in cells {
+        for (present, from, to) in [
+            (cells.contains(&(i, j - 1)), (i, j), (i + 1, j)),
+            (cells.contains(&(i + 1, j)), (i + 1, j), (i + 1, j + 1)),
+            (cells.contains(&(i, j + 1)), (i + 1, j + 1), (i, j + 1)),
+            (cells.contains(&(i - 1, j)), (i, j + 1), (i, j)),
+        ] {
+            if !present {
+                edges.entry(from).or_default().push(to);
+            }
+        }
+    }
+    if edges.is_empty() {
+        return None;
+    }
+    // Walk every edge exactly once. At a pinch, take the sharpest turn
+    // available — that keeps the walk on the component it is tracing
+    // instead of leaking across the diagonal into its neighbour.
+    let mut remaining = edges.clone();
+    let mut seeds: Vec<(i64, i64)> = edges.keys().copied().collect();
+    seeds.sort_unstable();
+    let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+    let total_edges: usize = edges.values().map(Vec::len).sum();
+    let mut walked = 0usize;
+    for seed in seeds {
+        while remaining.get(&seed).is_some_and(|outgoing| !outgoing.is_empty()) {
+            let mut ring: Vec<(i64, i64)> = Vec::new();
+            let mut at = seed;
+            let mut heading = (0i64, 0i64);
+            while let Some(outgoing) = remaining.get_mut(&at) {
+                if outgoing.is_empty() {
+                    break;
+                }
+                // Sharpest first: right, straight, left, back.
+                let slot = if heading == (0, 0) {
+                    0
+                } else {
+                    let order = [
+                        (heading.1, -heading.0),
+                        heading,
+                        (-heading.1, heading.0),
+                        (-heading.0, -heading.1),
+                    ];
+                    order
+                        .iter()
+                        .find_map(|&want| {
+                            outgoing.iter().position(|&next| {
+                                (next.0 - at.0, next.1 - at.1) == want
+                            })
+                        })
+                        .unwrap_or(0)
+                };
+                let next = outgoing.remove(slot);
+                walked += 1;
+                ring.push(at);
+                heading = (next.0 - at.0, next.1 - at.1);
+                at = next;
+                if at == seed || walked > total_edges {
+                    break;
+                }
+            }
+            if ring.len() >= 4 {
+                rings.push(
+                    ring.iter()
+                        .map(|&(i, j)| (i as f64 * step, j as f64 * step))
+                        .collect(),
+                );
+            }
+        }
+    }
+    if rings.is_empty() {
+        return None;
+    }
+    // Simplify away the staircase the lattice put there. The rim is
+    // cell-limited either way; this only stops it being cell-shaped.
+    let epsilon = step * 0.75;
+    let rings: Vec<Vec<(f64, f64)>> = rings
+        .into_iter()
+        .filter_map(|ring| {
+            let mut simplified = crate::reconstruct::simplify_polyline(&ring, epsilon);
+            if simplified.len() > 3
+                && let (Some(&first), Some(&last)) =
+                    (simplified.first(), simplified.last())
+                && (first.0 - last.0).hypot(first.1 - last.1) <= epsilon
+            {
+                simplified.pop();
+            }
+            (simplified.len() >= 3).then_some(simplified)
+        })
+        .collect();
+    // Outers enclose material, holes enclose its absence, and a hole
+    // belongs to whichever outer contains it.
+    let mut outers: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut holes: Vec<Vec<(f64, f64)>> = Vec::new();
+    for ring in rings {
+        if crate::step::signed_area(&ring) >= 0.0 {
+            outers.push(ring);
+        } else {
+            holes.push(ring);
+        }
+    }
+    if outers.is_empty() {
+        return None;
+    }
+    let mut soup: Vec<[Point3; 3]> = Vec::new();
+    let mut clipped_area = 0.0f64;
+    for outer in &outers {
+        let mut vertices: Vec<(f64, f64)> = Vec::new();
+        let mut ring: Vec<(f64, f64, usize)> = outer
+            .iter()
+            .map(|&(u, v)| {
+                vertices.push((u, v));
+                (u, v, vertices.len() - 1)
+            })
+            .collect();
+        if crate::step::signed_area(outer) < 0.0 {
+            ring.reverse();
+        }
+        let mine: Vec<Vec<(f64, f64, usize)>> = holes
+            .iter()
+            .filter(|hole| {
+                hole.first()
+                    .is_some_and(|&point| point_in_polygon(point, outer))
+            })
+            .map(|hole| {
+                let mut indexed: Vec<(f64, f64, usize)> = hole
+                    .iter()
+                    .map(|&(u, v)| {
+                        vertices.push((u, v));
+                        (u, v, vertices.len() - 1)
+                    })
+                    .collect();
+                if crate::step::signed_area(hole) > 0.0 {
+                    indexed.reverse();
+                }
+                indexed
+            })
+            .collect();
+        let merged = crate::step::bridge_holes(ring, mine);
+        let polygon: Vec<(f64, f64)> = merged.iter().map(|&(u, v, _)| (u, v)).collect();
+        for [a, b, c] in crate::step::ear_clip(&polygon) {
+            let (pa, pb, pc) = (polygon[a], polygon[b], polygon[c]);
+            clipped_area +=
+                ((pb.0 - pa.0) * (pc.1 - pa.1) - (pc.0 - pa.0) * (pb.1 - pa.1)).abs() / 2.0;
+            soup.push([
+                carrier.at(pa.0, pa.1),
+                carrier.at(pb.0, pb.1),
+                carrier.at(pc.0, pc.1),
+            ]);
+        }
+    }
+    // The polygons must account for the material the cells did. A
+    // triangulation that lost a limb or swallowed a hole shows up here
+    // and hands the face back to the raster.
+    let expected = cells.len() as f64 * step * step;
+    if soup.is_empty() || !(0.75 * expected..=1.25 * expected).contains(&clipped_area) {
+        return None;
+    }
+    Some(soup)
+}
+
 /// Emits a footprint as geometry on its carrier.
 ///
 /// Solidity is a property of the *face*, not the surface: in every B-rep
@@ -4920,6 +5961,179 @@ mod tests {
     use crate::report::{ReverseOptions, reverse_engineer};
     use crate::synth;
     use artificer_geometry::Vector3;
+
+    /// A flat footprint becomes one polygon, holes and all, carrying
+    /// the same material the cells did.
+    #[test]
+    fn a_flat_footprint_emits_as_a_polygon_not_a_raster() {
+        const STEP: f64 = 0.4;
+        let carrier = Carrier::Plane {
+            origin: Point3::new(0.0, 0.0, 3.0),
+            u: Vector3::new(1.0, 0.0, 0.0),
+            v: Vector3::new(0.0, 1.0, 0.0),
+        };
+        // A 20x20 block of cells with a 4x4 window punched out of it.
+        let mut cells: std::collections::HashSet<(i64, i64)> =
+            std::collections::HashSet::new();
+        for i in 0..20 {
+            for j in 0..20 {
+                if (8..12).contains(&i) && (8..12).contains(&j) {
+                    continue;
+                }
+                cells.insert((i, j));
+            }
+        }
+        let soup = planar_face_soup(&carrier, &cells, STEP).expect("a polygon");
+        let area: f64 = soup
+            .iter()
+            .map(|[a, b, c]| (*b - *a).cross(*c - *a).length() / 2.0)
+            .sum();
+        let expected = cells.len() as f64 * STEP * STEP;
+        assert!(
+            (area - expected).abs() < 0.05 * expected,
+            "polygon area {area:.3} should match the cells' {expected:.3}"
+        );
+        // The point of the exercise: far fewer triangles than cells,
+        // and every one of them exactly on the plane.
+        assert!(
+            soup.len() < cells.len() / 4,
+            "{} triangles for {} cells is still a raster",
+            soup.len(),
+            cells.len()
+        );
+        for [a, b, c] in &soup {
+            for point in [a, b, c] {
+                assert!((point.z - 3.0).abs() < 1e-9, "on the plane");
+            }
+        }
+    }
+
+    /// A rim ragged at cell scale — which is every real footprint —
+    /// must still come out as one face rather than a shower of
+    /// fragments.
+    #[test]
+    fn a_ragged_footprint_still_emits_as_one_face() {
+        const STEP: f64 = 0.4;
+        let carrier = Carrier::Plane {
+            origin: Point3::new(0.0, 0.0, 3.0),
+            u: Vector3::new(1.0, 0.0, 0.0),
+            v: Vector3::new(0.0, 1.0, 0.0),
+        };
+        // A 24x24 block whose rim the scan decided cell by cell: every
+        // third boundary cell missing, and a notch bitten out of each
+        // side — pinches and spurs everywhere.
+        let mut cells: std::collections::HashSet<(i64, i64)> =
+            std::collections::HashSet::new();
+        for i in 0..24 {
+            for j in 0..24 {
+                let rim = i == 0 || j == 0 || i == 23 || j == 23;
+                if rim && (i + j) % 3 == 0 {
+                    continue;
+                }
+                cells.insert((i, j));
+            }
+        }
+        cells.remove(&(12, 23));
+        cells.remove(&(0, 12));
+        let soup = planar_face_soup(&carrier, &cells, STEP).expect("one face");
+        let area: f64 = soup
+            .iter()
+            .map(|[a, b, c]| (*b - *a).cross(*c - *a).length() / 2.0)
+            .sum();
+        let expected = cells.len() as f64 * STEP * STEP;
+        assert!(
+            (area - expected).abs() < 0.1 * expected,
+            "polygon area {area:.3} vs cells {expected:.3}"
+        );
+        assert!(
+            soup.len() < 40,
+            "{} triangles means the rim shattered it",
+            soup.len()
+        );
+    }
+
+    /// A bore the feature layer never saw must still be found, because
+    /// the scan holds everything needed to know it is there: a ring of
+    /// inward-facing material with nothing inside it.
+    #[test]
+    fn a_chamfered_bore_fits_the_bore_and_not_its_chamfer() {
+        // A 10 mm bore with a wide chamfer at each mouth. The chamfer
+        // cone is nearly lateral, so it survives the wall filter and
+        // brings more material to the vote than the wall it belongs
+        // to — on a real scan that made two holes fit d=13.7 and
+        // d=15.1 against a true 10.0. The bore is the deep ring; the
+        // chamfer only touches any given radius in a thin slice.
+        let mut profile = vec![(7.0, 7.0)];
+        for step in 1..=4 {
+            let t = step as f64 / 4.0;
+            profile.push((7.0 - 2.0 * t, 7.0 - 2.0 * t));
+        }
+        for step in 1..=24 {
+            profile.push((5.0, 5.0 - 10.0 * step as f64 / 24.0));
+        }
+        for step in 1..=4 {
+            let t = step as f64 / 4.0;
+            profile.push((5.0 + 2.0 * t, -5.0 - 2.0 * t));
+        }
+        let soup = synth::revolved_profile_soup(&profile, 72);
+        let mesh = TriangleMesh::from_triangle_soup(&soup, 1e-9).expect("mesh");
+        let alignment = crate::datum::DatumAlignment {
+            transform: crate::transform::RigidTransform::IDENTITY,
+            notes: Vec::new(),
+        };
+        let occupied = scan_occupancy(&mesh, &alignment);
+        let found = bores_from_occupancy(&mesh, &alignment, &occupied, 0.05, 900);
+        assert_eq!(found.len(), 1, "the bore, once");
+        let SurfaceClass::Cylinder(fit) = &found[0].surface else {
+            panic!("a bore is a cylinder");
+        };
+        assert!(
+            (fit.radius - 5.0).abs() < 0.3,
+            "radius {} is the bore's 5, not the chamfer's 7",
+            fit.radius
+        );
+    }
+
+    #[test]
+    fn a_bore_is_fitted_from_scan_occupancy_alone() {
+        // A bare tube, wound so its material faces its own axis — a
+        // hole's wall, with no features and no fits anywhere.
+        let soup: Vec<[Point3; 3]> = synth::open_cylinder_soup(5.0, 14.0, 64, 10)
+            .into_iter()
+            .map(|[a, b, c]| [a, c, b])
+            .collect();
+        let mesh = TriangleMesh::from_triangle_soup(&soup, 1e-9).expect("mesh");
+        let alignment = crate::datum::DatumAlignment {
+            transform: crate::transform::RigidTransform::IDENTITY,
+            notes: Vec::new(),
+        };
+        let occupied = scan_occupancy(&mesh, &alignment);
+        let found = bores_from_occupancy(&mesh, &alignment, &occupied, 0.05, 900);
+        assert_eq!(found.len(), 1, "one bore, fitted from the scan alone");
+        let SurfaceClass::Cylinder(fit) = &found[0].surface else {
+            panic!("a bore is a cylinder");
+        };
+        assert!(
+            (fit.radius - 5.0).abs() < 0.2,
+            "radius {} should be 5",
+            fit.radius
+        );
+        assert!(!found[0].faces.is_empty(), "it carries its own material");
+    }
+
+    /// The same wall wound the other way is a boss, and a boss is not
+    /// a hole however round it is.
+    #[test]
+    fn an_outward_facing_wall_is_not_fitted_as_a_bore() {
+        let mesh = synth::open_cylinder(5.0, 14.0, 64, 10);
+        let alignment = crate::datum::DatumAlignment {
+            transform: crate::transform::RigidTransform::IDENTITY,
+            notes: Vec::new(),
+        };
+        let occupied = scan_occupancy(&mesh, &alignment);
+        let found = bores_from_occupancy(&mesh, &alignment, &occupied, 0.05, 900);
+        assert!(found.is_empty(), "a boss is not a bore");
+    }
 
     #[test]
     #[cfg_attr(

@@ -50,6 +50,7 @@ fn usage() -> String {
      artificer-scan align <source> <target> [--out aligned.stl]\n\
      artificer-scan reverse <mesh> [--tolerance MM] [--max-dihedral DEG] [--min-faces N]\n\
                             [--no-ransac] [--min-support N] [--ransac-epsilon MM]\n\
+     [--no-consolidate]\n\
                             [--no-merge] [--min-feature MM2] [--no-datum] [--datum-candidate N]\n\
                             [--no-snap] [--snap-max MM] [--json out.json]\n\
                             [--aligned-out mesh.stl] [--history plan.json] [--profile-out master.png]\n\
@@ -63,6 +64,8 @@ fn usage() -> String {
      artificer-scan simulate <mesh> [--density MM] [--smooth MM] [--noise MM]\n\
                              [--dropout N] [--dropout-size MM] [--seed N]\n\
                              [--out scan.stl] [--snapshot cmp.png]\n\
+     artificer-scan bench [--manifest bench/fixtures.txt] [--only NAME]\n\
+     \x20                    [--baseline file] [--write-baseline file]\n\
      artificer-scan demo [--out scan.stl]"
         .to_owned()
 }
@@ -124,6 +127,14 @@ fn parse_reverse_options(args: &mut Vec<String>) -> Result<ReverseOptions, Strin
     }
     if take_flag(args, "--no-merge") {
         options.merge_fragments = false;
+    }
+    // Consolidation is where a large scan spends nearly all its time —
+    // 3185 s of a 3369 s rail run — so being able to leave it out is
+    // what makes an 8-million-face part answerable at all while a
+    // question about fitting, rather than about consolidation, is
+    // being asked.
+    if take_flag(args, "--no-consolidate") {
+        options.consolidate = false;
     }
     if let Some(value) = take_flag_value(args, "--min-feature") {
         options.min_feature_area = value
@@ -347,6 +358,9 @@ fn run() -> Result<(), String> {
                 (10.0 * report.noise_sigma.sqrt()).clamp(1.0, 3.0),
                 report.tolerance
             );
+            for note in &report.demotions {
+                println!("  demoted: {note}");
+            }
             let rebuilt = artificer_scan_core::rebuild_sharp(&mesh, &report);
             let name = Path::new(path)
                 .file_name()
@@ -398,6 +412,9 @@ fn run() -> Result<(), String> {
                 (10.0 * report.noise_sigma.sqrt()).clamp(1.0, 3.0),
                 report.tolerance
             );
+            for note in &report.demotions {
+                println!("  demoted: {note}");
+            }
             let rebuilt = artificer_scan_core::rebuild_sharp(&mesh, &report)
                 .ok_or("rebuild needs a datum frame (auto-datum found none)")?;
             std::fs::write(&out, write_binary_stl(&rebuilt.mesh))
@@ -452,25 +469,33 @@ fn run() -> Result<(), String> {
             // a face as a success once it belongs to any feature, which
             // stays high even when those features are buckets nothing can
             // emit; this is the share of the scan the model actually draws.
+            //
+            // Measured at the tolerance the run actually used, not at
+            // the one the operator typed: on a noisy scan the adaptive
+            // floor lifts the working tolerance, and scoring a smooth
+            // surface against the original band asks it to reproduce
+            // the noise. Only a photocopy of the crumple can pass that,
+            // so the honest model scored *worse* than the dishonest one
+            // — the measurement was wrong, not the geometry.
             if let Some(alignment) = report.datum.as_ref() {
                 let (explained, total) = artificer_scan_core::coverage::explained_area(
                     &mesh,
                     &rebuilt.mesh,
                     alignment,
-                    options.tolerance,
+                    report.tolerance,
                 );
                 let (invented, emitted) = artificer_scan_core::coverage::invented_area(
                     &mesh,
                     &rebuilt.mesh,
                     alignment,
-                    options.tolerance,
+                    report.tolerance,
                 );
                 println!(
-                    "rebuild explains {:.1}% of the scanned surface ({:.0} of {:.0} mm^2 within {} mm)",
+                    "rebuild explains {:.1}% of the scanned surface ({:.0} of {:.0} mm^2 within {:.3} mm)",
                     100.0 * explained / total.max(1e-9),
                     explained,
                     total,
-                    options.tolerance
+                    report.tolerance
                 );
                 println!(
                     "  and invents {:.1}% of its own surface ({:.0} of {:.0} mm^2 lies nowhere near the scan)",
@@ -510,7 +535,7 @@ fn run() -> Result<(), String> {
                             &mesh,
                             &analytic,
                             alignment,
-                            options.tolerance,
+                            report.tolerance,
                         );
                         println!(
                             "  of which analytic surfaces explain {:.1}% ({:.0} mm^2); the rest is \
@@ -527,7 +552,7 @@ fn run() -> Result<(), String> {
                         &mesh,
                         &rebuilt.mesh,
                         alignment,
-                        options.tolerance,
+                        report.tolerance,
                     );
                     let mut by_feature: std::collections::HashMap<usize, f64> =
                         std::collections::HashMap::new();
@@ -542,7 +567,7 @@ fn run() -> Result<(), String> {
                         &mesh,
                         &rebuilt.mesh,
                         alignment,
-                        options.tolerance,
+                        report.tolerance,
                         &rebuilt.feature_of_face,
                     )
                     .iter()
@@ -769,6 +794,9 @@ fn run() -> Result<(), String> {
                 (10.0 * report.noise_sigma.sqrt()).clamp(1.0, 3.0),
                 report.tolerance
             );
+            for note in &report.demotions {
+                println!("  demoted: {note}");
+            }
             let rebuilt = artificer_scan_core::rebuild_sharp(&mesh, &report)
                 .ok_or("sections need a datum frame (auto-datum found none)")?;
             let alignment = report.datum.as_ref().expect("datum present after rebuild");
@@ -903,6 +931,96 @@ fn run() -> Result<(), String> {
                 "synthetic scan written to {out} ({} triangles)",
                 mesh.triangles().len()
             );
+            Ok(())
+        }
+        "bench" => {
+            let manifest_path = take_flag_value(&mut args, "--manifest")
+                .unwrap_or_else(|| "bench/fixtures.txt".to_owned());
+            let only = take_flag_value(&mut args, "--only");
+            let baseline_path = take_flag_value(&mut args, "--baseline");
+            let write_path = take_flag_value(&mut args, "--write-baseline");
+            let text = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| format!("cannot read {manifest_path}: {e}"))?;
+            let fixtures = artificer_scan_core::bench::parse_manifest(&text)?;
+            let wanted: Vec<_> = fixtures
+                .iter()
+                .filter(|f| only.as_deref().is_none_or(|name| f.name == name))
+                .collect();
+            if wanted.is_empty() {
+                return Err(match &only {
+                    Some(name) => format!("no fixture named `{name}` in {manifest_path}"),
+                    None => format!("{manifest_path} lists no fixtures"),
+                });
+            }
+            // A sweep is hours long and the machine it runs on is not
+            // guaranteed to stay up for all of them. Keep what each
+            // fixture earned the moment it earns it, and let a later
+            // run skip what is already scored, so an interrupted sweep
+            // costs the fixture it died on and nothing else.
+            let resume = take_flag(&mut args, "--resume");
+            let mut scores: Vec<artificer_scan_core::bench::Score> = Vec::new();
+            if resume && let Some(path) = &write_path
+                && let Ok(text) = std::fs::read_to_string(path)
+            {
+                scores = artificer_scan_core::bench::from_text(&text);
+                if !scores.is_empty() {
+                    println!("resuming: {} fixture(s) already scored", scores.len());
+                }
+            }
+            for fixture in wanted {
+                if resume && scores.iter().any(|s| s.name == fixture.name) {
+                    println!("skipping {} (already in baseline)", fixture.name);
+                    continue;
+                }
+                // Say which fixture before running it: these take
+                // minutes each, and a silent bench is indistinguishable
+                // from a hung one.
+                println!("running {} ({})...", fixture.name, fixture.source);
+                // One unreadable part must not cost the other four
+                // hours of an unattended sweep.
+                let source = match load_mesh(&fixture.source) {
+                    Ok(source) => source,
+                    Err(problem) => {
+                        eprintln!("  skipped {}: {problem}", fixture.name);
+                        continue;
+                    }
+                };
+                let started = std::time::Instant::now();
+                let score = artificer_scan_core::bench::score_fixture(
+                    fixture,
+                    &source,
+                    started.elapsed().as_secs_f64(),
+                );
+                let score = artificer_scan_core::bench::Score {
+                    seconds: started.elapsed().as_secs_f64(),
+                    ..score
+                };
+                println!(
+                    "  {} bore(s) on size of {} found ({} expected), worst d error {:.3} mm, {:.0}s",
+                    score.bores_on_size,
+                    score.bores_found,
+                    score.bores_expected,
+                    score.worst_bore_error,
+                    score.seconds
+                );
+                scores.push(score);
+                if let Some(path) = &write_path {
+                    std::fs::write(path, artificer_scan_core::bench::to_text(&scores))
+                        .map_err(|e| format!("cannot write {path}: {e}"))?;
+                }
+            }
+            println!();
+            print!("{}", artificer_scan_core::bench::table(&scores));
+            if let Some(path) = &baseline_path {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read {path}: {e}"))?;
+                let baseline = artificer_scan_core::bench::from_text(&text);
+                println!();
+                print!("{}", artificer_scan_core::bench::compare(&baseline, &scores));
+            }
+            if let Some(path) = &write_path {
+                println!("\nbaseline written to {path}");
+            }
             Ok(())
         }
         _ => Err(usage()),

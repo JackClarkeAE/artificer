@@ -415,6 +415,44 @@ lug-hole chamfer (a 45° cone merely parallel to Z) became a phantom
 "chamfer ring" proposal at the hole circle's diameter, eight strong on
 the spacer's feature tree.
 
+**Fits are checked against their own material (`validate.rs`,
+2026-08-17).** Each stage hands its claims to the next without ever
+re-reading the scan, so a fit that stopped describing its material
+travels the whole pipeline unchallenged. On a sigma 0.03 wheel spacer
+that produced 3,110 analytic features of which **3,110 had a residual
+past three tolerances** — including two "planes" with a 15.00 mm rms,
+exactly half the part's thickness, each holding some nine hundred
+thousand faces: one plane driven through the middle of the slab,
+holding both of its faces and describing neither. Every downstream
+stage then built on it, correctly, from a lie.
+
+Two checkpoints now probe each feature at its own face centroids and
+demote any whose **median** face sits past three tolerances from its
+surface — median, so that a few strays claimed in passing cannot
+condemn an honest fit, while a surface most of its material is not on
+is refused. Demotions are reported, not silent.
+
+The cause was fragment merging. Compatibility is screened pairwise
+against the *running* surface, which the union refit then moves, so a
+chain of individually legal steps accumulates an arbitrary walk — the
+same trap the constraint frames hit, where A parallel B and B square
+to C says nothing about A and C. A merge is now also required to leave
+the anchor's own geometry intact, by the same absolute constants that
+screened it: **residual tolerance scales with the scan's noise, because
+a union of noisy fragments cannot fit tighter than the noise;
+geometric identity does not, because whether two surfaces are the same
+physical surface is a question about the part, not about the scanner.**
+
+**Every run says where its time went (2026-08-21).** The stage table
+that already reported features and classified share per stage now
+carries seconds as well, so `reverse` answers "which stage is slow"
+without a flag or a profiler. `ARTIFICER_TIME=1` adds the same laps
+through the rebuild — revolved elements, scan occupancy, footprints,
+one-owner assignment, sew, hole stacks, exact emission, patches,
+punch. This was built because reading the code twice produced two
+wrong answers about which stage was costing an hour on one part: the
+rebuild turned out to take 0.09 s of it.
+
 **The pipeline measures its own noise (2026-08-17).** Every run
 estimates the scan's noise sigma from the mesh itself — four hundred
 small plane fits grown over adjacency, and the 25th percentile of

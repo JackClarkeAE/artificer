@@ -536,7 +536,7 @@ fn loop_polyline(
 /// Returns index triples into the vertex list. Quadratic and content
 /// with it: a machined face's boundary is hundreds of points, not
 /// millions.
-fn ear_clip(polygon: &[(f64, f64)]) -> Vec<[usize; 3]> {
+pub(crate) fn ear_clip(polygon: &[(f64, f64)]) -> Vec<[usize; 3]> {
     let n = polygon.len();
     if n < 3 {
         return Vec::new();
@@ -606,7 +606,7 @@ fn ear_clip(polygon: &[(f64, f64)]) -> Vec<[usize; 3]> {
     triangles
 }
 
-fn signed_area(polygon: &[(f64, f64)]) -> f64 {
+pub(crate) fn signed_area(polygon: &[(f64, f64)]) -> f64 {
     let mut doubled = 0.0;
     for index in 0..polygon.len() {
         let (x0, y0) = polygon[index];
@@ -621,7 +621,7 @@ fn signed_area(polygon: &[(f64, f64)]) -> f64 {
 /// Standard construction: take each hole's rightmost vertex, pick the
 /// outer-ring vertex it can see most cheaply, and stitch the hole in
 /// through a doubled bridge edge.
-fn bridge_holes(
+pub(crate) fn bridge_holes(
     outer: Vec<(f64, f64, usize)>,
     holes: Vec<Vec<(f64, f64, usize)>>,
 ) -> Vec<(f64, f64, usize)> {

@@ -1,0 +1,7 @@
+# Source CAD for the fixtures. Third-party parts, kept out of the tree
+# until their licensing is settled: the wheel spacer's download carried
+# no licence file at all. fixtures.txt names what each row expects, so
+# supply the parts here and the bench runs.
+parts/
+# Sweep logs are a record of one run, not of the pipeline.
+*.log

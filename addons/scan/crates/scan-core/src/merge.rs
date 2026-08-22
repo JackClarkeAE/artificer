@@ -219,7 +219,18 @@ pub fn merge_fragments(
         if consumed[anchor] {
             continue;
         }
-        let mut surface = features[anchor].surface.clone();
+        // The anchor's ORIGINAL surface, never updated: every accepted
+        // refit is measured against it as well as against the running
+        // one. Compatibility is checked pairwise and the refit then
+        // moves the running surface, so without this the chain
+        // ratchets — each step legal, the accumulation arbitrary. On a
+        // noisy wheel spacer that walked two lug-hole walls 16 mm out
+        // to a radius outside the part. Same trap the constraint
+        // frames hit (A parallel B, B square to C says nothing about A
+        // and C), and the same answer: cap the accumulated correction
+        // by what one step was ever allowed.
+        let anchor_surface = features[anchor].surface.clone();
+        let mut surface = anchor_surface.clone();
         let mut faces = features[anchor].faces.clone();
         let mut absorbed = 0usize;
         let mut changed = true;
@@ -234,7 +245,16 @@ pub fn merge_fragments(
                 let Some(refit) = refit_like(mesh, &trial, &surface) else {
                     continue;
                 };
-                if refit.rms().is_some_and(|rms| rms <= epsilon) {
+                // Residual tolerance scales with the scan's noise, and
+                // must: a legitimate union of noisy fragments cannot
+                // fit tighter than the noise. Geometric identity does
+                // not scale — whether two surfaces are the same
+                // physical surface is a question about the part, not
+                // about the scanner — so the drift test keeps its own
+                // absolute constants.
+                if refit.rms().is_some_and(|rms| rms <= epsilon)
+                    && compatible(&anchor_surface, &refit)
+                {
                     surface = refit;
                     faces = trial;
                     consumed[candidate] = true;
@@ -284,6 +304,72 @@ mod tests {
     use super::*;
     use crate::segment::{SegmentationParams, classify_region, segment};
     use crate::synth;
+
+    /// A fragment whose stated fit is a lie must not drag an honest
+    /// anchor off its own material.
+    ///
+    /// The compatibility screen reads the candidate's *claimed*
+    /// geometry, and upstream stages do produce claims their faces do
+    /// not support — displaced fits are exactly the failure this
+    /// guard exists for. The union refit follows the faces, so the
+    /// merged surface leaves the anchor behind unless something
+    /// checks where it landed.
+    #[test]
+    fn a_fragment_whose_fit_lies_cannot_drag_the_anchor() {
+        use crate::fit::{CylinderFit, DeviationStats};
+        use artificer_geometry::Point3;
+        let arc_at = |offset: f64, sweep_deg: f64, segments: usize| -> Vec<[Point3; 3]> {
+            synth::cylinder_arc_soup(5.0, 8.0, 0.0, sweep_deg.to_radians(), segments, 8)
+                .into_iter()
+                .map(|piece| piece.map(|p| Point3::new(p.x + offset, p.y, p.z)))
+                .collect()
+        };
+        let mut soup = arc_at(0.0, 300.0, 60);
+        let split = soup.len();
+        // Material ten millimetres away — nowhere near the anchor.
+        soup.extend(arc_at(10.0, 200.0, 40));
+        let mesh = TriangleMesh::from_triangle_soup(&soup, 1e-9).expect("mesh");
+        let cylinder = |x: f64| {
+            SurfaceClass::Cylinder(CylinderFit {
+                axis_point: Point3::new(x, 0.0, 4.0),
+                axis: Vector3::new(0.0, 0.0, 1.0),
+                radius: 5.0,
+                deviation: DeviationStats { rms: 0.0, max_abs: 0.0 },
+            })
+        };
+        let make = |id: usize, surface: SurfaceClass, faces: Vec<u32>| FeatureRecord {
+            id,
+            surface,
+            face_count: faces.len(),
+            area: faces.iter().map(|&f| mesh.face_area(f as usize)).sum(),
+            faces,
+            notes: Vec::new(),
+        };
+        let features = vec![
+            make(0, cylinder(0.0), (0..split as u32).collect()),
+            // Claims to sit a legal step away; its faces do not.
+            make(
+                1,
+                cylinder(1.4),
+                (split as u32..mesh.triangles().len() as u32).collect(),
+            ),
+        ];
+        // Loose enough to rubber-stamp the union, as a noisy scan's
+        // adaptive tolerance is.
+        let merged = merge_fragments(&mesh, features, 5.0);
+        let anchor = merged
+            .iter()
+            .find(|f| f.id == 0)
+            .expect("anchor survives");
+        let SurfaceClass::Cylinder(fit) = &anchor.surface else {
+            panic!("anchor is a cylinder");
+        };
+        assert!(
+            fit.axis_point.x.abs() <= AXIS_SEPARATION_TOL + 1e-6,
+            "anchor was dragged to x {:.2}",
+            fit.axis_point.x
+        );
+    }
 
     #[test]
     fn split_cylinder_halves_merge_into_one() {

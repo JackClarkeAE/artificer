@@ -1,0 +1,8 @@
+# artificer-scan bench baseline
+name=spacer-fast tri=489244 feat=239 sigma=0.0268 tol=0.1878 expl=0.9896 inv=0.0165 anly=0.9090 on_size=3 found=3 expected=4 worst_d=0.0422 slowest=merge+absorb slowest_s=2.1
+name=spacer-clean tri=3237664 feat=204 sigma=0.0000 tol=0.0500 expl=0.9923 inv=0.0048 anly=0.9923 on_size=4 found=4 expected=4 worst_d=0.0424 slowest=merge+absorb slowest_s=258.3
+name=spacer-n001 tri=3237664 feat=675 sigma=0.0088 tol=0.0619 expl=0.9833 inv=0.0385 anly=0.8992 on_size=4 found=4 expected=4 worst_d=0.0404 slowest=merge+absorb slowest_s=127.5
+name=spacer-n003 tri=3237664 feat=4444 sigma=0.0252 tol=0.1764 expl=0.9771 inv=0.1933 anly=0.9041 on_size=4 found=4 expected=4 worst_d=0.0348 slowest=mdl-consolidate slowest_s=909.2
+name=rail-n003 tri=2350491 feat=14154 sigma=0.0248 tol=0.1734 expl=0.9077 inv=0.1142 anly=0.9066 on_size=0 found=0 expected=0 worst_d=0.0000 slowest=coaxial-unify slowest_s=3184.9
+name=spacer-n003-sharp tri=3237664 feat=2741 sigma=0.0252 tol=0.1764 expl=0.9939 inv=0.0453 anly=0.9637 on_size=4 found=5 expected=4 worst_d=1.3201 slowest=mdl-consolidate slowest_s=709.1
+name=spacer-fast-sharp tri=489244 feat=165 sigma=0.0265 tol=0.1857 expl=0.9994 inv=0.0219 anly=0.9743 on_size=4 found=4 expected=4 worst_d=0.0383 slowest=merge+absorb slowest_s=2.8

@@ -73,6 +73,20 @@ impl SplitMix64 {
     }
 }
 
+static TORUS_PROPOSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TORUS_FITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TORUS_WON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reports how the torus candidate fared, for diagnosis only.
+pub fn torus_debug_counts() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        TORUS_PROPOSED.load(Relaxed),
+        TORUS_FITTED.load(Relaxed),
+        TORUS_WON.load(Relaxed),
+    )
+}
+
 /// Candidate primitive before refinement: geometry only, no statistics.
 #[derive(Clone, Copy, Debug)]
 enum Primitive {
@@ -93,6 +107,12 @@ enum Primitive {
         apex: Point3,
         axis: Vector3,
         half_angle: f64,
+    },
+    Torus {
+        center: Point3,
+        axis: Vector3,
+        major: f64,
+        minor: f64,
     },
 }
 
@@ -116,6 +136,28 @@ impl Primitive {
                 let radial = v - *axis * v.dot(*axis);
                 let len = radial.length();
                 (len > 1e-12).then(|| (len - radius, radial / len))
+            }
+            Self::Torus {
+                center,
+                axis,
+                major,
+                minor,
+            } => {
+                let v = p - *center;
+                let h = v.dot(*axis);
+                let radial = v - *axis * h;
+                let len = radial.length();
+                if len <= 1e-12 {
+                    return None;
+                }
+                let (dr, dh) = (len - *major, h);
+                let reach = dr.hypot(dh);
+                (reach > 1e-12).then(|| {
+                    (
+                        reach - *minor,
+                        (radial / len * dr + *axis * dh) / reach,
+                    )
+                })
             }
             Self::Cone {
                 apex,
@@ -145,6 +187,9 @@ impl Primitive {
             Self::Cylinder { .. } => 0.98,
             Self::Sphere { .. } => 0.97,
             Self::Cone { .. } => 0.95,
+            // Seven parameters: it must out-support every simpler
+            // shape by a clear margin, not merely tie with one.
+            Self::Torus { .. } => 0.90,
         }
     }
 
@@ -169,6 +214,7 @@ impl Primitive {
                 half_angle: f.half_angle,
             },
             SurfaceClass::Blend(_)
+            | SurfaceClass::Torus(_)
             | SurfaceClass::Pattern(_)
             | SurfaceClass::EdgeRound(_)
             | SurfaceClass::Freeform => {
@@ -393,7 +439,8 @@ fn refine(
             0 => fit_plane(&points, Some(mean_normal)).map(SurfaceClass::Plane),
             1 => fit_cylinder(&points, &normals).map(SurfaceClass::Cylinder),
             2 => fit_sphere(&points).map(SurfaceClass::Sphere),
-            _ => fit_cone(&cone_samples).map(SurfaceClass::Cone),
+            3 => fit_cone(&cone_samples).map(SurfaceClass::Cone),
+            _ => crate::fit::fit_torus(&points).map(SurfaceClass::Torus),
         }
     };
     let first = match primitive {
@@ -401,9 +448,10 @@ fn refine(
         Primitive::Cylinder { .. } => 1,
         Primitive::Sphere { .. } => 2,
         Primitive::Cone { .. } => 3,
+        Primitive::Torus { .. } => 4,
     };
     let mut order = vec![first];
-    order.extend([0u8, 1, 2, 3].into_iter().filter(|k| *k != first));
+    order.extend([0u8, 1, 2, 3, 4].into_iter().filter(|k| *k != first));
     for kind in order {
         if let Some(surface) = fit_kind(kind)
             && surface.rms().is_some_and(|rms| rms <= epsilon)
@@ -458,7 +506,7 @@ pub fn extract_primitives(
                 let normal = data.normal[face as usize].unwrap_or(Vector3::new(0.0, 0.0, 1.0));
                 (data.centroid[face as usize], normal)
             };
-            let candidate = match round % 5 {
+            let candidate = match round % 6 {
                 // Planes are cheap and common: propose them most often.
                 0 | 1 => {
                     let (origin, normal) = draw(&mut rng);
@@ -470,12 +518,45 @@ pub fn extract_primitives(
                     cylinder_from_two(p1, n1, p2, n2, scale)
                         .or_else(|| sphere_from_two(p1, n1, p2, n2, scale))
                 }
-                _ => {
+                4 => {
                     let s = [draw(&mut rng), draw(&mut rng), draw(&mut rng)];
                     cone_from_three(s, scale)
                 }
+                // No minimal point-and-normal construction gives a torus
+                // — seven parameters need more than three samples — so
+                // the neighbourhood itself is the construction. It is a
+                // contiguous scrap of one surface, which is exactly what
+                // the quadric-seeded fit wants. Proposing it as a
+                // candidate rather than only offering it at refinement
+                // matters: support is gathered within the candidate's own
+                // band, so a plane proposed over a crowned casting claims
+                // the flat middle and leaves the crown behind, and the
+                // refit never sees the shape that was the problem.
+                _ => {
+                    let points: Vec<Point3> = hood
+                        .iter()
+                        .map(|&face| data.centroid[face as usize])
+                        .collect();
+                    if std::env::var_os("ARTIFICER_TORUS_DEBUG").is_some() {
+                        TORUS_PROPOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if crate::fit::fit_torus(&points).is_some() {
+                            TORUS_FITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    crate::fit::fit_torus(&points).map(|fit| Primitive::Torus {
+                        center: fit.axis_point,
+                        axis: fit.axis,
+                        major: fit.major_radius,
+                        minor: fit.minor_radius,
+                    })
+                }
             };
             let Some(candidate) = candidate else { continue };
+            if matches!(candidate, Primitive::Torus { .. })
+                && std::env::var_os("ARTIFICER_TORUS_DEBUG").is_some()
+            {
+                TORUS_WON.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let mut score = 0.0;
             for &face in &subset {
                 let Some(normal) = data.normal[face as usize] else {
@@ -545,6 +626,12 @@ pub fn extract_primitives(
             faces,
         });
         dry_rounds = 0;
+    }
+    if std::env::var_os("ARTIFICER_TORUS_DEBUG").is_some() {
+        let (proposed, fitted, won) = torus_debug_counts();
+        eprintln!(
+            "torus-debug: {proposed} proposed, {fitted} fitted, {won} entered scoring"
+        );
     }
     results
 }

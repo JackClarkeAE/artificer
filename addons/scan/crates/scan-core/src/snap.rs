@@ -151,6 +151,12 @@ pub fn snap_surface(surface: &mut SurfaceClass, policy: &SnapPolicy) -> Vec<Stri
                 fit.half_angle = snapped_degrees.to_radians();
             }
         }
+        // A moulded torus is deliberately left alone. Snapping exists to
+        // recover a designer's round numbers, and this surface has none:
+        // its axis points wherever the moulding curves rather than along
+        // a datum direction, and its radii are whatever the tool and the
+        // shrinkage left. Rounding either would be inventing intent.
+        SurfaceClass::Torus(_) => {}
         SurfaceClass::Blend(fit) => {
             if let Some((snapped, delta)) = policy.snap_length(fit.minor_radius) {
                 notes.push(format!(

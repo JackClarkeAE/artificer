@@ -477,7 +477,10 @@ pub fn extract_revolved_bands(
     let tilt_donor = 2.5f64.to_radians().cos();
     let donor = |feature: &FeatureRecord| match &feature.surface {
         SurfaceClass::Freeform => true,
-        SurfaceClass::Blend(_) | SurfaceClass::Pattern(_) | SurfaceClass::EdgeRound(_) => false,
+        SurfaceClass::Blend(_)
+        | SurfaceClass::Torus(_)
+        | SurfaceClass::Pattern(_)
+        | SurfaceClass::EdgeRound(_) => false,
         SurfaceClass::Cylinder(fit) => {
             feature.area < MAX_DONOR_AREA || fit.axis.z.abs() < tilt_donor
         }
@@ -793,7 +796,7 @@ pub struct MasterProfile {
 }
 
 /// Douglas-Peucker polyline simplification in scaled coordinates.
-fn simplify_polyline(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
+pub(crate) fn simplify_polyline(points: &[(f64, f64)], epsilon: f64) -> Vec<(f64, f64)> {
     if points.len() < 3 {
         return points.to_vec();
     }

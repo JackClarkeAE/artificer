@@ -84,6 +84,10 @@ fn feature_label(surface: &SurfaceClass) -> String {
         SurfaceClass::Sphere(fit) => format!("sphere d {:.2} mm", fit.radius * 2.0),
         SurfaceClass::Cone(fit) => format!("cone {:.1} deg", fit.half_angle.to_degrees()),
         SurfaceClass::Blend(fit) => format!("fillet r {:.2} mm", fit.minor_radius),
+        SurfaceClass::Torus(fit) => format!(
+            "torus R {:.1} r {:.1} mm",
+            fit.major_radius, fit.minor_radius
+        ),
         SurfaceClass::Pattern(fit) => format!("pattern x {} (toothing)", fit.count),
         SurfaceClass::EdgeRound(fit) => format!("edge round, span {:.1} mm", fit.span),
         SurfaceClass::Freeform => "freeform".to_owned(),
