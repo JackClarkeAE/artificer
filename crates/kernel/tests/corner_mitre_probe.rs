@@ -77,11 +77,7 @@ fn every_mitre_between_three_corner_chamfers_presents_as_a_rail() {
     let mut slants = Vec::new();
     for triangle in &scene.triangles {
         let [first, second, third] = triangle.vertices;
-        let edge_a = [
-            second.x - first.x,
-            second.y - first.y,
-            second.z - first.z,
-        ];
+        let edge_a = [second.x - first.x, second.y - first.y, second.z - first.z];
         let edge_b = [third.x - first.x, third.y - first.y, third.z - first.z];
         let normal = [
             edge_a[1].mul_add(edge_b[2], -(edge_a[2] * edge_b[1])),
@@ -89,7 +85,10 @@ fn every_mitre_between_three_corner_chamfers_presents_as_a_rail() {
             edge_a[0].mul_add(edge_b[1], -(edge_a[1] * edge_b[0])),
         ];
         let length = normal[0]
-            .mul_add(normal[0], normal[1].mul_add(normal[1], normal[2] * normal[2]))
+            .mul_add(
+                normal[0],
+                normal[1].mul_add(normal[1], normal[2] * normal[2]),
+            )
             .sqrt();
         if length <= 1.0e-12 {
             continue;

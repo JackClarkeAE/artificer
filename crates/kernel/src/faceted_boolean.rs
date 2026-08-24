@@ -1143,7 +1143,15 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .copied()
             .map(|point| {
-                let key = quantized_key(point, epsilon);
+                let key = welded_key(
+                    |key| {
+                        vertex_map
+                            .get(key)
+                            .map(|key| topology.vertices[key.0].value.point)
+                    },
+                    point,
+                    epsilon,
+                );
                 *vertex_map.entry(key).or_insert_with(|| {
                     let vertex_key = VertexKey(topology.vertices.len());
                     topology.vertices.push(Record {
@@ -1788,9 +1796,8 @@ fn find_boundary_cycle(
 fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {
     let mut unique = BTreeMap::<[i64; 3], Point3>::new();
     for point in polygons.iter().flat_map(|polygon| &polygon.vertices) {
-        unique
-            .entry(quantized_key(*point, epsilon))
-            .or_insert(*point);
+        let key = welded_key(|key| unique.get(key).copied(), *point, epsilon);
+        unique.entry(key).or_insert(*point);
     }
     let candidates = unique.into_values().collect::<Vec<_>>();
     for polygon in &mut polygons {
@@ -1823,6 +1830,55 @@ fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
         polygon.vertices = conformed;
     }
     polygons
+}
+
+/// The bucket a point should weld into, given the buckets already occupied.
+///
+/// Rounding each coordinate onto an `epsilon` grid decides "these are the same
+/// point" with a hard boundary, and the boundary does not care how close the
+/// two points are. Two evaluations of one intersection which differ in the
+/// last bit share a bucket almost everywhere, and fall either side of one
+/// exactly when the coordinate lands on a half-bucket — which the offsets a
+/// finish sweep is built from, being whole multiples of `epsilon`, arrange
+/// rather often. The two spellings then publish two vertices a nanometre
+/// apart, and every face meeting there is torn into two single-use edges: an
+/// open shell the validator rejects, from a body that was closed.
+///
+/// So read the grid as a hint rather than as the answer. A point within
+/// `epsilon` of another is at most one bucket away on each axis, so look at
+/// those neighbours and weld to the nearest representative genuinely inside
+/// the tolerance. A point with no such neighbour keeps its own bucket, so this
+/// only ever repairs a straddle; it never merges two points the grid had
+/// already told apart by more than the tolerance.
+fn welded_key(
+    occupant: impl Fn(&[i64; 3]) -> Option<Point3>,
+    point: Point3,
+    epsilon: f64,
+) -> [i64; 3] {
+    let key = quantized_key(point, epsilon);
+    if occupant(&key).is_some() {
+        return key;
+    }
+    let mut nearest = None::<([i64; 3], f64)>;
+    for x in -1..=1_i64 {
+        for y in -1..=1_i64 {
+            for z in -1..=1_i64 {
+                if [x, y, z] == [0, 0, 0] {
+                    continue;
+                }
+                let neighbour = [key[0] + x, key[1] + y, key[2] + z];
+                let Some(occupied) = occupant(&neighbour) else {
+                    continue;
+                };
+                let separation = occupied.distance(point);
+                if separation <= epsilon && nearest.is_none_or(|(_, closest)| separation < closest)
+                {
+                    nearest = Some((neighbour, separation));
+                }
+            }
+        }
+    }
+    nearest.map_or(key, |(neighbour, _)| neighbour)
 }
 
 fn quantized_key(point: Point3, epsilon: f64) -> [i64; 3] {
