@@ -18984,6 +18984,94 @@ fn hud_button(
 }
 
 #[cfg(test)]
+mod view_cube_arrow_tests {
+    use super::*;
+
+    /// An arrow reaches the face the cube draws on that side of itself.
+    ///
+    /// Stated against the projection rather than against a table of view
+    /// names, because the two must agree whatever the projection's handedness
+    /// is: the arrow is a promise about the picture in front of the user, and
+    /// it stays true if the camera's basis is ever corrected.
+    #[test]
+    fn each_turn_arrow_reaches_the_face_drawn_on_that_side() {
+        for from in StandardView::ALL {
+            let mut view = ViewState::default();
+            view.set_standard_view(from);
+            for (name, direction) in VIEW_CUBE_ARROWS {
+                let Some(target) = view_cube_arrow_target(view, direction) else {
+                    panic!(
+                        "a square-on view should offer a {name} turn from {}",
+                        from.label()
+                    );
+                };
+                let projected = view.project_direction(target.outward_normal());
+                let along = projected.coordinates[0] as f32 * direction.x
+                    + projected.coordinates[1] as f32 * direction.y;
+                assert!(
+                    along > 0.9,
+                    "the {name} arrow from {} reached {}, which the cube does not draw that way",
+                    from.label(),
+                    target.label()
+                );
+            }
+        }
+    }
+
+    /// The four arrows of a square-on view name four different faces — the
+    /// four that are not the one facing the viewer or the one behind it.
+    ///
+    /// They are not required to round-trip: each standard view has a
+    /// canonical roll of its own, so turning up from the back and then down
+    /// again lands square on the front rather than retracing the turn.
+    #[test]
+    fn the_four_arrows_name_four_different_faces() {
+        for from in StandardView::ALL {
+            let mut view = ViewState::default();
+            view.set_standard_view(from);
+            let reached = VIEW_CUBE_ARROWS
+                .iter()
+                .filter_map(|(_, direction)| view_cube_arrow_target(view, *direction))
+                .collect::<Vec<_>>();
+            assert_eq!(reached.len(), 4, "from {}", from.label());
+            let unique = reached
+                .iter()
+                .map(|face| face.label())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                4,
+                "the four arrows from {} should name four faces, got {reached:?}",
+                from.label()
+            );
+            assert!(
+                !unique.contains(from.label()),
+                "no arrow from {} should name {} itself",
+                from.label(),
+                from.label()
+            );
+        }
+    }
+
+    /// An arrow that would barely turn the model is not offered at all: from
+    /// an isometric view every face is oblique, and the arrows must still
+    /// name distinct faces rather than repeating the nearest one.
+    #[test]
+    fn arrows_never_offer_the_face_already_in_front() {
+        let view = ViewState::default();
+        let nearest = view.nearest_standard_view();
+        for (_, direction) in VIEW_CUBE_ARROWS {
+            let target = view_cube_arrow_target(view, direction);
+            assert_ne!(
+                target,
+                Some(nearest),
+                "an arrow should never point at the face already facing the viewer"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod extrusion_workbench_tests {
     use artificer_geometry::ProfileWinding;
 
