@@ -219,6 +219,23 @@ fn visibility_toggle(ui: &mut egui::Ui, visible: bool, action_label: &str) -> eg
 /// 15×15 icon so the two columns read as one grid.
 const ROW_MARKER_SIZE: egui::Vec2 = egui::Vec2::splat(15.0);
 
+/// Clears the idle chrome of a framed button so a Browser row can answer the
+/// pointer.
+///
+/// A row wants three appearances: bare panel at rest, the theme's hover fill
+/// under the pointer, the selection fill when chosen. Asking for a frame only
+/// while selected gets the first and third and loses the second, because egui
+/// paints no background whatsoever for a frameless button — which is why rows
+/// went quiet under the pointer. Every row keeps its frame instead, and the
+/// inactive fill is emptied here, so hover and press find the chrome the rest
+/// of the app already uses.
+fn clear_idle_row_fill(ui: &mut egui::Ui) {
+    let widgets = &mut ui.style_mut().visuals.widgets;
+    widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+    widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    widgets.inactive.bg_stroke = egui::Stroke::NONE;
+}
+
 /// One interactive Browser row: a painted marker, then a truncating label,
 /// in a single full-width click target. The marker rides inside the button
 /// as a custom atom so selection and hover chrome cover it exactly as they
@@ -235,29 +252,34 @@ fn browser_row_button(
     selected: bool,
 ) -> egui::Response {
     let marker = egui::Id::new("browser_row_marker");
-    let layout = egui::Button::new((
-        egui::Atom::custom(marker, ROW_MARKER_SIZE),
-        text.into(),
-        egui::Atom::grow(),
-    ))
-    // A selected row wears the selection fill; a text tint alone reads as
-    // nothing at a glance, which left the Browser feeling unclickable.
-    .frame(selected)
-    .selected(selected)
-    .corner_radius(2)
-    .truncate()
-    .small()
-    .min_size(egui::vec2(width, 22.0))
-    .atom_ui(ui);
-    if let Some(rect) = layout.rect(marker) {
-        let color = icon_color.unwrap_or_else(|| {
-            ui.style()
-                .interact_selectable(&layout.response, selected)
-                .text_color()
-        });
-        paint_command_icon(ui.painter(), rect, icon, color);
-    }
-    layout.response
+    ui.scope(|ui| {
+        clear_idle_row_fill(ui);
+        let layout = egui::Button::new((
+            egui::Atom::custom(marker, ROW_MARKER_SIZE),
+            text.into(),
+            egui::Atom::grow(),
+        ))
+        // A selected row wears the selection fill and a hovered one the hover
+        // fill; a text tint alone reads as nothing at a glance, which left the
+        // Browser feeling unclickable.
+        .frame(true)
+        .selected(selected)
+        .corner_radius(2)
+        .truncate()
+        .small()
+        .min_size(egui::vec2(width, 22.0))
+        .atom_ui(ui);
+        if let Some(rect) = layout.rect(marker) {
+            let color = icon_color.unwrap_or_else(|| {
+                ui.style()
+                    .interact_selectable(&layout.response, selected)
+                    .text_color()
+            });
+            paint_command_icon(ui.painter(), rect, icon, color);
+        }
+        layout.response
+    })
+    .inner
 }
 
 /// A non-interactive Browser row: a painted marker and a truncating label,
@@ -331,14 +353,19 @@ impl KernelLabApp {
                                 self.pending_operation.is_none() && !has_other_plane_sketch;
                             let selected = self.selected_origin_plane == plane
                                 && self.selected_construction_plane.is_none();
-                            let response = ui.add_enabled(
-                                enabled,
-                                egui::Button::new(origin_plane_label(plane))
-                                    .frame(selected)
-                                    .selected(selected)
-                                    .corner_radius(2)
-                                    .min_size(egui::vec2(ui.available_width(), 24.0)),
-                            );
+                            let response = ui
+                                .scope(|ui| {
+                                    clear_idle_row_fill(ui);
+                                    ui.add_enabled(
+                                        enabled,
+                                        egui::Button::new(origin_plane_label(plane))
+                                            .frame(true)
+                                            .selected(selected)
+                                            .corner_radius(2)
+                                            .min_size(egui::vec2(ui.available_width(), 24.0)),
+                                    )
+                                })
+                                .inner;
                             if response.clicked() {
                                 self.select_origin_plane(plane);
                             }
