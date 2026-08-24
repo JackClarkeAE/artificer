@@ -19,6 +19,7 @@ mod export;
 pub mod feature_editor;
 pub mod library_catalog;
 pub mod material;
+mod parametric;
 pub mod part_library;
 mod ribbon;
 pub mod shell;
@@ -383,6 +384,18 @@ enum PendingOperation {
         ordinal: u32,
         value_mm: f64,
     },
+    /// The parsed binding is not `Copy`, so it stages beside the operation in
+    /// `staged_parameter_binding`, exactly as a Boolean's tool picks do.
+    SetParameterBindingEntry {
+        parameter: ParameterId,
+    },
+    RemoveParameter {
+        parameter: ParameterId,
+    },
+    AddUserParameter {
+        ordinal: u32,
+        kind: QuantityKind,
+    },
     CreateConstructionPlane {
         frame: PlanarFrame3,
         half_u: f64,
@@ -494,6 +507,13 @@ impl PendingOperation {
             Self::LoadDefaultDocument => "Open saved document",
             Self::SetParameterLiteral { .. } => "Update document parameter",
             Self::AddUserLengthParameter { .. } => "Add document parameter",
+            Self::SetParameterBindingEntry { .. } => "Update variable",
+            Self::RemoveParameter { .. } => "Delete variable",
+            Self::AddUserParameter { kind, .. } => match kind {
+                QuantityKind::Length => "Add length variable",
+                QuantityKind::Angle => "Add angle variable",
+                QuantityKind::Scalar => "Add factor variable",
+            },
             Self::CreateConstructionPlane { source, .. } => match source {
                 ConstructionPlaneSource::OnFace { .. } => "Create plane on face",
                 ConstructionPlaneSource::BetweenFaces { .. } => "Create midplane",
@@ -546,6 +566,13 @@ impl PendingOperation {
             Self::AddUserLengthParameter { .. } => {
                 "Create one named, reusable length parameter in this document"
             }
+            Self::SetParameterBindingEntry { .. } => {
+                "Publish the new value or expression and rebuild every consuming feature"
+            }
+            Self::RemoveParameter { .. } => {
+                "Delete the variable; a variable a feature or expression still uses is refused"
+            }
+            Self::AddUserParameter { .. } => "Create one named, reusable variable in this document",
             Self::CreateConstructionPlane { source, .. } => match source {
                 ConstructionPlaneSource::OnFace { .. } => {
                     "Commit a datum plane coincident with the selected planar face"
@@ -610,6 +637,16 @@ impl PendingOperation {
             Self::AddUserLengthParameter { ordinal, value_mm } => {
                 object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
                 object.insert("value_mm".to_owned(), serde_json::json!(value_mm));
+            }
+            Self::SetParameterBindingEntry { parameter } | Self::RemoveParameter { parameter } => {
+                object.insert(
+                    "parameter_id".to_owned(),
+                    serde_json::json!(parameter.to_string()),
+                );
+            }
+            Self::AddUserParameter { ordinal, kind } => {
+                object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
+                object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
             Self::CreateConstructionPlane { source, .. } => {
                 object.insert(
@@ -1654,6 +1691,19 @@ pub struct KernelLabApp {
     next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
     document_properties_open: bool,
+    /// The Parametric tab's variables panel.
+    variables_window_open: bool,
+    /// The parsed binding a staged `SetParameterBindingEntry` will publish.
+    /// Beside the operation rather than inside it so the op stays `Copy`.
+    staged_parameter_binding: Option<(ParameterId, ParameterBinding)>,
+    /// Text being typed into a variable's value field, by parameter id. The
+    /// draft is what the field shows until it parses and stages; a parse
+    /// error is shown beside it rather than corrupting the stored binding.
+    variable_value_drafts: BTreeMap<u64, String>,
+    /// Text being typed into a variable's name field, committed on focus loss.
+    variable_name_drafts: BTreeMap<u64, String>,
+    /// Text typed into the extrusion distance expression field.
+    extrusion_expression_draft: String,
     /// The Theme tab's colour editor window.
     theme_editor_open: bool,
     /// Where the theme choice and edited palettes are written; `None` in
@@ -1834,6 +1884,11 @@ impl Default for KernelLabApp {
             next_construction_plane_id: 1,
             selected_construction_plane: None,
             document_properties_open: false,
+            variables_window_open: false,
+            staged_parameter_binding: None,
+            variable_value_drafts: BTreeMap::new(),
+            variable_name_drafts: BTreeMap::new(),
+            extrusion_expression_draft: String::new(),
             theme_editor_open: false,
             theme_preferences_path: None,
             user_preferences_path: None,
@@ -3111,6 +3166,9 @@ impl KernelLabApp {
                 | PendingOperation::LoadDefaultDocument
                 | PendingOperation::SetParameterLiteral { .. }
                 | PendingOperation::AddUserLengthParameter { .. }
+                | PendingOperation::SetParameterBindingEntry { .. }
+                | PendingOperation::RemoveParameter { .. }
+                | PendingOperation::AddUserParameter { .. }
                 | PendingOperation::CreateConstructionPlane { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
@@ -7745,6 +7803,80 @@ impl KernelLabApp {
                     }
                 }
             }
+            PendingOperation::SetParameterBindingEntry { parameter } => {
+                match self
+                    .staged_parameter_binding
+                    .take()
+                    .filter(|(staged, _)| *staged == parameter)
+                {
+                    None => self.pending_operation = None,
+                    Some((_, binding)) => {
+                        match self
+                            .document
+                            .set_parameter_binding(parameter, binding.clone())
+                        {
+                            Ok(_) => {
+                                self.pending_operation = None;
+                                self.variable_value_drafts.remove(&parameter.get());
+                                self.rebuild_after_parameter_change();
+                            }
+                            Err(error) => {
+                                self.staged_parameter_binding = Some((parameter, binding));
+                                self.document_status =
+                                    Some(format!("Variable update rejected: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+            PendingOperation::RemoveParameter { parameter } => {
+                match self.document.remove_parameter(parameter) {
+                    Ok(_) => {
+                        self.pending_operation = None;
+                        self.variable_value_drafts.remove(&parameter.get());
+                        self.variable_name_drafts.remove(&parameter.get());
+                        self.history_scrub_position = self.document.history_position();
+                        self.document_status = Some("Variable deleted".to_owned());
+                    }
+                    Err(error) => {
+                        self.document_status = Some(format!("Variable deletion refused: {error}"));
+                    }
+                }
+            }
+            PendingOperation::AddUserParameter { ordinal, kind } => {
+                let (prefix, label, value, unit) = match kind {
+                    QuantityKind::Length => ("Length", "Length", 10.0, ParameterUnit::Millimeter),
+                    QuantityKind::Angle => ("Angle", "Angle", 45.0, ParameterUnit::Degree),
+                    QuantityKind::Scalar => ("Factor", "Factor", 1.0, ParameterUnit::Scalar),
+                };
+                let key = format!("{prefix}{ordinal}");
+                let metadata = ParameterMetadata {
+                    exposure: ParameterExposure::UserInput,
+                    description: Some("Reusable document variable".to_owned()),
+                    ..ParameterMetadata::default()
+                };
+                let spec = ParameterSpec::new(
+                    key.clone(),
+                    format!("{label} {ordinal}"),
+                    ParameterType::Quantity(kind),
+                )
+                .with_display_unit(unit)
+                .with_metadata(metadata);
+                match self.document.add_parameter(
+                    spec,
+                    ParameterBinding::literal(ParameterValue::quantity(value, unit)),
+                ) {
+                    Ok(_) => {
+                        self.pending_operation = None;
+                        self.history_scrub_position = self.document.history_position();
+                        self.variables_window_open = true;
+                        self.document_status = Some(format!("Variable {key} added"));
+                    }
+                    Err(error) => {
+                        self.document_status = Some(format!("Variable creation rejected: {error}"));
+                    }
+                }
+            }
             PendingOperation::CreateConstructionPlane {
                 frame,
                 half_u,
@@ -7900,7 +8032,13 @@ impl KernelLabApp {
             }
             PendingOperation::SetParameterLiteral { .. }
             | PendingOperation::AddUserLengthParameter { .. }
+            | PendingOperation::RemoveParameter { .. }
+            | PendingOperation::AddUserParameter { .. }
             | PendingOperation::CreateConstructionPlane { .. } => self.pending_operation = None,
+            PendingOperation::SetParameterBindingEntry { .. } => {
+                self.staged_parameter_binding = None;
+                self.pending_operation = None;
+            }
             PendingOperation::PresetFeature { .. } => {
                 self.staged_revolve = None;
                 self.pending_operation = None;
@@ -13183,6 +13321,43 @@ impl KernelLabApp {
                         .suffix(" mm"),
                 )
                 .changed();
+            // The same field, written as arithmetic over document variables:
+            // `depth`, `plate_width / 2`. Evaluated on Enter into the drag
+            // value above, so what commits is always a plain number.
+            let expression = ui.add(
+                egui::TextEdit::singleline(&mut self.extrusion_expression_draft)
+                    .desired_width(ui.available_width().min(190.0))
+                    .hint_text("distance = variables…"),
+            );
+            expression.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::TextEdit,
+                    true,
+                    "Extrusion distance expression",
+                )
+            });
+            if expression.lost_focus() && !self.extrusion_expression_draft.trim().is_empty() {
+                match self
+                    .sketch
+                    .evaluate_value_entry(&self.extrusion_expression_draft)
+                {
+                    Some(value) if (-1_000.0..=1_000.0).contains(&value) => {
+                        self.extrusion_distance = value;
+                        intent_changed = true;
+                    }
+                    Some(value) => {
+                        self.document_status = Some(format!(
+                            "Distance expression evaluates to {value:.3} mm, outside the supported range"
+                        ));
+                    }
+                    None => {
+                        self.document_status = Some(
+                            "Distance expression did not evaluate; check the variable names in the Parametric tab"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
         });
         if intent_changed {
             self.set_extrusion_distance_intent(self.extrusion_distance);
@@ -15325,6 +15500,14 @@ impl eframe::App for KernelLabApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sketch_dimension_keys = DimensionKeyClaims::default();
+        // Dimension and recipe fields accept document variables by name, so
+        // the canvas carries the current evaluated table.
+        let named_values = if self.document.parameters().is_empty() {
+            BTreeMap::new()
+        } else {
+            self.evaluated_variable_values()
+        };
+        self.sketch.set_named_values(named_values);
         let operation_at_frame_start = self.pending_operation;
         if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
             self.last_focused_editor = Some(focused);
@@ -15548,6 +15731,7 @@ impl eframe::App for KernelLabApp {
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.theme_editor_window(ui.ctx());
+        self.variables_window(ui.ctx());
         self.about_window(ui.ctx());
 
         if let Some(staging_id) = self

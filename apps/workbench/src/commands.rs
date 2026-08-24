@@ -29,17 +29,25 @@ pub enum RibbonTab {
     Model,
     Sketch,
     View,
+    Parametric,
     Theme,
 }
 
 impl RibbonTab {
-    pub const ALL: [Self; 4] = [Self::Model, Self::Sketch, Self::View, Self::Theme];
+    pub const ALL: [Self; 5] = [
+        Self::Model,
+        Self::Sketch,
+        Self::View,
+        Self::Parametric,
+        Self::Theme,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Model => "Model",
             Self::Sketch => "Sketch",
             Self::View => "View",
+            Self::Parametric => "Parametric",
             Self::Theme => "Theme",
         }
     }
@@ -59,6 +67,7 @@ impl RibbonTab {
             Self::Model => "Model mode",
             Self::Sketch => "Sketch mode",
             Self::View => "View ribbon tab",
+            Self::Parametric => "Parametric ribbon tab",
             Self::Theme => "Theme ribbon tab",
         }
     }
@@ -84,6 +93,7 @@ pub enum RibbonGroupId {
     Appearance,
     ThemeChoice,
     ThemeColours,
+    ParametricVariables,
 }
 
 impl RibbonGroupId {
@@ -104,6 +114,7 @@ impl RibbonGroupId {
             Self::Appearance => "APPEARANCE",
             Self::ThemeChoice => "THEME",
             Self::ThemeColours => "COLOURS",
+            Self::ParametricVariables => "VARIABLES",
         }
     }
 
@@ -128,6 +139,7 @@ impl RibbonGroupId {
             Self::Appearance => "group_appearance",
             Self::ThemeChoice => "group_theme_choice",
             Self::ThemeColours => "group_theme_colours",
+            Self::ParametricVariables => "group_parametric_variables",
         }
     }
 }
@@ -184,6 +196,10 @@ pub enum ModelCommand {
     ExitSketch,
     FrameSketch,
     ToggleSnap,
+    ToggleVariables,
+    NewLengthVariable,
+    NewAngleVariable,
+    NewFactorVariable,
 }
 
 /// Static presentation metadata for one command.
@@ -703,6 +719,55 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Reset",
         "Reset theme colours",
         "Restore the active theme's built-in colours.",
+        None,
+    ),
+    // ---- Parametric tab --------------------------------------------------
+    command(
+        ModelCommand::ToggleVariables,
+        "parametric.variables",
+        RibbonTab::Parametric,
+        RibbonGroupId::ParametricVariables,
+        CommandIcon::Variable,
+        CommandSize::Large,
+        "Variables",
+        "Variables",
+        "Open the variables panel: name values once and drive dimensions with them everywhere.",
+        None,
+    ),
+    command(
+        ModelCommand::NewLengthVariable,
+        "parametric.new_length",
+        RibbonTab::Parametric,
+        RibbonGroupId::ParametricVariables,
+        CommandIcon::VariableNew,
+        CommandSize::Small,
+        "Length",
+        "New length variable",
+        "Create a named length in millimetres, ready to reference from any dimension.",
+        None,
+    ),
+    command(
+        ModelCommand::NewAngleVariable,
+        "parametric.new_angle",
+        RibbonTab::Parametric,
+        RibbonGroupId::ParametricVariables,
+        CommandIcon::VariableNew,
+        CommandSize::Small,
+        "Angle",
+        "New angle variable",
+        "Create a named angle in degrees, ready to reference from any dimension.",
+        None,
+    ),
+    command(
+        ModelCommand::NewFactorVariable,
+        "parametric.new_factor",
+        RibbonTab::Parametric,
+        RibbonGroupId::ParametricVariables,
+        CommandIcon::VariableNew,
+        CommandSize::Small,
+        "Factor",
+        "New factor variable",
+        "Create a named dimensionless factor for scaling other variables.",
         None,
     ),
 ];
