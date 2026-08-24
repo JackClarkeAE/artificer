@@ -193,8 +193,43 @@ pub struct DocumentSettings {
     /// Retained so older workspace files keep parsing and older builds keep
     /// reading newer files; the navigation profile itself is a user
     /// preference now (see [`UserPreferencesFile`]), not document state.
-    #[serde(default)]
+    #[serde(default, with = "legacy_navigation")]
     pub navigation: navigation::NavigationPreset,
+}
+
+/// Workspace files carry the navigation profile under the spelling 0.6.0
+/// validates, so a workspace saved here stays readable by the previous
+/// release. Reading accepts both spellings, and nothing in this build
+/// consumes the stored value anyway — the live profile comes from the user
+/// preferences.
+mod legacy_navigation {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    use crate::navigation::NavigationPreset;
+
+    pub fn serialize<S: Serializer>(
+        preset: &NavigationPreset,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let legacy = match preset {
+            NavigationPreset::Artificer => "artificer",
+            // Inventor's hold-to-navigate keys have no 0.6.0 equivalent; its
+            // button bindings match the middle-pan scheme, which is what an
+            // older build can honour.
+            NavigationPreset::Fusion | NavigationPreset::Inventor => "middle-pan-inverted",
+            NavigationPreset::SolidWorks => "middle-orbit-inverted",
+            NavigationPreset::Onshape => "right-orbit",
+            NavigationPreset::Creo => "middle-orbit-shift-pan-inverted",
+            NavigationPreset::Nx => "middle-orbit-shift-pan",
+        };
+        serializer.serialize_str(legacy)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<NavigationPreset, D::Error> {
+        NavigationPreset::deserialize(deserializer)
+    }
 }
 
 /// Cross-document user preferences, stored beside the theme file so a chosen
@@ -22443,14 +22478,16 @@ mod user_preference_tests {
         let mut app = KernelLabApp::default();
         app.set_navigation_preference(navigation::NavigationPreset::Fusion);
         let saved = app.workspace_document_json().expect("workspace serializes");
+        // The workspace copy exists only for the previous release, so it is
+        // written under the spelling 0.6.0 validates.
         assert!(
-            saved.contains("\"fusion\""),
-            "the saved workspace mirrors the profile for older builds: {saved}"
+            saved.contains("\"middle-pan-inverted\""),
+            "the saved workspace mirrors the profile under its legacy name: {saved}"
         );
 
         // The file on disk names a different profile — perhaps another
         // machine's — and opening it must not rebind this user's mouse.
-        let foreign = saved.replace("\"fusion\"", "\"solid-works\"");
+        let foreign = saved.replace("\"middle-pan-inverted\"", "\"middle-orbit-inverted\"");
         app.load_workspace_json(&foreign).expect("workspace loads");
         assert_eq!(
             app.navigation_preference(),
