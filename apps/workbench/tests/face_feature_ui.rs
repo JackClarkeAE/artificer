@@ -670,7 +670,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     assert_eq!(harness.state().sketch_count(), 3);
     assert!(
         harness
-            .query_by_role_and_label(Role::Button, "Edit Sketch 3")
+            .query_by_role_and_label(Role::Button, "Select Sketch 3")
             .is_some(),
         "Browser and History disagree on the final sketch"
     );

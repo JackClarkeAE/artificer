@@ -63,6 +63,32 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center, egui::Modifiers::NONE);
 }
 
+fn double_click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    // Outrun the double-click window first, so an earlier click in the test
+    // cannot chain with this pair into a triple click.
+    for _ in 0..30 {
+        harness.step();
+    }
+    let center = harness
+        .get_by_role_and_label(Role::Button, label)
+        .rect()
+        .center();
+    harness.hover_at(center);
+    harness.step();
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+    }
+    harness.step();
+}
+
 fn command_click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     let center = harness
         .get_by_role_and_label(Role::Button, label)
@@ -144,11 +170,18 @@ fn scratch_document_root(tag: &str) -> std::path::PathBuf {
 /// selection no-op. It is now the contextually correct action — open the
 /// sketch for editing.
 #[test]
-fn left_clicking_a_sketch_row_opens_it_for_editing() {
+fn left_clicking_a_sketch_row_selects_it_and_double_click_edits() {
     let mut harness = harness();
     commit_rectangle_sketch(&mut harness);
 
-    click_button(&mut harness, "Edit Sketch 1");
+    // A single click is orientation, not a mode jump: the row highlights and
+    // the sketch becomes the active profile source, while the workspace
+    // stays where the user was.
+    click_button(&mut harness, "Select Sketch 1");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    assert_eq!(harness.state().browser_selected_sketch_index(), Some(0));
+
+    double_click_button(&mut harness, "Select Sketch 1");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     assert!(
         harness.state().sketch_entity_count() >= 1,
@@ -169,7 +202,7 @@ fn the_sketch_row_menu_exports_a_dxf() {
         .state_mut()
         .set_document_path(root.join("part.artificer"));
 
-    right_click_button(&mut harness, "Edit Sketch 1");
+    right_click_button(&mut harness, "Select Sketch 1");
     click_button(&mut harness, "Export this sketch as DXF");
 
     let exported = root.join("part.sketch-1.dxf");

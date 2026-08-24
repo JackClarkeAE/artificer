@@ -3,10 +3,7 @@ use artificer_workbench::{
     sketch::{CertifiedProfileStatus, SketchPoint},
 };
 use egui::accesskit::Role;
-use egui_kittest::{
-    Harness,
-    kittest::Queryable as _,
-};
+use egui_kittest::{Harness, kittest::Queryable as _};
 
 const CONFIRM_OPERATION: &str = "Confirm operation";
 /// The Dimension tool's driving boxes for a picked rectangle.
