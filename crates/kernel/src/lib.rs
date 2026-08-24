@@ -818,10 +818,11 @@ impl NativeKernel {
                         // were.
                         warnings.push(approximation_warning(
                             "FACE_FEATURE_FACETED_APPROXIMATION",
-                            "This cut crosses curved geometry that the exact rewrite cannot split, so the body was \
-                             rebuilt from a tessellation. Its faces, edges, and measures approximate the true solid \
-                             rather than certifying it: two round bores that cross meet in ellipses, which are \
-                             outside this kernel's line-and-circle curve vocabulary.",
+                            "This cut crosses geometry that the exact rewrite cannot split - curved walls, or an \
+                             interior void with material resuming beyond it - so the body was rebuilt from a \
+                             tessellation. Its faces, edges, and measures approximate the true solid rather than \
+                             certifying it: two round bores that cross meet in ellipses, which are outside this \
+                             kernel's line-and-circle curve vocabulary.",
                         ));
                         (topology, None, true)
                     }

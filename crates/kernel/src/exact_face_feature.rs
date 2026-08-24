@@ -174,6 +174,29 @@ pub(crate) fn validate_exact_face_feature(
     ) {
         return Err(face_error(FaceFeatureInputError::SweepCollision));
     }
+    // A truncating exit certifies "through" only if nothing lies beyond it.
+    // The roof of an interior void — a slot or tunnel through the body —
+    // passes the profile-containment test exactly as a true bottom face
+    // does, yet material resumes past it, and the local rewrite would
+    // silently leave that far side uncut. Sweeping the full requested depth
+    // exposes any such resumption (the void's floor or crossing walls) as a
+    // collision, which routes the cut to the real-difference fallback.
+    if exit_face_index.is_some()
+        && distance > feature_distance + precision.linear_agreement
+        && sweep_contacts_source(
+            topology,
+            shell_index,
+            target_face_index,
+            exit_face_index,
+            &extrusion,
+            direction,
+            distance,
+            minimum,
+            angular_tolerance,
+        )
+    {
+        return Err(face_error(FaceFeatureInputError::SweepCollision));
+    }
 
     let mut candidate = topology.clone();
     append_exact_feature(
