@@ -455,6 +455,49 @@ fn a_region_picked_in_the_model_viewport_extrudes_that_region() {
 }
 
 #[test]
+fn a_picked_region_is_highlighted_and_a_background_click_releases_it() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Finish sketch");
+
+    // Finishing alone highlights nothing: the lone-cell convenience
+    // selection is for Extrude, not a pick the user made.
+    assert!(
+        harness
+            .state_mut()
+            .selected_sketch_region_selections()
+            .is_empty()
+    );
+
+    let anchor = harness.state().model_sketch_region_anchors(0)[0];
+    assert!(
+        harness
+            .state_mut()
+            .select_committed_sketch_region(0, anchor)
+    );
+    let highlighted = harness.state_mut().selected_sketch_region_selections();
+    assert_eq!(
+        highlighted.len(),
+        1,
+        "the picked region wears a selection fill"
+    );
+    assert_eq!(highlighted[0].sketch_index, 0);
+    // The pick selected the region, not the geometry beneath it.
+    assert_eq!(harness.state().selected_face(), None);
+
+    // Clicking empty space releases the region highlight.
+    let viewport = harness.get_by_label("Model viewport").rect();
+    click_at(&mut harness, viewport.left_top() + egui::vec2(40.0, 60.0));
+    assert!(
+        harness
+            .state_mut()
+            .selected_sketch_region_selections()
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_drafted_sketch_offers_its_regions_to_the_model_viewport() {
     // Leaving a sketch as a draft still draws it in 3D. Its regions have to
     // come with it, or the pointer finds nothing to pick for the next feature.

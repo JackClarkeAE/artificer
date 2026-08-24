@@ -4037,6 +4037,11 @@ struct AnalyticRegionSelection {
     selected: BTreeSet<CoreRegionSignature>,
     selection_anchors: BTreeMap<CoreRegionSignature, CorePoint2>,
     hovered: Option<CoreRegionSignature>,
+    /// Whether the selection came from a deliberate pick rather than the
+    /// lone-cell fallback that keeps Extrude working on single-profile
+    /// sketches. Only deliberate picks earn a selection fill in the model
+    /// viewport; the fallback would tint every committed sketch forever.
+    explicit: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4740,6 +4745,38 @@ impl SketchCanvasState {
         self.analytic_regions.selected.iter().cloned().collect()
     }
 
+    /// Canonical interior anchors of the deliberately selected cells, in
+    /// sketch-plane coordinates. These are the very samples the
+    /// model-viewport overlay regions anchor to, so a selection made on
+    /// either canvas highlights on both regardless of where inside the cell
+    /// the pick landed. The lone-cell fallback selection is excluded: it is
+    /// a convenience for Extrude, not something the user picked.
+    #[must_use]
+    pub fn selected_region_canonical_anchors(&mut self) -> Vec<[f64; 2]> {
+        self.refresh_analytic_regions();
+        if !self.analytic_regions.explicit {
+            return Vec::new();
+        }
+        let Some(arrangement) = self.analytic_regions.arrangement.as_ref() else {
+            return Vec::new();
+        };
+        let precision = PrecisionPolicy::default();
+        arrangement
+            .cells
+            .iter()
+            .filter(|cell| self.analytic_regions.selected.contains(&cell.signature))
+            .filter_map(|cell| arrangement.cell_interior_sample(cell, &precision))
+            .map(|anchor| [anchor.u, anchor.v])
+            .collect()
+    }
+
+    /// Clears the region selection, as a click on empty space does. The next
+    /// authoring edit still restores the lone cell of a single-cell sketch,
+    /// so Extrude keeps working without an explicit pick.
+    pub fn clear_region_selection(&mut self) -> bool {
+        self.clear_selected_regions()
+    }
+
     #[must_use]
     pub fn hovered_region_signature(&self) -> Option<&CoreRegionSignature> {
         self.analytic_regions.hovered.as_ref()
@@ -4824,6 +4861,7 @@ impl SketchCanvasState {
                 anchors.insert(repaired.signature.clone(), anchor);
             }
         }
+        let mut explicit = self.analytic_regions.explicit && !selected.is_empty();
         if selected.is_empty()
             && arrangement.cells.len() == 1
             && let Some(cell) = arrangement.cells.first()
@@ -4832,6 +4870,7 @@ impl SketchCanvasState {
             if let Some(anchor) = arrangement.cell_interior_sample(cell, &precision) {
                 anchors.insert(cell.signature.clone(), anchor);
             }
+            explicit = false;
         }
         self.analytic_regions = AnalyticRegionSelection {
             revision: Some(revision),
@@ -4839,6 +4878,7 @@ impl SketchCanvasState {
             selected,
             selection_anchors: anchors,
             hovered: None,
+            explicit,
         };
     }
 
@@ -4846,6 +4886,7 @@ impl SketchCanvasState {
         let changed = !self.analytic_regions.selected.is_empty();
         self.analytic_regions.selected.clear();
         self.analytic_regions.selection_anchors.clear();
+        self.analytic_regions.explicit = false;
         changed
     }
 
@@ -4877,6 +4918,7 @@ impl SketchCanvasState {
                     .selection_anchors
                     .insert(signature, point);
             }
+            self.analytic_regions.explicit = !self.analytic_regions.selected.is_empty();
             true
         } else {
             let unchanged = self.analytic_regions.selected.len() == 1
@@ -4887,6 +4929,7 @@ impl SketchCanvasState {
             self.analytic_regions
                 .selection_anchors
                 .insert(signature, point);
+            self.analytic_regions.explicit = true;
             !unchanged
         }
     }

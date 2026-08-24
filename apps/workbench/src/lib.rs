@@ -2636,6 +2636,33 @@ impl KernelLabApp {
         self.sketch.available_region_count()
     }
 
+    /// The active sketch's selected regions, addressed the way the model
+    /// viewport's overlay regions are, so a picked profile wears a selection
+    /// fill in 3D exactly as a picked face does. A consumed sketch is a
+    /// record rather than pending intent, so its selection shows nothing.
+    pub fn selected_sketch_region_selections(
+        &mut self,
+    ) -> Vec<viewport::ModelSketchRegionSelection> {
+        let Some(sketch_index) = self.active_sketch_index else {
+            return Vec::new();
+        };
+        if self
+            .sketches
+            .get(sketch_index)
+            .is_none_or(|sketch| sketch.consumed)
+        {
+            return Vec::new();
+        }
+        self.sketch
+            .selected_region_canonical_anchors()
+            .into_iter()
+            .map(|anchor| viewport::ModelSketchRegionSelection {
+                sketch_index,
+                anchor,
+            })
+            .collect()
+    }
+
     #[must_use]
     pub const fn sketch_revision(&self) -> u64 {
         self.sketch_revision
@@ -14210,6 +14237,7 @@ impl KernelLabApp {
             sketch_overlays.push(overlay);
         }
         sketch_overlays.extend(self.visible_reference_plane_overlays());
+        let selected_sketch_regions = self.selected_sketch_region_selections();
         let reference_plane_bounds = self.visible_reference_plane_bounds();
         let active_body = self
             .active_body_id()
@@ -14343,6 +14371,7 @@ impl KernelLabApp {
                         self.motion.phase,
                         feature_preview.as_ref(),
                         &sketch_overlays,
+                        &selected_sketch_regions,
                         &self.measured_edges,
                         measurement.as_ref(),
                         edge_finish_preview.as_ref(),
@@ -14491,6 +14520,13 @@ impl KernelLabApp {
                         let additive = ui.input(|input| input.modifiers.shift);
                         self.activate_body(index);
                         self.select_model_face(selection, additive);
+                    } else if output.clicked_empty {
+                        // A click on nothing deselects, the way every
+                        // mainstream package reads it: keeping the selection
+                        // until the same face was clicked again made
+                        // deselection a hunt.
+                        self.clear_model_entity_selection();
+                        self.sketch.clear_region_selection();
                     }
                 }
             });

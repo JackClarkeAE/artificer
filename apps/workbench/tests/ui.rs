@@ -749,6 +749,21 @@ fn background_click_does_not_select_a_face() {
 }
 
 #[test]
+fn background_click_deselects_the_selected_face() {
+    let mut harness = harness();
+    harness
+        .get_by_role_and_label(Role::Button, "Positive Z face")
+        .click_accesskit();
+    harness.run();
+    assert!(harness.state().selected_face().is_some());
+
+    let viewport = harness.get_by_label("Model viewport").rect();
+    click_at(&mut harness, viewport.left_top() + egui::vec2(45.0, 75.0));
+
+    assert_eq!(harness.state().selected_face(), None);
+}
+
+#[test]
 fn toolbar_exposes_each_interaction_mode() {
     let mut harness = harness();
 
