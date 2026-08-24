@@ -293,6 +293,11 @@ pub struct DocumentViewportOutput {
     pub selected_sketch_region: Option<ModelSketchRegionSelection>,
     pub selected_reference_plane: Option<ReferencePlaneSelection>,
     pub context_click: Option<ViewportContextClick>,
+    /// A Select-tool primary click that landed on nothing at all — no
+    /// vertex, edge, face, sketch region, or datum plane. The shell clears
+    /// the selection on it, so clicking away deselects the way every
+    /// mainstream package does.
+    pub clicked_empty: bool,
 }
 
 /// What one secondary click in the model viewport landed on.
@@ -1296,6 +1301,7 @@ pub fn show_document(
         feature_preview,
         sketch_overlays,
         &[],
+        &[],
         None,
         None,
         None,
@@ -1328,6 +1334,7 @@ pub fn show_document_with_feature_drag(
     animation_phase: f64,
     feature_preview: Option<&FeaturePreview>,
     sketch_overlays: &[ModelSketchOverlay],
+    selected_sketch_regions: &[ModelSketchRegionSelection],
     measured_edges: &[DocumentEdgeSelection],
     measurement: Option<&DocumentMeasurement>,
     edge_finish_preview: Option<&EdgeFinishPreview>,
@@ -1354,6 +1361,7 @@ pub fn show_document_with_feature_drag(
         animation_phase,
         feature_preview,
         sketch_overlays,
+        selected_sketch_regions,
         measured_edges,
         measurement,
         edge_finish_preview,
@@ -1383,6 +1391,7 @@ fn show_document_impl(
     animation_phase: f64,
     feature_preview: Option<&FeaturePreview>,
     sketch_overlays: &[ModelSketchOverlay],
+    selected_sketch_regions: &[ModelSketchRegionSelection],
     measured_edges: &[DocumentEdgeSelection],
     measurement: Option<&DocumentMeasurement>,
     edge_finish_preview: Option<&EdgeFinishPreview>,
@@ -1538,8 +1547,24 @@ fn show_document_impl(
         visible_edge_keys
             .as_ref()
             .map_or_else(EdgeFrameCache::default, |visible_edge_keys| {
-                if orbiting {
+                if orbiting && !exact_hidden_lines_affordable(bodies, &triangles) {
                     prepare_interaction_edge_frame_cache(
+                        bodies,
+                        active_body,
+                        *active_display_transform,
+                        *view,
+                        animation_phase,
+                        projection,
+                        visible_edge_keys,
+                        &triangles,
+                    )
+                } else if orbiting {
+                    // An ordinary part affords exact hidden lines on every
+                    // orbit frame. The cheap pass exists for dense Boolean
+                    // previews; on a body with interior geometry it drew
+                    // every hidden edge straight through the material, which
+                    // read as the model turning transparent while turning.
+                    prepare_edge_frame_cache(
                         bodies,
                         active_body,
                         *active_display_transform,
@@ -1602,10 +1627,33 @@ fn show_document_impl(
         .then_some(hover_position)
         .flatten()
         .and_then(|position| edge_at_position(&edge_frame, position));
-    let hovered = (hovered_vertex.is_none() && hovered_edge.is_none())
-        .then_some(hover_position)
-        .flatten()
-        .and_then(|position| face_at_position(&triangles, position));
+    // A hovered closed region highlights the way a hovered body face does,
+    // so a committed sketch reads as clickable material rather than as bare
+    // outlines with an invisible interior. Resolved before the face hover so
+    // a pointer over a sketch region does not also wash the whole underlying
+    // face: the region is the answer to "what would this click pick".
+    let hovered_sketch_region =
+        if active_tool == ActiveTool::Select && !feature_interaction.consumes_primary {
+            hover_position.and_then(|position| {
+                hit_test_model_sketch_regions(
+                    position,
+                    sketch_overlays,
+                    bodies,
+                    active_body,
+                    projection,
+                    *view,
+                    *active_display_transform,
+                    animation_phase,
+                )
+            })
+        } else {
+            None
+        };
+    let hovered =
+        (hovered_vertex.is_none() && hovered_edge.is_none() && hovered_sketch_region.is_none())
+            .then_some(hover_position)
+            .flatten()
+            .and_then(|position| face_at_position(&triangles, position));
     let hovered_faces = hovered
         .and_then(|selection| {
             bodies
@@ -1833,30 +1881,11 @@ fn show_document_impl(
         None
     };
 
-    // A hovered closed region highlights the way a hovered body face does,
-    // so a committed sketch reads as clickable material rather than as bare
-    // outlines with an invisible interior.
-    let hovered_sketch_region =
-        if active_tool == ActiveTool::Select && !feature_interaction.consumes_primary {
-            hover_position.and_then(|position| {
-                hit_test_model_sketch_regions(
-                    position,
-                    sketch_overlays,
-                    bodies,
-                    active_body,
-                    projection,
-                    *view,
-                    *active_display_transform,
-                    animation_phase,
-                )
-            })
-        } else {
-            None
-        };
     paint_model_sketch_overlays(
         &painter,
         sketch_overlays,
         hovered_sketch_region.as_ref(),
+        selected_sketch_regions,
         bodies,
         active_body,
         projection,
@@ -1866,6 +1895,8 @@ fn show_document_impl(
     );
     let selected_sketch_region = if active_tool == ActiveTool::Select
         && !feature_interaction.consumes_primary
+        && clicked_vertex.is_none()
+        && clicked_edge.is_none()
         && canvas.clicked_by(PointerButton::Primary)
     {
         canvas.interact_pointer_pos().and_then(|position| {
@@ -2070,6 +2101,19 @@ fn show_document_impl(
             .unwrap_or(ViewportContextTarget::Empty);
         ViewportContextClick { position, target }
     });
+    // A click that picked a sketch region picked the region, not the face it
+    // happens to lie on; reporting both made the shell's branch order decide
+    // the winner and left stale face selections behind.
+    if selected_sketch_region.is_some() {
+        selected_from_ui = None;
+    }
+    let clicked_empty = active_tool == ActiveTool::Select
+        && click_position.is_some()
+        && selected_from_ui.is_none()
+        && clicked_edge.is_none()
+        && clicked_vertex.is_none()
+        && selected_sketch_region.is_none()
+        && selected_reference_plane.is_none();
     DocumentViewportOutput {
         selected_face: selected_from_ui,
         selected_edge: clicked_edge,
@@ -2079,6 +2123,7 @@ fn show_document_impl(
         selected_sketch_region,
         selected_reference_plane,
         context_click,
+        clicked_empty,
     }
 }
 
@@ -2395,7 +2440,35 @@ fn project_document_triangles(
     triangles
 }
 
-/// Low-latency edge preparation used only while the camera owns the gesture.
+/// Whether exact hidden-line removal fits the orbit frame budget.
+///
+/// The exact pass costs roughly one spatial-index interval query per
+/// non-smooth edge over the nearby projected triangles, so the product of
+/// the two counts tracks the work. The bound is set below the supported
+/// 256-vertex extrusion limit: everyday parts — including bodies with slots
+/// and pockets whose hidden edges would otherwise draw straight through the
+/// material — stay exact while orbiting, and only genuinely dense Boolean
+/// previews fall back to the deferred-occlusion pass.
+fn exact_hidden_lines_affordable(
+    bodies: &[DocumentBodyInstance<'_>],
+    triangles: &[ProjectedTriangle],
+) -> bool {
+    const INTERACTION_OCCLUSION_BUDGET: usize = 120_000;
+    let edges = bodies
+        .iter()
+        .map(|body| {
+            body.scene
+                .edges
+                .iter()
+                .filter(|edge| !edge.is_smooth)
+                .count()
+        })
+        .sum::<usize>();
+    edges.saturating_mul(triangles.len()) <= INTERACTION_OCCLUSION_BUDGET
+}
+
+/// Low-latency edge preparation used only while the camera owns the gesture
+/// on scenes too dense for exact hidden lines at 60 Hz.
 ///
 /// Back-facing edges have already been rejected by membership in projected
 /// front-facing triangles. Exact partial occlusion is deliberately deferred,
@@ -3715,6 +3788,7 @@ fn paint_model_sketch_overlays(
     painter: &egui::Painter,
     overlays: &[ModelSketchOverlay],
     hovered_region: Option<&ModelSketchRegionSelection>,
+    selected_regions: &[ModelSketchRegionSelection],
     bodies: &[DocumentBodyInstance<'_>],
     active_body: Option<BodyInstanceKey>,
     projection: Projection,
@@ -3758,18 +3832,34 @@ fn paint_model_sketch_overlays(
                 continue;
             }
         }
-        // The hovered closed region fills like a hovered body face. The
-        // triangulation honours holes, so an annular region highlights as a
-        // ring rather than a disc.
-        if let (Some(hovered), Some(frame)) = (hovered_region, overlay.frame)
-            && overlay.sketch_index == Some(hovered.sketch_index)
-        {
+        // Selected and hovered closed regions fill like selected and hovered
+        // body faces, so a picked profile is visibly the thing that got
+        // picked rather than an invisible interior. The triangulation honours
+        // holes, so an annular region highlights as a ring rather than a
+        // disc. A region both selected and hovered wears the selection fill.
+        if let Some(frame) = overlay.frame {
             let normal = normalized_vector(cross_product(frame.u, frame.v));
-            for region in overlay
-                .regions
-                .iter()
-                .filter(|region| region.anchor == hovered.anchor)
-            {
+            let selected_here = |region: &ModelSketchRegion| {
+                selected_regions.iter().any(|selection| {
+                    overlay.sketch_index == Some(selection.sketch_index)
+                        && region.anchor == selection.anchor
+                })
+            };
+            let hovered_here = |region: &ModelSketchRegion| {
+                hovered_region.is_some_and(|hovered| {
+                    overlay.sketch_index == Some(hovered.sketch_index)
+                        && region.anchor == hovered.anchor
+                })
+            };
+            for (region, fill) in overlay.regions.iter().filter_map(|region| {
+                if selected_here(region) {
+                    Some((region, SELECTED.gamma_multiply(0.34)))
+                } else if hovered_here(region) {
+                    Some((region, HOVERED.gamma_multiply(0.30)))
+                } else {
+                    None
+                }
+            }) {
                 let Some(normal) = normal else { break };
                 let preview = FeaturePreviewRegion {
                     outer: region.outer.clone(),
@@ -3778,7 +3868,6 @@ fn paint_model_sketch_overlays(
                 let Some(triangles) = triangulate_preview_region(&preview, normal) else {
                     continue;
                 };
-                let fill = HOVERED.gamma_multiply(0.30);
                 // One mesh, not one anti-aliased polygon per triangle. Each
                 // convex_polygon feathers its own outline, so a triangulation
                 // painted piecewise shows a seam along every shared edge, and
@@ -6943,6 +7032,141 @@ mod tests {
         (NativeKernel::debug_scene(&outcome.snapshot), bounds, pivot)
     }
 
+    /// Two camera-facing square plates, the smaller entirely occluded behind
+    /// the larger — the shape of interior geometry (a slot wall, a pocket
+    /// floor) seen through a body's outer face.
+    fn occluded_plate_scene(view: ViewState) -> DebugScene {
+        let face = |id: u64| EntityRef {
+            snapshot: artificer_protocol::SnapshotId::new([3; 16]),
+            entity: artificer_protocol::EntityId(id),
+            kind: artificer_protocol::EntityKind::Face,
+        };
+        let edge = |id: u64| EntityRef {
+            snapshot: artificer_protocol::SnapshotId::new([3; 16]),
+            entity: artificer_protocol::EntityId(id),
+            kind: artificer_protocol::EntityKind::Edge,
+        };
+        let mut triangles = Vec::new();
+        let mut edges = Vec::new();
+        let mut plate = |face_id: u64, edge_base: u64, y: f64, half: f64| {
+            let corners = [
+                Point3::new(-half, y, -half),
+                Point3::new(half, y, -half),
+                Point3::new(half, y, half),
+                Point3::new(-half, y, half),
+            ];
+            let normal = Vector3::new(0.0, 1.0, 0.0);
+            let projected = [0_usize, 1, 2].map(|index| {
+                let camera = view.project(corners[index]);
+                Pos2::new(camera.coordinates[0] as f32, camera.coordinates[1] as f32)
+            });
+            // Wind whichever way survives the projected back-face cull, so
+            // the plates read as front-facing exactly like interior faces of
+            // a real body do.
+            let fan: [[usize; 3]; 2] = if triangle_signed_area(projected) > 0.0 {
+                [[0, 1, 2], [0, 2, 3]]
+            } else {
+                [[0, 2, 1], [0, 3, 2]]
+            };
+            for candidate in fan {
+                triangles.push(DebugTriangle {
+                    vertices: candidate.map(|index| corners[index]),
+                    normals: [normal; 3],
+                    source_face: face(face_id),
+                    role: FaceRole::PositiveY,
+                });
+            }
+            for (offset, pair) in [[0_usize, 1], [1, 2], [2, 3], [3, 0]].iter().enumerate() {
+                edges.push(DebugEdge {
+                    endpoints: [corners[pair[0]], corners[pair[1]]],
+                    source_edge: edge(edge_base + offset as u64),
+                    is_smooth: false,
+                    incident_faces: [Some(face(face_id)), None],
+                });
+            }
+        };
+        plate(1, 10, 0.0, 2.0);
+        plate(2, 20, -1.0, 0.8);
+        DebugScene {
+            snapshot: artificer_protocol::SnapshotId::new([3; 16]),
+            semantic_digest: artificer_protocol::SemanticDigest::new([5; 32]),
+            triangles,
+            edges,
+            vertices: Vec::new(),
+            carriers: Vec::new(),
+        }
+    }
+
+    /// The bug this pins: while orbiting, the deferred-occlusion pass drew
+    /// every edge of every front-facing triangle whole, so interior geometry
+    /// painted straight through the body. Small scenes now take the exact
+    /// pass during orbit, which hides the occluded plate completely.
+    #[test]
+    fn orbiting_a_small_scene_keeps_exact_hidden_lines() {
+        let mut view = ViewState::default();
+        view.yaw = 0.0;
+        view.pitch = 0.0;
+        let bounds = Aabb3::new(Point3::new(-2.0, -1.0, -2.0), Point3::new(2.0, 0.0, 2.0));
+        view.frame(bounds);
+        let scene = occluded_plate_scene(view);
+        let key = BodyInstanceKey::new(11);
+        let body = DocumentBodyInstance::new(key, &scene, Some(bounds), Point3::default());
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+        )
+        .unwrap();
+        let triangles = project_document_triangles(
+            &[body],
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+        );
+        assert!(
+            exact_hidden_lines_affordable(&[body], &triangles),
+            "a two-plate scene is far inside the exact orbit budget"
+        );
+        // Both plates face the camera, so the cheap pass would keep every
+        // hidden edge whole.
+        let visible_keys = visible_triangle_edge_keys_by_body(&triangles);
+        let cheap = prepare_interaction_edge_frame_cache(
+            &[body],
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+            &visible_keys,
+            &triangles,
+        );
+        let hidden_plate_drawn = cheap.by_body[&key]
+            .iter()
+            .filter(|edge| edge.visible && !edge.visible_intervals.is_empty())
+            .count();
+        assert_eq!(hidden_plate_drawn, 8, "the cheap pass draws both plates");
+
+        let exact = prepare_edge_frame_cache(
+            &[body],
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+            &visible_keys,
+            &triangles,
+        );
+        let exact_drawn = exact.by_body[&key]
+            .iter()
+            .filter(|edge| edge.visible && !edge.visible_intervals.is_empty())
+            .count();
+        assert_eq!(
+            exact_drawn, 4,
+            "the exact pass hides the occluded plate entirely"
+        );
+    }
+
     #[test]
     fn typed_selection_resolves_a_visible_authoritative_vertex() {
         let (scene, bounds, pivot) = cuboid_scene_fixture();
@@ -7244,6 +7468,7 @@ mod tests {
                         None,
                         &[],
                         &[],
+                        &[],
                         None,
                         None,
                         &mut state.drag,
@@ -7399,6 +7624,7 @@ mod tests {
                         Some(&state.preview),
                         &[],
                         &[],
+                        &[],
                         None,
                         None,
                         &mut state.drag,
@@ -7540,6 +7766,7 @@ mod tests {
                         &mut state.view,
                         0.0,
                         None,
+                        &[],
                         &[],
                         &[],
                         None,
