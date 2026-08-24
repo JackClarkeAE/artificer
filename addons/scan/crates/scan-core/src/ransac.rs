@@ -152,12 +152,7 @@ impl Primitive {
                 }
                 let (dr, dh) = (len - *major, h);
                 let reach = dr.hypot(dh);
-                (reach > 1e-12).then(|| {
-                    (
-                        reach - *minor,
-                        (radial / len * dr + *axis * dh) / reach,
-                    )
-                })
+                (reach > 1e-12).then(|| (reach - *minor, (radial / len * dr + *axis * dh) / reach))
             }
             Self::Cone {
                 apex,
@@ -629,9 +624,7 @@ pub fn extract_primitives(
     }
     if std::env::var_os("ARTIFICER_TORUS_DEBUG").is_some() {
         let (proposed, fitted, won) = torus_debug_counts();
-        eprintln!(
-            "torus-debug: {proposed} proposed, {fitted} fitted, {won} entered scoring"
-        );
+        eprintln!("torus-debug: {proposed} proposed, {fitted} fitted, {won} entered scoring");
     }
     results
 }

@@ -42,10 +42,9 @@ pub fn feature_label(surface: &SurfaceClass) -> String {
             format!("cone {:.1} deg", fit.half_angle.to_degrees())
         }
         SurfaceClass::Blend(fit) => format!("fillet r {:.1}", fit.minor_radius),
-        SurfaceClass::Torus(fit) => format!(
-            "torus R {:.1} r {:.1}",
-            fit.major_radius, fit.minor_radius
-        ),
+        SurfaceClass::Torus(fit) => {
+            format!("torus R {:.1} r {:.1}", fit.major_radius, fit.minor_radius)
+        }
         SurfaceClass::Pattern(fit) => format!("pattern x {}", fit.count),
         SurfaceClass::EdgeRound(_) => "edge round".to_owned(),
         SurfaceClass::Freeform => "freeform".to_owned(),

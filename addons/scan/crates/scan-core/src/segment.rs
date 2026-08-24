@@ -11,9 +11,8 @@ use std::collections::HashSet;
 use artificer_geometry::{Point3, Vector3};
 
 use crate::fit::{
-    fit_torus,
     ConeFit, CylinderFit, EdgeRoundFit, PatternFit, PlaneFit, RevolvedBlendFit, SphereFit,
-    fit_cone, fit_cylinder, fit_plane, fit_sphere,
+    fit_cone, fit_cylinder, fit_plane, fit_sphere, fit_torus,
 };
 use crate::mesh::TriangleMesh;
 
@@ -584,9 +583,7 @@ mod moulded_exploration {
                 SurfaceClass::Torus(f) => ("torus", f.minor_radius, f.deviation.rms),
                 _ => ("FREEFORM", 0.0, f64::NAN),
             };
-            println!(
-                "rx={rx:>7.0} ry={ry:>10.0} -> {name:<9} (R={fitted:>7.0}, rms={rms:.4})"
-            );
+            println!("rx={rx:>7.0} ry={ry:>10.0} -> {name:<9} (R={fitted:>7.0}, rms={rms:.4})");
             // Nothing here is allowed to fall out of the vocabulary: a
             // moulded crown must land on *some* primitive within
             // tolerance, or the analytic-exact kernel cannot carry
@@ -647,16 +644,17 @@ mod moulded_exploration {
                 SurfaceClass::Cone(_) => ("cone", 0.0),
                 _ => ("freeform", 0.0),
             };
-            println!(
-                "R={radius:>8.0} crown={sagitta:>6.3}mm -> {name} (fitted R={fitted:.0})"
-            );
+            println!("R={radius:>8.0} crown={sagitta:>6.3}mm -> {name} (fitted R={fitted:.0})");
             // The crossover is the noise floor, not a chosen constant: a
             // crown you can measure is kept exactly, one you cannot is
             // reported flat. This is the whole answer to how a moulded
             // panel survives an analytic-exact kernel — no spline is
             // needed, because a large-radius sphere is already exact.
             if sagitta > 0.1 {
-                assert_eq!(name, "sphere", "a measurable {sagitta:.3}mm crown is real shape");
+                assert_eq!(
+                    name, "sphere",
+                    "a measurable {sagitta:.3}mm crown is real shape"
+                );
                 assert!(
                     (fitted - radius).abs() < 0.1 * radius,
                     "fitted R={fitted:.0} should be near {radius:.0}"

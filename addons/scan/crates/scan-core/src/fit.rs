@@ -670,7 +670,9 @@ pub fn fit_torus(points: &[Point3]) -> Option<RevolvedBlendFit> {
     // Principal curvatures: eigenvalues of [[2a, b], [b, 2c]].
     let (h11, h12, h22) = (2.0 * a, b, 2.0 * c);
     let mean = 0.5 * (h11 + h22);
-    let spread = (0.25 * (h11 - h22) * (h11 - h22) + h12 * h12).max(0.0).sqrt();
+    let spread = (0.25 * (h11 - h22) * (h11 - h22) + h12 * h12)
+        .max(0.0)
+        .sqrt();
     let (kappa_1, kappa_2) = (mean + spread, mean - spread);
     // A saddle is not a torus patch at its outer equator, and the
     // vocabulary should say so rather than fit something plausible.
@@ -698,7 +700,11 @@ pub fn fit_torus(points: &[Point3]) -> Option<RevolvedBlendFit> {
         u * axis_angle.cos() + v * axis_angle.sin(),
         u * -axis_angle.sin() + v * axis_angle.cos(),
     );
-    let axis = if (kappa_1 - sharp).abs() < 1e-12 { first } else { second };
+    let axis = if (kappa_1 - sharp).abs() < 1e-12 {
+        first
+    } else {
+        second
+    };
     // The centre of curvature sits on whichever side the patch bends
     // toward, and the axis passes through it.
     let side = if sharp > 0.0 { 1.0 } else { -1.0 };
@@ -740,7 +746,10 @@ pub fn fit_torus(points: &[Point3]) -> Option<RevolvedBlendFit> {
                     max_abs: 0.0,
                 },
             };
-            points.iter().map(|q| candidate.signed_distance(*q)).collect()
+            points
+                .iter()
+                .map(|q| candidate.signed_distance(*q))
+                .collect()
         },
         30,
     );
@@ -903,7 +912,11 @@ mod torus_tests {
             for j in 0..=60 {
                 let x = -half + 2.0 * half * i as f64 / 60.0;
                 let y = -half + 2.0 * half * j as f64 / 60.0;
-                points.push(Point3::new(x, y, -(x * x) / (2.0 * rx) - (y * y) / (2.0 * ry)));
+                points.push(Point3::new(
+                    x,
+                    y,
+                    -(x * x) / (2.0 * rx) - (y * y) / (2.0 * ry),
+                ));
             }
         }
         let sphere = fit_sphere(&points).expect("a sphere always fits something");
@@ -976,6 +989,9 @@ mod torus_tests {
                 points.push(Point3::new(x, y, x * x / 4000.0 - y * y / 4000.0));
             }
         }
-        assert!(fit_torus(&points).is_none(), "a saddle is not a torus patch");
+        assert!(
+            fit_torus(&points).is_none(),
+            "a saddle is not a torus patch"
+        );
     }
 }

@@ -914,17 +914,33 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // ever went round.
         for element in &elements {
             match element {
-                Element::Wall { feature, rho, z0, z1 } => eprintln!(
+                Element::Wall {
+                    feature,
+                    rho,
+                    z0,
+                    z1,
+                } => eprintln!(
                     "element: #{feature} wall  rho {rho:.2} z {z0:.2}..{z1:.2}  \
                      swept {:.0} mm^2",
                     std::f64::consts::TAU * rho * (z1 - z0).abs()
                 ),
-                Element::Face { feature, z, rho0, rho1 } => eprintln!(
+                Element::Face {
+                    feature,
+                    z,
+                    rho0,
+                    rho1,
+                } => eprintln!(
                     "element: #{feature} face  z {z:.2} rho {rho0:.2}..{rho1:.2}  \
                      swept {:.0} mm^2",
                     std::f64::consts::PI * (rho1 * rho1 - rho0 * rho0).abs()
                 ),
-                Element::Taper { feature, slope, intercept, z0, z1 } => eprintln!(
+                Element::Taper {
+                    feature,
+                    slope,
+                    intercept,
+                    z0,
+                    z1,
+                } => eprintln!(
                     "element: #{feature} taper slope {slope:.3} intercept {intercept:.2} \
                      z {z0:.2}..{z1:.2}"
                 ),
@@ -1954,8 +1970,12 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // that names which one and by how much.
         let mut drawn: std::collections::HashMap<usize, (f64, usize)> =
             std::collections::HashMap::new();
-        for face in 0..mesh.triangles().len() {
-            let entry = drawn.entry(feature_of_face[face]).or_insert((0.0, 0));
+        for (face, feature) in feature_of_face
+            .iter()
+            .enumerate()
+            .take(mesh.triangles().len())
+        {
+            let entry = drawn.entry(*feature).or_insert((0.0, 0));
             entry.0 += mesh.face_area(face);
             entry.1 += 1;
         }
@@ -3582,10 +3602,13 @@ fn bores_from_occupancy(
     // and tallying where the steps land makes true centres pile up
     // whether or not their material is connected. Bosses step away
     // from themselves and never accumulate.
-    let vote_key =
-        |x: f64, y: f64| ((x / VOTE_CELL).floor() as i32, (y / VOTE_CELL).floor() as i32);
-    let mut votes: std::collections::HashMap<(i32, i32), usize> =
-        std::collections::HashMap::new();
+    let vote_key = |x: f64, y: f64| {
+        (
+            (x / VOTE_CELL).floor() as i32,
+            (y / VOTE_CELL).floor() as i32,
+        )
+    };
+    let mut votes: std::collections::HashMap<(i32, i32), usize> = std::collections::HashMap::new();
     for (point, normal) in &walls {
         let lateral = Vector3::new(normal.x, normal.y, 0.0);
         let length = lateral.length();
@@ -3596,15 +3619,22 @@ fn bores_from_occupancy(
         let mut radius = MIN_RADIUS;
         while radius <= MAX_RADIUS {
             *votes
-                .entry(vote_key(point.x + step.x * radius, point.y + step.y * radius))
+                .entry(vote_key(
+                    point.x + step.x * radius,
+                    point.y + step.y * radius,
+                ))
                 .or_default() += 1;
             radius += VOTE_STEP;
         }
     }
     // Lateral buckets so a peak collects its own material without
     // walking every wall point.
-    let bucket =
-        |p: Point3| ((p.x / MAX_RADIUS).floor() as i32, (p.y / MAX_RADIUS).floor() as i32);
+    let bucket = |p: Point3| {
+        (
+            (p.x / MAX_RADIUS).floor() as i32,
+            (p.y / MAX_RADIUS).floor() as i32,
+        )
+    };
     let mut buckets: std::collections::HashMap<(i32, i32), Vec<usize>> =
         std::collections::HashMap::new();
     for (index, (point, _)) in walls.iter().enumerate() {
@@ -3646,18 +3676,17 @@ fn bores_from_occupancy(
         }
         // A peak can sit inside a counterbore and see two rings, so let
         // the radius histogram say which one this is.
-        let mut histogram: std::collections::HashMap<i32, usize> =
-            std::collections::HashMap::new();
+        let mut histogram: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
         for &index in &nearby {
             let (point, normal) = walls[index];
             let arm = Vector3::new(cx0 - point.x, cy0 - point.y, 0.0);
             let length = arm.length();
-            if !(MIN_RADIUS..=MAX_RADIUS).contains(&length)
-                || normal.dot(arm / length) < 0.5
-            {
+            if !(MIN_RADIUS..=MAX_RADIUS).contains(&length) || normal.dot(arm / length) < 0.5 {
                 continue;
             }
-            *histogram.entry((length / VOTE_STEP).floor() as i32).or_default() += 1;
+            *histogram
+                .entry((length / VOTE_STEP).floor() as i32)
+                .or_default() += 1;
         }
         // A chamfer mouth is nearly lateral too, so it passes the wall
         // filter and can out-vote the bore it belongs to: two holes
@@ -3683,8 +3712,7 @@ fn bores_from_occupancy(
             let mut zs: Vec<f64> = Vec::new();
             for &index in &nearby {
                 let point = walls[index].0;
-                if ((cx0 - point.x).hypot(cy0 - point.y) - candidate).abs() <= VOTE_STEP * 2.0
-                {
+                if ((cx0 - point.x).hypot(cy0 - point.y) - candidate).abs() <= VOTE_STEP * 2.0 {
                     zs.push(point.z);
                 }
             }
@@ -3712,9 +3740,7 @@ fn bores_from_occupancy(
                 let (span, filled) = profile_of(candidate);
                 (candidate, span, filled, count)
             })
-            .filter(|(_, span, filled, _)| {
-                *span >= MIN_RING_DEPTH && *filled >= MIN_RING_COVERAGE
-            })
+            .filter(|(_, span, filled, _)| *span >= MIN_RING_DEPTH && *filled >= MIN_RING_COVERAGE)
             .max_by(|a, b| {
                 a.1.total_cmp(&b.1)
                     .then(a.3.cmp(&b.3))
@@ -3807,9 +3833,8 @@ fn bores_from_occupancy(
                 inward += normal.dot(arm / length);
             }
             let angle = (point.y - cy).atan2(point.x - cx);
-            let bin = (((angle + std::f64::consts::PI) / std::f64::consts::TAU * 24.0)
-                as usize)
-                .min(23);
+            let bin =
+                (((angle + std::f64::consts::PI) / std::f64::consts::TAU * 24.0) as usize).min(23);
             bins[bin] = true;
             lo = lo.min(point.z);
             hi = hi.max(point.z);
@@ -3967,9 +3992,7 @@ fn discover_bore_clusters(
         let SurfaceClass::Cylinder(fit) = &feature.surface else {
             continue;
         };
-        if !(MIN_RADIUS..=MAX_RADIUS).contains(&fit.radius)
-            || feature.area < 20.0
-        {
+        if !(MIN_RADIUS..=MAX_RADIUS).contains(&fit.radius) || feature.area < 20.0 {
             continue;
         }
         walls.push((
@@ -3986,14 +4009,16 @@ fn discover_bore_clusters(
     let mut clusters: Vec<Vec<usize>> = Vec::new();
     let mut leads: Vec<(Point3, Vector3, f64)> = Vec::new();
     for (id, point, axis, radius, _) in walls {
-        let joined = leads.iter().position(|&(lead_point, lead_axis, lead_radius)| {
-            if lead_axis.dot(axis).abs() < 0.999 {
-                return false;
-            }
-            let offset = point - lead_point;
-            (offset - lead_axis * offset.dot(lead_axis)).length() <= 1.5
-                && (radius - lead_radius).abs() <= (2.5 * tolerance).max(0.6)
-        });
+        let joined = leads
+            .iter()
+            .position(|&(lead_point, lead_axis, lead_radius)| {
+                if lead_axis.dot(axis).abs() < 0.999 {
+                    return false;
+                }
+                let offset = point - lead_point;
+                (offset - lead_axis * offset.dot(lead_axis)).length() <= 1.5
+                    && (radius - lead_radius).abs() <= (2.5 * tolerance).max(0.6)
+            });
         match joined {
             Some(slot) => clusters[slot].push(id),
             None => {
@@ -4195,8 +4220,7 @@ fn build_hole_stacks(
                         continue;
                     }
                     let angle = radial.dot(around_v).atan2(radial.dot(around_u));
-                    let bin = (((angle + std::f64::consts::PI)
-                        / std::f64::consts::TAU
+                    let bin = (((angle + std::f64::consts::PI) / std::f64::consts::TAU
                         * bins.len() as f64) as usize)
                         .min(bins.len() - 1);
                     bins[bin] = true;
@@ -4206,8 +4230,7 @@ fn build_hole_stacks(
             // And second that it is a hole: the scan must find its
             // inside empty. A fitted cylinder is a claim about a
             // surface; only the void behind it makes it a bore.
-            let hollow =
-                tube_is_hollow(occupied, fit.axis_point, fit.axis, fit.radius, (lo, hi));
+            let hollow = tube_is_hollow(occupied, fit.axis_point, fit.axis, fit.radius, (lo, hi));
             if std::env::var_os("ARTIFICER_BORE_DEBUG").is_some() {
                 eprintln!(
                     "bore-debug: lead #{} d={:.2} at ({:+.2} {:+.2}) members={} \
@@ -5792,7 +5815,10 @@ fn planar_face_soup(
     let total_edges: usize = edges.values().map(Vec::len).sum();
     let mut walked = 0usize;
     for seed in seeds {
-        while remaining.get(&seed).is_some_and(|outgoing| !outgoing.is_empty()) {
+        while remaining
+            .get(&seed)
+            .is_some_and(|outgoing| !outgoing.is_empty())
+        {
             let mut ring: Vec<(i64, i64)> = Vec::new();
             let mut at = seed;
             let mut heading = (0i64, 0i64);
@@ -5813,9 +5839,9 @@ fn planar_face_soup(
                     order
                         .iter()
                         .find_map(|&want| {
-                            outgoing.iter().position(|&next| {
-                                (next.0 - at.0, next.1 - at.1) == want
-                            })
+                            outgoing
+                                .iter()
+                                .position(|&next| (next.0 - at.0, next.1 - at.1) == want)
                         })
                         .unwrap_or(0)
                 };
@@ -5848,8 +5874,7 @@ fn planar_face_soup(
         .filter_map(|ring| {
             let mut simplified = crate::reconstruct::simplify_polyline(&ring, epsilon);
             if simplified.len() > 3
-                && let (Some(&first), Some(&last)) =
-                    (simplified.first(), simplified.last())
+                && let (Some(&first), Some(&last)) = (simplified.first(), simplified.last())
                 && (first.0 - last.0).hypot(first.1 - last.1) <= epsilon
             {
                 simplified.pop();
@@ -6143,8 +6168,7 @@ mod tests {
             v: Vector3::new(0.0, 1.0, 0.0),
         };
         // A 20x20 block of cells with a 4x4 window punched out of it.
-        let mut cells: std::collections::HashSet<(i64, i64)> =
-            std::collections::HashSet::new();
+        let mut cells: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
         for i in 0..20 {
             for j in 0..20 {
                 if (8..12).contains(&i) && (8..12).contains(&j) {
@@ -6192,8 +6216,7 @@ mod tests {
         // A 24x24 block whose rim the scan decided cell by cell: every
         // third boundary cell missing, and a notch bitten out of each
         // side — pinches and spurs everywhere.
-        let mut cells: std::collections::HashSet<(i64, i64)> =
-            std::collections::HashSet::new();
+        let mut cells: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
         for i in 0..24 {
             for j in 0..24 {
                 let rim = i == 0 || j == 0 || i == 23 || j == 23;

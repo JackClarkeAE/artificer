@@ -96,9 +96,7 @@ pub fn demote_unsupported(
         if matches!(feature.surface, SurfaceClass::Freeform) {
             continue;
         }
-        let Some((share, ninetieth)) =
-            undescribed_share(mesh, feature, to_frame, limit)
-        else {
+        let Some((share, ninetieth)) = undescribed_share(mesh, feature, to_frame, limit) else {
             continue;
         };
         if share <= MAX_UNDESCRIBED {
@@ -149,7 +147,10 @@ mod tests {
             surface: SurfaceClass::Plane(PlaneFit {
                 origin: Point3::new(0.0, 0.0, offset),
                 normal: Vector3::new(0.0, 0.0, 1.0),
-                deviation: DeviationStats { rms: 0.0, max_abs: 0.0 },
+                deviation: DeviationStats {
+                    rms: 0.0,
+                    max_abs: 0.0,
+                },
             }),
             face_count: faces.len(),
             area,
@@ -181,12 +182,7 @@ mod tests {
             .collect();
         assert!(!level.is_empty());
         let mut features = vec![plane_feature(0, 7.5, level, 3200.0)];
-        let support = demote_unsupported(
-            &mesh,
-            &mut features,
-            &RigidTransform::IDENTITY,
-            0.05,
-        );
+        let support = demote_unsupported(&mesh, &mut features, &RigidTransform::IDENTITY, 0.05);
         assert_eq!(support.demoted, 1, "the mid-slab plane must not survive");
         assert!(matches!(features[0].surface, SurfaceClass::Freeform));
     }
@@ -243,12 +239,7 @@ mod tests {
             median_would_pass < 0.05,
             "the median must look healthy for this test to mean anything: {median_would_pass}"
         );
-        let support = demote_unsupported(
-            &mesh,
-            &mut features,
-            &RigidTransform::IDENTITY,
-            0.05,
-        );
+        let support = demote_unsupported(&mesh, &mut features, &RigidTransform::IDENTITY, 0.05);
         assert_eq!(support.demoted, 1, "a third of the material is elsewhere");
     }
 
@@ -265,17 +256,10 @@ mod tests {
         )
         .expect("mesh");
         let top: Vec<u32> = (0..mesh.triangles().len() as u32)
-            .filter(|&face| {
-                mesh.face_normal(face as usize).is_some_and(|n| n.z > 0.9)
-            })
+            .filter(|&face| mesh.face_normal(face as usize).is_some_and(|n| n.z > 0.9))
             .collect();
         let mut features = vec![plane_feature(0, 15.0, top, 1600.0)];
-        let support = demote_unsupported(
-            &mesh,
-            &mut features,
-            &RigidTransform::IDENTITY,
-            0.05,
-        );
+        let support = demote_unsupported(&mesh, &mut features, &RigidTransform::IDENTITY, 0.05);
         assert_eq!(support.demoted, 0, "an honest fit is left alone");
         assert!(matches!(features[0].surface, SurfaceClass::Plane(_)));
     }

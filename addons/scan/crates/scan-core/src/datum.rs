@@ -140,10 +140,7 @@ pub fn auto_datum_alignment(features: &[FeatureRecord]) -> Option<DatumAlignment
 /// vote together as a line and the heaviest line wins. Same idiom as
 /// the datum *direction*, which has always been an area-weighted vote
 /// rather than a single winner.
-pub fn dominant_axis_line(
-    features: &[FeatureRecord],
-    z: Vector3,
-) -> Option<(Point3, f64, usize)> {
+pub fn dominant_axis_line(features: &[FeatureRecord], z: Vector3) -> Option<(Point3, f64, usize)> {
     let cos_near = CLUSTER_ANGLE_DEG.to_radians().cos();
     struct AxisLine {
         /// Where the line is: taken from the single best-conditioned

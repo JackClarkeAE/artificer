@@ -381,8 +381,7 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             /// churn — and on a healthy part there is nothing to fix.
             const ORIGIN_CORRECTION_MIN: f64 = 0.5;
             let axis = Vector3::new(0.0, 0.0, 1.0);
-            if let Some((point, area, members)) =
-                crate::datum::dominant_axis_line(&features, axis)
+            if let Some((point, area, members)) = crate::datum::dominant_axis_line(&features, axis)
             {
                 let offset = Vector3::new(point.x, point.y, 0.0);
                 if offset.length() > ORIGIN_CORRECTION_MIN {
@@ -469,7 +468,6 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
     // Frames are discovered mid-pipeline but reported with the other
     // shared parameters, which are collected further down.
     let mut frame_notes: Vec<String> = Vec::new();
-    let mut datum = datum;
     if let Some(alignment) = datum.as_mut() {
         let mut published = datum_notes;
         published.append(&mut alignment.notes);
@@ -925,11 +923,7 @@ pub fn report_summary(report: &ReverseReport) -> String {
             ),
             SurfaceClass::Torus(fit) => format!(
                 "torus    R {:.3} r {:.3} axis ({:+.3} {:+.3} {:+.3})",
-                fit.major_radius,
-                fit.minor_radius,
-                fit.axis.x,
-                fit.axis.y,
-                fit.axis.z
+                fit.major_radius, fit.minor_radius, fit.axis.x, fit.axis.y, fit.axis.z
             ),
             SurfaceClass::Blend(fit) => format!(
                 "fillet   r {:.3} ring d {:.3} at z {:+.3}",

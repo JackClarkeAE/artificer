@@ -506,11 +506,7 @@ pub fn unify_coaxial_families(
             ));
             let merged = &mut features[a];
             merged.face_count = merged.faces.len();
-            merged.area = merged
-                .faces
-                .iter()
-                .map(|&face| areas[face as usize])
-                .sum();
+            merged.area = merged.faces.iter().map(|&face| areas[face as usize]).sum();
             features.retain(|feature| !feature.faces.is_empty());
             merges += 1;
             continue 'passes;

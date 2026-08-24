@@ -122,7 +122,11 @@ pub fn parse_manifest(text: &str) -> Result<Vec<Fixture>, String> {
             return Err(format!("line {}: fixture has no name", number + 1));
         }
         if fixture.source.is_empty() {
-            return Err(format!("line {}: fixture `{}` has no source", number + 1, fixture.name));
+            return Err(format!(
+                "line {}: fixture `{}` has no source",
+                number + 1,
+                fixture.name
+            ));
         }
         fixtures.push(fixture);
     }
@@ -227,7 +231,9 @@ pub fn table(scores: &[Score]) -> String {
             score.slowest_seconds,
         ));
     }
-    out.push_str("\nbores read on-size / found / expected; worst-d is the largest diameter error (mm)\n");
+    out.push_str(
+        "\nbores read on-size / found / expected; worst-d is the largest diameter error (mm)\n",
+    );
     out
 }
 
@@ -251,7 +257,11 @@ pub fn to_text(scores: &[Score]) -> String {
             s.bores_found,
             s.bores_expected,
             s.worst_bore_error,
-            if s.slowest_stage.is_empty() { "-" } else { &s.slowest_stage },
+            if s.slowest_stage.is_empty() {
+                "-"
+            } else {
+                &s.slowest_stage
+            },
             s.slowest_seconds,
         ));
     }
@@ -320,11 +330,15 @@ pub fn from_text(text: &str) -> Vec<Score> {
 /// comparison that only lists regressions cannot be told apart from
 /// one that failed to run.
 pub fn compare(baseline: &[Score], current: &[Score]) -> String {
-    let mut out = String::from("fixture              expl%      inv%     anly%   on-size  worst-d\n");
+    let mut out =
+        String::from("fixture              expl%      inv%     anly%   on-size  worst-d\n");
     let mut regressed = 0;
     for now in current {
         let Some(was) = baseline.iter().find(|b| b.name == now.name) else {
-            out.push_str(&format!("{:<20} (new fixture, no baseline)\n", truncate(&now.name, 20)));
+            out.push_str(&format!(
+                "{:<20} (new fixture, no baseline)\n",
+                truncate(&now.name, 20)
+            ));
             continue;
         };
         // A bore that leaves tolerance, or invention that climbs, is a
@@ -348,7 +362,10 @@ pub fn compare(baseline: &[Score], current: &[Score]) -> String {
     }
     for was in baseline {
         if !current.iter().any(|n| n.name == was.name) {
-            out.push_str(&format!("{:<20} (in baseline, not run)\n", truncate(&was.name, 20)));
+            out.push_str(&format!(
+                "{:<20} (in baseline, not run)\n",
+                truncate(&was.name, 20)
+            ));
         }
     }
     out.push_str(&format!(
@@ -454,7 +471,10 @@ mod tests {
 
     #[test]
     fn a_fixture_that_did_not_run_is_named_rather_than_missing() {
-        let was = Score { name: "rail".to_owned(), ..blank() };
+        let was = Score {
+            name: "rail".to_owned(),
+            ..blank()
+        };
         let report = compare(&[was], &[]);
         assert!(report.contains("not run"), "{report}");
     }

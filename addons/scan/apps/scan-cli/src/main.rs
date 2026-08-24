@@ -959,7 +959,8 @@ fn run() -> Result<(), String> {
             // costs the fixture it died on and nothing else.
             let resume = take_flag(&mut args, "--resume");
             let mut scores: Vec<artificer_scan_core::bench::Score> = Vec::new();
-            if resume && let Some(path) = &write_path
+            if resume
+                && let Some(path) = &write_path
                 && let Ok(text) = std::fs::read_to_string(path)
             {
                 scores = artificer_scan_core::bench::from_text(&text);
@@ -1016,7 +1017,10 @@ fn run() -> Result<(), String> {
                     .map_err(|e| format!("cannot read {path}: {e}"))?;
                 let baseline = artificer_scan_core::bench::from_text(&text);
                 println!();
-                print!("{}", artificer_scan_core::bench::compare(&baseline, &scores));
+                print!(
+                    "{}",
+                    artificer_scan_core::bench::compare(&baseline, &scores)
+                );
             }
             if let Some(path) = &write_path {
                 println!("\nbaseline written to {path}");

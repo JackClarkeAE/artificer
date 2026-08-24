@@ -334,7 +334,10 @@ mod tests {
                 axis_point: Point3::new(x, 0.0, 4.0),
                 axis: Vector3::new(0.0, 0.0, 1.0),
                 radius: 5.0,
-                deviation: DeviationStats { rms: 0.0, max_abs: 0.0 },
+                deviation: DeviationStats {
+                    rms: 0.0,
+                    max_abs: 0.0,
+                },
             })
         };
         let make = |id: usize, surface: SurfaceClass, faces: Vec<u32>| FeatureRecord {
@@ -357,10 +360,7 @@ mod tests {
         // Loose enough to rubber-stamp the union, as a noisy scan's
         // adaptive tolerance is.
         let merged = merge_fragments(&mesh, features, 5.0);
-        let anchor = merged
-            .iter()
-            .find(|f| f.id == 0)
-            .expect("anchor survives");
+        let anchor = merged.iter().find(|f| f.id == 0).expect("anchor survives");
         let SurfaceClass::Cylinder(fit) = &anchor.surface else {
             panic!("anchor is a cylinder");
         };
