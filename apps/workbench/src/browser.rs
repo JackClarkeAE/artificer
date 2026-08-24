@@ -52,12 +52,17 @@ pub(crate) struct BrowserContextMenu {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserContextCommand {
     SetActiveBody,
+    AssignMaterial,
+    ExportBodyStl,
+    ExportBodyStep,
     HideSelectedBodies,
     ShowSelectedBodies,
     IsolateSelectedBodies,
     UnhideAllBodies,
     MirrorSelectedBodies,
+    EditSketch,
     SelectSketch,
+    ExportSketchDxf,
     HideSketch,
     ShowSketch,
     SelectPlane,
@@ -69,12 +74,17 @@ impl BrowserContextCommand {
     const fn label(self) -> &'static str {
         match self {
             Self::SetActiveBody => "Set as active body",
+            Self::AssignMaterial => "Assign material…",
+            Self::ExportBodyStl => "Export this body as STL",
+            Self::ExportBodyStep => "Export this body as STEP",
             Self::HideSelectedBodies => "Hide selected bodies",
             Self::ShowSelectedBodies => "Show selected bodies",
             Self::IsolateSelectedBodies => "Isolate selected bodies",
             Self::UnhideAllBodies => "Unhide all bodies",
             Self::MirrorSelectedBodies => "Mirror across selected plane",
+            Self::EditSketch => "Edit this sketch",
             Self::SelectSketch => "Select this sketch",
+            Self::ExportSketchDxf => "Export this sketch as DXF",
             Self::HideSketch => "Hide this sketch",
             Self::ShowSketch => "Show this sketch",
             Self::SelectPlane => "Select this plane",
@@ -533,7 +543,7 @@ impl KernelLabApp {
                         })
                         .collect::<Vec<_>>();
                     let mut sketch_visibility_change = None;
-                    let mut activate_sketch = None;
+                    let mut edit_sketch = None;
                     for (index, ordinal, support, finished, visible, consumed, active) in
                         sketch_rows
                     {
@@ -564,16 +574,17 @@ impl KernelLabApp {
                                     .color(row_color),
                                 (ui.available_width() - 2.0).max(24.0),
                                 active,
-                            );
+                            )
+                            .on_hover_text(format!("Open Sketch {ordinal} for editing"));
                             response.widget_info(|| {
                                 egui::WidgetInfo::labeled(
                                     egui::WidgetType::Button,
                                     true,
-                                    format!("Select Sketch {ordinal}"),
+                                    format!("Edit Sketch {ordinal}"),
                                 )
                             });
                             if response.clicked() {
-                                activate_sketch = Some(index);
+                                edit_sketch = Some(index);
                             }
                             if response.secondary_clicked() {
                                 let position = response
@@ -602,8 +613,12 @@ impl KernelLabApp {
                     if let Some((index, visible)) = sketch_visibility_change {
                         self.set_sketch_visibility(index, visible);
                     }
-                    if let Some(index) = activate_sketch {
-                        self.activate_committed_sketch(index);
+                    if let Some(index) = edit_sketch {
+                        // The row's left-click is the contextually correct
+                        // action for a sketch: open it for editing. The eye
+                        // handles visibility and the right-click menu carries
+                        // everything else.
+                        self.edit_committed_sketch(index);
                     }
 
                     let joint_rows = self
@@ -798,14 +813,21 @@ impl KernelLabApp {
                 if self.history_is_at_end() {
                     commands.push(BrowserContextCommand::MirrorSelectedBodies);
                 }
+                commands.push(BrowserContextCommand::AssignMaterial);
+                commands.push(BrowserContextCommand::ExportBodyStl);
+                commands.push(BrowserContextCommand::ExportBodyStep);
             }
             BrowserContextTarget::Sketch(index) => {
                 let Some(sketch) = self.sketches.get(index) else {
                     return commands;
                 };
+                if self.history_is_at_end() {
+                    commands.push(BrowserContextCommand::EditSketch);
+                }
                 if self.active_sketch_index != Some(index) && self.history_is_at_end() {
                     commands.push(BrowserContextCommand::SelectSketch);
                 }
+                commands.push(BrowserContextCommand::ExportSketchDxf);
                 commands.push(if sketch.visible {
                     BrowserContextCommand::HideSketch
                 } else {
@@ -933,9 +955,41 @@ impl KernelLabApp {
             BrowserContextCommand::MirrorSelectedBodies => {
                 self.stage_preset_feature(SolidFeaturePreset::Mirror);
             }
+            BrowserContextCommand::AssignMaterial => {
+                if let BrowserContextTarget::Body(ordinal) = target
+                    && let Some(index) = self.bodies.iter().position(|body| body.ordinal == ordinal)
+                {
+                    // The material picker lives in the properties popout and
+                    // follows the active body, so the command is: make this
+                    // body the one the picker drives, then open the picker.
+                    self.activate_body(index);
+                    self.document_properties_open = true;
+                    self.document_status = Some(format!(
+                        "Pick a material in the MATERIAL card to assign it to Body {ordinal}"
+                    ));
+                }
+            }
+            BrowserContextCommand::ExportBodyStl | BrowserContextCommand::ExportBodyStep => {
+                if let BrowserContextTarget::Body(ordinal) = target {
+                    self.export_single_body(
+                        ordinal,
+                        command == BrowserContextCommand::ExportBodyStep,
+                    );
+                }
+            }
+            BrowserContextCommand::EditSketch => {
+                if let BrowserContextTarget::Sketch(index) = target {
+                    self.edit_committed_sketch(index);
+                }
+            }
             BrowserContextCommand::SelectSketch => {
                 if let BrowserContextTarget::Sketch(index) = target {
                     self.activate_committed_sketch(index);
+                }
+            }
+            BrowserContextCommand::ExportSketchDxf => {
+                if let BrowserContextTarget::Sketch(index) = target {
+                    self.export_sketch_dxf(index);
                 }
             }
             BrowserContextCommand::HideSketch | BrowserContextCommand::ShowSketch => {
@@ -1068,6 +1122,9 @@ mod tests {
                 BrowserContextCommand::HideSelectedBodies,
                 BrowserContextCommand::IsolateSelectedBodies,
                 BrowserContextCommand::MirrorSelectedBodies,
+                BrowserContextCommand::AssignMaterial,
+                BrowserContextCommand::ExportBodyStl,
+                BrowserContextCommand::ExportBodyStep,
             ],
         );
         let for_inactive = app.browser_context_commands(BrowserContextTarget::Body(second));

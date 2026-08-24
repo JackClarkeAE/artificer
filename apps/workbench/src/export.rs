@@ -126,6 +126,96 @@ pub(crate) fn write_faceted_step(path: &Path, triangles: &[ExportTriangle]) -> R
     atomic_write(path, output.as_bytes())
 }
 
+/// One planar sketch curve in sketch-plane coordinates, canonical millimetres.
+/// The vocabulary is exactly the sketch kernel's: lines, circular arcs, and
+/// circles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SketchExportCurve {
+    Line {
+        start: [f64; 2],
+        end: [f64; 2],
+    },
+    Circle {
+        center: [f64; 2],
+        radius: f64,
+    },
+    /// Counter-clockwise from `start_degrees` to `end_degrees`, the DXF arc
+    /// convention.
+    Arc {
+        center: [f64; 2],
+        radius: f64,
+        start_degrees: f64,
+        end_degrees: f64,
+    },
+}
+
+/// Writes a minimal DXF (R12 entity vocabulary) of one sketch's curves.
+///
+/// A sketch is already a 2D drawing in its own plane, which is exactly what
+/// DXF consumers — laser cutters, CAM nesting, drawing packages — want from
+/// it. Only the ENTITIES section is emitted, in millimetres, on layer 0;
+/// every mainstream reader accepts that form.
+pub(crate) fn write_sketch_dxf(path: &Path, curves: &[SketchExportCurve]) -> Result<(), String> {
+    if curves.is_empty() {
+        return Err("the sketch has no curves to export".into());
+    }
+    let finite = |values: &[f64]| values.iter().all(|value| value.is_finite());
+    for curve in curves {
+        let sound = match *curve {
+            SketchExportCurve::Line { start, end } => finite(&start) && finite(&end),
+            SketchExportCurve::Circle { center, radius } => {
+                finite(&center) && radius.is_finite() && radius > 0.0
+            }
+            SketchExportCurve::Arc {
+                center,
+                radius,
+                start_degrees,
+                end_degrees,
+            } => {
+                finite(&center)
+                    && radius.is_finite()
+                    && radius > 0.0
+                    && start_degrees.is_finite()
+                    && end_degrees.is_finite()
+            }
+        };
+        if !sound {
+            return Err("the sketch contains a non-finite or degenerate curve".into());
+        }
+    }
+    let mut output = String::with_capacity(curves.len().saturating_mul(96) + 64);
+    output.push_str("0\nSECTION\n2\nENTITIES\n");
+    for curve in curves {
+        match *curve {
+            SketchExportCurve::Line { start, end } => {
+                output.push_str(&format!(
+                    "0\nLINE\n8\n0\n10\n{:.9}\n20\n{:.9}\n11\n{:.9}\n21\n{:.9}\n",
+                    start[0], start[1], end[0], end[1]
+                ));
+            }
+            SketchExportCurve::Circle { center, radius } => {
+                output.push_str(&format!(
+                    "0\nCIRCLE\n8\n0\n10\n{:.9}\n20\n{:.9}\n40\n{radius:.9}\n",
+                    center[0], center[1]
+                ));
+            }
+            SketchExportCurve::Arc {
+                center,
+                radius,
+                start_degrees,
+                end_degrees,
+            } => {
+                output.push_str(&format!(
+                    "0\nARC\n8\n0\n10\n{:.9}\n20\n{:.9}\n40\n{radius:.9}\n50\n{start_degrees:.9}\n51\n{end_degrees:.9}\n",
+                    center[0], center[1]
+                ));
+            }
+        }
+    }
+    output.push_str("0\nENDSEC\n0\nEOF\n");
+    atomic_write(path, output.as_bytes())
+}
+
 fn validate_triangles(triangles: &[ExportTriangle]) -> Result<(), String> {
     if triangles.is_empty() {
         return Err("there are no visible committed triangles to export".into());
@@ -236,6 +326,43 @@ mod tests {
         assert!(text.starts_with("solid Artificer"));
         assert!(text.contains("facet normal"));
         assert!(text.contains("vertex 1.00000000000000000e0"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dxf_carries_lines_circles_and_arcs_and_refuses_an_empty_sketch() {
+        let root = std::env::temp_dir().join(format!(
+            "artificer-dxf-export-{}-{}",
+            std::process::id(),
+            EXPORT_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = root.join("fixture.dxf");
+        write_sketch_dxf(
+            &path,
+            &[
+                SketchExportCurve::Line {
+                    start: [0.0, 0.0],
+                    end: [4.0, 0.0],
+                },
+                SketchExportCurve::Circle {
+                    center: [2.0, 1.0],
+                    radius: 0.5,
+                },
+                SketchExportCurve::Arc {
+                    center: [0.0, 0.0],
+                    radius: 2.0,
+                    start_degrees: 0.0,
+                    end_degrees: 90.0,
+                },
+            ],
+        )
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("0\nSECTION\n2\nENTITIES\n"));
+        for token in ["LINE", "CIRCLE", "ARC", "0\nEOF\n"] {
+            assert!(text.contains(token), "missing {token}");
+        }
+        assert!(write_sketch_dxf(&path, &[]).is_err());
         let _ = fs::remove_dir_all(root);
     }
 
