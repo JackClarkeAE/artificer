@@ -6,7 +6,7 @@
 //! Everything here drives accessible names, so the eye buttons keep their
 //! "Hide Body 1"-style labels no matter how they are painted.
 
-use artificer_workbench::KernelLabApp;
+use artificer_workbench::{KernelLabApp, WorkbenchMode, sketch::SketchPoint};
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable as _};
 
@@ -16,6 +16,9 @@ const HIDE_SELECTED: &str = "Hide selected bodies";
 const SHOW_SELECTED: &str = "Show selected bodies";
 const UNHIDE_ALL: &str = "Unhide all bodies";
 const MIRROR_SELECTED: &str = "Mirror across selected plane";
+const ASSIGN_MATERIAL: &str = "Assign material…";
+const EXPORT_BODY_STL: &str = "Export this body as STL";
+const EXPORT_BODY_STEP: &str = "Export this body as STEP";
 const CONFIRM_OPERATION: &str = "Confirm operation";
 
 fn harness() -> Harness<'static, KernelLabApp> {
@@ -117,6 +120,87 @@ fn insert_library_component(harness: &mut Harness<'static, KernelLabApp>) {
     assert_eq!(harness.state().body_count(), 2);
 }
 
+fn commit_rectangle_sketch(harness: &mut Harness<'static, KernelLabApp>) {
+    harness.run();
+    click_button(harness, "XY Plane");
+    click_button(harness, "Sketch mode");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    click_button(harness, "Two-point rectangle");
+    for point in [SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)] {
+        let position = harness
+            .state()
+            .sketch_point_screen_position(harness.get_by_label("Sketch viewport").rect(), point);
+        click_at(harness, position, egui::Modifiers::NONE);
+    }
+    click_button(harness, "Finish sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+}
+
+fn scratch_document_root(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("artificer-browser-{tag}-{}", std::process::id()))
+}
+
+/// The reported gap: a sketch row's left-click used to be an invisible
+/// selection no-op. It is now the contextually correct action — open the
+/// sketch for editing.
+#[test]
+fn left_clicking_a_sketch_row_opens_it_for_editing() {
+    let mut harness = harness();
+    commit_rectangle_sketch(&mut harness);
+
+    click_button(&mut harness, "Edit Sketch 1");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    assert!(
+        harness.state().sketch_entity_count() >= 1,
+        "the sketch opened with its committed geometry on the canvas"
+    );
+}
+
+/// A sketch is already a drawing in its own plane, and its row's menu can
+/// hand it to anything that reads DXF.
+#[test]
+fn the_sketch_row_menu_exports_a_dxf() {
+    let mut harness = harness();
+    commit_rectangle_sketch(&mut harness);
+    let root = scratch_document_root("dxf");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    harness
+        .state_mut()
+        .set_document_path(root.join("part.artificer"));
+
+    right_click_button(&mut harness, "Edit Sketch 1");
+    click_button(&mut harness, "Export this sketch as DXF");
+
+    let exported = root.join("part.sketch-1.dxf");
+    let text = std::fs::read_to_string(&exported).expect("the DXF should exist");
+    assert!(text.contains("LINE"), "{text}");
+    assert!(text.trim_end().ends_with("EOF"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// Exporting one body from its row writes that body alone, without touching
+/// the visibility of anything else.
+#[test]
+fn the_body_row_menu_exports_that_body_alone() {
+    let mut harness = harness();
+    harness.run();
+    let root = scratch_document_root("body-stl");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    harness
+        .state_mut()
+        .set_document_path(root.join("part.artificer"));
+
+    right_click_button(&mut harness, BODY_ONE_ROW);
+    click_button(&mut harness, EXPORT_BODY_STL);
+
+    let exported = root.join("part.body-1.stl");
+    let text = std::fs::read_to_string(&exported).expect("the STL should exist");
+    assert!(text.starts_with("solid Artificer"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
 #[test]
 fn right_clicking_a_body_row_offers_commands_and_escape_dismisses() {
     let mut harness = harness();
@@ -128,7 +212,13 @@ fn right_clicking_a_body_row_offers_commands_and_escape_dismisses() {
     assert_eq!(harness.state().browser_selected_body_ordinals(), vec![1]);
     assert_eq!(
         harness.state().browser_context_menu_labels(),
-        vec![HIDE_SELECTED, MIRROR_SELECTED],
+        vec![
+            HIDE_SELECTED,
+            MIRROR_SELECTED,
+            ASSIGN_MATERIAL,
+            EXPORT_BODY_STL,
+            EXPORT_BODY_STEP,
+        ],
     );
 
     press_key(&mut harness, egui::Key::Escape);

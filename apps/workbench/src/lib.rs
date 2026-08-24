@@ -10519,9 +10519,16 @@ impl KernelLabApp {
     }
 
     fn committed_export_triangles(&self) -> Vec<ExportTriangle> {
+        self.export_triangles_for(|body| body.visible)
+    }
+
+    fn export_triangles_for(
+        &self,
+        include: impl Fn(&WorkbenchBody) -> bool,
+    ) -> Vec<ExportTriangle> {
         self.bodies
             .iter()
-            .filter(|body| body.visible)
+            .filter(|body| include(body))
             .flat_map(|body| {
                 let placement = self.occurrence_transform_for_body(body.id);
                 // Interchange facets are regenerated at the kernel
@@ -10554,6 +10561,78 @@ impl KernelLabApp {
             return Err("confirm or cancel the pending operation before exporting".into());
         }
         write_faceted_step(path, &self.committed_export_triangles())
+    }
+
+    /// Exports one body on its own, visible or not: asking for a specific
+    /// body from its Browser row is the explicit intent that the visibility
+    /// filter exists to approximate for whole-document exports.
+    fn export_single_body(&mut self, ordinal: u32, step: bool) {
+        if self.pending_operation.is_some() {
+            self.document_status =
+                Some("Confirm or cancel the pending operation before exporting".into());
+            return;
+        }
+        let Some(body_id) = self
+            .bodies
+            .iter()
+            .find(|body| body.ordinal == ordinal)
+            .map(|body| body.id)
+        else {
+            return;
+        };
+        let path = self.document_path.with_extension(format!(
+            "body-{ordinal}.{}",
+            if step { "step" } else { "stl" }
+        ));
+        let triangles = self.export_triangles_for(|body| body.id == body_id);
+        let written = if step {
+            write_faceted_step(&path, &triangles)
+        } else {
+            write_ascii_stl(&path, &triangles)
+        };
+        self.document_status = Some(match written {
+            Ok(()) => format!("Body {ordinal} exported to {}", path.display()),
+            Err(error) => format!("Body {ordinal} export failed: {error}"),
+        });
+    }
+
+    /// Exports one sketch's exact curves as a 2D DXF beside the document.
+    /// A sketch is already a drawing in its own plane, so this is the
+    /// Browser's "use it as a drawing" action.
+    fn export_sketch_dxf(&mut self, index: usize) {
+        let Some(sketch) = self.sketches.get(index) else {
+            return;
+        };
+        let ordinal = sketch.ordinal;
+        let curves = if self.active_sketch_index == Some(index) {
+            sketch_export_curves_from_authoring(self.sketch.authoring())
+        } else if let Some(authoring) = sketch
+            .portable_payload
+            .as_ref()
+            .and_then(SketchPayload::authoring)
+        {
+            sketch_export_curves_from_authoring(authoring)
+        } else {
+            sketch_export_curves_from_entities(&sketch.entities)
+        };
+        let path = self
+            .document_path
+            .with_extension(format!("sketch-{ordinal}.dxf"));
+        self.document_status = Some(match export::write_sketch_dxf(&path, &curves) {
+            Ok(()) => format!("Sketch {ordinal} exported to {}", path.display()),
+            Err(error) => format!("Sketch {ordinal} DXF export failed: {error}"),
+        });
+    }
+
+    /// Opens a committed sketch for editing: the Browser row's left-click
+    /// action. Activation hydrates the canvas and the sketch entry path
+    /// applies its own read-only guards, so a stale face sketch reports why
+    /// it will not open instead of opening wrong.
+    pub(crate) fn edit_committed_sketch(&mut self, index: usize) {
+        if !self.activate_committed_sketch(index) {
+            return;
+        }
+        self.enter_sketch_mode();
     }
 
     /// Workspace settings and diagnostics.
@@ -15844,6 +15923,115 @@ fn default_catalog_root() -> PathBuf {
 
 /// The theme choice and edited palettes live beside the catalog, in the
 /// per-user Artificer data directory.
+/// One sketch's exact authored curves in its own plane, ready for the DXF
+/// writer. Hidden entities are skipped exactly as the 3D overlay skips them.
+fn sketch_export_curves_from_authoring(
+    authoring: &SketchDefinition,
+) -> Vec<export::SketchExportCurve> {
+    let mut curves = Vec::new();
+    for entity in authoring.active_entities().filter(|entity| entity.visible) {
+        let Ok(curve) = authoring.evaluated_curve(entity.id) else {
+            continue;
+        };
+        match curve {
+            AuthoringCurve2::Line { start, end } => {
+                curves.push(export::SketchExportCurve::Line {
+                    start: [start.u, start.v],
+                    end: [end.u, end.v],
+                });
+            }
+            AuthoringCurve2::Circle { center, radius, .. } => {
+                curves.push(export::SketchExportCurve::Circle {
+                    center: [center.u, center.v],
+                    radius,
+                });
+            }
+            AuthoringCurve2::CircularArc {
+                center,
+                start,
+                end,
+                direction,
+            } => {
+                let radius = (start.u - center.u).hypot(start.v - center.v);
+                if !(radius.is_finite() && radius > 0.0) {
+                    continue;
+                }
+                let angle = |point: AuthoringPoint2| {
+                    (point.v - center.v).atan2(point.u - center.u).to_degrees()
+                };
+                // DXF arcs always run counter-clockwise from 50 to 51, so a
+                // clockwise authored arc exports with its ends swapped.
+                let (from, to) = match direction {
+                    AuthoringCurveDirection::CounterClockwise => (angle(start), angle(end)),
+                    AuthoringCurveDirection::Clockwise => (angle(end), angle(start)),
+                };
+                curves.push(export::SketchExportCurve::Arc {
+                    center: [center.u, center.v],
+                    radius,
+                    start_degrees: from,
+                    end_degrees: to,
+                });
+            }
+        }
+    }
+    curves
+}
+
+/// The legacy fallback for a sketch that predates editable authoring graphs
+/// and carries only presentation entities.
+fn sketch_export_curves_from_entities(entities: &[SketchEntity]) -> Vec<export::SketchExportCurve> {
+    let mut curves = Vec::new();
+    for entity in entities {
+        match entity.geometry {
+            SketchGeometry::Segment { start, end } => {
+                curves.push(export::SketchExportCurve::Line {
+                    start: [start.u, start.v],
+                    end: [end.u, end.v],
+                });
+            }
+            SketchGeometry::Rectangle { .. } => {
+                if let Some(corners) = entity.geometry.rectangle_corners() {
+                    for index in 0..4 {
+                        let start = corners[index];
+                        let end = corners[(index + 1) % 4];
+                        curves.push(export::SketchExportCurve::Line {
+                            start: [start.u, start.v],
+                            end: [end.u, end.v],
+                        });
+                    }
+                }
+            }
+            SketchGeometry::Circle { center, rim } => {
+                let radius = (rim.u - center.u).hypot(rim.v - center.v);
+                if radius.is_finite() && radius > 0.0 {
+                    curves.push(export::SketchExportCurve::Circle {
+                        center: [center.u, center.v],
+                        radius,
+                    });
+                }
+            }
+            SketchGeometry::Arc { center, start, end } => {
+                let radius = (start.u - center.u).hypot(start.v - center.v);
+                if radius.is_finite() && radius > 0.0 {
+                    let angle = |point: SketchPoint| {
+                        (point.v - center.v).atan2(point.u - center.u).to_degrees()
+                    };
+                    // Legacy display arcs run counter-clockwise from start
+                    // to end, matching the DXF convention directly.
+                    curves.push(export::SketchExportCurve::Arc {
+                        center: [center.u, center.v],
+                        radius,
+                        start_degrees: angle(start),
+                        end_degrees: angle(end),
+                    });
+                }
+            }
+            SketchGeometry::Point(_) => {}
+        }
+    }
+    curves
+}
+
 fn theme_preferences_path() -> PathBuf {
     if let Some(path) = std::env::var_os("ARTIFICER_THEME_PATH").filter(|value| !value.is_empty()) {
         return PathBuf::from(path);
