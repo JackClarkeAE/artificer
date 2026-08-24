@@ -2423,7 +2423,7 @@ fn project_document_triangles(
                 let points = camera.map(|point| projection.camera_point(point));
                 let [a, b, c] = triangle.vertices;
                 let vertex_depths = camera.map(|point| point.depth);
-                (triangle_signed_area(points) > 1.0e-4).then(|| ProjectedTriangle {
+                faces_the_camera(points).then(|| ProjectedTriangle {
                     points,
                     screen_bounds: points_bounds(&points),
                     model_vertices: triangle.vertices,
@@ -3991,7 +3991,7 @@ fn paint_model_sketch_overlays(
                 ),
             ]
             .map(|point| projection.instance_point(point, view, presentation));
-            if triangle_signed_area(facing) <= 1.0e-4 {
+            if !faces_the_camera(facing) {
                 continue;
             }
         }
@@ -5869,6 +5869,17 @@ const fn accessible_tool_description(tool: ActiveTool) -> &'static str {
     }
 }
 
+/// Whether a projected triangle turns its front toward the camera.
+///
+/// Screen Y grows downward while screen X grows to the right, so the pair is
+/// left-handed and an outward-wound world triangle projects to a *negative*
+/// signed area. The sign moved when the projection stopped mirroring, and a
+/// bare comparison repeated at each site would have been one more chance to
+/// disagree, so the convention lives here alone.
+fn faces_the_camera(points: [Pos2; 3]) -> bool {
+    triangle_signed_area(points) < -1.0e-4
+}
+
 fn triangle_signed_area(points: [Pos2; 3]) -> f32 {
     let first = points[1] - points[0];
     let second = points[2] - points[0];
@@ -6742,7 +6753,9 @@ mod tests {
         };
         let first_position = body_center(first_key);
         let second_position = body_center(second_key);
-        assert!(first_position.x < second_position.x);
+        // The nearer instance sits at a lower world X, which the viewer sees
+        // on their right.
+        assert!(first_position.x > second_position.x);
         assert_eq!(
             face_at_position(&projected, first_position).map(|selection| selection.body),
             Some(first_key)
@@ -6857,7 +6870,7 @@ mod tests {
                 .collect::<Vec<_>>();
             points.iter().map(|point| point.x).sum::<f32>() / points.len() as f32
         };
-        let expected_delta = (10.0 * projection.points_per_unit) as f32;
+        let expected_delta = -((10.0 * projection.points_per_unit) as f32);
         assert!((mean_x(placed_key) - mean_x(stationary_key) - expected_delta).abs() <= 1.0e-3);
     }
 
@@ -6918,7 +6931,9 @@ mod tests {
             },
         )
         .unwrap();
-        let expected_delta = (7.0 * projection.points_per_unit) as f32;
+        // World +X is drawn to the viewer's left, so a body moved along it
+        // travels to a smaller screen X.
+        let expected_delta = -((7.0 * projection.points_per_unit) as f32);
         assert!((placed.start.x - identity.start.x - expected_delta).abs() <= 1.0e-3);
         assert!((placed.end.x - identity.end.x - expected_delta).abs() <= 1.0e-3);
     }
@@ -6965,7 +6980,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first.len(), second.len());
         assert!(!first.is_empty());
-        let expected_screen_delta = (3.0 * projection.points_per_unit) as f32;
+        let expected_screen_delta = -((3.0 * projection.points_per_unit) as f32);
         for (active, committed) in first.into_iter().zip(second) {
             assert_eq!(active.source, committed.source);
             assert_eq!(active.role, committed.role);
@@ -7303,7 +7318,7 @@ mod tests {
             // Wind whichever way survives the projected back-face cull, so
             // the plates read as front-facing exactly like interior faces of
             // a real body do.
-            let fan: [[usize; 3]; 2] = if triangle_signed_area(projected) > 0.0 {
+            let fan: [[usize; 3]; 2] = if faces_the_camera(projected) {
                 [[0, 1, 2], [0, 2, 3]]
             } else {
                 [[0, 2, 1], [0, 3, 2]]

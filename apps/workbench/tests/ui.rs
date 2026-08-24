@@ -918,7 +918,10 @@ fn viewport_gestures_change_only_presentation_state() {
     );
     drag_viewport(&mut harness, egui::vec2(90.0, -45.0));
     let (translation, rotation, scale) = harness.state().displayed_transform();
-    assert!(translation[0] > EPSILON);
+    // The body follows the pointer, and the pointer went right and up. World
+    // +X is drawn to the viewer's left, so following it rightward on screen
+    // is a move along -X; +Z is up either way.
+    assert!(translation[0] < -EPSILON);
     assert!(translation[2] > EPSILON);
     assert_eq!(rotation, [0.0; 3]);
     assert!((scale - 1.0).abs() <= EPSILON);
