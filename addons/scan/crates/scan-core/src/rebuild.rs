@@ -906,6 +906,31 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         }
         skipped.extend(unaccounted);
     }
+    if std::env::var_os("ARTIFICER_ELEMENT_DUMP").is_some() {
+        // The revolved stack is what actually gets swept a full turn, so
+        // when a part invents surface by the tens of thousands of square
+        // millimetres this is the list to read: every element here
+        // becomes a complete ring of material whether or not the scan
+        // ever went round.
+        for element in &elements {
+            match element {
+                Element::Wall { feature, rho, z0, z1 } => eprintln!(
+                    "element: #{feature} wall  rho {rho:.2} z {z0:.2}..{z1:.2}  \
+                     swept {:.0} mm^2",
+                    std::f64::consts::TAU * rho * (z1 - z0).abs()
+                ),
+                Element::Face { feature, z, rho0, rho1 } => eprintln!(
+                    "element: #{feature} face  z {z:.2} rho {rho0:.2}..{rho1:.2}  \
+                     swept {:.0} mm^2",
+                    std::f64::consts::PI * (rho1 * rho1 - rho0 * rho0).abs()
+                ),
+                Element::Taper { feature, slope, intercept, z0, z1 } => eprintln!(
+                    "element: #{feature} taper slope {slope:.3} intercept {intercept:.2} \
+                     z {z0:.2}..{z1:.2}"
+                ),
+            }
+        }
+    }
     // Sharpen: extend every endpoint to the nearest intersection with
     // another element within reach.
     let snapshot = elements.clone();
@@ -1922,6 +1947,36 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
     );
     lap("punch");
     let mesh = TriangleMesh::new(positions, triangles)?;
+    if std::env::var_os("ARTIFICER_EMIT_DUMP").is_some() {
+        // What each feature actually draws, against what it was fitted
+        // to. A surface that emits far more than its own measured area
+        // is extrapolating past its evidence, and this is the only view
+        // that names which one and by how much.
+        let mut drawn: std::collections::HashMap<usize, (f64, usize)> =
+            std::collections::HashMap::new();
+        for face in 0..mesh.triangles().len() {
+            let entry = drawn.entry(feature_of_face[face]).or_insert((0.0, 0));
+            entry.0 += mesh.face_area(face);
+            entry.1 += 1;
+        }
+        let mut ranked: Vec<(usize, f64, usize)> =
+            drawn.into_iter().map(|(id, (a, n))| (id, a, n)).collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, area, faces) in ranked.iter().take(12) {
+            let measured = report
+                .features
+                .iter()
+                .find(|f| f.id == *id)
+                .map(|f| (f.area, f.surface.kind()))
+                .unwrap_or((0.0, "?"));
+            eprintln!(
+                "emit: #{id} {:<9} drew {area:>9.0} mm^2 over {faces:>7} tri,                  measured {:>9.0} mm^2  (x{:.1})",
+                measured.1,
+                measured.0,
+                area / measured.0.max(1e-9)
+            );
+        }
+    }
     Some(RebuiltModel {
         mesh,
         feature_of_face,
@@ -3279,6 +3334,106 @@ fn scan_occupancy(
 /// tell us a cylinder was fitted; only the scan can tell us there is a
 /// hole there, and a hole is exactly a tube whose inside nothing
 /// occupies. Probes the axis and a ring at half radius over the run.
+/// Trims an axial run to the longest stretch the scan actually backs.
+///
+/// A hole stack's run is the union of its members' extents, and nothing
+/// in that union requires material to exist between them. Two coaxial
+/// bores at opposite ends of a casting are one instance, so the union
+/// spans the gap and the exact tube is emitted straight through it. On a
+/// water pump that produced a d 38.35 tube running z -186..+25 — 211 mm
+/// of wall through a part 121 mm deep — and three such tubes accounted
+/// for 59% of everything the rebuild invented, one of them drawing
+/// 17,497 mm^2 from a 33 mm^2 scrap.
+///
+/// So walk the run in slabs and keep only the longest contiguous stretch
+/// with wall material near the fitted radius. This trims overshoot at
+/// both ends and refuses to bridge a gap, which are the same failure
+/// seen from either side.
+fn backed_run(
+    occupied: &std::collections::HashMap<(i32, i32, i32), (Point3, Vector3)>,
+    origin: Point3,
+    axis: Vector3,
+    radius: f64,
+    run: (f64, f64),
+    band: f64,
+) -> Option<(f64, f64)> {
+    /// Slab height (mm): fine enough to place an end, coarse enough that
+    /// a scan's own sampling gaps do not read as absence.
+    const SLAB: f64 = 1.5;
+    let span = run.1 - run.0;
+    if span <= 0.0 {
+        return None;
+    }
+    /// Azimuth bins a slab is divided into, and how many must hold wall
+    /// before the slab counts as backed.
+    const BINS: usize = 16;
+    const NEEDED: usize = 8;
+    let slabs = ((span / SLAB).ceil() as usize).clamp(1, 4096);
+    // Proximity alone is not backing. A casting has material nearly
+    // everywhere, so a cylinder driven through one finds *something*
+    // within a millimetre of its surface in almost every slab, and a
+    // test that asks only "is scan near here" answers yes the whole way
+    // and trims nothing. A bore wall is material that faces the axis and
+    // rings it, so ask for that instead.
+    let (u, v_axis) = {
+        let aside = if axis.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        let across = axis.cross(aside);
+        let x = across / across.length().max(1e-12);
+        (x, axis.cross(x))
+    };
+    let mut wrap = vec![[false; BINS]; slabs];
+    for (point, normal) in occupied.values() {
+        let offset = *point - origin;
+        let s = offset.dot(axis);
+        if s < run.0 || s > run.1 {
+            continue;
+        }
+        let radial = offset - axis * s;
+        let length = radial.length();
+        if (length - radius).abs() > band || length < 1e-9 {
+            continue;
+        }
+        // Facing the axis it is supposed to bound, not merely near it.
+        if normal.dot(radial / length) > -0.5 {
+            continue;
+        }
+        let angle = radial.dot(v_axis).atan2(radial.dot(u));
+        let bin = (((angle + std::f64::consts::PI) / std::f64::consts::TAU) * BINS as f64) as usize;
+        let slot = (((s - run.0) / span) * slabs as f64) as usize;
+        wrap[slot.min(slabs - 1)][bin.min(BINS - 1)] = true;
+    }
+    let backed: Vec<bool> = wrap
+        .iter()
+        .map(|bins| bins.iter().filter(|hit| **hit).count() >= NEEDED)
+        .collect();
+    let (mut best, mut best_len) = (None, 0usize);
+    let (mut start, mut len) = (0usize, 0usize);
+    for (index, hit) in backed.iter().enumerate() {
+        if *hit {
+            if len == 0 {
+                start = index;
+            }
+            len += 1;
+            if len > best_len {
+                best_len = len;
+                best = Some(start);
+            }
+        } else {
+            len = 0;
+        }
+    }
+    let start = best?;
+    let step = span / slabs as f64;
+    Some((
+        run.0 + start as f64 * step,
+        run.0 + (start + best_len) as f64 * step,
+    ))
+}
+
 fn tube_is_hollow(
     occupied: &std::collections::HashMap<(i32, i32, i32), (Point3, Vector3)>,
     origin: Point3,
@@ -3992,6 +4147,21 @@ fn build_hole_stacks(
             hi = hi.max(m_hi);
         }
         if !(lo.is_finite() && hi.is_finite()) || hi - lo < 2.0 * tolerance {
+            continue;
+        }
+        // The union above is a claim about where this bore *could* run.
+        // The scan decides where it does.
+        let Some((lo, hi)) = backed_run(
+            occupied,
+            fit.axis_point,
+            fit.axis,
+            fit.radius,
+            (lo, hi),
+            (3.0 * tolerance).max(0.6),
+        ) else {
+            continue;
+        };
+        if hi - lo < 2.0 * tolerance {
             continue;
         }
         if candidate.discovered {
@@ -6091,6 +6261,55 @@ mod tests {
             (fit.radius - 5.0).abs() < 0.3,
             "radius {} is the bore's 5, not the chamfer's 7",
             fit.radius
+        );
+    }
+
+    #[test]
+    fn a_bore_runs_only_as_far_as_the_scan_backs_it() {
+        // Wall material for a 5 mm bore, present from z 0..20 and again
+        // from 60..80 — two real bores that happen to be coaxial, which
+        // the instance grouping hands over as one run of 0..80.
+        let axis = Vector3::new(0.0, 0.0, 1.0);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let mut occupied: std::collections::HashMap<(i32, i32, i32), (Point3, Vector3)> =
+            std::collections::HashMap::new();
+        let mut place = |z: f64, index: i32| {
+            for k in 0..16 {
+                let angle = std::f64::consts::TAU * k as f64 / 16.0;
+                let point = Point3::new(5.0 * angle.cos(), 5.0 * angle.sin(), z);
+                let inward = Vector3::new(-angle.cos(), -angle.sin(), 0.0);
+                occupied.insert((k, index, z as i32), (point, inward));
+            }
+        };
+        let mut step = 0;
+        let mut z = 0.0;
+        while z <= 20.0 {
+            place(z, step);
+            z += 0.5;
+            step += 1;
+        }
+        let mut z = 60.0;
+        while z <= 80.0 {
+            place(z, step);
+            z += 0.5;
+            step += 1;
+        }
+        let trimmed = backed_run(&occupied, origin, axis, 5.0, (0.0, 80.0), 0.6)
+            .expect("the scan backs part of this run");
+        // The longest backed stretch, not the union: emitting through
+        // the 40 mm gap is what put a 211 mm tube through a 121 mm part.
+        assert!(
+            trimmed.0 >= -1.0 && trimmed.1 <= 22.0,
+            "run {trimmed:?} should be the first bore, not the union"
+        );
+        assert!(
+            trimmed.1 - trimmed.0 > 15.0,
+            "run {trimmed:?} should keep the bore it found"
+        );
+        // And a run the scan does not back at all is refused outright.
+        assert!(
+            backed_run(&occupied, origin, axis, 40.0, (0.0, 80.0), 0.6).is_none(),
+            "no material at r=40, so no run"
         );
     }
 
