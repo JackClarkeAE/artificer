@@ -138,6 +138,36 @@ fn secondary_drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: 
     harness.step();
 }
 
+fn middle_drag_viewport(
+    harness: &mut Harness<'static, KernelLabApp>,
+    delta: egui::Vec2,
+    modifiers: egui::Modifiers,
+) {
+    let start = viewport_grab_point(harness);
+    let end = start + delta;
+    harness.input_mut().modifiers = modifiers;
+    harness.hover_at(start);
+    harness.step();
+    harness.event(egui::Event::PointerButton {
+        pos: start,
+        button: egui::PointerButton::Middle,
+        pressed: true,
+        modifiers,
+    });
+    harness.step();
+    harness.hover_at(end);
+    harness.step();
+    harness.event(egui::Event::PointerButton {
+        pos: end,
+        button: egui::PointerButton::Middle,
+        pressed: false,
+        modifiers,
+    });
+    harness.step();
+    harness.input_mut().modifiers = egui::Modifiers::NONE;
+    harness.step();
+}
+
 fn click_at(harness: &mut Harness<'static, KernelLabApp>, position: egui::Pos2) {
     harness.hover_at(position);
     harness.event(egui::Event::PointerButton {
@@ -1293,6 +1323,56 @@ fn orbit_returns_a_face_focused_camera_to_the_visible_document_centre() {
     secondary_drag_viewport(&mut harness, egui::vec2(36.0, -19.0));
 
     assert_eq!(harness.state().view_frame().0, document_centre);
+}
+
+#[test]
+fn orbit_keeps_a_pivot_the_user_panned_to() {
+    let mut harness = harness();
+    let centre_before = harness.state().view_frame().0;
+
+    // Middle-drag pans under the default profile, moving the pivot to the
+    // part being inspected.
+    middle_drag_viewport(&mut harness, egui::vec2(64.0, 22.0), egui::Modifiers::NONE);
+    let panned = harness.state().view_frame().0;
+    assert_ne!(panned, centre_before);
+
+    // Orbiting afterwards must stay about that pivot rather than snapping
+    // back to the document centre.
+    secondary_drag_viewport(&mut harness, egui::vec2(36.0, -19.0));
+    assert_eq!(harness.state().view_frame().0, panned);
+}
+
+#[test]
+fn fusion_profile_pans_on_middle_and_orbits_on_shift_middle() {
+    let mut harness = harness();
+    harness
+        .state_mut()
+        .set_navigation_preference(artificer_workbench::navigation::NavigationPreset::Fusion);
+    harness.run();
+
+    let view_before = harness.state().view_parameters();
+    let target_before = harness.state().view_frame().0;
+
+    middle_drag_viewport(&mut harness, egui::vec2(48.0, 18.0), egui::Modifiers::NONE);
+    let target_after_pan = harness.state().view_frame().0;
+    assert_ne!(target_after_pan, target_before, "middle drag pans");
+    assert_eq!(
+        harness.state().view_parameters(),
+        view_before,
+        "a pan leaves the orientation alone"
+    );
+
+    middle_drag_viewport(
+        &mut harness,
+        egui::vec2(48.0, -26.0),
+        egui::Modifiers::SHIFT,
+    );
+    let view_after_orbit = harness.state().view_parameters();
+    assert!((view_after_orbit.0 - view_before.0).abs() > EPSILON, "yaw");
+    assert!(
+        (view_after_orbit.1 - view_before.1).abs() > EPSILON,
+        "pitch"
+    );
 }
 
 #[test]
