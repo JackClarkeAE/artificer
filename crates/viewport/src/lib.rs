@@ -1740,9 +1740,6 @@ fn show_document_impl(
                 .unwrap_or_else(|| vec![selection])
         })
         .collect::<BTreeSet<_>>();
-    let mut face_mesh = Mesh::default();
-    face_mesh.reserve_vertices(triangles.len() * 3);
-    face_mesh.reserve_triangles(triangles.len());
     let cut_preview_faces = feature_preview
         .and_then(FeaturePreview::candidate)
         .map(|candidate| &candidate.changed_faces);
@@ -1752,6 +1749,7 @@ fn show_document_impl(
             .find(|body| body.key == key)
             .and_then(|body| body.tint)
     };
+    let mut pieces = Vec::with_capacity(triangles.len());
     for triangle in &triangles {
         // One colour per vertex, so the mesh rasteriser interpolates the exact
         // carrier shading across the facet. A cylinder's wall is the same
@@ -1804,8 +1802,23 @@ fn show_document_impl(
         } else if hovered_faces.contains(&identity) {
             fill = fill.map(|vertex| mix(vertex, HOVERED, 0.28));
         }
+        pieces.push(FacePaintPiece {
+            points: triangle.points,
+            depths: triangle.vertex_depths,
+            fills: fill,
+        });
+    }
+    subdivide_face_paint_pieces(&mut pieces);
+    // The projected triangles arrive depth-sorted, but one key per whole
+    // facet is what let a pocket wall out-sort the wall in front of it; the
+    // bounded pieces re-sort on their own local depths.
+    pieces.sort_by(|left, right| left.depth_key().total_cmp(&right.depth_key()));
+    let mut face_mesh = Mesh::default();
+    face_mesh.reserve_vertices(pieces.len() * 3);
+    face_mesh.reserve_triangles(pieces.len());
+    for piece in &pieces {
         let first = face_mesh.vertices.len() as u32;
-        for (point, vertex_fill) in triangle.points.into_iter().zip(fill) {
+        for (point, vertex_fill) in piece.points.into_iter().zip(piece.fills) {
             face_mesh.colored_vertex(point, vertex_fill);
         }
         face_mesh.add_triangle(first, first + 1, first + 2);
@@ -1892,6 +1905,7 @@ fn show_document_impl(
         *view,
         *active_display_transform,
         animation_phase,
+        &triangles,
     );
     let selected_sketch_region = if active_tool == ActiveTool::Select
         && !feature_interaction.consumes_primary
@@ -2440,20 +2454,91 @@ fn project_document_triangles(
     triangles
 }
 
+/// A screen triangle queued for the opaque face painter, small enough that
+/// one depth key orders it correctly against its neighbours.
+struct FacePaintPiece {
+    points: [Pos2; 3],
+    depths: [f64; 3],
+    fills: [Color32; 3],
+}
+
+impl FacePaintPiece {
+    fn depth_key(&self) -> f64 {
+        (self.depths[0] + self.depths[1] + self.depths[2]) / 3.0
+    }
+}
+
+/// Splits screen-large triangles for painting until every edge of every
+/// piece fits the limit.
+///
+/// The painter orders whole triangles by a single depth each, and a wall
+/// facet spanning half the viewport carries half the viewport's depth range
+/// under that one key: a pocket wall sitting behind the facet's near portion
+/// can out-sort it and paint straight through — interior geometry flashing
+/// into view at particular orbit angles. Bisecting the longest edge bounds
+/// how much depth one sort key has to stand for, and the pieces interpolate
+/// exactly the colours the rasteriser would have, so the seams are
+/// invisible.
+fn subdivide_face_paint_pieces(pieces: &mut Vec<FacePaintPiece>) {
+    const PAINT_PIECE_LIMIT: f32 = 96.0;
+    let mean_fill = |left: Color32, right: Color32| {
+        Color32::from_rgba_premultiplied(
+            midpoint_u8(left.r(), right.r()),
+            midpoint_u8(left.g(), right.g()),
+            midpoint_u8(left.b(), right.b()),
+            midpoint_u8(left.a(), right.a()),
+        )
+    };
+    let mut index = 0;
+    while index < pieces.len() {
+        let piece = &pieces[index];
+        let lengths = [0_usize, 1, 2]
+            .map(|start| piece.points[start].distance(piece.points[(start + 1) % 3]));
+        let longest = (0..3)
+            .max_by(|left, right| lengths[*left].total_cmp(&lengths[*right]))
+            .unwrap_or(0);
+        if !lengths[longest].is_finite() || lengths[longest] <= PAINT_PIECE_LIMIT {
+            index += 1;
+            continue;
+        }
+        let start = longest;
+        let end = (longest + 1) % 3;
+        let apex = (longest + 2) % 3;
+        let split_point = lerp_pos([piece.points[start], piece.points[end]], 0.5);
+        let split_depth = (piece.depths[start] + piece.depths[end]) * 0.5;
+        let split_fill = mean_fill(piece.fills[start], piece.fills[end]);
+        let far_half = FacePaintPiece {
+            points: [split_point, piece.points[end], piece.points[apex]],
+            depths: [split_depth, piece.depths[end], piece.depths[apex]],
+            fills: [split_fill, piece.fills[end], piece.fills[apex]],
+        };
+        let near_half = &mut pieces[index];
+        near_half.points[end] = split_point;
+        near_half.depths[end] = split_depth;
+        near_half.fills[end] = split_fill;
+        pieces.push(far_half);
+    }
+}
+
+fn midpoint_u8(left: u8, right: u8) -> u8 {
+    ((u16::from(left) + u16::from(right)) / 2) as u8
+}
+
 /// Whether exact hidden-line removal fits the orbit frame budget.
 ///
-/// The exact pass costs roughly one spatial-index interval query per
-/// non-smooth edge over the nearby projected triangles, so the product of
-/// the two counts tracks the work. The bound is set below the supported
-/// 256-vertex extrusion limit: everyday parts — including bodies with slots
-/// and pockets whose hidden edges would otherwise draw straight through the
-/// material — stay exact while orbiting, and only genuinely dense Boolean
-/// previews fall back to the deferred-occlusion pass.
+/// The exact pass costs one spatial-index interval query per non-smooth
+/// edge, and the index keeps each query proportional to the *nearby*
+/// triangles, so the edge-times-triangle product overstates the work by a
+/// wide margin: the maximum supported 256-vertex extrusion — a product of
+/// roughly 780,000 — measures well under a millisecond for the whole exact
+/// pass. The bound therefore sits far above every part a user models
+/// feature by feature; only faceted Boolean previews, which can carry tens
+/// of thousands of fragments, fall back to the sampled-occlusion pass.
 fn exact_hidden_lines_affordable(
     bodies: &[DocumentBodyInstance<'_>],
     triangles: &[ProjectedTriangle],
 ) -> bool {
-    const INTERACTION_OCCLUSION_BUDGET: usize = 120_000;
+    const INTERACTION_OCCLUSION_BUDGET: usize = 4_000_000;
     let edges = bodies
         .iter()
         .map(|body| {
@@ -2467,13 +2552,51 @@ fn exact_hidden_lines_affordable(
     edges.saturating_mul(triangles.len()) <= INTERACTION_OCCLUSION_BUDGET
 }
 
+/// Whether a projected line is hidden at every probe point along it.
+///
+/// Three interior samples classify the whole line: exact crossing intervals
+/// need a segment intersection against every nearby facet edge plus an
+/// occluder scan per sub-interval, while a sample is one depth test per
+/// nearby facet. A line that is partly visible keeps its full length — the
+/// approximation errs toward showing a line, never toward drawing a fully
+/// buried one through the material.
+fn sampled_line_hidden(
+    screen: [Pos2; 2],
+    depths: [f64; 2],
+    body: BodyInstanceKey,
+    ownership: LineOwnership,
+    index: &TriangleOcclusionIndex<'_>,
+) -> bool {
+    let minimum_depth = depths[0].min(depths[1]);
+    let occluders = index
+        .candidates(screen)
+        .into_iter()
+        .filter(|triangle| !triangle_carries_line(triangle, body, ownership))
+        .filter(|triangle| triangle.maximum_depth > minimum_depth + index.depth_bias)
+        .collect::<Vec<_>>();
+    if occluders.is_empty() {
+        return false;
+    }
+    [0.25_f32, 0.5, 0.75].into_iter().all(|parameter| {
+        let position = lerp_pos(screen, parameter);
+        let depth = depths[0] + (depths[1] - depths[0]) * f64::from(parameter);
+        occluders.iter().any(|triangle| {
+            triangle_depth_at(triangle, position)
+                .is_some_and(|face_depth| face_depth > depth + index.depth_bias)
+        })
+    })
+}
+
 /// Low-latency edge preparation used only while the camera owns the gesture
 /// on scenes too dense for exact hidden lines at 60 Hz.
 ///
 /// Back-facing edges have already been rejected by membership in projected
-/// front-facing triangles. Exact partial occlusion is deliberately deferred,
-/// avoiding the triangle spatial index and hundreds of interval queries while
-/// preserving the stable CAD silhouette and feature boundaries during orbit.
+/// front-facing triangles. Exact partial occlusion is deferred until the
+/// gesture ends, but each line is still probed at a few sample points so a
+/// fully buried edge stays buried: the old pass drew every interior edge
+/// whole, which read as the body turning transparent while turning. A partly
+/// visible edge draws whole until release — a stable silhouette matters more
+/// mid-gesture than exact split points.
 #[allow(clippy::too_many_arguments)]
 fn prepare_interaction_edge_frame_cache(
     bodies: &[DocumentBodyInstance<'_>],
@@ -2485,6 +2608,7 @@ fn prepare_interaction_edge_frame_cache(
     visible_edge_keys: &BTreeMap<BodyInstanceKey, HashSet<ModelEdgeKey>>,
     triangles: &[ProjectedTriangle],
 ) -> EdgeFrameCache {
+    let occlusion = TriangleOcclusionIndex::new(triangles);
     let front_facing_faces = front_facing_faces(triangles);
     let mut by_body = BTreeMap::new();
     let mut silhouettes_by_body = BTreeMap::new();
@@ -2493,7 +2617,7 @@ fn prepare_interaction_edge_frame_cache(
             InstancePresentation::for_body(body, active_body, active_transform, animation_phase);
         let body_keys = visible_edge_keys.get(&body.key);
         let front_facing = front_facing_faces.get(&body.key);
-        let edges = body
+        let edge_work = body
             .scene
             .edges
             .iter()
@@ -2502,33 +2626,57 @@ fn prepare_interaction_edge_frame_cache(
                     && body_keys
                         .is_some_and(|keys| keys.contains(&ModelEdgeKey::new(edge.endpoints)))
             })
-            .map(|edge| {
-                let screen = edge
+            .collect::<Vec<_>>();
+        let edges =
+            ComputePool::global().map("viewport.edges.interaction", &edge_work, |_, edge| {
+                let camera = edge
                     .endpoints
-                    .map(|point| projection.camera_point(presentation.project_point(point, view)));
+                    .map(|point| presentation.project_point(point, view));
+                let screen = camera.map(|point| projection.camera_point(point));
+                let hidden = sampled_line_hidden(
+                    screen,
+                    camera.map(|point| point.depth),
+                    body.key,
+                    LineOwnership::Edge {
+                        key: ModelEdgeKey::new(edge.endpoints),
+                        faces: edge.incident_faces,
+                    },
+                    &occlusion,
+                );
                 ProjectedModelEdge {
                     source: edge.source_edge,
                     screen,
                     visible: true,
                     smooth: false,
-                    visible_intervals: vec![[0.0, 1.0]],
+                    visible_intervals: if hidden { Vec::new() } else { vec![[0.0, 1.0]] },
                     outline: edge_is_outline(edge, front_facing),
                 }
-            })
-            .collect();
+            });
         // The silhouette is the outline of a curved body; dropping it during
         // orbit would make round parts visibly lose their edges exactly while
-        // the user is looking for them. Occlusion is what the cheap pass
-        // defers, so the chords go in whole.
-        let silhouettes = silhouette_chords(body.scene, presentation, view)
-            .into_iter()
-            .map(|(face, chord)| ProjectedSilhouette {
-                face,
-                screen: chord
-                    .map(|point| projection.camera_point(presentation.project_point(point, view))),
-                visible_intervals: vec![[0.0, 1.0]],
-            })
-            .collect();
+        // the user is looking for them. The same probes keep a bore's far rim
+        // from drawing through the wall in front of it.
+        let silhouette_work = silhouette_chords(body.scene, presentation, view);
+        let silhouettes = ComputePool::global().map(
+            "viewport.silhouettes.interaction",
+            &silhouette_work,
+            |_, (face, chord)| {
+                let camera = chord.map(|point| presentation.project_point(point, view));
+                let screen = camera.map(|point| projection.camera_point(point));
+                let hidden = sampled_line_hidden(
+                    screen,
+                    camera.map(|point| point.depth),
+                    body.key,
+                    LineOwnership::Silhouette(*face),
+                    &occlusion,
+                );
+                ProjectedSilhouette {
+                    face: *face,
+                    screen,
+                    visible_intervals: if hidden { Vec::new() } else { vec![[0.0, 1.0]] },
+                }
+            },
+        );
         by_body.insert(body.key, edges);
         silhouettes_by_body.insert(body.key, silhouettes);
     }
@@ -3645,6 +3793,11 @@ enum LineOwnership {
     /// A carrier silhouette: it lies *on* its face, so that whole face is
     /// excluded rather than three facets of it.
     Silhouette(EntityRef),
+    /// A sketch overlay curve: it belongs to no face, so every triangle may
+    /// occlude it. Coplanar cases — a sketch drawn on the very face it sits
+    /// on — are held visible by a depth allowance on the curve itself rather
+    /// than by ownership.
+    Overlay,
 }
 
 fn visible_edge_intervals_indexed(
@@ -3737,6 +3890,7 @@ fn triangle_carries_line(
                 || faces.iter().flatten().any(|face| *face == triangle.source)
         }
         LineOwnership::Silhouette(face) => triangle.source == face,
+        LineOwnership::Overlay => false,
     }
 }
 
@@ -3795,7 +3949,14 @@ fn paint_model_sketch_overlays(
     view: ViewState,
     active_transform: DisplayTransform,
     animation_phase: f64,
+    triangles: &[ProjectedTriangle],
 ) {
+    // Consumed sketches hide behind the model like the record they are, so
+    // the index is only worth building when one is on screen.
+    let occlusion = overlays
+        .iter()
+        .any(|overlay| overlay.consumed)
+        .then(|| TriangleOcclusionIndex::new(triangles));
     for overlay in overlays {
         let Some(presentation) = overlay_presentation(
             overlay,
@@ -3807,10 +3968,12 @@ fn paint_model_sketch_overlays(
             continue;
         };
         // Only reference-plane cards cull by facing: a card seen edge-on or
-        // from behind has nothing useful to show. Sketch curves are
-        // one-dimensional and must stay visible from every direction — the
-        // whole point of showing a committed sketch in 3D is seeing it in
-        // relation to the model while orbiting.
+        // from behind has nothing useful to show. The live sketch's curves
+        // stay visible from every direction — they are the profile the next
+        // feature will consume, and picking them must not depend on the
+        // camera. Consumed sketches instead hide behind the model below,
+        // because their curves trace interior feature boundaries and read as
+        // the body leaking its internals when drawn through the material.
         if overlay.reference_plane.is_some()
             && let Some(frame) = overlay.frame
         {
@@ -3910,14 +4073,50 @@ fn paint_model_sketch_overlays(
             artificer_ui_core::theme::viewport_bottom().gamma_multiply(0.78),
         );
         let stroke = Stroke::new(if overlay.consumed { 1.6 } else { 2.2 }, color);
+        // A consumed sketch sits exactly on the faces its feature made, and
+        // its projected depth disagrees with the interpolated facet depth by
+        // rounding alone. The allowance holds on-surface curves visible
+        // without letting anything show through a real wall, which is orders
+        // of magnitude thicker.
+        let index = occlusion.as_ref().filter(|_| overlay.consumed);
+        let allowance = index.map_or(0.0, |index| index.depth_bias * 250.0);
+        let overlay_body = overlay
+            .body_instance
+            .unwrap_or_else(|| BodyInstanceKey::new(u64::MAX));
         for segment in &overlay.segments {
-            let projected =
-                segment.map(|point| projection.instance_point(point, view, presentation));
-            painter.line_segment(projected, shadow);
-            painter.line_segment(projected, stroke);
+            let camera = segment.map(|point| presentation.project_point(point, view));
+            let projected = camera.map(|point| projection.camera_point(point));
+            let intervals = match index {
+                Some(index) => visible_edge_intervals_indexed(
+                    projected,
+                    camera.map(|point| point.depth + allowance),
+                    overlay_body,
+                    LineOwnership::Overlay,
+                    index,
+                ),
+                None => vec![[0.0, 1.0]],
+            };
+            for [start, end] in intervals {
+                let clipped = [lerp_pos(projected, start), lerp_pos(projected, end)];
+                painter.line_segment(clipped, shadow);
+                painter.line_segment(clipped, stroke);
+            }
         }
         for point in &overlay.points {
-            let projected = projection.instance_point(*point, view, presentation);
+            let camera = presentation.project_point(*point, view);
+            let projected = projection.camera_point(camera);
+            if let Some(index) = index
+                && visible_edge_intervals_indexed(
+                    [projected, projected],
+                    [camera.depth + allowance; 2],
+                    overlay_body,
+                    LineOwnership::Overlay,
+                    index,
+                )
+                .is_empty()
+            {
+                continue;
+            }
             painter.circle_filled(projected, 3.8, Color32::WHITE.gamma_multiply(0.85));
             painter.circle_filled(projected, 2.4, color);
         }
@@ -7128,8 +7327,9 @@ mod tests {
             exact_hidden_lines_affordable(&[body], &triangles),
             "a two-plate scene is far inside the exact orbit budget"
         );
-        // Both plates face the camera, so the cheap pass would keep every
-        // hidden edge whole.
+        // Both plates face the camera. The sampled interaction pass probes
+        // each edge against the material in front of it, so even the cheap
+        // tier hides the buried plate rather than drawing it through.
         let visible_keys = visible_triangle_edge_keys_by_body(&triangles);
         let cheap = prepare_interaction_edge_frame_cache(
             &[body],
@@ -7145,7 +7345,10 @@ mod tests {
             .iter()
             .filter(|edge| edge.visible && !edge.visible_intervals.is_empty())
             .count();
-        assert_eq!(hidden_plate_drawn, 8, "the cheap pass draws both plates");
+        assert_eq!(
+            hidden_plate_drawn, 4,
+            "the sampled pass hides the buried plate"
+        );
 
         let exact = prepare_edge_frame_cache(
             &[body],
@@ -7164,6 +7367,57 @@ mod tests {
         assert_eq!(
             exact_drawn, 4,
             "the exact pass hides the occluded plate entirely"
+        );
+    }
+
+    /// A consumed sketch's curves hide behind material, yet a curve lying
+    /// exactly on the face it was drawn on must survive the depth
+    /// comparison against that face's own facets.
+    #[test]
+    fn overlay_lines_hide_behind_material_but_stay_visible_on_it() {
+        let mut view = ViewState::default();
+        view.yaw = 0.0;
+        view.pitch = 0.0;
+        let bounds = Aabb3::new(Point3::new(-2.0, -1.0, -2.0), Point3::new(2.0, 0.0, 2.0));
+        view.frame(bounds);
+        let scene = occluded_plate_scene(view);
+        let key = BodyInstanceKey::new(11);
+        let body = DocumentBodyInstance::new(key, &scene, Some(bounds), Point3::default());
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+        )
+        .unwrap();
+        let triangles = project_document_triangles(
+            &[body],
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+        );
+        let index = TriangleOcclusionIndex::new(&triangles);
+        let allowance = index.depth_bias * 250.0;
+        let intervals_for = |segment: [Point3; 2]| {
+            let camera = segment.map(|point| view.project(point));
+            visible_edge_intervals_indexed(
+                camera.map(|point| projection.camera_point(point)),
+                camera.map(|point| point.depth + allowance),
+                BodyInstanceKey::new(u64::MAX),
+                LineOwnership::Overlay,
+                &index,
+            )
+        };
+        let buried = intervals_for([Point3::new(-0.5, -1.0, 0.1), Point3::new(0.5, -1.0, 0.1)]);
+        assert!(
+            buried.is_empty(),
+            "a curve behind the near plate must clip away, got {buried:?}"
+        );
+        let on_surface = intervals_for([Point3::new(-0.5, 0.0, 0.1), Point3::new(0.5, 0.0, 0.1)]);
+        assert_eq!(
+            on_surface,
+            vec![[0.0, 1.0]],
+            "a curve on the near plate's own surface must stay whole"
         );
     }
 
@@ -8711,5 +8965,246 @@ mod tests {
         let p95 = samples[(frame_count * 95).div_ceil(100) - 1];
         let budget = Duration::from_secs_f64(1.0 / 60.0);
         assert_frame_budget(average, p95, budget, budget);
+    }
+
+    /// The reported orbit scene: a block with a hexagonal pocket and a
+    /// through-bore, built through the real kernel.
+    fn pocketed_and_bored_block_scene() -> DebugScene {
+        use artificer_protocol::{
+            ArcDirection, FaceExtrusionOperation, PlanarCurve2, PlanarLoop2, PlanarProfile2,
+            PlanarRegion2,
+        };
+        let execute =
+            |snapshot: &artificer_kernel::Snapshot, label: &str, command: KernelCommand| {
+                let request = ExecuteRequest {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    request_id: RequestId::new(label),
+                    expected_snapshot: snapshot.id(),
+                    precision: PrecisionPolicy::default(),
+                    command,
+                };
+                NativeKernel::execute(snapshot, &request, &CancellationToken::new())
+                    .unwrap_or_else(|error| panic!("{label} should build: {error:?}"))
+                    .snapshot
+            };
+        let block = execute(
+            &NativeKernel::empty(),
+            "probe-block",
+            KernelCommand::MakeCuboid {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                size_x: 80.0,
+                size_y: 50.0,
+                size_z: 20.0,
+            },
+        );
+        let top_face = |snapshot: &artificer_kernel::Snapshot| {
+            let scene = NativeKernel::debug_scene(snapshot);
+            scene
+                .triangles
+                .iter()
+                .find(|triangle| {
+                    triangle
+                        .vertices
+                        .iter()
+                        .all(|vertex| (vertex.z - 20.0).abs() < 1.0e-6)
+                })
+                .expect("the block should expose its top face")
+                .source_face
+        };
+        let hexagon = PlanarProfile2 {
+            regions: vec![PlanarRegion2 {
+                outer: PlanarLoop2 {
+                    curves: (0..6)
+                        .map(|index| {
+                            let corner = |step: usize| {
+                                let angle = std::f64::consts::TAU * (step % 6) as f64 / 6.0;
+                                Point2::new(12.0 * angle.cos(), 12.0 * angle.sin())
+                            };
+                            PlanarCurve2::Line {
+                                start: corner(index),
+                                end: corner(index + 1),
+                            }
+                        })
+                        .collect(),
+                },
+                holes: vec![],
+            }],
+        };
+        let pocketed = execute(
+            &block,
+            "probe-hex-pocket",
+            KernelCommand::ExtrudeFacePlanarProfile {
+                target_face: top_face(&block),
+                frame: PlanarFrame3::new(
+                    Point3::new(25.0, 25.0, 20.0),
+                    Vector3::new(1.0, 0.0, 0.0),
+                    Vector3::new(0.0, 1.0, 0.0),
+                ),
+                profile: hexagon,
+                distance: 10.0,
+                operation: FaceExtrusionOperation::Cut,
+            },
+        );
+        let bore = PlanarProfile2 {
+            regions: vec![PlanarRegion2 {
+                outer: PlanarLoop2 {
+                    curves: vec![PlanarCurve2::Circle {
+                        center: Point2::new(0.0, 0.0),
+                        radius: 8.0,
+                        direction: ArcDirection::CounterClockwise,
+                    }],
+                },
+                holes: vec![],
+            }],
+        };
+        let bored = execute(
+            &pocketed,
+            "probe-bore",
+            KernelCommand::ExtrudeFacePlanarProfile {
+                target_face: top_face(&pocketed),
+                frame: PlanarFrame3::new(
+                    Point3::new(60.0, 25.0, 20.0),
+                    Vector3::new(1.0, 0.0, 0.0),
+                    Vector3::new(0.0, 1.0, 0.0),
+                ),
+                profile: bore,
+                distance: 1_000.0,
+                operation: FaceExtrusionOperation::Cut,
+            },
+        );
+        NativeKernel::debug_scene(&bored)
+    }
+
+    /// An everyday multi-feature part must stay inside the exact orbit
+    /// budget: over-tight budgets sent scenes like this to the deferred pass,
+    /// which drew the pocket and bore edges straight through the walls while
+    /// turning.
+    #[test]
+    fn a_pocketed_and_bored_block_affords_exact_hidden_lines_while_orbiting() {
+        let scene = pocketed_and_bored_block_scene();
+        let bounds = Aabb3::new(Point3::new(0.0, 0.0, 0.0), Point3::new(80.0, 50.0, 20.0));
+        let key = BodyInstanceKey::new(1);
+        let body = DocumentBodyInstance::new(key, &scene, Some(bounds), Point3::default());
+        let mut view = ViewState::default();
+        view.frame(bounds);
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(1_280.0, 800.0)),
+        )
+        .unwrap();
+        let triangles = project_document_triangles(
+            &[body],
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+        );
+        assert!(
+            exact_hidden_lines_affordable(&[body], &triangles),
+            "a block with a hex pocket and a through-bore must orbit exact"
+        );
+    }
+
+    /// The face painter must not let interior facets paint over the material
+    /// in front of them anywhere on an orbit. Whole-facet sort keys did: a
+    /// wall spanning half the viewport carries half the viewport's depth
+    /// range, and the bore wall behind its near portion out-sorted it at
+    /// particular yaw angles, flashing internals into view while turning.
+    #[test]
+    fn subdivided_face_paint_order_hides_interior_facets_on_a_full_orbit() {
+        let scene = pocketed_and_bored_block_scene();
+        let bounds = Aabb3::new(Point3::new(0.0, 0.0, 0.0), Point3::new(80.0, 50.0, 20.0));
+        let key = BodyInstanceKey::new(1);
+        let body = DocumentBodyInstance::new(key, &scene, Some(bounds), Point3::default());
+        let mut raw_violations = 0_usize;
+        for step in 0..24 {
+            let mut view = ViewState::default();
+            view.yaw = std::f64::consts::TAU * f64::from(step) / 24.0;
+            view.pitch = 0.5;
+            view.frame(bounds);
+            let projection = projection_for_view(
+                view,
+                Rect::from_min_size(Pos2::ZERO, Vec2::new(1_280.0, 800.0)),
+            )
+            .unwrap();
+            let triangles = project_document_triangles(
+                &[body],
+                Some(key),
+                DisplayTransform::default(),
+                view,
+                0.0,
+                projection,
+            );
+            let violations_in = |pieces: &[FacePaintPiece]| {
+                let mut violations = 0_usize;
+                for (early_index, early) in pieces.iter().enumerate() {
+                    let early_bounds = points_bounds(&early.points);
+                    for late in pieces.iter().skip(early_index + 1) {
+                        let centroid = Pos2::new(
+                            (late.points[0].x + late.points[1].x + late.points[2].x) / 3.0,
+                            (late.points[0].y + late.points[1].y + late.points[2].y) / 3.0,
+                        );
+                        if !early_bounds.contains(centroid) {
+                            continue;
+                        }
+                        let early_piece = ProjectedTriangle {
+                            points: early.points,
+                            screen_bounds: early_bounds,
+                            model_vertices: [Point3::default(); 3],
+                            model_edges: [ModelEdgeKey::new([Point3::default(); 2]); 3],
+                            vertex_depths: early.depths,
+                            maximum_depth: 0.0,
+                            depth: 0.0,
+                            body: key,
+                            source: EntityRef {
+                                snapshot: artificer_protocol::SnapshotId::new([0; 16]),
+                                entity: artificer_protocol::EntityId(0),
+                                kind: artificer_protocol::EntityKind::Face,
+                            },
+                            role: FaceRole::PositiveX,
+                            lighting: [VertexLighting::default(); 3],
+                        };
+                        let late_depth = late.depths.iter().sum::<f64>() / 3.0;
+                        // A quarter-millimetre allowance keeps shared
+                        // boundaries between pieces of adjacent coplanar
+                        // facets from counting as overdraw.
+                        if triangle_depth_at(&early_piece, centroid)
+                            .is_some_and(|early_depth| early_depth > late_depth + 0.25)
+                        {
+                            violations += 1;
+                        }
+                    }
+                }
+                violations
+            };
+            let raw = triangles
+                .iter()
+                .map(|triangle| FacePaintPiece {
+                    points: triangle.points,
+                    depths: triangle.vertex_depths,
+                    fills: [Color32::WHITE; 3],
+                })
+                .collect::<Vec<_>>();
+            let raw_here = violations_in(&raw);
+            raw_violations += raw_here;
+            // The subdivided scan is quadratic in pieces, so it runs only at
+            // the angles the whole-facet keys actually get wrong.
+            if raw_here == 0 {
+                continue;
+            }
+            let mut pieces = raw;
+            subdivide_face_paint_pieces(&mut pieces);
+            pieces.sort_by(|left, right| left.depth_key().total_cmp(&right.depth_key()));
+            assert_eq!(
+                violations_in(&pieces),
+                0,
+                "yaw step {step}: a subdivided piece painted over nearer material"
+            );
+        }
+        assert!(
+            raw_violations > 0,
+            "the sweep must include the raw misordering this test exists to catch"
+        );
     }
 }
