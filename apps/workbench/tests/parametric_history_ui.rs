@@ -103,6 +103,32 @@ fn history_slider_value(harness: &Harness<'static, KernelLabApp>) -> f64 {
         .expect("numeric history rollback slider value")
 }
 
+fn double_click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    // Outrun the double-click window first, so an earlier click in the test
+    // cannot chain with this pair into a triple click.
+    for _ in 0..30 {
+        harness.step();
+    }
+    let center = harness
+        .get_by_role_and_label(Role::Button, label)
+        .rect()
+        .center();
+    harness.hover_at(center);
+    harness.step();
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+    }
+    harness.step();
+}
+
 fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPoint) -> egui::Pos2 {
     harness
         .state()
@@ -957,8 +983,9 @@ fn editing_a_consumed_sketch_rebuilds_its_extrusion_automatically() {
         .volume;
     assert!((before - 4.0).abs() <= 1.0e-9, "1 x 1 x 4: {before}");
 
-    // The Browser row is the explicit edit action for a committed sketch.
-    click_button(&mut harness, "Edit Sketch 1");
+    // The Browser row's double-click is the explicit edit action for a
+    // committed sketch; a single click only selects it.
+    double_click_button(&mut harness, "Select Sketch 1");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     // Resize the rectangle through its own recipe.
     click_button(&mut harness, "Sketch dimension");
@@ -1009,7 +1036,7 @@ fn a_rolled_back_history_cursor_still_opens_a_sketch_for_editing() {
     set_history_slider(&mut harness, 2);
     assert_eq!(harness.state().history_position(), 2, "rolled back");
 
-    click_button(&mut harness, "Edit Sketch 1");
+    double_click_button(&mut harness, "Select Sketch 1");
     assert_eq!(
         harness.state().workbench_mode(),
         WorkbenchMode::Sketch,

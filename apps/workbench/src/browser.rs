@@ -240,7 +240,9 @@ fn browser_row_button(
         text.into(),
         egui::Atom::grow(),
     ))
-    .frame(false)
+    // A selected row wears the selection fill; a text tint alone reads as
+    // nothing at a glance, which left the Browser feeling unclickable.
+    .frame(selected)
     .selected(selected)
     .corner_radius(2)
     .truncate()
@@ -293,6 +295,12 @@ impl KernelLabApp {
             .collect::<BTreeSet<_>>();
         self.browser_selected_bodies
             .retain(|ordinal| live_ordinals.contains(ordinal));
+        if self
+            .browser_selected_sketch
+            .is_some_and(|index| index >= self.sketches.len())
+        {
+            self.browser_selected_sketch = None;
+        }
         let mut context_request: Option<(egui::Pos2, BrowserContextTarget)> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -326,7 +334,7 @@ impl KernelLabApp {
                             let response = ui.add_enabled(
                                 enabled,
                                 egui::Button::new(origin_plane_label(plane))
-                                    .frame(false)
+                                    .frame(selected)
                                     .selected(selected)
                                     .corner_radius(2)
                                     .min_size(egui::vec2(ui.available_width(), 24.0)),
@@ -538,13 +546,15 @@ impl KernelLabApp {
                                 sketch.finished,
                                 sketch.visible,
                                 sketch.consumed,
-                                self.active_sketch_index == Some(index),
+                                self.active_sketch_index == Some(index)
+                                    || self.browser_selected_sketch == Some(index),
                             )
                         })
                         .collect::<Vec<_>>();
                     let mut sketch_visibility_change = None;
                     let mut edit_sketch = None;
-                    for (index, ordinal, support, finished, visible, consumed, active) in
+                    let mut select_sketch = None;
+                    for (index, ordinal, support, finished, visible, consumed, selected) in
                         sketch_rows
                     {
                         ui.horizontal(|ui| {
@@ -573,20 +583,28 @@ impl KernelLabApp {
                                 RichText::new(format!("Sketch {ordinal} · {support} · {state}"))
                                     .color(row_color),
                                 (ui.available_width() - 2.0).max(24.0),
-                                active,
+                                selected,
                             )
-                            .on_hover_text(format!("Open Sketch {ordinal} for editing"));
+                            .on_hover_text(format!(
+                                "Sketch {ordinal} · click selects it for the next feature · double-click edits"
+                            ));
                             response.widget_info(|| {
                                 egui::WidgetInfo::labeled(
                                     egui::WidgetType::Button,
                                     true,
-                                    format!("Edit Sketch {ordinal}"),
+                                    format!("Select Sketch {ordinal}"),
                                 )
                             });
-                            if response.clicked() {
+                            if response.double_clicked() {
                                 edit_sketch = Some(index);
+                            } else if response.clicked() {
+                                select_sketch = Some(index);
                             }
                             if response.secondary_clicked() {
+                                // The menu is about this row, so the row also
+                                // becomes the selection: the highlight names
+                                // what the menu will act on.
+                                select_sketch = Some(index);
                                 let position = response
                                     .interact_pointer_pos()
                                     .unwrap_or_else(|| response.rect.left_bottom());
@@ -614,11 +632,12 @@ impl KernelLabApp {
                         self.set_sketch_visibility(index, visible);
                     }
                     if let Some(index) = edit_sketch {
-                        // The row's left-click is the contextually correct
-                        // action for a sketch: open it for editing. The eye
-                        // handles visibility and the right-click menu carries
-                        // everything else.
+                        // Double-click is the edit action; the single click
+                        // below only selects. The eye handles visibility and
+                        // the right-click menu carries everything else.
                         self.edit_committed_sketch(index);
+                    } else if let Some(index) = select_sketch {
+                        self.select_browser_sketch(index);
                     }
 
                     let joint_rows = self
@@ -674,6 +693,31 @@ impl KernelLabApp {
         }
     }
 
+    /// One left click on a sketch row: the row highlights, and the sketch
+    /// becomes the active one so its profile is what Extrude uses next.
+    /// Editing is the double-click (or context-menu) action.
+    pub(crate) fn select_browser_sketch(&mut self, index: usize) {
+        self.browser_selected_bodies.clear();
+        self.browser_selected_sketch = Some(index);
+        let Some(ordinal) = self.sketches.get(index).map(|sketch| sketch.ordinal) else {
+            return;
+        };
+        if self.active_sketch_index == Some(index) || self.activate_committed_sketch(index) {
+            self.document_status = Some(format!(
+                "Sketch {ordinal} selected · its profile feeds the next feature · double-click to edit"
+            ));
+        } else {
+            self.document_status =
+                Some(format!("Sketch {ordinal} selected · double-click to edit"));
+        }
+    }
+
+    /// The Browser sketch row currently wearing the selection highlight.
+    #[must_use]
+    pub fn browser_selected_sketch_index(&self) -> Option<usize> {
+        self.browser_selected_sketch
+    }
+
     /// One left click on an origin plane row, shared with the context menu's
     /// "Select this plane".
     pub(crate) fn select_origin_plane(&mut self, plane: SketchPlane) {
@@ -689,6 +733,7 @@ impl KernelLabApp {
     /// the selection without moving the active body; Shift selects the run of
     /// rows between the active body and the click.
     fn browser_body_row_clicked(&mut self, index: usize, ordinal: u32, modifiers: egui::Modifiers) {
+        self.browser_selected_sketch = None;
         if modifiers.command {
             if !self.browser_selected_bodies.remove(&ordinal) {
                 self.browser_selected_bodies.insert(ordinal);

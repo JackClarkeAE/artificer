@@ -1883,6 +1883,10 @@ pub struct KernelLabApp {
     /// commands such as Mirror act on this set; the active body remains the
     /// single-body fallback when the set is empty.
     browser_selected_bodies: BTreeSet<u32>,
+    /// The Browser sketch row wearing the selection highlight. Follows the
+    /// active sketch on successful activation, and still marks the clicked
+    /// row when activation is refused, so a click is never silent.
+    browser_selected_sketch: Option<usize>,
     /// The ribbon tab the user explicitly picked, and the workspace they picked
     /// it in. `None` means the tab follows the workspace, which is what makes
     /// the Sketch tab appear the moment a sketch opens; storing the workspace
@@ -2023,6 +2027,7 @@ impl Default for KernelLabApp {
             model_context_menu: None,
             browser_context_menu: None,
             browser_selected_bodies: BTreeSet::new(),
+            browser_selected_sketch: None,
             ribbon_tab: None,
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
