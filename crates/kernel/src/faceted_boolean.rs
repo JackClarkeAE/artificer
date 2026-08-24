@@ -407,10 +407,20 @@ pub(crate) fn finish_edges(
     } else {
         precision
     };
+    // Where the selected edges meet each other, the sweeps must overlap so the
+    // union has material to build the mitre from. Everywhere else that overlap
+    // buys nothing.
+    let shared_endpoints = shared_selection_endpoints(scene, targets, epsilon);
     for target in targets {
-        for polygons in
-            edge_finish_cutters(scene, *target, kind, distance, cutter_precision, epsilon)?
-        {
+        for polygons in edge_finish_cutters(
+            scene,
+            *target,
+            kind,
+            distance,
+            cutter_precision,
+            epsilon,
+            &shared_endpoints,
+        )? {
             let cutter = BspNode::from_polygons(polygons, epsilon);
             cutters = Some(match cutters {
                 None => cutter,
@@ -456,6 +466,34 @@ fn planar_topology_polygons(topology: &Topology, epsilon: f64) -> Option<Vec<Pol
     (!polygons.is_empty()).then_some(polygons)
 }
 
+/// The points where two or more of the selected segments meet each other.
+fn shared_selection_endpoints(
+    scene: &DebugScene,
+    targets: &[EntityRef],
+    epsilon: f64,
+) -> Vec<Point3> {
+    let endpoints = targets
+        .iter()
+        .flat_map(|target| {
+            scene
+                .edges
+                .iter()
+                .filter(move |edge| edge.source_edge == *target && !edge.is_smooth)
+                .flat_map(|edge| edge.endpoints.map(internal_point))
+        })
+        .collect::<Vec<_>>();
+    endpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, point)| {
+            endpoints.iter().enumerate().any(|(other, candidate)| {
+                other != *index && candidate.distance(**point) <= epsilon * 32.0
+            })
+        })
+        .map(|(_, point)| *point)
+        .collect()
+}
+
 fn edge_finish_cutters(
     scene: &DebugScene,
     target: EntityRef,
@@ -463,6 +501,7 @@ fn edge_finish_cutters(
     distance: f64,
     precision: PrecisionPolicy,
     epsilon: f64,
+    shared_endpoints: &[Point3],
 ) -> Option<Vec<Vec<Polygon>>> {
     let segments = scene
         .edges
@@ -474,7 +513,17 @@ fn edge_finish_cutters(
     }
     segments
         .into_iter()
-        .map(|edge| edge_finish_segment_cutter(scene, edge, kind, distance, precision, epsilon))
+        .map(|edge| {
+            edge_finish_segment_cutter(
+                scene,
+                edge,
+                kind,
+                distance,
+                precision,
+                epsilon,
+                shared_endpoints,
+            )
+        })
         .collect()
 }
 
@@ -485,6 +534,7 @@ fn edge_finish_segment_cutter(
     distance: f64,
     precision: PrecisionPolicy,
     epsilon: f64,
+    shared_endpoints: &[Point3],
 ) -> Option<Vec<Polygon>> {
     let [edge_start, edge_end] = edge.endpoints.map(internal_point);
     let edge_vector = edge_end - edge_start;
@@ -524,18 +574,46 @@ fn edge_finish_segment_cutter(
     // to build the actual miter/transition boundary; overlapping sweeps are
     // unioned before subtraction, so connected selected edges remain one
     // regularized operation.
+    //
+    // That overlap is worth its cost at two kinds of endpoint and no others:
+    // where another selected edge meets this one, since the mitre between them
+    // is built from material both sweeps share, and where the body simply
+    // ends, since reaching past it costs nothing. A pocket's rim corner is
+    // neither — the wall carries on — and there the overlap cut a notch a full
+    // setback long into material nobody selected. At such an endpoint the
+    // sweep is brought back to the wall that terminates the edge, which is a
+    // slant rather than a shortening: the cap is each profile point carried
+    // along the axis onto that wall's plane, so the chamfer ends exactly on
+    // the corner and leaves the geometry beside it alone.
     let extension = distance + epsilon * 8.0;
     let start_origin = edge_start + axis * -extension;
     let sweep = axis * (edge_length + extension * 2.0);
-    let start = local
+    let mut start = local
         .iter()
         .map(|point| start_origin + u * point.x + v * point.y)
         .collect::<Vec<_>>();
-    let end = start
+    let mut end = start
         .iter()
         .copied()
         .map(|point| point + sweep)
         .collect::<Vec<_>>();
+    let carry_onto = |points: &mut Vec<Point3>, endpoint: Point3, normal: Vector3| {
+        let denominator = axis.dot(normal);
+        if denominator.abs() <= 1.0e-12 {
+            return;
+        }
+        for point in points.iter_mut() {
+            *point = *point + axis * ((endpoint - *point).dot(normal) / denominator);
+        }
+    };
+    if let Some(normal) =
+        terminating_wall(scene, edge_start, axis * -1.0, shared_endpoints, epsilon)
+    {
+        carry_onto(&mut start, edge_start, normal);
+    }
+    if let Some(normal) = terminating_wall(scene, edge_end, axis, shared_endpoints, epsilon) {
+        carry_onto(&mut end, edge_end, normal);
+    }
     let cap_triangles = ear_clip(&local);
     if cap_triangles.len() != local.len().saturating_sub(2) {
         return None;
@@ -634,6 +712,55 @@ fn edge_finish_profile(
         ));
     }
     Some(profile)
+}
+
+/// The wall that stops a finish sweep leaving `endpoint` along `outward`, if
+/// one does.
+///
+/// Every face meeting at the endpoint carries the boundary's own outward
+/// normal, so a face the departure heads *behind* is a face the departure
+/// would have to cut through. The two faces the finish eats into both contain
+/// the edge, so their normals are square to the axis and never answer here;
+/// what answers is the third face that terminates the edge — a block's end
+/// face, whose normal runs with the departure and lets it leave, or a pocket's
+/// perpendicular wall, which does not. An endpoint another selected edge also
+/// reaches is exempt: the overlap there is the material their mitre is built
+/// from.
+fn terminating_wall(
+    scene: &DebugScene,
+    endpoint: Point3,
+    outward: Vector3,
+    shared_endpoints: &[Point3],
+    epsilon: f64,
+) -> Option<Vector3> {
+    if shared_endpoints
+        .iter()
+        .any(|point| point.distance(endpoint) <= epsilon * 32.0)
+    {
+        return None;
+    }
+    let mut stopper = None::<(f64, Vector3)>;
+    for triangle in &scene.triangles {
+        for (vertex, normal) in triangle.vertices.iter().zip(&triangle.normals) {
+            if internal_point(*vertex).distance(endpoint) > epsilon * 32.0 {
+                continue;
+            }
+            let normal = Vector3::new(normal.x, normal.y, normal.z);
+            let length = normal.length();
+            if length <= epsilon {
+                continue;
+            }
+            let normal = normal / length;
+            let alignment = normal.dot(outward);
+            if alignment >= -1.0e-6 {
+                continue;
+            }
+            if stopper.is_none_or(|(nearest, _)| alignment < nearest) {
+                stopper = Some((alignment, normal));
+            }
+        }
+    }
+    stopper.map(|(_, normal)| normal)
 }
 
 fn edge_inward_directions(

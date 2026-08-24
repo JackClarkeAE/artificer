@@ -151,17 +151,24 @@ fn a_hexagonal_pocket_rim_chamfers_in_part_and_in_whole() {
     .expect("two neighbouring pocket sides should chamfer");
     let removed = before - volume(&pair);
     let wedge = distance * distance / 2.0 * side;
+    // Two wedges less the one mitre they share: the corner between them is
+    // removed once, not twice. Over two full wedges would mean no mitre at
+    // all, and each sweep had simply run on past the corner into the wall
+    // beside it.
     assert!(
-        removed > wedge * 1.5 && removed < wedge * 2.5,
-        "two sides should remove about two wedges of {wedge}, removed {removed}"
+        removed > wedge * 1.75 && removed < wedge * 2.0,
+        "two sides should remove two wedges of {wedge} less their shared mitre, removed {removed}"
     );
 
     let whole = chamfer_set(&pocketed, rim, distance, "hex-pocket-whole-rim")
         .expect("the whole pocket rim should chamfer as one feature");
     let removed = before - volume(&whole);
+    // Closed, every corner is a mitre and the band is the prismatoid between
+    // the rim and its outward offset — which for a regular hexagon at this
+    // setback comes to six wedges.
     assert!(
-        removed > wedge * 5.0 && removed < wedge * 7.0,
-        "the whole rim should remove about six wedges of {wedge}, removed {removed}"
+        ((removed - wedge * 6.0) / (wedge * 6.0)).abs() < 0.01,
+        "the whole rim should remove six wedges of {wedge}, removed {removed}"
     );
 }
 
@@ -253,8 +260,12 @@ fn one_rim_edge_of_a_square_pocket_chamfers_to_a_closed_solid() {
         .expect("one pocket rim edge should chamfer to a closed solid");
     let removed = before - chamfered.measures().volume;
     let wedge = distance * distance / 2.0 * (POCKET_HALF * 2.0);
+    // Its own wedge and nothing else. The sweep overshoots each endpoint to
+    // give a mitre material to form from, which is free where the body ends
+    // but not at a pocket corner, where the wall carries on: that overshoot
+    // used to notch a full setback of unselected material off each end.
     assert!(
-        removed > wedge * 0.9 && removed < wedge * 1.6,
-        "the chamfer should remove about its wedge of {wedge}, removed {removed}"
+        ((removed - wedge) / wedge).abs() < 0.01,
+        "the chamfer should remove its wedge of {wedge}, removed {removed}"
     );
 }
