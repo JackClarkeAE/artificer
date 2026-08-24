@@ -132,6 +132,31 @@ fn dimension_pick_arms_the_caret_on_the_first_driving_box() {
     assert_eq!(rectangle_width(&harness), "6");
 }
 
+/// The picked side names the dimension: clicking a vertical wall of the
+/// rectangle arms Height, not whichever field happened to come first. This is
+/// the reported confusion — dimensioning one side used to bring the whole
+/// recipe back up with Width always holding the caret.
+#[test]
+fn clicking_a_vertical_side_arms_height() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    create_two_point_rectangle(&mut harness);
+    arm_dimension_tool(&mut harness);
+
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 0.0));
+    type_into_armed_box(&mut harness, HEIGHT_BOX, "3");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    let height = harness
+        .state()
+        .selected_sketch_recipe_editor()
+        .expect("a rectangle side is selected")
+        .parameters[1]
+        .text
+        .clone();
+    assert_eq!(height, "3");
+}
+
 /// The chip registered by `semantic_selection_targets` sits over the canvas and
 /// takes the click outright. It has to arm the tool too, or a pick that lands
 /// on it selects and does nothing else.

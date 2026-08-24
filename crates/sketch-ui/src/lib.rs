@@ -4116,6 +4116,13 @@ pub struct SketchCanvasState {
     /// pick and the boxes render in the same frame, so this never survives a
     /// frame boundary: it is a focus request, not editor state.
     focus_dimension_box: Option<SketchDimensionKind>,
+    /// Where the Dimension tool's pick landed, in sketch coordinates. On a
+    /// compound target — a rectangle reassembled from its exploded sides —
+    /// this is what remembers *which side* got clicked, so the armed box and
+    /// its annotation sit on that side rather than always on Width. It lives
+    /// until the selection or tool changes; unlike the focus request it has
+    /// to survive frames so the box stays put while the value is typed.
+    dimension_pick: Option<SketchPoint>,
     next_dimension_serial: u64,
     last_context_fit_key: Option<SketchContextFitKey>,
     /// The active support's analytic curves, mirrored here because snapping
@@ -4164,6 +4171,7 @@ impl Default for SketchCanvasState {
             analytic_regions: AnalyticRegionSelection::default(),
             dimension_session: None,
             focus_dimension_box: None,
+            dimension_pick: None,
             next_dimension_serial: 1,
             last_context_fit_key: None,
             support_curves: Vec::new(),
@@ -4621,6 +4629,7 @@ impl SketchCanvasState {
             self.modifier_picks.clear();
             self.trim_hover_fragment = None;
             self.pattern_manipulator = None;
+            self.dimension_pick = None;
             if matches!(
                 variant,
                 ToolVariant::RectangularPattern | ToolVariant::CircularPattern
@@ -4966,6 +4975,11 @@ impl SketchCanvasState {
         }
         let changed = self.selected != selected;
         self.selected = selected;
+        if changed {
+            // A new subject invalidates the previous pick's side identity;
+            // the caller re-records it when the pick is a Dimension gesture.
+            self.dimension_pick = None;
+        }
         if changed && self.pending.is_none() {
             self.rebuild_selected_recipe_editor();
         }
@@ -6364,7 +6378,7 @@ impl SketchCanvasState {
             // The honest negative: a plain line, a point, or a free arc measures
             // itself, so nothing here drives a literal. Say so on the canvas
             // rather than leaving the tool looking broken.
-            "This feature has no driving dimension · see sketch_colours().selected FEATURE"
+            "This feature has no driving dimension · see the SELECTED FEATURE card"
         } else if matches!(
             state.exact_tool,
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern
@@ -9476,6 +9490,8 @@ pub fn show_with_context(
                         // curve that is already selected re-arms it. A staged
                         // candidate owns the boxes, so it is left alone.
                         if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+                            state.dimension_pick =
+                                Some(state.view.screen_to_sketch(response.rect, position));
                             state.focus_dimension_box = first_armed_dimension_kind(state);
                         }
                     } else {
@@ -9539,9 +9555,11 @@ pub fn show_with_context(
         }
         // The semantic chip sits over the canvas and takes the click outright,
         // so a pick that lands on it never reaches the branch above. Arming
-        // here keeps both routes equivalent, and it still runs before the boxes
-        // lay out below.
+        // here keeps both routes equivalent, and it still runs before the
+        // boxes lay out below. The chip carries no side identity, so the
+        // armed dimension falls back to the field order.
         if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+            state.dimension_pick = None;
             state.focus_dimension_box = first_armed_dimension_kind(state);
         }
     }
@@ -9549,6 +9567,8 @@ pub fn show_with_context(
     paint_trim_hover(&painter, response.rect, state);
     paint_creation_preview(&painter, response.rect, state);
     paint_overlay(&painter, response.rect, state, context.is_some());
+    let committed_annotations = committed_dimension_annotation_layouts(state, response.rect);
+    paint_committed_dimension_annotations(&painter, &committed_annotations);
     let dimension_layouts = dimension_widget_layouts(state, response.rect);
     paint_dimension_leaders(&painter, &dimension_layouts);
     let dimensions = show_dimension_widgets(ui, state, &dimension_layouts, canvas_owned_keyboard);
@@ -10864,7 +10884,9 @@ struct DimensionWidgetLayout {
 /// rebuilds it the same way. Measuring whichever side happened to be picked
 /// would then show a line's length where the recipe says Width — so the
 /// composite is reassembled from every sibling the same authored operation
-/// owns, which is what the sketch_colours().selected FEATURE card is already describing.
+/// owns, which is what the SELECTED FEATURE card is already describing. The
+/// picked side is not lost: `dimension_pick` remembers where the click
+/// landed, and the armed box dresses that side.
 fn dimension_target(state: &SketchCanvasState) -> Option<(SketchGeometry, u64)> {
     let selected = state.selected?;
     let entity = state.presented_entity(selected)?;
@@ -10995,13 +11017,70 @@ fn committed_dimension_parameter(
         .find(|parameter| parameter.stable_key == stable_key && parameter.value.is_some())
 }
 
-/// The dimension the Dimension tool arms first for the selected feature.
+/// The dimension the Dimension tool arms for the selected feature.
+///
+/// On a rectangle the picked side names it: a horizontal side is a Width
+/// question and a vertical side a Height question, so clicking the left wall
+/// of a centre rectangle edits its height rather than whatever field came
+/// first. Without a side identity — the semantic chip, or a non-rectangle —
+/// the first drivable field keeps the caret.
 fn first_armed_dimension_kind(state: &SketchCanvasState) -> Option<SketchDimensionKind> {
     let (geometry, _) = dimension_target(state)?;
+    if let Some(pick) = state.dimension_pick
+        && let Some(kind) = rectangle_picked_dimension_kind(geometry, pick)
+        && committed_dimension_parameter(state, kind).is_some()
+    {
+        return Some(kind);
+    }
     dimension_fields_for_geometry(dimension_phase_for_geometry(geometry), geometry)
         .into_iter()
         .map(|field| field.readout.kind)
         .find(|kind| committed_dimension_parameter(state, *kind).is_some())
+}
+
+/// The dimension the picked side of an axis-aligned rectangle asks for: a
+/// horizontal side spans the width, a vertical side the height.
+fn rectangle_picked_dimension_kind(
+    geometry: SketchGeometry,
+    pick: SketchPoint,
+) -> Option<SketchDimensionKind> {
+    let corners = geometry.rectangle_corners()?;
+    let (min_u, min_v) = (corners[0].u, corners[0].v);
+    let (max_u, max_v) = (corners[2].u, corners[2].v);
+    let to_horizontal = (pick.v - min_v).abs().min((pick.v - max_v).abs());
+    let to_vertical = (pick.u - min_u).abs().min((pick.u - max_u).abs());
+    Some(if to_horizontal <= to_vertical {
+        SketchDimensionKind::Width
+    } else {
+        SketchDimensionKind::Height
+    })
+}
+
+/// Which of a rectangle's parallel sides carry the Width and Height
+/// annotations. The picked side wins, so the box and its witness lines sit
+/// on the edge that was clicked; without a pick the bottom and right sides
+/// keep their traditional spots.
+#[derive(Clone, Copy, Default)]
+struct RectangleAnnotationSides {
+    /// `true` when Width dresses the top (max v) side.
+    width_on_top: bool,
+    /// `true` when Height dresses the left (min u) side.
+    height_on_left: bool,
+}
+
+fn rectangle_annotation_sides(
+    geometry: SketchGeometry,
+    pick: Option<SketchPoint>,
+) -> RectangleAnnotationSides {
+    let (Some(pick), Some(corners)) = (pick, geometry.rectangle_corners()) else {
+        return RectangleAnnotationSides::default();
+    };
+    let (min_u, min_v) = (corners[0].u, corners[0].v);
+    let (max_u, max_v) = (corners[2].u, corners[2].v);
+    RectangleAnnotationSides {
+        width_on_top: (pick.v - max_v).abs() < (pick.v - min_v).abs(),
+        height_on_left: (pick.u - min_u).abs() < (pick.u - max_u).abs(),
+    }
 }
 
 fn dimension_widget_layouts(
@@ -11065,13 +11144,17 @@ fn dimension_widget_layouts(
     let Some((geometry, readouts, serial, live)) = source else {
         return Vec::new();
     };
+    // A live draft has no pick; the committed target dresses the side the
+    // Dimension tool's click landed on.
+    let sides =
+        rectangle_annotation_sides(geometry, (!live).then_some(state.dimension_pick).flatten());
 
     readouts
         .into_iter()
         .filter(|readout| readout.kind.shows_on_canvas())
         .filter_map(|readout| {
-            dimension_widget_position(geometry, readout.kind, state.view, canvas_rect).and_then(
-                |(center, leader_start)| {
+            dimension_widget_position(geometry, readout.kind, sides, state.view, canvas_rect)
+                .and_then(|(center, leader_start)| {
                     let rect = clamp_dimension_rect(
                         Rect::from_center_size(center, DIMENSION_WIDGET_SIZE),
                         canvas_rect,
@@ -11081,19 +11164,167 @@ fn dimension_widget_layouts(
                             readout,
                             rect,
                             leader_start,
-                            span: dimension_span(geometry, readout.kind, state.view, canvas_rect),
+                            span: dimension_span(
+                                geometry,
+                                readout.kind,
+                                sides,
+                                state.view,
+                                canvas_rect,
+                            ),
                             id: Id::new(("sketch-dimension", live, serial, readout.kind)),
                         },
                     )
-                },
-            )
+                })
         })
         .collect()
+}
+
+/// Read-only annotations for every committed feature whose recipe carries
+/// driving dimensions, shown while the Dimension tool is active: the
+/// engineering-drawing record that a width, height, or diameter has been
+/// assigned, kept on the canvas after the pick moves on instead of vanishing
+/// the moment the entity deselects. The selected feature is excluded — its
+/// interactive boxes already dress it.
+fn committed_dimension_annotation_layouts(
+    state: &SketchCanvasState,
+    canvas_rect: Rect,
+) -> Vec<DimensionWidgetLayout> {
+    if state.exact_tool != ToolVariant::Dimension {
+        return Vec::new();
+    }
+    let selected_operation = state
+        .selected
+        .and_then(|selected| state.operation_by_ui.get(&selected).copied());
+    let superseded = state.superseded_by_in_place_edit();
+    let mut layouts = Vec::new();
+    for (index, operation) in state
+        .authoring
+        .operations()
+        .iter()
+        .filter(|operation| operation.active)
+        .enumerate()
+    {
+        if selected_operation == Some(operation.id) {
+            continue;
+        }
+        let entities = state
+            .entities
+            .iter()
+            .filter(|entity| {
+                !superseded.contains(&entity.id)
+                    && state.operation_by_ui.get(&entity.id) == Some(&operation.id)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if entities.is_empty() {
+            continue;
+        }
+        let mut dressed: Vec<(SketchDimensionKind, SketchGeometry, f64)> = Vec::new();
+        match operation.recipe {
+            CoreRecipe::TwoPointRectangle { .. } | CoreRecipe::CentrePointRectangle { .. } => {
+                if let Some([min_u, max_u, min_v, max_v]) = sketch_point_bounds(
+                    entities
+                        .iter()
+                        .flat_map(|entity| entity.geometry.control_points().iter()),
+                ) && max_u > min_u
+                    && max_v > min_v
+                {
+                    let geometry = SketchGeometry::rectangle(
+                        SketchPoint::new(min_u, min_v),
+                        SketchPoint::new(max_u, max_v),
+                    );
+                    dressed.push((SketchDimensionKind::Width, geometry, max_u - min_u));
+                    dressed.push((SketchDimensionKind::Height, geometry, max_v - min_v));
+                }
+            }
+            CoreRecipe::CentrePointCircle { .. } => {
+                if let Some(geometry @ SketchGeometry::Circle { center, rim }) = entities
+                    .iter()
+                    .map(|entity| entity.geometry)
+                    .find(|geometry| matches!(geometry, SketchGeometry::Circle { .. }))
+                {
+                    let radius = (rim.u - center.u).hypot(rim.v - center.v);
+                    if radius.is_finite() && radius > 0.0 {
+                        dressed.push((SketchDimensionKind::Diameter, geometry, radius * 2.0));
+                    }
+                }
+            }
+            _ => {}
+        }
+        for (kind, geometry, value) in dressed {
+            let Some((center, leader_start)) = dimension_widget_position(
+                geometry,
+                kind,
+                RectangleAnnotationSides::default(),
+                state.view,
+                canvas_rect,
+            ) else {
+                continue;
+            };
+            let rect = clamp_dimension_rect(
+                Rect::from_center_size(center, DIMENSION_WIDGET_SIZE),
+                canvas_rect,
+            );
+            if !leader_start.is_finite() || !rect.is_finite() {
+                continue;
+            }
+            layouts.push(DimensionWidgetLayout {
+                readout: DimensionReadout {
+                    kind,
+                    value,
+                    locked: false,
+                    editable: false,
+                },
+                rect,
+                leader_start,
+                span: dimension_span(
+                    geometry,
+                    kind,
+                    RectangleAnnotationSides::default(),
+                    state.view,
+                    canvas_rect,
+                ),
+                id: Id::new(("sketch-committed-dimension", index, kind)),
+            });
+        }
+    }
+    layouts
+}
+
+/// Paints the committed dimension records: the drafted annotation with a
+/// quiet read-only value plate. These are canvas ink rather than widgets —
+/// they never take a click or the caret.
+fn paint_committed_dimension_annotations(
+    painter: &egui::Painter,
+    layouts: &[DimensionWidgetLayout],
+) {
+    let colours = sketch_colours();
+    let stroke = Stroke::new(1.0, colours.dimension.gamma_multiply(0.45));
+    for layout in layouts {
+        if !paint_dimension_annotation(painter, layout, stroke) {
+            painter.line_segment([layout.leader_start, layout.rect.center()], stroke);
+        }
+        painter.rect(
+            layout.rect,
+            4.0,
+            colours.dimension_background.gamma_multiply(0.85),
+            Stroke::new(1.0, colours.dimension.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            layout.rect.center(),
+            Align2::CENTER_CENTER,
+            format_dimension_readout(layout.readout),
+            FontId::monospace(10.0),
+            colours.dimension.gamma_multiply(0.85),
+        );
+    }
 }
 
 fn dimension_widget_position(
     geometry: SketchGeometry,
     kind: SketchDimensionKind,
+    sides: RectangleAnnotationSides,
     view: SketchView,
     canvas_rect: Rect,
 ) -> Option<(Pos2, Pos2)> {
@@ -11140,17 +11371,23 @@ fn dimension_widget_position(
         }
         (SketchDimensionKind::Width, geometry @ SketchGeometry::Rectangle { .. }) => {
             let corners = geometry.rectangle_corners()?;
-            let first = screen(corners[0]);
-            let second = screen(corners[1]);
+            let (first, second, outward) = if sides.width_on_top {
+                (screen(corners[3]), screen(corners[2]), -18.0)
+            } else {
+                (screen(corners[0]), screen(corners[1]), 18.0)
+            };
             let midpoint = first + (second - first) * 0.5;
-            Some((midpoint + Vec2::new(0.0, 18.0), midpoint))
+            Some((midpoint + Vec2::new(0.0, outward), midpoint))
         }
         (SketchDimensionKind::Height, geometry @ SketchGeometry::Rectangle { .. }) => {
             let corners = geometry.rectangle_corners()?;
-            let first = screen(corners[1]);
-            let second = screen(corners[2]);
+            let (first, second, outward) = if sides.height_on_left {
+                (screen(corners[0]), screen(corners[3]), -64.0)
+            } else {
+                (screen(corners[1]), screen(corners[2]), 64.0)
+            };
             let midpoint = first + (second - first) * 0.5;
-            Some((midpoint + Vec2::new(64.0, 0.0), midpoint))
+            Some((midpoint + Vec2::new(outward, 0.0), midpoint))
         }
         (SketchDimensionKind::Width, SketchGeometry::Segment { start, end }) => {
             let start = screen(start);
@@ -11240,6 +11477,7 @@ fn clamp_dimension_rect(rect: Rect, canvas_rect: Rect) -> Rect {
 fn dimension_span(
     geometry: SketchGeometry,
     kind: SketchDimensionKind,
+    sides: RectangleAnnotationSides,
     view: SketchView,
     canvas_rect: Rect,
 ) -> Option<(Pos2, Pos2)> {
@@ -11255,6 +11493,22 @@ fn dimension_span(
             (radius.is_finite() && radius > 0.0).then(|| {
                 let offset = Vec2::new(radius, 0.0);
                 (centre - offset, centre + offset)
+            })
+        }
+        (SketchDimensionKind::Width, geometry @ SketchGeometry::Rectangle { .. }) => {
+            let corners = geometry.rectangle_corners()?;
+            Some(if sides.width_on_top {
+                (screen(corners[3]), screen(corners[2]))
+            } else {
+                (screen(corners[0]), screen(corners[1]))
+            })
+        }
+        (SketchDimensionKind::Height, geometry @ SketchGeometry::Rectangle { .. }) => {
+            let corners = geometry.rectangle_corners()?;
+            Some(if sides.height_on_left {
+                (screen(corners[0]), screen(corners[3]))
+            } else {
+                (screen(corners[1]), screen(corners[2]))
             })
         }
         _ => None,
@@ -12079,6 +12333,95 @@ mod tests {
     use egui_kittest::{Harness, kittest::Queryable as _};
 
     const EPSILON: f64 = 1.0e-10;
+
+    #[test]
+    fn the_picked_rectangle_side_names_its_dimension() {
+        let geometry =
+            SketchGeometry::rectangle(SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0));
+        // Horizontal sides are Width questions, vertical sides Height ones.
+        for (pick, expected) in [
+            (SketchPoint::new(0.3, 1.0), SketchDimensionKind::Width),
+            (SketchPoint::new(-0.4, -1.0), SketchDimensionKind::Width),
+            (SketchPoint::new(2.0, 0.2), SketchDimensionKind::Height),
+            (SketchPoint::new(-2.0, -0.5), SketchDimensionKind::Height),
+        ] {
+            assert_eq!(
+                rectangle_picked_dimension_kind(geometry, pick),
+                Some(expected),
+                "{pick:?}"
+            );
+        }
+        // The picked side also carries the annotation.
+        let top = rectangle_annotation_sides(geometry, Some(SketchPoint::new(0.0, 1.0)));
+        assert!(top.width_on_top);
+        let left = rectangle_annotation_sides(geometry, Some(SketchPoint::new(-2.0, 0.0)));
+        assert!(left.height_on_left);
+        let default = rectangle_annotation_sides(geometry, None);
+        assert!(!default.width_on_top && !default.height_on_left);
+    }
+
+    #[test]
+    fn committed_recipes_keep_their_annotations_while_the_dimension_tool_is_active() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_tool(SketchTool::Rectangle));
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-2.0, -1.0),
+                SketchPoint::new(2.0, 1.0),
+            ))
+            .expect("rectangle should stage");
+        state.commit_pending().expect("rectangle should commit");
+        // Committing auto-selects the new entity; the record annotations are
+        // for everything the pick has moved on from.
+        state.set_selected(None);
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+        // Outside the Dimension tool the canvas stays clean.
+        assert!(committed_dimension_annotation_layouts(&state, canvas).is_empty());
+
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        let layouts = committed_dimension_annotation_layouts(&state, canvas);
+        assert_eq!(
+            layouts.len(),
+            2,
+            "an unselected committed rectangle wears its width and height"
+        );
+        for layout in &layouts {
+            assert!(
+                layout.span.is_some(),
+                "{:?} carries witness lines and arrows",
+                layout.readout.kind
+            );
+            assert!(!layout.readout.editable);
+        }
+        let width = layouts
+            .iter()
+            .find(|layout| layout.readout.kind == SketchDimensionKind::Width)
+            .expect("width annotation");
+        assert!((width.readout.value - 4.0).abs() <= EPSILON);
+
+        // Selecting the rectangle hands it to the interactive boxes instead
+        // of double-drawing it.
+        let subject = state.entities[0].id;
+        assert!(state.set_selected(Some(subject)));
+        assert!(committed_dimension_annotation_layouts(&state, canvas).is_empty());
+    }
+
+    #[test]
+    fn rectangle_spans_dress_the_picked_side() {
+        let geometry =
+            SketchGeometry::rectangle(SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0));
+        let view = SketchView::default();
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let top = rectangle_annotation_sides(geometry, Some(SketchPoint::new(0.0, 1.0)));
+        let span = dimension_span(geometry, SketchDimensionKind::Width, top, view, canvas)
+            .expect("a rectangle width is a span");
+        let top_screen = view.sketch_to_screen(canvas, SketchPoint::new(0.0, 1.0));
+        assert!(
+            (span.0.y - top_screen.y).abs() <= 0.5 && (span.1.y - top_screen.y).abs() <= 0.5,
+            "the span runs along the picked top side: {span:?}"
+        );
+    }
 
     #[test]
     fn arc_endpoint_preserves_an_exact_snapped_antipode() {
