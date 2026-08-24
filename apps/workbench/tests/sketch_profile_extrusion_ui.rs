@@ -741,3 +741,88 @@ fn a_minus_sign_still_chooses_cut_on_a_face() {
         measures.volume
     );
 }
+
+#[test]
+fn a_second_sketch_is_its_own_feature_and_the_first_still_extrudes() {
+    // The reported flow: two sketches, extrude the second, then extrude the
+    // first without undoing anything. The Sketch command used to resume the
+    // committed first sketch silently, so the "second sketch" rewrote the
+    // first one in place and the rewrite left its feature dirty and
+    // unextrudable.
+    let mut harness = blank_harness();
+    // Sketch 1: a 2 x 2 square left of the origin.
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-3.0, -1.0));
+    click_sketch_point(&mut harness, SketchPoint::new(-1.0, 1.0));
+    click_button(&mut harness, "Finish sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    // Sketch 2: a 3 x 3 square right of the origin, its own feature.
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(1.0, 1.0));
+    click_sketch_point(&mut harness, SketchPoint::new(4.0, 4.0));
+    click_button(&mut harness, "Finish sketch");
+    assert_eq!(
+        harness.state().feature_timeline_entries(),
+        ["Origin", "Sketch 1 · r1", "Sketch 2 · r1"],
+        "the second sketch must be its own history feature"
+    );
+    // Extrude sketch 2 (the active one) at the default 4 mm.
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion")
+        .volume;
+    assert!((volume - 36.0).abs() <= 1.0e-8, "sketch 2 alone: {volume}");
+
+    // Now extrude sketch 1 without undoing anything: pick its region the way
+    // the viewport click does, then run the same Extrude action.
+    let anchor = harness
+        .state()
+        .model_sketch_region_anchors(0)
+        .first()
+        .copied()
+        .expect("sketch 1 keeps its region");
+    assert!(
+        harness
+            .state_mut()
+            .select_committed_sketch_region(0, anchor),
+        "sketch 1's region must be selectable after sketch 2 was consumed"
+    );
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let second = harness
+        .state()
+        .displayed_measures()
+        .expect("both extrusions committed")
+        .volume;
+    assert!(
+        (second - 16.0).abs() <= 1.0e-8,
+        "sketch 1's own 16 mm3 body: {second}"
+    );
+    let timeline = harness.state().feature_timeline_entries();
+    assert_eq!(
+        timeline.len(),
+        5,
+        "both extrusions live in history with both sketches: {timeline:?}"
+    );
+    assert!(
+        timeline[3].starts_with("Extrude") && timeline[4].starts_with("Extrude"),
+        "{timeline:?}"
+    );
+}

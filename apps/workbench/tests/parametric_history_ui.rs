@@ -940,3 +940,88 @@ fn native_document_json_roundtrip_preserves_public_document_invariants() {
     let reencoded = serde_json::to_value(&restored).expect("restored document should serialize");
     assert_eq!(reencoded, encoded);
 }
+
+/// The reported gap: editing a sketch that a feature already consumed used to
+/// leave the branch dirty until a manual Rebuild press, and until then the
+/// document refused further work on it. An accepted sketch edit now replays
+/// its dependents on its own, exactly as a feature-scalar edit does.
+#[test]
+fn editing_a_consumed_sketch_rebuilds_its_extrusion_automatically() {
+    let mut harness = harness();
+    prepare_finished_sketch(&mut harness, FeatureScenario::Extrude);
+    commit_prepared_feature(&mut harness, FeatureScenario::Extrude);
+    let before = harness
+        .state()
+        .displayed_measures()
+        .expect("committed extrusion")
+        .volume;
+    assert!((before - 4.0).abs() <= 1.0e-9, "1 x 1 x 4: {before}");
+
+    // The Browser row is the explicit edit action for a committed sketch.
+    click_button(&mut harness, "Edit Sketch 1");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    // Resize the rectangle through its own recipe.
+    click_button(&mut harness, "Sketch dimension");
+    let top_edge = canvas_sketch_point(&harness, SketchPoint::new(0.0, 0.5));
+    click_at(&mut harness, top_edge);
+    {
+        let input = harness.get_by_role_and_label(Role::TextInput, "Rectangle width");
+        input.scroll_to_me();
+    }
+    harness.run();
+    harness
+        .get_by_role_and_label(Role::TextInput, "Rectangle width")
+        .click();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness
+        .get_by_role_and_label(Role::TextInput, "Rectangle width")
+        .type_text("2");
+    harness.run();
+    press_key(&mut harness, egui::Key::Enter);
+    click_button(&mut harness, "Finish sketch");
+
+    assert_eq!(
+        harness.state().document_dirty_feature_count(),
+        0,
+        "finishing the edit replays the dependent extrusion by itself"
+    );
+    let after = harness
+        .state()
+        .displayed_measures()
+        .expect("rebuilt extrusion")
+        .volume;
+    assert!(
+        (after - 8.0).abs() <= 1.0e-9,
+        "the extrusion follows the edited sketch: {after}"
+    );
+}
+
+/// Editing a sketch from a rolled-back history cursor used to do nothing at
+/// all. The edit action now returns the cursor to the end of history and
+/// opens the sketch, so the Browser row works no matter where the scrubber
+/// stands.
+#[test]
+fn a_rolled_back_history_cursor_still_opens_a_sketch_for_editing() {
+    let mut harness = harness();
+    prepare_finished_sketch(&mut harness, FeatureScenario::Extrude);
+    commit_prepared_feature(&mut harness, FeatureScenario::Extrude);
+    let end = harness.state().history_position();
+    set_history_slider(&mut harness, 2);
+    assert_eq!(harness.state().history_position(), 2, "rolled back");
+
+    click_button(&mut harness, "Edit Sketch 1");
+    assert_eq!(
+        harness.state().workbench_mode(),
+        WorkbenchMode::Sketch,
+        "the edit opens instead of silently refusing"
+    );
+    assert_eq!(
+        harness.state().history_position(),
+        end,
+        "editing returned the cursor to the end of history"
+    );
+    assert!(
+        harness.state().sketch_entity_count() >= 1,
+        "the committed geometry is on the canvas"
+    );
+}

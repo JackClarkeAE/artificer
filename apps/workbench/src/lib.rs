@@ -6559,11 +6559,18 @@ impl KernelLabApp {
         if !self.active_document_sketch_is_available() {
             return;
         }
+        // The Sketch command creates; editing what history already holds is
+        // its own explicit action. Once the active canvas is committed to
+        // history, pressing Sketch again means "a new sketch", not a silent
+        // in-place edit of the finished one — which is how a second profile
+        // used to land inside the first sketch and rewrite it.
+        let active_canvas_is_committed = self.sketch_finished;
         if let Some(selected_face) = self.selected_face {
             let already_on_selected_face = matches!(
                 &self.sketch_support,
                 SketchSupport::PlanarFace { face, .. } if *face == selected_face
-            ) && self.sketch_support_is_current();
+            ) && self.sketch_support_is_current()
+                && !active_canvas_is_committed;
             if !already_on_selected_face {
                 let Some(body) = &self.displayed else {
                     return;
@@ -6589,11 +6596,12 @@ impl KernelLabApp {
                 self.sketch_support,
                 SketchSupport::ConstructionPlane { id: Some(active), .. } if active == id
             ) && self.sketch_support_is_current();
-            if !already_on_plane || self.sketch.entities().is_empty() {
+            if !already_on_plane || self.sketch.entities().is_empty() || active_canvas_is_committed
+            {
                 self.begin_construction_plane_sketch(id);
                 return;
             }
-        } else if self.sketch.entities().is_empty() {
+        } else if self.sketch.entities().is_empty() || active_canvas_is_committed {
             let plane = self.selected_origin_plane;
             let flying = self.start_plane_sketch_camera_transition(
                 sketch_plane_frame(plane),
@@ -6655,6 +6663,13 @@ impl KernelLabApp {
 
     /// Opens a sketch on an origin plane, once the camera is looking at it.
     fn open_origin_plane_sketch(&mut self, plane: SketchPlane) {
+        // A committed canvas is a history record; opening the plane starts
+        // the next sketch rather than resuming the finished one.
+        if self.sketch_finished {
+            self.selected_origin_plane = plane;
+            self.begin_new_origin_sketch();
+            return;
+        }
         let _ = self.sketch.set_plane(plane);
         self.sketch_support = SketchSupport::Origin { plane };
         self.face_sketch_context = None;
@@ -8020,10 +8035,26 @@ impl KernelLabApp {
                     self.sync_active_sketch_record();
                     self.bind_active_sketch_document_ids(sketch_id, sketch_feature);
                     self.selected_history_feature = Some(sketch_feature);
-                    self.document_status = Some("Sketch committed to history".to_owned());
                     self.sketch_finish_issue = None;
                     self.pending_operation = None;
                     self.leave_sketch_mode();
+                    // Editing a sketch history already holds replaces its
+                    // payload and dirties the branch that depends on it.
+                    // Replay immediately, exactly as a feature-scalar edit
+                    // does: the user finished an edit, not a request to go
+                    // find a Rebuild button before the model is theirs again.
+                    if self
+                        .document
+                        .feature(sketch_feature)
+                        .is_some_and(|node| node.state.rebuild == RebuildState::Dirty)
+                    {
+                        if self.rebuild_document_from(sketch_feature) {
+                            self.document_status =
+                                Some("Sketch committed · dependent features rebuilt".to_owned());
+                        }
+                    } else {
+                        self.document_status = Some("Sketch committed to history".to_owned());
+                    }
                 } else {
                     self.sketch_finish_issue = Some(if authoring_valid {
                         profile
@@ -10797,15 +10828,35 @@ impl KernelLabApp {
         });
     }
 
-    /// Opens a committed sketch for editing: the Browser row's left-click
-    /// action. Activation hydrates the canvas and the sketch entry path
-    /// applies its own read-only guards, so a stale face sketch reports why
-    /// it will not open instead of opening wrong.
+    /// Opens a committed sketch for editing — the Browser's explicit edit
+    /// action. A rolled-back history cursor first returns to the end: the
+    /// edit belongs to the whole recorded design, and finishing it replays
+    /// every dependent feature anyway, so viewing an earlier state is no
+    /// reason to refuse the edit the user asked for.
     pub(crate) fn edit_committed_sketch(&mut self, index: usize) {
+        if self.pending_operation.is_some() {
+            return;
+        }
+        if !self.history_is_at_end() && !self.move_history_cursor(self.document.features().len()) {
+            return;
+        }
         if !self.activate_committed_sketch(index) {
             return;
         }
-        self.enter_sketch_mode();
+        // Entering directly: the Sketch command itself now means "a new
+        // sketch" once a canvas is committed, while this path is the explicit
+        // edit of an existing one. The stale-face guard still applies — a
+        // face-backed sketch whose body has since changed must not look
+        // editable against the new B-rep.
+        if matches!(&self.sketch_support, SketchSupport::PlanarFace { .. })
+            && !self.sketch_support_is_current()
+        {
+            self.document_status = Some(
+                "That sketch's face belongs to an earlier body state; edit its feature history instead".to_owned(),
+            );
+            return;
+        }
+        self.workbench_mode = WorkbenchMode::Sketch;
     }
 
     /// Workspace settings and diagnostics.
@@ -20886,8 +20937,16 @@ mod extrusion_workbench_tests {
             app.sketch_extrusion_eligibility(),
             SketchExtrusionEligibility::StaleFaceSupport
         );
+        // The consumed face sketch must not reopen against the new B-rep.
+        // With nothing selected, the Sketch command starts the next sketch on
+        // an origin plane instead of silently doing nothing.
         app.enter_sketch_mode();
-        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert!(
+            app.sketch.entities().is_empty(),
+            "a fresh canvas, not the consumed one"
+        );
+        assert!(matches!(app.sketch_support, SketchSupport::Origin { .. }));
     }
 
     #[test]
@@ -21074,8 +21133,9 @@ mod extrusion_workbench_tests {
 
         assert_eq!(app.document.features().len(), original_feature_count);
         assert_eq!(app.document.sketch(sketch).unwrap().geometry_revision, 2);
-        let sketch_feature = app.document.sketch(sketch).unwrap().last_feature;
-        assert_eq!(app.document_dirty_feature_count(), 1);
+        // Finishing the edit replays the dirtied branch on its own, the same
+        // way a feature-scalar edit does; nothing waits on a Rebuild press.
+        assert_eq!(app.document_dirty_feature_count(), 0);
         let payload = app
             .document
             .sketch_payload(sketch, 2)
@@ -21089,8 +21149,6 @@ mod extrusion_workbench_tests {
             2
         );
         assert!(!payload.profile.regions.is_empty());
-        assert!(app.rebuild_document_from(sketch_feature));
-        assert_eq!(app.document_dirty_feature_count(), 0);
     }
 
     #[test]
@@ -21135,8 +21193,10 @@ mod extrusion_workbench_tests {
             .load_native_document_json(&encoded)
             .expect("hydrate revision five");
         let sketch_index = restored.active_sketch_index.expect("hydrated sketch");
-        assert!(restored.activate_committed_sketch(sketch_index));
-        restored.enter_sketch_mode();
+        // Editing a committed sketch is its own explicit action now; the
+        // Sketch command would start a fresh one instead.
+        restored.edit_committed_sketch(sketch_index);
+        assert_eq!(restored.workbench_mode, WorkbenchMode::Sketch);
         assert_eq!(restored.sketch_revision, 5);
         assert!(!restored.sketch.can_undo_local());
 

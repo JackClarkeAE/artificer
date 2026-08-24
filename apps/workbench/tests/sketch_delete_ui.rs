@@ -182,8 +182,8 @@ fn saved_v6_sketch_delete_replaces_one_logical_feature_and_rebuilds() {
     assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(restored.state().document_feature_count(), feature_count);
     assert_eq!(restored.state().sketch_revision(), 2);
-    assert_eq!(restored.state().document_dirty_feature_count(), 1);
-    click_button(&mut restored, "Rebuild selected branch");
+    // Finishing the edit replays the dirtied branch on its own; the manual
+    // Rebuild press is no longer part of the flow.
     assert_eq!(restored.state().document_dirty_feature_count(), 0);
     assert_eq!(restored.state().document_feature_count(), feature_count);
 

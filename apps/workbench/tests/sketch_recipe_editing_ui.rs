@@ -5,7 +5,7 @@ use artificer_workbench::{
 use egui::accesskit::Role;
 use egui_kittest::{
     Harness,
-    kittest::{NodeT as _, Queryable as _},
+    kittest::Queryable as _,
 };
 
 const CONFIRM_OPERATION: &str = "Confirm operation";
@@ -504,8 +504,7 @@ fn saved_v6_recipe_reopens_editable_and_persists_one_logical_revision() {
     accept_selected_parameter(&mut restored, WIDTH_BOX, "3");
     click_button(&mut restored, "Finish sketch");
     assert_eq!(restored.state().document_feature_count(), feature_count);
-    assert_eq!(restored.state().document_dirty_feature_count(), 1);
-    click_button(&mut restored, "Rebuild selected branch");
+    // Finishing the edit replays the dirtied branch on its own.
     assert_eq!(restored.state().document_dirty_feature_count(), 0);
     assert!(
         restored
@@ -559,13 +558,9 @@ fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
         harness.state().document_feature_count(),
         original_feature_count
     );
-    assert!(harness.state().document_dirty_feature_count() >= 2);
-    assert_eq!(harness.state().displayed_snapshot_id(), original_snapshot);
-    assert!((harness.state().displayed_measures().unwrap().volume - 16.0).abs() <= 1.0e-9);
-
-    let rebuild = harness.get_by_role_and_label(Role::Button, "Rebuild selected branch");
-    assert!(!rebuild.accesskit_node().is_disabled());
-    click_button(&mut harness, "Rebuild selected branch");
+    // Finishing the edit replays the extrusion that consumed the sketch on
+    // its own: the widened rectangle is simply the model, with no Rebuild
+    // press in between.
     assert_eq!(harness.state().document_dirty_feature_count(), 0);
     assert_ne!(harness.state().displayed_snapshot_id(), original_snapshot);
     assert!((harness.state().displayed_measures().unwrap().volume - 24.0).abs() <= 1.0e-9);
