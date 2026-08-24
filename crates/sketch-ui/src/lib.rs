@@ -2342,12 +2342,16 @@ impl DimensionSession {
         next.is_some_and(|index| self.begin_edit(index))
     }
 
-    fn cycle(&mut self, backwards: bool) -> Result<(), DimensionInputError> {
+    fn cycle(
+        &mut self,
+        backwards: bool,
+        names: &BTreeMap<String, f64>,
+    ) -> Result<(), DimensionInputError> {
         let Some(active) = self.active else {
             self.begin_first_editable(backwards);
             return Ok(());
         };
-        self.accept()?;
+        self.accept(names)?;
         let len = self.fields.len();
         for offset in 1..=len {
             let index = if backwards {
@@ -2363,12 +2367,15 @@ impl DimensionSession {
         Ok(())
     }
 
-    fn apply_buffer_live(&mut self) -> Result<(), DimensionInputError> {
+    fn apply_buffer_live(
+        &mut self,
+        names: &BTreeMap<String, f64>,
+    ) -> Result<(), DimensionInputError> {
         let Some(active) = self.active else {
             return Ok(());
         };
         let kind = self.fields[active].readout.kind;
-        let value = parse_dimension_value(kind, &self.buffer)?;
+        let value = parse_dimension_value(kind, &self.buffer, names)?;
         let previous_geometry = self.geometry;
         let previous_fields = self.fields.clone();
         if let Err(error) = self.apply_value(active, value) {
@@ -2380,8 +2387,8 @@ impl DimensionSession {
         Ok(())
     }
 
-    fn accept(&mut self) -> Result<(), DimensionInputError> {
-        self.apply_buffer_live()?;
+    fn accept(&mut self, names: &BTreeMap<String, f64>) -> Result<(), DimensionInputError> {
+        self.apply_buffer_live(names)?;
         self.active = None;
         self.edit_original = None;
         self.error = None;
@@ -2690,17 +2697,178 @@ fn dimension_phase_accepts_geometry(phase: DimensionPhase, geometry: SketchGeome
     )
 }
 
+/// Evaluates a plain arithmetic entry over named document variables.
+///
+/// The grammar mirrors the parametric table's textual form minus units:
+/// numbers, names, `+ - * /`, parentheses, unary minus. Everything here is a
+/// bare magnitude — lengths in millimetres — because that is what dimension
+/// fields hold. Returns `None` for anything that fails to parse or divide.
+fn evaluate_named_expression(text: &str, names: &BTreeMap<String, f64>) -> Option<f64> {
+    struct Evaluator<'entry> {
+        tokens: Vec<NamedToken>,
+        cursor: usize,
+        names: &'entry BTreeMap<String, f64>,
+    }
+    #[derive(Clone, Debug, PartialEq)]
+    enum NamedToken {
+        Number(f64),
+        Name(String),
+        Plus,
+        Minus,
+        Star,
+        Slash,
+        Open,
+        Close,
+    }
+    fn tokenize(text: &str) -> Option<Vec<NamedToken>> {
+        let mut tokens = Vec::new();
+        let mut characters = text.chars().peekable();
+        while let Some(&character) = characters.peek() {
+            match character {
+                ' ' | '\t' => {
+                    characters.next();
+                }
+                '+' => {
+                    characters.next();
+                    tokens.push(NamedToken::Plus);
+                }
+                '-' => {
+                    characters.next();
+                    tokens.push(NamedToken::Minus);
+                }
+                '*' => {
+                    characters.next();
+                    tokens.push(NamedToken::Star);
+                }
+                '/' => {
+                    characters.next();
+                    tokens.push(NamedToken::Slash);
+                }
+                '(' => {
+                    characters.next();
+                    tokens.push(NamedToken::Open);
+                }
+                ')' => {
+                    characters.next();
+                    tokens.push(NamedToken::Close);
+                }
+                '0'..='9' | '.' => {
+                    let mut digits = String::new();
+                    while let Some(&digit) = characters.peek() {
+                        if digit.is_ascii_digit() || digit == '.' {
+                            digits.push(digit);
+                            characters.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    tokens.push(NamedToken::Number(digits.parse().ok()?));
+                }
+                letter if letter.is_alphabetic() || letter == '_' => {
+                    let mut name = String::new();
+                    while let Some(&piece) = characters.peek() {
+                        if piece.is_alphanumeric() || piece == '_' {
+                            name.push(piece);
+                            characters.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    tokens.push(NamedToken::Name(name));
+                }
+                _ => return None,
+            }
+        }
+        Some(tokens)
+    }
+    impl Evaluator<'_> {
+        fn expression(&mut self) -> Option<f64> {
+            let mut left = self.term()?;
+            loop {
+                match self.tokens.get(self.cursor) {
+                    Some(NamedToken::Plus) => {
+                        self.cursor += 1;
+                        left += self.term()?;
+                    }
+                    Some(NamedToken::Minus) => {
+                        self.cursor += 1;
+                        left -= self.term()?;
+                    }
+                    _ => return Some(left),
+                }
+            }
+        }
+        fn term(&mut self) -> Option<f64> {
+            let mut left = self.factor()?;
+            loop {
+                match self.tokens.get(self.cursor) {
+                    Some(NamedToken::Star) => {
+                        self.cursor += 1;
+                        left *= self.factor()?;
+                    }
+                    Some(NamedToken::Slash) => {
+                        self.cursor += 1;
+                        let divisor = self.factor()?;
+                        left /= divisor;
+                    }
+                    _ => return Some(left),
+                }
+            }
+        }
+        fn factor(&mut self) -> Option<f64> {
+            let token = self.tokens.get(self.cursor)?.clone();
+            self.cursor += 1;
+            match token {
+                NamedToken::Minus => Some(-self.factor()?),
+                NamedToken::Plus => self.factor(),
+                NamedToken::Number(value) => Some(value),
+                NamedToken::Name(name) => self.names.get(&name).copied(),
+                NamedToken::Open => {
+                    let inner = self.expression()?;
+                    match self.tokens.get(self.cursor) {
+                        Some(NamedToken::Close) => {
+                            self.cursor += 1;
+                            Some(inner)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+    let tokens = tokenize(text)?;
+    // A bare number is not this evaluator's business, and an entry with no
+    // name in it gains nothing from it either; requiring a name keeps plain
+    // typo'd numbers reporting "not a number" rather than evaluating oddly.
+    if !tokens
+        .iter()
+        .any(|token| matches!(token, NamedToken::Name(_)))
+    {
+        return None;
+    }
+    let mut evaluator = Evaluator {
+        tokens,
+        cursor: 0,
+        names,
+    };
+    let value = evaluator.expression()?;
+    (evaluator.cursor == evaluator.tokens.len() && value.is_finite()).then_some(value)
+}
+
 fn parse_dimension_value(
     kind: SketchDimensionKind,
     text: &str,
+    names: &BTreeMap<String, f64>,
 ) -> Result<f64, DimensionInputError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(DimensionInputError::Empty);
     }
-    let value = text
-        .parse::<f64>()
-        .map_err(|_| DimensionInputError::NotANumber)?;
+    let value = text.parse::<f64>().map_or_else(
+        |_| evaluate_named_expression(text, names).ok_or(DimensionInputError::NotANumber),
+        Ok,
+    )?;
     if !value.is_finite() {
         return Err(DimensionInputError::NonFinite);
     }
@@ -4128,6 +4296,11 @@ pub struct SketchCanvasState {
     /// The active support's analytic curves, mirrored here because snapping
     /// runs before the frame's context borrow is available to `snap_point`.
     support_curves: Vec<SketchContextCurve>,
+    /// Named document variables, by name, evaluated to canonical magnitudes
+    /// (millimetres for lengths). Dimension and recipe fields accept these
+    /// names in arithmetic entries: `width`, `width / 2 + 5`. The workbench
+    /// refreshes the map from the document's parameter table.
+    named_values: BTreeMap<String, f64>,
 }
 
 impl Default for SketchCanvasState {
@@ -4175,6 +4348,7 @@ impl Default for SketchCanvasState {
             next_dimension_serial: 1,
             last_context_fit_key: None,
             support_curves: Vec::new(),
+            named_values: BTreeMap::new(),
         }
     }
 }
@@ -4666,6 +4840,29 @@ impl SketchCanvasState {
         self.snap = settings;
     }
 
+    /// Publishes the document's evaluated variables for numeric entries: a
+    /// dimension box or recipe field can then name them in arithmetic, so a
+    /// rectangle's width can be `plate_width / 2`. Values are canonical
+    /// magnitudes; lengths arrive in millimetres.
+    pub fn set_named_values(&mut self, values: BTreeMap<String, f64>) {
+        if self.named_values != values {
+            self.named_values = values;
+        }
+    }
+
+    /// Evaluates one numeric entry over the published document variables —
+    /// the same arithmetic the dimension boxes accept. Lengths come back in
+    /// millimetres; a plain number passes straight through.
+    #[must_use]
+    pub fn evaluate_value_entry(&self, text: &str) -> Option<f64> {
+        let trimmed = text.trim();
+        trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .or_else(|| evaluate_named_expression(trimmed, &self.named_values))
+    }
+
     /// Publishes the sketch support's analytic curves as snap references.
     ///
     /// Non-finite curves are dropped so a degenerate support can never move
@@ -5114,12 +5311,21 @@ impl SketchCanvasState {
         };
 
         let parsed = {
+            let named_values = &self.named_values;
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
                 .parameters
                 .iter_mut()
                 .find(|parameter| parameter.stable_key == stable_key)?;
-            match validate_tool_number(&parameter.text, domain) {
+            // Plain numbers stay the fast path; anything else may name a
+            // document variable — `plate_width / 2` — which evaluates first
+            // and then faces the same domain rules a typed number would.
+            let evaluated = validate_tool_number(&parameter.text, domain).or_else(|error| {
+                evaluate_named_expression(&parameter.text, named_values)
+                    .ok_or(error)
+                    .and_then(|value| validate_tool_number(&value.to_string(), domain))
+            });
+            match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
                     value
@@ -11829,10 +12035,11 @@ fn show_dimension_widgets(
     }
 
     if live_changed {
+        let named_values = &state.named_values;
         let result = state
             .dimension_session
             .as_mut()
-            .map_or(Ok(()), DimensionSession::apply_buffer_live);
+            .map_or(Ok(()), |session| session.apply_buffer_live(named_values));
         if let Some(session) = state.dimension_session.as_mut() {
             session.error = result.err();
         }
@@ -11869,8 +12076,9 @@ fn show_dimension_widgets(
         }
         state.sync_dimension_pending();
     } else if tab_owned && (tab_forward || tab_backward) {
+        let named_values = &state.named_values;
         if let Some(session) = state.dimension_session.as_mut()
-            && let Err(error) = session.cycle(tab_backward)
+            && let Err(error) = session.cycle(tab_backward, named_values)
         {
             session.error = Some(error);
             session.focus_next_frame = true;
@@ -11878,8 +12086,9 @@ fn show_dimension_widgets(
         state.sync_dimension_pending();
     } else if active_at_start.is_some() && active_editor_owned_keyboard && enter_pressed {
         claims.enter = true;
+        let named_values = &state.named_values;
         let accepted = if let Some(session) = state.dimension_session.as_mut() {
-            match session.accept() {
+            match session.accept(named_values) {
                 Ok(()) => true,
                 Err(error) => {
                     session.error = Some(error);
@@ -11918,8 +12127,9 @@ fn show_dimension_widgets(
         pending_created = state.finish_polyline_draft().ok();
     } else if let Some(kind) = clicked_kind {
         let can_switch = if state.dimension_editor_active() {
+            let named_values = &state.named_values;
             if let Some(session) = state.dimension_session.as_mut() {
-                match session.accept() {
+                match session.accept(named_values) {
                     Ok(()) => true,
                     Err(error) => {
                         session.error = Some(error);
@@ -13607,8 +13817,12 @@ mod tests {
             .direction;
         assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
         session.buffer = "120".to_owned();
-        session.apply_buffer_live().expect("valid directed sweep");
-        session.accept().expect("typed sweep accepts");
+        session
+            .apply_buffer_live(&BTreeMap::new())
+            .expect("valid directed sweep");
+        session
+            .accept(&BTreeMap::new())
+            .expect("typed sweep accepts");
         let radius = 4.0 / (2.0 * 60_f64.to_radians().sin());
         assert!((session.value(SketchDimensionKind::Radius) - radius).abs() <= EPSILON);
         let SketchGeometry::Arc { center, start, end } = session.geometry else {
@@ -13658,7 +13872,7 @@ mod tests {
         assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
         session.buffer = "400".to_owned();
         let error = session
-            .apply_buffer_live()
+            .apply_buffer_live(&BTreeMap::new())
             .expect_err("sweep beyond 360 is invalid");
         session.error = Some(error);
         assert_eq!(session.geometry, valid_geometry);
@@ -14584,8 +14798,12 @@ mod tests {
 
         assert!(session.begin_kind(SketchDimensionKind::Width));
         session.buffer = "10".to_owned();
-        session.apply_buffer_live().expect("valid width");
-        session.accept().expect("width should accept");
+        session
+            .apply_buffer_live(&BTreeMap::new())
+            .expect("valid width");
+        session
+            .accept(&BTreeMap::new())
+            .expect("width should accept");
         session.update_pointer(SketchPoint::new(-2.0, 9.0));
 
         assert!((readout_value(&session, SketchDimensionKind::Width) - 10.0).abs() <= EPSILON);
@@ -14610,7 +14828,9 @@ mod tests {
 
         assert!(session.begin_kind(SketchDimensionKind::Length));
         session.buffer = "10".to_owned();
-        session.accept().expect("length should accept");
+        session
+            .accept(&BTreeMap::new())
+            .expect("length should accept");
         session.update_pointer(SketchPoint::new(0.0, 6.0));
 
         let SketchGeometry::Segment { end, .. } = session.geometry else {
@@ -14654,7 +14874,9 @@ mod tests {
 
         assert!(session.begin_kind(SketchDimensionKind::Diameter));
         session.buffer = "20".to_owned();
-        session.accept().expect("diameter should accept");
+        session
+            .accept(&BTreeMap::new())
+            .expect("diameter should accept");
         let SketchGeometry::Circle { rim, .. } = session.geometry else {
             panic!("expected circle geometry");
         };
@@ -14676,10 +14898,14 @@ mod tests {
         );
         assert!(session.begin_kind(SketchDimensionKind::Radius));
         session.buffer = "3".to_owned();
-        session.accept().expect("radius should accept");
+        session
+            .accept(&BTreeMap::new())
+            .expect("radius should accept");
         assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
         session.buffer = "180".to_owned();
-        session.accept().expect("sweep should accept");
+        session
+            .accept(&BTreeMap::new())
+            .expect("sweep should accept");
 
         let SketchGeometry::Arc { start, end, .. } = session.geometry else {
             panic!("expected arc geometry");
@@ -14705,7 +14931,7 @@ mod tests {
         assert!(session.begin_kind(SketchDimensionKind::Width));
         session.buffer = "not a number".to_owned();
         assert_eq!(
-            session.apply_buffer_live(),
+            session.apply_buffer_live(&BTreeMap::new()),
             Err(DimensionInputError::NotANumber)
         );
         assert_eq!(session.geometry, geometry);
@@ -14729,7 +14955,9 @@ mod tests {
             .expect("pending circle should expose dimensions");
         assert!(session.begin_kind(SketchDimensionKind::Diameter));
         session.buffer = "10".to_owned();
-        session.accept().expect("diameter should accept");
+        session
+            .accept(&BTreeMap::new())
+            .expect("diameter should accept");
         state.sync_dimension_pending();
 
         assert_eq!(
@@ -14793,7 +15021,7 @@ mod tests {
             .expect("live segment dimensions");
         assert!(session.begin_kind(SketchDimensionKind::Length));
         session.buffer = "5".to_owned();
-        session.accept().expect("valid length");
+        session.accept(&BTreeMap::new()).expect("valid length");
 
         assert_eq!(stage_complete_dimension_draft(&mut state), None);
         assert_eq!(

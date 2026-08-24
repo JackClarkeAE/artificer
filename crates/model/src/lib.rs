@@ -36,10 +36,11 @@ pub use parameterized::{
     MAX_KERNEL_PARAMETER_BINDINGS, ParameterizedKernel, ParameterizedKernelError,
 };
 pub use parameters::{
-    EvaluatedParameters, ParameterBinding, ParameterBindingDigest, ParameterChoice, ParameterError,
-    ParameterExposure, ParameterExpression, ParameterMetadata, ParameterOverrides, ParameterRecord,
-    ParameterSpec, ParameterTable, ParameterType, ParameterUnit, ParameterValue, QuantityKind,
-    QuantityValue,
+    EvaluatedParameters, ExpressionParseError, ParameterBinding, ParameterBindingDigest,
+    ParameterChoice, ParameterError, ParameterExposure, ParameterExpression, ParameterMetadata,
+    ParameterOverrides, ParameterRecord, ParameterSpec, ParameterTable, ParameterType,
+    ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, QuantityValue,
+    format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
 pub use sketch_region::{
     CURRENT_SKETCH_REGION_RECIPE_VERSION, MAX_SELECTED_SKETCH_REGIONS, SketchRegionExtrusion,

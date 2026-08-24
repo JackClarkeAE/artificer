@@ -60,6 +60,8 @@ pub enum CommandIcon {
     Component,
     Joint,
     JointDisabled,
+    Variable,
+    VariableNew,
 }
 
 pub fn paint_command_icon(painter: &Painter, rect: Rect, icon: CommandIcon, color: Color32) {
@@ -525,6 +527,20 @@ impl IconPainter<'_> {
             CommandIcon::JointDisabled => {
                 // The same joint inert: the bare pivot ring, no motion.
                 self.circle((0.50, 0.50), 0.30);
+            }
+            CommandIcon::Variable => {
+                // A named unknown driving a value: x = …
+                self.line((0.12, 0.34), (0.40, 0.66));
+                self.line((0.40, 0.34), (0.12, 0.66));
+                self.line((0.54, 0.42), (0.88, 0.42));
+                self.line((0.54, 0.58), (0.88, 0.58));
+            }
+            CommandIcon::VariableNew => {
+                // The unknown with a plus: a new variable.
+                self.line((0.14, 0.36), (0.40, 0.64));
+                self.line((0.40, 0.36), (0.14, 0.64));
+                self.line((0.70, 0.34), (0.70, 0.66));
+                self.line((0.54, 0.50), (0.86, 0.50));
             }
         }
     }

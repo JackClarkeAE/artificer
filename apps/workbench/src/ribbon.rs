@@ -26,6 +26,8 @@ use crate::sketch_toolbar::{
     SketchOperationGate, SketchToolCapabilities, ToolVariant, render_sketch_toolbar,
 };
 use crate::theme::{self, ribbon_group};
+use artificer_model::QuantityKind;
+
 use crate::{KernelLabApp, SolidFeaturePreset, WorkbenchMode, shell_button_activated, viewport};
 
 /// Whether a command can run right now, and in plain words why not when it
@@ -164,7 +166,7 @@ impl KernelLabApp {
                         self.ribbon_tab = None;
                         self.enter_sketch_mode();
                     }
-                    RibbonTab::View | RibbonTab::Theme => {
+                    RibbonTab::View | RibbonTab::Parametric | RibbonTab::Theme => {
                         self.ribbon_tab = Some((self.workbench_mode, tab));
                     }
                 }
@@ -529,6 +531,7 @@ impl KernelLabApp {
             ModelCommand::ThemeLight => theme::active_theme() == theme::WorkbenchTheme::Light,
             ModelCommand::ThemeDark => theme::active_theme() == theme::WorkbenchTheme::Dark,
             ModelCommand::ThemeColours => self.theme_editor_open,
+            ModelCommand::ToggleVariables => self.variables_window_open,
             ModelCommand::PlayMotion => self.motion.playing,
             _ => false,
         }
@@ -742,6 +745,16 @@ impl KernelLabApp {
                     )
                 }
             }
+            ModelCommand::ToggleVariables => CommandAvailability::Enabled,
+            ModelCommand::NewLengthVariable
+            | ModelCommand::NewAngleVariable
+            | ModelCommand::NewFactorVariable => {
+                if self.pending_operation.is_some() {
+                    CommandAvailability::disabled("Confirm or cancel the pending operation first.")
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
         }
     }
 
@@ -927,6 +940,18 @@ impl KernelLabApp {
                 let mut settings = self.sketch.snap_settings();
                 settings.enabled = !settings.enabled;
                 self.sketch.set_snap_settings(settings);
+            }
+            ModelCommand::ToggleVariables => {
+                self.variables_window_open = !self.variables_window_open;
+            }
+            ModelCommand::NewLengthVariable => {
+                self.stage_new_variable(QuantityKind::Length);
+            }
+            ModelCommand::NewAngleVariable => {
+                self.stage_new_variable(QuantityKind::Angle);
+            }
+            ModelCommand::NewFactorVariable => {
+                self.stage_new_variable(QuantityKind::Scalar);
             }
         }
     }

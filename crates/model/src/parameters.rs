@@ -1419,6 +1419,487 @@ fn decode_hex(byte: u8) -> Option<u8> {
     }
 }
 
+/// How a parsed textual entry binds: a bare number stays a literal so simple
+/// values remain simple; anything naming another parameter or combining terms
+/// becomes an expression over the existing tree vocabulary.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParsedParameterEntry {
+    Literal(ParameterValue),
+    Expression(ParameterExpression),
+}
+
+/// Why a textual entry did not parse. Every message names the offending text
+/// so the editor can show it beside the field.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExpressionParseError {
+    #[error("enter a value or expression")]
+    Empty,
+    #[error("{0:?} is not a number")]
+    InvalidNumber(String),
+    #[error("{0:?} is not a known unit")]
+    UnknownUnit(String),
+    #[error("{0:?} is not a defined variable")]
+    UnknownName(String),
+    #[error("unexpected {0:?}")]
+    UnexpectedCharacter(char),
+    #[error("the expression ends too early")]
+    UnexpectedEnd,
+    #[error("unexpected trailing input {0:?}")]
+    TrailingInput(String),
+}
+
+/// The unit suffixes the textual grammar accepts after a number.
+const UNIT_SUFFIXES: [(&str, ParameterUnit); 9] = [
+    ("um", ParameterUnit::Micrometer),
+    ("µm", ParameterUnit::Micrometer),
+    ("mm", ParameterUnit::Millimeter),
+    ("cm", ParameterUnit::Centimeter),
+    ("m", ParameterUnit::Meter),
+    ("in", ParameterUnit::Inch),
+    ("ft", ParameterUnit::Foot),
+    ("deg", ParameterUnit::Degree),
+    ("rad", ParameterUnit::Radian),
+];
+
+/// The display suffix for a unit, matching what the parser accepts.
+#[must_use]
+pub const fn parameter_unit_suffix(unit: ParameterUnit) -> &'static str {
+    match unit {
+        ParameterUnit::Micrometer => "um",
+        ParameterUnit::Millimeter => "mm",
+        ParameterUnit::Centimeter => "cm",
+        ParameterUnit::Meter => "m",
+        ParameterUnit::Inch => "in",
+        ParameterUnit::Foot => "ft",
+        ParameterUnit::Radian => "rad",
+        ParameterUnit::Degree => "deg",
+        ParameterUnit::Scalar => "",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ExpressionToken {
+    Number(f64, Option<ParameterUnit>),
+    Name(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Open,
+    Close,
+}
+
+fn tokenize_expression(text: &str) -> Result<Vec<ExpressionToken>, ExpressionParseError> {
+    let mut tokens = Vec::new();
+    let mut characters = text.chars().peekable();
+    while let Some(&character) = characters.peek() {
+        match character {
+            ' ' | '\t' => {
+                characters.next();
+            }
+            '+' => {
+                characters.next();
+                tokens.push(ExpressionToken::Plus);
+            }
+            '-' | '−' => {
+                characters.next();
+                tokens.push(ExpressionToken::Minus);
+            }
+            '*' | '×' => {
+                characters.next();
+                tokens.push(ExpressionToken::Star);
+            }
+            '/' | '÷' => {
+                characters.next();
+                tokens.push(ExpressionToken::Slash);
+            }
+            '(' => {
+                characters.next();
+                tokens.push(ExpressionToken::Open);
+            }
+            ')' => {
+                characters.next();
+                tokens.push(ExpressionToken::Close);
+            }
+            '0'..='9' | '.' => {
+                let mut digits = String::new();
+                while let Some(&digit) = characters.peek() {
+                    if digit.is_ascii_digit() || digit == '.' {
+                        digits.push(digit);
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+                let magnitude = digits
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| ExpressionParseError::InvalidNumber(digits.clone()))?;
+                // An identifier directly after a number is its unit —
+                // juxtaposition is never multiplication in this grammar.
+                let mut suffix = String::new();
+                while let Some(&letter) = characters.peek() {
+                    if letter.is_alphabetic() || letter == 'µ' {
+                        suffix.push(letter);
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+                let unit = if suffix.is_empty() {
+                    None
+                } else {
+                    Some(
+                        UNIT_SUFFIXES
+                            .iter()
+                            .find(|(name, _)| *name == suffix)
+                            .map(|(_, unit)| *unit)
+                            .ok_or(ExpressionParseError::UnknownUnit(suffix))?,
+                    )
+                };
+                tokens.push(ExpressionToken::Number(magnitude, unit));
+            }
+            letter if letter.is_alphabetic() || letter == '_' => {
+                let mut name = String::new();
+                while let Some(&piece) = characters.peek() {
+                    if piece.is_alphanumeric() || piece == '_' {
+                        name.push(piece);
+                        characters.next();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(ExpressionToken::Name(name));
+            }
+            other => return Err(ExpressionParseError::UnexpectedCharacter(other)),
+        }
+    }
+    // `5 mm` is the same entry as `5mm`: a unit name directly after a bare
+    // number binds to it across the whitespace the display form prints.
+    let mut merged: Vec<ExpressionToken> = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        if let (ExpressionToken::Name(name), Some(ExpressionToken::Number(magnitude, None))) =
+            (&token, merged.last())
+            && let Some((_, unit)) = UNIT_SUFFIXES.iter().find(|(suffix, _)| suffix == name)
+        {
+            let magnitude = *magnitude;
+            merged.pop();
+            merged.push(ExpressionToken::Number(magnitude, Some(*unit)));
+            continue;
+        }
+        merged.push(token);
+    }
+    Ok(merged)
+}
+
+/// The parsed shape before units are assigned. Bare numbers stay bare here:
+/// whether `2` means two millimetres or a factor of two depends on where it
+/// stands, which only the whole tree can decide.
+#[derive(Clone, Debug)]
+enum RawExpression {
+    Bare(f64),
+    Quantity(QuantityValue),
+    Reference(ParameterId),
+    Negate(Box<RawExpression>),
+    Add(Box<RawExpression>, Box<RawExpression>),
+    Subtract(Box<RawExpression>, Box<RawExpression>),
+    Multiply(Box<RawExpression>, Box<RawExpression>),
+    Divide(Box<RawExpression>, Box<RawExpression>),
+}
+
+impl RawExpression {
+    /// Whether this subtree carries a dimension of its own — a reference or
+    /// an explicitly suffixed quantity — as opposed to bare numerals.
+    fn is_dimensioned(&self) -> bool {
+        match self {
+            Self::Bare(_) => false,
+            Self::Quantity(value) => value.unit != ParameterUnit::Scalar,
+            Self::Reference(_) => true,
+            Self::Negate(operand) => operand.is_dimensioned(),
+            Self::Add(left, right)
+            | Self::Subtract(left, right)
+            | Self::Multiply(left, right)
+            | Self::Divide(left, right) => left.is_dimensioned() || right.is_dimensioned(),
+        }
+    }
+
+    /// Assigns units to bare numerals by context, the way people write
+    /// dimensions: additive terms wear the field's unit (`width + 5` adds
+    /// five millimetres), while a bare factor beside dimensioned geometry is
+    /// a scalar (`width * 2` doubles, it does not multiply two lengths).
+    fn lower(self, expected: ParameterUnit) -> ParameterExpression {
+        match self {
+            Self::Bare(magnitude) => ParameterExpression::Literal {
+                value: ParameterValue::Quantity {
+                    value: QuantityValue::new(magnitude, expected),
+                },
+            },
+            Self::Quantity(value) => ParameterExpression::Literal {
+                value: ParameterValue::Quantity { value },
+            },
+            Self::Reference(parameter) => ParameterExpression::reference(parameter),
+            Self::Negate(operand) => ParameterExpression::Negate {
+                operand: Box::new(operand.lower(expected)),
+            },
+            Self::Add(left, right) => ParameterExpression::Add {
+                left: Box::new(left.lower(expected)),
+                right: Box::new(right.lower(expected)),
+            },
+            Self::Subtract(left, right) => ParameterExpression::Subtract {
+                left: Box::new(left.lower(expected)),
+                right: Box::new(right.lower(expected)),
+            },
+            Self::Multiply(left, right) => {
+                let (left_unit, right_unit) = match (left.is_dimensioned(), right.is_dimensioned())
+                {
+                    (true, false) => (expected, ParameterUnit::Scalar),
+                    (false, true) => (ParameterUnit::Scalar, expected),
+                    // Both dimensioned is the algebra's to judge; neither
+                    // dimensioned keeps the product in the field's unit by
+                    // scaling the left value.
+                    (true, true) | (false, false) => (expected, ParameterUnit::Scalar),
+                };
+                ParameterExpression::Multiply {
+                    left: Box::new(left.lower(left_unit)),
+                    right: Box::new(right.lower(right_unit)),
+                }
+            }
+            Self::Divide(left, right) => {
+                // A bare denominator is a scalar divisor: `width / 2` halves.
+                let denominator_unit = if right.is_dimensioned() {
+                    expected
+                } else {
+                    ParameterUnit::Scalar
+                };
+                ParameterExpression::Divide {
+                    left: Box::new(left.lower(expected)),
+                    right: Box::new(right.lower(denominator_unit)),
+                }
+            }
+        }
+    }
+}
+
+struct ExpressionParser<'resolve> {
+    tokens: Vec<ExpressionToken>,
+    cursor: usize,
+    resolve: &'resolve dyn Fn(&str) -> Option<ParameterId>,
+}
+
+impl ExpressionParser<'_> {
+    fn peek(&self) -> Option<&ExpressionToken> {
+        self.tokens.get(self.cursor)
+    }
+
+    fn advance(&mut self) -> Option<ExpressionToken> {
+        let token = self.tokens.get(self.cursor).cloned();
+        if token.is_some() {
+            self.cursor += 1;
+        }
+        token
+    }
+
+    fn expression(&mut self) -> Result<RawExpression, ExpressionParseError> {
+        let mut left = self.term()?;
+        loop {
+            let add = match self.peek() {
+                Some(ExpressionToken::Plus) => true,
+                Some(ExpressionToken::Minus) => false,
+                _ => break,
+            };
+            self.cursor += 1;
+            let right = self.term()?;
+            left = if add {
+                RawExpression::Add(Box::new(left), Box::new(right))
+            } else {
+                RawExpression::Subtract(Box::new(left), Box::new(right))
+            };
+        }
+        Ok(left)
+    }
+
+    fn term(&mut self) -> Result<RawExpression, ExpressionParseError> {
+        let mut left = self.factor()?;
+        while let Some(token) = self.peek() {
+            let multiply = match token {
+                ExpressionToken::Star => true,
+                ExpressionToken::Slash => false,
+                _ => break,
+            };
+            self.cursor += 1;
+            let right = self.factor()?;
+            left = if multiply {
+                RawExpression::Multiply(Box::new(left), Box::new(right))
+            } else {
+                RawExpression::Divide(Box::new(left), Box::new(right))
+            };
+        }
+        Ok(left)
+    }
+
+    fn factor(&mut self) -> Result<RawExpression, ExpressionParseError> {
+        match self.advance().ok_or(ExpressionParseError::UnexpectedEnd)? {
+            ExpressionToken::Minus => Ok(RawExpression::Negate(Box::new(self.factor()?))),
+            ExpressionToken::Open => {
+                let inner = self.expression()?;
+                match self.advance() {
+                    Some(ExpressionToken::Close) => Ok(inner),
+                    _ => Err(ExpressionParseError::UnexpectedEnd),
+                }
+            }
+            ExpressionToken::Number(magnitude, unit) => Ok(match unit {
+                Some(unit) => RawExpression::Quantity(QuantityValue::new(magnitude, unit)),
+                None => RawExpression::Bare(magnitude),
+            }),
+            ExpressionToken::Name(name) => (self.resolve)(&name)
+                .map(RawExpression::Reference)
+                .ok_or(ExpressionParseError::UnknownName(name)),
+            ExpressionToken::Plus => self.factor(),
+            other => Err(ExpressionParseError::TrailingInput(format!("{other:?}"))),
+        }
+    }
+}
+
+/// Parses one textual value-or-expression entry.
+///
+/// Bare numerals wear `default_unit` where they stand as dimensions and
+/// become scalars where they stand as factors; explicit suffixes like
+/// `12mm`, `0.5in`, or `30deg` always win, and identifiers resolve through
+/// `resolve` to references on the existing expression tree. A lone number —
+/// signed included — stays a literal binding.
+pub fn parse_parameter_entry(
+    text: &str,
+    default_unit: ParameterUnit,
+    resolve: &dyn Fn(&str) -> Option<ParameterId>,
+) -> Result<ParsedParameterEntry, ExpressionParseError> {
+    let tokens = tokenize_expression(text)?;
+    if tokens.is_empty() {
+        return Err(ExpressionParseError::Empty);
+    }
+    let mut parser = ExpressionParser {
+        tokens,
+        cursor: 0,
+        resolve,
+    };
+    let raw = parser.expression()?;
+    if parser.cursor != parser.tokens.len() {
+        return Err(ExpressionParseError::TrailingInput(format!(
+            "{:?}",
+            parser.tokens[parser.cursor]
+        )));
+    }
+    let expression = raw.lower(default_unit);
+    Ok(match expression {
+        ParameterExpression::Literal { value } => ParsedParameterEntry::Literal(value),
+        ParameterExpression::Negate { ref operand } => match operand.as_ref() {
+            ParameterExpression::Literal {
+                value: ParameterValue::Quantity { value },
+            } => ParsedParameterEntry::Literal(ParameterValue::Quantity {
+                value: QuantityValue::new(-value.magnitude, value.unit),
+            }),
+            _ => ParsedParameterEntry::Expression(expression),
+        },
+        _ => ParsedParameterEntry::Expression(expression),
+    })
+}
+
+/// Renders a binding back to the textual grammar `parse_parameter_entry`
+/// accepts, so a stored expression round-trips through its editor field.
+#[must_use]
+pub fn format_parameter_binding(
+    binding: &ParameterBinding,
+    name_of: &dyn Fn(ParameterId) -> Option<String>,
+) -> String {
+    match binding {
+        ParameterBinding::Unresolved => String::new(),
+        ParameterBinding::Literal { value } => format_parameter_value(value),
+        ParameterBinding::Expression { expression } => format_expression(expression, 0, name_of),
+    }
+}
+
+fn format_parameter_value(value: &ParameterValue) -> String {
+    match value {
+        ParameterValue::Quantity { value } => {
+            let suffix = parameter_unit_suffix(value.unit);
+            if suffix.is_empty() {
+                trim_float(value.magnitude)
+            } else {
+                format!("{} {suffix}", trim_float(value.magnitude))
+            }
+        }
+        ParameterValue::Integer { value } => value.to_string(),
+        ParameterValue::Boolean { value } => value.to_string(),
+        ParameterValue::Choice { value } => value.clone(),
+    }
+}
+
+fn trim_float(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn format_expression(
+    expression: &ParameterExpression,
+    parent_precedence: u8,
+    name_of: &dyn Fn(ParameterId) -> Option<String>,
+) -> String {
+    let (text, precedence) = match expression {
+        ParameterExpression::Literal { value } => (format_parameter_value(value), 3),
+        ParameterExpression::Reference { parameter } => (
+            name_of(*parameter).unwrap_or_else(|| format!("parameter_{}", parameter.get())),
+            3,
+        ),
+        ParameterExpression::Negate { operand } => {
+            (format!("-{}", format_expression(operand, 2, name_of)), 2)
+        }
+        ParameterExpression::Add { left, right } => (
+            format!(
+                "{} + {}",
+                format_expression(left, 1, name_of),
+                format_expression(right, 1, name_of)
+            ),
+            1,
+        ),
+        ParameterExpression::Subtract { left, right } => (
+            format!(
+                "{} - {}",
+                format_expression(left, 1, name_of),
+                // Right-associating a subtraction changes it; the right side
+                // binds one level tighter to keep parentheses honest.
+                format_expression(right, 2, name_of)
+            ),
+            1,
+        ),
+        ParameterExpression::Multiply { left, right } => (
+            format!(
+                "{} * {}",
+                format_expression(left, 2, name_of),
+                format_expression(right, 2, name_of)
+            ),
+            2,
+        ),
+        ParameterExpression::Divide { left, right } => (
+            format!(
+                "{} / {}",
+                format_expression(left, 2, name_of),
+                format_expression(right, 3, name_of)
+            ),
+            2,
+        ),
+    };
+    if precedence < parent_precedence {
+        format!("({text})")
+    } else {
+        text
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1430,6 +1911,151 @@ mod tests {
     fn length_spec(key: &str) -> ParameterSpec {
         ParameterSpec::new(key, key, ParameterType::Quantity(QuantityKind::Length))
             .with_display_unit(ParameterUnit::Millimeter)
+    }
+
+    #[test]
+    fn textual_entries_parse_to_literals_and_expressions() {
+        let width = allocated(7);
+        let resolve = |name: &str| (name == "width").then_some(width);
+
+        // Bare and signed numbers stay literal bindings in the default unit.
+        assert_eq!(
+            parse_parameter_entry("12.5", ParameterUnit::Millimeter, &resolve).unwrap(),
+            ParsedParameterEntry::Literal(ParameterValue::quantity(
+                12.5,
+                ParameterUnit::Millimeter
+            ))
+        );
+        assert_eq!(
+            parse_parameter_entry("-3", ParameterUnit::Millimeter, &resolve).unwrap(),
+            ParsedParameterEntry::Literal(ParameterValue::quantity(
+                -3.0,
+                ParameterUnit::Millimeter
+            ))
+        );
+        // An explicit suffix overrides the field's unit.
+        assert_eq!(
+            parse_parameter_entry("2in", ParameterUnit::Millimeter, &resolve).unwrap(),
+            ParsedParameterEntry::Literal(ParameterValue::quantity(2.0, ParameterUnit::Inch))
+        );
+
+        // Naming a variable produces a reference expression with precedence.
+        let parsed =
+            parse_parameter_entry("width * 2 + 5mm", ParameterUnit::Millimeter, &resolve).unwrap();
+        let ParsedParameterEntry::Expression(expression) = parsed else {
+            panic!("an arithmetic entry must become an expression");
+        };
+        assert_eq!(
+            expression,
+            ParameterExpression::Add {
+                left: Box::new(ParameterExpression::Multiply {
+                    left: Box::new(ParameterExpression::reference(width)),
+                    // A bare factor beside a dimensioned operand is a scalar:
+                    // `width * 2` doubles rather than multiplying two lengths.
+                    right: Box::new(ParameterExpression::Literal {
+                        value: ParameterValue::quantity(2.0, ParameterUnit::Scalar),
+                    }),
+                }),
+                right: Box::new(ParameterExpression::Literal {
+                    value: ParameterValue::quantity(5.0, ParameterUnit::Millimeter),
+                }),
+            }
+        );
+
+        // Failures name what went wrong.
+        assert_eq!(
+            parse_parameter_entry("depth + 1", ParameterUnit::Millimeter, &resolve),
+            Err(ExpressionParseError::UnknownName("depth".into()))
+        );
+        assert_eq!(
+            parse_parameter_entry("3qq", ParameterUnit::Millimeter, &resolve),
+            Err(ExpressionParseError::UnknownUnit("qq".into()))
+        );
+        assert_eq!(
+            parse_parameter_entry("", ParameterUnit::Millimeter, &resolve),
+            Err(ExpressionParseError::Empty)
+        );
+        assert_eq!(
+            parse_parameter_entry("(width", ParameterUnit::Millimeter, &resolve),
+            Err(ExpressionParseError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn expression_entries_round_trip_through_their_text_form() {
+        let width = allocated(7);
+        let height = allocated(9);
+        let resolve = |name: &str| match name {
+            "width" => Some(width),
+            "height" => Some(height),
+            _ => None,
+        };
+        let name_of = |id: ParameterId| {
+            if id == width {
+                Some("width".to_owned())
+            } else if id == height {
+                Some("height".to_owned())
+            } else {
+                None
+            }
+        };
+        for text in [
+            "width * 2 + 5 mm",
+            "(width + height) / 2",
+            "width - (height - 1 mm)",
+            "-width * 0.5",
+        ] {
+            let ParsedParameterEntry::Expression(expression) =
+                parse_parameter_entry(text, ParameterUnit::Millimeter, &resolve).unwrap()
+            else {
+                panic!("{text} should parse as an expression");
+            };
+            let formatted = format_parameter_binding(
+                &ParameterBinding::expression(expression.clone()),
+                &name_of,
+            );
+            let ParsedParameterEntry::Expression(reparsed) =
+                parse_parameter_entry(&formatted, ParameterUnit::Millimeter, &resolve).unwrap()
+            else {
+                panic!("{formatted} should re-parse as an expression");
+            };
+            assert_eq!(reparsed, expression, "{text} -> {formatted}");
+        }
+    }
+
+    #[test]
+    fn parsed_expressions_evaluate_through_the_table() {
+        let width = allocated(1);
+        let derived = allocated(2);
+        let resolve = |name: &str| (name == "width").then_some(width);
+        let ParsedParameterEntry::Expression(expression) =
+            parse_parameter_entry("width * 2 + 5mm", ParameterUnit::Millimeter, &resolve).unwrap()
+        else {
+            panic!("expression expected");
+        };
+        let table = ParameterTable::try_from_records(vec![
+            ParameterRecord {
+                id: width,
+                spec: length_spec("width"),
+                binding: ParameterBinding::literal(ParameterValue::quantity(
+                    4.0,
+                    ParameterUnit::Millimeter,
+                )),
+            },
+            ParameterRecord {
+                id: derived,
+                spec: length_spec("derived"),
+                binding: ParameterBinding::expression(expression),
+            },
+        ])
+        .expect("the parsed expression must validate");
+        let values = table
+            .evaluate(&ParameterOverrides::default())
+            .expect("the parsed expression must evaluate");
+        assert_eq!(
+            values.get(derived),
+            Some(&ParameterValue::quantity(13.0, ParameterUnit::Millimeter))
+        );
     }
 
     #[test]
