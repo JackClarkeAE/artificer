@@ -2728,10 +2728,19 @@ fn presentation_edge_classification(
         _ => None,
     };
     // A shared approximation-strip role may fan quite coarsely at a rounded
-    // transition, but it is not permission to erase a real right-angle rail.
-    // Keep up to a 60-degree fan smooth and publish harder chamfer corners as
-    // visible/selectable successor edges.
-    let same_rounded_strip = same_strip && normal_dot >= 60.0_f64.to_radians().cos();
+    // transition, but it is not permission to erase a real rail.
+    //
+    // The allowance was 60 degrees, which is exactly the dihedral between two
+    // 45-degree chamfer slants meeting at a cube corner — so the mitre between
+    // them landed on the threshold and the comparison decided by rounding.
+    // Where three such chamfers met, some of the three mitres tested just
+    // under and drew while the rest tested just over and vanished. A fan
+    // approximating a curve is dense, not coarse: the blend cutter panels a
+    // quarter turn twelve ways, so its steps are 7.5 degrees and even a
+    // four-panel fan turns by 22.5. Thirty degrees clears every such fan by a
+    // wide margin while leaving a chamfer mitre the visible, selectable rail
+    // it is.
+    let same_rounded_strip = same_strip && normal_dot >= 30.0_f64.to_radians().cos();
     let coincident_cylinder_strip = match (first_surface, second_surface) {
         (Surface::Cylinder(first), Surface::Cylinder(second)) => {
             let first_axis_length = first.axis.length();
