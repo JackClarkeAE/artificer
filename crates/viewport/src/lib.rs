@@ -15,6 +15,7 @@ use egui::{
 };
 
 use artificer_ui_core::drag_handle::{DragHandlePhase, DragHandleState, PointerSample};
+use artificer_ui_core::navigation::{GestureState, NavigationAction};
 use artificer_ui_core::presentation::{
     ActiveTool, AxisCameraFacing, CameraProjection, DisplayTransform, SignedDistanceDragProjection,
     ViewState, bounds_center,
@@ -1299,7 +1300,7 @@ pub fn show_document(
         None,
         None,
         None,
-        artificer_ui_core::navigation::NavigationPreset::Artificer,
+        artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
     )
     .selected_face
 }
@@ -1332,7 +1333,7 @@ pub fn show_document_with_feature_drag(
     edge_finish_preview: Option<&EdgeFinishPreview>,
     feature_drag_state: &mut FeaturePreviewDragState,
     edge_frame_memo: &mut Option<EdgeFrameMemo>,
-    navigation: artificer_ui_core::navigation::NavigationPreset,
+    navigation: artificer_ui_core::navigation::Bindings,
 ) -> DocumentViewportOutput {
     show_document_impl(
         ui,
@@ -1387,7 +1388,7 @@ fn show_document_impl(
     edge_finish_preview: Option<&EdgeFinishPreview>,
     mut feature_drag_state: Option<&mut FeaturePreviewDragState>,
     mut edge_frame_memo: Option<&mut Option<EdgeFrameMemo>>,
-    navigation: artificer_ui_core::navigation::NavigationPreset,
+    navigation: artificer_ui_core::navigation::Bindings,
 ) -> DocumentViewportOutput {
     let size = ui.available_size().max(Vec2::new(260.0, 260.0));
     let (canvas, painter) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -1478,13 +1479,22 @@ fn show_document_impl(
     // Face-focused sketch views deliberately move the camera target away from
     // the body centre. The first subsequent Orbit gesture returns the pivot to
     // the visible document centre while preserving the user's orientation and
-    // zoom. A body deliberately offset with the Move tool remains offset in
-    // presentation space because `bounds` contains committed geometry only.
-    let orbiting = canvas.dragged_by(PointerButton::Secondary)
+    // zoom; a pivot the user placed by panning is kept, so orbiting stays
+    // relative to the part being inspected. A body deliberately offset with
+    // the Move tool remains offset in presentation space because `bounds`
+    // contains committed geometry only.
+    let gesture_state = navigation_gesture_state(
+        ui,
+        &canvas,
+        feature_interaction.consumes_primary,
+        navigation,
+    );
+    let navigation_action = navigation.action(gesture_state);
+    let orbiting = navigation_action == Some(NavigationAction::Orbit)
         || (!feature_interaction.consumes_primary
             && (spring_orbit_delta.is_some()
                 || active_tool == ActiveTool::Orbit && canvas.dragged_by(PointerButton::Primary)));
-    if orbiting {
+    if orbiting && view.take_focus_pivot() {
         view.set_target(bounds_center(bounds));
     }
 
@@ -1497,6 +1507,7 @@ fn show_document_impl(
         projection,
         feature_interaction.consumes_primary,
         navigation,
+        navigation_action,
     );
 
     let triangles = project_document_triangles(
@@ -2173,6 +2184,36 @@ fn point_in_screen_polygon(point: Pos2, polygon: &[Pos2]) -> bool {
     inside
 }
 
+/// Samples the buttons, modifiers, and profile hold keys that drive
+/// navigation this frame. Primary drags are hidden from the state while a
+/// feature interaction owns them, so a hold-key gesture cannot steal an
+/// extrusion arrow drag.
+fn navigation_gesture_state(
+    ui: &Ui,
+    canvas: &Response,
+    suppress_primary: bool,
+    bindings: artificer_ui_core::navigation::Bindings,
+) -> GestureState {
+    // `dragged_by` reads the context's input itself, so it must be sampled
+    // outside the modifier read rather than inside it.
+    let primary = !suppress_primary && canvas.dragged_by(PointerButton::Primary);
+    let right = canvas.dragged_by(PointerButton::Secondary);
+    let middle = canvas.dragged_by(PointerButton::Middle);
+    let has_hold_keys = [bindings.orbit_key, bindings.pan_key, bindings.zoom_key]
+        .iter()
+        .any(Option::is_some);
+    ui.input(|input| GestureState {
+        primary,
+        right,
+        middle,
+        shift: input.modifiers.shift,
+        ctrl: input.modifiers.command || input.modifiers.ctrl,
+        f2: has_hold_keys && input.key_down(egui::Key::F2),
+        f3: has_hold_keys && input.key_down(egui::Key::F3),
+        f4: has_hold_keys && input.key_down(egui::Key::F4),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_canvas_input(
     ui: &Ui,
@@ -2182,37 +2223,30 @@ fn handle_canvas_input(
     view: &mut ViewState,
     projection: Projection,
     suppress_primary: bool,
-    preset: artificer_ui_core::navigation::NavigationPreset,
+    bindings: artificer_ui_core::navigation::Bindings,
+    action: Option<NavigationAction>,
 ) {
     let mut changed = false;
     let delta = canvas.drag_delta();
-    let bindings = preset.bindings();
-    // `dragged_by` reads the context's input itself, so it must be sampled
-    // outside the modifier read rather than inside it.
-    let right = canvas.dragged_by(PointerButton::Secondary);
-    let middle = canvas.dragged_by(PointerButton::Middle);
-    let modifiers = ui.input(|input| input.modifiers);
-    let state = artificer_ui_core::navigation::GestureState {
-        right,
-        middle,
-        shift: modifiers.shift,
-        ctrl: modifiers.command || modifiers.ctrl,
-    };
     let spring_orbit_delta = (!suppress_primary)
         .then(|| spring_loaded_orbit_delta(ui, canvas))
         .flatten();
     if let Some(delta) = spring_orbit_delta {
         view.orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
         changed = true;
-    } else if bindings.orbit.matches(state) {
+    } else if action == Some(NavigationAction::Orbit) {
         view.orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
         changed = true;
-    } else if bindings.pan.matches(state) {
+    } else if action == Some(NavigationAction::Pan) {
         let denominator = (projection.points_per_unit * view.zoom).max(1.0e-9);
         view.pan_by(
             f64::from(delta.x) / denominator,
             f64::from(delta.y) / denominator,
         );
+        changed = true;
+    } else if action == Some(NavigationAction::ZoomDrag) {
+        // Dragging up zooms in, matching the packages that bind a zoom drag.
+        view.zoom_by((-f64::from(delta.y) * 0.008).exp());
         changed = true;
     } else if !suppress_primary && canvas.dragged_by(PointerButton::Primary) {
         match active_tool {
@@ -2248,7 +2282,20 @@ fn handle_canvas_input(
         let scroll = ui.input(|input| input.smooth_scroll_delta.y);
         if scroll.abs() > f32::EPSILON {
             let sense = if bindings.invert_zoom { -1.0 } else { 1.0 };
-            view.zoom_by((f64::from(scroll) * 0.0025 * sense).exp());
+            let factor = (f64::from(scroll) * 0.0025 * sense).exp();
+            // Anchor the zoom to the pointer, so the geometry under the
+            // cursor stays put while the rest of the scene scales around it.
+            match canvas.hover_pos() {
+                Some(pointer) => view.zoom_about(
+                    factor,
+                    [
+                        f64::from(pointer.x - projection.screen_center.x),
+                        f64::from(pointer.y - projection.screen_center.y),
+                    ],
+                    projection.points_per_unit,
+                ),
+                None => view.zoom_by(factor),
+            }
             changed = true;
         }
     }
@@ -7201,7 +7248,7 @@ mod tests {
                         None,
                         &mut state.drag,
                         &mut state.edge_frame_memo,
-                        artificer_ui_core::navigation::NavigationPreset::Artificer,
+                        artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
                     );
                     if output.context_click.is_some() {
                         state.last_context = output.context_click;
@@ -7356,7 +7403,7 @@ mod tests {
                         None,
                         &mut state.drag,
                         &mut state.edge_frame_memo,
-                        artificer_ui_core::navigation::NavigationPreset::Artificer,
+                        artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
                     );
                     if let Some(drag) = output.feature_drag {
                         state.preview.distance = drag.signed_extent;
@@ -7499,7 +7546,7 @@ mod tests {
                         Some(&state.preview),
                         &mut state.drag,
                         &mut state.edge_frame_memo,
-                        artificer_ui_core::navigation::NavigationPreset::Artificer,
+                        artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
                     );
                     state.accumulated_delta += output.edge_finish_distance_delta.unwrap_or(0.0);
                 },

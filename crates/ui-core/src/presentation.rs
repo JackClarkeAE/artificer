@@ -373,6 +373,11 @@ pub struct ViewState {
     pub zoom: f64,
     target: Point3,
     fit_radius: f64,
+    /// Set while the target is parked on a face-focused sketch view. The next
+    /// orbit gesture trades that camera-owned pivot for the document centre;
+    /// a pivot the user placed by panning is never traded away, so orbiting
+    /// stays relative to the object being inspected.
+    focus_pivot: bool,
 }
 
 impl Default for ViewState {
@@ -384,6 +389,7 @@ impl Default for ViewState {
             zoom: 1.0,
             target: Point3::default(),
             fit_radius: 1.0,
+            focus_pivot: false,
         }
     }
 }
@@ -405,6 +411,7 @@ impl ViewState {
         {
             self.target = bounds_center(bounds);
             self.fit_radius = radius;
+            self.focus_pivot = false;
         }
     }
 
@@ -430,7 +437,27 @@ impl ViewState {
     pub fn set_target(&mut self, target: Point3) {
         if target.is_finite() {
             self.target = target;
+            self.focus_pivot = false;
         }
+    }
+
+    /// Parks the target on a face-focused point that the next orbit gesture
+    /// may trade for the document centre. Panning afterwards claims the pivot
+    /// for the user and cancels the trade.
+    pub fn set_focus_target(&mut self, target: Point3) {
+        if target.is_finite() {
+            self.target = target;
+            self.focus_pivot = true;
+        }
+    }
+
+    /// Consumes the pending face-focus pivot recovery, returning whether one
+    /// was armed. Callers recentre the target exactly once per face view, so
+    /// orbiting after a deliberate pan keeps the user's own pivot.
+    pub const fn take_focus_pivot(&mut self) -> bool {
+        let armed = self.focus_pivot;
+        self.focus_pivot = false;
+        armed
     }
 
     pub const fn fit_radius(self) -> f64 {
@@ -502,6 +529,48 @@ impl ViewState {
     pub fn zoom_by(&mut self, factor: f64) {
         if factor.is_finite() && factor > 0.0 {
             self.set_zoom(bounded_zoom(self.zoom) * factor);
+        }
+    }
+
+    /// Zooms while keeping the world point under the pointer stationary,
+    /// which is how every mainstream package's wheel behaves: the model
+    /// grows and shrinks around the cursor rather than around the pivot.
+    ///
+    /// `screen_offset` is the pointer's offset from the projection centre in
+    /// points (positive right and down), and `points_per_unit` is the
+    /// projection scale before zoom is applied.
+    pub fn zoom_about(&mut self, factor: f64, screen_offset: [f64; 2], points_per_unit: f64) {
+        if points_per_unit <= f64::EPSILON
+            || !screen_offset[0].is_finite()
+            || !screen_offset[1].is_finite()
+        {
+            self.zoom_by(factor);
+            return;
+        }
+        let before = bounded_zoom(self.zoom);
+        self.zoom_by(factor);
+        let after = bounded_zoom(self.zoom);
+        if after == before {
+            return;
+        }
+        let offset_at = |zoom: f64| {
+            self.world_delta_from_screen(
+                screen_offset[0] / (points_per_unit * zoom),
+                screen_offset[1] / (points_per_unit * zoom),
+            )
+        };
+        let held = offset_at(before);
+        let moved = offset_at(after);
+        let target = self.target;
+        // The pointer's world point is target + held before the zoom; keeping
+        // it under the pointer afterwards moves the target by the shrinkage.
+        let recentred = Point3::new(
+            target.x + held[0] - moved[0],
+            target.y + held[1] - moved[1],
+            target.z + held[2] - moved[2],
+        );
+        if recentred.is_finite() {
+            self.target = recentred;
         }
     }
 
@@ -627,6 +696,9 @@ impl ViewState {
             zoom: 1.0,
             target: focus,
             fit_radius,
+            // A face view deliberately parks the pivot off the document
+            // centre; the first orbit afterwards recovers the centre.
+            focus_pivot: true,
         })
     }
 }
@@ -708,6 +780,7 @@ impl CameraTransition {
             zoom: logarithmic_lerp(self.source.zoom, self.target.zoom, eased),
             target: lerp_point(self.source.target, self.target.target, eased),
             fit_radius: logarithmic_lerp(self.source.fit_radius, self.target.fit_radius, eased),
+            focus_pivot: self.target.focus_pivot,
         }
     }
 
@@ -1308,6 +1381,54 @@ mod tests {
 
         let up_after = camera_world_axes(view).2;
         assert!(protocol_dot(up_before, up_after) > 1.0 - 1.0e-9);
+    }
+
+    #[test]
+    fn a_face_view_arms_pivot_recovery_and_a_pan_cancels_it() {
+        let frame = PlanarFrame3::new(
+            Point3::new(3.0, -2.0, 5.0),
+            ProtocolVector3::new(1.0, 0.0, 0.0),
+            ProtocolVector3::new(0.0, 1.0, 0.0),
+        );
+        let mut view = ViewState::default()
+            .face_aligned_target(frame, Point3::new(3.0, -2.0, 5.0), 2.0)
+            .expect("face view");
+        let mut panned = view;
+        panned.pan_by(0.5, 0.0);
+        assert!(
+            !panned.take_focus_pivot(),
+            "a deliberate pan claims the pivot for the user"
+        );
+        assert!(view.take_focus_pivot(), "the face view armed the recovery");
+        assert!(!view.take_focus_pivot(), "the recovery fires exactly once");
+    }
+
+    #[test]
+    fn zoom_about_keeps_the_world_point_under_the_pointer() {
+        let mut view = ViewState {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..ViewState::default()
+        };
+        view.frame(bounds());
+        let points_per_unit = 40.0;
+        let probe = Point3::new(1.6, 1.0, 0.4);
+        let before = view.project(probe);
+        let screen_offset = [
+            before.coordinates[0] * points_per_unit,
+            before.coordinates[1] * points_per_unit,
+        ];
+
+        view.zoom_about(1.8, screen_offset, points_per_unit);
+
+        let after = view.project(probe);
+        assert!(
+            (after.coordinates[0] * points_per_unit - screen_offset[0]).abs() <= 1.0e-9
+                && (after.coordinates[1] * points_per_unit - screen_offset[1]).abs() <= 1.0e-9,
+            "probe moved from {screen_offset:?} to {:?}",
+            after.coordinates.map(|value| value * points_per_unit)
+        );
+        assert!((view.zoom - 1.8).abs() <= 1.0e-12);
     }
 
     #[test]

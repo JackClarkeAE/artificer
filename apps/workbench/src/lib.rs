@@ -189,9 +189,28 @@ impl DisplayLengthUnit {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DocumentSettings {
     pub length_unit: DisplayLengthUnit,
+    /// Retained so older workspace files keep parsing and older builds keep
+    /// reading newer files; the navigation profile itself is a user
+    /// preference now (see [`UserPreferencesFile`]), not document state.
     #[serde(default)]
     pub navigation: navigation::NavigationPreset,
 }
+
+/// Cross-document user preferences, stored beside the theme file so a chosen
+/// navigation profile survives new documents, loads, and restarts. Every
+/// field is optional so older files forward-migrate the same way the theme
+/// preferences do.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct UserPreferencesFile {
+    version: u32,
+    #[serde(default)]
+    navigation: Option<navigation::NavigationPreset>,
+    /// `Some` when the user overrode the profile's wheel-zoom sense.
+    #[serde(default)]
+    navigation_invert_zoom: Option<bool>,
+}
+
+const USER_PREFERENCES_VERSION: u32 = 1;
 
 #[derive(Deserialize, Serialize)]
 struct ArtificerWorkspaceFile {
@@ -1640,6 +1659,15 @@ pub struct KernelLabApp {
     /// Where the theme choice and edited palettes are written; `None` in
     /// tests and harnesses, which must not touch the user's preferences.
     theme_preferences_path: Option<PathBuf>,
+    /// Where cross-document user preferences (navigation profile) live;
+    /// `None` in tests and harnesses for the same reason as the theme path.
+    user_preferences_path: Option<PathBuf>,
+    /// The navigation profile in force. A user preference, not a document
+    /// setting: it survives new documents, loads, and restarts.
+    navigation_preference: navigation::NavigationPreset,
+    /// Overrides the profile's wheel sense when the user flips the checkbox;
+    /// `None` follows the profile default.
+    navigation_invert_zoom: Option<bool>,
     about_open: bool,
     updates: update::UpdateService,
     stl_export_path_text: String,
@@ -1808,6 +1836,9 @@ impl Default for KernelLabApp {
             document_properties_open: false,
             theme_editor_open: false,
             theme_preferences_path: None,
+            user_preferences_path: None,
+            navigation_preference: navigation::NavigationPreset::default(),
+            navigation_invert_zoom: None,
             about_open: false,
             updates: update::UpdateService::new(),
             stl_export_path_text,
@@ -1927,6 +1958,8 @@ impl KernelLabApp {
         app.reset_to_blank_workspace();
         app.theme_preferences_path = Some(theme_preferences_path());
         app.load_theme_preferences(&creation_context.egui_ctx);
+        app.user_preferences_path = Some(user_preferences_path());
+        app.load_user_preferences();
         if let Err(error) = app.open_catalog_store(default_catalog_root()) {
             app.document_status = Some(format!(
                 "Local Part Library is using its verified built-in fallback: {error}"
@@ -2206,7 +2239,12 @@ impl KernelLabApp {
                 .collect(),
             format: ARTIFICER_WORKSPACE_FORMAT.to_owned(),
             version: ARTIFICER_WORKSPACE_VERSION,
-            settings: self.document_settings,
+            settings: DocumentSettings {
+                // Mirror the live user preference so an older build reading
+                // this file still adopts the profile the user works in.
+                navigation: self.navigation_preference,
+                ..self.document_settings
+            },
             construction_planes: self.construction_planes.clone(),
             document: self.document.clone(),
         })
@@ -2294,6 +2332,10 @@ impl KernelLabApp {
             serde_json::to_string(&workspace.document).map_err(|error| error.to_string())?;
         self.load_native_document_json(&document_json)?;
         self.document_settings = workspace.settings;
+        // The navigation profile is a user preference: the file's copy exists
+        // only so older builds keep reading, and adopting it here would let
+        // every opened document overwrite how the user's mouse behaves.
+        self.document_settings.navigation = self.navigation_preference;
         self.construction_planes = workspace.construction_planes;
         self.next_construction_plane_id = self
             .construction_planes
@@ -3098,6 +3140,20 @@ impl KernelLabApp {
     #[must_use]
     pub const fn face_camera_transition_active(&self) -> bool {
         self.face_camera_transition.is_some()
+    }
+
+    #[must_use]
+    pub const fn navigation_preference(&self) -> navigation::NavigationPreset {
+        self.navigation_preference
+    }
+
+    /// Switches the navigation profile, exactly as the preferences picker
+    /// does: the wheel-sense override resets with the profile.
+    pub fn set_navigation_preference(&mut self, preset: navigation::NavigationPreset) {
+        self.navigation_preference = preset;
+        self.navigation_invert_zoom = None;
+        self.document_settings.navigation = preset;
+        self.save_user_preferences();
     }
 
     pub fn set_animation_phase(&mut self, phase: f64) {
@@ -10102,11 +10158,12 @@ impl KernelLabApp {
         });
     }
 
-    /// Mouse-navigation scheme. Orbit and pan bindings are pure habit, so the
+    /// Mouse-navigation profile. Orbit and pan bindings are pure habit, so the
     /// workbench asks which package the user already knows rather than making
-    /// them relearn one.
+    /// them relearn one. The choice is a user preference saved immediately, so
+    /// it holds across documents and restarts.
     fn navigation_card(&mut self, ui: &mut egui::Ui) {
-        let mut preset = self.document_settings.navigation;
+        let mut preset = self.navigation_preference;
         let changed = egui::ComboBox::from_id_salt("navigation_preset_picker")
             .selected_text(preset.label())
             .width(ui.available_width() - 8.0)
@@ -10127,7 +10184,19 @@ impl KernelLabApp {
             .inner
             .unwrap_or(false);
         if changed {
-            self.document_settings.navigation = preset;
+            // A fresh profile brings its own wheel sense; the override is a
+            // correction to one profile, not a standing decision.
+            self.set_navigation_preference(preset);
+        }
+        let mut invert = self.navigation_bindings().invert_zoom;
+        if ui
+            .checkbox(&mut invert, "Scrolling forward zooms out")
+            .on_hover_text("The wheel sense the profile ships with; tick or untick to override it.")
+            .changed()
+        {
+            self.navigation_invert_zoom =
+                (invert != preset.bindings().invert_zoom).then_some(invert);
+            self.save_user_preferences();
         }
         ui.label(
             RichText::new(preset.summary())
@@ -10469,7 +10538,7 @@ impl KernelLabApp {
     fn workspace_settings_cards(&mut self, ui: &mut egui::Ui) {
         self.document_parameter_controls(ui);
         ui.add_space(5.0);
-        collapsible_card(ui, "navigation_scheme", "NAVIGATION", false, |ui| {
+        collapsible_card(ui, "navigation_scheme", "NAVIGATION", true, |ui| {
             self.navigation_card(ui);
         });
         ui.add_space(5.0);
@@ -10626,6 +10695,62 @@ impl KernelLabApp {
         theme::install_style(context);
         context.request_repaint();
         self.save_theme_preferences();
+    }
+
+    /// The bindings the viewport should follow this frame: the chosen
+    /// profile, with the user's wheel-sense override applied on top.
+    fn navigation_bindings(&self) -> navigation::Bindings {
+        let mut bindings = self.navigation_preference.bindings();
+        if let Some(invert) = self.navigation_invert_zoom {
+            bindings.invert_zoom = invert;
+        }
+        bindings
+    }
+
+    fn load_user_preferences(&mut self) {
+        let Some(path) = self.user_preferences_path.as_ref() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        match serde_json::from_str::<UserPreferencesFile>(&text) {
+            Ok(preferences) => {
+                if let Some(navigation) = preferences.navigation {
+                    self.navigation_preference = navigation;
+                }
+                self.navigation_invert_zoom = preferences.navigation_invert_zoom;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Artificer ignored the user preferences at {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn save_user_preferences(&self) {
+        let Some(path) = self.user_preferences_path.as_ref() else {
+            return;
+        };
+        let preferences = UserPreferencesFile {
+            version: USER_PREFERENCES_VERSION,
+            navigation: Some(self.navigation_preference),
+            navigation_invert_zoom: self.navigation_invert_zoom,
+        };
+        let Ok(text) = serde_json::to_string_pretty(&preferences) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::write(path, text) {
+            eprintln!(
+                "Artificer could not save the user preferences to {}: {error}",
+                path.display()
+            );
+        }
     }
 
     fn load_theme_preferences(&mut self, context: &egui::Context) {
@@ -13581,8 +13706,10 @@ impl KernelLabApp {
     /// is for looking, and a stray click must not select bodies or activate
     /// another sketch while one is being drawn.
     fn sketch_orbit_peek_viewport(&mut self, ui: &mut egui::Ui) {
-        let orbit_button = match self.document_settings.navigation.bindings().orbit {
-            navigation::Gesture::Right => egui::PointerButton::Secondary,
+        let orbit_button = match self.navigation_bindings().orbit {
+            navigation::Gesture::Right | navigation::Gesture::CtrlRight => {
+                egui::PointerButton::Secondary
+            }
             _ => egui::PointerButton::Middle,
         };
         let released = !ui.input(|input| input.pointer.button_down(orbit_button));
@@ -13641,7 +13768,7 @@ impl KernelLabApp {
         // to the active preset's orbit gesture so it reads as "orbit" under
         // any binding; the 2D canvas pans with both middle and right drags,
         // so whichever button the preset claims, the other still pans.
-        let orbit = self.document_settings.navigation.bindings().orbit;
+        let orbit = self.navigation_bindings().orbit;
         if output.response.hovered()
             && ui.input(|input| {
                 orbit.matches(navigation::GestureState {
@@ -13649,6 +13776,7 @@ impl KernelLabApp {
                     middle: input.pointer.button_pressed(egui::PointerButton::Middle),
                     shift: input.modifiers.shift,
                     ctrl: input.modifiers.command || input.modifiers.ctrl,
+                    ..navigation::GestureState::default()
                 })
             })
         {
@@ -14195,6 +14323,7 @@ impl KernelLabApp {
                         });
                     }
                 } else {
+                    let navigation_bindings = self.navigation_bindings();
                     let output = viewport::show_document_with_feature_drag(
                         ui,
                         &body_instances,
@@ -14219,7 +14348,7 @@ impl KernelLabApp {
                         edge_finish_preview.as_ref(),
                         &mut self.feature_preview_drag,
                         &mut self.model_edge_frame_memo,
-                        self.document_settings.navigation,
+                        navigation_bindings,
                     );
                     if self.sketch_orbit_peek {
                         // The orbit peek is look-only: the camera responds,
@@ -15687,6 +15816,18 @@ fn theme_preferences_path() -> PathBuf {
         .parent()
         .map_or_else(default_catalog_root, Path::to_path_buf)
         .join("theme.json")
+}
+
+fn user_preferences_path() -> PathBuf {
+    if let Some(path) =
+        std::env::var_os("ARTIFICER_PREFERENCES_PATH").filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    default_catalog_root()
+        .parent()
+        .map_or_else(default_catalog_root, Path::to_path_buf)
+        .join("preferences.json")
 }
 
 fn default_document_path() -> PathBuf {
@@ -21861,6 +22002,57 @@ mod extrusion_workbench_tests {
         assert!(app.confirm_pending_operation());
         assert!(app.pending_operation.is_none());
         assert!(app.displayed.as_ref().unwrap().snapshot.counts().faces > 6);
+    }
+}
+
+#[cfg(test)]
+mod user_preference_tests {
+    use super::*;
+
+    #[test]
+    fn user_preferences_round_trip_and_missing_fields_keep_defaults() {
+        let stored = serde_json::to_string(&UserPreferencesFile {
+            version: USER_PREFERENCES_VERSION,
+            navigation: Some(navigation::NavigationPreset::SolidWorks),
+            navigation_invert_zoom: Some(false),
+        })
+        .unwrap();
+        let loaded: UserPreferencesFile = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            loaded.navigation,
+            Some(navigation::NavigationPreset::SolidWorks)
+        );
+        assert_eq!(loaded.navigation_invert_zoom, Some(false));
+
+        // A file from before a field existed still loads, keeping defaults.
+        let sparse: UserPreferencesFile = serde_json::from_str("{\"version\":1}").unwrap();
+        assert_eq!(sparse.navigation, None);
+        assert_eq!(sparse.navigation_invert_zoom, None);
+    }
+
+    #[test]
+    fn opening_a_workspace_keeps_the_users_navigation_profile() {
+        let mut app = KernelLabApp::default();
+        app.set_navigation_preference(navigation::NavigationPreset::Fusion);
+        let saved = app.workspace_document_json().expect("workspace serializes");
+        assert!(
+            saved.contains("\"fusion\""),
+            "the saved workspace mirrors the profile for older builds: {saved}"
+        );
+
+        // The file on disk names a different profile — perhaps another
+        // machine's — and opening it must not rebind this user's mouse.
+        let foreign = saved.replace("\"fusion\"", "\"solid-works\"");
+        app.load_workspace_json(&foreign).expect("workspace loads");
+        assert_eq!(
+            app.navigation_preference(),
+            navigation::NavigationPreset::Fusion
+        );
+        // The wheel override survives too: the profile did not change.
+        assert_eq!(
+            app.navigation_bindings(),
+            navigation::NavigationPreset::Fusion.bindings()
+        );
     }
 }
 
