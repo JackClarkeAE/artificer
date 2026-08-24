@@ -1,5 +1,5 @@
 use artificer_workbench::{
-    KernelLabApp, SketchExtrusionEligibility, WorkbenchMode,
+    ExtrusionMode, KernelLabApp, SketchExtrusionEligibility, WorkbenchMode,
     sketch::{CertifiedProfileStatus, SketchPoint},
 };
 use egui::accesskit::Role;
@@ -346,5 +346,355 @@ fn an_inscribed_circle_leaves_four_corner_profiles_and_the_disc() {
     assert!(
         (volume - 16.0 * std::f64::consts::PI).abs() <= 1.0e-9,
         "{volume}"
+    );
+}
+
+#[test]
+fn an_off_centre_circle_inside_a_rectangle_extrudes_the_ring_around_it() {
+    // Rectangle, circle dropped inside it off centre, pick the surround
+    // (rectangle minus disc), extrude it.
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, -2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 2.0));
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(1.5, 0.5));
+
+    assert_eq!(harness.state().sketch_entity_count(), 2);
+    assert_eq!(harness.state().available_sketch_region_count(), 2);
+    click_button(&mut harness, "Select sketch geometry");
+    click_sketch_point(&mut harness, SketchPoint::new(-1.5, -1.5));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+
+    let volume = extrude_and_measure(&mut harness);
+    assert!(
+        (volume - 4.0 * (16.0 - std::f64::consts::PI)).abs() <= 1.0e-8,
+        "{volume}"
+    );
+}
+
+fn draw_rectangle_around_an_off_centre_circle(harness: &mut Harness<'static, KernelLabApp>) {
+    click_button(harness, "Two-point rectangle");
+    click_sketch_point(harness, SketchPoint::new(-2.0, -2.0));
+    click_sketch_point(harness, SketchPoint::new(2.0, 2.0));
+    click_button(harness, "Centre-point circle");
+    click_sketch_point(harness, SketchPoint::new(0.5, 0.5));
+    click_sketch_point(harness, SketchPoint::new(1.5, 0.5));
+    assert_eq!(harness.state().available_sketch_region_count(), 2);
+}
+
+#[test]
+fn a_committed_multi_region_sketch_offers_every_region_to_the_model_viewport() {
+    // The regions the model viewport can hover and click used to come from
+    // the payload's compiled profile cache, which holds only whatever was
+    // selected when the sketch was committed. Finish a two-cell sketch
+    // without selecting anything and the cache is empty, so outside Sketch
+    // mode the sketch drew but nothing under the pointer ever lit up.
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Finish sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    assert_eq!(harness.state().visible_model_sketch_overlay_count(), 1);
+
+    let anchors = harness.state().model_sketch_region_anchors(0);
+    assert_eq!(
+        anchors.len(),
+        2,
+        "both the surround and the disc must be selectable in 3D: {anchors:?}"
+    );
+
+    // Every offered anchor selects its own region, and no two name the same
+    // one — an anchor that drifted onto a boundary or into a hole would
+    // resolve to a neighbouring cell.
+    let mut signatures = Vec::new();
+    for anchor in anchors {
+        assert!(
+            harness
+                .state_mut()
+                .select_committed_sketch_region(0, anchor),
+            "anchor {anchor:?} selected no region"
+        );
+        assert_eq!(harness.state().selected_sketch_region_count(), 1);
+        signatures.push(harness.state().selected_sketch_region_signatures());
+    }
+    assert_ne!(signatures[0], signatures[1]);
+}
+
+#[test]
+fn a_region_picked_in_the_model_viewport_extrudes_that_region() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Finish sketch");
+
+    // The surround is the region whose anchor is not inside the circle.
+    let ring = harness
+        .state()
+        .model_sketch_region_anchors(0)
+        .into_iter()
+        .find(|anchor| (anchor[0] - 0.5).hypot(anchor[1] - 0.5) > 1.0)
+        .expect("the rectangle minus the disc");
+    assert!(harness.state_mut().select_committed_sketch_region(0, ring));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion")
+        .volume;
+    assert!(
+        (volume - 4.0 * (16.0 - std::f64::consts::PI)).abs() <= 1.0e-8,
+        "{volume}"
+    );
+}
+
+#[test]
+fn a_drafted_sketch_offers_its_regions_to_the_model_viewport() {
+    // Leaving a sketch as a draft still draws it in 3D. Its regions have to
+    // come with it, or the pointer finds nothing to pick for the next feature.
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Exit sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    assert_eq!(harness.state().visible_model_sketch_overlay_count(), 1);
+    let anchors = harness.state().model_sketch_region_anchors(0);
+    assert_eq!(anchors.len(), 2, "{anchors:?}");
+    for anchor in anchors {
+        assert!(
+            harness
+                .state_mut()
+                .select_committed_sketch_region(0, anchor),
+            "anchor {anchor:?} selected no region"
+        );
+        assert_eq!(harness.state().selected_sketch_region_count(), 1);
+    }
+}
+
+fn blank_harness() -> Harness<'static, KernelLabApp> {
+    Harness::builder()
+        .with_size([1040.0, 700.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .with_theme(egui::Theme::Dark)
+        .with_os(egui::os::OperatingSystem::Nix)
+        .build_eframe(|creation_context| KernelLabApp::new_paused_blank(creation_context))
+}
+
+#[test]
+fn the_pointer_picks_a_committed_sketch_region_in_the_model_viewport() {
+    // The whole point of showing a sketch in 3D is being able to act on it
+    // there: hover a region, click it, extrude it, without going back into
+    // Sketch mode. The rectangle is placed off the origin and the circle at
+    // its centre so that framing the document puts the disc under the middle
+    // of the viewport whatever camera distance the framing chooses.
+    let mut harness = blank_harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-1.0, -1.0));
+    click_sketch_point(&mut harness, SketchPoint::new(3.0, 3.0));
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(1.0, 1.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 1.0));
+    assert_eq!(harness.state().available_sketch_region_count(), 2);
+    click_button(&mut harness, "Finish sketch");
+    click_button(&mut harness, "Frame all visible bodies");
+    for _ in 0..30 {
+        harness.step();
+    }
+
+    // Finishing carries the surround over as the live selection, so a click
+    // that lands on the disc has to visibly change it.
+    let surround = harness.state().selected_sketch_region_signatures();
+    assert_eq!(surround.len(), 1);
+    let after_finish = harness.state().feature_timeline_entries();
+    let viewport = harness.get_by_label("Model viewport").rect();
+    click_at(&mut harness, viewport.center());
+    let disc = harness.state().selected_sketch_region_signatures();
+    assert_eq!(disc.len(), 1);
+    assert_ne!(
+        disc, surround,
+        "clicking the disc in the model viewport must select the disc"
+    );
+
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion")
+        .volume;
+    assert!(
+        (volume - 4.0 * std::f64::consts::PI).abs() <= 1.0e-8,
+        "the disc, not the surround: {volume}"
+    );
+    // Picking a different region is not an edit to the sketch, so history
+    // gains the extrusion and nothing else. Rewriting the sketch here is what
+    // marked it dirty and had the extrusion refused for depending on it.
+    let mut expected = after_finish;
+    expected.push("Extrude 1".to_owned());
+    assert_eq!(harness.state().feature_timeline_entries(), expected);
+}
+
+#[test]
+fn picking_the_surround_of_a_committed_sketch_extrudes_it() {
+    // The reported flow, in the order it was hit: the sketch is committed
+    // carrying the disc, and the surround is picked afterwards. Picking is not
+    // an edit, so the sketch must not be rewritten and marked dirty under the
+    // extrusion that immediately depends on it.
+    let mut harness = blank_harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Select sketch geometry");
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+    click_button(&mut harness, "Finish sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    let committed = harness.state().feature_timeline_entries();
+
+    // The surround is the region whose anchor is not inside the circle.
+    let surround = harness
+        .state()
+        .model_sketch_region_anchors(0)
+        .into_iter()
+        .find(|anchor| (anchor[0] - 0.5).hypot(anchor[1] - 0.5) > 1.0)
+        .expect("the rectangle minus the disc");
+    assert!(
+        harness
+            .state_mut()
+            .select_committed_sketch_region(0, surround)
+    );
+
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion")
+        .volume;
+    assert!(
+        (volume - 4.0 * (16.0 - std::f64::consts::PI)).abs() <= 1.0e-8,
+        "the surround, not the disc: {volume}"
+    );
+    let mut expected = committed;
+    expected.push("Extrude 1".to_owned());
+    assert_eq!(harness.state().feature_timeline_entries(), expected);
+}
+
+#[test]
+fn a_negative_distance_builds_the_new_body_below_the_sketch_plane() {
+    // A minus sign used to be swallowed by the distance box's own range, which
+    // clamped it to the 0.01 mm minimum and built a sliver. New body reads its
+    // sign the way Add and Cut always have: which side of the plane to grow on.
+    // The rectangle is deliberately off the u axis, because reversing the frame
+    // reflects the profile to match and a symmetric one would hide a mistake.
+    let mut harness = blank_harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, 1.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 3.0));
+    click_button(&mut harness, "Extrude");
+    set_extrusion_distance(&mut harness, "-4");
+    assert!((harness.state().extrusion_distance() + 4.0).abs() <= 1.0e-9);
+    assert!(
+        !harness
+            .get_by_role_and_label(Role::Button, CONFIRM_OPERATION)
+            .accesskit_node()
+            .is_disabled(),
+        "a negative distance is a direction, not an invalid magnitude"
+    );
+
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let built = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion");
+    let centroid = built.centroid.expect("a solid has a centroid");
+    assert!((built.volume - 32.0).abs() <= 1.0e-9, "{}", built.volume);
+    assert!(
+        (centroid.z + 2.0).abs() <= 1.0e-9,
+        "below the plane: {centroid:?}"
+    );
+    assert!(
+        (centroid.y - 2.0).abs() <= 1.0e-9,
+        "the profile stays where it was drawn rather than mirroring: {centroid:?}"
+    );
+
+    // Replay has to reach the same solid. The kernel takes only positive
+    // depths, so the direction survives as a reversed frame or not at all.
+    click_button(&mut harness, "Suppress selected feature");
+    assert_eq!(harness.state().displayed_measures().map(|m| m.volume), None);
+    click_button(&mut harness, "Restore selected feature");
+    let rebuilt = harness
+        .state()
+        .displayed_measures()
+        .expect("the restored feature rebuilds");
+    let rebuilt_centroid = rebuilt.centroid.expect("a solid has a centroid");
+    assert!((rebuilt.volume - built.volume).abs() <= 1.0e-9);
+    assert!(
+        (rebuilt_centroid.z - centroid.z).abs() <= 1.0e-9,
+        "rebuilt on the wrong side of the plane: {rebuilt_centroid:?}"
+    );
+    assert!((rebuilt_centroid.y - centroid.y).abs() <= 1.0e-9);
+}
+
+#[test]
+fn a_minus_sign_still_chooses_cut_on_a_face() {
+    // Opening New body to negative distances must not disturb what the sign
+    // has always meant on a face: in Auto it picks the operation, and Cut is
+    // what a negative distance asks for.
+    let mut harness = harness();
+    enter_positive_z_face_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-0.4, -0.4));
+    click_sketch_point(&mut harness, SketchPoint::new(0.4, 0.4));
+    // The distance control belongs to the staged operation's panel.
+    click_button(&mut harness, "Extrude");
+
+    set_extrusion_distance(&mut harness, "-0.5");
+    assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Cut);
+    assert!((harness.state().extrusion_distance() + 0.5).abs() <= 1.0e-12);
+
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "{:?}",
+        harness.state().last_error_detail()
+    );
+    let measures = harness
+        .state()
+        .displayed_measures()
+        .expect("committed face cut");
+    // The canonical cuboid is 24 mm³, and the corners snap to a 1 × 1 square,
+    // so a 0.5 deep pocket removes exactly 0.5.
+    assert!(
+        (measures.volume - 23.5).abs() <= 1.0e-9,
+        "a negative distance must remove material, not add it: {}",
+        measures.volume
     );
 }

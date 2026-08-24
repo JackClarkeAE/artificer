@@ -54,7 +54,8 @@ use artificer_model::{
     ParameterBinding, ParameterExposure, ParameterId, ParameterMetadata, ParameterOverrides,
     ParameterSpec, ParameterType, ParameterUnit, ParameterValue, QuantityKind, RebuildState,
     ReplayAction, ReplayDisposition, RigidComponentPose, SketchId, SketchPayload,
-    SketchRegionExtrusion, SketchSupportRecipe, SnapshotAssociation,
+    SketchRegionExtrusion, SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
+    reflected_profile_across_u, reversed_extrusion_direction,
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
@@ -1556,6 +1557,10 @@ struct WorkbenchSketch {
     /// Exact document-owned geometry used when this sketch came from a fresh
     /// process and has no editable canvas cache yet.
     portable_payload: Option<SketchPayload>,
+    /// Regions this committed sketch offers to the model viewport, derived
+    /// once per payload because the arrangement behind them is not cheap
+    /// enough to rebuild every frame.
+    overlay_regions: Vec<viewport::ModelSketchRegion>,
     revision: u64,
     finished: bool,
     visible: bool,
@@ -2419,6 +2424,19 @@ impl KernelLabApp {
         }
     }
 
+    /// The rejection text behind [`Self::last_error_code`], with the specific
+    /// diagnostic that failed. Tests assert on it so a rejection names its
+    /// cause rather than only its category.
+    #[must_use]
+    pub fn last_error_detail(&self) -> Option<String> {
+        match &self.last_attempt {
+            Attempt::Rejected { error, .. } => {
+                Some(format!("{} · {}", rejection_label(error), error.message))
+            }
+            Attempt::NotRun | Attempt::Accepted { .. } => None,
+        }
+    }
+
     #[must_use]
     pub fn active_tool_label(&self) -> &'static str {
         self.active_tool.label()
@@ -2518,6 +2536,57 @@ impl KernelLabApp {
     #[must_use]
     pub fn selected_sketch_region_count(&self) -> usize {
         self.sketch.selected_region_count()
+    }
+
+    /// Stable identities of the selected committed-sketch regions.
+    #[must_use]
+    pub fn selected_sketch_region_signatures(&self) -> Vec<RegionSignature> {
+        self.sketch.selected_region_signatures()
+    }
+
+    /// Anchors of the committed-sketch regions the model viewport offers for
+    /// one Browser sketch. Each one selects its own region.
+    #[must_use]
+    pub fn model_sketch_region_anchors(&self, sketch_index: usize) -> Vec<[f64; 2]> {
+        self.sketches
+            .get(sketch_index)
+            .map(|sketch| {
+                sketch
+                    .overlay_regions
+                    .iter()
+                    .map(viewport::ModelSketchRegion::anchor)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Selects one region of a committed sketch by the anchor the model
+    /// viewport reports for it.
+    ///
+    /// This is the seam the viewport click uses. It is renderer-independent so
+    /// the same path is reachable without a projected pointer position.
+    pub fn select_committed_sketch_region(
+        &mut self,
+        sketch_index: usize,
+        anchor: [f64; 2],
+    ) -> bool {
+        // A draft sketch has no document identity to re-activate from; it is
+        // already the live canvas, and its regions are just as pickable.
+        if self.active_sketch_index != Some(sketch_index)
+            && !self.activate_committed_sketch(sketch_index)
+        {
+            return false;
+        }
+        self.clear_model_entity_selection();
+        let selected = self
+            .sketch
+            .select_region_at_point(SketchPoint::new(anchor[0], anchor[1]), false);
+        if selected || self.sketch.selected_region_count() > 0 {
+            self.document_status =
+                Some("Committed sketch region selected · choose Extrude, Add, or Cut".to_owned());
+            return true;
+        }
+        false
     }
 
     #[must_use]
@@ -2646,12 +2715,9 @@ impl KernelLabApp {
     }
 
     fn extrusion_distance_is_valid(&self) -> bool {
-        self.extrusion_distance.is_finite()
-            && if self.signed_face_distance_context() {
-                self.extrusion_distance.abs() > f64::EPSILON
-            } else {
-                self.extrusion_distance > 0.0
-            }
+        // A new body reads its sign the same way a face feature does: which
+        // side of the sketch plane the material goes on. Only zero is invalid.
+        self.extrusion_distance.is_finite() && self.extrusion_distance.abs() > f64::EPSILON
     }
 
     fn set_extrusion_distance_intent(&mut self, distance: f64) {
@@ -2674,8 +2740,12 @@ impl KernelLabApp {
         self.extrusion_mode = mode;
         self.extrusion_mode_explicit = matches!(mode, ExtrusionMode::Add | ExtrusionMode::Cut)
             && self.signed_face_distance_context();
-        if mode == ExtrusionMode::NewBody && self.extrusion_distance <= 0.0 {
-            self.extrusion_distance = self.extrusion_distance.abs().max(1.0);
+        // Only a zero distance needs rescuing. A negative one is a direction,
+        // now that New body reads the sign the way Add and Cut do. Defensive:
+        // New body is disabled on a face, which is the only place a negative
+        // distance can be standing when another mode is picked.
+        if mode == ExtrusionMode::NewBody && self.extrusion_distance == 0.0 {
+            self.extrusion_distance = 1.0;
         }
     }
 
@@ -3444,6 +3514,10 @@ impl KernelLabApp {
                 ordinal: sketches.len() as u32 + 1,
                 support,
                 entities: Vec::new(),
+                overlay_regions: payload
+                    .as_ref()
+                    .map(payload_overlay_regions)
+                    .unwrap_or_default(),
                 portable_payload: payload,
                 revision: record.geometry_revision,
                 finished: true,
@@ -4952,34 +5026,8 @@ impl KernelLabApp {
                     .map_or_else(|| sketch.support.frame(), |payload| payload.frame);
                 let mut points = Vec::new();
                 let mut segments = Vec::new();
-                let mut selectable_regions = Vec::new();
+                let selectable_regions = sketch.overlay_regions.clone();
                 if let Some(payload) = &sketch.portable_payload {
-                    for region in &payload.profile.regions {
-                        let outer_local = sample_planar_loop(&region.outer)?;
-                        let holes_local = region
-                            .holes
-                            .iter()
-                            .map(sample_planar_loop)
-                            .collect::<Option<Vec<_>>>()?;
-                        let anchor = profile_region_anchor(&outer_local, &holes_local)?;
-                        selectable_regions.push(viewport::ModelSketchRegion::new(
-                            outer_local
-                                .iter()
-                                .copied()
-                                .map(|point| frame_point(frame, point))
-                                .collect(),
-                            holes_local
-                                .iter()
-                                .map(|hole| {
-                                    hole.iter()
-                                        .copied()
-                                        .map(|point| frame_point(frame, point))
-                                        .collect()
-                                })
-                                .collect(),
-                            [anchor.x, anchor.y],
-                        ));
-                    }
                     if let Some(authoring) = payload.authoring() {
                         for entity in authoring.active_entities().filter(|entity| entity.visible) {
                             let Ok(curve) = authoring.evaluated_curve(entity.id) else {
@@ -5199,6 +5247,7 @@ impl KernelLabApp {
                     support: self.sketch_support.clone(),
                     entities: Vec::new(),
                     portable_payload: None,
+                    overlay_regions: Vec::new(),
                     revision: 0,
                     finished: false,
                     visible: true,
@@ -5209,12 +5258,24 @@ impl KernelLabApp {
                 index
             }
         };
+        // A sketch still being drawn has no document payload to derive from,
+        // but its canvas already holds a refreshed arrangement. Carrying those
+        // cells onto the record is what lets a draft sketch be hovered and
+        // picked in the model viewport rather than drawn as inert outlines.
+        let frame = self.sketch_support.frame();
+        let live_regions = self
+            .sketch
+            .refreshed_arrangement()
+            .map_or_else(Vec::new, |arrangement| {
+                arrangement_overlay_regions(frame, arrangement)
+            });
         let record = &mut self.sketches[index];
         record.body = self.sketch_support.body();
         record.support = self.sketch_support.clone();
         record.entities = self.sketch.entities().to_vec();
         record.revision = self.sketch_revision;
         record.finished = self.sketch_finished;
+        record.overlay_regions = live_regions;
     }
 
     fn append_active_sketch_to_document(
@@ -5274,7 +5335,9 @@ impl KernelLabApp {
             && let Some(record) = document.sketch(sketch)
             && document
                 .sketch_payload(sketch, record.geometry_revision)
-                .is_some_and(|existing| existing == &payload)
+                .is_some_and(|committed| {
+                    committed == &payload || same_authored_sketch(committed, &payload)
+                })
         {
             return Ok((sketch, feature));
         }
@@ -5360,14 +5423,24 @@ impl KernelLabApp {
                         .sketch_payload(record.id, record.geometry_revision)
                 })
                 .cloned();
+            record.overlay_regions = record
+                .portable_payload
+                .as_ref()
+                .map(payload_overlay_regions)
+                .unwrap_or_default();
         }
     }
 
+    /// `signed_distance` is the distance the user asked for, sign included.
+    /// `command` has already had that sign folded into a reversed frame and a
+    /// positive depth, so the recipe cannot recover the direction from it —
+    /// and the reflected profile in it names no region of the sketch as drawn.
     fn append_extrusion_to_document(
         &self,
         document: &mut ModelDocument,
         sketch: SketchId,
         command: KernelCommand,
+        signed_distance: f64,
         report: &OperationReport,
         mode: ExtrusionMode,
     ) -> Result<(FeatureId, Option<BodyId>), String> {
@@ -5383,27 +5456,34 @@ impl KernelLabApp {
             .ok_or_else(|| {
                 "the extrusion source has no editable sketch authoring graph".to_owned()
             })?;
+        // Undo the reversal the command carries, so region signatures are
+        // matched against the sketch as drawn.
+        let as_drawn = |profile: PlanarProfile2, operation| {
+            if extrusion_frame_is_reversed(operation, signed_distance) {
+                reflected_profile_across_u(profile)
+            } else {
+                profile
+            }
+        };
         let action = match command {
-            KernelCommand::ExtrudePlanarProfile {
-                profile, distance, ..
-            } => {
+            KernelCommand::ExtrudePlanarProfile { profile, .. } => {
+                let profile = as_drawn(profile, None);
                 let selected_regions = authoring_region_signatures_for_profile(authoring, &profile)
                     .ok_or_else(|| {
                         "the extrusion profile has no stable sketch-region selection".to_owned()
                     })?;
                 ReplayAction::SketchRegionExtrusion(
-                    SketchRegionExtrusion::new_body(sketch, selected_regions, distance.abs())
+                    SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
                         .map_err(|error| format!("invalid sketch-region extrusion: {error}"))?,
                 )
             }
             KernelCommand::ExtrudeFaceProfile {
                 target_face,
                 vertices,
-                distance,
                 operation,
                 ..
             } => {
-                let profile = PlanarProfile2::from_polygon(&vertices);
+                let profile = as_drawn(PlanarProfile2::from_polygon(&vertices), Some(operation));
                 let selected_regions = authoring_region_signatures_for_profile(authoring, &profile)
                     .ok_or_else(|| {
                         "the face extrusion profile has no stable sketch-region selection"
@@ -5420,7 +5500,7 @@ impl KernelLabApp {
                         selected_regions,
                         target,
                         operation,
-                        distance.abs(),
+                        signed_distance,
                     )
                     .map_err(|error| format!("invalid face sketch-region extrusion: {error}"))?,
                 )
@@ -5428,10 +5508,10 @@ impl KernelLabApp {
             KernelCommand::ExtrudeFacePlanarProfile {
                 target_face,
                 profile,
-                distance,
                 operation,
                 ..
             } => {
+                let profile = as_drawn(profile, Some(operation));
                 let selected_regions = authoring_region_signatures_for_profile(authoring, &profile)
                     .ok_or_else(|| {
                         "the face extrusion profile has no stable sketch-region selection"
@@ -5448,7 +5528,7 @@ impl KernelLabApp {
                         selected_regions,
                         target,
                         operation,
-                        distance.abs(),
+                        signed_distance,
                     )
                     .map_err(|error| format!("invalid face sketch-region extrusion: {error}"))?,
                 )
@@ -7870,11 +7950,7 @@ impl KernelLabApp {
             return;
         }
 
-        let distance_valid = distance.is_finite()
-            && match target_face {
-                Some(_) => distance.abs() > f64::EPSILON,
-                None => distance > 0.0,
-            };
+        let distance_valid = distance.is_finite() && distance.abs() > f64::EPSILON;
         if !distance_valid {
             self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                 KernelErrorCode::InvalidInput,
@@ -7995,6 +8071,7 @@ impl KernelLabApp {
             base_snapshot,
             revision,
             finish_sketch_on_commit,
+            distance,
             mode,
             ..
         } = pending
@@ -8020,6 +8097,7 @@ impl KernelLabApp {
                     &mut next_document,
                     sketch_id,
                     replay_command,
+                    distance,
                     &outcome.report,
                     mode,
                 );
@@ -12868,11 +12946,7 @@ impl KernelLabApp {
                 .add(
                     egui::DragValue::new(&mut self.extrusion_distance)
                         .speed(0.1)
-                        .range(if face_supported {
-                            -1_000.0..=1_000.0
-                        } else {
-                            0.01..=1_000.0
-                        })
+                        .range(-1_000.0..=1_000.0)
                         .max_decimals(3)
                         .prefix("Distance ")
                         .suffix(" mm"),
@@ -12882,17 +12956,17 @@ impl KernelLabApp {
         if intent_changed {
             self.set_extrusion_distance_intent(self.extrusion_distance);
         }
-        if face_supported {
-            ui.label(
-                RichText::new(if self.extrusion_mode_explicit {
-                    "Operation locked · signed distance controls direction only · Auto restores sign-based Add/Cut"
-                } else {
-                    "Auto · positive adds, negative cuts · choose Add or Cut to override without reversing direction"
-                })
-                    .small()
-                    .color(theme::muted()),
-            );
-        }
+        ui.label(
+            RichText::new(if !face_supported {
+                "Negative distance builds on the other side of the sketch plane"
+            } else if self.extrusion_mode_explicit {
+                "Operation locked · signed distance controls direction only · Auto restores sign-based Add/Cut"
+            } else {
+                "Auto · positive adds, negative cuts · choose Add or Cut to override without reversing direction"
+            })
+            .small()
+            .color(theme::muted()),
+        );
         if extrusion_pending {
             self.sync_pending_sketch_extrusion_inputs();
             if intent_changed {
@@ -12934,7 +13008,7 @@ impl KernelLabApp {
             if let Some(error) = &self.sketch_extrusion_issue {
                 status_line(ui, "EXTRUSION REJECTED · INTENT RETAINED", theme::bad());
                 ui.label(
-                    RichText::new(format!("Rejected · {}", error.code))
+                    RichText::new(format!("Rejected · {}", rejection_label(error)))
                         .small()
                         .color(theme::bad()),
                 );
@@ -13090,7 +13164,7 @@ impl KernelLabApp {
             if let Some(error) = &self.sketch_extrusion_issue {
                 status_line(ui, "PUSH/PULL REJECTED · INTENT RETAINED", theme::bad());
                 ui.label(
-                    RichText::new(format!("Rejected · {}", error.code))
+                    RichText::new(format!("Rejected · {}", rejection_label(error)))
                         .small()
                         .color(theme::bad()),
                 );
@@ -13789,13 +13863,8 @@ impl KernelLabApp {
                         || self.sketch.selected_recipe_parameter_issue().is_some());
                 let extrusion_confirmation_blocked = matches!(
                     self.pending_operation,
-                    Some(PendingOperation::ExtrudeSketch {
-                        distance,
-                        target_face,
-                        ..
-                    }) if !distance.is_finite()
-                        || target_face.is_some() && distance.abs() <= f64::EPSILON
-                        || target_face.is_none() && distance <= 0.0
+                    Some(PendingOperation::ExtrudeSketch { distance, .. })
+                        if !distance.is_finite() || distance.abs() <= f64::EPSILON
                 ) || matches!(
                     self.pending_operation,
                     Some(PendingOperation::PushPullFace { distance, .. })
@@ -14258,19 +14327,7 @@ impl KernelLabApp {
                             self.measured_face = Some(face);
                         }
                     } else if let Some(region) = output.selected_sketch_region {
-                        if self.activate_committed_sketch(region.sketch_index) {
-                            self.clear_model_entity_selection();
-                            let selected = self.sketch.select_region_at_point(
-                                SketchPoint::new(region.anchor[0], region.anchor[1]),
-                                false,
-                            );
-                            if selected || self.sketch.selected_region_count() > 0 {
-                                self.document_status = Some(
-                                    "Committed sketch region selected · choose Extrude, Add, or Cut"
-                                        .to_owned(),
-                                );
-                            }
-                        }
+                        self.select_committed_sketch_region(region.sketch_index, region.anchor);
                     } else if let Some(vertex) = output.selected_vertex
                         && let Some(index) = self
                             .bodies
@@ -16144,6 +16201,154 @@ fn point_in_planar_polygon(point: ProtocolPoint2, polygon: &[ProtocolPoint2]) ->
     inside
 }
 
+/// The regions one committed sketch offers the model viewport.
+///
+/// These come from the sketch's own analytic arrangement rather than from the
+/// compiled profile cache on the payload. The cache holds only the cells that
+/// were selected when the sketch was committed, so a sketch with more than one
+/// cell — a circle dropped inside a rectangle is the ordinary case — carried no
+/// regions at all, and outside Sketch mode there was nothing to hover or click.
+fn payload_overlay_regions(payload: &SketchPayload) -> Vec<viewport::ModelSketchRegion> {
+    let frame = payload.frame;
+    if let Some(authoring) = payload.authoring()
+        && let Ok(inputs) = authoring.arrangement_inputs()
+    {
+        let precision = PrecisionPolicy::default();
+        let arrangement = build_arrangement(&inputs, &precision, ArrangementLimits::default());
+        let regions = arrangement_overlay_regions(frame, &arrangement);
+        if !regions.is_empty() {
+            return regions;
+        }
+    }
+    // A payload written before editable authoring graphs existed carries only
+    // its compiled profile. Those regions are still worth offering.
+    payload
+        .profile
+        .regions
+        .iter()
+        .filter_map(|region| {
+            let outer_local = sample_planar_loop(&region.outer)?;
+            let holes_local = region
+                .holes
+                .iter()
+                .map(sample_planar_loop)
+                .collect::<Option<Vec<_>>>()?;
+            let anchor = profile_region_anchor(&outer_local, &holes_local)?;
+            Some(viewport::ModelSketchRegion::new(
+                outer_local
+                    .iter()
+                    .copied()
+                    .map(|point| frame_point(frame, point))
+                    .collect(),
+                holes_local
+                    .iter()
+                    .map(|hole| {
+                        hole.iter()
+                            .copied()
+                            .map(|point| frame_point(frame, point))
+                            .collect()
+                    })
+                    .collect(),
+                [anchor.x, anchor.y],
+            ))
+        })
+        .collect()
+}
+
+/// One selectable model-viewport region per bounded cell of `arrangement`.
+fn arrangement_overlay_regions(
+    frame: PlanarFrame3,
+    arrangement: &SketchArrangement,
+) -> Vec<viewport::ModelSketchRegion> {
+    let precision = PrecisionPolicy::default();
+    arrangement
+        .cells
+        .iter()
+        .filter_map(|cell| {
+            // The anchor is the exact interior sample the canvas takes for the
+            // same cell, so a click in the viewport resolves back to this one.
+            let anchor = arrangement.cell_interior_sample(cell, &precision)?;
+            Some(viewport::ModelSketchRegion::new(
+                arrangement_loop_polygon(frame, &cell.outer)?,
+                cell.holes
+                    .iter()
+                    .map(|hole| arrangement_loop_polygon(frame, hole))
+                    .collect::<Option<Vec<_>>>()?,
+                [anchor.u, anchor.v],
+            ))
+        })
+        .collect()
+}
+
+/// Samples one arrangement loop into a closed world-space polygon, sharing the
+/// chord count the overlay's own curves are drawn with so a highlighted region
+/// lands exactly under its outline.
+fn arrangement_loop_polygon(
+    frame: PlanarFrame3,
+    profile_loop: &artificer_sketch::ArrangementLoop,
+) -> Option<Vec<Point3>> {
+    let mut points: Vec<Point3> = Vec::new();
+    for curve in &profile_loop.curves {
+        for point in preview_authoring_curve(frame, *curve)? {
+            if points
+                .last()
+                .is_none_or(|last| !points_coincide(*last, point))
+            {
+                points.push(point);
+            }
+        }
+    }
+    // A loop closes by winding, not by repeating its first point: leaving the
+    // duplicate in would hand the triangulator a zero-length edge.
+    while points.len() > 1 && points_coincide(points[0], points[points.len() - 1]) {
+        points.pop();
+    }
+    (points.len() >= 3).then_some(points)
+}
+
+fn points_coincide(left: Point3, right: Point3) -> bool {
+    const COINCIDENT: f64 = 1.0e-9;
+    (left.x - right.x).abs() <= COINCIDENT
+        && (left.y - right.y).abs() <= COINCIDENT
+        && (left.z - right.z).abs() <= COINCIDENT
+}
+
+/// Names a rejection precisely enough to act on.
+///
+/// The error code alone is a category — `InvalidInput` covers every way a
+/// profile can be refused — while the first diagnostic names the check that
+/// actually failed. Showing both is what makes a bug report from a build we
+/// cannot attach a debugger to worth having.
+fn rejection_label(error: &KernelError) -> String {
+    error.diagnostics.first().map_or_else(
+        || error.code.to_string(),
+        |diagnostic| format!("{} · {}", error.code, diagnostic.code),
+    )
+}
+
+/// Whether two payloads describe the same *authored* sketch.
+///
+/// `SketchPayload::profile` is a derived cache of whichever regions happened to
+/// be selected, not authored geometry, and the extrusion recipe re-resolves its
+/// own region signatures against the authoring graph rather than reading it.
+/// Picking a different region of a committed sketch therefore changes the cache
+/// while the sketch itself is untouched — and treating that as an edit rewrote
+/// the sketch's history and marked it, plus every feature depending on it,
+/// dirty, so the extrusion appended straight afterwards was refused for
+/// depending on a dirty sketch.
+///
+/// A payload with no authoring graph is a legacy one whose profile *is* its
+/// geometry, so it never takes this route.
+fn same_authored_sketch(committed: &SketchPayload, candidate: &SketchPayload) -> bool {
+    committed.frame == candidate.frame
+        && committed.support == candidate.support
+        && committed.precision_policy_version == candidate.precision_policy_version
+        && match (committed.authoring(), candidate.authoring()) {
+            (Some(committed), Some(candidate)) => committed == candidate,
+            _ => false,
+        }
+}
+
 fn workbench_sketch_has_overlay_geometry(sketch: &WorkbenchSketch) -> bool {
     // While an existing sketch is being edited, the canvas adapter is the
     // current Browser/overlay projection and `portable_payload` is still the
@@ -16382,87 +16587,32 @@ fn build_planar_profile_extrusion_command(
     distance: f64,
     mode: ExtrusionMode,
 ) -> Option<KernelCommand> {
-    match (target_face, mode.feature_operation()) {
-        (Some(target_face), Some(operation)) => {
-            let reverse_frame = matches!(
-                (mode, distance.is_sign_negative()),
-                (ExtrusionMode::Add, true) | (ExtrusionMode::Cut, false)
-            );
-            let (frame, profile) = if reverse_frame {
-                reflect_face_extrusion_direction(frame, profile)
-            } else {
-                (frame, profile)
-            };
-            Some(KernelCommand::ExtrudeFacePlanarProfile {
-                target_face,
-                frame,
-                profile,
-                distance: distance.abs(),
-                operation,
-            })
-        }
+    let operation = mode.feature_operation();
+    if target_face.is_some() != operation.is_some() {
+        return None;
+    }
+    // One rule for every target, and the same one replay uses, so a feature
+    // rebuilds into the solid it was first committed as.
+    let (frame, profile) = if extrusion_frame_is_reversed(operation, distance) {
+        reversed_extrusion_direction(frame, profile)
+    } else {
+        (frame, profile)
+    };
+    let distance = distance.abs();
+    match (target_face, operation) {
+        (Some(target_face), Some(operation)) => Some(KernelCommand::ExtrudeFacePlanarProfile {
+            target_face,
+            frame,
+            profile,
+            distance,
+            operation,
+        }),
         (None, None) => Some(KernelCommand::ExtrudePlanarProfile {
             frame,
             profile,
-            distance: distance.abs(),
+            distance,
         }),
         _ => None,
-    }
-}
-
-/// Reverses the frame normal while reflecting profile coordinates so the
-/// physical sketch wires remain exactly where the user drew them. This keeps
-/// the protocol's positive depth invariant while making Boolean operation and
-/// signed arrow direction independent.
-fn reflect_face_extrusion_direction(
-    mut frame: PlanarFrame3,
-    mut profile: PlanarProfile2,
-) -> (PlanarFrame3, PlanarProfile2) {
-    frame.v = Vector3::new(-frame.v.x, -frame.v.y, -frame.v.z);
-    for curve in profile
-        .regions
-        .iter_mut()
-        .flat_map(|region| std::iter::once(&mut region.outer).chain(&mut region.holes))
-        .flat_map(|profile_loop| &mut profile_loop.curves)
-    {
-        *curve = match *curve {
-            PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
-                start: reflect_profile_point(start),
-                end: reflect_profile_point(end),
-            },
-            PlanarCurve2::CircularArc {
-                center,
-                start,
-                end,
-                direction,
-            } => PlanarCurve2::CircularArc {
-                center: reflect_profile_point(center),
-                start: reflect_profile_point(start),
-                end: reflect_profile_point(end),
-                direction: reverse_arc_direction(direction),
-            },
-            PlanarCurve2::Circle {
-                center,
-                radius,
-                direction,
-            } => PlanarCurve2::Circle {
-                center: reflect_profile_point(center),
-                radius,
-                direction: reverse_arc_direction(direction),
-            },
-        };
-    }
-    (frame, profile)
-}
-
-const fn reflect_profile_point(point: ProtocolPoint2) -> ProtocolPoint2 {
-    ProtocolPoint2::new(point.x, -point.y)
-}
-
-const fn reverse_arc_direction(direction: ArcDirection) -> ArcDirection {
-    match direction {
-        ArcDirection::CounterClockwise => ArcDirection::Clockwise,
-        ArcDirection::Clockwise => ArcDirection::CounterClockwise,
     }
 }
 

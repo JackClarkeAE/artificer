@@ -343,6 +343,12 @@ pub struct ModelSketchRegion {
 }
 
 impl ModelSketchRegion {
+    /// The sketch-plane point that identifies this region to the document.
+    #[must_use]
+    pub const fn anchor(&self) -> [f64; 2] {
+        self.anchor
+    }
+
     #[must_use]
     pub fn new(outer: Vec<Point3>, holes: Vec<Vec<Point3>>, anchor: [f64; 2]) -> Self {
         Self {
@@ -3726,14 +3732,26 @@ fn paint_model_sketch_overlays(
                     continue;
                 };
                 let fill = HOVERED.gamma_multiply(0.30);
+                // One mesh, not one anti-aliased polygon per triangle. Each
+                // convex_polygon feathers its own outline, so a triangulation
+                // painted piecewise shows a seam along every shared edge, and
+                // the sliver triangles a corner fan produces feather into
+                // spikes that shoot clear across the viewport.
+                let mut mesh = egui::Mesh::default();
                 for triangle in triangles {
-                    let projected =
-                        triangle.map(|point| projection.instance_point(point, view, presentation));
-                    painter.add(egui::Shape::convex_polygon(
-                        projected.to_vec(),
-                        fill,
-                        Stroke::NONE,
-                    ));
+                    let Ok(base) = u32::try_from(mesh.vertices.len()) else {
+                        break;
+                    };
+                    for point in triangle {
+                        mesh.colored_vertex(
+                            projection.instance_point(point, view, presentation),
+                            fill,
+                        );
+                    }
+                    mesh.add_triangle(base, base + 1, base + 2);
+                }
+                if !mesh.is_empty() {
+                    painter.add(egui::Shape::mesh(mesh));
                 }
             }
         }

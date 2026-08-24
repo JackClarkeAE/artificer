@@ -3184,52 +3184,6 @@ fn legacy_geometry_from_core(curve: CoreEvaluatedCurve2) -> SketchGeometry {
     }
 }
 
-fn point_near_arrangement_boundary(
-    arrangement: &CoreSketchArrangement,
-    point: CorePoint2,
-    tolerance: f64,
-) -> bool {
-    arrangement.fragments.iter().any(|fragment| {
-        let parameter = fragment.curve.closest_parameter(point);
-        fragment
-            .curve
-            .evaluate(parameter)
-            .is_ok_and(|nearest| nearest.distance(point) <= tolerance)
-    })
-}
-
-fn analytic_cell_interior_sample(
-    arrangement: &CoreSketchArrangement,
-    cell: &CoreArrangementCell,
-    precision: &PrecisionPolicy,
-) -> Option<CorePoint2> {
-    for curve in &cell.outer.curves {
-        for parameter in [0.5, 0.25, 0.75] {
-            let boundary = curve.evaluate(parameter).ok()?;
-            let inward = curve.tangent(parameter).ok()?.normalized()?.left_normal();
-            let base_offset = precision
-                .modeling_resolution
-                .max(precision.linear_agreement)
-                .max(curve.arc_length() * 1.0e-5);
-            for multiple in [4.0, 16.0, 1.0] {
-                let candidate = boundary + inward * (base_offset * multiple);
-                if arrangement
-                    .cell_at_point(candidate, precision)
-                    .is_some_and(|owner| owner.signature == cell.signature)
-                    && !point_near_arrangement_boundary(
-                        arrangement,
-                        candidate,
-                        precision.modeling_resolution,
-                    )
-                {
-                    return Some(candidate);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn regular_polygon_preview(
     variant: ToolVariant,
     center: SketchPoint,
@@ -4282,7 +4236,8 @@ impl SketchCanvasState {
             let cell = arrangement
                 .cell(signature)
                 .ok_or(SketchEditError::AuthoringRejected)?;
-            let anchor = analytic_cell_interior_sample(arrangement, cell, &precision)
+            let anchor = arrangement
+                .cell_interior_sample(cell, &precision)
                 .ok_or(SketchEditError::AuthoringRejected)?;
             selected.insert(signature.clone());
             anchors.insert(signature.clone(), anchor);
@@ -4756,6 +4711,18 @@ impl SketchCanvasState {
         self.analytic_regions.selected.len()
     }
 
+    /// The analytic arrangement for the current authoring revision, rebuilt
+    /// first if an edit has landed since it was last needed.
+    ///
+    /// Exposed so the model viewport can offer the very same cells this canvas
+    /// selects. It takes `&mut self` deliberately: reading the cached field
+    /// alone would hand out a one-edit-stale arrangement whenever this is
+    /// called before the canvas next draws.
+    pub fn refreshed_arrangement(&mut self) -> Option<&CoreSketchArrangement> {
+        self.refresh_analytic_regions();
+        self.analytic_regions.arrangement.as_ref()
+    }
+
     /// Number of analytically certified bounded cells currently available for
     /// explicit profile selection.
     #[must_use]
@@ -4849,7 +4816,7 @@ impl SketchCanvasState {
             let Some(anchor) = old_anchors.get(&signature).copied() else {
                 continue;
             };
-            if point_near_arrangement_boundary(&arrangement, anchor, boundary_tolerance) {
+            if arrangement.point_near_boundary(anchor, boundary_tolerance) {
                 continue;
             }
             if let Some(repaired) = arrangement.cell_at_point(anchor, &precision) {
@@ -4862,7 +4829,7 @@ impl SketchCanvasState {
             && let Some(cell) = arrangement.cells.first()
         {
             selected.insert(cell.signature.clone());
-            if let Some(anchor) = analytic_cell_interior_sample(&arrangement, cell, &precision) {
+            if let Some(anchor) = arrangement.cell_interior_sample(cell, &precision) {
                 anchors.insert(cell.signature.clone(), anchor);
             }
         }

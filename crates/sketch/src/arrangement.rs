@@ -267,6 +267,65 @@ impl SketchArrangement {
             })
     }
 
+    /// Whether `point` lies within `tolerance` of any arrangement fragment.
+    ///
+    /// Region anchors must be strictly interior: a point that has drifted onto
+    /// a boundary belongs to no cell in particular, and resolving it would
+    /// pick a neighbour arbitrarily.
+    #[must_use]
+    pub fn point_near_boundary(&self, point: SketchPoint2, tolerance: f64) -> bool {
+        self.fragments.iter().any(|fragment| {
+            let parameter = fragment.curve.closest_parameter(point);
+            fragment
+                .curve
+                .evaluate(parameter)
+                .is_ok_and(|nearest| nearest.distance(point) <= tolerance)
+        })
+    }
+
+    /// An exact interior point of `cell`, suitable as a stable region anchor.
+    ///
+    /// The sample is stepped inward from the cell's own boundary rather than
+    /// taken from a centroid, so it stays inside concave and annular cells
+    /// whose centroid falls in a hole or outside the loop entirely.
+    #[must_use]
+    pub fn cell_interior_sample(
+        &self,
+        cell: &ArrangementCell,
+        precision: &PrecisionPolicy,
+    ) -> Option<SketchPoint2> {
+        for curve in &cell.outer.curves {
+            for parameter in [0.5, 0.25, 0.75] {
+                let Ok(boundary) = curve.evaluate(parameter) else {
+                    continue;
+                };
+                let Some(inward) = curve
+                    .tangent(parameter)
+                    .ok()
+                    .and_then(|tangent| tangent.normalized())
+                    .map(|tangent| tangent.left_normal())
+                else {
+                    continue;
+                };
+                let base_offset = precision
+                    .modeling_resolution
+                    .max(precision.linear_agreement)
+                    .max(curve.arc_length() * 1.0e-5);
+                for multiple in [4.0, 16.0, 1.0] {
+                    let candidate = boundary + inward * (base_offset * multiple);
+                    if self
+                        .cell_at_point(candidate, precision)
+                        .is_some_and(|owner| owner.signature == cell.signature)
+                        && !self.point_near_boundary(candidate, precision.modeling_resolution)
+                    {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Resolves the minimal bounded cell containing a sketch-plane point.
     /// This is analytic region selection; renderer fill meshes are not used.
     #[must_use]

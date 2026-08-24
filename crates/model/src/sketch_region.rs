@@ -6,8 +6,9 @@
 //! current analytic arrangement and compiles a fresh exact kernel profile.
 
 use artificer_protocol::{
-    EntityId, EntityKind, EntityRef, FaceExtrusionOperation, KernelCommand, PrecisionPolicy,
-    SnapshotId,
+    ArcDirection, EntityId, EntityKind, EntityRef, FaceExtrusionOperation, KernelCommand,
+    PlanarCurve2, PlanarFrame3, PlanarProfile2, Point2 as ProtocolPoint2, PrecisionPolicy,
+    SnapshotId, Vector3,
 };
 use artificer_sketch::{
     ArrangementLimits, ProfileCompileError, RegionSignature, SketchValidationError,
@@ -29,6 +30,98 @@ pub const MAX_SELECTED_SKETCH_REGIONS: usize = 32;
 
 const fn current_sketch_region_recipe_version() -> u32 {
     CURRENT_SKETCH_REGION_RECIPE_VERSION
+}
+
+/// Whether a signed feature distance means "build on the other side of the
+/// sketch plane".
+///
+/// The recipe's distance carries direction in its sign, but `KernelCommand`
+/// depths are positive by protocol invariant, so the direction has to be
+/// re-expressed as a reversed frame. The convention is the one the workbench
+/// panel states: positive adds, negative cuts. A Cut therefore travels into the
+/// material by default and reverses when asked for a positive distance, while
+/// New body and Add travel along the frame normal and reverse when negative.
+#[must_use]
+pub fn extrusion_frame_is_reversed(
+    operation: Option<FaceExtrusionOperation>,
+    distance: f64,
+) -> bool {
+    match operation {
+        Some(FaceExtrusionOperation::Cut) => distance > 0.0,
+        _ => distance < 0.0,
+    }
+}
+
+/// Reverses the frame normal while reflecting profile coordinates to match, so
+/// the physical sketch wires stay exactly where they were drawn.
+///
+/// Negating `v` alone would mirror the profile about the frame's u axis; the
+/// matching reflection of every curve's v coordinate (and of each arc's sense)
+/// puts every point back on the plane where the user drew it, leaving only the
+/// normal flipped. This is what keeps the protocol's positive-depth invariant
+/// independent of which way a feature grows.
+#[must_use]
+pub fn reversed_extrusion_direction(
+    mut frame: PlanarFrame3,
+    profile: PlanarProfile2,
+) -> (PlanarFrame3, PlanarProfile2) {
+    frame.v = Vector3::new(-frame.v.x, -frame.v.y, -frame.v.z);
+    (frame, reflected_profile_across_u(profile))
+}
+
+/// Reflects every profile coordinate about the frame's u axis.
+///
+/// This is the profile half of [`reversed_extrusion_direction`], exposed on its
+/// own because it is an involution: applying it to a reversed command's profile
+/// recovers the profile as the sketch actually holds it, which is what a region
+/// signature has to be matched against.
+#[must_use]
+pub fn reflected_profile_across_u(mut profile: PlanarProfile2) -> PlanarProfile2 {
+    for curve in profile
+        .regions
+        .iter_mut()
+        .flat_map(|region| std::iter::once(&mut region.outer).chain(&mut region.holes))
+        .flat_map(|profile_loop| &mut profile_loop.curves)
+    {
+        *curve = match *curve {
+            PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
+                start: reflect_profile_point(start),
+                end: reflect_profile_point(end),
+            },
+            PlanarCurve2::CircularArc {
+                center,
+                start,
+                end,
+                direction,
+            } => PlanarCurve2::CircularArc {
+                center: reflect_profile_point(center),
+                start: reflect_profile_point(start),
+                end: reflect_profile_point(end),
+                direction: reverse_arc_direction(direction),
+            },
+            PlanarCurve2::Circle {
+                center,
+                radius,
+                direction,
+            } => PlanarCurve2::Circle {
+                center: reflect_profile_point(center),
+                radius,
+                direction: reverse_arc_direction(direction),
+            },
+        };
+    }
+    profile
+}
+
+const fn reflect_profile_point(point: ProtocolPoint2) -> ProtocolPoint2 {
+    ProtocolPoint2::new(point.x, -point.y)
+}
+
+const fn reverse_arc_direction(direction: ArcDirection) -> ArcDirection {
+    match direction {
+        ArcDirection::CounterClockwise => ArcDirection::Clockwise,
+        ArcDirection::Clockwise => ArcDirection::CounterClockwise,
+    }
 }
 
 /// Where a compiled sketch profile is applied.
@@ -128,7 +221,10 @@ impl SketchRegionExtrusion {
         if self.regions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(SketchRegionRecipeError::NonCanonicalSelection);
         }
-        if !self.distance.is_finite() || self.distance <= 0.0 {
+        // The sign is direction, not magnitude: it says which side of the
+        // sketch plane the material goes. Only zero and non-finite are
+        // structurally invalid. See [`extrusion_frame_is_reversed`].
+        if !self.distance.is_finite() || self.distance == 0.0 {
             return Err(SketchRegionRecipeError::InvalidDistance);
         }
         if let SketchRegionExtrusionTarget::PlanarFace { face, .. } = &self.target {
@@ -204,27 +300,38 @@ impl SketchRegionExtrusion {
 
         let compiled = compile_selected_profile(&arrangement, &self.regions, &precision)
             .map_err(SketchRegionResolveError::Profile)?;
-        let command = match &self.target {
-            SketchRegionExtrusionTarget::NewBody => KernelCommand::ExtrudePlanarProfile {
-                frame: payload.frame,
-                profile: compiled.profile,
-                distance: self.distance,
+        // Replay must reconstruct the same solid the feature first built, so
+        // the sign is re-expressed here exactly as it was when the command was
+        // issued: a reversed frame plus a positive depth.
+        let operation = match &self.target {
+            SketchRegionExtrusionTarget::NewBody => None,
+            SketchRegionExtrusionTarget::PlanarFace { operation, .. } => Some(*operation),
+        };
+        let (frame, profile) = if extrusion_frame_is_reversed(operation, self.distance) {
+            reversed_extrusion_direction(payload.frame, compiled.profile)
+        } else {
+            (payload.frame, compiled.profile)
+        };
+        let distance = self.distance.abs();
+        let command = match operation {
+            None => KernelCommand::ExtrudePlanarProfile {
+                frame,
+                profile,
+                distance,
             },
-            SketchRegionExtrusionTarget::PlanarFace { operation, .. } => {
-                KernelCommand::ExtrudeFacePlanarProfile {
-                    // Serialization placeholder only. `TargetedKernel::rebind`
-                    // overwrites this value before execution.
-                    target_face: EntityRef {
-                        snapshot: SnapshotId::ZERO,
-                        entity: EntityId(0),
-                        kind: EntityKind::Face,
-                    },
-                    frame: payload.frame,
-                    profile: compiled.profile,
-                    distance: self.distance,
-                    operation: *operation,
-                }
-            }
+            Some(operation) => KernelCommand::ExtrudeFacePlanarProfile {
+                // Serialization placeholder only. `TargetedKernel::rebind`
+                // overwrites this value before execution.
+                target_face: EntityRef {
+                    snapshot: SnapshotId::ZERO,
+                    entity: EntityId(0),
+                    kind: EntityKind::Face,
+                },
+                frame,
+                profile,
+                distance,
+                operation,
+            },
         };
         match &self.target {
             SketchRegionExtrusionTarget::NewBody => Ok(ReplayAction::Kernel(command)),
@@ -256,7 +363,7 @@ pub enum SketchRegionRecipeError {
     TooManyRegions { actual: usize, limit: usize },
     #[error("selected sketch regions must be sorted and unique")]
     NonCanonicalSelection,
-    #[error("sketch-region extrusion distance must be finite and greater than zero")]
+    #[error("sketch-region extrusion distance must be finite and non-zero")]
     InvalidDistance,
     #[error("a face sketch-region feature requires a valid persistent face target")]
     InvalidFaceTarget,
@@ -411,6 +518,104 @@ mod tests {
             )
             .unwrap();
         (document, appended.created_sketches[0], regions[0].clone())
+    }
+
+    #[test]
+    fn a_negative_distance_resolves_to_a_reversed_frame_and_a_positive_depth() {
+        // The protocol keeps extrusion depths positive, so a feature that
+        // grows the other way has to say so with its frame. If replay dropped
+        // the sign here, a rebuild would silently move the body to the far
+        // side of the sketch plane.
+        let (document, sketch, signature) = document_with_rectangle();
+        let precision = PrecisionPolicy::default();
+        let upward = SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 5.0).unwrap();
+        let downward = SketchRegionExtrusion::new_body(sketch, vec![signature], -5.0).unwrap();
+
+        let ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile {
+            frame: up_frame,
+            distance: up_distance,
+            ..
+        }) = upward.resolve(&document, precision).unwrap()
+        else {
+            panic!("a standalone region recipe resolves to a profile extrusion")
+        };
+        let ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile {
+            frame: down_frame,
+            distance: down_distance,
+            ..
+        }) = downward.resolve(&document, precision).unwrap()
+        else {
+            panic!("a standalone region recipe resolves to a profile extrusion")
+        };
+
+        assert_eq!(up_distance, 5.0);
+        assert_eq!(
+            down_distance, 5.0,
+            "depth stays positive; the frame carries direction"
+        );
+        assert_eq!(down_frame.origin, up_frame.origin);
+        assert_eq!(down_frame.u, up_frame.u);
+        assert_eq!(
+            down_frame.v,
+            Vector3::new(-up_frame.v.x, -up_frame.v.y, -up_frame.v.z)
+        );
+    }
+
+    #[test]
+    fn a_zero_distance_is_the_only_invalid_magnitude() {
+        let (_, sketch, signature) = document_with_rectangle();
+        assert!(SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], -5.0).is_ok());
+        assert_eq!(
+            SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 0.0).unwrap_err(),
+            SketchRegionRecipeError::InvalidDistance
+        );
+        assert_eq!(
+            SketchRegionExtrusion::new_body(sketch, vec![signature], f64::NAN).unwrap_err(),
+            SketchRegionRecipeError::InvalidDistance
+        );
+    }
+
+    #[test]
+    fn the_direction_rule_matches_the_panel_it_is_written_from() {
+        use artificer_protocol::FaceExtrusionOperation;
+        // "positive adds, negative cuts": Add and New body travel along the
+        // frame normal, a Cut travels into the material.
+        assert!(!extrusion_frame_is_reversed(None, 5.0));
+        assert!(extrusion_frame_is_reversed(None, -5.0));
+        assert!(!extrusion_frame_is_reversed(
+            Some(FaceExtrusionOperation::Add),
+            5.0
+        ));
+        assert!(extrusion_frame_is_reversed(
+            Some(FaceExtrusionOperation::Add),
+            -5.0
+        ));
+        assert!(extrusion_frame_is_reversed(
+            Some(FaceExtrusionOperation::Cut),
+            5.0
+        ));
+        assert!(!extrusion_frame_is_reversed(
+            Some(FaceExtrusionOperation::Cut),
+            -5.0
+        ));
+    }
+
+    #[test]
+    fn reflecting_a_profile_twice_returns_it_unchanged() {
+        // The workbench relies on this to recover the profile as drawn from a
+        // command whose direction was already folded into its frame.
+        let (document, sketch, signature) = document_with_rectangle();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], 5.0).unwrap();
+        let ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile { profile, .. }) = recipe
+            .resolve(&document, PrecisionPolicy::default())
+            .unwrap()
+        else {
+            panic!("a standalone region recipe resolves to a profile extrusion")
+        };
+        assert_eq!(
+            reflected_profile_across_u(reflected_profile_across_u(profile.clone())),
+            profile
+        );
     }
 
     #[test]
