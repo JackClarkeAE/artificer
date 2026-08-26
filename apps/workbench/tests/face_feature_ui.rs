@@ -834,3 +834,84 @@ impl ExtrusionModeTestLabel for ExtrusionMode {
         }
     }
 }
+
+#[test]
+fn test_project_3d_body_context_toggle_and_ribbon_interaction() {
+    let mut harness = harness();
+    prepare_active_one_by_one_face_rectangle(&mut harness);
+
+    // Initial state: 3D context is enabled by default
+    assert!(harness.state().project_3d_body_context());
+    let (initial_triangles, initial_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+    assert!(initial_triangles > 0);
+    assert!(initial_edges > 0);
+
+    // Click the "Project 3D Context" ribbon button to toggle it off
+    click_button(&mut harness, "Project 3D Context");
+    assert!(!harness.state().project_3d_body_context());
+
+    // Step harness to update the sketch viewport
+    harness.step();
+    let (toggled_triangles, toggled_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+    assert_eq!(toggled_triangles, 0);
+    assert_eq!(toggled_edges, 0);
+
+    // Click "Project 3D Context" again to toggle it back on
+    click_button(&mut harness, "Project 3D Context");
+    assert!(harness.state().project_3d_body_context());
+    harness.step();
+
+    let (restored_triangles, restored_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+    assert_eq!(restored_triangles, initial_triangles);
+    assert_eq!(restored_edges, initial_edges);
+}
+
+#[test]
+fn test_project_3d_body_depth_slider_filtering() {
+    let mut harness = harness();
+    prepare_active_one_by_one_face_rectangle(&mut harness);
+
+    // With depth = 50.0 mm (default), all features behind the face are captured
+    let (full_triangles, full_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+
+    // Set depth to 0.0 mm (surface only)
+    harness.state_mut().set_project_3d_body_depth(0.0);
+    harness.step();
+
+    let (surface_triangles, surface_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+
+    assert!(
+        surface_triangles <= full_triangles,
+        "surface-only triangles ({surface_triangles}) should not exceed full depth triangles ({full_triangles})"
+    );
+    assert!(
+        surface_edges <= full_edges,
+        "surface-only edges ({surface_edges}) should not exceed full depth edges ({full_edges})"
+    );
+
+    // Set depth back to 100.0 mm
+    harness.state_mut().set_project_3d_body_depth(100.0);
+    harness.step();
+
+    let (re_triangles, re_edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("face context exists");
+    assert_eq!(re_triangles, full_triangles);
+    assert_eq!(re_edges, full_edges);
+}

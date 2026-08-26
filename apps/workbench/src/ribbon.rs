@@ -205,6 +205,9 @@ impl KernelLabApp {
                 if group == RibbonGroupId::Boolean {
                     self.boolean_operand_panel(ui);
                 }
+                if group == RibbonGroupId::SketchView {
+                    self.sketch_projected_context_panel(ui);
+                }
             });
         }
     }
@@ -464,6 +467,32 @@ impl KernelLabApp {
         });
     }
 
+    fn sketch_projected_context_panel(&mut self, ui: &mut egui::Ui) {
+        if self.face_sketch_context.is_some() && self.project_3d_body_context {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Project Depth")
+                        .small()
+                        .color(theme::muted()),
+                );
+                let mut depth = self.project_3d_body_depth;
+                let slider = egui::DragValue::new(&mut depth)
+                    .range(0.0..=500.0)
+                    .speed(1.0)
+                    .suffix(" mm");
+                if ui
+                    .add(slider)
+                    .on_hover_text(
+                        "Set the maximum depth relative to the sketch face for projected 3D body edges and surfaces.",
+                    )
+                    .changed()
+                {
+                    self.project_3d_body_depth = depth.max(0.0);
+                }
+            });
+        }
+    }
+
     pub(crate) fn activate_sketch_tool_variant(&mut self, variant: ToolVariant) {
         if self.sketch.set_exact_tool(variant) {
             self.active_sketch_tool = variant;
@@ -522,6 +551,7 @@ impl KernelLabApp {
             ModelCommand::ToggleEdges => self.edge_overlay && !self.model_display_mode.is_shaded(),
             ModelCommand::ToggleShaded => self.model_display_mode.is_shaded(),
             ModelCommand::ToggleSnap => self.sketch.snap_settings().enabled,
+            ModelCommand::ToggleProjectedContext => self.project_3d_body_context,
             ModelCommand::ShowBrowser => self.shell.visibility().model_browser,
             // The properties palette has no hidden state of its own; the
             // command raises and focuses it, so it is never "on".
@@ -707,7 +737,8 @@ impl KernelLabApp {
             | ModelCommand::Home
             | ModelCommand::PlayMotion
             | ModelCommand::FrameSketch
-            | ModelCommand::ToggleSnap => CommandAvailability::Enabled,
+            | ModelCommand::ToggleSnap
+            | ModelCommand::ToggleProjectedContext => CommandAvailability::Enabled,
             ModelCommand::ToggleEdges => {
                 if self.model_display_mode.is_shaded() {
                     CommandAvailability::disabled(
@@ -940,6 +971,9 @@ impl KernelLabApp {
                 let mut settings = self.sketch.snap_settings();
                 settings.enabled = !settings.enabled;
                 self.sketch.set_snap_settings(settings);
+            }
+            ModelCommand::ToggleProjectedContext => {
+                self.project_3d_body_context = !self.project_3d_body_context;
             }
             ModelCommand::ToggleVariables => {
                 self.variables_window_open = !self.variables_window_open;
