@@ -398,7 +398,12 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         .get_by_role_and_label(Role::Button, "File menu")
         .click_accesskit();
     harness.run();
-    for label in ["Save document", "Open saved document", "Export…"] {
+    for label in [
+        "Save document",
+        "Open saved document",
+        "Export as STL…",
+        "Export as STEP…",
+    ] {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must be reachable: {rect:?}");
         assert!(

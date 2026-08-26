@@ -407,10 +407,20 @@ pub(crate) fn finish_edges(
     } else {
         precision
     };
+    // Where the selected edges meet each other, the sweeps must overlap so the
+    // union has material to build the mitre from. Everywhere else that overlap
+    // buys nothing.
+    let shared_endpoints = shared_selection_endpoints(scene, targets, epsilon);
     for target in targets {
-        for polygons in
-            edge_finish_cutters(scene, *target, kind, distance, cutter_precision, epsilon)?
-        {
+        for polygons in edge_finish_cutters(
+            scene,
+            *target,
+            kind,
+            distance,
+            cutter_precision,
+            epsilon,
+            &shared_endpoints,
+        )? {
             let cutter = BspNode::from_polygons(polygons, epsilon);
             cutters = Some(match cutters {
                 None => cutter,
@@ -456,6 +466,34 @@ fn planar_topology_polygons(topology: &Topology, epsilon: f64) -> Option<Vec<Pol
     (!polygons.is_empty()).then_some(polygons)
 }
 
+/// The points where two or more of the selected segments meet each other.
+fn shared_selection_endpoints(
+    scene: &DebugScene,
+    targets: &[EntityRef],
+    epsilon: f64,
+) -> Vec<Point3> {
+    let endpoints = targets
+        .iter()
+        .flat_map(|target| {
+            scene
+                .edges
+                .iter()
+                .filter(move |edge| edge.source_edge == *target && !edge.is_smooth)
+                .flat_map(|edge| edge.endpoints.map(internal_point))
+        })
+        .collect::<Vec<_>>();
+    endpoints
+        .iter()
+        .enumerate()
+        .filter(|(index, point)| {
+            endpoints.iter().enumerate().any(|(other, candidate)| {
+                other != *index && candidate.distance(**point) <= epsilon * 32.0
+            })
+        })
+        .map(|(_, point)| *point)
+        .collect()
+}
+
 fn edge_finish_cutters(
     scene: &DebugScene,
     target: EntityRef,
@@ -463,6 +501,7 @@ fn edge_finish_cutters(
     distance: f64,
     precision: PrecisionPolicy,
     epsilon: f64,
+    shared_endpoints: &[Point3],
 ) -> Option<Vec<Vec<Polygon>>> {
     let segments = scene
         .edges
@@ -474,7 +513,17 @@ fn edge_finish_cutters(
     }
     segments
         .into_iter()
-        .map(|edge| edge_finish_segment_cutter(scene, edge, kind, distance, precision, epsilon))
+        .map(|edge| {
+            edge_finish_segment_cutter(
+                scene,
+                edge,
+                kind,
+                distance,
+                precision,
+                epsilon,
+                shared_endpoints,
+            )
+        })
         .collect()
 }
 
@@ -485,6 +534,7 @@ fn edge_finish_segment_cutter(
     distance: f64,
     precision: PrecisionPolicy,
     epsilon: f64,
+    shared_endpoints: &[Point3],
 ) -> Option<Vec<Polygon>> {
     let [edge_start, edge_end] = edge.endpoints.map(internal_point);
     let edge_vector = edge_end - edge_start;
@@ -524,18 +574,46 @@ fn edge_finish_segment_cutter(
     // to build the actual miter/transition boundary; overlapping sweeps are
     // unioned before subtraction, so connected selected edges remain one
     // regularized operation.
+    //
+    // That overlap is worth its cost at two kinds of endpoint and no others:
+    // where another selected edge meets this one, since the mitre between them
+    // is built from material both sweeps share, and where the body simply
+    // ends, since reaching past it costs nothing. A pocket's rim corner is
+    // neither — the wall carries on — and there the overlap cut a notch a full
+    // setback long into material nobody selected. At such an endpoint the
+    // sweep is brought back to the wall that terminates the edge, which is a
+    // slant rather than a shortening: the cap is each profile point carried
+    // along the axis onto that wall's plane, so the chamfer ends exactly on
+    // the corner and leaves the geometry beside it alone.
     let extension = distance + epsilon * 8.0;
     let start_origin = edge_start + axis * -extension;
     let sweep = axis * (edge_length + extension * 2.0);
-    let start = local
+    let mut start = local
         .iter()
         .map(|point| start_origin + u * point.x + v * point.y)
         .collect::<Vec<_>>();
-    let end = start
+    let mut end = start
         .iter()
         .copied()
         .map(|point| point + sweep)
         .collect::<Vec<_>>();
+    let carry_onto = |points: &mut Vec<Point3>, endpoint: Point3, normal: Vector3| {
+        let denominator = axis.dot(normal);
+        if denominator.abs() <= 1.0e-12 {
+            return;
+        }
+        for point in points.iter_mut() {
+            *point = *point + axis * ((endpoint - *point).dot(normal) / denominator);
+        }
+    };
+    if let Some(normal) =
+        terminating_wall(scene, edge_start, axis * -1.0, shared_endpoints, epsilon)
+    {
+        carry_onto(&mut start, edge_start, normal);
+    }
+    if let Some(normal) = terminating_wall(scene, edge_end, axis, shared_endpoints, epsilon) {
+        carry_onto(&mut end, edge_end, normal);
+    }
     let cap_triangles = ear_clip(&local);
     if cap_triangles.len() != local.len().saturating_sub(2) {
         return None;
@@ -634,6 +712,55 @@ fn edge_finish_profile(
         ));
     }
     Some(profile)
+}
+
+/// The wall that stops a finish sweep leaving `endpoint` along `outward`, if
+/// one does.
+///
+/// Every face meeting at the endpoint carries the boundary's own outward
+/// normal, so a face the departure heads *behind* is a face the departure
+/// would have to cut through. The two faces the finish eats into both contain
+/// the edge, so their normals are square to the axis and never answer here;
+/// what answers is the third face that terminates the edge — a block's end
+/// face, whose normal runs with the departure and lets it leave, or a pocket's
+/// perpendicular wall, which does not. An endpoint another selected edge also
+/// reaches is exempt: the overlap there is the material their mitre is built
+/// from.
+fn terminating_wall(
+    scene: &DebugScene,
+    endpoint: Point3,
+    outward: Vector3,
+    shared_endpoints: &[Point3],
+    epsilon: f64,
+) -> Option<Vector3> {
+    if shared_endpoints
+        .iter()
+        .any(|point| point.distance(endpoint) <= epsilon * 32.0)
+    {
+        return None;
+    }
+    let mut stopper = None::<(f64, Vector3)>;
+    for triangle in &scene.triangles {
+        for (vertex, normal) in triangle.vertices.iter().zip(&triangle.normals) {
+            if internal_point(*vertex).distance(endpoint) > epsilon * 32.0 {
+                continue;
+            }
+            let normal = Vector3::new(normal.x, normal.y, normal.z);
+            let length = normal.length();
+            if length <= epsilon {
+                continue;
+            }
+            let normal = normal / length;
+            let alignment = normal.dot(outward);
+            if alignment >= -1.0e-6 {
+                continue;
+            }
+            if stopper.is_none_or(|(nearest, _)| alignment < nearest) {
+                stopper = Some((alignment, normal));
+            }
+        }
+    }
+    stopper.map(|(_, normal)| normal)
 }
 
 fn edge_inward_directions(
@@ -1063,17 +1190,18 @@ fn ear_clip(points: &[Point2]) -> Vec<[usize; 3]> {
     let mut remaining = (0..points.len()).collect::<Vec<_>>();
     let mut triangles = Vec::new();
     while remaining.len() > 3 {
-        let mut ear = None;
+        let mut best_ear = None::<usize>;
+        let mut best_area = 0.0_f64;
         for current in 0..remaining.len() {
             let previous = (current + remaining.len() - 1) % remaining.len();
             let next = (current + 1) % remaining.len();
             let triangle = [remaining[previous], remaining[current], remaining[next]];
-            if signed_area(
+            let area = signed_area(
                 points[triangle[0]],
                 points[triangle[1]],
                 points[triangle[2]],
-            ) <= 0.0
-            {
+            );
+            if area <= 1.0e-12 {
                 continue;
             }
             if remaining.iter().copied().any(|candidate| {
@@ -1082,13 +1210,27 @@ fn ear_clip(points: &[Point2]) -> Vec<[usize; 3]> {
             }) {
                 continue;
             }
-            ear = Some((current, triangle));
-            break;
+            if area > best_area {
+                best_area = area;
+                best_ear = Some(current);
+            }
         }
-        let Some((index, triangle)) = ear else {
+        let Some(index) = best_ear.or_else(|| {
+            for current in 0..remaining.len() {
+                let previous = (current + remaining.len() - 1) % remaining.len();
+                let next = (current + 1) % remaining.len();
+                let triangle = [remaining[previous], remaining[current], remaining[next]];
+                if signed_area(points[triangle[0]], points[triangle[1]], points[triangle[2]]) > 0.0 {
+                    return Some(current);
+                }
+            }
+            None
+        }) else {
             return Vec::new();
         };
-        triangles.push(triangle);
+        let previous = (index + remaining.len() - 1) % remaining.len();
+        let next = (index + 1) % remaining.len();
+        triangles.push([remaining[previous], remaining[index], remaining[next]]);
         remaining.remove(index);
     }
     if remaining.len() == 3 {
@@ -1114,11 +1256,63 @@ fn topology_from_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Option<Topolo
     topology_from_polygons_with_heal_limit(polygons, epsilon, None)
 }
 
+fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {
+    let mut result = Vec::with_capacity(polygons.len());
+    for polygon in polygons {
+        if polygon.vertices.len() <= 3 {
+            result.push(polygon);
+            continue;
+        }
+        let Some(plane) = SplitPlane::from_points(&polygon.vertices, epsilon * epsilon) else {
+            result.push(polygon);
+            continue;
+        };
+        let p0 = polygon.vertices[0];
+        let Some(u) = polygon.vertices.iter().skip(1).find_map(|p| {
+            let d = *p - p0;
+            (d.length() > epsilon).then(|| d / d.length())
+        }) else {
+            result.push(polygon);
+            continue;
+        };
+        let v = plane.normal.cross(u);
+        let planar_frame = Plane::new(p0, u, v);
+        let planar_error = polygon
+            .vertices
+            .iter()
+            .map(|p| ((*p - p0).dot(plane.normal)).abs())
+            .fold(0.0_f64, f64::max);
+        if planar_error > (epsilon * 1.0e-4).max(1.0e-12) {
+            let projected = polygon
+                .vertices
+                .iter()
+                .map(|p| planar_frame.project(*p))
+                .collect::<Vec<_>>();
+            let triangles = ear_clip(&projected);
+            if triangles.len() == polygon.vertices.len().saturating_sub(2) {
+                for tri in triangles {
+                    if let Some(fragment) = Polygon::new(
+                        tri.map(|i| polygon.vertices[i]).to_vec(),
+                        polygon.role,
+                        epsilon,
+                    ) {
+                        result.push(fragment);
+                    }
+                }
+                continue;
+            }
+        }
+        result.push(polygon);
+    }
+    result
+}
+
 fn topology_from_polygons_with_heal_limit(
     polygons: Vec<Polygon>,
     epsilon: f64,
     maximum_healed_cycle_span: Option<f64>,
 ) -> Option<Topology> {
+    let polygons = split_non_planar_polygons(polygons, epsilon);
     let polygons = conform_polygon_edges(polygons, epsilon);
     let mut pending = VecDeque::from(polygons);
     let mut topology = Topology::default();
@@ -1143,7 +1337,15 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .copied()
             .map(|point| {
-                let key = quantized_key(point, epsilon);
+                let key = welded_key(
+                    |key| {
+                        vertex_map
+                            .get(key)
+                            .map(|key| topology.vertices[key.0].value.point)
+                    },
+                    point,
+                    epsilon,
+                );
                 *vertex_map.entry(key).or_insert_with(|| {
                     let vertex_key = VertexKey(topology.vertices.len());
                     topology.vertices.push(Record {
@@ -1205,20 +1407,7 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .map(|point| ((*point - points[0]).dot(normal)).abs())
             .fold(0.0_f64, f64::max);
-        if points.len() > 3 && planar_error > (epsilon * 1.0e-4).max(1.0e-12) {
-            let triangles = ear_clip(&projected);
-            if triangles.len() != points.len().saturating_sub(2) {
-                continue;
-            }
-            for triangle in triangles.into_iter().rev() {
-                if let Some(fragment) = Polygon::new(
-                    triangle.map(|index| points[index]).to_vec(),
-                    polygon.role,
-                    epsilon,
-                ) {
-                    pending.push_front(fragment);
-                }
-            }
+        if points.len() > 3 && planar_error > (epsilon * 1.0e-2).max(1.0e-7) {
             continue;
         }
         let twice_area = projected
@@ -1394,8 +1583,6 @@ fn heal_planar_boundary_cycles(
             .then(|| find_undirected_boundary_cycle(&boundary, &unused, seed))
             .flatten();
         if !directed && fallback.is_none() {
-            // This connected remainder is genuinely open rather than a set
-            // of closed transition loops; leave it for validation to reject.
             break;
         }
         if let Some((fallback_path, _)) = &fallback {
@@ -1458,30 +1645,16 @@ fn heal_planar_boundary_cycles(
             );
         }
         for triangle in triangles {
-            let triangle_points = triangle.map(|index| projected[index]);
-            let twice_area = triangle_points[0].x.mul_add(
-                triangle_points[1].y - triangle_points[2].y,
-                triangle_points[1].x.mul_add(
-                    triangle_points[2].y - triangle_points[0].y,
-                    triangle_points[2].x * (triangle_points[0].y - triangle_points[1].y),
-                ),
-            );
-            if !twice_area.is_finite() || twice_area.abs() <= epsilon * epsilon {
-                continue;
-            }
             let model_triangle = triangle.map(|index| points[index]);
             let triangle_u = model_triangle[1] - model_triangle[0];
             let triangle_cross = triangle_u.cross(model_triangle[2] - model_triangle[0]);
-            if triangle_u.length() <= epsilon || triangle_cross.length() <= epsilon * epsilon {
-                continue;
-            }
-            let triangle_u = triangle_u / triangle_u.length();
-            let triangle_normal = triangle_cross / triangle_cross.length();
-            let triangle_plane = Plane::new(
-                model_triangle[0],
-                triangle_u,
-                triangle_normal.cross(triangle_u),
-            );
+            let triangle_plane = if triangle_u.length() > epsilon && triangle_cross.length() > epsilon * epsilon {
+                let u = triangle_u / triangle_u.length();
+                let normal = triangle_cross / triangle_cross.length();
+                Plane::new(model_triangle[0], u, normal.cross(u))
+            } else {
+                plane
+            };
             let mut coedges = Vec::with_capacity(3);
             for side in 0..3 {
                 let start = cycle[triangle[side]].0;
@@ -1515,8 +1688,8 @@ fn heal_planar_boundary_cycles(
                         edge,
                         orientation,
                         [
-                            triangle_plane.project(points[triangle[side]]),
-                            triangle_plane.project(points[triangle[(side + 1) % 3]]),
+                            triangle_plane.project(model_triangle[side]),
+                            triangle_plane.project(model_triangle[(side + 1) % 3]),
                         ],
                     ),
                 });
@@ -1534,7 +1707,7 @@ fn heal_planar_boundary_cycles(
                     surface: Surface::Plane(triangle_plane),
                     outer_loop: loop_key,
                     inner_loops: Vec::new(),
-                    role: FaceRole::FeatureSide(u32::MAX),
+                    role: FaceRole::FeatureEnd,
                 },
             });
             shell_faces.push(face_key);
@@ -1788,9 +1961,8 @@ fn find_boundary_cycle(
 fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {
     let mut unique = BTreeMap::<[i64; 3], Point3>::new();
     for point in polygons.iter().flat_map(|polygon| &polygon.vertices) {
-        unique
-            .entry(quantized_key(*point, epsilon))
-            .or_insert(*point);
+        let key = welded_key(|key| unique.get(key).copied(), *point, epsilon);
+        unique.entry(key).or_insert(*point);
     }
     let candidates = unique.into_values().collect::<Vec<_>>();
     for polygon in &mut polygons {
@@ -1823,6 +1995,55 @@ fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
         polygon.vertices = conformed;
     }
     polygons
+}
+
+/// The bucket a point should weld into, given the buckets already occupied.
+///
+/// Rounding each coordinate onto an `epsilon` grid decides "these are the same
+/// point" with a hard boundary, and the boundary does not care how close the
+/// two points are. Two evaluations of one intersection which differ in the
+/// last bit share a bucket almost everywhere, and fall either side of one
+/// exactly when the coordinate lands on a half-bucket — which the offsets a
+/// finish sweep is built from, being whole multiples of `epsilon`, arrange
+/// rather often. The two spellings then publish two vertices a nanometre
+/// apart, and every face meeting there is torn into two single-use edges: an
+/// open shell the validator rejects, from a body that was closed.
+///
+/// So read the grid as a hint rather than as the answer. A point within
+/// `epsilon` of another is at most one bucket away on each axis, so look at
+/// those neighbours and weld to the nearest representative genuinely inside
+/// the tolerance. A point with no such neighbour keeps its own bucket, so this
+/// only ever repairs a straddle; it never merges two points the grid had
+/// already told apart by more than the tolerance.
+fn welded_key(
+    occupant: impl Fn(&[i64; 3]) -> Option<Point3>,
+    point: Point3,
+    epsilon: f64,
+) -> [i64; 3] {
+    let key = quantized_key(point, epsilon);
+    if occupant(&key).is_some() {
+        return key;
+    }
+    let mut nearest = None::<([i64; 3], f64)>;
+    for x in -1..=1_i64 {
+        for y in -1..=1_i64 {
+            for z in -1..=1_i64 {
+                if [x, y, z] == [0, 0, 0] {
+                    continue;
+                }
+                let neighbour = [key[0] + x, key[1] + y, key[2] + z];
+                let Some(occupied) = occupant(&neighbour) else {
+                    continue;
+                };
+                let separation = occupied.distance(point);
+                if separation <= epsilon && nearest.is_none_or(|(_, closest)| separation < closest)
+                {
+                    nearest = Some((neighbour, separation));
+                }
+            }
+        }
+    }
+    nearest.map_or(key, |(neighbour, _)| neighbour)
 }
 
 fn quantized_key(point: Point3, epsilon: f64) -> [i64; 3] {

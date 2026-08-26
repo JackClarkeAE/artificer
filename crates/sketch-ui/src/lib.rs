@@ -9616,7 +9616,6 @@ pub fn show_with_context(
         .flatten();
     state.update_trim_hover(trim_hover_point, 8.0 / state.view.points_per_unit);
     let region_hover_point = (state.exact_tool == ToolVariant::Select
-        && state.hovered.is_none()
         && !pointer_over_dimension)
         .then(|| {
             response
@@ -9676,36 +9675,42 @@ pub fn show_with_context(
         } else {
             match state.tool {
                 SketchTool::Select => {
-                    let selected = hit_test_entities(
-                        &state.entities,
-                        state.view,
-                        response.rect,
-                        position,
-                        entity_pick_radius,
-                    );
+                    let sketch_pt = state.view.screen_to_sketch(response.rect, position);
                     let additive = ui.input(|input| input.modifiers.shift);
-                    if let Some(selected) = selected {
-                        selection_changed = state.set_selected(Some(selected));
-                        if !additive {
-                            selection_changed |= state.clear_selected_regions();
-                        }
-                        // Picking is the whole Dimension gesture: the first
-                        // driving box takes the caret so "click the curve, type
-                        // 3, Enter" never leaves the canvas. This deliberately
-                        // does not read `selection_changed`, so re-picking a
-                        // curve that is already selected re-arms it. A staged
-                        // candidate owns the boxes, so it is left alone.
-                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
-                            state.dimension_pick =
-                                Some(state.view.screen_to_sketch(response.rect, position));
-                            state.focus_dimension_box = first_armed_dimension_kind(state);
-                        }
-                    } else {
+                    let hovered_region = state.analytic_regions.hovered.clone();
+                    if hovered_region.is_some() {
                         selection_changed = state.set_selected(None);
-                        selection_changed |= state.select_region_at_point(
-                            state.view.screen_to_sketch(response.rect, position),
-                            additive,
+                        selection_changed |= state.select_region_at_point(sketch_pt, additive);
+                    } else {
+                        let selected = hit_test_entities(
+                            &state.entities,
+                            state.view,
+                            response.rect,
+                            position,
+                            entity_pick_radius,
                         );
+                        if let Some(selected) = selected {
+                            selection_changed = state.set_selected(Some(selected));
+                            if !additive {
+                                selection_changed |= state.clear_selected_regions();
+                            }
+                            // Picking is the whole Dimension gesture: the first
+                            // driving box takes the caret so "click the curve, type
+                            // 3, Enter" never leaves the canvas. This deliberately
+                            // does not read `selection_changed`, so re-picking a
+                            // curve that is already selected re-arms it. A staged
+                            // candidate owns the boxes, so it is left alone.
+                            if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+                                state.dimension_pick = Some(sketch_pt);
+                                state.focus_dimension_box = first_armed_dimension_kind(state);
+                            }
+                        } else {
+                            selection_changed = state.set_selected(None);
+                            selection_changed |= state.select_region_at_point(
+                                sketch_pt,
+                                additive,
+                            );
+                        }
                     }
                 }
                 SketchTool::Point
@@ -10517,6 +10522,8 @@ fn paint_entities(
             (sketch_colours().hovered, 2.2)
         } else if entity.role == SketchEntityRole::Construction {
             (sketch_colours().construction, 1.45)
+        } else if matches!(entity.geometry, SketchGeometry::Point(_)) {
+            (sketch_colours().entity.gamma_multiply(0.4), 1.7)
         } else {
             (sketch_colours().entity, 1.7)
         };
@@ -11169,17 +11176,6 @@ const fn canvas_dimensionable_keys(recipe: &CoreRecipe) -> &'static [&'static st
 
 /// The recipe literal a committed dimension box drives, if the Dimension tool
 /// has armed one.
-///
-/// The Dimension tool owns no session of its own: it edits the selected
-/// feature's persistent recipe through the same authoritative path the
-/// Properties field uses, so a box becomes a real field only where that
-/// literal actually exists. A point, a plain line, or a free arc measures
-/// itself — nothing in its recipe drives that number — and its box stays an
-/// honest read-only label.
-///
-/// The key/kind pairing is unambiguous because the committed branch derives
-/// its phase from `dimension_phase_for_geometry`, which never yields the
-/// slot phases that reuse `"width"`.
 fn committed_dimension_parameter(
     state: &SketchCanvasState,
     kind: SketchDimensionKind,
@@ -11192,9 +11188,8 @@ fn committed_dimension_parameter(
         SketchDimensionKind::Height => "height",
         SketchDimensionKind::Diameter => "diameter",
         SketchDimensionKind::Radius => "radius",
-        // A line calls it "length"; a polygon edge is one of n equal "side"s.
-        // Both are the same question asked of the shape the user clicked, so
-        // the kind resolves to whichever key that shape actually offers.
+        // A line calls it "length"; a polygon edge is one of n equal "side"s;
+        // a slot calls it "overall_length" or "centre_distance".
         SketchDimensionKind::Length => "length",
         SketchDimensionKind::AngleDegrees => "angle",
         _ => return None,
@@ -11206,7 +11201,32 @@ fn committed_dimension_parameter(
             .iter()
             .any(|parameter| parameter.stable_key == "length")
     {
-        "side"
+        if editor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.stable_key == "overall_length")
+        {
+            "overall_length"
+        } else if editor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.stable_key == "centre_distance")
+        {
+            "centre_distance"
+        } else {
+            "side"
+        }
+    } else if (stable_key == "radius" || stable_key == "diameter")
+        && !editor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.stable_key == stable_key)
+        && editor
+            .parameters
+            .iter()
+            .any(|parameter| parameter.stable_key == "width")
+    {
+        "width"
     } else {
         stable_key
     };
@@ -11452,6 +11472,38 @@ fn committed_dimension_annotation_layouts(
                     let radius = (rim.u - center.u).hypot(rim.v - center.v);
                     if radius.is_finite() && radius > 0.0 {
                         dressed.push((SketchDimensionKind::Diameter, geometry, radius * 2.0));
+                    }
+                }
+            }
+            CoreRecipe::TwoPointSlot { width, .. } => {
+                if let CoreValue::Literal(w) = width {
+                    if let Some(arc) = entities
+                        .iter()
+                        .find(|e| matches!(e.geometry, SketchGeometry::Arc { .. }))
+                    {
+                        dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
+                    }
+                }
+            }
+            CoreRecipe::CentreOuterPointSlot {
+                overall_length,
+                width,
+                ..
+            } => {
+                if let CoreValue::Literal(w) = width {
+                    if let Some(arc) = entities
+                        .iter()
+                        .find(|e| matches!(e.geometry, SketchGeometry::Arc { .. }))
+                    {
+                        dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
+                    }
+                }
+                if let CoreValue::Literal(l) = overall_length {
+                    if let Some(seg) = entities
+                        .iter()
+                        .find(|e| matches!(e.geometry, SketchGeometry::Segment { .. }))
+                    {
+                        dressed.push((SketchDimensionKind::Length, seg.geometry, l.get()));
                     }
                 }
             }

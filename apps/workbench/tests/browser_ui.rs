@@ -205,10 +205,32 @@ fn the_sketch_row_menu_exports_a_dxf() {
     right_click_button(&mut harness, "Select Sketch 1");
     click_button(&mut harness, "Export this sketch as DXF");
 
-    let exported = root.join("part.sketch-1.dxf");
+    // The command proposes a destination beside the document rather than
+    // writing somewhere unannounced, and nothing is written until asked.
+    let proposed = harness
+        .state()
+        .export_destination()
+        .expect("the export dialog should be open");
+    assert_eq!(proposed.parent(), Some(root.as_path()), "{proposed:?}");
+    assert_eq!(
+        proposed.extension().and_then(|kind| kind.to_str()),
+        Some("dxf")
+    );
+
+    let exported = root.join("chosen.dxf");
+    harness.state_mut().set_export_destination(&exported);
+    click_button(&mut harness, "Export");
+
     let text = std::fs::read_to_string(&exported).expect("the DXF should exist");
     assert!(text.contains("LINE"), "{text}");
     assert!(text.trim_end().ends_with("EOF"));
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("Exported to")),
+        "the export should confirm where it went"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -228,7 +250,14 @@ fn the_body_row_menu_exports_that_body_alone() {
     right_click_button(&mut harness, BODY_ONE_ROW);
     click_button(&mut harness, EXPORT_BODY_STL);
 
-    let exported = root.join("part.body-1.stl");
+    let exported = root.join("part-body-1.stl");
+    assert_eq!(
+        harness.state().export_destination().as_deref(),
+        Some(exported.as_path()),
+        "the dialog should propose the body's own file beside the document"
+    );
+    click_button(&mut harness, "Export");
+
     let text = std::fs::read_to_string(&exported).expect("the STL should exist");
     assert!(text.starts_with("solid Artificer"));
     let _ = std::fs::remove_dir_all(root);

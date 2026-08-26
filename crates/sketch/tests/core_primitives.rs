@@ -68,7 +68,7 @@ fn all_creation_recipes_have_deterministic_atomic_output_counts() {
                 width: signed(8.0),
                 height: signed(4.0),
             },
-            4,
+            5,
             4,
         ),
         (
@@ -134,7 +134,7 @@ fn all_creation_recipes_have_deterministic_atomic_output_counts() {
                 second_cap_center: point(4.0, 0.0),
                 width: length(2.0),
             },
-            6,
+            7,
             4,
         ),
         (
@@ -292,6 +292,7 @@ fn semantic_point_roles_do_not_depend_on_display_order() {
             PointOutputRole::Corner(1),
             PointOutputRole::Corner(2),
             PointOutputRole::Corner(3),
+            PointOutputRole::Center,
         ])
     );
 }
