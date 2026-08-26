@@ -27,7 +27,12 @@ crate_version="$(cargo pkgid --manifest-path "${workspace_dir}/Cargo.toml" \
 version="${1:-${crate_version}}"
 version="${version#v}"
 if printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+$'; then
-    version="${version}.0"
+    decl_compact="$(printf '%s' "${crate_version}" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')"
+    if [ "${version}" = "${decl_compact}" ]; then
+        version="${crate_version}"
+    else
+        version="${version}.0"
+    fi
 fi
 
 if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$'; then
