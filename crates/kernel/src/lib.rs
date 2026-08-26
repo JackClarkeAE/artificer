@@ -2468,6 +2468,9 @@ fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
                     continue;
                 };
                 let continuation = -incoming.dot(outgoing);
+                if continuation < 0.5 {
+                    continue;
+                }
                 if best.is_none_or(|(score, edge_index)| {
                     continuation > score + 1.0e-12
                         || ((continuation - score).abs() <= 1.0e-12 && candidate < edge_index)
@@ -2506,9 +2509,6 @@ fn presentation_prismatic_feature_roles(topology: &Topology) -> BTreeSet<u32> {
         else {
             continue;
         };
-        if role >= u32::MAX - 1 {
-            continue;
-        }
         let length = plane.normal.length();
         if !length.is_finite() || length <= f64::EPSILON {
             continue;
@@ -2726,7 +2726,7 @@ fn presentation_edge_classification(
     // dihedral. Harder, differently-owned patch intersections remain real
     // visible/selectable rails and can host a successor finish.
     let normal_dot = first_normal.dot(second_normal).abs();
-    let low_dihedral = normal_dot >= 5.0_f64.to_radians().cos();
+    let low_dihedral = normal_dot >= 15.0_f64.to_radians().cos();
     let approximation_strip = |face_index: usize| {
         matches!(topology.faces[face_index].value.surface, Surface::Plane(_))
             && matches!(
@@ -2739,9 +2739,7 @@ fn presentation_edge_classification(
         topology.faces[*first].value.role,
         topology.faces[*second].value.role,
     ) {
-        (FaceRole::FeatureSide(first), FaceRole::FeatureSide(second))
-            if first == second && first < u32::MAX - 1 =>
-        {
+        (FaceRole::FeatureSide(first), FaceRole::FeatureSide(second)) if first == second => {
             Some(first)
         }
         _ => None,
@@ -3019,7 +3017,13 @@ impl ChordBudget {
         let tolerance = match self {
             Self::Authoritative => authoritative,
             Self::Display => display,
-            Self::DisplayScaled(scale) => display * scale.clamp(1.0, 64.0),
+            Self::DisplayScaled(scale) => {
+                if scale < 1.0 {
+                    (display * scale.clamp(0.25, 1.0)).max(authoritative)
+                } else {
+                    display * scale.clamp(1.0, 64.0)
+                }
+            }
         };
         tolerance.min(radius)
     }
@@ -3038,7 +3042,12 @@ fn arc_subdivisions(
         (2.0 * (1.0 - tolerance / radius).acos()).max(precision.angular_agreement_radians)
     };
     let requested = (sweep.abs() / maximum_angle).ceil() as usize;
-    let minimum = (sweep.abs() / std::f64::consts::FRAC_PI_4).ceil() as usize;
+    let minimum = match budget {
+        ChordBudget::DisplayScaled(scale) if scale <= 0.5 => {
+            (sweep.abs() / (std::f64::consts::TAU / 128.0)).ceil() as usize
+        }
+        _ => (sweep.abs() / std::f64::consts::FRAC_PI_4).ceil() as usize,
+    };
     let maximum = 1_usize << precision.max_subdivisions.min(12);
     requested.max(minimum).max(1).min(maximum)
 }

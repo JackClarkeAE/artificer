@@ -817,6 +817,9 @@ pub fn edge_finish_live_frame(
             .all(|existing| dot_product(*existing, direction).abs() < 1.0 - 1.0e-6)
         {
             inward.push(direction);
+            if inward.len() == 2 {
+                break;
+            }
         }
     }
     let &[mut u, mut v] = inward.as_slice() else {
@@ -1749,8 +1752,12 @@ fn show_document_impl(
             .find(|body| body.key == key)
             .and_then(|body| body.tint)
     };
+    let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
     for triangle in &triangles {
+        if !visible_rect.intersects(triangle.screen_bounds) {
+            continue;
+        }
         // One colour per vertex, so the mesh rasteriser interpolates the exact
         // carrier shading across the facet. A cylinder's wall is the same
         // triangle count it always was and no longer bands.
@@ -3042,6 +3049,10 @@ fn paint_edges(
             continue;
         }
         if edge.visible != visible_pass {
+            continue;
+        }
+        let edge_bounds = Rect::from_two_pos(edge.screen[0], edge.screen[1]).expand(16.0);
+        if !painter.clip_rect().intersects(edge_bounds) {
             continue;
         }
         let segments = groups

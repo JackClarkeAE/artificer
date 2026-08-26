@@ -1726,6 +1726,8 @@ struct HydratedWorkbenchRuntime {
 struct FaceSketchDisplayContext {
     fit_key: SketchContextFitKey,
     axis_labels: [&'static str; 2],
+    raw_triangles: Vec<(f64, SketchContextTriangle)>,
+    raw_edges: Vec<(f64, SketchContextEdge)>,
     triangles: Vec<SketchContextTriangle>,
     edges: Vec<SketchContextEdge>,
     boundary: Vec<SketchPoint>,
@@ -1745,6 +1747,26 @@ struct PendingFaceSketch {
 }
 
 impl FaceSketchDisplayContext {
+    fn update_filtered_geometry(&mut self, enabled: bool, max_depth: f64) {
+        if !enabled {
+            self.triangles.clear();
+            self.edges.clear();
+        } else {
+            self.triangles = self
+                .raw_triangles
+                .iter()
+                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
+                .map(|(_, tri)| *tri)
+                .collect();
+            self.edges = self
+                .raw_edges
+                .iter()
+                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
+                .map(|(_, edge)| *edge)
+                .collect();
+        }
+    }
+
     fn viewport_context(&self) -> SketchViewportContext<'_> {
         SketchViewportContext::new(&self.triangles, &self.edges)
             .with_selected_face(&self.boundary, self.fit_key)
@@ -1862,6 +1884,8 @@ pub struct KernelLabApp {
     selected_origin_plane: SketchPlane,
     sketch_support: SketchSupport,
     face_sketch_context: Option<FaceSketchDisplayContext>,
+    project_3d_body_context: bool,
+    project_3d_body_depth: f64,
     sketches: Vec<WorkbenchSketch>,
     active_sketch_index: Option<usize>,
     sketch: SketchCanvasState,
@@ -2032,6 +2056,8 @@ impl Default for KernelLabApp {
             selected_origin_plane: SketchPlane::XY,
             sketch_support: SketchSupport::default(),
             face_sketch_context: None,
+            project_3d_body_context: true,
+            project_3d_body_depth: 50.0,
             sketches: Vec::new(),
             active_sketch_index: None,
             sketch: SketchCanvasState::default(),
@@ -2998,6 +3024,24 @@ impl KernelLabApp {
     #[must_use]
     pub const fn sketch_is_face_supported(&self) -> bool {
         matches!(self.sketch_support, SketchSupport::PlanarFace { .. })
+    }
+
+    #[must_use]
+    pub const fn project_3d_body_context(&self) -> bool {
+        self.project_3d_body_context
+    }
+
+    pub fn set_project_3d_body_context(&mut self, enabled: bool) {
+        self.project_3d_body_context = enabled;
+    }
+
+    #[must_use]
+    pub const fn project_3d_body_depth(&self) -> f64 {
+        self.project_3d_body_depth
+    }
+
+    pub fn set_project_3d_body_depth(&mut self, depth: f64) {
+        self.project_3d_body_depth = depth.max(0.0);
     }
 
     fn sketch_support_is_current(&self) -> bool {
@@ -4976,7 +5020,9 @@ impl KernelLabApp {
             return false;
         }
         if self.workbench_mode == WorkbenchMode::Sketch {
-            return true;
+            return self.sketch.has_pending_edit()
+                || self.sketch.creation_draft_blocks_modeling()
+                || self.sketch.can_undo_local();
         }
         self.document.can_undo()
     }
@@ -4996,13 +5042,22 @@ impl KernelLabApp {
             return false;
         }
         if self.workbench_mode == WorkbenchMode::Sketch {
-            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(false) {
+            if self.sketch.has_pending_edit() {
+                self.sketch.cancel_pending();
+                self.sketch.clear_creation_draft();
+                self.document_status = Some("Cancelled pending sketch edit".to_owned());
                 return true;
             }
-            self.leave_sketch_mode();
-            self.sketch.clear_creation_draft();
-            self.active_tool = ActiveTool::Select;
-            self.document_status = Some("Undo exited sketch mode".to_owned());
+            if self.sketch.creation_draft_blocks_modeling() {
+                self.sketch.clear_creation_draft();
+                self.document_status = Some("Cancelled sketch gesture".to_owned());
+                return true;
+            }
+            if self.restore_local_sketch_journal(false) {
+                self.document_status = Some("Undid sketch action".to_owned());
+                return true;
+            }
+            self.document_status = Some("No more sketch actions to undo".to_owned());
             return true;
         }
         self.undo_document()
@@ -5013,9 +5068,11 @@ impl KernelLabApp {
             return false;
         }
         if self.workbench_mode == WorkbenchMode::Sketch {
-            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(true) {
+            if self.restore_local_sketch_journal(true) {
+                self.document_status = Some("Redid sketch action".to_owned());
                 return true;
             }
+            self.document_status = Some("No more sketch actions to redo".to_owned());
             return false;
         }
         self.redo_document()
@@ -7022,6 +7079,10 @@ impl KernelLabApp {
             fitted_view,
         } = pending;
         self.face_sketch_context = context;
+        if let Some(context) = &mut self.face_sketch_context {
+            context
+                .update_filtered_geometry(self.project_3d_body_context, self.project_3d_body_depth);
+        }
         let display_plane = sketch_plane_for_frame(support.frame);
         self.sketch = SketchCanvasState::new(display_plane);
         self.active_sketch_tool = ToolVariant::Select;
@@ -10878,11 +10939,10 @@ impl KernelLabApp {
             .filter(|body| include(body))
             .flat_map(|body| {
                 let placement = self.occurrence_transform_for_body(body.id);
-                // Interchange facets are regenerated at the kernel
-                // approximation budget: the retained display scene spends a
-                // coarser presentation chord budget that must never define
-                // exported geometry quality.
-                NativeKernel::authoritative_scene(&body.body.snapshot)
+                // Interchange facets are regenerated at doubled high-density facet resolution (scale 0.5):
+                // the retained display scene spends a coarser presentation chord budget,
+                // while export guarantees smooth surfaces for STEP / STL downstream manufacturing.
+                NativeKernel::display_scene_scaled(&body.body.snapshot, 0.5)
                     .triangles
                     .into_iter()
                     .map(move |triangle| ExportTriangle {
@@ -14401,6 +14461,10 @@ impl KernelLabApp {
     fn sketch_viewport(&mut self, ui: &mut egui::Ui) {
         let available = ui.available_size();
         let canvas_size = egui::vec2((available.x - 14.0).max(1.0), (available.y - 14.0).max(1.0));
+        if let Some(context) = &mut self.face_sketch_context {
+            context
+                .update_filtered_geometry(self.project_3d_body_context, self.project_3d_body_depth);
+        }
         let output = {
             let viewport_context = self
                 .face_sketch_context
@@ -14832,22 +14896,25 @@ impl KernelLabApp {
                     + (bounds.max.z - bounds.min.z).powi(2))
                 .sqrt();
             let screen_radius = radius * points_per_unit;
-            let bucket: u8 = if screen_radius >= 160.0 {
+            let bucket: u8 = if screen_radius >= 320.0 {
                 0
-            } else if screen_radius >= 48.0 {
+            } else if screen_radius >= 120.0 {
                 1
-            } else {
+            } else if screen_radius >= 40.0 {
                 2
+            } else {
+                3
             };
             let entry = self
                 .display_detail_buckets
                 .entry(body.id.get())
-                .or_insert(0);
+                .or_insert(u8::MAX);
             if *entry != bucket {
                 *entry = bucket;
                 let scale = match bucket {
-                    0 => 1.0,
-                    1 => 3.0,
+                    0 => 0.5,
+                    1 => 1.0,
+                    2 => 3.0,
                     _ => 9.0,
                 };
                 body.body.scene = NativeKernel::display_scene_scaled(&body.body.snapshot, scale);
@@ -15345,6 +15412,10 @@ impl KernelLabApp {
                     self.view.rotate_in_plane_quarter_turn(clockwise);
                 }
                 ViewCubeCommand::Isometric => self.reset_view(ui.ctx()),
+                ViewCubeCommand::Drag { delta } => {
+                    self.view
+                        .orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
+                }
             }
             ui.ctx().request_repaint();
         }
@@ -16236,6 +16307,7 @@ enum ViewCubeCommand {
     Face(StandardView),
     Roll { clockwise: bool },
     Isometric,
+    Drag { delta: egui::Vec2 },
 }
 
 fn model_view_cube(
@@ -16254,6 +16326,21 @@ fn model_view_cube(
         },
     );
     let cube_scale = 22.0_f32;
+
+    let cube_bounds = egui::Rect::from_center_size(cube_center, egui::vec2(68.0, 68.0))
+        .intersect(rect.shrink(2.0));
+    let bg_response = ui.interact(
+        cube_bounds,
+        ui.id().with("view-cube-orbit-drag"),
+        egui::Sense::drag(),
+    );
+    let mut command = if bg_response.dragged() {
+        let delta = bg_response.drag_delta();
+        (delta != egui::Vec2::ZERO).then_some(ViewCubeCommand::Drag { delta })
+    } else {
+        None
+    };
+
     let mut visible_faces = view_cube_faces()
         .into_iter()
         .filter_map(|(face, vertices)| {
@@ -16273,7 +16360,6 @@ fn model_view_cube(
     visible_faces.sort_by(|left, right| left.3.total_cmp(&right.3));
 
     let nearest = view.nearest_standard_view();
-    let mut command = None;
     for (face, _, points, facing) in visible_faces {
         let center = points
             .iter()
@@ -16285,7 +16371,7 @@ fn model_view_cube(
         let response = ui.interact(
             hit_rect,
             ui.id().with(("view-cube-face", face.label())),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
         );
         response.widget_info(|| {
             egui::WidgetInfo::labeled(
@@ -16301,7 +16387,7 @@ fn model_view_cube(
         };
         let light = (0.86 + facing as f32 * 0.14).clamp(0.86, 1.0);
         let mut fill = translucent(base.gamma_multiply(light), 235);
-        if response.hovered() {
+        if response.hovered() || response.dragged() {
             fill = blend_color(fill, theme::accent(), 0.30);
         }
         ui.painter().add(egui::Shape::convex_polygon(
@@ -16316,7 +16402,12 @@ fn model_view_cube(
             FontId::monospace(7.0),
             Color32::from_rgb(58, 68, 79),
         );
-        if response.clicked() {
+        if response.dragged() {
+            let delta = response.drag_delta();
+            if delta != egui::Vec2::ZERO {
+                command = Some(ViewCubeCommand::Drag { delta });
+            }
+        } else if response.clicked() {
             command = Some(ViewCubeCommand::Face(face));
         }
     }
@@ -17174,11 +17265,28 @@ fn new_surface_faces(
     candidate: &DebugScene,
     precision: PrecisionPolicy,
 ) -> BTreeSet<EntityRef> {
-    let source_planes = source
-        .triangles
-        .iter()
-        .filter_map(|triangle| presentation_triangle_plane(triangle.vertices))
-        .collect::<Vec<_>>();
+    let distance_tolerance = precision
+        .linear_agreement
+        .max(precision.modeling_resolution)
+        .max(1.0e-9)
+        * 64.0;
+    let mut source_planes = Vec::<([f64; 3], f64)>::new();
+    for triangle in &source.triangles {
+        if let Some((normal, offset)) = presentation_triangle_plane(triangle.vertices) {
+            let exists = source_planes
+                .iter()
+                .any(|(existing_normal, existing_offset)| {
+                    let dot = normal[0].mul_add(
+                        existing_normal[0],
+                        normal[1].mul_add(existing_normal[1], normal[2] * existing_normal[2]),
+                    );
+                    dot >= 1.0 - 1.0e-10 && (offset - existing_offset).abs() <= distance_tolerance
+                });
+            if !exists {
+                source_planes.push((normal, offset));
+            }
+        }
+    }
     let mut candidate_planes = BTreeMap::<EntityRef, Vec<([f64; 3], f64)>>::new();
     for triangle in &candidate.triangles {
         if let Some(plane) = presentation_triangle_plane(triangle.vertices) {
@@ -17188,11 +17296,6 @@ fn new_surface_faces(
                 .push(plane);
         }
     }
-    let distance_tolerance = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-9)
-        * 64.0;
     candidate_planes
         .into_iter()
         .filter_map(|(face, planes)| {
@@ -18439,7 +18542,7 @@ fn project_face_sketch_context(
     support: &PlanarFaceSupport,
 ) -> Option<FaceSketchDisplayContext> {
     let projection = FaceSketchProjection::from_frame(support.frame)?;
-    let mut projected_triangles = scene
+    let projected_triangles = scene
         .triangles
         .iter()
         .filter_map(|triangle| {
@@ -18468,22 +18571,33 @@ fn project_face_sketch_context(
             Some((depth, vertex_depths, SketchContextTriangle::new(vertices)))
         })
         .collect::<Vec<_>>();
-    projected_triangles.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let raw_triangles: Vec<(f64, SketchContextTriangle)> = projected_triangles
+        .iter()
+        .map(|(depth, _, triangle)| (depth.abs(), *triangle))
+        .collect();
 
-    let edges = scene
+    let raw_edges: Vec<(f64, SketchContextEdge)> = scene
         .edges
         .iter()
         .filter_map(|edge| {
             let endpoints = edge.endpoints.map(|point| projection.project(point));
             let endpoints = [endpoints[0]?, endpoints[1]?];
+            let edge_depth = (endpoints[0].1.abs() + endpoints[1].1.abs()) * 0.5;
             projected_triangles
                 .iter()
                 .any(|(_, depths, triangle)| {
                     projected_edge_matches_triangle(endpoints, triangle.vertices, *depths)
                 })
-                .then_some(SketchContextEdge::new([endpoints[0].0, endpoints[1].0]))
+                .then_some((
+                    edge_depth,
+                    SketchContextEdge::new([endpoints[0].0, endpoints[1].0]),
+                ))
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    let triangles = raw_triangles.iter().map(|(_, tri)| *tri).collect();
+    let edges = raw_edges.iter().map(|(_, edge)| *edge).collect();
+
     let boundary = support
         .boundary
         .iter()
@@ -18518,10 +18632,9 @@ fn project_face_sketch_context(
             dominant_axis_label(support.frame.u).unwrap_or("U"),
             dominant_axis_label(support.frame.v).unwrap_or("V"),
         ],
-        triangles: projected_triangles
-            .into_iter()
-            .map(|(_, _, triangle)| triangle)
-            .collect(),
+        raw_triangles,
+        raw_edges,
+        triangles,
         edges,
         boundary,
         inner_boundaries,
@@ -19127,6 +19240,24 @@ mod view_cube_arrow_tests {
                 "an arrow should never point at the face already facing the viewer"
             );
         }
+    }
+
+    #[test]
+    fn view_cube_drag_command_orbits_view() {
+        let mut view = ViewState::default();
+        let initial_yaw = view.yaw;
+        let initial_pitch = view.pitch;
+        let command = ViewCubeCommand::Drag {
+            delta: egui::vec2(50.0, 30.0),
+        };
+        match command {
+            ViewCubeCommand::Drag { delta } => {
+                view.orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
+            }
+            _ => panic!("expected Drag command"),
+        }
+        assert!((view.yaw - initial_yaw).abs() > 0.01);
+        assert!((view.pitch - initial_pitch).abs() > 0.01);
     }
 }
 
@@ -21905,6 +22036,60 @@ mod extrusion_workbench_tests {
             6
         );
         assert!(restored.document.sketch_payload(sketch_id, 6).is_some());
+    }
+
+    #[test]
+    fn sketch_mode_undo_redo_steps_through_actions_without_exiting_sketch() {
+        let mut app = KernelLabApp::default();
+        app.enter_sketch_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+
+        let p1 = point(0.0, 0.0);
+        let p2 = point(10.0, 0.0);
+        let p3 = point(10.0, 10.0);
+
+        let entity1 = app
+            .sketch
+            .stage_geometry(SketchGeometry::segment(p1, p2))
+            .expect("stage segment 1");
+        app.commit_sketch_stroke(entity1);
+
+        let entity2 = app
+            .sketch
+            .stage_geometry(SketchGeometry::segment(p2, p3))
+            .expect("stage segment 2");
+        app.commit_sketch_stroke(entity2);
+
+        assert_eq!(app.sketch.entities().len(), 2);
+        assert!(app.can_undo());
+
+        // Undo 2nd stroke
+        assert!(app.handle_undo());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert_eq!(app.sketch.entities().len(), 1);
+
+        // Undo 1st stroke
+        assert!(app.handle_undo());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert_eq!(app.sketch.entities().len(), 0);
+
+        // Further undo should NOT exit sketch mode
+        assert!(app.handle_undo());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert_eq!(
+            app.document_status.as_deref(),
+            Some("No more sketch actions to undo")
+        );
+
+        // Redo 1st stroke
+        assert!(app.handle_redo());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert_eq!(app.sketch.entities().len(), 1);
+
+        // Redo 2nd stroke
+        assert!(app.handle_redo());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert_eq!(app.sketch.entities().len(), 2);
     }
 
     #[test]

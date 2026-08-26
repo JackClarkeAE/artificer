@@ -800,18 +800,345 @@ impl SketchGeometry {
         Some(SketchDisplayPolyline { points, closed })
     }
 
+    /// The center or midpoint of the sketch geometry, if well-defined.
+    #[must_use]
+    pub fn center(self) -> Option<SketchPoint> {
+        match self {
+            Self::Point(point) => Some(point),
+            Self::Segment { start, end } => Some(SketchPoint::new(
+                (start.u + end.u) * 0.5,
+                (start.v + end.v) * 0.5,
+            )),
+            Self::Rectangle { first, opposite } => Some(SketchPoint::new(
+                (first.u + opposite.u) * 0.5,
+                (first.v + opposite.v) * 0.5,
+            )),
+            Self::Circle { center, .. } => Some(center),
+            Self::Arc { center, .. } => Some(center),
+        }
+    }
+
+    /// Translates the sketch geometry by the given delta in sketch plane coordinates.
+    #[must_use]
+    pub fn translate(self, delta_u: f64, delta_v: f64) -> Self {
+        match self {
+            Self::Point(p) => Self::Point(SketchPoint::new(p.u + delta_u, p.v + delta_v)),
+            Self::Segment { start, end } => Self::Segment {
+                start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
+                end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+            },
+            Self::Rectangle { first, opposite } => Self::Rectangle {
+                first: SketchPoint::new(first.u + delta_u, first.v + delta_v),
+                opposite: SketchPoint::new(opposite.u + delta_u, opposite.v + delta_v),
+            },
+            Self::Circle { center, rim } => Self::Circle {
+                center: SketchPoint::new(center.u + delta_u, center.v + delta_v),
+                rim: SketchPoint::new(rim.u + delta_u, rim.v + delta_v),
+            },
+            Self::Arc { center, start, end } => Self::Arc {
+                center: SketchPoint::new(center.u + delta_u, center.v + delta_v),
+                start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
+                end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+            },
+        }
+    }
+
+    /// Reshapes the sketch geometry using the specified drag handle and coordinate delta.
+    #[must_use]
+    pub fn reshape(self, handle: SketchDragHandle, delta_u: f64, delta_v: f64) -> Self {
+        match (self, handle) {
+            (_, SketchDragHandle::Translate) => self.translate(delta_u, delta_v),
+            (Self::Point(p), _) => Self::Point(SketchPoint::new(p.u + delta_u, p.v + delta_v)),
+            (Self::Segment { start, end }, SketchDragHandle::StartPoint) => Self::Segment {
+                start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
+                end,
+            },
+            (Self::Segment { start, end }, SketchDragHandle::EndPoint) => Self::Segment {
+                start,
+                end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+            },
+            (Self::Segment { .. }, _) => self.translate(delta_u, delta_v),
+            (Self::Rectangle { .. }, SketchDragHandle::RectangleCorner(corner_idx)) => {
+                let Some(corners) = self.rectangle_corners() else {
+                    return self;
+                };
+                let opp_idx = (corner_idx + 2) % 4;
+                let fixed_corner = corners[opp_idx];
+                let moving_corner = corners[corner_idx];
+                let new_corner =
+                    SketchPoint::new(moving_corner.u + delta_u, moving_corner.v + delta_v);
+                Self::Rectangle {
+                    first: fixed_corner,
+                    opposite: new_corner,
+                }
+            }
+            (Self::Rectangle { first, opposite }, SketchDragHandle::RectangleSide(side_idx)) => {
+                let min_u = first.u.min(opposite.u);
+                let max_u = first.u.max(opposite.u);
+                let min_v = first.v.min(opposite.v);
+                let max_v = first.v.max(opposite.v);
+                match side_idx {
+                    0 => {
+                        let new_min_v = min_v + delta_v;
+                        Self::Rectangle {
+                            first: SketchPoint::new(min_u, max_v),
+                            opposite: SketchPoint::new(max_u, new_min_v),
+                        }
+                    }
+                    1 => {
+                        let new_max_u = max_u + delta_u;
+                        Self::Rectangle {
+                            first: SketchPoint::new(min_u, min_v),
+                            opposite: SketchPoint::new(new_max_u, max_v),
+                        }
+                    }
+                    2 => {
+                        let new_max_v = max_v + delta_v;
+                        Self::Rectangle {
+                            first: SketchPoint::new(min_u, min_v),
+                            opposite: SketchPoint::new(max_u, new_max_v),
+                        }
+                    }
+                    3 => {
+                        let new_min_u = min_u + delta_u;
+                        Self::Rectangle {
+                            first: SketchPoint::new(max_u, min_v),
+                            opposite: SketchPoint::new(new_min_u, max_v),
+                        }
+                    }
+                    _ => self.translate(delta_u, delta_v),
+                }
+            }
+            (Self::Circle { center, rim }, SketchDragHandle::CircleRim) => {
+                let current_radius = center.distance_squared(rim).sqrt();
+                let rim_dir = if current_radius > 1e-9 {
+                    (
+                        (rim.u - center.u) / current_radius,
+                        (rim.v - center.v) / current_radius,
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
+                let radial_delta = delta_u.mul_add(rim_dir.0, delta_v * rim_dir.1);
+                let new_radius = (current_radius + radial_delta).max(0.01);
+                let new_rim = SketchPoint::new(
+                    new_radius.mul_add(rim_dir.0, center.u),
+                    new_radius.mul_add(rim_dir.1, center.v),
+                );
+                Self::Circle {
+                    center,
+                    rim: new_rim,
+                }
+            }
+            (Self::Arc { center, start, end }, SketchDragHandle::StartPoint) => {
+                let new_start = SketchPoint::new(start.u + delta_u, start.v + delta_v);
+                Self::Arc {
+                    center,
+                    start: new_start,
+                    end,
+                }
+            }
+            (Self::Arc { center, start, end }, SketchDragHandle::EndPoint) => {
+                let new_end = SketchPoint::new(end.u + delta_u, end.v + delta_v);
+                Self::Arc {
+                    center,
+                    start,
+                    end: new_end,
+                }
+            }
+            (Self::Arc { center, start, end }, SketchDragHandle::ArcCurve) => {
+                let current_radius = center.distance_squared(start).sqrt();
+                let start_dir = if current_radius > 1e-9 {
+                    (
+                        (start.u - center.u) / current_radius,
+                        (start.v - center.v) / current_radius,
+                    )
+                } else {
+                    (1.0, 0.0)
+                };
+                let end_dir = if current_radius > 1e-9 {
+                    (
+                        (end.u - center.u) / current_radius,
+                        (end.v - center.v) / current_radius,
+                    )
+                } else {
+                    (0.0, 1.0)
+                };
+                let radial_delta = delta_u.mul_add(start_dir.0, delta_v * start_dir.1);
+                let new_radius = (current_radius + radial_delta).max(0.01);
+                Self::Arc {
+                    center,
+                    start: SketchPoint::new(
+                        new_radius.mul_add(start_dir.0, center.u),
+                        new_radius.mul_add(start_dir.1, center.v),
+                    ),
+                    end: SketchPoint::new(
+                        new_radius.mul_add(end_dir.0, center.u),
+                        new_radius.mul_add(end_dir.1, center.v),
+                    ),
+                }
+            }
+            _ => self.translate(delta_u, delta_v),
+        }
+    }
+
     fn control_points(self) -> GeometryPoints {
         match self {
             Self::Point(point) => GeometryPoints::one(point),
-            Self::Segment { start, end } => GeometryPoints::two(start, end),
-            Self::Rectangle { .. } => {
+            Self::Segment { start, end } => {
+                let mid = SketchPoint::new((start.u + end.u) * 0.5, (start.v + end.v) * 0.5);
+                GeometryPoints::three(start, end, mid)
+            }
+            Self::Rectangle { first, opposite } => {
                 let corners = self
                     .rectangle_corners()
                     .expect("the rectangle branch always supplies corners");
-                GeometryPoints::four(corners)
+                let center =
+                    SketchPoint::new((first.u + opposite.u) * 0.5, (first.v + opposite.v) * 0.5);
+                let mid_bottom = SketchPoint::new(
+                    (corners[0].u + corners[1].u) * 0.5,
+                    (corners[0].v + corners[1].v) * 0.5,
+                );
+                let mid_right = SketchPoint::new(
+                    (corners[1].u + corners[2].u) * 0.5,
+                    (corners[1].v + corners[2].v) * 0.5,
+                );
+                let mid_top = SketchPoint::new(
+                    (corners[2].u + corners[3].u) * 0.5,
+                    (corners[2].v + corners[3].v) * 0.5,
+                );
+                let mid_left = SketchPoint::new(
+                    (corners[3].u + corners[0].u) * 0.5,
+                    (corners[3].v + corners[0].v) * 0.5,
+                );
+                GeometryPoints::nine([
+                    corners[0], corners[1], corners[2], corners[3], center, mid_bottom, mid_right,
+                    mid_top, mid_left,
+                ])
             }
             Self::Circle { center, rim } => GeometryPoints::two(center, rim),
             Self::Arc { center, start, end } => GeometryPoints::three(center, start, end),
+        }
+    }
+}
+
+/// A specific handle or feature of a sketch entity being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchDragHandle {
+    /// Move the entire entity
+    Translate,
+    /// Corner of a rectangle (index 0..4 in rectangle_corners)
+    RectangleCorner(usize),
+    /// Side of a rectangle (0: Bottom, 1: Right, 2: Top, 3: Left)
+    RectangleSide(usize),
+    /// Rim of a circle (adjust radius / diameter)
+    CircleRim,
+    /// Start point of a line / arc / slot
+    StartPoint,
+    /// End point of a line / arc / slot
+    EndPoint,
+    /// Arc curve radius adjustment
+    ArcCurve,
+}
+
+impl SketchDragHandle {
+    #[must_use]
+    pub const fn cursor(self) -> CursorIcon {
+        match self {
+            Self::Translate => CursorIcon::Move,
+            Self::RectangleCorner(0 | 2) => CursorIcon::ResizeNwSe,
+            Self::RectangleCorner(1 | 3) => CursorIcon::ResizeNeSw,
+            Self::RectangleCorner(_) => CursorIcon::Grab,
+            Self::RectangleSide(0 | 2) => CursorIcon::ResizeVertical,
+            Self::RectangleSide(1 | 3) => CursorIcon::ResizeHorizontal,
+            Self::RectangleSide(_) => CursorIcon::Grab,
+            Self::CircleRim | Self::ArcCurve => CursorIcon::ResizeEast,
+            Self::StartPoint | Self::EndPoint => CursorIcon::Crosshair,
+        }
+    }
+}
+
+#[must_use]
+pub fn hit_test_drag_handle(
+    geometry: SketchGeometry,
+    view: SketchView,
+    rect: Rect,
+    position: Pos2,
+    hit_radius: f32,
+) -> SketchDragHandle {
+    match geometry {
+        SketchGeometry::Point(_) => SketchDragHandle::Translate,
+        SketchGeometry::Segment { start, end } => {
+            let start_pos = view.sketch_to_screen(rect, start);
+            let end_pos = view.sketch_to_screen(rect, end);
+            if start_pos.distance(position) <= hit_radius {
+                SketchDragHandle::StartPoint
+            } else if end_pos.distance(position) <= hit_radius {
+                SketchDragHandle::EndPoint
+            } else {
+                SketchDragHandle::Translate
+            }
+        }
+        SketchGeometry::Rectangle { .. } => {
+            if let Some(center) = geometry.center() {
+                let center_pos = view.sketch_to_screen(rect, center);
+                if center_pos.distance(position) <= hit_radius {
+                    return SketchDragHandle::Translate;
+                }
+            }
+            if let Some(corners) = geometry.rectangle_corners() {
+                let screen_corners = corners.map(|pt| view.sketch_to_screen(rect, pt));
+                for (index, corner_pos) in screen_corners.iter().enumerate() {
+                    if corner_pos.distance(position) <= hit_radius {
+                        return SketchDragHandle::RectangleCorner(index);
+                    }
+                }
+                let mut best_side = None;
+                let mut min_side_dist = hit_radius;
+                for index in 0..4 {
+                    let d = point_segment_distance(
+                        position,
+                        screen_corners[index],
+                        screen_corners[(index + 1) % 4],
+                    );
+                    if d <= min_side_dist {
+                        min_side_dist = d;
+                        best_side = Some(index);
+                    }
+                }
+                if let Some(side) = best_side {
+                    return SketchDragHandle::RectangleSide(side);
+                }
+            }
+            SketchDragHandle::Translate
+        }
+        SketchGeometry::Circle { center, rim } => {
+            let center_pos = view.sketch_to_screen(rect, center);
+            if center_pos.distance(position) <= hit_radius {
+                return SketchDragHandle::Translate;
+            }
+            let rim_pos = view.sketch_to_screen(rect, rim);
+            let radius = center_pos.distance(rim_pos);
+            let dist_to_center = center_pos.distance(position);
+            if (dist_to_center - radius).abs() <= hit_radius + 4.0 {
+                return SketchDragHandle::CircleRim;
+            }
+            SketchDragHandle::Translate
+        }
+        SketchGeometry::Arc { center, start, end } => {
+            let center_pos = view.sketch_to_screen(rect, center);
+            if center_pos.distance(position) <= hit_radius {
+                return SketchDragHandle::Translate;
+            }
+            let start_pos = view.sketch_to_screen(rect, start);
+            if start_pos.distance(position) <= hit_radius {
+                return SketchDragHandle::StartPoint;
+            }
+            let end_pos = view.sketch_to_screen(rect, end);
+            if end_pos.distance(position) <= hit_radius {
+                return SketchDragHandle::EndPoint;
+            }
+            SketchDragHandle::ArcCurve
         }
     }
 }
@@ -1706,6 +2033,13 @@ fn literal_length_value(length: &CoreValue<CoreLength>) -> Option<f64> {
     }
 }
 
+fn literal_signed_length_value(length: &CoreValue<CoreSignedLength>) -> Option<f64> {
+    match length {
+        CoreValue::Literal(value) => Some(value.get()),
+        CoreValue::Input(_) => None,
+    }
+}
+
 /// The diameter a polygon should now carry, given that its `side` and its
 /// diameter drive the same single number and nothing records which box was
 /// typed into.
@@ -1897,6 +2231,231 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         | CoreRecipe::Trim { .. } => {}
     }
     Ok(recipe)
+}
+
+fn translate_core_point_input(input: &mut CorePointInput, delta_u: f64, delta_v: f64) {
+    if let CorePointInput::Position(pos) = input {
+        *pos = CorePoint2::new(pos.u + delta_u, pos.v + delta_v);
+    }
+}
+
+fn translate_core_recipe(recipe: &mut CoreRecipe, delta_u: f64, delta_v: f64) {
+    match recipe {
+        CoreRecipe::Point { position } => {
+            *position = CorePoint2::new(position.u + delta_u, position.v + delta_v);
+        }
+        CoreRecipe::Line { start, end } | CoreRecipe::CentreLine { start, end } => {
+            translate_core_point_input(start, delta_u, delta_v);
+            translate_core_point_input(end, delta_u, delta_v);
+        }
+        CoreRecipe::Polyline { vertices, .. } => {
+            for vertex in vertices {
+                translate_core_point_input(vertex, delta_u, delta_v);
+            }
+        }
+        CoreRecipe::TwoPointRectangle { first_corner, .. } => {
+            translate_core_point_input(first_corner, delta_u, delta_v);
+        }
+        CoreRecipe::CentrePointRectangle { center, .. } => {
+            translate_core_point_input(center, delta_u, delta_v);
+        }
+        CoreRecipe::CentrePointCircle { center, .. } => {
+            translate_core_point_input(center, delta_u, delta_v);
+        }
+        CoreRecipe::TwoPointCircle {
+            first_diameter_point,
+            second_diameter_point,
+            ..
+        } => {
+            translate_core_point_input(first_diameter_point, delta_u, delta_v);
+            translate_core_point_input(second_diameter_point, delta_u, delta_v);
+        }
+        CoreRecipe::CentreStartEndArc {
+            center, start, end, ..
+        } => {
+            translate_core_point_input(center, delta_u, delta_v);
+            translate_core_point_input(start, delta_u, delta_v);
+            translate_core_point_input(end, delta_u, delta_v);
+        }
+        CoreRecipe::InnerDiameterPolygon { center, .. }
+        | CoreRecipe::OuterDiameterPolygon { center, .. } => {
+            translate_core_point_input(center, delta_u, delta_v);
+        }
+        CoreRecipe::TwoPointSlot {
+            first_cap_center,
+            second_cap_center,
+            ..
+        } => {
+            translate_core_point_input(first_cap_center, delta_u, delta_v);
+            translate_core_point_input(second_cap_center, delta_u, delta_v);
+        }
+        _ => {}
+    }
+}
+
+fn reshape_core_recipe(
+    recipe: &mut CoreRecipe,
+    handle: SketchDragHandle,
+    delta_u: f64,
+    delta_v: f64,
+) {
+    match (recipe, handle) {
+        (recipe, SketchDragHandle::Translate) => {
+            translate_core_recipe(recipe, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::Line { start, .. } | CoreRecipe::CentreLine { start, .. },
+            SketchDragHandle::StartPoint,
+        ) => {
+            translate_core_point_input(start, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::Line { end, .. } | CoreRecipe::CentreLine { end, .. },
+            SketchDragHandle::EndPoint,
+        ) => {
+            translate_core_point_input(end, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::TwoPointRectangle {
+                first_corner,
+                width,
+                height,
+            },
+            SketchDragHandle::RectangleCorner(corner_idx),
+        ) => {
+            let current_w = literal_signed_length_value(width).unwrap_or(0.0);
+            let current_h = literal_signed_length_value(height).unwrap_or(0.0);
+            let first = match first_corner {
+                CorePointInput::Position(pos) => *pos,
+                _ => return,
+            };
+            let opp = CorePoint2::new(first.u + current_w, first.v + current_h);
+            let min_u = first.u.min(opp.u);
+            let max_u = first.u.max(opp.u);
+            let min_v = first.v.min(opp.v);
+            let max_v = first.v.max(opp.v);
+            let corners = [
+                CorePoint2::new(min_u, min_v),
+                CorePoint2::new(max_u, min_v),
+                CorePoint2::new(max_u, max_v),
+                CorePoint2::new(min_u, max_v),
+            ];
+            let opp_idx = (corner_idx + 2) % 4;
+            let fixed_c = corners[opp_idx];
+            let moving_c = corners[corner_idx];
+            let new_c = CorePoint2::new(moving_c.u + delta_u, moving_c.v + delta_v);
+            *first_corner = CorePointInput::Position(fixed_c);
+            let _ = replace_literal_signed_length(width, Some(new_c.u - fixed_c.u));
+            let _ = replace_literal_signed_length(height, Some(new_c.v - fixed_c.v));
+        }
+        (
+            CoreRecipe::TwoPointRectangle {
+                first_corner,
+                width,
+                height,
+            },
+            SketchDragHandle::RectangleSide(side_idx),
+        ) => {
+            let current_w = literal_signed_length_value(width).unwrap_or(0.0);
+            let current_h = literal_signed_length_value(height).unwrap_or(0.0);
+            let first = match first_corner {
+                CorePointInput::Position(pos) => *pos,
+                _ => return,
+            };
+            let opp = CorePoint2::new(first.u + current_w, first.v + current_h);
+            let min_u = first.u.min(opp.u);
+            let max_u = first.u.max(opp.u);
+            let min_v = first.v.min(opp.v);
+            let max_v = first.v.max(opp.v);
+            match side_idx {
+                0 => {
+                    *first_corner = CorePointInput::Position(CorePoint2::new(min_u, max_v));
+                    let _ = replace_literal_signed_length(width, Some(max_u - min_u));
+                    let _ = replace_literal_signed_length(height, Some((min_v + delta_v) - max_v));
+                }
+                1 => {
+                    *first_corner = CorePointInput::Position(CorePoint2::new(min_u, min_v));
+                    let _ = replace_literal_signed_length(width, Some((max_u + delta_u) - min_u));
+                    let _ = replace_literal_signed_length(height, Some(max_v - min_v));
+                }
+                2 => {
+                    *first_corner = CorePointInput::Position(CorePoint2::new(min_u, min_v));
+                    let _ = replace_literal_signed_length(width, Some(max_u - min_u));
+                    let _ = replace_literal_signed_length(height, Some((max_v + delta_v) - min_v));
+                }
+                3 => {
+                    *first_corner = CorePointInput::Position(CorePoint2::new(max_u, min_v));
+                    let _ = replace_literal_signed_length(width, Some((min_u + delta_u) - max_u));
+                    let _ = replace_literal_signed_length(height, Some(max_v - min_v));
+                }
+                _ => {}
+            }
+        }
+        (
+            CoreRecipe::CentrePointRectangle { width, height, .. },
+            SketchDragHandle::RectangleCorner(_),
+        ) => {
+            let current_w = literal_length_value(width).unwrap_or(1.0);
+            let current_h = literal_length_value(height).unwrap_or(1.0);
+            let new_w = delta_u.abs().mul_add(2.0, current_w).max(0.01);
+            let new_h = delta_v.abs().mul_add(2.0, current_h).max(0.01);
+            let _ = replace_literal_length(width, Some(new_w));
+            let _ = replace_literal_length(height, Some(new_h));
+        }
+        (
+            CoreRecipe::CentrePointRectangle { width, height, .. },
+            SketchDragHandle::RectangleSide(side_idx),
+        ) => {
+            let current_w = literal_length_value(width).unwrap_or(1.0);
+            let current_h = literal_length_value(height).unwrap_or(1.0);
+            if side_idx == 1 || side_idx == 3 {
+                let new_w = delta_u.abs().mul_add(2.0, current_w).max(0.01);
+                let _ = replace_literal_length(width, Some(new_w));
+            } else {
+                let new_h = delta_v.abs().mul_add(2.0, current_h).max(0.01);
+                let _ = replace_literal_length(height, Some(new_h));
+            }
+        }
+        (CoreRecipe::CentrePointCircle { radius, .. }, SketchDragHandle::CircleRim) => {
+            let current_r = literal_length_value(radius).unwrap_or(1.0);
+            let delta = delta_u.hypot(delta_v) * if delta_u + delta_v >= 0.0 { 1.0 } else { -1.0 };
+            let new_r = (current_r + delta).max(0.01);
+            let _ = replace_literal_length(radius, Some(new_r));
+        }
+        (CoreRecipe::CentreStartEndArc { start, .. }, SketchDragHandle::StartPoint) => {
+            translate_core_point_input(start, delta_u, delta_v);
+        }
+        (CoreRecipe::CentreStartEndArc { end, .. }, SketchDragHandle::EndPoint) => {
+            translate_core_point_input(end, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::TwoPointSlot {
+                first_cap_center, ..
+            },
+            SketchDragHandle::StartPoint,
+        ) => {
+            translate_core_point_input(first_cap_center, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::TwoPointSlot {
+                second_cap_center, ..
+            },
+            SketchDragHandle::EndPoint,
+        ) => {
+            translate_core_point_input(second_cap_center, delta_u, delta_v);
+        }
+        (
+            CoreRecipe::TwoPointSlot { width, .. },
+            SketchDragHandle::CircleRim | SketchDragHandle::RectangleSide(_),
+        ) => {
+            let current_w = literal_length_value(width).unwrap_or(1.0);
+            let new_w = delta_u.hypot(delta_v).mul_add(2.0, current_w).max(0.01);
+            let _ = replace_literal_length(width, Some(new_w));
+        }
+        (recipe, _) => {
+            translate_core_recipe(recipe, delta_u, delta_v);
+        }
+    }
 }
 
 /// Keyboard ownership returned to the workbench-wide shortcut arbiter.
@@ -2951,34 +3510,63 @@ fn geometry_coordinates_supported(geometry: SketchGeometry) -> bool {
 
 #[derive(Clone, Copy, Debug)]
 struct GeometryPoints {
-    points: [SketchPoint; 4],
+    points: [SketchPoint; 9],
     len: usize,
 }
 
 impl GeometryPoints {
     const fn one(first: SketchPoint) -> Self {
         Self {
-            points: [first; 4],
+            points: [first; 9],
             len: 1,
         }
     }
 
     const fn two(first: SketchPoint, second: SketchPoint) -> Self {
         Self {
-            points: [first, second, first, first],
+            points: [
+                first, second, first, first, first, first, first, first, first,
+            ],
             len: 2,
         }
     }
 
-    const fn four(points: [SketchPoint; 4]) -> Self {
-        Self { points, len: 4 }
-    }
-
     const fn three(first: SketchPoint, second: SketchPoint, third: SketchPoint) -> Self {
         Self {
-            points: [first, second, third, first],
+            points: [
+                first, second, third, first, first, first, first, first, first,
+            ],
             len: 3,
         }
+    }
+
+    #[allow(dead_code)]
+    const fn four(points: [SketchPoint; 4]) -> Self {
+        Self {
+            points: [
+                points[0], points[1], points[2], points[3], points[0], points[0], points[0],
+                points[0], points[0],
+            ],
+            len: 4,
+        }
+    }
+
+    #[allow(dead_code)]
+    const fn five(
+        p0: SketchPoint,
+        p1: SketchPoint,
+        p2: SketchPoint,
+        p3: SketchPoint,
+        p4: SketchPoint,
+    ) -> Self {
+        Self {
+            points: [p0, p1, p2, p3, p4, p0, p0, p0, p0],
+            len: 5,
+        }
+    }
+
+    const fn nine(points: [SketchPoint; 9]) -> Self {
+        Self { points, len: 9 }
     }
 
     fn iter(self) -> impl Iterator<Item = SketchPoint> {
@@ -4260,6 +4848,7 @@ pub struct SketchCanvasState {
     /// Retained primary-pointer handle for pattern direction/centre editing.
     pattern_manipulator: Option<PatternManipulator>,
     pattern_drag: DragHandleState,
+    active_drag_handle: Option<SketchDragHandle>,
     creation_anchor: Option<SketchPoint>,
     /// Uncommitted vertices owned by one atomic chained-polyline gesture.
     ///
@@ -4327,6 +4916,7 @@ impl Default for SketchCanvasState {
             trim_hover_fragment: None,
             pattern_manipulator: None,
             pattern_drag: DragHandleState::default(),
+            active_drag_handle: None,
             creation_anchor: None,
             polyline_vertices: Vec::new(),
             polyline_current_segment_active: false,
@@ -4906,6 +5496,14 @@ impl SketchCanvasState {
     #[must_use]
     pub fn entities(&self) -> &[SketchEntity] {
         &self.entities
+    }
+
+    #[must_use]
+    pub fn entity_geometry(&self, id: SketchEntityId) -> Option<SketchGeometry> {
+        self.entities
+            .iter()
+            .find(|entity| entity.id == id)
+            .map(|entity| entity.geometry)
     }
 
     /// Authoritative persistent recipe graph mirrored by the interactive
@@ -5505,6 +6103,66 @@ impl SketchCanvasState {
         self.pending
             .as_ref()
             .map_or(0, |pending| pending.entities.len())
+    }
+
+    /// Translates the currently selected sketch entity by (delta_u, delta_v).
+    pub fn translate_selected(&mut self, delta_u: f64, delta_v: f64) -> bool {
+        self.reshape_selected(SketchDragHandle::Translate, delta_u, delta_v)
+    }
+
+    /// Reshapes or translates the currently selected sketch entity using the given drag handle and delta.
+    pub fn reshape_selected(
+        &mut self,
+        handle: SketchDragHandle,
+        delta_u: f64,
+        delta_v: f64,
+    ) -> bool {
+        let Some(selected) = self.selected else {
+            return false;
+        };
+        if !delta_u.is_finite() || !delta_v.is_finite() || (delta_u == 0.0 && delta_v == 0.0) {
+            return false;
+        }
+        let mut any_reshaped = false;
+        let op_id = self.operation_by_ui.get(&selected).copied().or_else(|| {
+            self.core_by_ui
+                .get(&selected)
+                .and_then(|entities| entities.first())
+                .and_then(|entity| self.authoring.entity(*entity))
+                .map(|record| record.provenance.operation)
+        });
+        if let Some(op_id) = op_id
+            && let Some(op) = self.authoring.operation(op_id)
+        {
+            let mut new_recipe = op.recipe.clone();
+            reshape_core_recipe(&mut new_recipe, handle, delta_u, delta_v);
+            if let Ok(tx) = self.authoring.stage_replace(
+                op_id,
+                new_recipe,
+                "Reshape sketch entity",
+                &Default::default(),
+                PrecisionPolicy::default(),
+            ) && self
+                .authoring
+                .commit(tx, CoreConfirmationSource::GreenTick)
+                .is_ok()
+            {
+                any_reshaped = true;
+            }
+        }
+        for entity in &mut self.entities {
+            let matches_op =
+                op_id.is_some() && self.operation_by_ui.get(&entity.id).copied() == op_id;
+            if entity.id == selected || matches_op {
+                entity.geometry = entity.geometry.reshape(handle, delta_u, delta_v);
+                any_reshaped = true;
+            }
+        }
+        if any_reshaped {
+            self.refresh_profile_analysis();
+            self.rebuild_selected_recipe_editor();
+        }
+        any_reshaped
     }
 
     /// Stages programmatically supplied geometry through the same UI gate.
@@ -9558,7 +10216,21 @@ pub fn show_with_context(
             state.tool.label()
         ));
     });
-    let response = response.on_hover_cursor(state.tool.cursor());
+    let hover_cursor = if state.tool == SketchTool::Select && state.pending.is_none() {
+        if let Some(handle) = state.active_drag_handle {
+            handle.cursor()
+        } else if let Some(hovered_id) = state.hovered
+            && let Some(pos) = response.hover_pos()
+            && let Some(geom) = state.entity_geometry(hovered_id)
+        {
+            hit_test_drag_handle(geom, state.view, response.rect, pos, 12.0).cursor()
+        } else {
+            state.tool.cursor()
+        }
+    } else {
+        state.tool.cursor()
+    };
+    let response = response.on_hover_cursor(hover_cursor);
     // Focus traversal and Escape preprocessing can move focus before widgets
     // inspect this frame. `lost_focus` therefore represents ownership at the
     // start of the key event just as importantly as `has_focus` does.
@@ -9721,6 +10393,66 @@ pub fn show_with_context(
                 }
             }
         }
+    }
+
+    if response.drag_started_by(PointerButton::Primary)
+        && !pattern_interaction.consumes_primary
+        && !pointer_over_dimension
+        && state.tool == SketchTool::Select
+        && state.pending.is_none()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        if state.selected.is_none() && state.hovered.is_some() {
+            state.set_selected(state.hovered);
+            selection_changed = true;
+        }
+        if let Some(selected_id) = state.selected
+            && let Some(geom) = state.entity_geometry(selected_id)
+        {
+            state.active_drag_handle = Some(hit_test_drag_handle(
+                geom,
+                state.view,
+                response.rect,
+                pos,
+                12.0,
+            ));
+        }
+    }
+
+    let primary_drag_delta = ui.input(|input| input.pointer.delta());
+    if response.dragged_by(PointerButton::Primary)
+        && !pattern_interaction.consumes_primary
+        && !pointer_over_dimension
+        && state.tool == SketchTool::Select
+        && state.pending.is_none()
+        && primary_drag_delta != Vec2::ZERO
+    {
+        if state.selected.is_none() && state.hovered.is_some() {
+            state.set_selected(state.hovered);
+            selection_changed = true;
+        }
+        let handle = state.active_drag_handle.unwrap_or_else(|| {
+            if let Some(pos) = response.interact_pointer_pos()
+                && let Some(selected_id) = state.selected
+                && let Some(geom) = state.entity_geometry(selected_id)
+            {
+                let h = hit_test_drag_handle(geom, state.view, response.rect, pos, 12.0);
+                state.active_drag_handle = Some(h);
+                h
+            } else {
+                SketchDragHandle::Translate
+            }
+        });
+        let delta_u = f64::from(primary_drag_delta.x) / state.view.points_per_unit;
+        let delta_v = -f64::from(primary_drag_delta.y) / state.view.points_per_unit;
+        if state.reshape_selected(handle, delta_u, delta_v) {
+            draft_changed = true;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    if response.drag_stopped() {
+        state.active_drag_handle = None;
     }
 
     if let Some(context) = context {
@@ -10505,7 +11237,8 @@ fn paint_entities(
     hovered: Option<SketchEntityId>,
     selected: Option<SketchEntityId>,
 ) {
-    for entity in entities {
+    let entities_vec = entities.into_iter().collect::<Vec<_>>();
+    for entity in &entities_vec {
         let (color, width) = if Some(entity.id) == selected {
             (sketch_colours().selected, 2.5)
         } else if Some(entity.id) == hovered {
@@ -10522,6 +11255,17 @@ fn paint_entities(
             paint_dashed_geometry(painter, rect, view, entity.geometry, stroke);
         } else {
             paint_geometry(painter, rect, view, entity.geometry, stroke);
+        }
+        if Some(entity.id) == selected || Some(entity.id) == hovered {
+            for pt in entity.geometry.control_points().iter() {
+                let pt_screen = view.sketch_to_screen(rect, pt);
+                painter.circle_filled(pt_screen, 3.5, color);
+                painter.circle_stroke(
+                    pt_screen,
+                    4.5,
+                    Stroke::new(1.0, sketch_colours().background),
+                );
+            }
         }
     }
 }
@@ -10978,14 +11722,21 @@ fn paint_geometry(
             for index in 0..4 {
                 painter.line_segment([corners[index], corners[(index + 1) % 4]], stroke);
             }
+            if let Some(center) = geometry.center() {
+                let center_screen = view.sketch_to_screen(rect, center);
+                painter.circle_filled(center_screen, 2.5, stroke.color.gamma_multiply(0.75));
+            }
         }
         SketchGeometry::Circle { center, rim } => {
-            let center = view.sketch_to_screen(rect, center);
-            let rim = view.sketch_to_screen(rect, rim);
-            painter.circle_stroke(center, center.distance(rim), stroke);
+            let center_screen = view.sketch_to_screen(rect, center);
+            let rim_screen = view.sketch_to_screen(rect, rim);
+            painter.circle_stroke(center_screen, center_screen.distance(rim_screen), stroke);
+            painter.circle_filled(center_screen, 2.5, stroke.color.gamma_multiply(0.85));
         }
         SketchGeometry::Arc { center, start, end } => {
             paint_arc(painter, rect, view, center, start, end, stroke);
+            let center_screen = view.sketch_to_screen(rect, center);
+            painter.circle_filled(center_screen, 2.5, stroke.color.gamma_multiply(0.75));
         }
     }
 }
@@ -12392,9 +13143,9 @@ fn geometry_screen_distance(
                 .fold(f32::INFINITY, f32::min)
         }
         SketchGeometry::Circle { center, rim } => {
-            let center = view.sketch_to_screen(rect, center);
-            let radius = center.distance(view.sketch_to_screen(rect, rim));
-            (center.distance(position) - radius).abs()
+            let center_screen = view.sketch_to_screen(rect, center);
+            let radius = center_screen.distance(view.sketch_to_screen(rect, rim));
+            (center_screen.distance(position) - radius).abs()
         }
         SketchGeometry::Arc { center, start, end } => {
             arc_screen_distance(position, rect, view, center, start, end)
@@ -16963,5 +17714,200 @@ mod tests {
         assert_eq!(hydrated.selected_region_signatures(), signatures);
         assert_eq!(hydrated.selected_planar_profile(), Some(expected));
         assert!(!hydrated.can_undo_local());
+    }
+
+    #[test]
+    fn sketch_objects_expose_visible_and_snappable_centre_points() {
+        // Circle center point
+        let circle =
+            SketchGeometry::circle(SketchPoint::new(10.0, 20.0), SketchPoint::new(15.0, 20.0));
+        assert_eq!(circle.center(), Some(SketchPoint::new(10.0, 20.0)));
+        let circle_points = circle.control_points().iter().collect::<Vec<_>>();
+        assert!(circle_points.contains(&SketchPoint::new(10.0, 20.0)));
+
+        // Rectangle center point
+        let rect =
+            SketchGeometry::rectangle(SketchPoint::new(0.0, 0.0), SketchPoint::new(40.0, 30.0));
+        assert_eq!(rect.center(), Some(SketchPoint::new(20.0, 15.0)));
+        let rect_points = rect.control_points().iter().collect::<Vec<_>>();
+        assert_eq!(rect_points.len(), 9);
+        assert!(rect_points.contains(&SketchPoint::new(20.0, 15.0))); // center
+        assert!(rect_points.contains(&SketchPoint::new(20.0, 0.0))); // bottom midpoint
+        assert!(rect_points.contains(&SketchPoint::new(40.0, 15.0))); // right midpoint
+        assert!(rect_points.contains(&SketchPoint::new(20.0, 30.0))); // top midpoint
+        assert!(rect_points.contains(&SketchPoint::new(0.0, 15.0))); // left midpoint
+
+        // Arc center point
+        let arc = SketchGeometry::arc(
+            SketchPoint::new(5.0, 5.0),
+            SketchPoint::new(10.0, 5.0),
+            SketchPoint::new(5.0, 10.0),
+        );
+        assert_eq!(arc.center(), Some(SketchPoint::new(5.0, 5.0)));
+        let arc_points = arc.control_points().iter().collect::<Vec<_>>();
+        assert!(arc_points.contains(&SketchPoint::new(5.0, 5.0)));
+    }
+
+    #[test]
+    fn sketch_objects_can_be_grabbed_and_translated_via_drag() {
+        let mut state = SketchCanvasState::default();
+        let circle_id = state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(10.0, 20.0),
+                SketchPoint::new(15.0, 20.0),
+            ))
+            .expect("stage circle");
+        state.commit_pending().expect("commit circle");
+        state.set_selected(Some(circle_id));
+
+        // Drag by (5.0, -10.0)
+        assert!(state.translate_selected(5.0, -10.0));
+
+        let translated = state.entity_geometry(circle_id).expect("circle exists");
+        assert_eq!(translated.center(), Some(SketchPoint::new(15.0, 10.0)));
+
+        // Stage and drag a rectangle
+        let rect_id = state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(20.0, 10.0),
+            ))
+            .expect("stage rect");
+        state.commit_pending().expect("commit rect");
+        state.set_selected(Some(rect_id));
+
+        assert!(state.translate_selected(10.0, 20.0));
+        let translated_rect = state.entity_geometry(rect_id).expect("rect exists");
+        assert_eq!(translated_rect.center(), Some(SketchPoint::new(20.0, 25.0)));
+    }
+
+    #[test]
+    fn sketch_objects_can_be_reshaped_via_corner_side_and_rim_dragging() {
+        let mut state = SketchCanvasState::default();
+
+        // 1. Rectangle corner reshaping: dragging top-right corner (index 2)
+        let rect_id = state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(10.0, 20.0),
+            ))
+            .expect("stage rect");
+        state.commit_pending().expect("commit rect");
+        state.set_selected(Some(rect_id));
+
+        // Drag Top-Right corner (index 2) by (+5.0, +10.0) -> rectangle should become [0..15] x [0..30]
+        assert!(state.reshape_selected(SketchDragHandle::RectangleCorner(2), 5.0, 10.0));
+        let reshaped_rect = state.entity_geometry(rect_id).expect("rect exists");
+        let corners = reshaped_rect.rectangle_corners().expect("corners");
+        assert_eq!(corners[0], SketchPoint::new(0.0, 0.0)); // bottom-left stays fixed
+        assert_eq!(corners[2], SketchPoint::new(15.0, 30.0)); // top-right moved
+
+        // 2. Rectangle side reshaping: dragging Right side (index 1) by (+10.0, 0.0)
+        assert!(state.reshape_selected(SketchDragHandle::RectangleSide(1), 10.0, 0.0));
+        let reshaped_rect2 = state.entity_geometry(rect_id).expect("rect exists");
+        let corners2 = reshaped_rect2.rectangle_corners().expect("corners");
+        assert_eq!(corners2[0], SketchPoint::new(0.0, 0.0));
+        assert_eq!(corners2[1], SketchPoint::new(25.0, 0.0)); // width increased from 15 to 25
+        assert_eq!(corners2[2], SketchPoint::new(25.0, 30.0));
+        assert_eq!(corners2[3], SketchPoint::new(0.0, 30.0)); // height stays 30
+
+        // 3. Rectangle side reshaping: dragging Top side (index 2) by (0.0, +5.0)
+        assert!(state.reshape_selected(SketchDragHandle::RectangleSide(2), 0.0, 5.0));
+        let reshaped_rect3 = state.entity_geometry(rect_id).expect("rect exists");
+        let corners3 = reshaped_rect3.rectangle_corners().expect("corners");
+        assert_eq!(corners3[0], SketchPoint::new(0.0, 0.0));
+        assert_eq!(corners3[2], SketchPoint::new(25.0, 35.0)); // height increased from 30 to 35
+
+        // 4. Circle rim reshaping: dragging rim changes radius
+        let circle_id = state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(50.0, 50.0),
+                SketchPoint::new(60.0, 50.0),
+            ))
+            .expect("stage circle");
+        state.commit_pending().expect("commit circle");
+        state.set_selected(Some(circle_id));
+
+        // Drag rim by (+5.0, 0.0) -> radius should expand from 10 to 15
+        assert!(state.reshape_selected(SketchDragHandle::CircleRim, 5.0, 0.0));
+        let reshaped_circle = state.entity_geometry(circle_id).expect("circle exists");
+        assert_eq!(reshaped_circle.center(), Some(SketchPoint::new(50.0, 50.0))); // center fixed
+        match reshaped_circle {
+            SketchGeometry::Circle { center, rim } => {
+                let r = center.distance_squared(rim).sqrt();
+                assert!((r - 15.0).abs() < 1e-6);
+            }
+            _ => panic!("expected circle"),
+        }
+
+        // 5. Line endpoint reshaping: dragging end moves end, keeping start fixed
+        let line_id = state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(10.0, 0.0),
+            ))
+            .expect("stage line");
+        state.commit_pending().expect("commit line");
+        state.set_selected(Some(line_id));
+
+        assert!(state.reshape_selected(SketchDragHandle::EndPoint, 0.0, 15.0));
+        let reshaped_line = state.entity_geometry(line_id).expect("line exists");
+        match reshaped_line {
+            SketchGeometry::Segment { start, end } => {
+                assert_eq!(start, SketchPoint::new(0.0, 0.0)); // start fixed
+                assert_eq!(end, SketchPoint::new(10.0, 15.0)); // end moved
+            }
+            _ => panic!("expected segment"),
+        }
+    }
+
+    #[test]
+    fn midpoints_appear_on_hover_and_selection_across_all_straight_lines() {
+        let mut state = SketchCanvasState::default();
+        let canvas_rect = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(800.0, 600.0));
+
+        // 1. Line segment midpoint
+        let line_id = state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(20.0, 0.0),
+            ))
+            .expect("stage line");
+        state.commit_pending().expect("commit line");
+
+        let geom = state.entity_geometry(line_id).expect("line geometry");
+        let control_pts = geom.control_points().iter().collect::<Vec<_>>();
+        assert_eq!(control_pts.len(), 3);
+        assert_eq!(control_pts[0], SketchPoint::new(0.0, 0.0)); // start
+        assert_eq!(control_pts[1], SketchPoint::new(20.0, 0.0)); // end
+        assert_eq!(control_pts[2], SketchPoint::new(10.0, 0.0)); // midpoint!
+
+        // Hover over the line
+        let screen_pos = state
+            .view
+            .sketch_to_screen(canvas_rect, SketchPoint::new(10.0, 0.0));
+        let hovered = hit_test_entities(&state.entities, state.view, canvas_rect, screen_pos, 8.0);
+        assert_eq!(hovered, Some(line_id));
+
+        // Snapping near the midpoint returns SnapKind::Endpoint / Midpoint
+        let snap = state.snap_point(canvas_rect, screen_pos);
+        assert_eq!(snap.point, SketchPoint::new(10.0, 0.0));
+
+        // 2. Rectangle side midpoints
+        let rect_id = state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(40.0, 20.0),
+            ))
+            .expect("stage rect");
+        state.commit_pending().expect("commit rect");
+
+        let rect_geom = state.entity_geometry(rect_id).expect("rect geometry");
+        let rect_pts = rect_geom.control_points().iter().collect::<Vec<_>>();
+        assert_eq!(rect_pts.len(), 9); // 4 corners + 1 center + 4 side midpoints
+        assert!(rect_pts.contains(&SketchPoint::new(20.0, 0.0))); // bottom side midpoint
+        assert!(rect_pts.contains(&SketchPoint::new(40.0, 10.0))); // right side midpoint
+        assert!(rect_pts.contains(&SketchPoint::new(20.0, 20.0))); // top side midpoint
+        assert!(rect_pts.contains(&SketchPoint::new(0.0, 10.0))); // left side midpoint
     }
 }
