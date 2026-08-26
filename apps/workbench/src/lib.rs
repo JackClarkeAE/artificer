@@ -218,6 +218,7 @@ mod legacy_navigation {
             // older build can honour.
             NavigationPreset::Fusion | NavigationPreset::Inventor => "middle-pan-inverted",
             NavigationPreset::SolidWorks => "middle-orbit-inverted",
+            NavigationPreset::Blender => "middle-orbit-shift-pan",
             NavigationPreset::Onshape => "right-orbit",
             NavigationPreset::Creo => "middle-orbit-shift-pan-inverted",
             NavigationPreset::Nx => "middle-orbit-shift-pan",
@@ -1508,6 +1509,53 @@ enum Attempt {
     },
 }
 
+/// What an open Export dialog is about to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportSubject {
+    Body { ordinal: u32, step: bool },
+    Sketch { index: usize, ordinal: u32 },
+    Document { step: bool },
+}
+
+impl ExportSubject {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Body { step: true, .. } | Self::Document { step: true } => "step",
+            Self::Body { step: false, .. } | Self::Document { step: false } => "stl",
+            Self::Sketch { .. } => "dxf",
+        }
+    }
+
+    fn title(self) -> String {
+        let format = self.extension().to_ascii_uppercase();
+        match self {
+            Self::Body { ordinal, .. } => format!("EXPORT BODY {ordinal} AS {format}"),
+            Self::Sketch { ordinal, .. } => format!("EXPORT SKETCH {ordinal} AS {format}"),
+            Self::Document { .. } => format!("EXPORT DOCUMENT AS {format}"),
+        }
+    }
+
+    fn file_stem(self, document: &Path) -> String {
+        let stem = document
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("artificer");
+        match self {
+            Self::Body { ordinal, .. } => format!("{stem}-body-{ordinal}"),
+            Self::Sketch { ordinal, .. } => format!("{stem}-sketch-{ordinal}"),
+            Self::Document { .. } => stem.to_owned(),
+        }
+    }
+}
+
+/// An Export dialog: what to write, where the user has said to write it, and
+/// what happened the last time they pressed the button.
+struct PendingExport {
+    subject: ExportSubject,
+    path_text: String,
+    outcome: Option<Result<PathBuf, String>>,
+}
+
 #[derive(Clone)]
 struct DisplayedBody {
     snapshot: Snapshot,
@@ -1726,6 +1774,7 @@ pub struct KernelLabApp {
     next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
     document_properties_open: bool,
+    pending_export: Option<PendingExport>,
     /// The Parametric tab's variables panel.
     variables_window_open: bool,
     /// The parsed binding a staged `SetParameterBindingEntry` will publish.
@@ -1923,6 +1972,7 @@ impl Default for KernelLabApp {
             next_construction_plane_id: 1,
             selected_construction_plane: None,
             document_properties_open: false,
+            pending_export: None,
             variables_window_open: false,
             staged_parameter_binding: None,
             variable_value_drafts: BTreeMap::new(),
@@ -2306,6 +2356,28 @@ impl KernelLabApp {
     pub fn set_document_path(&mut self, path: impl Into<PathBuf>) {
         self.document_path = path.into();
         self.document_path_text = self.document_path.display().to_string();
+    }
+
+    /// The most recent document-level message — a save, a load, an export.
+    #[must_use]
+    pub fn document_status_text(&self) -> Option<&str> {
+        self.document_status.as_deref()
+    }
+
+    /// The destination the open Export dialog is proposing, if one is open.
+    #[must_use]
+    pub fn export_destination(&self) -> Option<PathBuf> {
+        self.pending_export
+            .as_ref()
+            .map(|pending| PathBuf::from(pending.path_text.trim()))
+    }
+
+    /// Points the open Export dialog at a destination, as typing one does.
+    pub fn set_export_destination(&mut self, path: impl Into<PathBuf>) {
+        if let Some(pending) = self.pending_export.as_mut() {
+            pending.path_text = path.into().display().to_string();
+            pending.outcome = None;
+        }
     }
 
     #[must_use]
@@ -3646,24 +3718,32 @@ impl KernelLabApp {
                     })?;
                     let native = NativeKernel::planar_face_support(snapshot, resolved)
                         .map_err(|error| format!("sketch {} support failed: {error}", record.id))?;
-                    if native.frame
-                        != payload
-                            .as_ref()
-                            .expect("the support came from a payload")
-                            .frame
-                    {
+                    let stored = payload
+                        .as_ref()
+                        .expect("the support came from a payload")
+                        .frame;
+                    // The face must still be the same plane; its in-plane axes
+                    // need not be the same choice. A sketch's coordinates mean
+                    // what the frame stored beside them says they mean, so the
+                    // stored frame stays authoritative here and the recomputed
+                    // support is expressed in it. Demanding an identical frame
+                    // instead would make any later improvement to how the
+                    // kernel names a face's axes — such as squaring them to
+                    // the world — retroactively refuse to open documents whose
+                    // geometry has not moved at all.
+                    let Some(support) = reframe_face_support(&native, stored) else {
                         return Err(format!(
-                            "sketch {} support frame changed during replay",
+                            "sketch {} support plane changed during replay",
                             record.id
                         ));
-                    }
+                    };
                     SketchSupport::PlanarFace {
                         body: *body,
                         snapshot: head,
                         face: native.face,
-                        frame: Box::new(native.frame),
-                        boundary: native.boundary,
-                        inner_boundaries: native.inner_boundaries,
+                        frame: Box::new(stored),
+                        boundary: support.boundary,
+                        inner_boundaries: support.inner_boundaries,
                         support_digest: native.support_digest,
                     }
                 }
@@ -4889,6 +4969,56 @@ impl KernelLabApp {
         self.restore_runtime_from_document();
         self.document_status = Some(format!("Rebuilt {completed} feature(s) atomically"));
         true
+    }
+
+    fn can_undo(&self) -> bool {
+        if self.operation_confirmation_pending() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            return true;
+        }
+        self.document.can_undo()
+    }
+
+    fn can_redo(&self) -> bool {
+        if self.operation_confirmation_pending() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            return self.sketch.can_redo_local();
+        }
+        self.document.can_redo()
+    }
+
+    fn handle_undo(&mut self) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(false) {
+                return true;
+            }
+            self.leave_sketch_mode();
+            self.sketch.clear_creation_draft();
+            self.active_tool = ActiveTool::Select;
+            self.document_status = Some("Undo exited sketch mode".to_owned());
+            return true;
+        }
+        self.undo_document()
+    }
+
+    fn handle_redo(&mut self) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(true) {
+                return true;
+            }
+            return false;
+        }
+        self.redo_document()
     }
 
     fn undo_document(&mut self) -> bool {
@@ -6582,7 +6712,7 @@ impl KernelLabApp {
                 };
                 match NativeKernel::planar_face_support(&body.snapshot, selected_face) {
                     Ok(support) => {
-                        if self.start_face_sketch_camera_transition(support) {
+                        if self.start_face_sketch_camera_transition(squared_face_support(support)) {
                             return;
                         }
                     }
@@ -9347,13 +9477,20 @@ impl KernelLabApp {
         })
     }
 
-    /// The mirror plane chosen in the Browser: the selected construction
-    /// plane when there is one, the selected origin plane otherwise.
+    /// The mirror plane chosen in the Browser or viewport: the selected
+    /// construction plane when there is one, the selected planar face if one
+    /// is picked, and the selected origin plane otherwise.
     fn browser_mirror_plane(&self) -> (PlanarFrame3, String) {
         if let Some(id) = self.selected_construction_plane
             && let Some(plane) = self.construction_planes.iter().find(|plane| plane.id == id)
         {
             return (plane.frame, plane.name.clone());
+        }
+        if let Some(face_ref) = self.selected_face
+            && let Some(index) = self.active_body_index()
+            && let Ok(support) = NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face_ref)
+        {
+            return (support.frame, "selected planar face".to_owned());
         }
         (
             sketch_plane_frame(self.selected_origin_plane),
@@ -10078,15 +10215,7 @@ impl KernelLabApp {
                             || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
                 )
             });
-            if self.workbench_mode == WorkbenchMode::Sketch
-                && !self.sketch.dimension_editor_active()
-                && ((undo && self.restore_local_sketch_journal(false))
-                    || (redo && self.restore_local_sketch_journal(true)))
-            {
-                context.request_repaint();
-                return;
-            }
-            if (undo && self.undo_document()) || (redo && self.redo_document()) {
+            if (undo && self.handle_undo()) || (redo && self.handle_redo()) {
                 context.request_repaint();
                 return;
             }
@@ -10263,17 +10392,25 @@ impl KernelLabApp {
                     ui.close();
                 }
                 ui.separator();
-                // Exports need a path, and the path editor lives in the
-                // document properties popout. The menu routes there rather
-                // than growing a second pair of export buttons that write
-                // somewhere else — the ellipsis is the promise that this
-                // opens a dialog rather than doing the thing.
+                // The ellipsis is the promise that this opens a dialog rather
+                // than doing the thing, and now it keeps it: the same Export
+                // dialog the Browser's own export actions raise, so a
+                // destination is proposed and confirmed wherever the command
+                // was reached from.
                 if ui
-                    .add_enabled(!operation_pending, egui::Button::new("Export…"))
-                    .on_hover_text("Choose an STL or faceted STEP path and export")
+                    .add_enabled(!operation_pending, egui::Button::new("Export as STL…"))
+                    .on_hover_text("Choose where to write an STL of the visible bodies")
                     .clicked()
                 {
-                    self.document_properties_open = true;
+                    self.open_export_dialog(ExportSubject::Document { step: false });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(!operation_pending, egui::Button::new("Export as STEP…"))
+                    .on_hover_text("Choose where to write a faceted STEP of the visible bodies")
+                    .clicked()
+                {
+                    self.open_export_dialog(ExportSubject::Document { step: true });
                     ui.close();
                 }
                 ui.separator();
@@ -10328,10 +10465,10 @@ impl KernelLabApp {
             // history strip: they are the two controls a user reaches for
             // without looking, and the strip is where you go to inspect
             // history, not to step it.
-            let undo_enabled = !operation_pending && self.document.can_undo();
+            let undo_enabled = self.can_undo();
             let undo = ui
                 .add_enabled(undo_enabled, egui::Button::new("Undo").small())
-                .on_hover_text("Undo the last committed document change");
+                .on_hover_text("Undo the last action");
             undo.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
@@ -10339,7 +10476,7 @@ impl KernelLabApp {
                     "Undo history change",
                 )
             });
-            let redo_enabled = !operation_pending && self.document.can_redo();
+            let redo_enabled = self.can_redo();
             let redo = ui
                 .add_enabled(redo_enabled, egui::Button::new("Redo").small())
                 .on_hover_text("Redo the change that was undone");
@@ -10351,9 +10488,9 @@ impl KernelLabApp {
                 )
             });
             if undo.clicked() {
-                self.undo_document();
+                self.handle_undo();
             } else if redo.clicked() {
-                self.redo_document();
+                self.handle_redo();
             }
             shell_toggle_button(
                 ui,
@@ -10781,28 +10918,190 @@ impl KernelLabApp {
                 Some("Confirm or cancel the pending operation before exporting".into());
             return;
         }
-        let Some(body_id) = self
-            .bodies
-            .iter()
-            .find(|body| body.ordinal == ordinal)
-            .map(|body| body.id)
-        else {
+        if !self.bodies.iter().any(|body| body.ordinal == ordinal) {
+            return;
+        }
+        self.open_export_dialog(ExportSubject::Body { ordinal, step });
+    }
+
+    /// Opens the Export dialog on a chosen destination.
+    ///
+    /// Exporting used to write immediately to a path derived from the
+    /// document's, which for an unsaved document meant a file appearing inside
+    /// the application data directory with nothing said about it. From the
+    /// outside that is indistinguishable from the command doing nothing. The
+    /// destination is now proposed, shown, and editable before anything is
+    /// written, and the result is reported where it was asked for.
+    fn open_export_dialog(&mut self, subject: ExportSubject) {
+        let path = default_export_directory(&self.document_path).join(format!(
+            "{}.{}",
+            subject.file_stem(&self.document_path),
+            subject.extension()
+        ));
+        self.pending_export = Some(PendingExport {
+            subject,
+            path_text: path.display().to_string(),
+            outcome: None,
+        });
+    }
+
+    /// Writes the export the dialog is holding, and reports what happened.
+    fn write_pending_export(&mut self) {
+        let Some(pending) = self.pending_export.as_ref() else {
             return;
         };
-        let path = self.document_path.with_extension(format!(
-            "body-{ordinal}.{}",
-            if step { "step" } else { "stl" }
-        ));
-        let triangles = self.export_triangles_for(|body| body.id == body_id);
-        let written = if step {
-            write_faceted_step(&path, &triangles)
-        } else {
-            write_ascii_stl(&path, &triangles)
+        let (subject, path) = (pending.subject, PathBuf::from(pending.path_text.trim()));
+        if path.as_os_str().is_empty() {
+            if let Some(pending) = self.pending_export.as_mut() {
+                pending.outcome = Some(Err("Give the export a destination path".to_owned()));
+            }
+            return;
+        }
+        let written = match subject {
+            ExportSubject::Body { ordinal, step } => {
+                let body_id = self
+                    .bodies
+                    .iter()
+                    .find(|body| body.ordinal == ordinal)
+                    .map(|body| body.id);
+                match body_id {
+                    Some(body_id) => {
+                        let triangles = self.export_triangles_for(|body| body.id == body_id);
+                        if step {
+                            write_faceted_step(&path, &triangles)
+                        } else {
+                            write_ascii_stl(&path, &triangles)
+                        }
+                    }
+                    None => Err("that body is no longer in the document".into()),
+                }
+            }
+            ExportSubject::Document { step } => {
+                let triangles = self.committed_export_triangles();
+                if step {
+                    write_faceted_step(&path, &triangles)
+                } else {
+                    write_ascii_stl(&path, &triangles)
+                }
+            }
+            ExportSubject::Sketch { index, .. } => match self.sketch_export_curves(index) {
+                Some(curves) => export::write_sketch_dxf(&path, &curves),
+                None => Err("that sketch is no longer in the document".into()),
+            },
         };
-        self.document_status = Some(match written {
-            Ok(()) => format!("Body {ordinal} exported to {}", path.display()),
-            Err(error) => format!("Body {ordinal} export failed: {error}"),
+        self.document_status = Some(match &written {
+            Ok(()) => format!("Exported to {}", path.display()),
+            Err(error) => format!("Export failed: {error}"),
         });
+        if let Some(pending) = self.pending_export.as_mut() {
+            pending.outcome = Some(match written {
+                Ok(()) => Ok(path),
+                Err(error) => Err(error.to_string()),
+            });
+        }
+    }
+
+    /// The Export dialog itself.
+    fn export_window(&mut self, context: &egui::Context) {
+        let Some(pending) = self.pending_export.as_ref() else {
+            return;
+        };
+        let (subject, mut path_text) = (pending.subject, pending.path_text.clone());
+        let mut open = true;
+        let mut export = false;
+        let mut close = false;
+        egui::Window::new(subject.title())
+            .id(egui::Id::new("export_window"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(520.0)
+            .min_width(460.0)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(context, |ui| {
+                ui.label(RichText::new("Destination").small().color(theme::muted()));
+                ui.add(
+                    egui::TextEdit::singleline(&mut path_text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/path/to/export.stl"),
+                );
+                let path = PathBuf::from(path_text.trim());
+                if path.is_file() {
+                    status_line(
+                        ui,
+                        "A file is already there and will be replaced",
+                        theme::warn(),
+                    );
+                } else if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty() && !parent.is_dir())
+                {
+                    status_line(
+                        ui,
+                        &format!("No such folder: {}", parent.display()),
+                        theme::warn(),
+                    );
+                }
+                match self
+                    .pending_export
+                    .as_ref()
+                    .and_then(|pending| pending.outcome.as_ref())
+                {
+                    Some(Ok(written)) => status_line(
+                        ui,
+                        &format!("Exported to {}", written.display()),
+                        theme::good(),
+                    ),
+                    Some(Err(error)) => status_line(ui, error, theme::bad()),
+                    None => {}
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Export").clicked() {
+                        export = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(pending) = self
+            .pending_export
+            .as_mut()
+            .filter(|pending| pending.path_text != path_text)
+        {
+            pending.path_text = path_text;
+            pending.outcome = None;
+        }
+        if export {
+            self.write_pending_export();
+        }
+        if close || !open {
+            self.pending_export = None;
+        }
+    }
+
+    /// The exact curves a sketch would export, wherever it currently lives.
+    fn sketch_export_curves(&self, index: usize) -> Option<Vec<export::SketchExportCurve>> {
+        let sketch = self.sketches.get(index)?;
+        Some(if self.active_sketch_index == Some(index) {
+            sketch_export_curves_from_authoring(self.sketch.authoring())
+        } else if let Some(authoring) = sketch
+            .portable_payload
+            .as_ref()
+            .and_then(SketchPayload::authoring)
+        {
+            sketch_export_curves_from_authoring(authoring)
+        } else {
+            sketch_export_curves_from_entities(&sketch.entities)
+        })
     }
 
     /// Exports one sketch's exact curves as a 2D DXF beside the document.
@@ -10813,24 +11112,7 @@ impl KernelLabApp {
             return;
         };
         let ordinal = sketch.ordinal;
-        let curves = if self.active_sketch_index == Some(index) {
-            sketch_export_curves_from_authoring(self.sketch.authoring())
-        } else if let Some(authoring) = sketch
-            .portable_payload
-            .as_ref()
-            .and_then(SketchPayload::authoring)
-        {
-            sketch_export_curves_from_authoring(authoring)
-        } else {
-            sketch_export_curves_from_entities(&sketch.entities)
-        };
-        let path = self
-            .document_path
-            .with_extension(format!("sketch-{ordinal}.dxf"));
-        self.document_status = Some(match export::write_sketch_dxf(&path, &curves) {
-            Ok(()) => format!("Sketch {ordinal} exported to {}", path.display()),
-            Err(error) => format!("Sketch {ordinal} DXF export failed: {error}"),
-        });
+        self.open_export_dialog(ExportSubject::Sketch { index, ordinal });
     }
 
     /// Opens a committed sketch for editing — the Browser's explicit edit
@@ -11534,10 +11816,11 @@ impl KernelLabApp {
             && self.contextual_card_subject().is_some()
     }
 
-    /// The height the view cube and its roll controls occupy at the top-right
-    /// of the viewport. The card starts below it, and leaves the same gap at
-    /// the bottom, so the two sit as one column of chrome down the right edge.
-    const VIEW_CUBE_BLOCK: f32 = 115.0;
+    /// The height the view cube, its turn arrows, and its roll controls occupy
+    /// at the top-right of the viewport. The card starts below it, and leaves
+    /// the same gap at the bottom, so the two sit as one column of chrome down
+    /// the right edge.
+    const VIEW_CUBE_BLOCK: f32 = 135.0;
 
     /// The contextual card: the model workspace's replacement for a palette
     /// that was reserved on every frame whether or not it had anything to
@@ -15052,7 +15335,7 @@ impl KernelLabApp {
 
         let cube_rect = egui::Rect::from_min_size(
             egui::pos2(rect.right() - 112.0, rect.top()),
-            egui::vec2(112.0, 108.0),
+            egui::vec2(112.0, 128.0),
         );
         if let Some(command) = model_view_cube(ui, cube_rect, self.view, true) {
             match command {
@@ -15821,6 +16104,7 @@ impl eframe::App for KernelLabApp {
         self.show_browser_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
+        self.export_window(ui.ctx());
         self.theme_editor_window(ui.ctx());
         self.variables_window(ui.ctx());
         self.about_window(ui.ctx());
@@ -15959,17 +16243,11 @@ fn model_view_cube(
     view: ViewState,
     show_controls: bool,
 ) -> Option<ViewCubeCommand> {
-    ui.painter().rect(
-        rect,
-        4.0,
-        translucent(theme::panel(), 92),
-        Stroke::new(1.0, translucent(theme::border(), 132)),
-        egui::StrokeKind::Inside,
-    );
+    // Make the navigation cube fully integrated into the main view with transparent background
     let cube_center = egui::pos2(
         rect.center().x,
         if show_controls {
-            rect.top() + 43.0
+            rect.top() + 52.0
         } else {
             rect.center().y
         },
@@ -16046,6 +16324,40 @@ fn model_view_cube(
         return command;
     }
 
+    for (name, direction, target) in view_cube_adjacent_arrows(view) {
+        let center = cube_center + direction * 42.0;
+        let hit_rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
+        let response = ui.interact(
+            hit_rect,
+            ui.id().with(("view-cube-arrow", name)),
+            egui::Sense::click(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("View cube turn {name}"),
+            )
+        });
+        let tip = center + direction * 9.0;
+        let back = center - direction * 3.0;
+        let flank = egui::vec2(-direction.y, direction.x) * 6.0;
+        let fill = if response.hovered() {
+            theme::accent()
+        } else {
+            Color32::from_rgb(148, 158, 170)
+        };
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![tip, back + flank, back - flank],
+            translucent(fill, 226),
+            Stroke::NONE,
+        ));
+        if response.clicked() {
+            command = Some(ViewCubeCommand::Face(target));
+        }
+        response.on_hover_text(format!("Turn to the {} view", target.label()));
+    }
+
     let controls_y = rect.bottom() - 25.0;
     for (x, width, text, label, next) in [
         (
@@ -16084,6 +16396,47 @@ fn model_view_cube(
         }
     }
     command
+}
+
+/// Computes the 4 rotating adjacent face arrows in 3D screen space around the
+/// dominant visible view cube face.
+fn view_cube_adjacent_arrows(view: ViewState) -> Vec<(&'static str, egui::Vec2, StandardView)> {
+    let nearest = view.nearest_standard_view();
+    let n = nearest.outward_normal();
+    let mut arrows = Vec::new();
+    for target in StandardView::ALL {
+        let t_norm = target.outward_normal();
+        // Check if orthogonal to the nearest face normal (dot product ~ 0)
+        let dot = (n.x * t_norm.x + n.y * t_norm.y + n.z * t_norm.z).abs();
+        if dot > 0.1 {
+            continue;
+        }
+        let projected = view.project_direction(t_norm);
+        let screen_vec =
+            egui::vec2(projected.coordinates[0] as f32, projected.coordinates[1] as f32);
+        if screen_vec.length_sq() > 1.0e-4 {
+            let normalized = screen_vec.normalized();
+            arrows.push((target.label(), normalized, target));
+        }
+    }
+    arrows
+}
+
+/// Fallback for view_cube_arrow_target when needed by tests.
+#[cfg(test)]
+fn view_cube_arrow_target(view: ViewState, direction: egui::Vec2) -> Option<StandardView> {
+    let nearest = view.nearest_standard_view();
+    StandardView::ALL
+        .into_iter()
+        .filter(|face| *face != nearest)
+        .filter_map(|face| {
+            let projected = view.project_direction(face.outward_normal());
+            let along = projected.coordinates[0] as f32 * direction.x
+                + projected.coordinates[1] as f32 * direction.y;
+            (along > 0.35).then_some((face, along))
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(face, _)| face)
 }
 
 fn view_cube_faces() -> [(StandardView, [Vector3; 4]); 6] {
@@ -16144,6 +16497,212 @@ fn view_cube_faces() -> [(StandardView, [Vector3; 4]); 6] {
             ],
         ),
     ]
+}
+
+/// Squares a face support's in-plane axes to the world, keeping the plane, the
+/// origin, and every piece of geometry exactly where it was.
+///
+/// A face surface carries whichever parameterization the operation that built
+/// it left behind, and nothing downstream noticed until a sketch read those
+/// axes as the frame a person draws in. The faceted rebuild names a face's `u`
+/// after the first boundary chord it happens to visit, so once a fillet puts a
+/// blend's arc chords into the loop, that chord's angle — 7.5°, 15°, whatever
+/// the panel count implies — becomes the sketch's idea of horizontal.
+///
+/// The rule is the camera's, applied to axes instead of a view: of the
+/// candidates, take the one nearest square and keep the normal fixed. The
+/// candidates are the three world axes projected into the face, and the winner
+/// is whichever lies most nearly in it — an exact axis for any face of an
+/// axis-aligned body, however that face came to be built. Ties, which is every
+/// axis-aligned face, resolve by axis order so the choice is stable across a
+/// rebuild. The new axes differ from the old by a rotation about the face
+/// normal, so the support's own outline is carried across by that rotation and
+/// describes the same curves in the same places.
+fn squared_face_support(support: PlanarFaceSupport) -> PlanarFaceSupport {
+    let unit = |vector: Vector3| {
+        let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+        (length.is_finite() && length > 1.0e-12)
+            .then(|| Vector3::new(vector.x / length, vector.y / length, vector.z / length))
+    };
+    let cross = |left: Vector3, right: Vector3| {
+        Vector3::new(
+            left.y * right.z - left.z * right.y,
+            left.z * right.x - left.x * right.z,
+            left.x * right.y - left.y * right.x,
+        )
+    };
+    let dot = |left: Vector3, right: Vector3| {
+        left.x
+            .mul_add(right.x, left.y.mul_add(right.y, left.z * right.z))
+    };
+    let Some(u) = unit(support.frame.u) else {
+        return support;
+    };
+    let Some(v) = unit(support.frame.v) else {
+        return support;
+    };
+    let Some(normal) = unit(cross(u, v)) else {
+        return support;
+    };
+    let squared_u = [
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    ]
+    .into_iter()
+    .map(|axis| {
+        let along = dot(axis, normal);
+        Vector3::new(
+            axis.x - normal.x * along,
+            axis.y - normal.y * along,
+            axis.z - normal.z * along,
+        )
+    })
+    .max_by(|left, right| dot(*left, *left).total_cmp(&dot(*right, *right)))
+    .and_then(unit);
+    let Some(squared_u) = squared_u else {
+        return support;
+    };
+    let squared_v = cross(normal, squared_u);
+    // The rotation from the face's own axes to the squared ones, as the 2×2 it
+    // acts by on in-plane coordinates.
+    let (a, b) = (dot(u, squared_u), dot(v, squared_u));
+    let (c, d) = (dot(u, squared_v), dot(v, squared_v));
+    if (a - 1.0).abs() < 1.0e-12 && b.abs() < 1.0e-12 && c.abs() < 1.0e-12 {
+        return support;
+    }
+    let turn = |x: f64, y: f64| (a.mul_add(x, b * y), c.mul_add(x, d * y));
+    let turn_point = |point: &ProtocolPoint2| {
+        let (x, y) = turn(point.x, point.y);
+        ProtocolPoint2::new(x, y)
+    };
+    let turn_direction = |direction: [f64; 2]| {
+        let (x, y) = turn(direction[0], direction[1]);
+        [x, y]
+    };
+    let turn_curve = |curve: &FaceBoundaryCurve2| match curve {
+        FaceBoundaryCurve2::Segment { endpoints } => FaceBoundaryCurve2::Segment {
+            endpoints: [turn_point(&endpoints[0]), turn_point(&endpoints[1])],
+        },
+        FaceBoundaryCurve2::Arc {
+            center,
+            u,
+            v,
+            radius,
+            start,
+            end,
+        } => FaceBoundaryCurve2::Arc {
+            center: turn_point(center),
+            u: turn_direction(*u),
+            v: turn_direction(*v),
+            radius: *radius,
+            start: *start,
+            end: *end,
+        },
+    };
+    PlanarFaceSupport {
+        frame: PlanarFrame3::new(support.frame.origin, squared_u, squared_v),
+        boundary: support.boundary.iter().map(turn_point).collect(),
+        inner_boundaries: support
+            .inner_boundaries
+            .iter()
+            .map(|loop_points| loop_points.iter().map(turn_point).collect())
+            .collect(),
+        boundary_curves: support.boundary_curves.iter().map(turn_curve).collect(),
+        inner_boundary_curves: support
+            .inner_boundary_curves
+            .iter()
+            .map(|loop_curves| loop_curves.iter().map(turn_curve).collect())
+            .collect(),
+        ..support
+    }
+}
+
+/// A face support's polygon boundaries, re-expressed in a caller's frame.
+struct ReframedFaceSupport {
+    boundary: Vec<ProtocolPoint2>,
+    inner_boundaries: Vec<Vec<ProtocolPoint2>>,
+}
+
+/// Re-expresses a freshly computed face support in a frame recorded earlier,
+/// as long as both frames describe the same plane.
+///
+/// Replay needs the stored frame to stay authoritative — a sketch's saved
+/// coordinates only mean anything alongside the frame they were authored in —
+/// while the support outline it snaps to has just been recomputed against the
+/// current body. Carrying the outline across is a change of basis in the
+/// plane the two share: lift each point into the world through the frame that
+/// produced it, then read it back through the frame that will consume it.
+/// Returns `None` when the planes genuinely differ, which is the case the
+/// replay guard exists to catch.
+fn reframe_face_support(
+    native: &PlanarFaceSupport,
+    stored: PlanarFrame3,
+) -> Option<ReframedFaceSupport> {
+    if native.frame == stored {
+        return Some(ReframedFaceSupport {
+            boundary: native.boundary.clone(),
+            inner_boundaries: native.inner_boundaries.clone(),
+        });
+    }
+    let unit = |vector: Vector3| {
+        let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+        (length.is_finite() && length > 1.0e-12)
+            .then(|| Vector3::new(vector.x / length, vector.y / length, vector.z / length))
+    };
+    let cross = |left: Vector3, right: Vector3| {
+        Vector3::new(
+            left.y * right.z - left.z * right.y,
+            left.z * right.x - left.x * right.z,
+            left.x * right.y - left.y * right.x,
+        )
+    };
+    let dot = |left: Vector3, right: Vector3| {
+        left.x
+            .mul_add(right.x, left.y.mul_add(right.y, left.z * right.z))
+    };
+    let (native_u, native_v) = (unit(native.frame.u)?, unit(native.frame.v)?);
+    let (stored_u, stored_v) = (unit(stored.u)?, unit(stored.v)?);
+    let native_normal = unit(cross(native_u, native_v))?;
+    let stored_normal = unit(cross(stored_u, stored_v))?;
+    let offset = Vector3::new(
+        stored.origin.x - native.frame.origin.x,
+        stored.origin.y - native.frame.origin.y,
+        stored.origin.z - native.frame.origin.z,
+    );
+    // Only the in-plane rotation is forgiven. The normals must still be
+    // parallel — either sense, since a frame may name the face's two sides
+    // differently — and the origin must not have moved at all: a drifted
+    // centroid means the outline itself changed, which is exactly what this
+    // guard is here to catch.
+    let skew = cross(native_normal, stored_normal);
+    let skew = skew
+        .x
+        .mul_add(skew.x, skew.y.mul_add(skew.y, skew.z * skew.z))
+        .sqrt();
+    let drift = offset
+        .x
+        .mul_add(offset.x, offset.y.mul_add(offset.y, offset.z * offset.z))
+        .sqrt();
+    if skew > 1.0e-9 || drift > 1.0e-7 {
+        return None;
+    }
+    let convert = |point: &ProtocolPoint2| {
+        let local = Vector3::new(
+            native_u.x.mul_add(point.x, native_v.x * point.y) - offset.x,
+            native_u.y.mul_add(point.x, native_v.y * point.y) - offset.y,
+            native_u.z.mul_add(point.x, native_v.z * point.y) - offset.z,
+        );
+        ProtocolPoint2::new(dot(local, stored_u), dot(local, stored_v))
+    };
+    Some(ReframedFaceSupport {
+        boundary: native.boundary.iter().map(convert).collect(),
+        inner_boundaries: native
+            .inner_boundaries
+            .iter()
+            .map(|loop_points| loop_points.iter().map(convert).collect())
+            .collect(),
+    })
 }
 
 fn blend_color(left: Color32, right: Color32, amount: f32) -> Color32 {
@@ -16327,6 +16886,26 @@ fn user_preferences_path() -> PathBuf {
         .parent()
         .map_or_else(default_catalog_root, Path::to_path_buf)
         .join("preferences.json")
+}
+
+/// Where an export should land when the user has not said otherwise.
+///
+/// The document's own folder is the right answer once the document lives
+/// somewhere the user chose. Until then `document_path` points inside the
+/// application data directory — a reasonable home for an autosaved workspace
+/// and a terrible one for an export, which is a file the user means to go and
+/// find. An unsaved document therefore exports to the home directory, where
+/// looking for it will succeed.
+fn default_export_directory(document_path: &Path) -> PathBuf {
+    let parent = document_path.parent().unwrap_or_else(|| Path::new("."));
+    if document_path == default_document_path() {
+        for variable in ["HOME", "USERPROFILE"] {
+            if let Some(home) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+                return PathBuf::from(home);
+            }
+        }
+    }
+    parent.to_path_buf()
 }
 
 fn default_document_path() -> PathBuf {
@@ -18451,6 +19030,101 @@ fn hud_button(
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, accessible_label)
     });
     response.on_hover_text(accessible_label)
+}
+
+#[cfg(test)]
+mod view_cube_arrow_tests {
+    use super::*;
+
+    const VIEW_CUBE_ARROWS: [(&str, egui::Vec2); 4] = [
+        ("left", egui::vec2(-1.0, 0.0)),
+        ("right", egui::vec2(1.0, 0.0)),
+        ("top", egui::vec2(0.0, -1.0)),
+        ("bottom", egui::vec2(0.0, 1.0)),
+    ];
+
+    /// An arrow reaches the face the cube draws on that side of itself.
+    ///
+    /// Stated against the projection rather than against a table of view
+    /// names, because the two must agree whatever the projection's handedness
+    /// is: the arrow is a promise about the picture in front of the user, and
+    /// it stays true if the camera's basis is ever corrected.
+    #[test]
+    fn each_turn_arrow_reaches_the_face_drawn_on_that_side() {
+        for from in StandardView::ALL {
+            let mut view = ViewState::default();
+            view.set_standard_view(from);
+            for (name, direction) in VIEW_CUBE_ARROWS {
+                let Some(target) = view_cube_arrow_target(view, direction) else {
+                    panic!(
+                        "a square-on view should offer a {name} turn from {}",
+                        from.label()
+                    );
+                };
+                let projected = view.project_direction(target.outward_normal());
+                let along = projected.coordinates[0] as f32 * direction.x
+                    + projected.coordinates[1] as f32 * direction.y;
+                assert!(
+                    along > 0.9,
+                    "the {name} arrow from {} reached {}, which the cube does not draw that way",
+                    from.label(),
+                    target.label()
+                );
+            }
+        }
+    }
+
+    /// The four arrows of a square-on view name four different faces — the
+    /// four that are not the one facing the viewer or the one behind it.
+    ///
+    /// They are not required to round-trip: each standard view has a
+    /// canonical roll of its own, so turning up from the back and then down
+    /// again lands square on the front rather than retracing the turn.
+    #[test]
+    fn the_four_arrows_name_four_different_faces() {
+        for from in StandardView::ALL {
+            let mut view = ViewState::default();
+            view.set_standard_view(from);
+            let reached = VIEW_CUBE_ARROWS
+                .iter()
+                .filter_map(|(_, direction)| view_cube_arrow_target(view, *direction))
+                .collect::<Vec<_>>();
+            assert_eq!(reached.len(), 4, "from {}", from.label());
+            let unique = reached
+                .iter()
+                .map(|face| face.label())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                4,
+                "the four arrows from {} should name four faces, got {reached:?}",
+                from.label()
+            );
+            assert!(
+                !unique.contains(from.label()),
+                "no arrow from {} should name {} itself",
+                from.label(),
+                from.label()
+            );
+        }
+    }
+
+    /// An arrow that would barely turn the model is not offered at all: from
+    /// an isometric view every face is oblique, and the arrows must still
+    /// name distinct faces rather than repeating the nearest one.
+    #[test]
+    fn arrows_never_offer_the_face_already_in_front() {
+        let view = ViewState::default();
+        let nearest = view.nearest_standard_view();
+        for (_, direction) in VIEW_CUBE_ARROWS {
+            let target = view_cube_arrow_target(view, direction);
+            assert_ne!(
+                target,
+                Some(nearest),
+                "an arrow should never point at the face already facing the viewer"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -286,12 +286,12 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
     let center = harness.get_by_label("Sketch viewport").rect().center();
     harness.hover_at(center);
     harness.step();
-    // The default preset orbits with the right button; pressing it over the
-    // canvas swaps the 2D canvas for the 3D model viewport without leaving
-    // the sketch.
+    // The default SolidWorks preset orbits with the middle button; pressing it
+    // over the canvas swaps the 2D canvas for the 3D model viewport without
+    // leaving the sketch.
     harness.event(egui::Event::PointerButton {
         pos: center,
-        button: egui::PointerButton::Secondary,
+        button: egui::PointerButton::Middle,
         pressed: true,
         modifiers: egui::Modifiers::NONE,
     });
@@ -306,7 +306,7 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
     // its entities intact.
     harness.event(egui::Event::PointerButton {
         pos: center,
-        button: egui::PointerButton::Secondary,
+        button: egui::PointerButton::Middle,
         pressed: false,
         modifiers: egui::Modifiers::NONE,
     });

@@ -234,6 +234,11 @@ pub fn evaluate_recipe(
             let horizontal = SketchPoint2::new(anchor_position.u + width, anchor_position.v);
             let opposite = SketchPoint2::new(anchor_position.u + width, anchor_position.v + height);
             let vertical = SketchPoint2::new(anchor_position.u, anchor_position.v + height);
+            let center = SketchPoint2::new(
+                anchor_position.u + width * 0.5,
+                anchor_position.v + height * 0.5,
+            );
+            builder.add_derived_point(PointOutputRole::Center, center)?;
             let h = builder.add_derived_point(PointOutputRole::Corner(1), horizontal)?;
             let o = builder.add_derived_point(PointOutputRole::Corner(2), opposite)?;
             let v = builder.add_derived_point(PointOutputRole::Corner(3), vertical)?;
@@ -391,6 +396,13 @@ pub fn evaluate_recipe(
         } => {
             let first = builder.bind_input(*first_cap_center, PointOutputRole::CapCenter(0))?;
             let second = builder.bind_input(*second_cap_center, PointOutputRole::CapCenter(1))?;
+            let first_pos = builder.position(first)?;
+            let second_pos = builder.position(second)?;
+            let center = SketchPoint2::new(
+                (first_pos.u + second_pos.u) * 0.5,
+                (first_pos.v + second_pos.v) * 0.5,
+            );
+            builder.add_derived_point(PointOutputRole::Center, center)?;
             let width = resolve_length(*width, inputs)?;
             builder.add_slot(first, second, width, entity_role)?;
         }
@@ -2405,7 +2417,8 @@ mod tests {
             PrecisionPolicy::default(),
         )
         .expect("rectangle");
-        assert_eq!(evaluation.points.len(), 4);
+        assert_eq!(evaluation.points.len(), 5);
+        assert!(evaluation.points.iter().any(|p| p.role == PointOutputRole::Center));
         assert_eq!(evaluation.curves.len(), 4);
         let positions: BTreeMap<_, _> = evaluation
             .points
@@ -2468,7 +2481,8 @@ mod tests {
             PrecisionPolicy::default(),
         )
         .expect("slot");
-        assert_eq!(evaluation.points.len(), 6);
+        assert_eq!(evaluation.points.len(), 7);
+        assert!(evaluation.points.iter().any(|p| p.role == PointOutputRole::Center));
         assert_eq!(evaluation.curves.len(), 4);
         assert_eq!(
             evaluation

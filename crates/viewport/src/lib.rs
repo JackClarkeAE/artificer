@@ -2423,7 +2423,7 @@ fn project_document_triangles(
                 let points = camera.map(|point| projection.camera_point(point));
                 let [a, b, c] = triangle.vertices;
                 let vertex_depths = camera.map(|point| point.depth);
-                (triangle_signed_area(points) > 1.0e-4).then(|| ProjectedTriangle {
+                faces_the_camera(points).then(|| ProjectedTriangle {
                     points,
                     screen_bounds: points_bounds(&points),
                     model_vertices: triangle.vertices,
@@ -3991,7 +3991,7 @@ fn paint_model_sketch_overlays(
                 ),
             ]
             .map(|point| projection.instance_point(point, view, presentation));
-            if triangle_signed_area(facing) <= 1.0e-4 {
+            if !faces_the_camera(facing) {
                 continue;
             }
         }
@@ -4258,17 +4258,34 @@ pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
         .iter()
         .filter(|edge| !edge.is_smooth)
         .collect::<Vec<_>>();
-    let tangent = |first: [Point3; 2], second: [Point3; 2]| {
-        let shared = first.iter().any(|left| {
+    // Two faces joined across a smooth edge are panels of one curved surface.
+    // That is the fact a curved rail needs: it is the only thing that tells a
+    // bore's rim, whose chords ride from one wall panel to the next, apart from
+    // a hexagon's rim, whose sides meet at a corner the kernel kept hard.
+    // Asking the angle instead cannot separate them — a coarsely sampled arc
+    // turns by as much between chords as a shallow polygon does at a corner.
+    let mut smooth_joins = BTreeSet::new();
+    for edge in &scene.edges {
+        if let (true, [Some(left), Some(right)]) = (edge.is_smooth, edge.incident_faces) {
+            smooth_joins.insert(if left <= right {
+                (left, right)
+            } else {
+                (right, left)
+            });
+        }
+    }
+    let meets = |first: [Point3; 2], second: [Point3; 2]| {
+        first.iter().any(|left| {
             second
                 .iter()
                 .any(|right| vector_length(vector_between(*left, *right)) <= tolerance)
-        });
+        })
+    };
+    let collinear = |first: [Point3; 2], second: [Point3; 2]| {
         let first_direction = vector_between(first[0], first[1]);
         let second_direction = vector_between(second[0], second[1]);
         let denominator = vector_length(first_direction) * vector_length(second_direction);
-        shared
-            && denominator > f64::EPSILON
+        denominator > f64::EPSILON
             && (first_direction.x.mul_add(
                 second_direction.x,
                 first_direction
@@ -4277,6 +4294,28 @@ pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
             ) / denominator)
                 .abs()
                 >= 1.0 - 1.0e-7
+    };
+    // The two chords keep one face between them — the cap the rim bounds — and
+    // leave one each; the rail continues exactly when those two are panels of
+    // the same curved wall.
+    let curves_on = |first: [Option<EntityRef>; 2], second: [Option<EntityRef>; 2]| {
+        let first = first.into_iter().flatten().collect::<Vec<_>>();
+        let second = second.into_iter().flatten().collect::<Vec<_>>();
+        if first.len() != 2 || second.len() != 2 {
+            return false;
+        }
+        let (Some(left), Some(right)) = (
+            first.iter().find(|face| !second.contains(face)),
+            second.iter().find(|face| !first.contains(face)),
+        ) else {
+            return false;
+        };
+        first.iter().any(|face| second.contains(face))
+            && smooth_joins.contains(&if left <= right {
+                (*left, *right)
+            } else {
+                (*right, *left)
+            })
     };
     let mut group = BTreeSet::from([seed]);
     let mut changed = true;
@@ -4288,7 +4327,9 @@ pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
             }
             let connected = visible.iter().any(|selected| {
                 group.contains(&selected.source_edge)
-                    && tangent(selected.endpoints, candidate.endpoints)
+                    && meets(selected.endpoints, candidate.endpoints)
+                    && (collinear(selected.endpoints, candidate.endpoints)
+                        || curves_on(selected.incident_faces, candidate.incident_faces))
             });
             if connected {
                 group.insert(candidate.source_edge);
@@ -5828,6 +5869,17 @@ const fn accessible_tool_description(tool: ActiveTool) -> &'static str {
     }
 }
 
+/// Whether a projected triangle turns its front toward the camera.
+///
+/// Screen Y grows downward while screen X grows to the right, so the pair is
+/// left-handed and an outward-wound world triangle projects to a *negative*
+/// signed area. The sign moved when the projection stopped mirroring, and a
+/// bare comparison repeated at each site would have been one more chance to
+/// disagree, so the convention lives here alone.
+fn faces_the_camera(points: [Pos2; 3]) -> bool {
+    triangle_signed_area(points) < -1.0e-4
+}
+
 fn triangle_signed_area(points: [Pos2; 3]) -> f32 {
     let first = points[1] - points[0];
     let second = points[2] - points[0];
@@ -6701,7 +6753,9 @@ mod tests {
         };
         let first_position = body_center(first_key);
         let second_position = body_center(second_key);
-        assert!(first_position.x < second_position.x);
+        // The nearer instance sits at a lower world X, which the viewer sees
+        // on their right.
+        assert!(first_position.x > second_position.x);
         assert_eq!(
             face_at_position(&projected, first_position).map(|selection| selection.body),
             Some(first_key)
@@ -6816,7 +6870,7 @@ mod tests {
                 .collect::<Vec<_>>();
             points.iter().map(|point| point.x).sum::<f32>() / points.len() as f32
         };
-        let expected_delta = (10.0 * projection.points_per_unit) as f32;
+        let expected_delta = -((10.0 * projection.points_per_unit) as f32);
         assert!((mean_x(placed_key) - mean_x(stationary_key) - expected_delta).abs() <= 1.0e-3);
     }
 
@@ -6877,7 +6931,9 @@ mod tests {
             },
         )
         .unwrap();
-        let expected_delta = (7.0 * projection.points_per_unit) as f32;
+        // World +X is drawn to the viewer's left, so a body moved along it
+        // travels to a smaller screen X.
+        let expected_delta = -((7.0 * projection.points_per_unit) as f32);
         assert!((placed.start.x - identity.start.x - expected_delta).abs() <= 1.0e-3);
         assert!((placed.end.x - identity.end.x - expected_delta).abs() <= 1.0e-3);
     }
@@ -6924,7 +6980,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first.len(), second.len());
         assert!(!first.is_empty());
-        let expected_screen_delta = (3.0 * projection.points_per_unit) as f32;
+        let expected_screen_delta = -((3.0 * projection.points_per_unit) as f32);
         for (active, committed) in first.into_iter().zip(second) {
             assert_eq!(active.source, committed.source);
             assert_eq!(active.role, committed.role);
@@ -7262,7 +7318,7 @@ mod tests {
             // Wind whichever way survives the projected back-face cull, so
             // the plates read as front-facing exactly like interior faces of
             // a real body do.
-            let fan: [[usize; 3]; 2] = if triangle_signed_area(projected) > 0.0 {
+            let fan: [[usize; 3]; 2] = if faces_the_camera(projected) {
                 [[0, 1, 2], [0, 2, 3]]
             } else {
                 [[0, 2, 1], [0, 3, 2]]
@@ -9073,6 +9129,82 @@ mod tests {
             },
         );
         NativeKernel::debug_scene(&bored)
+    }
+
+    /// Picking a bore's rim must offer the whole ring, not the chord under the
+    /// pointer. The rim is sampled into chords that ride from one wall panel
+    /// to the next across smooth joins, so the group follows it all the way
+    /// round; the hexagonal pocket in the same body proves the rule stops at a
+    /// real corner, where the walls meet hard.
+    #[test]
+    fn a_bore_rim_groups_as_one_ring_while_a_pocket_corner_stays_a_boundary() {
+        let scene = pocketed_and_bored_block_scene();
+        let bore_center = Point3::new(60.0, 25.0, 20.0);
+        let on_rim = |edge: &artificer_kernel::DebugEdge, center: Point3, radius: f64| {
+            edge.endpoints.iter().all(|point| {
+                (point.z - 20.0).abs() < 1.0e-6
+                    && ((point.x - center.x).hypot(point.y - center.y) - radius).abs() < 1.0e-6
+            })
+        };
+        let seed = scene
+            .edges
+            .iter()
+            .find(|edge| !edge.is_smooth && on_rim(edge, bore_center, 8.0))
+            .expect("the bore should present a rim edge on the top face");
+        let group = logical_edge_group(&scene, seed.source_edge);
+        let grouped_length: f64 = scene
+            .edges
+            .iter()
+            .filter(|edge| group.contains(&edge.source_edge))
+            .map(|edge| vector_length(vector_between(edge.endpoints[0], edge.endpoints[1])))
+            .sum();
+        let circumference = std::f64::consts::TAU * 8.0;
+        assert!(
+            grouped_length > circumference * 0.99 && grouped_length < circumference * 1.01,
+            "the rim group should trace the whole ring, got {grouped_length} for {circumference}"
+        );
+        assert!(
+            scene
+                .edges
+                .iter()
+                .filter(|edge| group.contains(&edge.source_edge))
+                .all(|edge| on_rim(edge, bore_center, 8.0)),
+            "the rim group should hold nothing but the rim"
+        );
+
+        let pocket_center = Point3::new(25.0, 25.0, 20.0);
+        let corner = |step: usize| {
+            let angle = std::f64::consts::TAU * (step % 6) as f64 / 6.0;
+            Point3::new(
+                12.0f64.mul_add(angle.cos(), pocket_center.x),
+                12.0f64.mul_add(angle.sin(), pocket_center.y),
+                20.0,
+            )
+        };
+        let side = scene
+            .edges
+            .iter()
+            .find(|edge| {
+                !edge.is_smooth
+                    && edge
+                        .endpoints
+                        .iter()
+                        .all(|point| (point.z - 20.0).abs() < 1.0e-6)
+                    && vector_length(vector_between(edge.endpoints[0], corner(0))) < 1.0e-6
+                    && vector_length(vector_between(edge.endpoints[1], corner(1))) < 1.0e-6
+            })
+            .expect("the pocket should present its first rim side");
+        let side_group = logical_edge_group(&scene, side.source_edge);
+        let side_length: f64 = scene
+            .edges
+            .iter()
+            .filter(|edge| side_group.contains(&edge.source_edge))
+            .map(|edge| vector_length(vector_between(edge.endpoints[0], edge.endpoints[1])))
+            .sum();
+        assert!(
+            side_length < 12.0 * 1.01,
+            "a pocket side should stop at its corners, got {side_length} for a side of 12"
+        );
     }
 
     /// An everyday multi-feature part must stay inside the exact orbit

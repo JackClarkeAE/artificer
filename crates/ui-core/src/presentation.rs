@@ -577,7 +577,8 @@ impl ViewState {
     /// Converts an orthographic screen-plane delta into a world-space vector.
     /// Horizontal is positive screen-right and vertical is positive down.
     pub fn world_delta_from_screen(self, horizontal: f64, vertical: f64) -> [f64; 3] {
-        let camera = [finite_or_zero(horizontal), 0.0, -finite_or_zero(vertical)];
+        // The exact inverse of `project_direction`, negated horizontal included.
+        let camera = [-finite_or_zero(horizontal), 0.0, -finite_or_zero(vertical)];
         let rolled = rotate_y(camera, finite_or_zero(self.roll));
         let yawed = rotate_x(rolled, finite_or_zero(self.pitch));
         rotate_z(yawed, finite_or_zero(self.yaw))
@@ -602,8 +603,17 @@ impl ViewState {
         let pitched = rotate_x(yawed, -finite_or_zero(self.pitch));
         let camera = rotate_y(pitched, -finite_or_zero(self.roll));
 
+        // Camera X is the axis the rotation carries the world's right-hand
+        // side onto, and it points screen *left*.
+        //
+        // The camera frame is right-handed, so its three axes satisfy
+        // `x × y = z`. Reading them as (right, toward-viewer, up) asks instead
+        // for `right × up = toward`, which the same three axes answer with
+        // `x × z = -y`. One negation reconciles them, and without it every
+        // view came out mirrored: standing square to the front of a part, its
+        // right-hand side was drawn on the viewer's left.
         CameraProjection {
-            coordinates: [camera[0], -camera[2]],
+            coordinates: [-camera[0], -camera[2]],
             depth: camera[1],
         }
     }
@@ -1251,7 +1261,11 @@ mod tests {
         };
         view.frame(bounds());
         let projection = view.project(Point3::new(2.0, 3.0, 4.0));
-        assert_eq!(projection.coordinates, [2.0, -6.0]);
+        // Identity orientation puts world +Y toward the viewer, so they stand
+        // on the +Y side looking back along -Y with +Z up. Facing that way,
+        // world +X is on their left — so a point at +X belongs at a negative
+        // screen X. It used to land at a positive one, mirrored.
+        assert_eq!(projection.coordinates, [-2.0, -6.0]);
         assert_eq!(projection.depth, 2.0);
     }
 
