@@ -92,6 +92,7 @@ cargo build \
 # file left behind by an earlier build would ship inside the release.
 rm -rf "${publish_dir}"
 mkdir -p "${publish_dir}" "${output_dir}"
+rm -f "${output_dir}"/*"${version}"* "${output_dir}"/*"${version#v}"*
 install -m 0755 "${workspace_dir}/target/release/${binary}" "${publish_dir}/${main_exe}"
 
 # The pack id is permanent. It names the install directory, the update cache,

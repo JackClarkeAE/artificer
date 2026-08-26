@@ -170,9 +170,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --draft \
-                 --title "Artificer $GITHUB_REF_NAME" --generate-notes
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release delete "$GITHUB_REF_NAME" --yes || true
+          fi
+          gh release create "$GITHUB_REF_NAME" --draft \
+            --title "Artificer $GITHUB_REF_NAME" --generate-notes
 
   release:
     needs: release-prepare
@@ -240,6 +242,11 @@ jobs:
             --token "$GH_TOKEN" \
             --outputDir artifacts/releases \
             || echo "no previous Velopack release found; packing a full release"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            tagged="${tagged}.0"
+          fi
+          rm -f artifacts/releases/*"$tagged"* artifacts/releases/*"${GITHUB_REF_NAME#v}"*
       - name: Pack
         if: matrix.packaging == 'velopack'
         shell: bash
