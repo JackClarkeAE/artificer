@@ -9676,38 +9676,31 @@ pub fn show_with_context(
                 SketchTool::Select => {
                     let sketch_pt = state.view.screen_to_sketch(response.rect, position);
                     let additive = ui.input(|input| input.modifiers.shift);
-                    let hovered_region = state.analytic_regions.hovered.clone();
-                    if hovered_region.is_some() {
+                    let selected = hit_test_entities(
+                        &state.entities,
+                        state.view,
+                        response.rect,
+                        position,
+                        entity_pick_radius,
+                    );
+                    if let Some(selected) = selected {
+                        selection_changed = state.set_selected(Some(selected));
+                        if !additive {
+                            selection_changed |= state.clear_selected_regions();
+                        }
+                        // Picking is the whole Dimension gesture: the first
+                        // driving box takes the caret so "click the curve, type
+                        // 3, Enter" never leaves the canvas. This deliberately
+                        // does not read `selection_changed`, so re-picking a
+                        // curve that is already selected re-arms it. A staged
+                        // candidate owns the boxes, so it is left alone.
+                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+                            state.dimension_pick = Some(sketch_pt);
+                            state.focus_dimension_box = first_armed_dimension_kind(state);
+                        }
+                    } else {
                         selection_changed = state.set_selected(None);
                         selection_changed |= state.select_region_at_point(sketch_pt, additive);
-                    } else {
-                        let selected = hit_test_entities(
-                            &state.entities,
-                            state.view,
-                            response.rect,
-                            position,
-                            entity_pick_radius,
-                        );
-                        if let Some(selected) = selected {
-                            selection_changed = state.set_selected(Some(selected));
-                            if !additive {
-                                selection_changed |= state.clear_selected_regions();
-                            }
-                            // Picking is the whole Dimension gesture: the first
-                            // driving box takes the caret so "click the curve, type
-                            // 3, Enter" never leaves the canvas. This deliberately
-                            // does not read `selection_changed`, so re-picking a
-                            // curve that is already selected re-arms it. A staged
-                            // candidate owns the boxes, so it is left alone.
-                            if state.exact_tool == ToolVariant::Dimension && state.pending.is_none()
-                            {
-                                state.dimension_pick = Some(sketch_pt);
-                                state.focus_dimension_box = first_armed_dimension_kind(state);
-                            }
-                        } else {
-                            selection_changed = state.set_selected(None);
-                            selection_changed |= state.select_region_at_point(sketch_pt, additive);
-                        }
                     }
                 }
                 SketchTool::Point
