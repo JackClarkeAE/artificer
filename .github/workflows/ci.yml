@@ -155,6 +155,9 @@ jobs:
         run: |
           set -euo pipefail
           tagged="${GITHUB_REF_NAME#v}"
+          if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            tagged="${tagged}.0"
+          fi
           declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
                           found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
           if [ "$tagged" != "$declared" ]; then

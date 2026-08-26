@@ -9488,7 +9488,8 @@ impl KernelLabApp {
         }
         if let Some(face_ref) = self.selected_face
             && let Some(index) = self.active_body_index()
-            && let Ok(support) = NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face_ref)
+            && let Ok(support) =
+                NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face_ref)
         {
             return (support.frame, "selected planar face".to_owned());
         }
@@ -16412,8 +16413,10 @@ fn view_cube_adjacent_arrows(view: ViewState) -> Vec<(&'static str, egui::Vec2, 
             continue;
         }
         let projected = view.project_direction(t_norm);
-        let screen_vec =
-            egui::vec2(projected.coordinates[0] as f32, projected.coordinates[1] as f32);
+        let screen_vec = egui::vec2(
+            projected.coordinates[0] as f32,
+            projected.coordinates[1] as f32,
+        );
         if screen_vec.length_sq() > 1.0e-4 {
             let normalized = screen_vec.normalized();
             arrows.push((target.label(), normalized, target));
@@ -16423,7 +16426,7 @@ fn view_cube_adjacent_arrows(view: ViewState) -> Vec<(&'static str, egui::Vec2, 
 }
 
 /// Fallback for view_cube_arrow_target when needed by tests.
-#[cfg(test)]
+#[allow(dead_code)]
 fn view_cube_arrow_target(view: ViewState, direction: egui::Vec2) -> Option<StandardView> {
     let nearest = view.nearest_standard_view();
     StandardView::ALL
