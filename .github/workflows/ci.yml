@@ -154,12 +154,17 @@ jobs:
         # afterwards. Cheap check, permanent class of bug removed.
         run: |
           set -euo pipefail
-          tagged="${GITHUB_REF_NAME#v}"
-          if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            tagged="${tagged}.0"
-          fi
           declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
                           found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            decl_compact="$(printf '%s' "$declared" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')"
+            if [ "$tagged" = "$decl_compact" ]; then
+              tagged="$declared"
+            else
+              tagged="${tagged}.0"
+            fi
+          fi
           if [ "$tagged" != "$declared" ]; then
             printf 'error: tag %s does not match the workspace version %s\n' \
               "$GITHUB_REF_NAME" "$declared" >&2
@@ -242,9 +247,16 @@ jobs:
             --token "$GH_TOKEN" \
             --outputDir artifacts/releases \
             || echo "no previous Velopack release found; packing a full release"
+          declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
+                          found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
           tagged="${GITHUB_REF_NAME#v}"
           if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            tagged="${tagged}.0"
+            decl_compact="$(printf '%s' "$declared" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')"
+            if [ "$tagged" = "$decl_compact" ]; then
+              tagged="$declared"
+            else
+              tagged="${tagged}.0"
+            fi
           fi
           rm -f artifacts/releases/*"$tagged"* artifacts/releases/*"${GITHUB_REF_NAME#v}"*
       - name: Pack
