@@ -218,6 +218,7 @@ mod legacy_navigation {
             // older build can honour.
             NavigationPreset::Fusion | NavigationPreset::Inventor => "middle-pan-inverted",
             NavigationPreset::SolidWorks => "middle-orbit-inverted",
+            NavigationPreset::Blender => "middle-orbit-shift-pan",
             NavigationPreset::Onshape => "right-orbit",
             NavigationPreset::Creo => "middle-orbit-shift-pan-inverted",
             NavigationPreset::Nx => "middle-orbit-shift-pan",
@@ -4970,6 +4971,56 @@ impl KernelLabApp {
         true
     }
 
+    fn can_undo(&self) -> bool {
+        if self.operation_confirmation_pending() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            return true;
+        }
+        self.document.can_undo()
+    }
+
+    fn can_redo(&self) -> bool {
+        if self.operation_confirmation_pending() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            return self.sketch.can_redo_local();
+        }
+        self.document.can_redo()
+    }
+
+    fn handle_undo(&mut self) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(false) {
+                return true;
+            }
+            self.leave_sketch_mode();
+            self.sketch.clear_creation_draft();
+            self.active_tool = ActiveTool::Select;
+            self.document_status = Some("Undo exited sketch mode".to_owned());
+            return true;
+        }
+        self.undo_document()
+    }
+
+    fn handle_redo(&mut self) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            if !self.sketch.dimension_editor_active() && self.restore_local_sketch_journal(true) {
+                return true;
+            }
+            return false;
+        }
+        self.redo_document()
+    }
+
     fn undo_document(&mut self) -> bool {
         if self.pending_operation.is_some() || !self.document.undo() {
             return false;
@@ -9426,13 +9477,20 @@ impl KernelLabApp {
         })
     }
 
-    /// The mirror plane chosen in the Browser: the selected construction
-    /// plane when there is one, the selected origin plane otherwise.
+    /// The mirror plane chosen in the Browser or viewport: the selected
+    /// construction plane when there is one, the selected planar face if one
+    /// is picked, and the selected origin plane otherwise.
     fn browser_mirror_plane(&self) -> (PlanarFrame3, String) {
         if let Some(id) = self.selected_construction_plane
             && let Some(plane) = self.construction_planes.iter().find(|plane| plane.id == id)
         {
             return (plane.frame, plane.name.clone());
+        }
+        if let Some(face_ref) = self.selected_face
+            && let Some(index) = self.active_body_index()
+            && let Ok(support) = NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face_ref)
+        {
+            return (support.frame, "selected planar face".to_owned());
         }
         (
             sketch_plane_frame(self.selected_origin_plane),
@@ -10157,15 +10215,7 @@ impl KernelLabApp {
                             || (input.modifiers.shift && input.key_pressed(egui::Key::Z))),
                 )
             });
-            if self.workbench_mode == WorkbenchMode::Sketch
-                && !self.sketch.dimension_editor_active()
-                && ((undo && self.restore_local_sketch_journal(false))
-                    || (redo && self.restore_local_sketch_journal(true)))
-            {
-                context.request_repaint();
-                return;
-            }
-            if (undo && self.undo_document()) || (redo && self.redo_document()) {
+            if (undo && self.handle_undo()) || (redo && self.handle_redo()) {
                 context.request_repaint();
                 return;
             }
@@ -10415,10 +10465,10 @@ impl KernelLabApp {
             // history strip: they are the two controls a user reaches for
             // without looking, and the strip is where you go to inspect
             // history, not to step it.
-            let undo_enabled = !operation_pending && self.document.can_undo();
+            let undo_enabled = self.can_undo();
             let undo = ui
                 .add_enabled(undo_enabled, egui::Button::new("Undo").small())
-                .on_hover_text("Undo the last committed document change");
+                .on_hover_text("Undo the last action");
             undo.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
@@ -10426,7 +10476,7 @@ impl KernelLabApp {
                     "Undo history change",
                 )
             });
-            let redo_enabled = !operation_pending && self.document.can_redo();
+            let redo_enabled = self.can_redo();
             let redo = ui
                 .add_enabled(redo_enabled, egui::Button::new("Redo").small())
                 .on_hover_text("Redo the change that was undone");
@@ -10438,9 +10488,9 @@ impl KernelLabApp {
                 )
             });
             if undo.clicked() {
-                self.undo_document();
+                self.handle_undo();
             } else if redo.clicked() {
-                self.redo_document();
+                self.handle_redo();
             }
             shell_toggle_button(
                 ui,
@@ -16193,13 +16243,7 @@ fn model_view_cube(
     view: ViewState,
     show_controls: bool,
 ) -> Option<ViewCubeCommand> {
-    ui.painter().rect(
-        rect,
-        4.0,
-        translucent(theme::panel(), 92),
-        Stroke::new(1.0, translucent(theme::border(), 132)),
-        egui::StrokeKind::Inside,
-    );
+    // Make the navigation cube fully integrated into the main view with transparent background
     let cube_center = egui::pos2(
         rect.center().x,
         if show_controls {
@@ -16280,11 +16324,8 @@ fn model_view_cube(
         return command;
     }
 
-    for (name, direction) in VIEW_CUBE_ARROWS {
-        let Some(target) = view_cube_arrow_target(view, direction) else {
-            continue;
-        };
-        let center = cube_center + egui::vec2(direction.x * 44.0, direction.y * 40.0);
+    for (name, direction, target) in view_cube_adjacent_arrows(view) {
+        let center = cube_center + direction * 42.0;
         let hit_rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
         let response = ui.interact(
             hit_rect,
@@ -16357,24 +16398,32 @@ fn model_view_cube(
     command
 }
 
-/// The four turn arrows around the cube, named for the screen direction they
-/// point in. Screen y grows downward, so "up" is negative.
-const VIEW_CUBE_ARROWS: [(&str, egui::Vec2); 4] = [
-    ("left", egui::vec2(-1.0, 0.0)),
-    ("right", egui::vec2(1.0, 0.0)),
-    ("up", egui::vec2(0.0, -1.0)),
-    ("down", egui::vec2(0.0, 1.0)),
-];
+/// Computes the 4 rotating adjacent face arrows in 3D screen space around the
+/// dominant visible view cube face.
+fn view_cube_adjacent_arrows(view: ViewState) -> Vec<(&'static str, egui::Vec2, StandardView)> {
+    let nearest = view.nearest_standard_view();
+    let n = nearest.outward_normal();
+    let mut arrows = Vec::new();
+    for target in StandardView::ALL {
+        let t_norm = target.outward_normal();
+        // Check if orthogonal to the nearest face normal (dot product ~ 0)
+        let dot = (n.x * t_norm.x + n.y * t_norm.y + n.z * t_norm.z).abs();
+        if dot > 0.1 {
+            continue;
+        }
+        let projected = view.project_direction(t_norm);
+        let screen_vec =
+            egui::vec2(projected.coordinates[0] as f32, projected.coordinates[1] as f32);
+        if screen_vec.length_sq() > 1.0e-4 {
+            let normalized = screen_vec.normalized();
+            arrows.push((target.label(), normalized, target));
+        }
+    }
+    arrows
+}
 
-/// The face a turn arrow reaches: the standard view whose outward normal
-/// currently projects furthest along that screen direction.
-///
-/// This is the question the arrow actually asks — "which face is off-screen
-/// that way" — rather than a fixed table per current view, so it answers from
-/// an oblique camera as readily as from a square-on one. The current face is
-/// excluded because its own normal points at the viewer, and a candidate must
-/// clear a threshold so a nearly edge-on face is never offered: an arrow that
-/// would barely turn the model is not drawn at all.
+/// Fallback for view_cube_arrow_target when needed by tests.
+#[cfg(test)]
 fn view_cube_arrow_target(view: ViewState, direction: egui::Vec2) -> Option<StandardView> {
     let nearest = view.nearest_standard_view();
     StandardView::ALL
@@ -18986,6 +19035,13 @@ fn hud_button(
 #[cfg(test)]
 mod view_cube_arrow_tests {
     use super::*;
+
+    const VIEW_CUBE_ARROWS: [(&str, egui::Vec2); 4] = [
+        ("left", egui::vec2(-1.0, 0.0)),
+        ("right", egui::vec2(1.0, 0.0)),
+        ("top", egui::vec2(0.0, -1.0)),
+        ("bottom", egui::vec2(0.0, 1.0)),
+    ];
 
     /// An arrow reaches the face the cube draws on that side of itself.
     ///

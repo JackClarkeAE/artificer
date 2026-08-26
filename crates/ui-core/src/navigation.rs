@@ -23,10 +23,11 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NavigationPreset {
-    /// The workbench's own scheme: right-drag orbits, middle-drag pans.
+    /// SolidWorks: middle orbits, Ctrl+middle pans, Shift+middle drag zooms,
+    /// wheel forward zooms out.
     #[default]
-    #[serde(alias = "right-orbit")]
-    Artificer,
+    #[serde(alias = "middle-orbit-inverted", alias = "solidworks")]
+    SolidWorks,
     /// Fusion 360: middle pans, Shift+middle orbits, wheel forward zooms out.
     #[serde(
         alias = "middle-pan",
@@ -34,14 +35,12 @@ pub enum NavigationPreset {
         alias = "fusion360"
     )]
     Fusion,
-    /// Inventor: as Fusion, plus hold F4 to orbit, F2 to pan, F3 to zoom.
-    Inventor,
-    /// SolidWorks: middle orbits, Ctrl+middle pans, Shift+middle drag zooms,
-    /// wheel forward zooms out.
-    #[serde(alias = "middle-orbit-inverted", alias = "solidworks")]
-    SolidWorks,
     /// Onshape: right orbits, middle or Ctrl+right pans.
     Onshape,
+    /// Blender: middle orbits, Shift+middle pans, wheel forward zooms in.
+    Blender,
+    /// Inventor: as Fusion, plus hold F4 to orbit, F2 to pan, F3 to zoom.
+    Inventor,
     /// Creo: middle orbits, Shift+middle pans, Ctrl+middle drag zooms,
     /// wheel forward zooms out.
     #[serde(alias = "middle-orbit-shift-pan-inverted")]
@@ -49,6 +48,9 @@ pub enum NavigationPreset {
     /// NX: middle orbits, Shift+middle pans, Ctrl+middle drag zooms.
     #[serde(alias = "middle-orbit-shift-pan")]
     Nx,
+    /// Artificer: right-drag orbits, middle-drag pans.
+    #[serde(alias = "right-orbit")]
+    Artificer,
 }
 
 /// Which mouse button, with which modifier, drives a navigation gesture.
@@ -175,26 +177,28 @@ impl Bindings {
 }
 
 impl NavigationPreset {
-    pub const ALL: [Self; 7] = [
-        Self::Artificer,
-        Self::Fusion,
-        Self::Inventor,
+    pub const ALL: [Self; 8] = [
         Self::SolidWorks,
+        Self::Fusion,
         Self::Onshape,
+        Self::Blender,
+        Self::Inventor,
         Self::Creo,
         Self::Nx,
+        Self::Artificer,
     ];
 
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Artificer => "Artificer",
-            Self::Fusion => "Familiar with Fusion 360",
-            Self::Inventor => "Familiar with Inventor",
-            Self::SolidWorks => "Familiar with SolidWorks",
-            Self::Onshape => "Familiar with Onshape",
-            Self::Creo => "Familiar with Creo",
-            Self::Nx => "Familiar with NX",
+            Self::SolidWorks => "SolidWorks",
+            Self::Fusion => "Fusion 360",
+            Self::Onshape => "Onshape",
+            Self::Blender => "Blender",
+            Self::Inventor => "Inventor",
+            Self::Creo => "Creo",
+            Self::Nx => "NX",
+            Self::Artificer => "Artificer (Legacy)",
         }
     }
 
@@ -211,11 +215,30 @@ impl NavigationPreset {
             zoom_key: None,
         };
         match self {
-            Self::Artificer => COMMON,
+            Self::SolidWorks => Bindings {
+                orbit: Gesture::Middle,
+                pan: Gesture::CtrlMiddle,
+                zoom_drag: Some(Gesture::ShiftMiddle),
+                invert_zoom: true,
+                ..COMMON
+            },
             Self::Fusion => Bindings {
                 orbit: Gesture::ShiftMiddle,
                 pan: Gesture::Middle,
                 invert_zoom: true,
+                ..COMMON
+            },
+            Self::Onshape => Bindings {
+                orbit: Gesture::Right,
+                pan: Gesture::Middle,
+                pan_alternate: Some(Gesture::CtrlRight),
+                ..COMMON
+            },
+            Self::Blender => Bindings {
+                orbit: Gesture::Middle,
+                pan: Gesture::ShiftMiddle,
+                zoom_drag: Some(Gesture::CtrlMiddle),
+                invert_zoom: false,
                 ..COMMON
             },
             Self::Inventor => Bindings {
@@ -225,19 +248,6 @@ impl NavigationPreset {
                 orbit_key: Some(HoldKey::F4),
                 pan_key: Some(HoldKey::F2),
                 zoom_key: Some(HoldKey::F3),
-                ..COMMON
-            },
-            Self::SolidWorks => Bindings {
-                orbit: Gesture::Middle,
-                pan: Gesture::CtrlMiddle,
-                zoom_drag: Some(Gesture::ShiftMiddle),
-                invert_zoom: true,
-                ..COMMON
-            },
-            Self::Onshape => Bindings {
-                orbit: Gesture::Right,
-                pan: Gesture::Middle,
-                pan_alternate: Some(Gesture::CtrlRight),
                 ..COMMON
             },
             Self::Creo => Bindings {
@@ -253,6 +263,7 @@ impl NavigationPreset {
                 zoom_drag: Some(Gesture::CtrlMiddle),
                 ..COMMON
             },
+            Self::Artificer => COMMON,
         }
     }
 

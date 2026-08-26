@@ -115,6 +115,7 @@ fn drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: egui::Vec2
     harness.step();
 }
 
+#[allow(dead_code)]
 fn secondary_drag_viewport(harness: &mut Harness<'static, KernelLabApp>, delta: egui::Vec2) {
     let start = viewport_grab_point(harness);
     let end = start + delta;
@@ -1215,7 +1216,7 @@ fn universal_orbit_and_zoom_work_without_leaving_select() {
     let transform_before = harness.state().displayed_transform();
     let view_before = harness.state().view_parameters();
 
-    secondary_drag_viewport(&mut harness, egui::vec2(48.0, -26.0));
+    middle_drag_viewport(&mut harness, egui::vec2(48.0, -26.0), egui::Modifiers::NONE);
     let view_after_orbit = harness.state().view_parameters();
     assert!((view_after_orbit.0 - view_before.0).abs() > EPSILON);
     assert!((view_after_orbit.1 - view_before.1).abs() > EPSILON);
@@ -1338,7 +1339,7 @@ fn orbit_returns_a_face_focused_camera_to_the_visible_document_centre() {
         .get_by_role_and_label(Role::Button, "Model mode")
         .click_accesskit();
     harness.run();
-    secondary_drag_viewport(&mut harness, egui::vec2(36.0, -19.0));
+    middle_drag_viewport(&mut harness, egui::vec2(36.0, -19.0), egui::Modifiers::NONE);
 
     assert_eq!(harness.state().view_frame().0, document_centre);
 }
@@ -1348,15 +1349,15 @@ fn orbit_keeps_a_pivot_the_user_panned_to() {
     let mut harness = harness();
     let centre_before = harness.state().view_frame().0;
 
-    // Middle-drag pans under the default profile, moving the pivot to the
+    // Ctrl+Middle-drag pans under the default SolidWorks profile, moving the pivot to the
     // part being inspected.
-    middle_drag_viewport(&mut harness, egui::vec2(64.0, 22.0), egui::Modifiers::NONE);
+    middle_drag_viewport(&mut harness, egui::vec2(64.0, 22.0), egui::Modifiers::COMMAND);
     let panned = harness.state().view_frame().0;
     assert_ne!(panned, centre_before);
 
     // Orbiting afterwards must stay about that pivot rather than snapping
     // back to the document centre.
-    secondary_drag_viewport(&mut harness, egui::vec2(36.0, -19.0));
+    middle_drag_viewport(&mut harness, egui::vec2(36.0, -19.0), egui::Modifiers::NONE);
     assert_eq!(harness.state().view_frame().0, panned);
 }
 
@@ -1438,7 +1439,7 @@ fn keyboard_shortcuts_separate_view_reset_pending_cancel_and_confirm() {
     assert_eq!(harness.state().active_tool_label(), "Move");
     drag_viewport(&mut harness, egui::vec2(65.0, -20.0));
     assert_ne!(harness.state().displayed_transform().0, [0.0; 3]);
-    secondary_drag_viewport(&mut harness, egui::vec2(35.0, 20.0));
+    middle_drag_viewport(&mut harness, egui::vec2(35.0, 20.0), egui::Modifiers::NONE);
     assert_ne!(harness.state().view_parameters(), initial_view);
 
     harness.key_press(egui::Key::Space);

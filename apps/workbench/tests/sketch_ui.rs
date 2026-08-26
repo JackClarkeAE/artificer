@@ -1437,7 +1437,7 @@ fn sketch_pan_and_zoom_are_immediate_presentation_changes_only() {
     harness.step();
     harness.event(egui::Event::PointerButton {
         pos: start,
-        button: egui::PointerButton::Middle,
+        button: egui::PointerButton::Secondary,
         pressed: true,
         modifiers: egui::Modifiers::NONE,
     });
@@ -1446,7 +1446,7 @@ fn sketch_pan_and_zoom_are_immediate_presentation_changes_only() {
     harness.step();
     harness.event(egui::Event::PointerButton {
         pos: end,
-        button: egui::PointerButton::Middle,
+        button: egui::PointerButton::Secondary,
         pressed: false,
         modifiers: egui::Modifiers::NONE,
     });
