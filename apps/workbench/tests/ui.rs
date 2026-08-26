@@ -1351,7 +1351,11 @@ fn orbit_keeps_a_pivot_the_user_panned_to() {
 
     // Ctrl+Middle-drag pans under the default SolidWorks profile, moving the pivot to the
     // part being inspected.
-    middle_drag_viewport(&mut harness, egui::vec2(64.0, 22.0), egui::Modifiers::COMMAND);
+    middle_drag_viewport(
+        &mut harness,
+        egui::vec2(64.0, 22.0),
+        egui::Modifiers::COMMAND,
+    );
     let panned = harness.state().view_frame().0;
     assert_ne!(panned, centre_before);
 

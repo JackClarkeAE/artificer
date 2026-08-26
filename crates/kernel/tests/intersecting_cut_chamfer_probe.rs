@@ -41,7 +41,9 @@ fn outer_top_edge(snapshot: &Snapshot) -> EntityRef {
         .edges
         .iter()
         .find(|edge| {
-            edge.endpoints.iter().all(|point| (point.z - SIZE).abs() < 1.0e-6)
+            edge.endpoints
+                .iter()
+                .all(|point| (point.z - SIZE).abs() < 1.0e-6)
                 && edge.endpoints.iter().any(|point| point.x.abs() < 1.0e-6)
         })
         .expect("outer top edge should exist")
@@ -141,7 +143,12 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
     // 3. Chamfer the edge of the cube
     let edge = outer_top_edge(&slot_cut);
     let scene = NativeKernel::debug_scene(&slot_cut);
-    println!("Scene edges: {}, triangles: {}, vertices: {}", scene.edges.len(), scene.triangles.len(), scene.vertices.len());
+    println!(
+        "Scene edges: {}, triangles: {}, vertices: {}",
+        scene.edges.len(),
+        scene.triangles.len(),
+        scene.vertices.len()
+    );
     let request = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         request_id: RequestId::new("chamfer"),

@@ -1220,7 +1220,12 @@ fn ear_clip(points: &[Point2]) -> Vec<[usize; 3]> {
                 let previous = (current + remaining.len() - 1) % remaining.len();
                 let next = (current + 1) % remaining.len();
                 let triangle = [remaining[previous], remaining[current], remaining[next]];
-                if signed_area(points[triangle[0]], points[triangle[1]], points[triangle[2]]) > 0.0 {
+                if signed_area(
+                    points[triangle[0]],
+                    points[triangle[1]],
+                    points[triangle[2]],
+                ) > 0.0
+                {
                     return Some(current);
                 }
             }
@@ -1648,13 +1653,14 @@ fn heal_planar_boundary_cycles(
             let model_triangle = triangle.map(|index| points[index]);
             let triangle_u = model_triangle[1] - model_triangle[0];
             let triangle_cross = triangle_u.cross(model_triangle[2] - model_triangle[0]);
-            let triangle_plane = if triangle_u.length() > epsilon && triangle_cross.length() > epsilon * epsilon {
-                let u = triangle_u / triangle_u.length();
-                let normal = triangle_cross / triangle_cross.length();
-                Plane::new(model_triangle[0], u, normal.cross(u))
-            } else {
-                plane
-            };
+            let triangle_plane =
+                if triangle_u.length() > epsilon && triangle_cross.length() > epsilon * epsilon {
+                    let u = triangle_u / triangle_u.length();
+                    let normal = triangle_cross / triangle_cross.length();
+                    Plane::new(model_triangle[0], u, normal.cross(u))
+                } else {
+                    plane
+                };
             let mut coedges = Vec::with_capacity(3);
             for side in 0..3 {
                 let start = cycle[triangle[side]].0;

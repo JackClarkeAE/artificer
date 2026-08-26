@@ -9615,8 +9615,7 @@ pub fn show_with_context(
         })
         .flatten();
     state.update_trim_hover(trim_hover_point, 8.0 / state.view.points_per_unit);
-    let region_hover_point = (state.exact_tool == ToolVariant::Select
-        && !pointer_over_dimension)
+    let region_hover_point = (state.exact_tool == ToolVariant::Select && !pointer_over_dimension)
         .then(|| {
             response
                 .hover_pos()
@@ -9700,16 +9699,14 @@ pub fn show_with_context(
                             // does not read `selection_changed`, so re-picking a
                             // curve that is already selected re-arms it. A staged
                             // candidate owns the boxes, so it is left alone.
-                            if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+                            if state.exact_tool == ToolVariant::Dimension && state.pending.is_none()
+                            {
                                 state.dimension_pick = Some(sketch_pt);
                                 state.focus_dimension_box = first_armed_dimension_kind(state);
                             }
                         } else {
                             selection_changed = state.set_selected(None);
-                            selection_changed |= state.select_region_at_point(
-                                sketch_pt,
-                                additive,
-                            );
+                            selection_changed |= state.select_region_at_point(sketch_pt, additive);
                         }
                     }
                 }
@@ -11475,14 +11472,15 @@ fn committed_dimension_annotation_layouts(
                     }
                 }
             }
-            CoreRecipe::TwoPointSlot { width, .. } => {
-                if let CoreValue::Literal(w) = width {
-                    if let Some(arc) = entities
-                        .iter()
-                        .find(|e| matches!(e.geometry, SketchGeometry::Arc { .. }))
-                    {
-                        dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
-                    }
+            CoreRecipe::TwoPointSlot {
+                width: CoreValue::Literal(w),
+                ..
+            } => {
+                if let Some(arc) = entities
+                    .iter()
+                    .find(|e| matches!(e.geometry, SketchGeometry::Arc { .. }))
+                {
+                    dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
                 }
             }
             CoreRecipe::CentreOuterPointSlot {
@@ -11490,21 +11488,19 @@ fn committed_dimension_annotation_layouts(
                 width,
                 ..
             } => {
-                if let CoreValue::Literal(w) = width {
-                    if let Some(arc) = entities
+                if let CoreValue::Literal(w) = width
+                    && let Some(arc) = entities
                         .iter()
                         .find(|e| matches!(e.geometry, SketchGeometry::Arc { .. }))
-                    {
-                        dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
-                    }
+                {
+                    dressed.push((SketchDimensionKind::Radius, arc.geometry, w.get() * 0.5));
                 }
-                if let CoreValue::Literal(l) = overall_length {
-                    if let Some(seg) = entities
+                if let CoreValue::Literal(l) = overall_length
+                    && let Some(seg) = entities
                         .iter()
                         .find(|e| matches!(e.geometry, SketchGeometry::Segment { .. }))
-                    {
-                        dressed.push((SketchDimensionKind::Length, seg.geometry, l.get()));
-                    }
+                {
+                    dressed.push((SketchDimensionKind::Length, seg.geometry, l.get()));
                 }
             }
             _ => {}

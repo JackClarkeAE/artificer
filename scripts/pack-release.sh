@@ -26,6 +26,9 @@ crate_version="$(cargo pkgid --manifest-path "${workspace_dir}/Cargo.toml" \
     --package artificer-workbench | sed 's/.*[@#]//')"
 version="${1:-${crate_version}}"
 version="${version#v}"
+if printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+$'; then
+    version="${version}.0"
+fi
 
 if ! printf '%s' "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+].+)?$'; then
     printf 'error: "%s" is not a semver2 version\n' "${version}" >&2

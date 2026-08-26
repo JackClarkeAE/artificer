@@ -2418,7 +2418,12 @@ mod tests {
         )
         .expect("rectangle");
         assert_eq!(evaluation.points.len(), 5);
-        assert!(evaluation.points.iter().any(|p| p.role == PointOutputRole::Center));
+        assert!(
+            evaluation
+                .points
+                .iter()
+                .any(|p| p.role == PointOutputRole::Center)
+        );
         assert_eq!(evaluation.curves.len(), 4);
         let positions: BTreeMap<_, _> = evaluation
             .points
@@ -2482,7 +2487,12 @@ mod tests {
         )
         .expect("slot");
         assert_eq!(evaluation.points.len(), 7);
-        assert!(evaluation.points.iter().any(|p| p.role == PointOutputRole::Center));
+        assert!(
+            evaluation
+                .points
+                .iter()
+                .any(|p| p.role == PointOutputRole::Center)
+        );
         assert_eq!(evaluation.curves.len(), 4);
         assert_eq!(
             evaluation
