@@ -893,20 +893,39 @@ impl NativeKernel {
                             FaceExtrusionOperation::Add => BooleanOperation::Union,
                             FaceExtrusionOperation::Cut => BooleanOperation::Difference,
                         };
-                        let topology = prism_boolean::build_prism_boolean(
+                        let topology = match prism_boolean::build_prism_boolean(
                             &input.topology,
                             &tool,
                             boolean_operation,
                             request.precision,
-                        )
-                        .map_err(|_| {
-                            planar_profile_input_error(
-                                input.id,
-                                PlanarProfileInputError::FaceFeature(
-                                    FaceFeatureInputError::ProfileOutsideFace,
-                                ),
-                            )
-                        })?;
+                        ) {
+                            Ok(topology) => topology,
+                            Err(_) if *operation == FaceExtrusionOperation::Cut => {
+                                let mut boolean_input = input.clone();
+                                let mut boolean_precision = request.precision;
+                                boolean_precision.max_subdivisions =
+                                    boolean_precision.max_subdivisions.min(4);
+                                boolean_input.precision = Some(boolean_precision);
+                                let scene = NativeKernel::authoritative_scene(&boolean_input);
+                                faceted_boolean::subtract_crossing_profile(
+                                    &scene,
+                                    *frame,
+                                    profile,
+                                    Vector3::new(-unit.x, -unit.y, -unit.z),
+                                    *distance,
+                                    request.precision,
+                                )
+                                .map_err(|reason| planar_profile_input_error(input.id, reason))?
+                            }
+                            Err(_) => {
+                                return Err(planar_profile_input_error(
+                                    input.id,
+                                    PlanarProfileInputError::FaceFeature(
+                                        FaceFeatureInputError::ProfileOutsideFace,
+                                    ),
+                                ));
+                            }
+                        };
                         (topology, None, true)
                     }
                     Err(reason) => {
@@ -2757,8 +2776,8 @@ fn presentation_edge_classification(
                     .max((first.origin - Point3::default()).length())
                     .max((second.origin - Point3::default()).length())
                     .max(1.0);
-                let tolerance = scale * 1.0e-9;
-                first_axis.dot(second_axis).abs() >= 1.0 - 1.0e-10
+                let tolerance = scale * 1.0e-5;
+                first_axis.dot(second_axis).abs() >= 1.0 - 1.0e-6
                     && (first.radius - second.radius).abs() <= tolerance
                     && (second.origin - first.origin).cross(first_axis).length() <= tolerance
             }
@@ -2786,8 +2805,8 @@ fn presentation_edge_classification(
                 (Some(first_axis), Some(second_axis)) => {
                     let tolerance =
                         carrier_scale(first.origin, first.major_radius + first.minor_radius)
-                            * 1.0e-9;
-                    first_axis.dot(second_axis).abs() >= 1.0 - 1.0e-10
+                            * 1.0e-5;
+                    first_axis.dot(second_axis).abs() >= 1.0 - 1.0e-6
                         && (second.origin - first.origin).length() <= tolerance
                         && (first.major_radius - second.major_radius).abs() <= tolerance
                         && (first.minor_radius - second.minor_radius).abs() <= tolerance
@@ -2799,10 +2818,10 @@ fn presentation_edge_classification(
             match (unit(first.axis), unit(second.axis)) {
                 (Some(first_axis), Some(second_axis)) => {
                     let alignment = first_axis.dot(second_axis);
-                    let tolerance = carrier_scale(first.origin, first.base_radius) * 1.0e-9;
+                    let tolerance = carrier_scale(first.origin, first.base_radius) * 1.0e-5;
                     // An anti-parallel axis flips the axial parameter, so the
                     // same point set carries the negated slope.
-                    alignment.abs() >= 1.0 - 1.0e-10
+                    alignment.abs() >= 1.0 - 1.0e-6
                         && (second.origin - first.origin).length() <= tolerance
                         && (first.base_radius - second.base_radius).abs() <= tolerance
                         && (first.slope - alignment.signum() * second.slope).abs() <= tolerance
@@ -2811,7 +2830,7 @@ fn presentation_edge_classification(
             }
         }
         (Surface::Sphere(first), Surface::Sphere(second)) => {
-            let tolerance = carrier_scale(first.origin, first.radius) * 1.0e-9;
+            let tolerance = carrier_scale(first.origin, first.radius) * 1.0e-5;
             (second.origin - first.origin).length() <= tolerance
                 && (first.radius - second.radius).abs() <= tolerance
         }
@@ -2837,27 +2856,18 @@ fn finish_logical_successor_edges(
     precision: PrecisionPolicy,
 ) -> Option<Topology> {
     let source_scene = NativeKernel::authoritative_scene(input);
-    let source_segments = targets
-        .iter()
-        .map(|target| {
-            source_scene
-                .edges
-                .iter()
-                .filter(|edge| edge.source_edge == *target && !edge.is_smooth)
-                .max_by(|left, right| {
-                    let length_squared = |edge: &&DebugEdge| {
-                        let delta = [
-                            edge.endpoints[1].x - edge.endpoints[0].x,
-                            edge.endpoints[1].y - edge.endpoints[0].y,
-                            edge.endpoints[1].z - edge.endpoints[0].z,
-                        ];
-                        delta[0].mul_add(delta[0], delta[1].mul_add(delta[1], delta[2] * delta[2]))
-                    };
-                    length_squared(left).total_cmp(&length_squared(right))
-                })
-                .map(|segment| segment.endpoints)
-        })
-        .collect::<Option<Vec<_>>>()?;
+    let mut source_segments = Vec::with_capacity(targets.len());
+    for target in targets {
+        let matching = source_scene
+            .edges
+            .iter()
+            .filter(|edge| edge.source_edge == *target && !edge.is_smooth)
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return None;
+        }
+        source_segments.push(matching[0].endpoints);
+    }
 
     let mut current = input.clone();
     for source in source_segments {

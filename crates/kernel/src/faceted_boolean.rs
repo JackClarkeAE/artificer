@@ -1190,17 +1190,18 @@ fn ear_clip(points: &[Point2]) -> Vec<[usize; 3]> {
     let mut remaining = (0..points.len()).collect::<Vec<_>>();
     let mut triangles = Vec::new();
     while remaining.len() > 3 {
-        let mut ear = None;
+        let mut best_ear = None::<usize>;
+        let mut best_area = 0.0_f64;
         for current in 0..remaining.len() {
             let previous = (current + remaining.len() - 1) % remaining.len();
             let next = (current + 1) % remaining.len();
             let triangle = [remaining[previous], remaining[current], remaining[next]];
-            if signed_area(
+            let area = signed_area(
                 points[triangle[0]],
                 points[triangle[1]],
                 points[triangle[2]],
-            ) <= 0.0
-            {
+            );
+            if area <= 1.0e-12 {
                 continue;
             }
             if remaining.iter().copied().any(|candidate| {
@@ -1209,13 +1210,27 @@ fn ear_clip(points: &[Point2]) -> Vec<[usize; 3]> {
             }) {
                 continue;
             }
-            ear = Some((current, triangle));
-            break;
+            if area > best_area {
+                best_area = area;
+                best_ear = Some(current);
+            }
         }
-        let Some((index, triangle)) = ear else {
+        let Some(index) = best_ear.or_else(|| {
+            for current in 0..remaining.len() {
+                let previous = (current + remaining.len() - 1) % remaining.len();
+                let next = (current + 1) % remaining.len();
+                let triangle = [remaining[previous], remaining[current], remaining[next]];
+                if signed_area(points[triangle[0]], points[triangle[1]], points[triangle[2]]) > 0.0 {
+                    return Some(current);
+                }
+            }
+            None
+        }) else {
             return Vec::new();
         };
-        triangles.push(triangle);
+        let previous = (index + remaining.len() - 1) % remaining.len();
+        let next = (index + 1) % remaining.len();
+        triangles.push([remaining[previous], remaining[index], remaining[next]]);
         remaining.remove(index);
     }
     if remaining.len() == 3 {
@@ -1241,11 +1256,63 @@ fn topology_from_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Option<Topolo
     topology_from_polygons_with_heal_limit(polygons, epsilon, None)
 }
 
+fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {
+    let mut result = Vec::with_capacity(polygons.len());
+    for polygon in polygons {
+        if polygon.vertices.len() <= 3 {
+            result.push(polygon);
+            continue;
+        }
+        let Some(plane) = SplitPlane::from_points(&polygon.vertices, epsilon * epsilon) else {
+            result.push(polygon);
+            continue;
+        };
+        let p0 = polygon.vertices[0];
+        let Some(u) = polygon.vertices.iter().skip(1).find_map(|p| {
+            let d = *p - p0;
+            (d.length() > epsilon).then(|| d / d.length())
+        }) else {
+            result.push(polygon);
+            continue;
+        };
+        let v = plane.normal.cross(u);
+        let planar_frame = Plane::new(p0, u, v);
+        let planar_error = polygon
+            .vertices
+            .iter()
+            .map(|p| ((*p - p0).dot(plane.normal)).abs())
+            .fold(0.0_f64, f64::max);
+        if planar_error > (epsilon * 1.0e-4).max(1.0e-12) {
+            let projected = polygon
+                .vertices
+                .iter()
+                .map(|p| planar_frame.project(*p))
+                .collect::<Vec<_>>();
+            let triangles = ear_clip(&projected);
+            if triangles.len() == polygon.vertices.len().saturating_sub(2) {
+                for tri in triangles {
+                    if let Some(fragment) = Polygon::new(
+                        tri.map(|i| polygon.vertices[i]).to_vec(),
+                        polygon.role,
+                        epsilon,
+                    ) {
+                        result.push(fragment);
+                    }
+                }
+                continue;
+            }
+        }
+        result.push(polygon);
+    }
+    result
+}
+
 fn topology_from_polygons_with_heal_limit(
     polygons: Vec<Polygon>,
     epsilon: f64,
     maximum_healed_cycle_span: Option<f64>,
 ) -> Option<Topology> {
+    let polygons = split_non_planar_polygons(polygons, epsilon);
     let polygons = conform_polygon_edges(polygons, epsilon);
     let mut pending = VecDeque::from(polygons);
     let mut topology = Topology::default();
@@ -1340,20 +1407,7 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .map(|point| ((*point - points[0]).dot(normal)).abs())
             .fold(0.0_f64, f64::max);
-        if points.len() > 3 && planar_error > (epsilon * 1.0e-4).max(1.0e-12) {
-            let triangles = ear_clip(&projected);
-            if triangles.len() != points.len().saturating_sub(2) {
-                continue;
-            }
-            for triangle in triangles.into_iter().rev() {
-                if let Some(fragment) = Polygon::new(
-                    triangle.map(|index| points[index]).to_vec(),
-                    polygon.role,
-                    epsilon,
-                ) {
-                    pending.push_front(fragment);
-                }
-            }
+        if points.len() > 3 && planar_error > (epsilon * 1.0e-2).max(1.0e-7) {
             continue;
         }
         let twice_area = projected
@@ -1529,8 +1583,6 @@ fn heal_planar_boundary_cycles(
             .then(|| find_undirected_boundary_cycle(&boundary, &unused, seed))
             .flatten();
         if !directed && fallback.is_none() {
-            // This connected remainder is genuinely open rather than a set
-            // of closed transition loops; leave it for validation to reject.
             break;
         }
         if let Some((fallback_path, _)) = &fallback {
@@ -1593,30 +1645,16 @@ fn heal_planar_boundary_cycles(
             );
         }
         for triangle in triangles {
-            let triangle_points = triangle.map(|index| projected[index]);
-            let twice_area = triangle_points[0].x.mul_add(
-                triangle_points[1].y - triangle_points[2].y,
-                triangle_points[1].x.mul_add(
-                    triangle_points[2].y - triangle_points[0].y,
-                    triangle_points[2].x * (triangle_points[0].y - triangle_points[1].y),
-                ),
-            );
-            if !twice_area.is_finite() || twice_area.abs() <= epsilon * epsilon {
-                continue;
-            }
             let model_triangle = triangle.map(|index| points[index]);
             let triangle_u = model_triangle[1] - model_triangle[0];
             let triangle_cross = triangle_u.cross(model_triangle[2] - model_triangle[0]);
-            if triangle_u.length() <= epsilon || triangle_cross.length() <= epsilon * epsilon {
-                continue;
-            }
-            let triangle_u = triangle_u / triangle_u.length();
-            let triangle_normal = triangle_cross / triangle_cross.length();
-            let triangle_plane = Plane::new(
-                model_triangle[0],
-                triangle_u,
-                triangle_normal.cross(triangle_u),
-            );
+            let triangle_plane = if triangle_u.length() > epsilon && triangle_cross.length() > epsilon * epsilon {
+                let u = triangle_u / triangle_u.length();
+                let normal = triangle_cross / triangle_cross.length();
+                Plane::new(model_triangle[0], u, normal.cross(u))
+            } else {
+                plane
+            };
             let mut coedges = Vec::with_capacity(3);
             for side in 0..3 {
                 let start = cycle[triangle[side]].0;
@@ -1650,8 +1688,8 @@ fn heal_planar_boundary_cycles(
                         edge,
                         orientation,
                         [
-                            triangle_plane.project(points[triangle[side]]),
-                            triangle_plane.project(points[triangle[(side + 1) % 3]]),
+                            triangle_plane.project(model_triangle[side]),
+                            triangle_plane.project(model_triangle[(side + 1) % 3]),
                         ],
                     ),
                 });
@@ -1669,7 +1707,7 @@ fn heal_planar_boundary_cycles(
                     surface: Surface::Plane(triangle_plane),
                     outer_loop: loop_key,
                     inner_loops: Vec::new(),
-                    role: FaceRole::FeatureSide(u32::MAX),
+                    role: FaceRole::FeatureEnd,
                 },
             });
             shell_faces.push(face_key);
