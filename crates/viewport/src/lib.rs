@@ -439,6 +439,12 @@ impl ModelSketchOverlay {
         self.segments.len()
     }
 
+    /// Number of selectable planar regions in this overlay.
+    #[must_use]
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
     /// World-space extent of the overlay's own lines and points. A reference
     /// plane's corners are reported by the shell separately.
     #[must_use]
@@ -4878,7 +4884,11 @@ fn preview_bridge_is_visible(
         }
         let start = polygon[edge_start].projected;
         let end = polygon[edge_end].projected;
-        if same_point2(start, outer) || same_point2(end, outer) {
+        if same_point2(start, outer)
+            || same_point2(end, outer)
+            || same_point2(start, inner)
+            || same_point2(end, inner)
+        {
             continue;
         }
         if segments_intersect(outer, inner, start, end, FEATURE_PREVIEW_SIDE_TOLERANCE) {
@@ -4893,13 +4903,16 @@ fn preview_bridge_is_visible(
             {
                 continue;
             }
-            if segments_intersect(
-                outer,
-                inner,
-                boundary[edge_start],
-                boundary[edge_end],
-                FEATURE_PREVIEW_SIDE_TOLERANCE,
-            ) {
+            let start = boundary[edge_start];
+            let end = boundary[edge_end];
+            if same_point2(start, outer)
+                || same_point2(end, outer)
+                || same_point2(start, inner)
+                || same_point2(end, inner)
+            {
+                continue;
+            }
+            if segments_intersect(outer, inner, start, end, FEATURE_PREVIEW_SIDE_TOLERANCE) {
                 return false;
             }
         }
@@ -4935,7 +4948,8 @@ fn preview_ear_clip_polygon(points: &[[f64; 2]]) -> Option<Vec<[usize; 3]>> {
     }
     let mut remaining = (0..points.len()).collect::<Vec<_>>();
     let mut triangles = Vec::with_capacity(points.len().saturating_sub(2));
-    while remaining.len() > 3 {
+    let mut stale_count = 0;
+    while remaining.len() > 3 && stale_count < remaining.len() * 2 {
         let mut ear = None;
         for current in 0..remaining.len() {
             let previous = (current + remaining.len() - 1) % remaining.len();
@@ -4967,16 +4981,71 @@ fn preview_ear_clip_polygon(points: &[[f64; 2]]) -> Option<Vec<[usize; 3]>> {
             ear = Some((current, triangle));
             break;
         }
-        let (current, triangle) = ear?;
-        triangles.push(triangle);
-        remaining.remove(current);
+        if let Some((current, triangle)) = ear {
+            triangles.push(triangle);
+            remaining.remove(current);
+            stale_count = 0;
+        } else {
+            let mut best_fallback: Option<(usize, [usize; 3], usize)> = None;
+            for current in 0..remaining.len() {
+                let previous = (current + remaining.len() - 1) % remaining.len();
+                let next = (current + 1) % remaining.len();
+                let triangle = [remaining[previous], remaining[current], remaining[next]];
+                let cross = cross_2d(
+                    points[triangle[0]],
+                    points[triangle[1]],
+                    points[triangle[2]],
+                );
+                if cross <= 0.0 {
+                    continue;
+                }
+                let intrusions = remaining
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        !triangle.contains(candidate)
+                            && !triangle
+                                .iter()
+                                .any(|vertex| same_point2(points[*candidate], points[*vertex]))
+                            && point_in_or_on_triangle_2d(
+                                points[*candidate],
+                                points[triangle[0]],
+                                points[triangle[1]],
+                                points[triangle[2]],
+                                FEATURE_PREVIEW_SIDE_TOLERANCE,
+                            )
+                    })
+                    .count();
+                if best_fallback
+                    .as_ref()
+                    .is_none_or(|(_, _, best_count)| intrusions < *best_count)
+                {
+                    best_fallback = Some((current, triangle, intrusions));
+                    if intrusions == 0 {
+                        break;
+                    }
+                }
+            }
+            if let Some((current, triangle, _)) = best_fallback {
+                triangles.push(triangle);
+                remaining.remove(current);
+                stale_count += 1;
+            } else {
+                return None;
+            }
+        }
     }
-    triangles.push([remaining[0], remaining[1], remaining[2]]);
-    Some(triangles)
+    if remaining.len() == 3 {
+        triangles.push([remaining[0], remaining[1], remaining[2]]);
+        Some(triangles)
+    } else {
+        None
+    }
 }
 
 fn same_point2(left: [f64; 2], right: [f64; 2]) -> bool {
-    left == right
+    const TOL: f64 = 1.0e-7;
+    (left[0] - right[0]).hypot(left[1] - right[1]) <= TOL
 }
 
 #[cfg(test)]
