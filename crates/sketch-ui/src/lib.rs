@@ -10443,8 +10443,9 @@ pub fn show_with_context(
                 SketchDragHandle::Translate
             }
         });
-        let delta_u = f64::from(primary_drag_delta.x) / state.view.points_per_unit;
-        let delta_v = -f64::from(primary_drag_delta.y) / state.view.points_per_unit;
+        let horizontal = f64::from(primary_drag_delta.x) / state.view.points_per_unit;
+        let vertical = -f64::from(primary_drag_delta.y) / state.view.points_per_unit;
+        let (delta_u, delta_v) = state.view.unrotate_offset(horizontal, vertical);
         if state.reshape_selected(handle, delta_u, delta_v) {
             draft_changed = true;
             ui.ctx().request_repaint();
@@ -17909,5 +17910,41 @@ mod tests {
         assert!(rect_pts.contains(&SketchPoint::new(40.0, 10.0))); // right side midpoint
         assert!(rect_pts.contains(&SketchPoint::new(20.0, 20.0))); // top side midpoint
         assert!(rect_pts.contains(&SketchPoint::new(0.0, 10.0))); // left side midpoint
+    }
+
+    #[test]
+    fn rotated_sketch_view_drag_moves_in_screen_direction() {
+        let mut state = SketchCanvasState::default();
+        state.view.set_quarter_turns(1); // 90 deg CCW rotation
+
+        let pt_id = state
+            .stage_geometry(SketchGeometry::point(SketchPoint::new(10.0, 20.0)))
+            .expect("stage point");
+        state.commit_pending().expect("commit");
+        state.set_selected(Some(pt_id));
+
+        // Dragging UP on screen: horizontal = 0, vertical = 5.0
+        let (delta_u, delta_v) = state.view.unrotate_offset(0.0, 5.0);
+        // With quarter_turns = 1, (0, 5) unrotates to (5, 0) in sketch coords (which is +U)
+        assert_eq!(delta_u, 5.0);
+        assert_eq!(delta_v, 0.0);
+
+        assert!(state.reshape_selected(SketchDragHandle::Translate, delta_u, delta_v));
+        let moved_geom = state.entity_geometry(pt_id).expect("point geom");
+        assert_eq!(
+            moved_geom,
+            SketchGeometry::point(SketchPoint::new(15.0, 20.0))
+        );
+
+        // In the rotated view, (15.0, 20.0) is drawn 5 units higher on screen than (10.0, 20.0)
+        let canvas_rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(500.0));
+        let screen_before = state
+            .view
+            .sketch_to_screen(canvas_rect, SketchPoint::new(10.0, 20.0));
+        let screen_after = state
+            .view
+            .sketch_to_screen(canvas_rect, SketchPoint::new(15.0, 20.0));
+        assert!((screen_after.x - screen_before.x).abs() < 1e-4);
+        assert!(screen_after.y < screen_before.y); // Y decreases upwards on screen!
     }
 }
