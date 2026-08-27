@@ -2461,6 +2461,9 @@ fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
             for candidate in edges.iter().copied().filter(|edge_index| {
                 smooth[*edge_index]
                     && !classifications[*edge_index].coplanar_subdivision
+                    && classifications[*edge_index]
+                        .same_feature_side_role
+                        .is_none()
                     && !logical_carrier_subdivision[*edge_index]
             }) {
                 let Some(outgoing) = edge_direction_from_vertex(topology, candidate, vertex_index)
@@ -2526,10 +2529,10 @@ fn presentation_prismatic_feature_roles(topology: &Topology) -> BTreeSet<u32> {
     normals
         .into_iter()
         .filter_map(|(role, normals)| {
-            // Eight directions excludes ordinary planar chamfers and small
-            // corner fans while remaining below the native circle/arc display
-            // tessellation density.
-            if normals.len() < 8 {
+            // Two or more distinct directions uniquely identify an extruded
+            // curved carrier sharing one axis, while excluding flat single-plane
+            // chamfers and side walls.
+            if normals.len() < 2 {
                 return None;
             }
             let first = normals[0];

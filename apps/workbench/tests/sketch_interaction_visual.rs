@@ -286,14 +286,15 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
     let center = harness.get_by_label("Sketch viewport").rect().center();
     harness.hover_at(center);
     harness.step();
-    // The default SolidWorks preset orbits with the middle button; pressing it
+    // The default Fusion 360 preset orbits with Shift + Middle button; pressing it
     // over the canvas swaps the 2D canvas for the 3D model viewport without
     // leaving the sketch.
+    harness.input_mut().modifiers = egui::Modifiers::SHIFT;
     harness.event(egui::Event::PointerButton {
         pos: center,
         button: egui::PointerButton::Middle,
         pressed: true,
-        modifiers: egui::Modifiers::NONE,
+        modifiers: egui::Modifiers::SHIFT,
     });
     harness.step();
     harness.step();
@@ -304,6 +305,7 @@ fn holding_the_orbit_button_peeks_at_the_model_and_returns_to_the_sketch() {
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     // Releasing the button returns to the sketch canvas with the sketch and
     // its entities intact.
+    harness.input_mut().modifiers = egui::Modifiers::NONE;
     harness.event(egui::Event::PointerButton {
         pos: center,
         button: egui::PointerButton::Middle,

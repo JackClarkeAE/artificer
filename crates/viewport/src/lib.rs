@@ -1406,15 +1406,9 @@ fn show_document_impl(
     let (canvas, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     artificer_ui_core::theme::paint_viewport_gradient(&painter, canvas.rect);
     canvas.widget_info(|| WidgetInfo::labeled(WidgetType::Image, true, "Model viewport"));
-    let spring_orbit_delta = spring_loaded_orbit_delta(ui, &canvas);
-    let interaction_tool = if spring_orbit_delta.is_some() {
-        ActiveTool::Orbit
-    } else {
-        active_tool
-    };
-    let canvas = canvas.on_hover_cursor(tool_cursor(interaction_tool));
+    let canvas = canvas.on_hover_cursor(tool_cursor(active_tool));
     canvas.ctx.accesskit_node_builder(canvas.id, |node| {
-        node.set_description(accessible_tool_description(interaction_tool));
+        node.set_description(accessible_tool_description(active_tool));
     });
 
     // Sampled before the early returns below: with every body hidden there is
@@ -1504,8 +1498,8 @@ fn show_document_impl(
     let navigation_action = navigation.action(gesture_state);
     let orbiting = navigation_action == Some(NavigationAction::Orbit)
         || (!feature_interaction.consumes_primary
-            && (spring_orbit_delta.is_some()
-                || active_tool == ActiveTool::Orbit && canvas.dragged_by(PointerButton::Primary)));
+            && active_tool == ActiveTool::Orbit
+            && canvas.dragged_by(PointerButton::Primary));
     if orbiting && view.take_focus_pivot() {
         view.set_target(bounds_center(bounds));
     }
@@ -2070,7 +2064,7 @@ fn show_document_impl(
         paint_active_tool_gizmo(
             &painter,
             canvas.rect,
-            interaction_tool,
+            active_tool,
             projection,
             active_bounds,
             *view,
@@ -2083,7 +2077,7 @@ fn show_document_impl(
         );
     }
     paint_axes(&painter, canvas.rect, *view);
-    paint_tool_hint(&painter, canvas.rect, interaction_tool);
+    paint_tool_hint(&painter, canvas.rect, active_tool);
     // A secondary click is a menu gesture, never a camera gesture: egui only
     // reports `clicked_by` once it has ruled out a drag, so the right-drag
     // orbit binding keeps working untouched. The pick is re-run from the
@@ -2294,13 +2288,7 @@ fn handle_canvas_input(
 ) {
     let mut changed = false;
     let delta = canvas.drag_delta();
-    let spring_orbit_delta = (!suppress_primary)
-        .then(|| spring_loaded_orbit_delta(ui, canvas))
-        .flatten();
-    if let Some(delta) = spring_orbit_delta {
-        view.orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
-        changed = true;
-    } else if action == Some(NavigationAction::Orbit) {
+    if action == Some(NavigationAction::Orbit) {
         view.orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
         changed = true;
     } else if action == Some(NavigationAction::Pan) {
@@ -2368,20 +2356,6 @@ fn handle_canvas_input(
     if changed {
         ui.ctx().request_repaint();
     }
-}
-
-/// A spring-loaded navigation gesture: Shift plus unbuttoned mouse movement
-/// temporarily behaves as Orbit. The selected modeling tool never changes, so
-/// the very next idle or Shift-release frame is already back in that tool.
-fn spring_loaded_orbit_delta(ui: &Ui, canvas: &Response) -> Option<Vec2> {
-    if !canvas.hovered() {
-        return None;
-    }
-    ui.input(|input| {
-        let delta = input.pointer.delta();
-        (input.modifiers.shift && !input.pointer.any_down() && delta.length_sq() > f32::EPSILON)
-            .then_some(delta)
-    })
 }
 
 fn project_document_triangles(
