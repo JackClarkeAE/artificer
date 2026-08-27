@@ -20661,6 +20661,64 @@ mod extrusion_workbench_tests {
     }
 
     #[test]
+    fn rectangle_with_circle_and_slot_holes_exposes_holed_region_overlay() {
+        let mut app = KernelLabApp::default();
+        // Stage rectangle
+        app.sketch
+            .stage_geometry(SketchGeometry::rectangle(
+                point(-50.0, -50.0),
+                point(50.0, 50.0),
+            ))
+            .expect("rectangle");
+        app.sketch.commit_pending().expect("commit");
+        // Stage circle hole
+        app.sketch
+            .stage_geometry(SketchGeometry::circle(point(-20.0, 0.0), point(-10.0, 0.0)))
+            .expect("circle");
+        app.sketch.commit_pending().expect("commit");
+        // Stage 4-part slot hole (2 arcs, 2 segments)
+        // Left arc from (15, 5) to (15, -5) CCW (goes through x=10)
+        app.sketch
+            .stage_geometry(SketchGeometry::arc(
+                point(15.0, 0.0),
+                point(15.0, 5.0),
+                point(15.0, -5.0),
+            ))
+            .expect("left arc");
+        app.sketch.commit_pending().expect("commit");
+        // Bottom segment from (15, -5) to (25, -5)
+        app.sketch
+            .stage_geometry(SketchGeometry::segment(
+                point(15.0, -5.0),
+                point(25.0, -5.0),
+            ))
+            .expect("bottom seg");
+        app.sketch.commit_pending().expect("commit");
+        // Right arc from (25, -5) to (25, 5) CCW (goes through x=30)
+        app.sketch
+            .stage_geometry(SketchGeometry::arc(
+                point(25.0, 0.0),
+                point(25.0, -5.0),
+                point(25.0, 5.0),
+            ))
+            .expect("right arc");
+        app.sketch.commit_pending().expect("commit");
+        // Top segment from (25, 5) to (15, 5)
+        app.sketch
+            .stage_geometry(SketchGeometry::segment(point(25.0, 5.0), point(15.0, 5.0)))
+            .expect("top seg");
+        app.sketch.commit_pending().expect("commit");
+
+        // Finish the sketch into 3D view
+        assert!(app.finish_sketch_now());
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+
+        let overlays = app.visible_sketch_overlays();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[0].region_count(), 3);
+    }
+
+    #[test]
     fn staged_face_sketch_uses_snapshot_bound_planar_profile_command() {
         let mut app = finished_face_rectangle_app(ExtrusionMode::Add);
         assert!(app.stage_sketch_extrusion());

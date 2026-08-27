@@ -6204,6 +6204,8 @@ impl SketchCanvasState {
         self.dimension_session = Some(if let Some(mut session) = existing_draft {
             session.target = DimensionTarget::Pending(id);
             session.geometry = geometry;
+            session.fields = dimension_fields_for_geometry(session.phase, geometry);
+            session.error = None;
             session
         } else {
             let serial = self.take_dimension_serial();
@@ -15772,6 +15774,31 @@ mod tests {
         );
         assert_eq!(state.commit_pending(), Ok(id));
         assert!(!state.dimension_editor_active());
+    }
+
+    #[test]
+    fn circle_creation_clicks_produce_accurate_diameter_readout() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::CentrePointCircle));
+        state.handle_creation_click(SketchPoint::new(0.0, 0.0));
+        let id = state
+            .handle_creation_click(SketchPoint::new(8.0, 0.0))
+            .expect("second click should stage circle");
+        let session = state
+            .dimension_session
+            .as_ref()
+            .expect("staged circle should have dimension session");
+        assert_eq!(session.target, DimensionTarget::Pending(id));
+        let dia = readout_value(session, SketchDimensionKind::Diameter);
+        assert!(
+            (dia - 16.0).abs() <= EPSILON,
+            "expected diameter 16.0, got {dia}"
+        );
+        assert!(session.error.is_none());
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::ClosedAnalyticCircle
+        );
     }
 
     #[test]
