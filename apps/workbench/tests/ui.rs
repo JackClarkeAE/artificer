@@ -146,9 +146,9 @@ fn middle_drag_viewport(
 ) {
     let start = viewport_grab_point(harness);
     let end = start + delta;
-    harness.input_mut().modifiers = modifiers;
     harness.hover_at(start);
     harness.step();
+    harness.input_mut().modifiers = modifiers;
     harness.event(egui::Event::PointerButton {
         pos: start,
         button: egui::PointerButton::Middle,

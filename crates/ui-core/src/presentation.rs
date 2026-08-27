@@ -470,17 +470,13 @@ impl ViewState {
         if yaw_delta == 0.0 && pitch_delta == 0.0 {
             return;
         }
-        // Compose around the camera's current screen-up and screen-right axes.
-        // Adding world-Z yaw after a face view feels inverted whenever that
-        // view carries roll; local composition keeps mouse directions stable.
-        let orientation = view_orientation_quaternion(*self);
-        let local_yaw = axis_angle_quaternion([0.0, 0.0, 1.0], yaw_delta);
-        let local_pitch = axis_angle_quaternion([1.0, 0.0, 0.0], pitch_delta);
-        let next = quaternion_multiply(orientation, quaternion_multiply(local_yaw, local_pitch));
-        if let Some([yaw, pitch, roll]) = camera_euler_from_quaternion(next) {
-            self.yaw = yaw;
-            self.pitch = pitch;
-            self.roll = roll;
+        self.yaw = normalize_angle(self.yaw - yaw_delta);
+        self.pitch = (self.pitch + pitch_delta).clamp(-PI * 0.5 + 0.005, PI * 0.5 - 0.005);
+        if self.roll.abs() > 1e-4 {
+            self.roll = normalize_angle(self.roll) * 0.85;
+            if self.roll.abs() < 1e-3 {
+                self.roll = 0.0;
+            }
         }
     }
 
@@ -1385,16 +1381,23 @@ mod tests {
     }
 
     #[test]
-    fn orbit_uses_camera_local_axes_after_a_rolled_face_view() {
+    fn orbit_rotates_yaw_around_world_up_and_clamps_pitch() {
         let mut view = ViewState::default();
-        view.set_standard_view(StandardView::Front);
-        view.rotate_in_plane_quarter_turn(true);
-        let up_before = camera_world_axes(view).2;
+        let initial_yaw = view.yaw;
+        let initial_pitch = view.pitch;
 
-        view.orbit(0.37, 0.0);
+        view.orbit(0.37, 0.2);
+        assert!((view.yaw - (initial_yaw - 0.37)).abs() < 1.0e-9);
+        assert!((view.pitch - (initial_pitch + 0.2)).abs() < 1.0e-9);
 
-        let up_after = camera_world_axes(view).2;
-        assert!(protocol_dot(up_before, up_after) > 1.0 - 1.0e-9);
+        // Clamping pitch near the poles
+        view.orbit(0.0, 10.0);
+        assert!(view.pitch < PI * 0.5);
+        assert!(view.pitch > PI * 0.5 - 0.01);
+
+        view.orbit(0.0, -20.0);
+        assert!(view.pitch > -PI * 0.5);
+        assert!(view.pitch < -PI * 0.5 + 0.01);
     }
 
     #[test]
