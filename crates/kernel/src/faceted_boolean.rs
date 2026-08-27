@@ -414,6 +414,7 @@ pub(crate) fn finish_edges(
     for target in targets {
         for polygons in edge_finish_cutters(
             scene,
+            targets,
             *target,
             kind,
             distance,
@@ -430,17 +431,7 @@ pub(crate) fn finish_edges(
     }
     let result = subtract(BspNode::from_polygons(source_polygons, epsilon), cutters?);
     let conformed = conform_polygon_edges(result.all_polygons(), epsilon);
-    // BSP intersections are classified and conformed at `epsilon`.  Publish
-    // with that same tolerance so independently split paths which represent
-    // one modeled corner are welded to one authoritative vertex.  Falling
-    // back to the much smaller linear-agreement tolerance here left
-    // roundoff-sized open cycles at intersections between successive edge
-    // finishes (for example a fillet applied to a fillet-patch rail).
     let publication_epsilon = epsilon;
-    // Transition healing is allowed only in the distance-scale neighbourhood
-    // of an edge finish.  An unrestricted boundary cap can otherwise close a
-    // remote cycle on the opposite side of a successor body and publish a
-    // large, artificial face which was never part of the requested finish.
     topology_from_polygons_with_heal_limit(
         conformed,
         publication_epsilon,
@@ -454,16 +445,20 @@ fn planar_topology_polygons(topology: &Topology, epsilon: f64) -> Option<Vec<Pol
         if !matches!(face.value.surface, Surface::Plane(_)) || !face.value.inner_loops.is_empty() {
             return None;
         }
-        let loop_record = topology.loops.get(face.value.outer_loop.0)?;
-        let mut points = Vec::with_capacity(loop_record.value.coedges.len());
-        for coedge_key in &loop_record.value.coedges {
-            let coedge = topology.coedges.get(coedge_key.0)?.value;
-            let (_, vertices) = topology.oriented_edge_vertices(&coedge)?;
-            points.push(vertices[0]);
+        let outer_loop = &topology.loops[face.value.outer_loop.0].value;
+        let mut vertices = Vec::with_capacity(outer_loop.coedges.len());
+        for coedge_key in &outer_loop.coedges {
+            let coedge = topology.coedges[coedge_key.0].value;
+            let edge = topology.edges[coedge.edge.0].value;
+            let vertex_key = match coedge.orientation {
+                Orientation::Forward => edge.vertices[0],
+                Orientation::Reverse => edge.vertices[1],
+            };
+            vertices.push(topology.vertices[vertex_key.0].value.point);
         }
-        polygons.push(Polygon::new(points, face.value.role, epsilon)?);
+        polygons.push(Polygon::new(vertices, face.value.role, epsilon)?);
     }
-    (!polygons.is_empty()).then_some(polygons)
+    Some(polygons)
 }
 
 /// The points where two or more of the selected segments meet each other.
@@ -494,8 +489,10 @@ fn shared_selection_endpoints(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn edge_finish_cutters(
     scene: &DebugScene,
+    targets: &[EntityRef],
     target: EntityRef,
     kind: EdgeFinishKind,
     distance: f64,
@@ -516,6 +513,7 @@ fn edge_finish_cutters(
         .map(|edge| {
             edge_finish_segment_cutter(
                 scene,
+                targets,
                 edge,
                 kind,
                 distance,
@@ -527,8 +525,10 @@ fn edge_finish_cutters(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn edge_finish_segment_cutter(
     scene: &DebugScene,
+    targets: &[EntityRef],
     edge: &crate::DebugEdge,
     kind: EdgeFinishKind,
     distance: f64,
@@ -561,31 +561,20 @@ fn edge_finish_segment_cutter(
         .iter()
         .map(|vertex| (internal_point(vertex.point) - edge_start).dot(v))
         .fold(0.0_f64, f64::max);
-    if distance >= available_u.min(available_v) - precision.min_feature_size.max(epsilon * 2.0) {
+    let required_setback = if kind == EdgeFinishKind::Fillet {
+        let half_angle_ratio = ((1.0 + corner_dot) / (1.0 - corner_dot).max(1.0e-12)).sqrt();
+        distance * half_angle_ratio
+    } else {
+        distance
+    };
+    if required_setback
+        >= available_u.min(available_v) - precision.min_feature_size.max(epsilon * 2.0)
+    {
         return None;
     }
 
     let local = edge_finish_profile(kind, distance, precision, u, v)?;
-    // A finish sweep must pass through each endpoint's complete setback
-    // neighbourhood, not merely cross the endpoint by numerical epsilon.
-    // The latter leaves a tangent sliver when a successor edge terminates on
-    // an earlier fillet (for example a three-edge U chamfer around a rounded
-    // corner).  A one-distance overlap gives the grouped BSP enough material
-    // to build the actual miter/transition boundary; overlapping sweeps are
-    // unioned before subtraction, so connected selected edges remain one
-    // regularized operation.
-    //
-    // That overlap is worth its cost at two kinds of endpoint and no others:
-    // where another selected edge meets this one, since the mitre between them
-    // is built from material both sweeps share, and where the body simply
-    // ends, since reaching past it costs nothing. A pocket's rim corner is
-    // neither — the wall carries on — and there the overlap cut a notch a full
-    // setback long into material nobody selected. At such an endpoint the
-    // sweep is brought back to the wall that terminates the edge, which is a
-    // slant rather than a shortening: the cap is each profile point carried
-    // along the axis onto that wall's plane, so the chamfer ends exactly on
-    // the corner and leaves the geometry beside it alone.
-    let extension = distance + epsilon * 8.0;
+    let extension = required_setback + epsilon * 8.0;
     let start_origin = edge_start + axis * -extension;
     let sweep = axis * (edge_length + extension * 2.0);
     let mut start = local
@@ -606,17 +595,42 @@ fn edge_finish_segment_cutter(
             *point = *point + axis * ((endpoint - *point).dot(normal) / denominator);
         }
     };
-    if let Some(normal) =
+    if let Some(miter) = meeting_edge_miter_plane(
+        scene,
+        targets,
+        edge.endpoints,
+        edge_start,
+        axis,
+        u,
+        shared_endpoints,
+        epsilon,
+    ) {
+        carry_onto(&mut start, edge_start, miter);
+    } else if let Some(normal) =
         terminating_wall(scene, edge_start, axis * -1.0, shared_endpoints, epsilon)
     {
         carry_onto(&mut start, edge_start, normal);
     }
-    if let Some(normal) = terminating_wall(scene, edge_end, axis, shared_endpoints, epsilon) {
+    if let Some(miter) = meeting_edge_miter_plane(
+        scene,
+        targets,
+        edge.endpoints,
+        edge_end,
+        axis,
+        u,
+        shared_endpoints,
+        epsilon,
+    ) {
+        carry_onto(&mut end, edge_end, miter);
+    } else if let Some(normal) = terminating_wall(scene, edge_end, axis, shared_endpoints, epsilon)
+    {
         carry_onto(&mut end, edge_end, normal);
     }
-    let cap_triangles = ear_clip(&local);
+    let mut cap_triangles = ear_clip(&local);
     if cap_triangles.len() != local.len().saturating_sub(2) {
-        return None;
+        cap_triangles = (1..local.len().saturating_sub(1))
+            .map(|index| [0, index, index + 1])
+            .collect();
     }
     let mut polygons = Vec::with_capacity(cap_triangles.len() * 2 + local.len());
     for [first, second, third] in cap_triangles {
@@ -661,27 +675,26 @@ fn edge_finish_profile(
     let bisector_denominator = 1.0 + dot;
     if denominator <= precision.angular_agreement_radians.max(1.0e-10)
         || bisector_denominator <= precision.angular_agreement_radians.max(1.0e-10)
+        || 1.0 - dot <= precision.angular_agreement_radians.max(1.0e-10)
     {
         return None;
     }
-    // The user-facing distance is the setback measured along both incident
-    // faces.  For a non-right dihedral, build the unique circle tangent to
-    // both face rays at those setback points, then express its samples in the
-    // non-orthogonal (u,v) coefficient frame used by the sweep.
-    let center_coefficient = distance / bisector_denominator;
-    let center = u * center_coefficient + v * center_coefficient;
-    let start = u * distance;
-    let end = v * distance;
+    let radius = distance;
+    let setback = radius * ((1.0 + dot) / (1.0 - dot)).sqrt();
+    let center_coeff = radius / denominator.sqrt();
+    let center = (u + v) * center_coeff;
+    let start = u * setback;
+    let end = v * setback;
     let start_radius = start - center;
     let end_radius = end - center;
-    let radius = start_radius.length();
-    if !radius.is_finite() || radius <= precision.min_feature_size {
+    let computed_radius = start_radius.length();
+    if !computed_radius.is_finite() || computed_radius <= precision.min_feature_size {
         return None;
     }
-    let first = start_radius / radius;
-    let last = end_radius / radius;
-    let sweep = first.dot(last).clamp(-1.0, 1.0).acos();
-    let tangent = last - first * first.dot(last);
+    let first = start_radius / computed_radius;
+    let last = end_radius / computed_radius;
+    let sweep = (-dot).clamp(-1.0, 1.0).acos();
+    let tangent = last + first * dot;
     let tangent_length = tangent.length();
     if !sweep.is_finite()
         || sweep <= precision.angular_agreement_radians
@@ -696,9 +709,12 @@ fn edge_finish_profile(
         .min(radius * 0.5);
     let maximum_angle = (2.0 * (1.0 - tolerance / radius).clamp(-1.0, 1.0).acos()).max(0.04);
     let maximum_subdivisions = precision.max_subdivisions.clamp(4, 96) as usize;
+    let min_chord_budget = precision.linear_agreement.max(1.0e-8) * 128.0;
+    let max_from_chord = (radius * sweep / min_chord_budget).max(2.0);
     let subdivisions = (sweep / maximum_angle)
         .ceil()
-        .clamp(4.0, maximum_subdivisions as f64) as usize;
+        .clamp(2.0, (maximum_subdivisions as f64).min(max_from_chord))
+        as usize;
     let mut profile = Vec::with_capacity(subdivisions + 2);
     profile.push(Point2::new(0.0, 0.0));
     for step in 0..=subdivisions {
@@ -712,6 +728,93 @@ fn edge_finish_profile(
         ));
     }
     Some(profile)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn meeting_edge_miter_plane(
+    scene: &DebugScene,
+    targets: &[EntityRef],
+    current_endpoints: [artificer_protocol::Point3; 2],
+    endpoint: Point3,
+    axis: Vector3,
+    u: Vector3,
+    shared_endpoints: &[Point3],
+    epsilon: f64,
+) -> Option<Vector3> {
+    if !shared_endpoints
+        .iter()
+        .any(|point| point.distance(endpoint) <= epsilon * 32.0)
+    {
+        return None;
+    }
+    let mut other_target = None;
+    for other in &scene.edges {
+        if !targets.contains(&other.source_edge)
+            || other.is_smooth
+            || other.endpoints == current_endpoints
+            || other.endpoints == [current_endpoints[1], current_endpoints[0]]
+        {
+            continue;
+        }
+        let [other_start, other_end] = other.endpoints.map(internal_point);
+        if other_start.distance(endpoint) <= epsilon * 32.0
+            || other_end.distance(endpoint) <= epsilon * 32.0
+        {
+            if other_target.is_some() && other_target != Some(other.source_edge) {
+                // 3 or more selected edges meet: let them union naturally
+                return None;
+            }
+            other_target = Some(other.source_edge);
+        }
+    }
+    other_target?;
+    for other in &scene.edges {
+        if Some(other.source_edge) != other_target
+            || other.is_smooth
+            || other.endpoints == current_endpoints
+            || other.endpoints == [current_endpoints[1], current_endpoints[0]]
+        {
+            continue;
+        }
+        let [other_start, other_end] = other.endpoints.map(internal_point);
+        let other_vec = other_end - other_start;
+        let other_len = other_vec.length();
+        if other_len <= epsilon {
+            continue;
+        }
+        let other_axis = other_vec / other_len;
+        let other_dir = if other_start.distance(endpoint) <= epsilon * 32.0 {
+            Some(other_axis)
+        } else if other_end.distance(endpoint) <= epsilon * 32.0 {
+            Some(other_axis * -1.0)
+        } else {
+            None
+        };
+        if let Some(departure) = other_dir {
+            let outward =
+                if endpoint.distance(internal_point(current_endpoints[0])) <= epsilon * 32.0 {
+                    axis * -1.0
+                } else {
+                    axis
+                };
+            let alignment = outward.dot(departure);
+            if alignment >= 1.0 - 1.0e-5 {
+                return None;
+            }
+            let corner_normal = axis.cross(u);
+            let turn_cross = outward.cross(departure);
+            if turn_cross.dot(corner_normal) < -1.0e-5 {
+                // Hole / concave pocket rim corner: sweeps naturally overlap and merge
+                return None;
+            }
+            let miter = outward + departure;
+            let len = miter.length();
+            if len > 1.0e-6 {
+                return Some(miter / len);
+            }
+        }
+    }
+    None
 }
 
 /// The wall that stops a finish sweep leaving `endpoint` along `outward`, if
@@ -752,7 +855,7 @@ fn terminating_wall(
             }
             let normal = normal / length;
             let alignment = normal.dot(outward);
-            if alignment >= -1.0e-6 {
+            if alignment >= -0.15 {
                 continue;
             }
             if stopper.is_none_or(|(nearest, _)| alignment < nearest) {
@@ -795,9 +898,41 @@ fn edge_inward_directions(
         let direction = tangent / length;
         if directions
             .iter()
-            .all(|existing| existing.dot(direction).abs() < 1.0 - 1.0e-6)
+            .all(|existing| existing.dot(direction).abs() < 1.0 - 1.0e-5)
         {
             directions.push(direction);
+        }
+    }
+    if directions.len() < 2 {
+        for triangle in &scene.triangles {
+            let points = triangle.vertices.map(internal_point);
+            if !points
+                .iter()
+                .any(|point| contains(*point, start) || contains(*point, end))
+            {
+                continue;
+            }
+            let centroid = Point3::new(
+                (points[0].x + points[1].x + points[2].x) / 3.0,
+                (points[0].y + points[1].y + points[2].y) / 3.0,
+                (points[0].z + points[1].z + points[2].z) / 3.0,
+            );
+            let relative = centroid - midpoint;
+            let tangent = relative - axis * relative.dot(axis);
+            let length = tangent.length();
+            if length <= epsilon {
+                continue;
+            }
+            let direction = tangent / length;
+            if directions
+                .iter()
+                .all(|existing| existing.dot(direction).abs() < 1.0 - 1.0e-5)
+            {
+                directions.push(direction);
+                if directions.len() == 2 {
+                    break;
+                }
+            }
         }
     }
     if directions.len() == 2 {
@@ -1338,7 +1473,7 @@ fn topology_from_polygons_with_heal_limit(
         if points.len() < 3 {
             continue;
         }
-        let vertex_keys = points
+        let mut vertex_keys = points
             .iter()
             .copied()
             .map(|point| {
@@ -1398,7 +1533,7 @@ fn topology_from_polygons_with_heal_limit(
         };
         let v = normal.cross(u);
         let plane = Plane::new(points[0], u, v);
-        let projected = points
+        let mut projected = points
             .iter()
             .map(|point| plane.project(*point))
             .collect::<Vec<_>>();
@@ -1415,7 +1550,7 @@ fn topology_from_polygons_with_heal_limit(
         if points.len() > 3 && planar_error > (epsilon * 1.0e-2).max(1.0e-7) {
             continue;
         }
-        let twice_area = projected
+        let mut twice_area = projected
             .iter()
             .enumerate()
             .map(|(index, point)| {
@@ -1425,6 +1560,12 @@ fn topology_from_polygons_with_heal_limit(
             .sum::<f64>();
         if !twice_area.is_finite() || twice_area.abs() <= epsilon * epsilon {
             continue;
+        }
+        if twice_area < 0.0 {
+            points.reverse();
+            vertex_keys.reverse();
+            projected.reverse();
+            twice_area = -twice_area;
         }
         let mut coedges = Vec::new();
         for index in 0..points.len() {
@@ -1649,18 +1790,29 @@ fn heal_planar_boundary_cycles(
                 *edge,
             );
         }
-        for triangle in triangles {
-            let model_triangle = triangle.map(|index| points[index]);
+        for mut triangle in triangles {
+            let mut model_triangle = triangle.map(|index| points[index]);
             let triangle_u = model_triangle[1] - model_triangle[0];
             let triangle_cross = triangle_u.cross(model_triangle[2] - model_triangle[0]);
             let triangle_plane =
                 if triangle_u.length() > epsilon && triangle_cross.length() > epsilon * epsilon {
                     let u = triangle_u / triangle_u.length();
-                    let normal = triangle_cross / triangle_cross.length();
+                    let mut normal = triangle_cross / triangle_cross.length();
+                    if normal.dot(split_plane.normal) < 0.0 {
+                        normal = normal * -1.0;
+                    }
                     Plane::new(model_triangle[0], u, normal.cross(u))
                 } else {
                     plane
                 };
+            let p0 = triangle_plane.project(model_triangle[0]);
+            let p1 = triangle_plane.project(model_triangle[1]);
+            let p2 = triangle_plane.project(model_triangle[2]);
+            let twice_area = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+            if twice_area < 0.0 {
+                triangle.swap(1, 2);
+                model_triangle.swap(1, 2);
+            }
             let mut coedges = Vec::with_capacity(3);
             for side in 0..3 {
                 let start = cycle[triangle[side]].0;

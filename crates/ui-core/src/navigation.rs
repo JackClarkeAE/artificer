@@ -23,18 +23,18 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NavigationPreset {
-    /// SolidWorks: middle orbits, Ctrl+middle pans, Shift+middle drag zooms,
-    /// wheel forward zooms out.
-    #[default]
-    #[serde(alias = "middle-orbit-inverted", alias = "solidworks")]
-    SolidWorks,
     /// Fusion 360: middle pans, Shift+middle orbits, wheel forward zooms out.
+    #[default]
     #[serde(
         alias = "middle-pan",
         alias = "middle-pan-inverted",
         alias = "fusion360"
     )]
     Fusion,
+    /// SolidWorks: middle orbits, Ctrl+middle pans, Shift+middle drag zooms,
+    /// wheel forward zooms out.
+    #[serde(alias = "middle-orbit-inverted", alias = "solidworks")]
+    SolidWorks,
     /// Onshape: right orbits, middle or Ctrl+right pans.
     Onshape,
     /// Blender: middle orbits, Shift+middle pans, wheel forward zooms in.
@@ -178,11 +178,11 @@ impl Bindings {
 
 impl NavigationPreset {
     pub const ALL: [Self; 8] = [
-        Self::SolidWorks,
         Self::Fusion,
+        Self::SolidWorks,
+        Self::Inventor,
         Self::Onshape,
         Self::Blender,
-        Self::Inventor,
         Self::Creo,
         Self::Nx,
         Self::Artificer,
@@ -191,11 +191,11 @@ impl NavigationPreset {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::SolidWorks => "SolidWorks",
             Self::Fusion => "Fusion 360",
+            Self::SolidWorks => "SolidWorks",
+            Self::Inventor => "Inventor",
             Self::Onshape => "Onshape",
             Self::Blender => "Blender",
-            Self::Inventor => "Inventor",
             Self::Creo => "Creo",
             Self::Nx => "NX",
             Self::Artificer => "Artificer (Legacy)",
