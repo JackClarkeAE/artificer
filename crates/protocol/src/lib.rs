@@ -2448,13 +2448,20 @@ mod tests {
     fn bspline_planar_curve_serializes_and_validates_finiteness() {
         let bspline = PlanarCurve2::Bspline {
             degree: 2,
-            control_points: vec![Point2::new(0.0, 0.0), Point2::new(1.0, 2.0), Point2::new(2.0, 0.0)],
+            control_points: vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 2.0),
+                Point2::new(2.0, 0.0),
+            ],
             knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
             weights: Some(vec![1.0, 2.0_f64.sqrt() / 2.0, 1.0]),
         };
         assert!(bspline.is_finite());
         let encoded = serde_json::to_value(&bspline).unwrap();
         assert_eq!(encoded["type"], json!("bspline"));
-        assert_eq!(serde_json::from_value::<PlanarCurve2>(encoded).unwrap(), bspline);
+        assert_eq!(
+            serde_json::from_value::<PlanarCurve2>(encoded).unwrap(),
+            bspline
+        );
     }
 }

@@ -817,7 +817,11 @@ impl ViewState {
     /// Generates a standard $4\times 4$ projection matrix in column-major order: `matrix[col][row]`.
     #[must_use]
     pub fn projection_matrix(self, aspect_ratio: f32) -> [[f32; 4]; 4] {
-        let aspect = if aspect_ratio > 0.0 { aspect_ratio } else { 1.0 };
+        let aspect = if aspect_ratio > 0.0 {
+            aspect_ratio
+        } else {
+            1.0
+        };
         match self.projection_mode {
             ProjectionMode::Orthographic => {
                 let radius = ((self.fit_radius.max(0.1) * 1.25) / bounded_zoom(self.zoom)) as f32;
@@ -1991,4 +1995,3 @@ mod tests {
         }
     }
 }
-

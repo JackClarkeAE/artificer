@@ -5401,7 +5401,8 @@ impl KernelLabApp {
                             let Ok(curve) = authoring.evaluated_curve(entity.id) else {
                                 continue;
                             };
-                            let Some(sampled) = preview_authoring_curve(frame, curve.clone()) else {
+                            let Some(sampled) = preview_authoring_curve(frame, curve.clone())
+                            else {
                                 continue;
                             };
                             segments.extend(sampled.windows(2).map(|pair| [pair[0], pair[1]]));
@@ -17479,10 +17480,19 @@ fn sample_planar_loop(profile_loop: &PlanarLoop2) -> Option<Vec<ProtocolPoint2>>
                 knots,
                 weights,
             } => {
-                let eval_pts = control_points.iter().map(|p| artificer_geometry::Point2::new(p.x, p.y)).collect::<Vec<_>>();
+                let eval_pts = control_points
+                    .iter()
+                    .map(|p| artificer_geometry::Point2::new(p.x, p.y))
+                    .collect::<Vec<_>>();
                 let n_segments = 32;
                 if let Some(w) = weights {
-                    if let Ok(nurbs) = artificer_geometry::NurbsCurve2::new(*degree, eval_pts, w.clone(), knots.clone(), false) {
+                    if let Ok(nurbs) = artificer_geometry::NurbsCurve2::new(
+                        *degree,
+                        eval_pts,
+                        w.clone(),
+                        knots.clone(),
+                        false,
+                    ) {
                         for step in 0..n_segments {
                             let t = step as f64 / n_segments as f64;
                             if let Ok(pt) = nurbs.evaluate(t) {
@@ -17490,7 +17500,9 @@ fn sample_planar_loop(profile_loop: &PlanarLoop2) -> Option<Vec<ProtocolPoint2>>
                             }
                         }
                     }
-                } else if let Ok(bspline) = artificer_geometry::BSplineCurve2::new(*degree, eval_pts, knots.clone(), false) {
+                } else if let Ok(bspline) =
+                    artificer_geometry::BSplineCurve2::new(*degree, eval_pts, knots.clone(), false)
+                {
                     for step in 0..n_segments {
                         let t = step as f64 / n_segments as f64;
                         if let Ok(pt) = bspline.evaluate(t) {

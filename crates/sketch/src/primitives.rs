@@ -1171,14 +1171,7 @@ impl<'a> EvaluationBuilder<'a> {
                     let pt = self.add_derived_point(point(idx as u8), transform(cp))?;
                     mapped_cps.push(pt);
                 }
-                self.add_bspline(
-                    role,
-                    entity_role,
-                    mapped_cps,
-                    degree,
-                    knots,
-                    weights,
-                )
+                self.add_bspline(role, entity_role, mapped_cps, degree, knots, weights)
             }
         }
     }

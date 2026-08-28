@@ -122,7 +122,10 @@ impl Similarity2 {
                 knots,
                 weights,
             } => EvaluatedCurve2::Bspline {
-                control_points: control_points.into_iter().map(|p| self.apply_point(p)).collect(),
+                control_points: control_points
+                    .into_iter()
+                    .map(|p| self.apply_point(p))
+                    .collect(),
                 degree,
                 knots,
                 weights,
@@ -448,7 +451,9 @@ fn arrangement_and_profile_are_similarity_equivariant_for_a_deterministic_transf
         for expected in expected_curves {
             let index = actual_curves
                 .iter()
-                .position(|actual| protocol_curve_equivalent(expected.clone(), actual.clone(), tolerance))
+                .position(|actual| {
+                    protocol_curve_equivalent(expected.clone(), actual.clone(), tolerance)
+                })
                 .unwrap_or_else(|| panic!("{transform:?}: profile curve was not equivariant"));
             actual_curves.swap_remove(index);
         }

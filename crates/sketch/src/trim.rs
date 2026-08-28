@@ -180,11 +180,7 @@ pub fn select_trim_span(
     let at_click: Vec<_> = clustered
         .iter()
         .filter(|junction| {
-            parameter_distance(
-                click_parameter,
-                junction.parameter,
-                target_periodic,
-            ) <= uncertainty
+            parameter_distance(click_parameter, junction.parameter, target_periodic) <= uncertainty
         })
         .map(|junction| junction.key.clone())
         .collect();

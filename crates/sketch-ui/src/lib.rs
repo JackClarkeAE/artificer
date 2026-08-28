@@ -3942,7 +3942,10 @@ fn legacy_geometry_from_core(curve: CoreEvaluatedCurve2) -> SketchGeometry {
             SketchGeometry::circle(center, SketchPoint::new(center.u + radius, center.v))
         }
         CoreEvaluatedCurve2::Bspline { control_points, .. } => {
-            let start = control_points.first().map(|p| point(*p)).unwrap_or_default();
+            let start = control_points
+                .first()
+                .map(|p| point(*p))
+                .unwrap_or_default();
             let end = control_points.last().map(|p| point(*p)).unwrap_or_default();
             SketchGeometry::segment(start, end)
         }
@@ -16540,8 +16543,10 @@ mod tests {
         let (mut state, _) = crossing_trim_fixture();
         assert!(state.set_exact_tool(ToolVariant::Trim));
         assert!(state.update_trim_hover(Some(SketchPoint::new(-1.0, 0.0)), 0.25));
-        let CoreEvaluatedCurve2::Line { start, end } =
-            state.trim_hover_fragment.clone().expect("middle line fragment")
+        let CoreEvaluatedCurve2::Line { start, end } = state
+            .trim_hover_fragment
+            .clone()
+            .expect("middle line fragment")
         else {
             panic!("line trim hover must remain an exact line subcurve")
         };

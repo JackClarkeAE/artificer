@@ -939,7 +939,11 @@ impl EvaluatedCurve2 {
                     let mut bspline = BSplineCurve2::new(*degree, pts, knots.clone(), false)
                         .map_err(|_| CurveGeometryError::Degenerate)?;
                     if u_a > geom_knot_min + 1.0e-7 {
-                        let mult = bspline.knots().iter().filter(|k| (**k - u_a).abs() < 1.0e-7).count();
+                        let mult = bspline
+                            .knots()
+                            .iter()
+                            .filter(|k| (**k - u_a).abs() < 1.0e-7)
+                            .count();
                         for _ in mult..*degree {
                             if let Ok(inserted) = bspline.insert_knot(u_a) {
                                 bspline = inserted;
@@ -947,7 +951,11 @@ impl EvaluatedCurve2 {
                         }
                     }
                     if u_b < geom_knot_max - 1.0e-7 {
-                        let mult = bspline.knots().iter().filter(|k| (**k - u_b).abs() < 1.0e-7).count();
+                        let mult = bspline
+                            .knots()
+                            .iter()
+                            .filter(|k| (**k - u_b).abs() < 1.0e-7)
+                            .count();
                         for _ in mult..*degree {
                             if let Ok(inserted) = bspline.insert_knot(u_b) {
                                 bspline = inserted;
@@ -958,15 +966,24 @@ impl EvaluatedCurve2 {
                     // Extract the sub-curve control points and knots
                     let new_knots = bspline.knots();
                     let new_pts = bspline.control_points();
-                    let span_a = new_knots.iter().position(|k| (*k - u_a).abs() < 1.0e-7).unwrap_or(0);
-                    let span_b = new_knots.iter().rposition(|k| (*k - u_b).abs() < 1.0e-7).unwrap_or(new_knots.len() - 1);
+                    let span_a = new_knots
+                        .iter()
+                        .position(|k| (*k - u_a).abs() < 1.0e-7)
+                        .unwrap_or(0);
+                    let span_b = new_knots
+                        .iter()
+                        .rposition(|k| (*k - u_b).abs() < 1.0e-7)
+                        .unwrap_or(new_knots.len() - 1);
 
                     let sub_knots_raw = &new_knots[span_a..=span_b];
                     if sub_knots_raw.len() >= 2 * (*degree + 1) {
                         let k_min = sub_knots_raw[0];
                         let k_max = *sub_knots_raw.last().unwrap();
                         let k_range = (k_max - k_min).max(1.0e-12);
-                        let norm_knots = sub_knots_raw.iter().map(|k| (k - k_min) / k_range).collect::<Vec<_>>();
+                        let norm_knots = sub_knots_raw
+                            .iter()
+                            .map(|k| (k - k_min) / k_range)
+                            .collect::<Vec<_>>();
                         let cp_start = span_a;
                         let cp_count = norm_knots.len() - *degree - 1;
                         let sub_cps = new_pts[cp_start..cp_start + cp_count]
@@ -991,7 +1008,9 @@ impl EvaluatedCurve2 {
                             }
                         }
                         let target_degree = (*degree).min(sub_pts.len().saturating_sub(1));
-                        if let Ok((fit_cps, fit_knots)) = crate::primitives::fit_spline_points(&sub_pts, target_degree) {
+                        if let Ok((fit_cps, fit_knots)) =
+                            crate::primitives::fit_spline_points(&sub_pts, target_degree)
+                        {
                             Self::Bspline {
                                 control_points: fit_cps,
                                 degree: target_degree,

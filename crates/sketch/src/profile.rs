@@ -511,7 +511,9 @@ mod tests {
             assert_eq!(loop_curves.len(), 2);
             let endpoints = |curve: &artificer_protocol::PlanarCurve2| match curve {
                 artificer_protocol::PlanarCurve2::Line { start, end }
-                | artificer_protocol::PlanarCurve2::CircularArc { start, end, .. } => (*start, *end),
+                | artificer_protocol::PlanarCurve2::CircularArc { start, end, .. } => {
+                    (*start, *end)
+                }
                 artificer_protocol::PlanarCurve2::Bspline { control_points, .. } => {
                     (control_points[0], *control_points.last().unwrap())
                 }

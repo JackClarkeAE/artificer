@@ -231,9 +231,7 @@ fn linear_loop_vertices(
             PlanarCurve2::Line { start, end } => Ok((start, end)),
             PlanarCurve2::CircularArc { .. }
             | PlanarCurve2::Circle { .. }
-            | PlanarCurve2::Bspline { .. } => {
-                Err(PlanarProfileInputError::AnalyticCurve)
-            }
+            | PlanarCurve2::Bspline { .. } => Err(PlanarProfileInputError::AnalyticCurve),
         })
         .collect::<Result<Vec<_>, _>>()?;
     if (0..lines.len()).any(|index| lines[index].1 != lines[(index + 1) % lines.len()].0) {

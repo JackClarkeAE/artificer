@@ -243,10 +243,7 @@ fn assert_parallel(
     second: artificer_sketch::SketchVector2,
 ) {
     let normalized_cross = first.cross(second).abs() / (first.length() * second.length());
-    assert!(
-        normalized_cross < 1.0e-6,
-        "cross={normalized_cross}"
-    );
+    assert!(normalized_cross < 1.0e-6, "cross={normalized_cross}");
 }
 
 fn assert_exact_fillet_contract(fixture: &PairFixture, preview: &SketchDefinition) {

@@ -158,11 +158,13 @@ impl BodyMeshCache {
                 return None;
             }
 
-            let vertex_buffer = Box::leak(Box::new(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("artificer.viewport.body_mesh"),
-                contents: bytemuck::cast_slice(&vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })));
+            let vertex_buffer = Box::leak(Box::new(device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("artificer.viewport.body_mesh"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                },
+            )));
 
             e.insert(BodyMeshGpuBuffer {
                 vertex_buffer,
@@ -190,10 +192,12 @@ pub struct GpuViewportPipeline {
 
 impl GpuViewportPipeline {
     pub fn new(device: &wgpu::Device, initial_format: wgpu::TextureFormat) -> Self {
-        let shader = Box::leak(Box::new(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("artificer.viewport.shader"),
-            source: wgpu::ShaderSource::Wgsl(WGSL_SHADER.into()),
-        })));
+        let shader = Box::leak(Box::new(device.create_shader_module(
+            wgpu::ShaderModuleDescriptor {
+                label: Some("artificer.viewport.shader"),
+                source: wgpu::ShaderSource::Wgsl(WGSL_SHADER.into()),
+            },
+        )));
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("artificer.viewport.bind_group_layout"),
@@ -216,20 +220,24 @@ impl GpuViewportPipeline {
             mapped_at_creation: false,
         })));
 
-        let bind_group = Box::leak(Box::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("artificer.viewport.bind_group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        })));
+        let bind_group = Box::leak(Box::new(device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("artificer.viewport.bind_group"),
+                layout: &bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            },
+        )));
 
-        let pipeline_layout = Box::leak(Box::new(device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("artificer.viewport.pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        })));
+        let pipeline_layout = Box::leak(Box::new(device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("artificer.viewport.pipeline_layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            },
+        )));
 
         let mut slf = Self {
             shader,
@@ -253,44 +261,50 @@ impl GpuViewportPipeline {
         slf
     }
 
-    pub fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) -> &'static wgpu::RenderPipeline {
+    pub fn ensure_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+    ) -> &'static wgpu::RenderPipeline {
         if let Some(&pipeline) = self.pipelines.get(&format) {
             return pipeline;
         }
 
-        let pipeline = Box::leak(Box::new(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("artificer.viewport.render_pipeline"),
-            layout: Some(self.pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: self.shader,
-                entry_point: Some("vs_main"),
-                buffers: &[GpuVertex::LAYOUT],
-                compilation_options: Default::default(),
+        let pipeline = Box::leak(Box::new(device.create_render_pipeline(
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("artificer.viewport.render_pipeline"),
+                layout: Some(self.pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: self.shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[GpuVertex::LAYOUT],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: self.shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: None,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: self.shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview_mask: None,
-            cache: None,
-        })));
+        )));
 
         self.pipelines.insert(format, pipeline);
         pipeline
@@ -320,7 +334,11 @@ impl GpuViewportPipeline {
                 section.offset as f32,
             ],
             flags: [
-                if section.active && view.section_cut_plane.is_some() { 1 } else { 0 },
+                if section.active && view.section_cut_plane.is_some() {
+                    1
+                } else {
+                    0
+                },
                 if is_shaded { 1 } else { 0 },
                 0,
                 0,
@@ -366,16 +384,18 @@ impl egui_wgpu::CallbackTrait for ViewportGpuCallback {
         _egui_encoder: &mut wgpu::CommandEncoder,
         callback_resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        let pipeline = callback_resources.entry::<GpuViewportPipeline>().or_insert_with(|| {
-            GpuViewportPipeline::new(device, self.target_format)
-        });
+        let pipeline = callback_resources
+            .entry::<GpuViewportPipeline>()
+            .or_insert_with(|| GpuViewportPipeline::new(device, self.target_format));
 
         pipeline.active_format = self.target_format;
         pipeline.ensure_pipeline(device, self.target_format);
         pipeline.prepare(queue, self.view, self.aspect_ratio, self.is_shaded);
 
         for (key, scene, tint) in &self.bodies {
-            pipeline.mesh_cache_mut().get_or_upload(device, *key, scene, *tint);
+            pipeline
+                .mesh_cache_mut()
+                .get_or_upload(device, *key, scene, *tint);
         }
 
         Vec::new()
@@ -416,5 +436,3 @@ impl GpuViewportPipeline {
             .expect("GpuViewportPipeline must have at least one pipeline")
     }
 }
-
-
