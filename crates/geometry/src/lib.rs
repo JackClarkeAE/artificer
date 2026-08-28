@@ -17,9 +17,10 @@ pub use foundation::{
     PrecisionPolicy, Similarity2, Vector3,
 };
 pub use parametric::{
-    AnalyticSurface, BSplineCurve3, BSplineSurface3, BezierCurve3, BezierSurface3, GeometryError,
-    NurbsCurve3, NurbsSurface3, ParameterDomain, ParametricCurve3, ParametricSurface3,
-    SurfaceDerivatives,
+    AnalyticSurface, BSplineCurve2, BSplineCurve3, BSplineSurface3, BezierCurve3, BezierSurface3,
+    GeometryError, NurbsCurve2, NurbsCurve3, NurbsSurface3, ParameterDomain, ParametricCurve2,
+    ParametricCurve3, ParametricMesh3, ParametricSurface3, SurfaceCurvature, SurfaceDerivatives,
+    adaptive_tessellate_surface, basis_values, tessellate_surface,
 };
 pub use planar::{Arc2, Circle2, Line2, SegmentRelation, classify_segment_relation};
 
@@ -75,6 +76,36 @@ impl Vector2 {
     pub const fn is_finite(self) -> bool {
         self.x.is_finite() && self.y.is_finite()
     }
+
+    #[must_use]
+    pub fn dot(self, rhs: Self) -> f64 {
+        self.x * rhs.x + self.y * rhs.y
+    }
+
+    #[must_use]
+    pub fn cross(self, rhs: Self) -> f64 {
+        self.x * rhs.y - self.y * rhs.x
+    }
+
+    #[must_use]
+    pub fn length_squared(self) -> f64 {
+        self.dot(self)
+    }
+
+    #[must_use]
+    pub fn length(self) -> f64 {
+        self.length_squared().sqrt()
+    }
+
+    #[must_use]
+    pub fn normalize(self) -> Option<Self> {
+        let len = self.length();
+        if len.is_finite() && len > 1.0e-12 {
+            Some(self / len)
+        } else {
+            None
+        }
+    }
 }
 
 impl std::ops::Add for Vector2 {
@@ -90,6 +121,22 @@ impl std::ops::Sub for Vector2 {
 
     fn sub(self, rhs: Self) -> Self::Output {
         Self::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
+impl std::ops::Mul<f64> for Vector2 {
+    type Output = Self;
+
+    fn mul(self, rhs: f64) -> Self::Output {
+        Self::new(self.x * rhs, self.y * rhs)
+    }
+}
+
+impl std::ops::Div<f64> for Vector2 {
+    type Output = Self;
+
+    fn div(self, rhs: f64) -> Self::Output {
+        Self::new(self.x / rhs, self.y / rhs)
     }
 }
 

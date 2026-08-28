@@ -347,6 +347,7 @@ fn profile_curve_kinds(profile: &artificer_protocol::PlanarProfile2) -> (usize, 
             PlanarCurve2::Line { .. } => kinds.0 += 1,
             PlanarCurve2::CircularArc { .. } => kinds.1 += 1,
             PlanarCurve2::Circle { .. } => kinds.2 += 1,
+            PlanarCurve2::Bspline { .. } => {}
         }
     }
     kinds

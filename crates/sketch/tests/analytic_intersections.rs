@@ -22,7 +22,7 @@ fn circle(center: (f64, f64), radius: f64) -> EvaluatedCurve2 {
 fn assert_reversal_symmetric(first: EvaluatedCurve2, second: EvaluatedCurve2) {
     let precision = PrecisionPolicy::default();
     assert_eq!(
-        intersect_curves(first, second, &precision),
+        intersect_curves(first.clone(), second.clone(), &precision),
         intersect_curves(second, first, &precision).reversed()
     );
 }
@@ -39,8 +39,8 @@ fn entire_pair_matrix_is_operand_reversal_symmetric() {
         end: SketchPoint2::new(-2.0, 0.0),
         direction: CurveDirection::CounterClockwise,
     };
-    assert_reversal_symmetric(line((0.0, -3.0), (0.0, 3.0)), arc);
-    assert_reversal_symmetric(arc, circle((1.5, 0.0), 2.0));
+    assert_reversal_symmetric(line((0.0, -3.0), (0.0, 3.0)), arc.clone());
+    assert_reversal_symmetric(arc.clone(), circle((1.5, 0.0), 2.0));
     assert_reversal_symmetric(
         arc,
         EvaluatedCurve2::CircularArc {

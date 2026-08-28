@@ -365,6 +365,63 @@ impl SignedDistanceDragProjection {
     }
 }
 
+/// Camera projection mode for the 3D viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ProjectionMode {
+    #[default]
+    Orthographic,
+    Perspective {
+        /// Vertical field of view in radians (default ~45° or ~0.785 rad).
+        fov_y_radians: f64,
+    },
+}
+
+impl ProjectionMode {
+    pub const fn is_perspective(self) -> bool {
+        matches!(self, Self::Perspective { .. })
+    }
+
+    pub const fn default_perspective() -> Self {
+        Self::Perspective {
+            fov_y_radians: std::f64::consts::FRAC_PI_4,
+        }
+    }
+}
+
+/// A real-time section cut plane defined in world space.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SectionCutPlane {
+    pub normal: ProtocolVector3,
+    pub offset: f64,
+    pub active: bool,
+}
+
+impl SectionCutPlane {
+    #[must_use]
+    pub const fn new(normal: ProtocolVector3, offset: f64) -> Self {
+        Self {
+            normal,
+            offset,
+            active: true,
+        }
+    }
+
+    /// Evaluates signed distance from a point to the section plane ($n \cdot p + \text{offset}$).
+    #[must_use]
+    pub fn distance_to_point(self, point: Point3) -> f64 {
+        self.normal.x * point.x + self.normal.y * point.y + self.normal.z * point.z + self.offset
+    }
+}
+
+/// Selection for the triangle fill rendering backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FillBackend {
+    #[default]
+    CpuOnly,
+    GpuOnly,
+    Auto,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub yaw: f64,
@@ -378,6 +435,9 @@ pub struct ViewState {
     /// a pivot the user placed by panning is never traded away, so orbiting
     /// stays relative to the object being inspected.
     focus_pivot: bool,
+    pub projection_mode: ProjectionMode,
+    pub section_cut_plane: Option<SectionCutPlane>,
+    pub fill_backend: FillBackend,
 }
 
 impl Default for ViewState {
@@ -390,6 +450,9 @@ impl Default for ViewState {
             target: Point3::default(),
             fit_radius: 1.0,
             focus_pivot: false,
+            projection_mode: ProjectionMode::default(),
+            section_cut_plane: None,
+            fill_backend: FillBackend::default(),
         }
     }
 }
@@ -398,9 +461,15 @@ impl ViewState {
     pub fn reset_orientation(&mut self) {
         let target = self.target;
         let fit_radius = self.fit_radius;
+        let projection_mode = self.projection_mode;
+        let section_cut_plane = self.section_cut_plane;
+        let fill_backend = self.fill_backend;
         *self = Self {
             target,
             fit_radius,
+            projection_mode,
+            section_cut_plane,
+            fill_backend,
             ..Self::default()
         };
     }
@@ -705,8 +774,107 @@ impl ViewState {
             // A face view deliberately parks the pivot off the document
             // centre; the first orbit afterwards recovers the centre.
             focus_pivot: true,
+            projection_mode: self.projection_mode,
+            section_cut_plane: self.section_cut_plane,
+            fill_backend: self.fill_backend,
         })
     }
+
+    /// Returns the world-space camera eye position.
+    #[must_use]
+    pub fn eye_position(self) -> Point3 {
+        let forward = camera_world_axes(self).1;
+        let distance = (self.fit_radius.max(0.1) * 2.5) / bounded_zoom(self.zoom);
+        Point3::new(
+            self.target.x + forward.x * distance,
+            self.target.y + forward.y * distance,
+            self.target.z + forward.z * distance,
+        )
+    }
+
+    /// Generates a standard $4\times 4$ view matrix in column-major order: `matrix[col][row]`.
+    #[must_use]
+    pub fn view_matrix(self) -> [[f32; 4]; 4] {
+        let (right, forward, up) = camera_world_axes(self);
+        let eye = self.eye_position();
+        let r = [right.x as f32, right.y as f32, right.z as f32];
+        let u = [up.x as f32, up.y as f32, up.z as f32];
+        let view_dir = [-forward.x as f32, -forward.y as f32, -forward.z as f32];
+        let eye_v = [eye.x as f32, eye.y as f32, eye.z as f32];
+
+        let tx = -(r[0] * eye_v[0] + r[1] * eye_v[1] + r[2] * eye_v[2]);
+        let ty = -(u[0] * eye_v[0] + u[1] * eye_v[1] + u[2] * eye_v[2]);
+        let tz = -(view_dir[0] * eye_v[0] + view_dir[1] * eye_v[1] + view_dir[2] * eye_v[2]);
+
+        [
+            [r[0], u[0], view_dir[0], 0.0],
+            [r[1], u[1], view_dir[1], 0.0],
+            [r[2], u[2], view_dir[2], 0.0],
+            [tx, ty, tz, 1.0],
+        ]
+    }
+
+    /// Generates a standard $4\times 4$ projection matrix in column-major order: `matrix[col][row]`.
+    #[must_use]
+    pub fn projection_matrix(self, aspect_ratio: f32) -> [[f32; 4]; 4] {
+        let aspect = if aspect_ratio > 0.0 { aspect_ratio } else { 1.0 };
+        match self.projection_mode {
+            ProjectionMode::Orthographic => {
+                let radius = ((self.fit_radius.max(0.1) * 1.25) / bounded_zoom(self.zoom)) as f32;
+                let half_h = radius;
+                let half_w = radius * aspect;
+                let near = 0.01_f32;
+                let far = (self.fit_radius.max(0.1) * 20.0) as f32;
+                let range = far - near;
+                [
+                    [1.0 / half_w, 0.0, 0.0, 0.0],
+                    [0.0, 1.0 / half_h, 0.0, 0.0],
+                    [0.0, 0.0, 1.0 / range, 0.0],
+                    [0.0, 0.0, -near / range, 1.0],
+                ]
+            }
+            ProjectionMode::Perspective { fov_y_radians } => {
+                let fov = if fov_y_radians.is_finite() && fov_y_radians > 0.0 {
+                    fov_y_radians as f32
+                } else {
+                    std::f32::consts::FRAC_PI_4
+                };
+                let f = 1.0 / (fov * 0.5).tan();
+                let near = 0.1_f32;
+                let far = (self.fit_radius.max(0.1) * 40.0) as f32;
+                let range = far - near;
+                [
+                    [f / aspect, 0.0, 0.0, 0.0],
+                    [0.0, f, 0.0, 0.0],
+                    [0.0, 0.0, far / range, 1.0],
+                    [0.0, 0.0, -(far * near) / range, 0.0],
+                ]
+            }
+        }
+    }
+
+    /// Multiplies Projection and View matrices to produce the combined view-projection matrix.
+    #[must_use]
+    pub fn view_projection_matrix(self, aspect_ratio: f32) -> [[f32; 4]; 4] {
+        let v = self.view_matrix();
+        let p = self.projection_matrix(aspect_ratio);
+        matrix4_multiply(p, v)
+    }
+}
+
+/// Column-major $4\times 4$ matrix multiplication ($A \cdot B$).
+#[must_use]
+pub fn matrix4_multiply(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut result = [[0.0_f32; 4]; 4];
+    for col in 0..4 {
+        for row in 0..4 {
+            result[col][row] = a[0][row] * b[col][0]
+                + a[1][row] * b[col][1]
+                + a[2][row] * b[col][2]
+                + a[3][row] * b[col][3];
+        }
+    }
+    result
 }
 
 /// Deterministic, presentation-only move from the current model camera to a
@@ -787,6 +955,9 @@ impl CameraTransition {
             target: lerp_point(self.source.target, self.target.target, eased),
             fit_radius: logarithmic_lerp(self.source.fit_radius, self.target.fit_radius, eased),
             focus_pivot: self.target.focus_pivot,
+            projection_mode: self.target.projection_mode,
+            section_cut_plane: self.target.section_cut_plane,
+            fill_backend: self.target.fill_backend,
         }
     }
 
@@ -1774,4 +1945,50 @@ mod tests {
         assert_eq!(motion.target_hz, 60);
         assert_eq!(motion.frame_interval(), 1.0 / 60.0);
     }
+
+    #[test]
+    fn section_cut_plane_evaluates_signed_distance() {
+        let plane = SectionCutPlane::new(ProtocolVector3::new(0.0, 0.0, 1.0), -5.0);
+        assert!(plane.active);
+        assert_eq!(plane.distance_to_point(Point3::new(0.0, 0.0, 5.0)), 0.0);
+        assert_eq!(plane.distance_to_point(Point3::new(10.0, -2.0, 7.0)), 2.0);
+        assert_eq!(plane.distance_to_point(Point3::new(0.0, 0.0, 3.0)), -2.0);
+    }
+
+    #[test]
+    fn view_state_generates_valid_view_and_projection_matrices() {
+        let mut view = ViewState::default();
+        let eye = view.eye_position();
+        assert!(eye.is_finite());
+
+        let v_mat = view.view_matrix();
+        for col in v_mat {
+            for val in col {
+                assert!(val.is_finite());
+            }
+        }
+
+        let p_ortho = view.projection_matrix(16.0 / 9.0);
+        for col in p_ortho {
+            for val in col {
+                assert!(val.is_finite());
+            }
+        }
+
+        view.projection_mode = ProjectionMode::default_perspective();
+        let p_persp = view.projection_matrix(16.0 / 9.0);
+        for col in p_persp {
+            for val in col {
+                assert!(val.is_finite());
+            }
+        }
+
+        let mvp = view.view_projection_matrix(16.0 / 9.0);
+        for col in mvp {
+            for val in col {
+                assert!(val.is_finite());
+            }
+        }
+    }
 }
+

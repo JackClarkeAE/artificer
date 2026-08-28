@@ -52,6 +52,17 @@ pub enum SketchConstraintKind {
         second_start: SketchPointId,
         second_end: SketchPointId,
     },
+    Tangent {
+        first_start: SketchPointId,
+        first_end: SketchPointId,
+        second_start: SketchPointId,
+        second_end: SketchPointId,
+    },
+    Collinear {
+        first: SketchPointId,
+        second: SketchPointId,
+        third: SketchPointId,
+    },
 }
 
 impl SketchConstraintKind {
@@ -63,6 +74,11 @@ impl SketchConstraintKind {
             | Self::Horizontal { first, second }
             | Self::Vertical { first, second }
             | Self::Distance { first, second, .. } => vec![first, second],
+            Self::Collinear {
+                first,
+                second,
+                third,
+            } => vec![first, second, third],
             Self::Parallel {
                 first_start,
                 first_end,
@@ -76,6 +92,12 @@ impl SketchConstraintKind {
                 second_end,
             }
             | Self::EqualLength {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+            }
+            | Self::Tangent {
                 first_start,
                 first_end,
                 second_start,
@@ -95,7 +117,9 @@ impl SketchConstraintKind {
             | Self::Distance { .. }
             | Self::Parallel { .. }
             | Self::Perpendicular { .. }
-            | Self::EqualLength { .. } => 1,
+            | Self::EqualLength { .. }
+            | Self::Tangent { .. }
+            | Self::Collinear { .. } => 1,
         }
     }
 }
@@ -474,6 +498,41 @@ fn project(
                 a.distance(b),
             );
         }
+        SketchConstraintKind::Tangent {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+        } => {
+            let a = point(positions, first_start);
+            let b = point(positions, first_end);
+            let c = point(positions, second_start);
+            let d = point(positions, second_end);
+            let direction = normalized((b.u - a.u, b.v - a.v), (1.0, 0.0));
+            set_segment(
+                positions,
+                pinned,
+                second_start,
+                second_end,
+                direction,
+                c.distance(d),
+            );
+        }
+        SketchConstraintKind::Collinear {
+            first,
+            second,
+            third,
+        } => {
+            let a = point(positions, first);
+            let c = point(positions, third);
+            let b = point(positions, second);
+            let ac = c - a;
+            let len_sq = ac.length_squared();
+            if len_sq > 1.0e-14 && !pinned.contains_key(&second) {
+                let t = ((b - a).dot(ac) / len_sq).clamp(0.0, 1.0);
+                positions.insert(second, a + ac * t);
+            }
+        }
     }
 }
 
@@ -525,6 +584,28 @@ fn residual(positions: &BTreeMap<SketchPointId, SketchPoint2>, kind: &SketchCons
         } => (point(positions, first_start).distance(point(positions, first_end))
             - point(positions, second_start).distance(point(positions, second_end)))
         .abs(),
+        SketchConstraintKind::Tangent {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+        } => {
+            let a = point(positions, first_end) - point(positions, first_start);
+            let b = point(positions, second_end) - point(positions, second_start);
+            a.cross(b).abs() / (a.length() * b.length()).max(1.0e-14)
+        }
+        SketchConstraintKind::Collinear {
+            first,
+            second,
+            third,
+        } => {
+            let a = point(positions, first);
+            let b = point(positions, second);
+            let c = point(positions, third);
+            let ab = b - a;
+            let ac = c - a;
+            ab.cross(ac).abs() / (ac.length()).max(1.0e-14)
+        }
     }
 }
 

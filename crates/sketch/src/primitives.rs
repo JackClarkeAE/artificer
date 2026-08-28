@@ -26,7 +26,7 @@ pub struct PointOutputDraft {
     pub position: SketchPoint2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CurveDraft2 {
     Line {
         start: PointBindingDraft,
@@ -43,9 +43,15 @@ pub enum CurveDraft2 {
         radius: f64,
         direction: CurveDirection,
     },
+    Bspline {
+        control_points: Vec<PointBindingDraft>,
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+    },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CurveOutputDraft {
     pub role: CurveOutputRole,
     pub entity_role: SketchEntityRole,
@@ -154,6 +160,31 @@ pub fn evaluate_recipe(
                                     center,
                                     radius,
                                     protocol_direction(direction),
+                                )?;
+                            }
+                            PlanarCurve2::Bspline {
+                                degree,
+                                ref control_points,
+                                ref knots,
+                                ref weights,
+                            } => {
+                                let mut imported_cps = Vec::with_capacity(control_points.len());
+                                for cp in control_points {
+                                    let pt = import_point(
+                                        &mut builder,
+                                        &mut imported_points,
+                                        &mut point_index,
+                                        (*cp).into(),
+                                    )?;
+                                    imported_cps.push(pt);
+                                }
+                                builder.add_bspline(
+                                    role,
+                                    SketchEntityRole::Profile,
+                                    imported_cps,
+                                    degree,
+                                    knots.clone(),
+                                    weights.clone(),
                                 )?;
                             }
                         }
@@ -480,7 +511,7 @@ pub fn evaluate_recipe(
                             instance,
                             index_u16(source_index)?,
                             *role,
-                            *curve,
+                            curve.clone(),
                             |point| {
                                 SketchPoint2::new(point.u + translation.0, point.v + translation.1)
                             },
@@ -521,7 +552,7 @@ pub fn evaluate_recipe(
                         instance,
                         index_u16(source_index)?,
                         *role,
-                        *curve,
+                        curve.clone(),
                         |point| {
                             if *rotate_instances {
                                 rotate_about(point, center_position, angle)
@@ -640,9 +671,177 @@ pub fn evaluate_recipe(
                 builder.add_trim_fragment(index_u16(index)?, target_record.role, fragment.curve)?;
             }
         }
+        SketchRecipe::FitPointSpline {
+            fit_points,
+            degree,
+            closed: _,
+        } => {
+            if fit_points.len() < 2 {
+                return Err(SketchValidationError::FeatureTooSmall {
+                    operation: placeholder_operation(),
+                });
+            }
+            let mut resolved_fit_points = Vec::with_capacity(fit_points.len());
+            for (index, pt_input) in fit_points.iter().enumerate() {
+                let role = PointOutputRole::FitPoint(index_u16(index)?);
+                let binding = builder.bind_input(*pt_input, role)?;
+                let pos = builder.position(binding)?;
+                resolved_fit_points.push(pos);
+            }
+            let (control_positions, knots) = fit_spline_points(&resolved_fit_points, *degree)?;
+            let p_degree = (*degree).min(resolved_fit_points.len() - 1);
+            let mut control_bindings = Vec::with_capacity(control_positions.len());
+            for (index, pos) in control_positions.into_iter().enumerate() {
+                let role = PointOutputRole::ControlPoint(index_u16(index)?);
+                let pt = builder.add_derived_point(role, pos)?;
+                control_bindings.push(pt);
+            }
+            builder.add_bspline(
+                CurveOutputRole::Spline,
+                entity_role,
+                control_bindings,
+                p_degree,
+                knots,
+                None,
+            )?;
+        }
+        SketchRecipe::ControlVertexSpline {
+            control_points,
+            degree,
+            knots,
+            weights,
+            closed: _,
+        } => {
+            if control_points.len() <= *degree || *degree == 0 {
+                return Err(SketchValidationError::FeatureTooSmall {
+                    operation: placeholder_operation(),
+                });
+            }
+            let mut control_bindings = Vec::with_capacity(control_points.len());
+            for (index, pt_input) in control_points.iter().enumerate() {
+                let role = PointOutputRole::ControlPoint(index_u16(index)?);
+                let binding = builder.bind_input(*pt_input, role)?;
+                control_bindings.push(binding);
+            }
+            builder.add_bspline(
+                CurveOutputRole::Spline,
+                entity_role,
+                control_bindings,
+                *degree,
+                knots.clone(),
+                weights.clone(),
+            )?;
+        }
     }
 
     builder.finish()
+}
+
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn fit_spline_points(
+    points: &[SketchPoint2],
+    degree: usize,
+) -> Result<(Vec<SketchPoint2>, Vec<f64>), SketchValidationError> {
+    let n = points.len();
+    let p = degree.clamp(1, n - 1);
+    if n < 2 {
+        return Err(SketchValidationError::FeatureTooSmall {
+            operation: placeholder_operation(),
+        });
+    }
+
+    // 1. Parameterize points using chord length
+    let mut total_length = 0.0;
+    let mut chord_lengths = Vec::with_capacity(n - 1);
+    for window in points.windows(2) {
+        let d = (window[1].u - window[0].u).hypot(window[1].v - window[0].v);
+        chord_lengths.push(d);
+        total_length += d;
+    }
+    if total_length < 1.0e-12 {
+        return Err(SketchValidationError::FeatureTooSmall {
+            operation: placeholder_operation(),
+        });
+    }
+
+    let mut u_params = Vec::with_capacity(n);
+    u_params.push(0.0);
+    let mut running = 0.0;
+    for &d in &chord_lengths {
+        running += d;
+        u_params.push((running / total_length).clamp(0.0, 1.0));
+    }
+    u_params[n - 1] = 1.0;
+
+    // 2. Clamped knot vector via averaging
+    let mut knots = vec![0.0; n + p + 1];
+    for k in 0..=p {
+        knots[k] = 0.0;
+        knots[n + k] = 1.0;
+    }
+    for j in 1..(n - p) {
+        let sum: f64 = u_params.iter().skip(j).take(p).sum();
+        knots[j + p] = sum / (p as f64);
+    }
+
+    // 3. Set up linear system A * P = D
+    let mut a_mat = vec![vec![0.0; n]; n];
+    for (k, &uk) in u_params.iter().enumerate() {
+        let b = artificer_geometry::basis_values(p, &knots, n, uk);
+        for (i, val) in b.into_iter().enumerate() {
+            a_mat[k][i] = val;
+        }
+    }
+
+    // 4. Solve for Px and Py using Gaussian elimination with partial pivoting
+    let mut px = points.iter().map(|p| p.u).collect::<Vec<_>>();
+    let mut py = points.iter().map(|p| p.v).collect::<Vec<_>>();
+
+    for i in 0..n {
+        let mut max_row = i;
+        let mut max_val = a_mat[i][i].abs();
+        for k in (i + 1)..n {
+            let val = a_mat[k][i].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = k;
+            }
+        }
+        if max_val < 1.0e-14 {
+            return Err(SketchValidationError::FeatureTooSmall {
+                operation: placeholder_operation(),
+            });
+        }
+        if max_row != i {
+            a_mat.swap(i, max_row);
+            px.swap(i, max_row);
+            py.swap(i, max_row);
+        }
+        for k in (i + 1)..n {
+            let factor = a_mat[k][i] / a_mat[i][i];
+            for j in (i + 1)..n {
+                a_mat[k][j] -= factor * a_mat[i][j];
+            }
+            px[k] -= factor * px[i];
+            py[k] -= factor * py[i];
+        }
+    }
+
+    // Back substitution
+    for i in (0..n).rev() {
+        for j in (i + 1)..n {
+            px[i] -= a_mat[i][j] * px[j];
+            py[i] -= a_mat[i][j] * py[j];
+        }
+        px[i] /= a_mat[i][i];
+        py[i] /= a_mat[i][i];
+    }
+
+    let control_points = (0..n)
+        .map(|i| SketchPoint2::new(px[i], py[i]))
+        .collect::<Vec<_>>();
+
+    Ok((control_points, knots))
 }
 
 struct EvaluationBuilder<'a> {
@@ -773,6 +972,27 @@ impl<'a> EvaluationBuilder<'a> {
                 center,
                 radius,
                 direction,
+            },
+        )
+    }
+
+    fn add_bspline(
+        &mut self,
+        role: CurveOutputRole,
+        entity_role: SketchEntityRole,
+        control_points: Vec<PointBindingDraft>,
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+    ) -> Result<(), SketchValidationError> {
+        self.add_curve(
+            role,
+            entity_role,
+            CurveDraft2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
             },
         )
     }
@@ -940,6 +1160,26 @@ impl<'a> EvaluationBuilder<'a> {
                 let center = self.add_derived_point(point(0), transform(center))?;
                 self.add_circle(role, entity_role, center, radius, direction)
             }
+            EvaluatedCurve2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let mut mapped_cps = Vec::with_capacity(control_points.len());
+                for (idx, cp) in control_points.into_iter().enumerate() {
+                    let pt = self.add_derived_point(point(idx as u8), transform(cp))?;
+                    mapped_cps.push(pt);
+                }
+                self.add_bspline(
+                    role,
+                    entity_role,
+                    mapped_cps,
+                    degree,
+                    knots,
+                    weights,
+                )
+            }
         }
     }
 
@@ -971,9 +1211,9 @@ impl<'a> EvaluationBuilder<'a> {
                 let end = self.add_derived_point(point(2), end)?;
                 self.add_arc(role, entity_role, center, start, end, direction)
             }
-            EvaluatedCurve2::Circle { .. } => {
-                // A valid periodic Trim always has at least two limits and its
-                // retained spans are proper circular arcs.
+            EvaluatedCurve2::Circle { .. } | EvaluatedCurve2::Bspline { .. } => {
+                // A valid periodic or general Trim always has at least two limits and its
+                // retained spans are proper circular arcs or segments.
                 Err(SketchValidationError::InvalidTrimSelection)
             }
         }
@@ -1064,19 +1304,24 @@ fn pattern_anchor(sources: &[(SketchEntityId, SketchEntityRole, EvaluatedCurve2)
         count += 1;
     };
     for (_, _, curve) in sources {
-        match *curve {
+        match curve {
             EvaluatedCurve2::Line { start, end } => {
-                include(start);
-                include(end);
+                include(*start);
+                include(*end);
             }
             EvaluatedCurve2::CircularArc {
                 center, start, end, ..
             } => {
-                include(center);
-                include(start);
-                include(end);
+                include(*center);
+                include(*start);
+                include(*end);
             }
-            EvaluatedCurve2::Circle { center, .. } => include(center),
+            EvaluatedCurve2::Circle { center, .. } => include(*center),
+            EvaluatedCurve2::Bspline { control_points, .. } => {
+                for cp in control_points {
+                    include(*cp);
+                }
+            }
         }
     }
     SketchPoint2::new(sum_u / f64::from(count), sum_v / f64::from(count))
@@ -1321,7 +1566,7 @@ enum GeneralSourceBinding {
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GeneralFilletSource {
     entity: SketchEntityId,
     role: SketchEntityRole,
@@ -1388,20 +1633,20 @@ fn add_general_fillet(
     let sources = [first, second];
     let picks = [hints.first_pick, hints.second_pick];
     let pick_parameters = [
-        fillet_hint_parameter(first, hints.first_pick, precision)?,
-        fillet_hint_parameter(second, hints.second_pick, precision)?,
+        fillet_hint_parameter(&sources[0], hints.first_pick, precision)?,
+        fillet_hint_parameter(&sources[1], hints.second_pick, precision)?,
     ];
     let (corner, corner_parameters) =
-        select_general_fillet_corner(first, second, hints.corner_hint, precision)?;
+        select_general_fillet_corner(&sources[0], &sources[1], hints.corner_hint, precision)?;
 
-    let first_loci = offset_loci(first.curve, radius, precision);
-    let second_loci = offset_loci(second.curve, radius, precision);
+    let first_loci = offset_loci(&sources[0].curve, radius, precision);
+    let second_loci = offset_loci(&sources[1].curve, radius, precision);
     let mut candidates = Vec::new();
     for first_locus in first_loci {
         for second_locus in second_loci.iter().copied() {
             for center in offset_locus_intersections(first_locus, second_locus, precision) {
                 if let Some(candidate) = build_general_fillet_candidate(
-                    sources,
+                    &sources,
                     [first_locus, second_locus],
                     picks,
                     pick_parameters,
@@ -1454,7 +1699,7 @@ fn add_general_fillet(
         .transpose()?;
     add_general_trimmed_source(
         builder,
-        first,
+        &sources[0],
         0,
         selected.retained[0],
         first_tangent,
@@ -1462,7 +1707,7 @@ fn add_general_fillet(
     )?;
     add_general_trimmed_source(
         builder,
-        second,
+        &sources[1],
         1,
         selected.retained[1],
         second_tangent,
@@ -1470,7 +1715,7 @@ fn add_general_fillet(
     )?;
     builder.add_arc(
         CurveOutputRole::CornerConnector,
-        first.role,
+        sources[0].role,
         center,
         first_tangent,
         second_tangent,
@@ -1486,22 +1731,31 @@ fn read_general_fillet_source(
         .entity(entity)
         .filter(|record| record.active)
         .ok_or(SketchValidationError::MissingEntity { entity })?;
-    let binding = match record.geometry {
-        SketchCurve2::Line { start, end } => GeneralSourceBinding::Line { start, end },
+    let binding = match &record.geometry {
+        SketchCurve2::Line { start, end } => GeneralSourceBinding::Line {
+            start: *start,
+            end: *end,
+        },
         SketchCurve2::CircularArc {
             center,
             start,
             end,
             direction,
         } => GeneralSourceBinding::Arc {
-            center,
-            start,
-            end,
-            direction,
+            center: *center,
+            start: *start,
+            end: *end,
+            direction: *direction,
         },
         SketchCurve2::Circle {
             center, direction, ..
-        } => GeneralSourceBinding::Circle { center, direction },
+        } => GeneralSourceBinding::Circle {
+            center: *center,
+            direction: *direction,
+        },
+        SketchCurve2::Bspline { .. } => {
+            return Err(SketchValidationError::InvalidCornerSelection);
+        }
     };
     Ok(GeneralFilletSource {
         entity,
@@ -1512,13 +1766,13 @@ fn read_general_fillet_source(
 }
 
 fn select_general_fillet_corner(
-    first: GeneralFilletSource,
-    second: GeneralFilletSource,
+    first: &GeneralFilletSource,
+    second: &GeneralFilletSource,
     hint: SketchPoint2,
     precision: PrecisionPolicy,
 ) -> Result<(SketchPoint2, [f64; 2]), SketchValidationError> {
     let CurveIntersections::Points { mut intersections } =
-        intersect_curves(first.curve, second.curve, &precision)
+        intersect_curves(first.curve.clone(), second.curve.clone(), &precision)
     else {
         return Err(SketchValidationError::FilletNoBoundedSolution);
     };
@@ -1556,7 +1810,7 @@ fn select_general_fillet_corner(
 }
 
 fn fillet_hint_parameter(
-    source: GeneralFilletSource,
+    source: &GeneralFilletSource,
     pick: SketchPoint2,
     precision: PrecisionPolicy,
 ) -> Result<f64, SketchValidationError> {
@@ -1585,35 +1839,36 @@ fn fillet_hint_parameter(
 }
 
 fn offset_loci(
-    curve: EvaluatedCurve2,
+    curve: &EvaluatedCurve2,
     radius: f64,
     precision: PrecisionPolicy,
 ) -> Vec<OffsetLocus> {
     match curve {
         EvaluatedCurve2::Line { start, end } => {
-            let Some(direction) = (end - start).normalized() else {
+            let Some(direction) = (*end - *start).normalized() else {
                 return Vec::new();
             };
             let normal = direction.left_normal() * radius;
             vec![
                 OffsetLocus::Line {
-                    origin: start + normal,
+                    origin: *start + normal,
                     direction,
                 },
                 OffsetLocus::Line {
-                    origin: start + -normal,
+                    origin: *start + -normal,
                     direction,
                 },
             ]
         }
         EvaluatedCurve2::CircularArc { center, start, .. } => {
-            circular_offset_loci(center, center.distance(start), radius, precision)
+            circular_offset_loci(*center, center.distance(*start), radius, precision)
         }
         EvaluatedCurve2::Circle {
             center,
             radius: source_radius,
             ..
-        } => circular_offset_loci(center, source_radius, radius, precision),
+        } => circular_offset_loci(*center, *source_radius, radius, precision),
+        EvaluatedCurve2::Bspline { .. } => Vec::new(),
     }
 }
 
@@ -1773,7 +2028,7 @@ fn circle_circle_locus_intersections(
 
 #[allow(clippy::too_many_arguments)]
 fn build_general_fillet_candidate(
-    sources: [GeneralFilletSource; 2],
+    sources: &[GeneralFilletSource; 2],
     loci: [OffsetLocus; 2],
     picks: [SketchPoint2; 2],
     pick_parameters: [f64; 2],
@@ -1783,14 +2038,14 @@ fn build_general_fillet_candidate(
     radius: f64,
     precision: PrecisionPolicy,
 ) -> Result<Option<GeneralFilletCandidate>, SketchValidationError> {
-    let Some(first_tangent) = tangent_on_source(sources[0], loci[0], center, precision) else {
+    let Some(first_tangent) = tangent_on_source(&sources[0], loci[0], center, precision) else {
         return Ok(None);
     };
-    let Some(second_tangent) = tangent_on_source(sources[1], loci[1], center, precision) else {
+    let Some(second_tangent) = tangent_on_source(&sources[1], loci[1], center, precision) else {
         return Ok(None);
     };
     let Some(first_retained) = retained_branch(
-        sources[0].curve,
+        sources[0].curve.clone(),
         corner_parameters[0],
         first_tangent.1,
         pick_parameters[0],
@@ -1799,7 +2054,7 @@ fn build_general_fillet_candidate(
         return Ok(None);
     };
     let Some(second_retained) = retained_branch(
-        sources[1].curve,
+        sources[1].curve.clone(),
         corner_parameters[1],
         second_tangent.1,
         pick_parameters[1],
@@ -1832,7 +2087,7 @@ fn build_general_fillet_candidate(
 }
 
 fn tangent_on_source(
-    source: GeneralFilletSource,
+    source: &GeneralFilletSource,
     locus: OffsetLocus,
     fillet_center: SketchPoint2,
     precision: PrecisionPolicy,
@@ -1843,16 +2098,16 @@ fn tangent_on_source(
         .max(fillet_center.u.abs())
         .max(fillet_center.v.abs());
     let tolerance = fillet_linear_tolerance(precision, scale) * 8.0;
-    match (source.curve, locus) {
+    match (&source.curve, locus) {
         (EvaluatedCurve2::Line { start, end }, OffsetLocus::Line { direction, .. }) => {
-            let length = start.distance(end);
-            let parameter = (fillet_center - start).dot(direction) / length;
+            let length = start.distance(*end);
+            let parameter = (fillet_center - *start).dot(direction) / length;
             let parameter_tolerance = tolerance / length.max(precision.min_feature_size);
             if parameter < -parameter_tolerance || parameter > 1.0 + parameter_tolerance {
                 return None;
             }
             let parameter = parameter.clamp(0.0, 1.0);
-            let tangent = start + (end - start) * parameter;
+            let tangent = *start + (*end - *start) * parameter;
             Some((tangent, parameter))
         }
         (
@@ -1863,12 +2118,12 @@ fn tangent_on_source(
             OffsetLocus::Circle { signed_radius, .. },
         ) => {
             let source_radius = source.curve.radius()?;
-            let delta = fillet_center - center;
+            let delta = fillet_center - *center;
             let separation = delta.length();
             if separation <= tolerance || (separation - signed_radius.abs()).abs() > tolerance {
                 return None;
             }
-            let tangent = center + delta / separation * (source_radius * signed_radius.signum());
+            let tangent = *center + delta / separation * (source_radius * signed_radius.signum());
             let parameter = source.curve.closest_parameter(tangent);
             let evaluated = source.curve.evaluate(parameter).ok()?;
             if evaluated.distance(tangent) > tolerance {
@@ -1952,7 +2207,7 @@ fn connector_direction(
 }
 
 fn prove_fillet_tangency(
-    sources: [GeneralFilletSource; 2],
+    sources: &[GeneralFilletSource; 2],
     tangencies: [(SketchPoint2, f64); 2],
     center: SketchPoint2,
     radius: f64,
@@ -1969,7 +2224,7 @@ fn prove_fillet_tangency(
         .max(precision.modeling_resolution / radius.max(precision.min_feature_size))
         * 16.0;
     sources
-        .into_iter()
+        .iter()
         .zip(tangencies)
         .all(|(source, (point, parameter))| {
             if (center.distance(point) - radius).abs() > linear_tolerance {
@@ -2018,7 +2273,7 @@ fn canonicalize_fillet_candidates(
 
 fn add_general_trimmed_source(
     builder: &mut EvaluationBuilder<'_>,
-    source: GeneralFilletSource,
+    source: &GeneralFilletSource,
     source_index: u8,
     retained: RetainedBranch,
     tangent: PointBindingDraft,
@@ -2180,7 +2435,7 @@ pub(crate) fn instantiate_evaluation(
 
     for curve in curves {
         let id = definition.allocate_entity()?;
-        let geometry = instantiate_curve(curve.geometry, &point_ids)?;
+        let geometry = instantiate_curve(curve.geometry.clone(), &point_ids)?;
         if outputs
             .insert(OutputRole::Curve(curve.role), SketchOutputRef::Curve(id))
             .is_some()
@@ -2245,6 +2500,23 @@ pub(crate) fn instantiate_curve(
             radius,
             direction,
         },
+        CurveDraft2::Bspline {
+            control_points,
+            degree,
+            knots,
+            weights,
+        } => {
+            let mut resolved = Vec::with_capacity(control_points.len());
+            for pt in control_points {
+                resolved.push(resolve(pt)?);
+            }
+            SketchCurve2::Bspline {
+                control_points: resolved,
+                degree,
+                knots,
+                weights,
+            }
+        }
     })
 }
 

@@ -5401,7 +5401,7 @@ impl KernelLabApp {
                             let Ok(curve) = authoring.evaluated_curve(entity.id) else {
                                 continue;
                             };
-                            let Some(sampled) = preview_authoring_curve(frame, curve) else {
+                            let Some(sampled) = preview_authoring_curve(frame, curve.clone()) else {
                                 continue;
                             };
                             segments.extend(sampled.windows(2).map(|pair| [pair[0], pair[1]]));
@@ -16900,6 +16900,19 @@ fn sketch_export_curves_from_authoring(
                     end_degrees: to,
                 });
             }
+            AuthoringCurve2::Bspline { .. } => {
+                let n_samples = 32;
+                for i in 0..n_samples {
+                    let t0 = i as f64 / n_samples as f64;
+                    let t1 = (i + 1) as f64 / n_samples as f64;
+                    if let (Ok(p0), Ok(p1)) = (curve.evaluate(t0), curve.evaluate(t1)) {
+                        curves.push(export::SketchExportCurve::Line {
+                            start: [p0.u, p0.v],
+                            end: [p1.u, p1.v],
+                        });
+                    }
+                }
+            }
         }
     }
     curves
@@ -17394,8 +17407,8 @@ fn sample_planar_loop(profile_loop: &PlanarLoop2) -> Option<Vec<ProtocolPoint2>>
 
     let mut sampled = Vec::new();
     for curve in &profile_loop.curves {
-        match *curve {
-            PlanarCurve2::Line { start, .. } => sampled.push(start),
+        match curve {
+            PlanarCurve2::Line { start, .. } => sampled.push(*start),
             PlanarCurve2::CircularArc {
                 center,
                 start,
@@ -17444,7 +17457,7 @@ fn sample_planar_loop(profile_loop: &PlanarLoop2) -> Option<Vec<ProtocolPoint2>>
                 radius,
                 direction,
             } => {
-                if !radius.is_finite() || radius <= f64::EPSILON {
+                if !radius.is_finite() || *radius <= f64::EPSILON {
                     return None;
                 }
                 let sign = match direction {
@@ -17458,6 +17471,32 @@ fn sample_planar_loop(profile_loop: &PlanarLoop2) -> Option<Vec<ProtocolPoint2>>
                         radius.mul_add(angle.cos(), center.x),
                         radius.mul_add(angle.sin(), center.y),
                     ));
+                }
+            }
+            PlanarCurve2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let eval_pts = control_points.iter().map(|p| artificer_geometry::Point2::new(p.x, p.y)).collect::<Vec<_>>();
+                let n_segments = 32;
+                if let Some(w) = weights {
+                    if let Ok(nurbs) = artificer_geometry::NurbsCurve2::new(*degree, eval_pts, w.clone(), knots.clone(), false) {
+                        for step in 0..n_segments {
+                            let t = step as f64 / n_segments as f64;
+                            if let Ok(pt) = nurbs.evaluate(t) {
+                                sampled.push(ProtocolPoint2::new(pt.x, pt.y));
+                            }
+                        }
+                    }
+                } else if let Ok(bspline) = artificer_geometry::BSplineCurve2::new(*degree, eval_pts, knots.clone(), false) {
+                    for step in 0..n_segments {
+                        let t = step as f64 / n_segments as f64;
+                        if let Ok(pt) = bspline.evaluate(t) {
+                            sampled.push(ProtocolPoint2::new(pt.x, pt.y));
+                        }
+                    }
                 }
             }
         }
@@ -17614,7 +17653,7 @@ fn arrangement_loop_polygon(
 ) -> Option<Vec<Point3>> {
     let mut points: Vec<Point3> = Vec::new();
     for curve in &profile_loop.curves {
-        for point in preview_authoring_curve(frame, *curve)? {
+        for point in preview_authoring_curve(frame, curve.clone())? {
             if points
                 .last()
                 .is_none_or(|last| !points_coincide(*last, point))
@@ -17697,7 +17736,7 @@ fn workbench_sketch_has_overlay_geometry(sketch: &WorkbenchSketch) -> bool {
 fn preview_authoring_curve(frame: PlanarFrame3, curve: AuthoringCurve2) -> Option<Vec<Point3>> {
     let subdivisions = match curve {
         AuthoringCurve2::Line { .. } => 1,
-        AuthoringCurve2::CircularArc { .. } => 32,
+        AuthoringCurve2::CircularArc { .. } | AuthoringCurve2::Bspline { .. } => 32,
         AuthoringCurve2::Circle { .. } => 64,
     };
     let sample_count = if curve.is_periodic() {
@@ -17839,7 +17878,7 @@ fn planar_loop_contains_authoring_point(
     let mut parameters = Vec::new();
     for curve in curves {
         if let CurveIntersections::Points { intersections } =
-            intersect_curves(ray, curve, precision)
+            intersect_curves(ray.clone(), curve, precision)
         {
             parameters.extend(
                 intersections
@@ -17891,6 +17930,17 @@ fn protocol_curve_as_authoring(curve: &PlanarCurve2) -> Option<AuthoringCurve2> 
             },
         },
         PlanarCurve2::Circle { .. } => return None,
+        PlanarCurve2::Bspline {
+            ref control_points,
+            degree,
+            ref knots,
+            ref weights,
+        } => AuthoringCurve2::Bspline {
+            control_points: control_points.iter().map(|p| (*p).into()).collect(),
+            degree,
+            knots: knots.clone(),
+            weights: weights.clone(),
+        },
     })
 }
 
@@ -18076,7 +18126,9 @@ fn classify_selected_planar_profile(
                 .iter()
                 .filter_map(|curve| match curve {
                     PlanarCurve2::Line { start, .. } => Some(SketchPoint::new(start.x, start.y)),
-                    PlanarCurve2::CircularArc { .. } | PlanarCurve2::Circle { .. } => None,
+                    PlanarCurve2::CircularArc { .. }
+                    | PlanarCurve2::Circle { .. }
+                    | PlanarCurve2::Bspline { .. } => None,
                 })
                 .collect::<Vec<_>>();
             let eligibility = classify_face_profile_domain(&vertices, boundary, inner_boundaries);

@@ -11,8 +11,11 @@ artificer-geometry = { path = "../geometry" }
 artificer-kernel = { path = "../kernel" }
 artificer-protocol = { path = "../protocol" }
 artificer-ui-core = { path = "../ui-core" }
+bytemuck.workspace = true
 egui.workspace = true
+egui_wgpu.workspace = true
 serde.workspace = true
+wgpu.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = [

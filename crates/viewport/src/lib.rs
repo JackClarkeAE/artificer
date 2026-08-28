@@ -43,17 +43,34 @@ const MODEL_VERTEX_FILL_RADIUS: f32 = 2.4;
 const MODEL_VERTEX_OUTLINE_RADIUS: f32 = 2.9;
 const MODEL_VERTEX_HIT_RADIUS: f32 = 8.0;
 
+pub mod gpu;
+
+/// Selection for the triangle fill rendering backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FillBackend {
+    #[default]
+    Auto,
+    GpuOnly,
+    CpuOnly,
+}
+
 /// Model-face presentation independent of authoritative kernel geometry.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ModelDisplayMode {
     Diagnostic,
     #[default]
     ShadedEdges,
+    Wireframe,
+    HiddenLinesRemoved,
 }
 
 impl ModelDisplayMode {
     pub const fn is_shaded(self) -> bool {
         matches!(self, Self::ShadedEdges)
+    }
+
+    pub const fn shows_triangles(self) -> bool {
+        matches!(self, Self::Diagnostic | Self::ShadedEdges | Self::HiddenLinesRemoved)
     }
 }
 
@@ -1752,85 +1769,159 @@ fn show_document_impl(
             .find(|body| body.key == key)
             .and_then(|body| body.tint)
     };
+    let section_plane = view.section_cut_plane.filter(|p| p.active);
     let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
-    for triangle in &triangles {
-        if !visible_rect.intersects(triangle.screen_bounds) {
-            continue;
-        }
-        // One colour per vertex, so the mesh rasteriser interpolates the exact
-        // carrier shading across the facet. A cylinder's wall is the same
-        // triangle count it always was and no longer bands.
-        let mut fill = if display_mode.is_shaded() {
-            tint_of(triangle.body).map_or_else(
-                || triangle.lighting.map(shaded_face_color),
-                |tint| {
-                    triangle
-                        .lighting
-                        .map(|lighting| shaded_material_color(tint, lighting))
-                },
-            )
-        } else {
-            [face_color(triangle.role); 3]
-        };
-        let identity = DocumentFaceSelection {
-            body: triangle.body,
-            face: triangle.source,
-        };
-        let edge_finish_face = edge_finish_preview
-            .filter(|preview| preview.body == triangle.body)
-            .and_then(|preview| preview.candidate.as_deref())
-            .is_some_and(|candidate| candidate.changed_faces.contains(&triangle.source));
-        let cut_preview_face =
-            cut_preview_faces.is_some_and(|changed_faces| changed_faces.contains(&triangle.source));
-        if cut_preview_face {
-            // The staged body is the exact regularized difference. Red marks
-            // the newly exposed cut boundary; the translucent swept-volume
-            // overlay painted later also identifies the material being
-            // removed without restoring it to the depth scene.
-            fill = fill.map(|vertex| mix(vertex, FeaturePreviewStyle::Cut.color(), 0.58));
-        } else if edge_finish_face {
-            // The viewport is already displaying the privately evaluated
-            // candidate body.  Tint only the new finish surface, rather than
-            // painting a translucent cutter box over selected orange source
-            // geometry.
-            let accent = match edge_finish_preview.map(|preview| preview.kind) {
-                Some(EdgeFinishKind::Chamfer) => Color32::from_rgb(83, 202, 255),
-                Some(EdgeFinishKind::Fillet) => Color32::from_rgb(82, 224, 174),
-                None => HOVERED,
+    let mut section_cut_segments: Vec<[Pos2; 2]> = Vec::new();
+
+    if display_mode.shows_triangles() {
+
+        for triangle in &triangles {
+            if !visible_rect.intersects(triangle.screen_bounds) {
+                continue;
+            }
+
+            if let Some(plane) = section_plane {
+                let d0 = plane.distance_to_point(triangle.model_vertices[0]);
+                let d1 = plane.distance_to_point(triangle.model_vertices[1]);
+                let d2 = plane.distance_to_point(triangle.model_vertices[2]);
+                if d0 < -1.0e-6 && d1 < -1.0e-6 && d2 < -1.0e-6 {
+                    // Entirely on the discarded side of the section plane
+                    continue;
+                }
+                // If crossing the plane, compute cut contour segment for highlight overlay
+                if (d0 < 0.0 || d1 < 0.0 || d2 < 0.0) && (d0 > 0.0 || d1 > 0.0 || d2 > 0.0) {
+                    let mut cut_pts = Vec::new();
+                    let edges = [
+                        (triangle.model_vertices[0], triangle.model_vertices[1], d0, d1),
+                        (triangle.model_vertices[1], triangle.model_vertices[2], d1, d2),
+                        (triangle.model_vertices[2], triangle.model_vertices[0], d2, d0),
+                    ];
+                    for (p0, p1, da, db) in edges {
+                        if (da < 0.0 && db > 0.0) || (da > 0.0 && db < 0.0) {
+                            let t = da / (da - db);
+                            let pt = Point3::new(
+                                p0.x + (p1.x - p0.x) * t,
+                                p0.y + (p1.y - p0.y) * t,
+                                p0.z + (p1.z - p0.z) * t,
+                            );
+                            let proj = view.project(pt);
+                            cut_pts.push(projection.camera_point(proj));
+                        }
+                    }
+                    if cut_pts.len() == 2 {
+                        section_cut_segments.push([cut_pts[0], cut_pts[1]]);
+                    }
+                }
+            }
+
+            // One colour per vertex, so the mesh rasteriser interpolates the exact
+            // carrier shading across the facet. A cylinder's wall is the same
+            // triangle count it always was and no longer bands.
+            let mut fill = if display_mode.is_shaded() {
+                tint_of(triangle.body).map_or_else(
+                    || triangle.lighting.map(shaded_face_color),
+                    |tint| {
+                        triangle
+                            .lighting
+                            .map(|lighting| shaded_material_color(tint, lighting))
+                    },
+                )
+            } else {
+                [face_color(triangle.role); 3]
             };
-            fill = fill.map(|vertex| mix(vertex, accent, 0.72));
-        } else if selected_face_groups.contains(&identity) {
-            fill = fill.map(|vertex| mix(vertex, SELECTED, 0.48));
-        } else if measurement.is_some_and(|measurement| {
-            matches!(measurement, DocumentMeasurement::Face { selection, .. } if *selection == identity)
-        }) {
-            fill = fill.map(|vertex| mix(vertex, SELECTED, 0.24));
-        } else if hovered_faces.contains(&identity) {
-            fill = fill.map(|vertex| mix(vertex, HOVERED, 0.28));
+            let identity = DocumentFaceSelection {
+                body: triangle.body,
+                face: triangle.source,
+            };
+            let edge_finish_face = edge_finish_preview
+                .filter(|preview| preview.body == triangle.body)
+                .and_then(|preview| preview.candidate.as_deref())
+                .is_some_and(|candidate| candidate.changed_faces.contains(&triangle.source));
+            let cut_preview_face =
+                cut_preview_faces.is_some_and(|changed_faces| changed_faces.contains(&triangle.source));
+            if cut_preview_face {
+                // The staged body is the exact regularized difference. Red marks
+                // the newly exposed cut boundary; the translucent swept-volume
+                // overlay painted later also identifies the material being
+                // removed without restoring it to the depth scene.
+                fill = fill.map(|vertex| mix(vertex, FeaturePreviewStyle::Cut.color(), 0.58));
+            } else if edge_finish_face {
+                // The viewport is already displaying the privately evaluated
+                // candidate body.  Tint only the new finish surface, rather than
+                // painting a translucent cutter box over selected orange source
+                // geometry.
+                let accent = match edge_finish_preview.map(|preview| preview.kind) {
+                    Some(EdgeFinishKind::Chamfer) => Color32::from_rgb(83, 202, 255),
+                    Some(EdgeFinishKind::Fillet) => Color32::from_rgb(82, 224, 174),
+                    None => HOVERED,
+                };
+                fill = fill.map(|vertex| mix(vertex, accent, 0.72));
+            } else if selected_face_groups.contains(&identity) {
+                fill = fill.map(|vertex| mix(vertex, SELECTED, 0.48));
+            } else if measurement.is_some_and(|measurement| {
+                matches!(measurement, DocumentMeasurement::Face { selection, .. } if *selection == identity)
+            }) {
+                fill = fill.map(|vertex| mix(vertex, SELECTED, 0.24));
+            } else if hovered_faces.contains(&identity) {
+                fill = fill.map(|vertex| mix(vertex, HOVERED, 0.28));
+            }
+            pieces.push(FacePaintPiece {
+                points: triangle.points,
+                depths: triangle.vertex_depths,
+                fills: fill,
+            });
         }
-        pieces.push(FacePaintPiece {
-            points: triangle.points,
-            depths: triangle.vertex_depths,
-            fills: fill,
-        });
-    }
-    subdivide_face_paint_pieces(&mut pieces);
-    // The projected triangles arrive depth-sorted, but one key per whole
-    // facet is what let a pocket wall out-sort the wall in front of it; the
-    // bounded pieces re-sort on their own local depths.
-    pieces.sort_by(|left, right| left.depth_key().total_cmp(&right.depth_key()));
-    let mut face_mesh = Mesh::default();
-    face_mesh.reserve_vertices(pieces.len() * 3);
-    face_mesh.reserve_triangles(pieces.len());
-    for piece in &pieces {
-        let first = face_mesh.vertices.len() as u32;
-        for (point, vertex_fill) in piece.points.into_iter().zip(piece.fills) {
-            face_mesh.colored_vertex(point, vertex_fill);
+        subdivide_face_paint_pieces(&mut pieces);
+        // The projected triangles arrive depth-sorted, but one key per whole
+        // facet is what let a pocket wall out-sort the wall in front of it; the
+        // bounded pieces re-sort on their own local depths.
+        pieces.sort_by(|left, right| left.depth_key().total_cmp(&right.depth_key()));
+        if view.fill_backend == artificer_ui_core::presentation::FillBackend::GpuOnly {
+            let gpu_bodies = bodies
+                .iter()
+                .map(|b| {
+                    let tint_rgba = b.tint.map(|c| {
+                        [
+                            f32::from(c.r()) / 255.0,
+                            f32::from(c.g()) / 255.0,
+                            f32::from(c.b()) / 255.0,
+                            f32::from(c.a()) / 255.0,
+                        ]
+                    });
+                    (b.key.get(), b.scene.clone(), tint_rgba)
+                })
+                .collect::<Vec<_>>();
+            let aspect_ratio = canvas.rect.width() / canvas.rect.height().max(1.0);
+            let gpu_cb = crate::gpu::ViewportGpuCallback::new(
+                *view,
+                aspect_ratio,
+                display_mode.is_shaded(),
+                gpu_bodies,
+            );
+            painter.add(egui_wgpu::Callback::new_paint_callback(canvas.rect, gpu_cb));
+        } else {
+            let mut face_mesh = Mesh::default();
+            face_mesh.reserve_vertices(pieces.len() * 3);
+            face_mesh.reserve_triangles(pieces.len());
+            for piece in &pieces {
+                let first = face_mesh.vertices.len() as u32;
+                for (point, vertex_fill) in piece.points.into_iter().zip(piece.fills) {
+                    face_mesh.colored_vertex(point, vertex_fill);
+                }
+                face_mesh.add_triangle(first, first + 1, first + 2);
+            }
+            painter.add(Shape::mesh(face_mesh));
         }
-        face_mesh.add_triangle(first, first + 1, first + 2);
     }
-    painter.add(Shape::mesh(face_mesh));
+
+    // Paint section cut outline contours if active
+    if !section_cut_segments.is_empty() {
+        let cut_stroke = Stroke::new(2.0, Color32::from_rgb(255, 140, 0));
+        for segment in section_cut_segments {
+            painter.line_segment(segment, cut_stroke);
+        }
+    }
 
     if visible_edge_keys.is_some() {
         for body in bodies {
@@ -3141,9 +3232,10 @@ fn painted_visible_edge_intervals(
     triangles: &[ProjectedTriangle],
 ) -> Vec<[f32; 2]> {
     match display_mode {
-        ModelDisplayMode::Diagnostic | ModelDisplayMode::ShadedEdges => {
+        ModelDisplayMode::Diagnostic | ModelDisplayMode::ShadedEdges | ModelDisplayMode::HiddenLinesRemoved => {
             visible_edge_intervals(edge, depths, body, edge_key, triangles)
         }
+        ModelDisplayMode::Wireframe => vec![[0.0, 1.0]],
     }
 }
 

@@ -116,6 +116,17 @@ impl Similarity2 {
                 radius: radius * self.scale,
                 direction: self.direction(direction),
             },
+            EvaluatedCurve2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => EvaluatedCurve2::Bspline {
+                control_points: control_points.into_iter().map(|p| self.apply_point(p)).collect(),
+                degree,
+                knots,
+                weights,
+            },
         }
     }
 
@@ -158,6 +169,20 @@ impl Similarity2 {
                 center: self.apply_protocol_point(center),
                 radius: radius * self.scale,
                 direction: self.protocol_direction(direction),
+            },
+            PlanarCurve2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => PlanarCurve2::Bspline {
+                control_points: control_points
+                    .into_iter()
+                    .map(|p| self.apply_protocol_point(p))
+                    .collect(),
+                degree,
+                knots,
+                weights,
             },
         }
     }
@@ -239,7 +264,7 @@ fn profile_curves(profile: &artificer_protocol::PlanarProfile2) -> Vec<PlanarCur
         .flat_map(|region| {
             std::iter::once(&region.outer)
                 .chain(region.holes.iter())
-                .flat_map(|profile_loop| profile_loop.curves.iter().copied())
+                .flat_map(|profile_loop| profile_loop.curves.iter().cloned())
         })
         .collect()
 }
@@ -309,7 +334,7 @@ fn arrangement_and_profile_are_similarity_equivariant_for_a_deterministic_transf
     for transform in cases {
         let transformed_inputs = source
             .iter()
-            .copied()
+            .cloned()
             .map(|input| transform.apply_input(input))
             .collect::<Vec<_>>();
         let transformed = build_arrangement(
@@ -362,13 +387,13 @@ fn arrangement_and_profile_are_similarity_equivariant_for_a_deterministic_transf
         let transformed_fragments = transformed
             .fragments
             .iter()
-            .map(|fragment| (&fragment.key, fragment.curve))
+            .map(|fragment| (&fragment.key, fragment.curve.clone()))
             .collect::<BTreeMap<_, _>>();
         for fragment in &baseline.fragments {
             let actual = transformed_fragments
                 .get(&fragment.key)
                 .unwrap_or_else(|| panic!("{transform:?}: stable fragment key changed"));
-            let expected = transform.apply_curve(fragment.curve);
+            let expected = transform.apply_curve(fragment.curve.clone());
             for parameter in [0.0, 0.25, 0.5, 0.75, 1.0] {
                 let expected_point = expected
                     .evaluate(if expected.is_periodic() && parameter == 1.0 {
@@ -423,7 +448,7 @@ fn arrangement_and_profile_are_similarity_equivariant_for_a_deterministic_transf
         for expected in expected_curves {
             let index = actual_curves
                 .iter()
-                .position(|actual| protocol_curve_equivalent(expected, *actual, tolerance))
+                .position(|actual| protocol_curve_equivalent(expected.clone(), actual.clone(), tolerance))
                 .unwrap_or_else(|| panic!("{transform:?}: profile curve was not equivariant"));
             actual_curves.swap_remove(index);
         }

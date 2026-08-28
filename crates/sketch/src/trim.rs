@@ -9,7 +9,7 @@ use crate::{
     SketchPoint2, SourceInterval, intersect_entities,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrimCurve {
     pub entity: SketchEntityId,
     pub curve: EvaluatedCurve2,
@@ -79,9 +79,9 @@ pub fn select_trim_span(
         }
         let intersections = intersect_entities(
             target.entity,
-            target.curve,
+            target.curve.clone(),
             limit.entity,
-            limit.curve,
+            limit.curve.clone(),
             precision,
         );
         match intersections.result {
@@ -108,7 +108,7 @@ pub fn select_trim_span(
                     }
                 }
             }
-            CurveIntersections::Overlap { .. } | CurveIntersections::CoincidentFull => {
+            CurveIntersections::CoincidentFull | CurveIntersections::Overlap { .. } => {
                 return Err(TrimError::NoUniqueSpan {
                     limit_entity: limit.entity,
                 });
@@ -120,23 +120,30 @@ pub fn select_trim_span(
             }
         }
     }
+
+    if junctions.is_empty() {
+        return Err(if target.curve.is_periodic() {
+            TrimError::CircleNeedsTwoLimits
+        } else {
+            TrimError::RecommendDelete
+        });
+    }
+
     junctions.sort_by(|first, second| {
         first
             .parameter
             .total_cmp(&second.parameter)
             .then_with(|| first.key.cmp(&second.key))
     });
-    let parameter_tolerance = precision.parameter_resolution.max(f64::EPSILON * 64.0);
-    let mut clustered = Vec::<TrimJunction>::new();
+
+    let parameter_tolerance = parameter_uncertainty(&target.curve, precision);
+    let mut clustered = Vec::<TrimJunction>::with_capacity(junctions.len());
     for junction in junctions {
         if let Some(last) = clustered.last_mut()
-            && parameter_distance(
-                last.parameter,
-                junction.parameter,
-                target.curve.is_periodic(),
-            ) <= parameter_tolerance
+            && (junction.parameter - last.parameter).abs() <= parameter_tolerance
         {
-            // The lower semantic key is the deterministic representative;
+            // The first canonical branch key survives clustering. When
+            // intersecting lines produce identical parameter positions,
             // the complete arrangement retains the full cluster key.
             if junction.key < last.key {
                 last.key = junction.key;
@@ -168,14 +175,15 @@ pub fn select_trim_span(
     }
 
     let click_parameter = target.curve.closest_parameter(click);
-    let uncertainty = parameter_uncertainty(target.curve, precision);
+    let uncertainty = parameter_uncertainty(&target.curve, precision);
+    let target_periodic = target.curve.is_periodic();
     let at_click: Vec<_> = clustered
         .iter()
         .filter(|junction| {
             parameter_distance(
                 click_parameter,
                 junction.parameter,
-                target.curve.is_periodic(),
+                target_periodic,
             ) <= uncertainty
         })
         .map(|junction| junction.key.clone())
@@ -197,7 +205,7 @@ pub fn select_trim_span(
         .ok_or(TrimError::InvalidSpan)?;
     let mut fragments = Vec::with_capacity(spans.len());
     for span in &spans {
-        fragments.push(fragment_for_span(target.curve, *span, &clustered)?);
+        fragments.push(fragment_for_span(&target.curve, *span, &clustered)?);
     }
     let removed = fragments.remove(removed_index);
     Ok(TrimSpanSelection {
@@ -213,58 +221,76 @@ pub fn select_trim_span(
 struct TrimSpan {
     start: f64,
     end: f64,
-    wraps: bool,
     start_limit: Option<usize>,
     end_limit: Option<usize>,
+    wraps: bool,
+}
+
+impl TrimSpan {
+    const fn new(start: f64, end: f64, start_limit: usize, end_limit: usize) -> Self {
+        Self {
+            start,
+            end,
+            start_limit: Some(start_limit),
+            end_limit: Some(end_limit),
+            wraps: false,
+        }
+    }
 }
 
 fn open_spans(junctions: &[TrimJunction]) -> Vec<TrimSpan> {
-    let mut boundaries = Vec::with_capacity(junctions.len() + 2);
-    let start_limit = junctions
-        .iter()
-        .position(|junction| junction.parameter == 0.0);
-    let end_limit = junctions
-        .iter()
-        .position(|junction| junction.parameter == 1.0);
-    boundaries.push((0.0, start_limit));
-    boundaries.extend(
-        junctions
-            .iter()
-            .enumerate()
-            .filter(|(_, junction)| junction.parameter > 0.0 && junction.parameter < 1.0)
-            .map(|(index, junction)| (junction.parameter, Some(index))),
-    );
-    boundaries.push((1.0, end_limit));
-    boundaries
-        .windows(2)
-        .filter(|pair| pair[1].0 > pair[0].0)
-        .map(|pair| TrimSpan {
-            start: pair[0].0,
-            end: pair[1].0,
+    let mut spans = Vec::with_capacity(junctions.len() + 1);
+    if let Some(first) = junctions.first()
+        && first.parameter > 0.0
+    {
+        spans.push(TrimSpan {
+            start: 0.0,
+            end: first.parameter,
+            start_limit: None,
+            end_limit: Some(0),
             wraps: false,
-            start_limit: pair[0].1,
-            end_limit: pair[1].1,
-        })
-        .collect()
+        });
+    }
+    for index in 0..junctions.len().saturating_sub(1) {
+        spans.push(TrimSpan::new(
+            junctions[index].parameter,
+            junctions[index + 1].parameter,
+            index,
+            index + 1,
+        ));
+    }
+    if let Some(last) = junctions.last()
+        && last.parameter < 1.0
+    {
+        spans.push(TrimSpan {
+            start: last.parameter,
+            end: 1.0,
+            start_limit: Some(junctions.len() - 1),
+            end_limit: None,
+            wraps: false,
+        });
+    }
+    spans
 }
 
 fn periodic_spans(junctions: &[TrimJunction]) -> Vec<TrimSpan> {
-    (0..junctions.len())
-        .map(|index| {
-            let next = (index + 1) % junctions.len();
-            TrimSpan {
-                start: junctions[index].parameter,
-                end: junctions[next].parameter,
-                wraps: next == 0,
-                start_limit: Some(index),
-                end_limit: Some(next),
-            }
-        })
-        .collect()
+    let mut spans = Vec::with_capacity(junctions.len());
+    for index in 0..junctions.len() {
+        let next_index = (index + 1) % junctions.len();
+        let wraps = index + 1 == junctions.len();
+        spans.push(TrimSpan {
+            start: junctions[index].parameter,
+            end: junctions[next_index].parameter,
+            start_limit: Some(index),
+            end_limit: Some(next_index),
+            wraps,
+        });
+    }
+    spans
 }
 
 fn fragment_for_span(
-    curve: EvaluatedCurve2,
+    curve: &EvaluatedCurve2,
     span: TrimSpan,
     junctions: &[TrimJunction],
 ) -> Result<TrimFragment, TrimError> {
@@ -278,7 +304,7 @@ fn fragment_for_span(
         let (center, direction) = match curve {
             EvaluatedCurve2::Circle {
                 center, direction, ..
-            } => (center, direction),
+            } => (*center, *direction),
             _ => return Err(TrimError::InvalidSpan),
         };
         EvaluatedCurve2::CircularArc {
@@ -315,7 +341,7 @@ fn span_contains(span: TrimSpan, parameter: f64, tolerance: f64) -> bool {
     }
 }
 
-fn parameter_uncertainty(curve: EvaluatedCurve2, precision: &PrecisionPolicy) -> f64 {
+fn parameter_uncertainty(curve: &EvaluatedCurve2, precision: &PrecisionPolicy) -> f64 {
     let length = curve.arc_length().max(precision.min_feature_size);
     precision
         .parameter_resolution

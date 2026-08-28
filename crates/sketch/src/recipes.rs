@@ -368,6 +368,18 @@ pub enum SketchRecipe {
         limits: Vec<SketchEntityId>,
         pick: SketchPoint2,
     },
+    FitPointSpline {
+        fit_points: Vec<PointInput>,
+        degree: usize,
+        closed: bool,
+    },
+    ControlVertexSpline {
+        control_points: Vec<PointInput>,
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+        closed: bool,
+    },
 }
 
 impl SketchRecipe {
@@ -454,6 +466,16 @@ impl SketchRecipe {
                 push(second_cap_center);
             }
             Self::CircularPattern { center, .. } => push(center),
+            Self::FitPointSpline { fit_points, .. } => {
+                for pt in fit_points {
+                    push(pt);
+                }
+            }
+            Self::ControlVertexSpline { control_points, .. } => {
+                for pt in control_points {
+                    push(pt);
+                }
+            }
             Self::RectangularPattern { .. }
             | Self::Fillet { .. }
             | Self::FilletWithHints { .. }

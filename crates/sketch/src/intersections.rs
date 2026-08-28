@@ -257,17 +257,17 @@ pub fn intersect_curves(
     }
     if !first
         .bounds()
-        .expanded(linear_tolerance(precision, first, second))
+        .expanded(linear_tolerance(precision, &first, &second))
         .intersects(
             second
                 .bounds()
-                .expanded(linear_tolerance(precision, first, second)),
+                .expanded(linear_tolerance(precision, &first, &second)),
         )
     {
         return CurveIntersections::Disjoint;
     }
 
-    let mut result = match (first, second) {
+    let mut result = match (&first, &second) {
         (
             EvaluatedCurve2::Line {
                 start: first_start,
@@ -277,19 +277,125 @@ pub fn intersect_curves(
                 start: second_start,
                 end: second_end,
             },
-        ) => intersect_line_line(first_start, first_end, second_start, second_end, precision),
-        (EvaluatedCurve2::Line { start, end }, circular) => {
-            intersect_line_circular(start, end, circular, precision)
+        ) => intersect_line_line(*first_start, *first_end, *second_start, *second_end, precision),
+        (EvaluatedCurve2::Line { start, end }, circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. })) => {
+            intersect_line_circular(*start, *end, circular.clone(), precision)
         }
-        (circular, EvaluatedCurve2::Line { start, end }) => {
-            intersect_line_circular(start, end, circular, precision).reversed()
+        (circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }), EvaluatedCurve2::Line { start, end }) => {
+            intersect_line_circular(*start, *end, circular.clone(), precision).reversed()
         }
-        (first_circular, second_circular) => {
-            intersect_circular_circular(first_circular, second_circular, precision)
-        }
+        (
+            first_circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
+            second_circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
+        ) => intersect_circular_circular(first_circular.clone(), second_circular.clone(), precision),
+        _ => intersect_general_curves(&first, &second, precision),
     };
     canonicalize_points(&mut result, precision);
     result
+}
+
+fn intersect_general_curves(
+    first: &EvaluatedCurve2,
+    second: &EvaluatedCurve2,
+    precision: &PrecisionPolicy,
+) -> CurveIntersections {
+    let n_samples = 32;
+    let m_samples = 32;
+    let mut intersections = Vec::new();
+
+    for i in 0..n_samples {
+        let t1_start = i as f64 / n_samples as f64;
+        let t1_end = (i + 1) as f64 / n_samples as f64;
+        let Ok(p1_start) = first.evaluate(t1_start) else { continue };
+        let Ok(p1_end) = first.evaluate(t1_end) else { continue };
+
+        for j in 0..m_samples {
+            let t2_start = j as f64 / m_samples as f64;
+            let t2_end = (j + 1) as f64 / m_samples as f64;
+            let Ok(p2_start) = second.evaluate(t2_start) else { continue };
+            let Ok(p2_end) = second.evaluate(t2_end) else { continue };
+
+            let tol = precision.linear_agreement;
+            let b1 = crate::geometry::Aabb2::from_points(p1_start, p1_end).expanded(tol);
+            let b2 = crate::geometry::Aabb2::from_points(p2_start, p2_end).expanded(tol);
+            if !b1.intersects(b2) {
+                continue;
+            }
+
+            let v1 = p1_end - p1_start;
+            let v2 = p2_end - p2_start;
+            let denom = v1.cross(v2);
+            if denom.abs() < 1.0e-12 {
+                continue;
+            }
+            let s1 = (p2_start - p1_start).cross(v2) / denom;
+            let s2 = (p2_start - p1_start).cross(v1) / denom;
+            if !(0.0..=1.0).contains(&s1) || !(0.0..=1.0).contains(&s2) {
+                continue;
+            }
+
+            let mut u = t1_start + s1 * (t1_end - t1_start);
+            let mut v = t2_start + s2 * (t2_end - t2_start);
+
+            for _ in 0..10 {
+                let Ok(pt1) = first.evaluate(u) else { break };
+                let Ok(pt2) = second.evaluate(v) else { break };
+                let delta = pt1 - pt2;
+                if delta.length() < precision.linear_agreement {
+                    break;
+                }
+                let Ok(tan1) = first.tangent(u) else { break };
+                let Ok(tan2) = second.tangent(v) else { break };
+                let det = -tan1.u * tan2.v + tan1.v * tan2.u;
+                if det.abs() < 1.0e-14 {
+                    break;
+                }
+                let du = (-tan2.v * delta.u + tan2.u * delta.v) / det;
+                let dv = (-tan1.v * delta.u + tan1.u * delta.v) / det;
+                u = (u - du).clamp(0.0, 1.0);
+                v = (v - dv).clamp(0.0, 1.0);
+            }
+
+            let Ok(final_pt1) = first.evaluate(u) else { continue };
+            let Ok(final_pt2) = second.evaluate(v) else { continue };
+            if final_pt1.distance(final_pt2) <= precision.linear_agreement * 2.0 {
+                let point = final_pt1;
+                if !intersections.iter().any(|ix: &CurveIntersection| {
+                    (ix.first_parameter - u).abs() < 1.0e-4 && (ix.second_parameter - v).abs() < 1.0e-4
+                }) {
+                    let is_tangent = if let (Ok(t1), Ok(t2)) = (first.tangent(u), second.tangent(v)) {
+                        if let (Some(n1), Some(n2)) = (t1.normalized(), t2.normalized()) {
+                            n1.cross(n2).abs() < 1.0e-3
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    intersections.push(CurveIntersection {
+                        point,
+                        first_parameter: u,
+                        second_parameter: v,
+                        class: contact_class(
+                            u,
+                            v,
+                            is_tangent,
+                            first.is_periodic(),
+                            second.is_periodic(),
+                            precision,
+                        ),
+                        is_tangent,
+                    });
+                }
+            }
+        }
+    }
+
+    if intersections.is_empty() {
+        CurveIntersections::Disjoint
+    } else {
+        CurveIntersections::Points { intersections }
+    }
 }
 
 fn intersect_line_line(
@@ -493,7 +599,7 @@ fn intersect_line_circular(
         }
         let line_parameter = snap_unit(root, parameter_tolerance);
         let point = line_start + direction * line_parameter;
-        let Some(circular_parameter) = parameter_on_circular(circular, point, precision) else {
+        let Some(circular_parameter) = parameter_on_circular(&circular, point, precision) else {
             continue;
         };
         intersections.push(CurveIntersection {
@@ -640,10 +746,10 @@ fn intersect_circular_circular(
 
     let mut intersections = Vec::new();
     for point in candidates {
-        let Some(first_parameter) = parameter_on_circular(first, point, precision) else {
+        let Some(first_parameter) = parameter_on_circular(&first, point, precision) else {
             continue;
         };
-        let Some(second_parameter) = parameter_on_circular(second, point, precision) else {
+        let Some(second_parameter) = parameter_on_circular(&second, point, precision) else {
             continue;
         };
         intersections.push(CurveIntersection {
@@ -674,23 +780,21 @@ fn coincident_circular_overlap(
     }
 
     // Build intervals by cutting the shared carrier at both arcs' endpoints.
-    // Midpoint membership identifies every overlap component exactly; no
-    // tessellation or screen-space tolerance enters the result.
     let mut first_cuts = vec![0.0, 1.0];
     let mut second_cuts = vec![0.0, 1.0];
     if let Some((start, end)) = second.endpoints() {
-        if let Some(parameter) = parameter_on_circular(first, start, precision) {
+        if let Some(parameter) = parameter_on_circular(&first, start, precision) {
             first_cuts.push(parameter);
         }
-        if let Some(parameter) = parameter_on_circular(first, end, precision) {
+        if let Some(parameter) = parameter_on_circular(&first, end, precision) {
             first_cuts.push(parameter);
         }
     }
     if let Some((start, end)) = first.endpoints() {
-        if let Some(parameter) = parameter_on_circular(second, start, precision) {
+        if let Some(parameter) = parameter_on_circular(&second, start, precision) {
             second_cuts.push(parameter);
         }
-        if let Some(parameter) = parameter_on_circular(second, end, precision) {
+        if let Some(parameter) = parameter_on_circular(&second, end, precision) {
             second_cuts.push(parameter);
         }
     }
@@ -711,18 +815,18 @@ fn coincident_circular_overlap(
         let Ok(point) = first.evaluate(eval_parameter) else {
             continue;
         };
-        let Some(second_midpoint) = parameter_on_circular(second, point, precision) else {
+        let Some(second_midpoint) = parameter_on_circular(&second, point, precision) else {
             continue;
         };
-        let start_point = evaluate_allow_seam(first, pair[0]);
-        let end_point = evaluate_allow_seam(first, pair[1]);
+        let start_point = evaluate_allow_seam(&first, pair[0]);
+        let end_point = evaluate_allow_seam(&first, pair[1]);
         let (Ok(start_point), Ok(end_point)) = (start_point, end_point) else {
             continue;
         };
-        let Some(second_start) = parameter_on_circular(second, start_point, precision) else {
+        let Some(second_start) = parameter_on_circular(&second, start_point, precision) else {
             continue;
         };
-        let Some(second_end) = parameter_on_circular(second, end_point, precision) else {
+        let Some(second_end) = parameter_on_circular(&second, end_point, precision) else {
             continue;
         };
         if second_midpoint >= -precision.parameter_resolution
@@ -739,7 +843,7 @@ fn coincident_circular_overlap(
         let mut points = Vec::new();
         if let Some((start, end)) = first.endpoints() {
             for (parameter, point) in [(0.0, start), (1.0, end)] {
-                if let Some(other_parameter) = parameter_on_circular(second, point, precision) {
+                if let Some(other_parameter) = parameter_on_circular(&second, point, precision) {
                     points.push(CurveIntersection {
                         point,
                         first_parameter: parameter,
@@ -764,7 +868,7 @@ fn coincident_circular_overlap(
 }
 
 fn parameter_on_circular(
-    curve: EvaluatedCurve2,
+    curve: &EvaluatedCurve2,
     point: SketchPoint2,
     precision: &PrecisionPolicy,
 ) -> Option<f64> {
@@ -772,8 +876,8 @@ fn parameter_on_circular(
         EvaluatedCurve2::Circle {
             center, direction, ..
         } => Some(parameter_for_circle_angle(
-            angle_of(point - center),
-            direction,
+            angle_of(point - *center),
+            *direction,
         )),
         EvaluatedCurve2::CircularArc {
             center,
@@ -781,15 +885,15 @@ fn parameter_on_circular(
             end,
             direction,
         } => {
-            let start_angle = angle_of(start - center);
-            let end_angle = angle_of(end - center);
-            let angle = angle_of(point - center);
-            let radius = center.distance(start).max(precision.min_feature_size);
+            let start_angle = angle_of(*start - *center);
+            let end_angle = angle_of(*end - *center);
+            let angle = angle_of(point - *center);
+            let radius = center.distance(*start).max(precision.min_feature_size);
             let angular_tolerance = precision
                 .angular_agreement_radians
                 .max(precision.modeling_resolution / radius);
-            if angle_on_directed_arc(angle, start_angle, end_angle, direction, angular_tolerance) {
-                let parameter = parameter_for_arc_angle(angle, start_angle, end_angle, direction);
+            if angle_on_directed_arc(angle, start_angle, end_angle, *direction, angular_tolerance) {
+                let parameter = parameter_for_arc_angle(angle, start_angle, end_angle, *direction);
                 Some(snap_unit(
                     parameter,
                     precision.parameter_resolution.max(f64::EPSILON * 64.0),
@@ -798,12 +902,12 @@ fn parameter_on_circular(
                 None
             }
         }
-        EvaluatedCurve2::Line { .. } => None,
+        EvaluatedCurve2::Line { .. } | EvaluatedCurve2::Bspline { .. } => None,
     }
 }
 
 fn evaluate_allow_seam(
-    curve: EvaluatedCurve2,
+    curve: &EvaluatedCurve2,
     parameter: f64,
 ) -> Result<SketchPoint2, crate::CurveGeometryError> {
     curve.evaluate(if curve.is_periodic() && parameter == 1.0 {
@@ -868,8 +972,8 @@ fn sort_dedup_parameters(parameters: &mut Vec<f64>, tolerance: f64) {
 
 fn linear_tolerance(
     precision: &PrecisionPolicy,
-    first: EvaluatedCurve2,
-    second: EvaluatedCurve2,
+    first: &EvaluatedCurve2,
+    second: &EvaluatedCurve2,
 ) -> f64 {
     let first_bounds = first.bounds();
     let second_bounds = second.bounds();
@@ -987,7 +1091,7 @@ mod tests {
         let precision = PrecisionPolicy::default();
         let first = line((-2.0, 0.0), (2.0, 0.0));
         let second = circle((0.0, 0.0), 1.0);
-        let forward = intersect_curves(first, second, &precision);
+        let forward = intersect_curves(first.clone(), second.clone(), &precision);
         let reverse = intersect_curves(second, first, &precision).reversed();
         assert_eq!(forward, reverse);
         assert_eq!(forward.unique_points().len(), 2);

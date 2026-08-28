@@ -12,7 +12,7 @@ use crate::{
     JunctionKey, SketchEntityId, SketchPoint2, SketchPointId, intersect_entities,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ArrangementInputCurve {
     pub entity: SketchEntityId,
     pub curve: EvaluatedCurve2,
@@ -494,13 +494,13 @@ pub fn build_arrangement_with_pool(
             if invalid_curves.contains(&first_index) || invalid_curves.contains(&second_index) {
                 return None;
             }
-            let first = curves[first_index];
-            let second = curves[second_index];
+            let first = &curves[first_index];
+            let second = &curves[second_index];
             Some(intersect_entities(
                 first.entity,
-                first.curve,
+                first.curve.clone(),
                 second.entity,
-                second.curve,
+                second.curve.clone(),
                 precision,
             ))
         },
@@ -511,8 +511,8 @@ pub fn build_arrangement_with_pool(
         let Some(intersections) = intersections else {
             continue;
         };
-        let first = curves[first_index];
-        let second = curves[second_index];
+        let first = &curves[first_index];
+        let second = &curves[second_index];
         match &intersections.result {
             CurveIntersections::Disjoint => {}
             CurveIntersections::Points {
@@ -646,11 +646,11 @@ pub fn build_arrangement_with_pool(
         }
         let events = &events_by_curve[curve_index];
         if input.curve.is_periodic() && events.is_empty() {
-            unsplit_circles.push(*input);
+            unsplit_circles.push(input.clone());
             continue;
         }
         add_curve_fragments(
-            *input,
+            input,
             events,
             &arrangement.junctions,
             precision,
@@ -690,18 +690,19 @@ pub fn build_arrangement_with_pool(
             direction: FragmentDirection::Forward,
             sense: None,
         };
-        let curve = match input.curve {
+        let curve = match &input.curve {
             EvaluatedCurve2::Circle {
                 direction: CurveDirection::CounterClockwise,
                 ..
-            } => input.curve,
+            } => input.curve.clone(),
             _ => input.curve.reverse(),
         };
+        let area = curve.signed_area_contribution();
         positive_loops.push(ArrangementLoop {
             half_edges: Vec::new(),
             curves: vec![curve],
             fragment_keys: vec![key],
-            signed_area: curve.signed_area_contribution(),
+            signed_area: area,
         });
     }
 
@@ -858,7 +859,7 @@ fn cluster_events(
 }
 
 fn add_curve_fragments(
-    input: ArrangementInputCurve,
+    input: &ArrangementInputCurve,
     events: &[CurveEvent],
     junctions: &[ArrangementJunction],
     precision: &PrecisionPolicy,
@@ -872,12 +873,12 @@ fn add_curve_fragments(
             let start = &events[index];
             let end = &events[(index + 1) % events.len()];
             let wraps = index + 1 == events.len();
-            let curve = periodic_fragment(input.curve, start.parameter, end.parameter, wraps);
+            let curve = periodic_fragment(&input.curve, start.parameter, end.parameter, wraps);
             if let Ok(curve) = curve {
-                let sense = match curve {
+                let sense = match &curve {
                     EvaluatedCurve2::CircularArc { direction, .. }
-                    | EvaluatedCurve2::Circle { direction, .. } => Some(direction),
-                    EvaluatedCurve2::Line { .. } => None,
+                    | EvaluatedCurve2::Circle { direction, .. } => Some(*direction),
+                    EvaluatedCurve2::Line { .. } | EvaluatedCurve2::Bspline { .. } => None,
                 };
                 push_fragment(
                     input.entity,
@@ -914,7 +915,7 @@ fn add_curve_fragments(
 }
 
 fn periodic_fragment(
-    circle: EvaluatedCurve2,
+    circle: &EvaluatedCurve2,
     start_parameter: f64,
     end_parameter: f64,
     wraps: bool,
@@ -931,10 +932,10 @@ fn periodic_fragment(
         unreachable!("periodic sketch curve is a circle");
     };
     Ok(EvaluatedCurve2::CircularArc {
-        center,
+        center: *center,
         start,
         end,
-        direction,
+        direction: *direction,
     })
 }
 
@@ -999,7 +1000,7 @@ fn retarget_endpoints(
             end,
             direction,
         },
-        EvaluatedCurve2::Circle { .. } => curve,
+        EvaluatedCurve2::Circle { .. } | EvaluatedCurve2::Bspline { .. } => curve,
     }
 }
 
@@ -1014,7 +1015,7 @@ fn build_half_edges(fragments: &[ArrangementFragment]) -> Vec<ArrangementHalfEdg
             destination: fragment.end_junction,
             twin: reverse_index,
             next: None,
-            curve: fragment.curve,
+            curve: fragment.curve.clone(),
             key: fragment.key.clone(),
         });
         half_edges.push(ArrangementHalfEdge {
@@ -1150,7 +1151,7 @@ fn departure_angle(edge: &ArrangementHalfEdge) -> f64 {
 /// Signed curvature at the departure: positive bends left (counter-clockwise),
 /// negative bends right, zero for a straight carrier.
 fn signed_curvature(edge: &ArrangementHalfEdge) -> f64 {
-    match edge.curve {
+    match &edge.curve {
         EvaluatedCurve2::Line { .. } => 0.0,
         EvaluatedCurve2::CircularArc { direction, .. }
         | EvaluatedCurve2::Circle { direction, .. } => {
@@ -1163,6 +1164,7 @@ fn signed_curvature(edge: &ArrangementHalfEdge) -> f64 {
                 CurveDirection::Clockwise => -1.0 / radius,
             }
         }
+        EvaluatedCurve2::Bspline { .. } => edge.curve.curvature(0.0).unwrap_or(0.0),
     }
 }
 
@@ -1212,12 +1214,12 @@ fn walk_positive_loops(
                 (
                     *index,
                     half_edges[*index].key.clone(),
-                    half_edges[*index].curve,
+                    half_edges[*index].curve.clone(),
                 )
             })
             .collect();
         remove_bridge_backtracks(&mut boundary_uses);
-        let curves: Vec<_> = boundary_uses.iter().map(|(_, _, curve)| *curve).collect();
+        let curves: Vec<_> = boundary_uses.iter().map(|(_, _, curve)| curve.clone()).collect();
         let signed_area: f64 = curves
             .iter()
             .map(|curve| curve.signed_area_contribution())
@@ -1391,7 +1393,7 @@ fn interior_sample(
     profile_loop: &ArrangementLoop,
     precision: &PrecisionPolicy,
 ) -> Option<SketchPoint2> {
-    let curve = *profile_loop.curves.first()?;
+    let curve = profile_loop.curves.first()?;
     let midpoint_parameter = if curve.is_periodic() { 0.125 } else { 0.5 };
     let point = curve.evaluate(midpoint_parameter).ok()?;
     let tangent = curve.tangent(midpoint_parameter).ok()?.normalized()?;
@@ -1429,7 +1431,7 @@ fn point_in_loop(
     let mut parameters = Vec::new();
     for curve in &profile_loop.curves {
         if let CurveIntersections::Points { intersections } =
-            crate::intersect_curves(ray, *curve, precision)
+            crate::intersect_curves(ray.clone(), curve.clone(), precision)
         {
             for intersection in intersections {
                 if intersection.first_parameter > precision.parameter_resolution {

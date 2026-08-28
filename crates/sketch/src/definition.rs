@@ -54,6 +54,8 @@ pub enum PointOutputRole {
     /// The selected source-carrier intersection retained as an endpoint when
     /// a full circle is split into an exact circular arc by a fillet.
     FilletCorner,
+    ControlPoint(u16),
+    FitPoint(u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -64,6 +66,7 @@ pub enum CurveOutputRole {
     Side(u16),
     Rail(u8),
     Cap(u8),
+    Spline,
     ImportedCurve(u16),
     PatternCurve {
         instance: u16,
@@ -480,6 +483,23 @@ impl SketchDefinition {
                 radius,
                 direction,
             },
+            SketchCurve2::Bspline {
+                ref control_points,
+                degree,
+                ref knots,
+                ref weights,
+            } => {
+                let mut evaluated_cps = Vec::with_capacity(control_points.len());
+                for &cp in control_points {
+                    evaluated_cps.push(point(cp)?);
+                }
+                crate::EvaluatedCurve2::Bspline {
+                    control_points: evaluated_cps,
+                    degree,
+                    knots: knots.clone(),
+                    weights: weights.clone(),
+                }
+            }
         })
     }
 
@@ -497,6 +517,12 @@ impl SketchDefinition {
                     SketchCurve2::Line { start, end }
                     | SketchCurve2::CircularArc { start, end, .. } => (Some(start), Some(end)),
                     SketchCurve2::Circle { .. } => (None, None),
+                    SketchCurve2::Bspline {
+                        ref control_points, ..
+                    } => (
+                        control_points.first().copied(),
+                        control_points.last().copied(),
+                    ),
                 };
                 Ok(crate::ArrangementInputCurve {
                     entity: entity.id,
@@ -855,6 +881,32 @@ impl SketchDefinition {
                     return Err(SketchValidationError::FeatureTooSmall {
                         operation: entity.provenance.operation,
                     });
+                }
+            }
+            SketchCurve2::Bspline {
+                ref control_points,
+                degree,
+                ref knots,
+                ref weights,
+            } => {
+                if control_points.len() <= degree || degree == 0 {
+                    return Err(SketchValidationError::FeatureTooSmall {
+                        operation: entity.provenance.operation,
+                    });
+                }
+                for &cp in control_points {
+                    let _ = validate_reference(cp)?;
+                }
+                if knots.len() != control_points.len() + degree + 1 {
+                    return Err(SketchValidationError::FeatureTooSmall {
+                        operation: entity.provenance.operation,
+                    });
+                }
+                if let Some(w) = weights
+                    && (w.len() != control_points.len()
+                        || w.iter().any(|v| !v.is_finite() || *v <= 0.0))
+                {
+                    return Err(SketchValidationError::NonFiniteValue);
                 }
             }
         }
