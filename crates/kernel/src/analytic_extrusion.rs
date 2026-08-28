@@ -527,6 +527,9 @@ pub(crate) fn parse_loop(
                 }
             }
             PlanarCurve2::Circle { .. } => unreachable!(),
+            PlanarCurve2::Bspline { .. } => {
+                return Err(PlanarProfileInputError::AnalyticCurve);
+            }
         };
         segments.push(segment);
     }

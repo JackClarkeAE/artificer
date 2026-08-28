@@ -891,7 +891,7 @@ pub enum ArcDirection {
 /// A circular arc uses the unique non-zero sweep below one full revolution in
 /// `direction` from `start` to `end`. A complete circle is represented
 /// separately so coincident arc endpoints never carry ambiguous intent.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PlanarCurve2 {
     Line {
@@ -910,17 +910,35 @@ pub enum PlanarCurve2 {
         radius: f64,
         direction: ArcDirection,
     },
+    Bspline {
+        degree: usize,
+        control_points: Vec<Point2>,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+    },
 }
 
 impl PlanarCurve2 {
     #[must_use]
-    pub fn is_finite(self) -> bool {
+    pub fn is_finite(&self) -> bool {
         match self {
             Self::Line { start, end } => start.is_finite() && end.is_finite(),
             Self::CircularArc {
                 center, start, end, ..
             } => center.is_finite() && start.is_finite() && end.is_finite(),
             Self::Circle { center, radius, .. } => center.is_finite() && radius.is_finite(),
+            Self::Bspline {
+                control_points,
+                knots,
+                weights,
+                ..
+            } => {
+                control_points.iter().all(|pt| pt.is_finite())
+                    && knots.iter().all(|k| k.is_finite())
+                    && weights
+                        .as_ref()
+                        .is_none_or(|w| w.iter().all(|val| val.is_finite() && *val > 0.0))
+            }
         }
     }
 }
@@ -2424,5 +2442,19 @@ mod tests {
             serde_json::from_value::<KernelError>(encoded).unwrap(),
             error
         );
+    }
+
+    #[test]
+    fn bspline_planar_curve_serializes_and_validates_finiteness() {
+        let bspline = PlanarCurve2::Bspline {
+            degree: 2,
+            control_points: vec![Point2::new(0.0, 0.0), Point2::new(1.0, 2.0), Point2::new(2.0, 0.0)],
+            knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            weights: Some(vec![1.0, 2.0_f64.sqrt() / 2.0, 1.0]),
+        };
+        assert!(bspline.is_finite());
+        let encoded = serde_json::to_value(&bspline).unwrap();
+        assert_eq!(encoded["type"], json!("bspline"));
+        assert_eq!(serde_json::from_value::<PlanarCurve2>(encoded).unwrap(), bspline);
     }
 }

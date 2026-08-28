@@ -229,7 +229,9 @@ fn linear_loop_vertices(
         .iter()
         .map(|curve| match *curve {
             PlanarCurve2::Line { start, end } => Ok((start, end)),
-            PlanarCurve2::CircularArc { .. } | PlanarCurve2::Circle { .. } => {
+            PlanarCurve2::CircularArc { .. }
+            | PlanarCurve2::Circle { .. }
+            | PlanarCurve2::Bspline { .. } => {
                 Err(PlanarProfileInputError::AnalyticCurve)
             }
         })

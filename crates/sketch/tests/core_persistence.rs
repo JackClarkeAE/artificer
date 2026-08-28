@@ -174,7 +174,7 @@ fn legacy_import_reuses_identical_boundary_points_for_exact_connectivity() {
     assert_eq!(sketch.active_points().count(), 3);
     let curves = sketch
         .active_entities()
-        .map(|entity| entity.geometry)
+        .map(|entity| entity.geometry.clone())
         .collect::<Vec<_>>();
     let SketchCurve2::Line { start: first, .. } = curves[0] else {
         panic!("line")

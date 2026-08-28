@@ -83,10 +83,10 @@ pub fn reflected_profile_across_u(mut profile: PlanarProfile2) -> PlanarProfile2
         .flat_map(|region| std::iter::once(&mut region.outer).chain(&mut region.holes))
         .flat_map(|profile_loop| &mut profile_loop.curves)
     {
-        *curve = match *curve {
+        let reflected = match curve {
             PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
-                start: reflect_profile_point(start),
-                end: reflect_profile_point(end),
+                start: reflect_profile_point(*start),
+                end: reflect_profile_point(*end),
             },
             PlanarCurve2::CircularArc {
                 center,
@@ -94,21 +94,33 @@ pub fn reflected_profile_across_u(mut profile: PlanarProfile2) -> PlanarProfile2
                 end,
                 direction,
             } => PlanarCurve2::CircularArc {
-                center: reflect_profile_point(center),
-                start: reflect_profile_point(start),
-                end: reflect_profile_point(end),
-                direction: reverse_arc_direction(direction),
+                center: reflect_profile_point(*center),
+                start: reflect_profile_point(*start),
+                end: reflect_profile_point(*end),
+                direction: reverse_arc_direction(*direction),
             },
             PlanarCurve2::Circle {
                 center,
                 radius,
                 direction,
             } => PlanarCurve2::Circle {
-                center: reflect_profile_point(center),
-                radius,
-                direction: reverse_arc_direction(direction),
+                center: reflect_profile_point(*center),
+                radius: *radius,
+                direction: reverse_arc_direction(*direction),
+            },
+            PlanarCurve2::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => PlanarCurve2::Bspline {
+                control_points: control_points.iter().map(|p| reflect_profile_point(*p)).collect(),
+                degree: *degree,
+                knots: knots.clone(),
+                weights: weights.clone(),
             },
         };
+        *curve = reflected;
     }
     profile
 }

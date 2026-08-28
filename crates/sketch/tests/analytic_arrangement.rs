@@ -42,6 +42,9 @@ fn planar_endpoints(curve: PlanarCurve2) -> Option<(Point2, Point2)> {
         PlanarCurve2::Line { start, end } | PlanarCurve2::CircularArc { start, end, .. } => {
             Some((start, end))
         }
+        PlanarCurve2::Bspline { control_points, .. } => {
+            Some((control_points[0], *control_points.last().unwrap()))
+        }
         PlanarCurve2::Circle { .. } => None,
     }
 }
@@ -163,9 +166,9 @@ fn semicircle_and_diameter_compile_with_bitwise_connected_authored_endpoints() {
     let output = &profile.regions[0].outer.curves;
     assert_eq!(output.len(), 2);
     for index in 0..output.len() {
-        let (_, end) = planar_endpoints(output[index]).expect("nonperiodic curve");
+        let (_, end) = planar_endpoints(output[index].clone()).expect("nonperiodic curve");
         let (next_start, _) =
-            planar_endpoints(output[(index + 1) % output.len()]).expect("nonperiodic curve");
+            planar_endpoints(output[(index + 1) % output.len()].clone()).expect("nonperiodic curve");
         assert_eq!(end.x.to_bits(), next_start.x.to_bits());
         assert_eq!(end.y.to_bits(), next_start.y.to_bits());
     }

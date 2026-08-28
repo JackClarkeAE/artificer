@@ -121,13 +121,13 @@ fn rectangular_pattern_selection_order_is_canonical_by_stable_id() {
         .preview()
         .active_entities()
         .skip(2)
-        .map(|entity| entity.geometry)
+        .map(|entity| entity.geometry.clone())
         .collect::<Vec<_>>();
     let reversed_curves = reversed
         .preview()
         .active_entities()
         .skip(2)
-        .map(|entity| entity.geometry)
+        .map(|entity| entity.geometry.clone())
         .collect::<Vec<_>>();
     assert_eq!(forward_curves, reversed_curves);
 }

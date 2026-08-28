@@ -133,7 +133,7 @@ pub fn query_snap_candidates(
     let mut candidates = Vec::new();
 
     for (entity, curve) in &nearby {
-        match entity.geometry {
+        match &entity.geometry {
             SketchCurve2::Line { start, end } | SketchCurve2::CircularArc { start, end, .. } => {
                 let Some((start_position, end_position)) = curve.endpoints() else {
                     continue;
@@ -142,7 +142,7 @@ pub fn query_snap_candidates(
                     &mut candidates,
                     SketchSnapKey::Endpoint {
                         entity: entity.id,
-                        point: start,
+                        point: *start,
                     },
                     start_position,
                     pointer,
@@ -152,12 +152,41 @@ pub fn query_snap_candidates(
                     &mut candidates,
                     SketchSnapKey::Endpoint {
                         entity: entity.id,
-                        point: end,
+                        point: *end,
                     },
                     end_position,
                     pointer,
                     radius_squared,
                 );
+            }
+            SketchCurve2::Bspline { control_points, .. } => {
+                let Some((start_position, end_position)) = curve.endpoints() else {
+                    continue;
+                };
+                if let Some(&first_pt) = control_points.first() {
+                    push_candidate(
+                        &mut candidates,
+                        SketchSnapKey::Endpoint {
+                            entity: entity.id,
+                            point: first_pt,
+                        },
+                        start_position,
+                        pointer,
+                        radius_squared,
+                    );
+                }
+                if let Some(&last_pt) = control_points.last() {
+                    push_candidate(
+                        &mut candidates,
+                        SketchSnapKey::Endpoint {
+                            entity: entity.id,
+                            point: last_pt,
+                        },
+                        end_position,
+                        pointer,
+                        radius_squared,
+                    );
+                }
             }
             SketchCurve2::Circle { .. } => {}
         }
@@ -217,13 +246,13 @@ pub fn query_snap_candidates(
 
     for first_index in 0..nearby.len() {
         for second_index in first_index + 1..nearby.len() {
-            let (first_entity, first_curve) = nearby[first_index];
-            let (second_entity, second_curve) = nearby[second_index];
+            let (first_entity, first_curve) = &nearby[first_index];
+            let (second_entity, second_curve) = &nearby[second_index];
             let intersections = intersect_entities(
                 first_entity.id,
-                first_curve,
+                first_curve.clone(),
                 second_entity.id,
-                second_curve,
+                second_curve.clone(),
                 precision,
             );
             if let CurveIntersections::Points {

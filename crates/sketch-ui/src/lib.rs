@@ -1901,6 +1901,8 @@ fn selected_recipe_editor_for(
         | CoreRecipe::Polyline { .. }
         | CoreRecipe::TwoPointCircle { .. }
         | CoreRecipe::CentreStartEndArc { .. }
+        | CoreRecipe::FitPointSpline { .. }
+        | CoreRecipe::ControlVertexSpline { .. }
         | CoreRecipe::Trim { .. } => (
             "Authored sketch feature",
             Vec::new(),
@@ -2228,6 +2230,8 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         | CoreRecipe::Polyline { .. }
         | CoreRecipe::TwoPointCircle { .. }
         | CoreRecipe::CentreStartEndArc { .. }
+        | CoreRecipe::FitPointSpline { .. }
+        | CoreRecipe::ControlVertexSpline { .. }
         | CoreRecipe::Trim { .. } => {}
     }
     Ok(recipe)
@@ -3937,6 +3941,11 @@ fn legacy_geometry_from_core(curve: CoreEvaluatedCurve2) -> SketchGeometry {
             let center = point(center);
             SketchGeometry::circle(center, SketchPoint::new(center.u + radius, center.v))
         }
+        CoreEvaluatedCurve2::Bspline { control_points, .. } => {
+            let start = control_points.first().map(|p| point(*p)).unwrap_or_default();
+            let end = control_points.last().map(|p| point(*p)).unwrap_or_default();
+            SketchGeometry::segment(start, end)
+        }
     }
 }
 
@@ -5372,9 +5381,14 @@ impl SketchCanvasState {
             | ToolVariant::DistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
-            | ToolVariant::EqualLengthRelation => SketchTool::Select,
+            | ToolVariant::EqualLengthRelation
+            | ToolVariant::TangentRelation
+            | ToolVariant::CollinearRelation => SketchTool::Select,
             ToolVariant::Point => SketchTool::Point,
-            ToolVariant::SingleLine | ToolVariant::ChainedPolyline => SketchTool::Line,
+            ToolVariant::SingleLine
+            | ToolVariant::ChainedPolyline
+            | ToolVariant::FitPointSpline
+            | ToolVariant::ControlVertexSpline => SketchTool::Line,
             ToolVariant::Centreline => SketchTool::CentreLine,
             ToolVariant::TwoPointRectangle | ToolVariant::CentrePointRectangle => {
                 SketchTool::Rectangle
@@ -7536,7 +7550,11 @@ impl SketchCanvasState {
             | ToolVariant::DistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
-            | ToolVariant::EqualLengthRelation => None,
+            | ToolVariant::EqualLengthRelation
+            | ToolVariant::TangentRelation
+            | ToolVariant::CollinearRelation
+            | ToolVariant::FitPointSpline
+            | ToolVariant::ControlVertexSpline => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
             ToolVariant::SingleLine => {
                 if let Some(start) = self.creation_anchor.take() {
@@ -7875,7 +7893,7 @@ impl SketchCanvasState {
     }
 
     fn update_trim_hover(&mut self, point: Option<SketchPoint>, pick_radius: f64) -> bool {
-        let previous = self.trim_hover_fragment;
+        let previous = self.trim_hover_fragment.clone();
         let next = point.and_then(|point| {
             if self.exact_tool != ToolVariant::Trim {
                 return None;
@@ -7925,7 +7943,7 @@ impl SketchCanvasState {
             .ok()
             .map(|selection| selection.removed.curve)
         });
-        self.trim_hover_fragment = next;
+        self.trim_hover_fragment = next.clone();
         previous != next
     }
 
@@ -8207,7 +8225,9 @@ impl SketchCanvasState {
         }
         match record.geometry {
             CoreCurve2::Line { start, end } => Ok((start, end)),
-            CoreCurve2::CircularArc { .. } | CoreCurve2::Circle { .. } => Err(
+            CoreCurve2::CircularArc { .. }
+            | CoreCurve2::Circle { .. }
+            | CoreCurve2::Bspline { .. } => Err(
                 "This relation applies to straight curves; pick a line or two endpoints."
                     .to_owned(),
             ),
@@ -8550,6 +8570,11 @@ impl SketchCanvasState {
                     include(end);
                 }
                 CoreEvaluatedCurve2::Circle { center, .. } => include(center),
+                CoreEvaluatedCurve2::Bspline { control_points, .. } => {
+                    for cp in control_points {
+                        include(cp);
+                    }
+                }
             }
         }
         (count > 0).then(|| SketchPoint::new(sum_u / f64::from(count), sum_v / f64::from(count)))
@@ -11305,14 +11330,14 @@ fn paint_modifier_sources(painter: &egui::Painter, rect: Rect, state: &SketchCan
 }
 
 fn paint_trim_hover(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
-    let Some(fragment) = state.trim_hover_fragment else {
+    let Some(ref fragment) = state.trim_hover_fragment else {
         return;
     };
     paint_geometry(
         painter,
         rect,
         state.view,
-        legacy_geometry_from_core(fragment),
+        legacy_geometry_from_core(fragment.clone()),
         Stroke::new(3.4, sketch_colours().trim_hover),
     );
 }
@@ -16516,7 +16541,7 @@ mod tests {
         assert!(state.set_exact_tool(ToolVariant::Trim));
         assert!(state.update_trim_hover(Some(SketchPoint::new(-1.0, 0.0)), 0.25));
         let CoreEvaluatedCurve2::Line { start, end } =
-            state.trim_hover_fragment.expect("middle line fragment")
+            state.trim_hover_fragment.clone().expect("middle line fragment")
         else {
             panic!("line trim hover must remain an exact line subcurve")
         };
@@ -16528,6 +16553,7 @@ mod tests {
         assert!(state.update_trim_hover(Some(SketchPoint::new(3.0, 0.0)), 0.25));
         let CoreEvaluatedCurve2::Line { start, end } = state
             .trim_hover_fragment
+            .clone()
             .expect("retained candidate's outer fragment")
         else {
             panic!("repeated trim hover must query the evolving candidate")

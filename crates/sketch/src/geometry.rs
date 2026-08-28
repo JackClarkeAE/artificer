@@ -7,6 +7,7 @@
 
 use std::f64::consts::{PI, TAU};
 
+use artificer_geometry::{BSplineCurve2, NurbsCurve2, ParametricCurve2, Point2 as GeomPoint2};
 use artificer_protocol::{
     ArcDirection as ProtocolArcDirection, PlanarCurve2, Point2 as ProtocolPoint2, PrecisionPolicy,
 };
@@ -171,7 +172,7 @@ impl std::ops::Neg for SketchVector2 {
 }
 
 /// Conservative Cartesian bounds for one analytic curve.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Aabb2 {
     pub min: SketchPoint2,
     pub max: SketchPoint2,
@@ -220,7 +221,7 @@ impl Aabb2 {
 
 /// Persisted exact curve intent. Endpoints and centres refer to authored point
 /// outputs rather than copying coordinates.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SketchCurve2 {
     Line {
@@ -238,18 +239,25 @@ pub enum SketchCurve2 {
         radius: f64,
         direction: CurveDirection,
     },
+    Bspline {
+        control_points: Vec<SketchPointId>,
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
+    },
 }
 
 impl SketchCurve2 {
     /// The points this curve is defined by, in deterministic order.
     #[must_use]
-    pub fn referenced_points(self) -> Vec<SketchPointId> {
+    pub fn referenced_points(&self) -> Vec<SketchPointId> {
         match self {
-            Self::Line { start, end } => vec![start, end],
+            Self::Line { start, end } => vec![*start, *end],
             Self::CircularArc {
                 center, start, end, ..
-            } => vec![center, start, end],
-            Self::Circle { center, .. } => vec![center],
+            } => vec![*center, *start, *end],
+            Self::Circle { center, .. } => vec![*center],
+            Self::Bspline { control_points, .. } => control_points.clone(),
         }
     }
 }
@@ -281,7 +289,7 @@ impl From<ProtocolArcDirection> for CurveDirection {
 }
 
 /// Resolved analytic curve for one evaluated sketch revision.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvaluatedCurve2 {
     Line {
@@ -298,6 +306,12 @@ pub enum EvaluatedCurve2 {
         center: SketchPoint2,
         radius: f64,
         direction: CurveDirection,
+    },
+    Bspline {
+        control_points: Vec<SketchPoint2>,
+        degree: usize,
+        knots: Vec<f64>,
+        weights: Option<Vec<f64>>,
     },
 }
 
@@ -342,13 +356,25 @@ pub enum CurveGeometryError {
 }
 
 impl EvaluatedCurve2 {
-    pub fn validate(self, precision: &PrecisionPolicy) -> Result<(), CurveGeometryError> {
+    pub fn validate(&self, precision: &PrecisionPolicy) -> Result<(), CurveGeometryError> {
         let finite = match self {
             Self::Line { start, end } => start.is_finite() && end.is_finite(),
             Self::CircularArc {
                 center, start, end, ..
             } => center.is_finite() && start.is_finite() && end.is_finite(),
             Self::Circle { center, radius, .. } => center.is_finite() && radius.is_finite(),
+            Self::Bspline {
+                control_points,
+                knots,
+                weights,
+                ..
+            } => {
+                control_points.iter().all(|pt| pt.is_finite())
+                    && knots.iter().all(|k| k.is_finite())
+                    && weights
+                        .as_ref()
+                        .is_none_or(|w| w.iter().all(|val| val.is_finite() && *val > 0.0))
+            }
         };
         if !finite {
             return Err(CurveGeometryError::NonFinite);
@@ -356,7 +382,7 @@ impl EvaluatedCurve2 {
 
         match self {
             Self::Line { start, end } => {
-                if start.distance(end) < precision.min_feature_size {
+                if start.distance(*end) < precision.min_feature_size {
                     Err(CurveGeometryError::Degenerate)
                 } else {
                     Ok(())
@@ -365,8 +391,8 @@ impl EvaluatedCurve2 {
             Self::CircularArc {
                 center, start, end, ..
             } => {
-                let first = center.distance(start);
-                let second = center.distance(end);
+                let first = center.distance(*start);
+                let second = center.distance(*end);
                 if first < precision.min_feature_size || start == end {
                     return Err(CurveGeometryError::Degenerate);
                 }
@@ -382,117 +408,251 @@ impl EvaluatedCurve2 {
                 }
             }
             Self::Circle { radius, .. } => {
-                if radius < precision.min_feature_size {
+                if *radius < precision.min_feature_size {
                     Err(CurveGeometryError::Degenerate)
                 } else {
                     Ok(())
                 }
             }
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                ..
+            } => {
+                if control_points.len() <= *degree || *degree == 0 {
+                    return Err(CurveGeometryError::Degenerate);
+                }
+                if knots.len() != control_points.len() + *degree + 1 {
+                    return Err(CurveGeometryError::Degenerate);
+                }
+                Ok(())
+            }
         }
     }
 
     #[must_use]
-    pub const fn is_periodic(self) -> bool {
+    pub const fn is_periodic(&self) -> bool {
         matches!(self, Self::Circle { .. })
     }
 
     #[must_use]
-    pub const fn parameter_domain(self) -> std::ops::RangeInclusive<f64> {
+    pub const fn parameter_domain(&self) -> std::ops::RangeInclusive<f64> {
         0.0..=1.0
     }
 
-    pub fn evaluate(self, parameter: f64) -> Result<SketchPoint2, CurveGeometryError> {
+    pub fn evaluate(&self, parameter: f64) -> Result<SketchPoint2, CurveGeometryError> {
         if !parameter.is_finite()
             || !(0.0..=1.0).contains(&parameter)
             || (self.is_periodic() && parameter == 1.0)
         {
             return Err(CurveGeometryError::ParameterOutsideDomain);
         }
-        // Non-periodic authored endpoints are authoritative topology. Avoid
-        // reconstructing them through interpolation or trigonometry: even a
-        // one-ulp drift can turn an exact shared point into an open profile at
-        // the sketch/compiler boundary.
-        if parameter == 0.0
-            && let Self::Line { start, .. } | Self::CircularArc { start, .. } = self
-        {
-            return Ok(start);
+        // Non-periodic authored endpoints are authoritative topology.
+        if parameter == 0.0 {
+            if let Self::Line { start, .. } | Self::CircularArc { start, .. } = self {
+                return Ok(*start);
+            }
+            if let Self::Bspline { control_points, .. } = self
+                && let Some(first) = control_points.first()
+            {
+                return Ok(*first);
+            }
         }
-        if parameter == 1.0
-            && let Self::Line { end, .. } | Self::CircularArc { end, .. } = self
-        {
-            return Ok(end);
+        if parameter == 1.0 {
+            if let Self::Line { end, .. } | Self::CircularArc { end, .. } = self {
+                return Ok(*end);
+            }
+            if let Self::Bspline { control_points, .. } = self
+                && let Some(last) = control_points.last()
+            {
+                return Ok(*last);
+            }
         }
-        Ok(match self {
-            Self::Line { start, end } => start + (end - start) * parameter,
+        match self {
+            Self::Line { start, end } => Ok(*start + (*end - *start) * parameter),
             Self::CircularArc {
                 center,
                 start,
                 end,
                 direction,
             } => {
-                let start_angle = angle_of(start - center);
-                let sweep = directed_sweep(start_angle, angle_of(end - center), direction);
-                point_on_circle(
-                    center,
-                    center.distance(start),
+                let start_angle = angle_of(*start - *center);
+                let sweep = directed_sweep(start_angle, angle_of(*end - *center), *direction);
+                Ok(point_on_circle(
+                    *center,
+                    center.distance(*start),
                     start_angle + sweep * parameter,
-                )
+                ))
             }
             Self::Circle {
                 center,
                 radius,
                 direction,
             } => {
-                let sign = direction_sign(direction);
-                point_on_circle(center, radius, sign * TAU * parameter)
+                let sign = direction_sign(*direction);
+                Ok(point_on_circle(*center, *radius, sign * TAU * parameter))
             }
-        })
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let pts = control_points
+                    .iter()
+                    .map(|p| GeomPoint2::new(p.u, p.v))
+                    .collect::<Vec<_>>();
+                let geom_knot_min = knots[*degree];
+                let geom_knot_max = knots[control_points.len()];
+                let geom_param = geom_knot_min + (geom_knot_max - geom_knot_min) * parameter;
+                let evaluated_pt = if let Some(w) = weights {
+                    let nurbs = NurbsCurve2::new(*degree, pts, w.clone(), knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    nurbs
+                        .evaluate(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)?
+                } else {
+                    let bspline = BSplineCurve2::new(*degree, pts, knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    bspline
+                        .evaluate(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)?
+                };
+                Ok(SketchPoint2::new(evaluated_pt.x, evaluated_pt.y))
+            }
+        }
     }
 
-    pub fn tangent(self, parameter: f64) -> Result<SketchVector2, CurveGeometryError> {
+    pub fn tangent(&self, parameter: f64) -> Result<SketchVector2, CurveGeometryError> {
         let point = self.evaluate(parameter)?;
-        Ok(match self {
-            Self::Line { start, end } => end - start,
+        match self {
+            Self::Line { start, end } => Ok(*end - *start),
             Self::CircularArc {
                 center, direction, ..
             }
             | Self::Circle {
                 center, direction, ..
-            } => (point - center).left_normal() * direction_sign(direction),
-        })
+            } => Ok((point - *center).left_normal() * direction_sign(*direction)),
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let pts = control_points
+                    .iter()
+                    .map(|p| GeomPoint2::new(p.u, p.v))
+                    .collect::<Vec<_>>();
+                let geom_knot_min = knots[*degree];
+                let geom_knot_max = knots[control_points.len()];
+                let geom_param = geom_knot_min + (geom_knot_max - geom_knot_min) * parameter;
+                let d = if let Some(w) = weights {
+                    let nurbs = NurbsCurve2::new(*degree, pts, w.clone(), knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    nurbs
+                        .derivative(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)?
+                } else {
+                    let bspline = BSplineCurve2::new(*degree, pts, knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    bspline
+                        .derivative(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)?
+                };
+                Ok(SketchVector2::new(d.x, d.y))
+            }
+        }
+    }
+
+    pub fn curvature(&self, parameter: f64) -> Result<f64, CurveGeometryError> {
+        match self {
+            Self::Line { .. } => Ok(0.0),
+            Self::CircularArc { center, start, .. } => {
+                let r = center.distance(*start);
+                if r <= 1.0e-14 {
+                    Err(CurveGeometryError::Degenerate)
+                } else {
+                    Ok(1.0 / r)
+                }
+            }
+            Self::Circle { radius, .. } => {
+                if *radius <= 1.0e-14 {
+                    Err(CurveGeometryError::Degenerate)
+                } else {
+                    Ok(1.0 / *radius)
+                }
+            }
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let pts = control_points
+                    .iter()
+                    .map(|p| GeomPoint2::new(p.u, p.v))
+                    .collect::<Vec<_>>();
+                let geom_knot_min = knots[*degree];
+                let geom_knot_max = knots[control_points.len()];
+                let geom_param = geom_knot_min + (geom_knot_max - geom_knot_min) * parameter;
+                if let Some(w) = weights {
+                    let nurbs = NurbsCurve2::new(*degree, pts, w.clone(), knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    nurbs
+                        .curvature(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)
+                } else {
+                    let bspline = BSplineCurve2::new(*degree, pts, knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    bspline
+                        .curvature(geom_param)
+                        .map_err(|_| CurveGeometryError::ParameterOutsideDomain)
+                }
+            }
+        }
     }
 
     #[must_use]
-    pub fn endpoints(self) -> Option<(SketchPoint2, SketchPoint2)> {
+    pub fn endpoints(&self) -> Option<(SketchPoint2, SketchPoint2)> {
         match self {
-            Self::Line { start, end } | Self::CircularArc { start, end, .. } => Some((start, end)),
+            Self::Line { start, end } | Self::CircularArc { start, end, .. } => {
+                Some((*start, *end))
+            }
             Self::Circle { .. } => None,
+            Self::Bspline { control_points, .. } => {
+                if let (Some(first), Some(last)) = (control_points.first(), control_points.last()) {
+                    Some((*first, *last))
+                } else {
+                    None
+                }
+            }
         }
     }
 
     #[must_use]
-    pub fn radius(self) -> Option<f64> {
+    pub fn radius(&self) -> Option<f64> {
         match self {
-            Self::Line { .. } => None,
-            Self::CircularArc { center, start, .. } => Some(center.distance(start)),
-            Self::Circle { radius, .. } => Some(radius),
+            Self::Line { .. } | Self::Bspline { .. } => None,
+            Self::CircularArc { center, start, .. } => Some(center.distance(*start)),
+            Self::Circle { radius, .. } => Some(*radius),
         }
     }
 
     #[must_use]
-    pub fn center(self) -> Option<SketchPoint2> {
+    pub fn center(&self) -> Option<SketchPoint2> {
         match self {
-            Self::Line { .. } => None,
-            Self::CircularArc { center, .. } | Self::Circle { center, .. } => Some(center),
+            Self::Line { .. } | Self::Bspline { .. } => None,
+            Self::CircularArc { center, .. } | Self::Circle { center, .. } => Some(*center),
         }
     }
 
     #[must_use]
-    pub fn reverse(self) -> Self {
+    pub fn reverse(&self) -> Self {
         match self {
             Self::Line { start, end } => Self::Line {
-                start: end,
-                end: start,
+                start: *end,
+                end: *start,
             },
             Self::CircularArc {
                 center,
@@ -500,29 +660,54 @@ impl EvaluatedCurve2 {
                 end,
                 direction,
             } => Self::CircularArc {
-                center,
-                start: end,
-                end: start,
-                direction: opposite_direction(direction),
+                center: *center,
+                start: *end,
+                end: *start,
+                direction: opposite_direction(*direction),
             },
             Self::Circle {
                 center,
                 radius,
                 direction,
             } => Self::Circle {
-                center,
-                radius,
-                direction: opposite_direction(direction),
+                center: *center,
+                radius: *radius,
+                direction: opposite_direction(*direction),
             },
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => {
+                let mut reversed_pts = control_points.clone();
+                reversed_pts.reverse();
+                let mut reversed_knots = Vec::with_capacity(knots.len());
+                let max_knot = knots.last().copied().unwrap_or(1.0);
+                for k in knots.iter().rev() {
+                    reversed_knots.push(max_knot - *k);
+                }
+                let reversed_weights = weights.as_ref().map(|w| {
+                    let mut rw = w.clone();
+                    rw.reverse();
+                    rw
+                });
+                Self::Bspline {
+                    control_points: reversed_pts,
+                    degree: *degree,
+                    knots: reversed_knots,
+                    weights: reversed_weights,
+                }
+            }
         }
     }
 
     #[must_use]
-    pub fn transformed(self, transform: RigidTransform2) -> Self {
+    pub fn transformed(&self, transform: RigidTransform2) -> Self {
         match self {
             Self::Line { start, end } => Self::Line {
-                start: transform.apply_point(start),
-                end: transform.apply_point(end),
+                start: transform.apply_point(*start),
+                end: transform.apply_point(*end),
             },
             Self::CircularArc {
                 center,
@@ -530,44 +715,74 @@ impl EvaluatedCurve2 {
                 end,
                 direction,
             } => Self::CircularArc {
-                center: transform.apply_point(center),
-                start: transform.apply_point(start),
-                end: transform.apply_point(end),
-                direction,
+                center: transform.apply_point(*center),
+                start: transform.apply_point(*start),
+                end: transform.apply_point(*end),
+                direction: *direction,
             },
             Self::Circle {
                 center,
                 radius,
                 direction,
             } => Self::Circle {
-                center: transform.apply_point(center),
-                radius,
-                direction,
+                center: transform.apply_point(*center),
+                radius: *radius,
+                direction: *direction,
+            },
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => Self::Bspline {
+                control_points: control_points
+                    .iter()
+                    .map(|pt| transform.apply_point(*pt))
+                    .collect(),
+                degree: *degree,
+                knots: knots.clone(),
+                weights: weights.clone(),
             },
         }
     }
 
     #[must_use]
-    pub fn arc_length(self) -> f64 {
+    pub fn arc_length(&self) -> f64 {
         match self {
-            Self::Line { start, end } => start.distance(end),
+            Self::Line { start, end } => start.distance(*end),
             Self::CircularArc {
                 center,
                 start,
                 end,
                 direction,
             } => {
-                center.distance(start)
-                    * directed_sweep(angle_of(start - center), angle_of(end - center), direction)
-                        .abs()
+                center.distance(*start)
+                    * directed_sweep(
+                        angle_of(*start - *center),
+                        angle_of(*end - *center),
+                        *direction,
+                    )
+                    .abs()
             }
-            Self::Circle { radius, .. } => TAU * radius,
+            Self::Circle { radius, .. } => TAU * *radius,
+            Self::Bspline { .. } => {
+                let mut total = 0.0;
+                let mut prev = self.evaluate(0.0).unwrap_or_default();
+                for i in 1..=32 {
+                    let t = i as f64 / 32.0;
+                    if let Ok(curr) = self.evaluate(t) {
+                        total += prev.distance(curr);
+                        prev = curr;
+                    }
+                }
+                total
+            }
         }
     }
 
     /// Signed contribution to `1/2 integral(x dy - y dx)`.
     #[must_use]
-    pub fn signed_area_contribution(self) -> f64 {
+    pub fn signed_area_contribution(&self) -> f64 {
         match self {
             Self::Line { start, end } => 0.5 * (start.u * end.v - start.v * end.u),
             Self::CircularArc {
@@ -575,17 +790,29 @@ impl EvaluatedCurve2 {
                 start,
                 end,
                 direction,
-            } => arc_area(center, start, end, direction),
+            } => arc_area(*center, *start, *end, *direction),
             Self::Circle {
                 radius, direction, ..
-            } => direction_sign(direction) * PI * radius * radius,
+            } => direction_sign(*direction) * PI * radius * radius,
+            Self::Bspline { .. } => {
+                let mut area = 0.0;
+                let mut prev = self.evaluate(0.0).unwrap_or_default();
+                for i in 1..=32 {
+                    let t = i as f64 / 32.0;
+                    if let Ok(curr) = self.evaluate(t) {
+                        area += 0.5 * (prev.u * curr.v - prev.v * curr.u);
+                        prev = curr;
+                    }
+                }
+                area
+            }
         }
     }
 
     #[must_use]
-    pub fn bounds(self) -> Aabb2 {
+    pub fn bounds(&self) -> Aabb2 {
         match self {
-            Self::Line { start, end } => Aabb2::from_points(start, end),
+            Self::Line { start, end } => Aabb2::from_points(*start, *end),
             Self::Circle { center, radius, .. } => Aabb2 {
                 min: SketchPoint2::new(center.u - radius, center.v - radius),
                 max: SketchPoint2::new(center.u + radius, center.v + radius),
@@ -596,54 +823,80 @@ impl EvaluatedCurve2 {
                 end,
                 direction,
             } => {
-                let mut bounds = Aabb2::from_points(start, end);
-                let start_angle = angle_of(start - center);
-                let end_angle = angle_of(end - center);
-                let radius = center.distance(start);
+                let mut bounds = Aabb2::from_points(*start, *end);
+                let start_angle = angle_of(*start - *center);
+                let end_angle = angle_of(*end - *center);
+                let radius = center.distance(*start);
                 for candidate in [0.0, PI / 2.0, PI, 3.0 * PI / 2.0] {
-                    if angle_on_directed_arc(candidate, start_angle, end_angle, direction, 0.0) {
-                        bounds.include(point_on_circle(center, radius, candidate));
+                    if angle_on_directed_arc(candidate, start_angle, end_angle, *direction, 0.0) {
+                        bounds.include(point_on_circle(*center, radius, candidate));
                     }
                 }
                 bounds
+            }
+            Self::Bspline { control_points, .. } => {
+                if control_points.is_empty() {
+                    Aabb2::default()
+                } else {
+                    let mut b = Aabb2::from_points(control_points[0], control_points[0]);
+                    for pt in &control_points[1..] {
+                        b.include(*pt);
+                    }
+                    b
+                }
             }
         }
     }
 
     #[must_use]
-    pub fn closest_parameter(self, point: SketchPoint2) -> f64 {
+    pub fn closest_parameter(&self, point: SketchPoint2) -> f64 {
         match self {
             Self::Line { start, end } => {
-                let delta = end - start;
-                ((point - start).dot(delta) / delta.length_squared()).clamp(0.0, 1.0)
+                let delta = *end - *start;
+                ((point - *start).dot(delta) / delta.length_squared()).clamp(0.0, 1.0)
             }
             Self::Circle {
                 center, direction, ..
-            } => parameter_for_circle_angle(angle_of(point - center), direction),
+            } => parameter_for_circle_angle(angle_of(point - *center), *direction),
             Self::CircularArc {
                 center,
                 start,
                 end,
                 direction,
             } => {
-                let start_angle = angle_of(start - center);
-                let end_angle = angle_of(end - center);
-                let point_angle = angle_of(point - center);
-                let sweep = directed_sweep(start_angle, end_angle, direction);
-                let from_start = directed_sweep_allow_zero(start_angle, point_angle, direction);
+                let start_angle = angle_of(*start - *center);
+                let end_angle = angle_of(*end - *center);
+                let point_angle = angle_of(point - *center);
+                let sweep = directed_sweep(start_angle, end_angle, *direction);
+                let from_start = directed_sweep_allow_zero(start_angle, point_angle, *direction);
                 if from_start <= sweep.abs() {
                     (from_start / sweep.abs()).clamp(0.0, 1.0)
-                } else if point.distance(start) <= point.distance(end) {
+                } else if point.distance(*start) <= point.distance(*end) {
                     0.0
                 } else {
                     1.0
                 }
             }
+            Self::Bspline { .. } => {
+                let mut best_t = 0.0;
+                let mut best_dist = f64::INFINITY;
+                for i in 0..=32 {
+                    let t = i as f64 / 32.0;
+                    if let Ok(pt) = self.evaluate(t) {
+                        let d = pt.distance(point);
+                        if d < best_dist {
+                            best_dist = d;
+                            best_t = t;
+                        }
+                    }
+                }
+                best_t
+            }
         }
     }
 
     pub fn subcurve(
-        self,
+        &self,
         start_parameter: f64,
         end_parameter: f64,
     ) -> Result<Self, CurveGeometryError> {
@@ -664,26 +917,113 @@ impl EvaluatedCurve2 {
         let end = self.evaluate(end_parameter_for_eval)?;
         Ok(match self {
             Self::Line { .. } => Self::Line { start, end },
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights: _,
+            } => {
+                if start_parameter <= 1.0e-7 && end_parameter >= 1.0 - 1.0e-7 {
+                    self.clone()
+                } else {
+                    // For general subcurves, we insert knots to isolate the span [a, b]
+                    let pts = control_points
+                        .iter()
+                        .map(|p| GeomPoint2::new(p.u, p.v))
+                        .collect::<Vec<_>>();
+                    let geom_knot_min = knots[*degree];
+                    let geom_knot_max = knots[control_points.len()];
+                    let u_a = geom_knot_min + (geom_knot_max - geom_knot_min) * start_parameter;
+                    let u_b = geom_knot_min + (geom_knot_max - geom_knot_min) * end_parameter;
+
+                    let mut bspline = BSplineCurve2::new(*degree, pts, knots.clone(), false)
+                        .map_err(|_| CurveGeometryError::Degenerate)?;
+                    if u_a > geom_knot_min + 1.0e-7 {
+                        let mult = bspline.knots().iter().filter(|k| (**k - u_a).abs() < 1.0e-7).count();
+                        for _ in mult..*degree {
+                            if let Ok(inserted) = bspline.insert_knot(u_a) {
+                                bspline = inserted;
+                            }
+                        }
+                    }
+                    if u_b < geom_knot_max - 1.0e-7 {
+                        let mult = bspline.knots().iter().filter(|k| (**k - u_b).abs() < 1.0e-7).count();
+                        for _ in mult..*degree {
+                            if let Ok(inserted) = bspline.insert_knot(u_b) {
+                                bspline = inserted;
+                            }
+                        }
+                    }
+
+                    // Extract the sub-curve control points and knots
+                    let new_knots = bspline.knots();
+                    let new_pts = bspline.control_points();
+                    let span_a = new_knots.iter().position(|k| (*k - u_a).abs() < 1.0e-7).unwrap_or(0);
+                    let span_b = new_knots.iter().rposition(|k| (*k - u_b).abs() < 1.0e-7).unwrap_or(new_knots.len() - 1);
+
+                    let sub_knots_raw = &new_knots[span_a..=span_b];
+                    if sub_knots_raw.len() >= 2 * (*degree + 1) {
+                        let k_min = sub_knots_raw[0];
+                        let k_max = *sub_knots_raw.last().unwrap();
+                        let k_range = (k_max - k_min).max(1.0e-12);
+                        let norm_knots = sub_knots_raw.iter().map(|k| (k - k_min) / k_range).collect::<Vec<_>>();
+                        let cp_start = span_a;
+                        let cp_count = norm_knots.len() - *degree - 1;
+                        let sub_cps = new_pts[cp_start..cp_start + cp_count]
+                            .iter()
+                            .map(|p| SketchPoint2::new(p.x, p.y))
+                            .collect();
+                        Self::Bspline {
+                            control_points: sub_cps,
+                            degree: *degree,
+                            knots: norm_knots,
+                            weights: None,
+                        }
+                    } else {
+                        // Fallback: evaluate points on span and fit
+                        let sample_count = 16;
+                        let mut sub_pts = Vec::with_capacity(sample_count);
+                        for s in 0..sample_count {
+                            let frac = s as f64 / (sample_count - 1) as f64;
+                            let param = start_parameter + frac * (end_parameter - start_parameter);
+                            if let Ok(pt) = self.evaluate(param) {
+                                sub_pts.push(pt);
+                            }
+                        }
+                        let target_degree = (*degree).min(sub_pts.len().saturating_sub(1));
+                        if let Ok((fit_cps, fit_knots)) = crate::primitives::fit_spline_points(&sub_pts, target_degree) {
+                            Self::Bspline {
+                                control_points: fit_cps,
+                                degree: target_degree,
+                                knots: fit_knots,
+                                weights: None,
+                            }
+                        } else {
+                            Self::Line { start, end }
+                        }
+                    }
+                }
+            }
             Self::CircularArc {
                 center, direction, ..
             }
             | Self::Circle {
                 center, direction, ..
             } => Self::CircularArc {
-                center,
+                center: *center,
                 start,
                 end,
-                direction,
+                direction: *direction,
             },
         })
     }
 
     #[must_use]
-    pub fn to_planar_curve(self) -> PlanarCurve2 {
+    pub fn to_planar_curve(&self) -> PlanarCurve2 {
         match self {
             Self::Line { start, end } => PlanarCurve2::Line {
-                start: start.into(),
-                end: end.into(),
+                start: (*start).into(),
+                end: (*end).into(),
             },
             Self::CircularArc {
                 center,
@@ -691,19 +1031,30 @@ impl EvaluatedCurve2 {
                 end,
                 direction,
             } => PlanarCurve2::CircularArc {
-                center: center.into(),
-                start: start.into(),
-                end: end.into(),
-                direction: direction.into(),
+                center: (*center).into(),
+                start: (*start).into(),
+                end: (*end).into(),
+                direction: (*direction).into(),
             },
             Self::Circle {
                 center,
                 radius,
                 direction,
             } => PlanarCurve2::Circle {
-                center: center.into(),
-                radius,
-                direction: direction.into(),
+                center: (*center).into(),
+                radius: *radius,
+                direction: (*direction).into(),
+            },
+            Self::Bspline {
+                control_points,
+                degree,
+                knots,
+                weights,
+            } => PlanarCurve2::Bspline {
+                degree: *degree,
+                control_points: control_points.iter().map(|p| (*p).into()).collect(),
+                knots: knots.clone(),
+                weights: weights.clone(),
             },
         }
     }

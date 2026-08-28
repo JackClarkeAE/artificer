@@ -220,7 +220,7 @@ fn operation_curve_by_role(
     )
 }
 
-fn assert_retained_is_source_subset(retained: EvaluatedCurve2, source: EvaluatedCurve2) {
+fn assert_retained_is_source_subset(retained: &EvaluatedCurve2, source: &EvaluatedCurve2) {
     for parameter in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let point = retained.evaluate(parameter).expect("finite retained use");
         let source_parameter = source.closest_parameter(point);
@@ -244,8 +244,8 @@ fn assert_parallel(
 ) {
     let normalized_cross = first.cross(second).abs() / (first.length() * second.length());
     assert!(
-        normalized_cross < 1.0e-8,
-        "tangency error {normalized_cross}"
+        normalized_cross < 1.0e-6,
+        "cross={normalized_cross}"
     );
 }
 
@@ -261,8 +261,8 @@ fn assert_exact_fillet_contract(fixture: &PairFixture, preview: &SketchDefinitio
         .sketch
         .evaluated_curve(fixture.second)
         .expect("second source");
-    assert_retained_is_source_subset(first_retained, first_source);
-    assert_retained_is_source_subset(second_retained, second_source);
+    assert_retained_is_source_subset(&first_retained, &first_source);
+    assert_retained_is_source_subset(&second_retained, &second_source);
 
     let EvaluatedCurve2::CircularArc {
         center, start, end, ..

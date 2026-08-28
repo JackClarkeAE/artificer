@@ -157,7 +157,7 @@ fn cancel_shared_boundaries(cells: &[&ArrangementCell]) -> Vec<DirectedUse> {
                 .fragment_keys
                 .iter()
                 .cloned()
-                .zip(profile_loop.curves.iter().copied())
+                .zip(profile_loop.curves.iter().cloned())
             {
                 let reverse = key.reversed();
                 if uses.remove(&reverse).is_none() {
@@ -180,11 +180,12 @@ fn stitch_boundary_loops(
         if directed.key.start == directed.key.end
             && matches!(directed.key.start, FragmentEndpointKey::PeriodicSeam { .. })
         {
+            let area = directed.curve.signed_area_contribution();
             periodic.push(ArrangementLoop {
                 half_edges: Vec::new(),
                 curves: vec![directed.curve],
                 fragment_keys: vec![directed.key],
-                signed_area: directed.curve.signed_area_contribution(),
+                signed_area: area,
             });
             continue;
         }
@@ -214,7 +215,7 @@ fn stitch_boundary_loops(
             }
             let directed = &ordinary[&current_key];
             keys.push(directed.key.clone());
-            curves.push(directed.curve);
+            curves.push(directed.curve.clone());
             let destination = directed.key.end.clone();
             if destination == start_endpoint {
                 break;
@@ -249,14 +250,13 @@ fn compile_loop(profile_loop: &ArrangementLoop) -> PlanarLoop2 {
         curves: profile_loop
             .curves
             .iter()
-            .copied()
-            .map(EvaluatedCurve2::to_planar_curve)
+            .map(|c| c.to_planar_curve())
             .collect(),
     }
 }
 
 fn boundary_sample(profile_loop: &ArrangementLoop) -> Option<SketchPoint2> {
-    let curve = *profile_loop.curves.first()?;
+    let curve = profile_loop.curves.first()?;
     curve
         .evaluate(if curve.is_periodic() { 0.125 } else { 0.5 })
         .ok()
@@ -279,7 +279,7 @@ fn point_in_analytic_loop(
     let mut parameters = Vec::new();
     for curve in &profile_loop.curves {
         if let CurveIntersections::Points { intersections } =
-            intersect_curves(ray, *curve, precision)
+            intersect_curves(ray.clone(), curve.clone(), precision)
         {
             parameters.extend(
                 intersections
@@ -316,6 +316,14 @@ fn planar_loop_key(profile_loop: &PlanarLoop2) -> Vec<(u8, u64, u64)> {
             artificer_protocol::PlanarCurve2::Circle { center, radius, .. } => {
                 (2, center.x.to_bits() ^ center.y.to_bits(), radius.to_bits())
             }
+            artificer_protocol::PlanarCurve2::Bspline { control_points, .. } => (
+                3,
+                control_points.len() as u64,
+                control_points
+                    .first()
+                    .map(|p| p.x.to_bits() ^ p.y.to_bits())
+                    .unwrap_or(0),
+            ),
         })
         .collect()
 }
@@ -501,9 +509,12 @@ mod tests {
             .unwrap();
             let loop_curves = &compiled.profile.regions[0].outer.curves;
             assert_eq!(loop_curves.len(), 2);
-            let endpoints = |curve: &artificer_protocol::PlanarCurve2| match *curve {
+            let endpoints = |curve: &artificer_protocol::PlanarCurve2| match curve {
                 artificer_protocol::PlanarCurve2::Line { start, end }
-                | artificer_protocol::PlanarCurve2::CircularArc { start, end, .. } => (start, end),
+                | artificer_protocol::PlanarCurve2::CircularArc { start, end, .. } => (*start, *end),
+                artificer_protocol::PlanarCurve2::Bspline { control_points, .. } => {
+                    (control_points[0], *control_points.last().unwrap())
+                }
                 artificer_protocol::PlanarCurve2::Circle { .. } => panic!("no full circles here"),
             };
             for index in 0..loop_curves.len() {

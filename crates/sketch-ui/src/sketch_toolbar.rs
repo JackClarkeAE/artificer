@@ -156,6 +156,8 @@ pub enum ToolVariant {
     SingleLine,
     ChainedPolyline,
     Centreline,
+    FitPointSpline,
+    ControlVertexSpline,
     TwoPointRectangle,
     CentrePointRectangle,
     CentrePointCircle,
@@ -180,17 +182,21 @@ pub enum ToolVariant {
     ParallelRelation,
     PerpendicularRelation,
     EqualLengthRelation,
+    TangentRelation,
+    CollinearRelation,
     Dimension,
 }
 
 impl ToolVariant {
-    pub const COUNT: usize = 30;
+    pub const COUNT: usize = 34;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
         Self::SingleLine,
         Self::ChainedPolyline,
         Self::Centreline,
+        Self::FitPointSpline,
+        Self::ControlVertexSpline,
         Self::TwoPointRectangle,
         Self::CentrePointRectangle,
         Self::CentrePointCircle,
@@ -215,6 +221,8 @@ impl ToolVariant {
         Self::ParallelRelation,
         Self::PerpendicularRelation,
         Self::EqualLengthRelation,
+        Self::TangentRelation,
+        Self::CollinearRelation,
         Self::Dimension,
     ];
 
@@ -326,6 +334,8 @@ pub enum ToolIcon {
     SingleLine,
     Polyline,
     Centreline,
+    FitPointSpline,
+    ControlVertexSpline,
     CornerRectangle,
     CentreRectangle,
     CentreCircle,
@@ -349,6 +359,8 @@ pub enum ToolIcon {
     ParallelRelation,
     PerpendicularRelation,
     EqualLengthRelation,
+    TangentRelation,
+    CollinearRelation,
     Dimension,
 }
 
@@ -436,6 +448,8 @@ const LINE_VARIANTS: &[ToolVariant] = &[
     ToolVariant::SingleLine,
     ToolVariant::ChainedPolyline,
     ToolVariant::Centreline,
+    ToolVariant::FitPointSpline,
+    ToolVariant::ControlVertexSpline,
 ];
 const RECTANGLE_VARIANTS: &[ToolVariant] = &[
     ToolVariant::TwoPointRectangle,
@@ -468,6 +482,8 @@ const RELATION_VARIANTS: &[ToolVariant] = &[
     ToolVariant::EqualLengthRelation,
     ToolVariant::DistanceRelation,
     ToolVariant::FixedRelation,
+    ToolVariant::TangentRelation,
+    ToolVariant::CollinearRelation,
 ];
 const DIMENSION_VARIANTS: &[ToolVariant] = &[ToolVariant::Dimension];
 
@@ -632,6 +648,13 @@ const POLYLINE_PHASES: &[PointAcquisitionPhase] = &[
     phase(
         "next",
         "Click consecutive vertices; Enter, double-click, close to the first point, or Finish chain stages it.",
+    ),
+];
+const SPLINE_PHASES: &[PointAcquisitionPhase] = &[
+    phase("start", "Click the first spline point."),
+    phase(
+        "next",
+        "Click consecutive points; Enter, double-click, or Finish stages the spline.",
     ),
 ];
 const CORNER_RECTANGLE_PHASES: &[PointAcquisitionPhase] = &[
@@ -1056,6 +1079,46 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         ToolOutputRole::ConstructionGeometry,
         CapabilityRequirement::EditableSketch,
         "Centreline creation requires an editable sketch.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::FitPointSpline,
+        "sketch.spline.fit_points",
+        ToolFamily::Line,
+        "Fit-point spline",
+        "Create an exact B-spline interpolated through clicked points.",
+        "Click consecutive fit points. Enter, double-click, or Finish stages the fitted curve; the green tick commits.",
+        "Click the first fit point.",
+        "Choose line or spline type; current default: Fit-point spline.",
+        Some(SHORTCUT_L),
+        ToolIcon::FitPointSpline,
+        ToolCursor::Crosshair,
+        SPLINE_PHASES,
+        NO_INPUTS,
+        SelectionRequirement::None,
+        ToolOutputRole::ProfileGeometry,
+        CapabilityRequirement::EditableSketch,
+        "Spline creation requires an editable sketch.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::ControlVertexSpline,
+        "sketch.spline.control_vertices",
+        ToolFamily::Line,
+        "Control-vertex spline",
+        "Create an exact B-spline defined by its control polygon.",
+        "Click consecutive control vertices. Enter, double-click, or Finish stages the curve; the green tick commits.",
+        "Click the first control vertex.",
+        "Choose line or spline type; current default: Control-vertex spline.",
+        Some(SHORTCUT_L),
+        ToolIcon::ControlVertexSpline,
+        ToolCursor::Crosshair,
+        SPLINE_PHASES,
+        NO_INPUTS,
+        SelectionRequirement::None,
+        ToolOutputRole::ProfileGeometry,
+        CapabilityRequirement::EditableSketch,
+        "Spline creation requires an editable sketch.",
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
@@ -1536,6 +1599,46 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         ToolOutputRole::Modification,
         CapabilityRequirement::RelationOperands,
         "An equal-length relation needs two lines.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::TangentRelation,
+        "sketch.relation.tangent",
+        ToolFamily::Relation,
+        "Tangent relation",
+        "Hold two curves tangent at their junction.",
+        "Click two connected curves. The solver aligns their tangent vectors and holds them tangent.",
+        "Click the first curve to hold tangent.",
+        "Choose relation; current default: Horizontal.",
+        Some(SHORTCUT_G),
+        ToolIcon::TangentRelation,
+        ToolCursor::PrecisionPick,
+        RELATION_TWO_OPERAND_PHASES,
+        NO_INPUTS,
+        SelectionRequirement::RelationOperands,
+        ToolOutputRole::Modification,
+        CapabilityRequirement::RelationOperands,
+        "A tangent relation needs two curves.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::CollinearRelation,
+        "sketch.relation.collinear",
+        ToolFamily::Relation,
+        "Collinear relation",
+        "Hold points or lines along the same infinite line.",
+        "Click lines or points. The solver brings them onto one common line and holds them collinear.",
+        "Click the first entity to hold collinear.",
+        "Choose relation; current default: Horizontal.",
+        Some(SHORTCUT_G),
+        ToolIcon::CollinearRelation,
+        ToolCursor::PrecisionPick,
+        RELATION_TWO_OPERAND_PHASES,
+        NO_INPUTS,
+        SelectionRequirement::RelationOperands,
+        ToolOutputRole::Modification,
+        CapabilityRequirement::RelationOperands,
+        "A collinear relation needs two lines or three points.",
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
@@ -2420,6 +2523,22 @@ impl<'a> IconPainter<'a> {
                 }
                 self.dot((0.50, 0.50), 0.055);
             }
+            ToolIcon::FitPointSpline => {
+                self.line((0.15, 0.75), (0.35, 0.35));
+                self.line((0.35, 0.35), (0.65, 0.65));
+                self.line((0.65, 0.65), (0.85, 0.25));
+                self.dot((0.15, 0.75), 0.05);
+                self.dot((0.35, 0.35), 0.05);
+                self.dot((0.65, 0.65), 0.05);
+                self.dot((0.85, 0.25), 0.05);
+            }
+            ToolIcon::ControlVertexSpline => {
+                self.line((0.15, 0.75), (0.85, 0.25));
+                self.dot((0.15, 0.75), 0.05);
+                self.dot((0.40, 0.15), 0.05);
+                self.dot((0.60, 0.85), 0.05);
+                self.dot((0.85, 0.25), 0.05);
+            }
             ToolIcon::CornerRectangle => {
                 self.line((0.16, 0.22), (0.84, 0.22));
                 self.line((0.84, 0.22), (0.84, 0.78));
@@ -2571,6 +2690,19 @@ impl<'a> IconPainter<'a> {
             ToolIcon::EqualLengthRelation => {
                 self.line((0.20, 0.38), (0.80, 0.38));
                 self.line((0.20, 0.62), (0.80, 0.62));
+            }
+            ToolIcon::TangentRelation => {
+                self.circle((0.50, 0.58), 0.26);
+                self.line((0.15, 0.32), (0.85, 0.32));
+                self.dot((0.50, 0.32), 0.045);
+            }
+            ToolIcon::CollinearRelation => {
+                self.line((0.15, 0.50), (0.45, 0.50));
+                self.line((0.55, 0.50), (0.85, 0.50));
+                self.dot((0.15, 0.50), 0.045);
+                self.dot((0.45, 0.50), 0.045);
+                self.dot((0.55, 0.50), 0.045);
+                self.dot((0.85, 0.50), 0.045);
             }
             ToolIcon::CircularPattern => {
                 self.dot((0.50, 0.50), 0.045);
