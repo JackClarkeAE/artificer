@@ -50,8 +50,14 @@ fn circle_wrap_span_is_exact_and_clicking_a_junction_is_ambiguous() {
         },
     };
     let limits = [line(2, (0.0, -3.0), (0.0, 3.0))];
-    let wrap =
-        select_trim_span(circle.clone(), &limits, SketchPoint2::new(2.0, 0.0), &precision, 64).unwrap();
+    let wrap = select_trim_span(
+        circle.clone(),
+        &limits,
+        SketchPoint2::new(2.0, 0.0),
+        &precision,
+        64,
+    )
+    .unwrap();
     assert!(wrap.removed.source_interval.wraps_periodic_seam);
     assert!(matches!(
         wrap.removed.curve,

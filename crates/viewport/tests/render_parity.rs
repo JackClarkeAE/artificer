@@ -2,15 +2,15 @@ use std::f64::consts::FRAC_PI_4;
 
 use artificer_kernel::{CancellationToken, DebugScene, NativeKernel};
 use artificer_protocol::{
-    Aabb3, ExecuteRequest, KernelCommand, Point3, PrecisionPolicy, RequestId, Vector3,
-    CURRENT_PROTOCOL_VERSION,
+    Aabb3, CURRENT_PROTOCOL_VERSION, ExecuteRequest, KernelCommand, Point3, PrecisionPolicy,
+    RequestId, Vector3,
 };
 use artificer_ui_core::presentation::{
     ActiveTool, DisplayTransform, ProjectionMode, SectionCutPlane, ViewState,
 };
 use artificer_viewport::{
-    show_document_with_feature_drag, BodyInstanceKey, DocumentBodyInstance, FeaturePreviewDragState,
-    ModelDisplayMode,
+    BodyInstanceKey, DocumentBodyInstance, FeaturePreviewDragState, ModelDisplayMode,
+    show_document_with_feature_drag,
 };
 use egui_kittest::Harness;
 
@@ -28,8 +28,8 @@ fn cuboid_fixture() -> (DebugScene, Aabb3, Point3) {
             size_z: 20.0,
         },
     };
-    let outcome = NativeKernel::execute(&input, &request, &CancellationToken::new())
-        .expect("cuboid fixture");
+    let outcome =
+        NativeKernel::execute(&input, &request, &CancellationToken::new()).expect("cuboid fixture");
     let bounds = outcome.report.bounds.expect("cuboid bounds");
     let pivot = Point3::new(
         (bounds.min.x + bounds.max.x) * 0.5,
@@ -95,10 +95,7 @@ fn test_section_cut_plane_rendering() {
     let (scene, bounds, pivot) = cuboid_fixture();
     let body_key = BodyInstanceKey::new(1);
     let mut view = ViewState::default();
-    view.section_cut_plane = Some(SectionCutPlane::new(
-        Vector3::new(0.0, 0.0, 1.0),
-        0.0,
-    ));
+    view.section_cut_plane = Some(SectionCutPlane::new(Vector3::new(0.0, 0.0, 1.0), 0.0));
     view.frame(bounds);
     let mut display_transform = DisplayTransform::default();
     let mut drag_state = FeaturePreviewDragState::default();

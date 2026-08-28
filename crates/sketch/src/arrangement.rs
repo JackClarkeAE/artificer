@@ -1219,7 +1219,10 @@ fn walk_positive_loops(
             })
             .collect();
         remove_bridge_backtracks(&mut boundary_uses);
-        let curves: Vec<_> = boundary_uses.iter().map(|(_, _, curve)| curve.clone()).collect();
+        let curves: Vec<_> = boundary_uses
+            .iter()
+            .map(|(_, _, curve)| curve.clone())
+            .collect();
         let signed_area: f64 = curves
             .iter()
             .map(|curve| curve.signed_area_contribution())

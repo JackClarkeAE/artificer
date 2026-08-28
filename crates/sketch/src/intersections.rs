@@ -277,17 +277,28 @@ pub fn intersect_curves(
                 start: second_start,
                 end: second_end,
             },
-        ) => intersect_line_line(*first_start, *first_end, *second_start, *second_end, precision),
-        (EvaluatedCurve2::Line { start, end }, circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. })) => {
-            intersect_line_circular(*start, *end, circular.clone(), precision)
-        }
-        (circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }), EvaluatedCurve2::Line { start, end }) => {
-            intersect_line_circular(*start, *end, circular.clone(), precision).reversed()
-        }
+        ) => intersect_line_line(
+            *first_start,
+            *first_end,
+            *second_start,
+            *second_end,
+            precision,
+        ),
+        (
+            EvaluatedCurve2::Line { start, end },
+            circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
+        ) => intersect_line_circular(*start, *end, circular.clone(), precision),
+        (
+            circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
+            EvaluatedCurve2::Line { start, end },
+        ) => intersect_line_circular(*start, *end, circular.clone(), precision).reversed(),
         (
             first_circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
-            second_circular @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
-        ) => intersect_circular_circular(first_circular.clone(), second_circular.clone(), precision),
+            second_circular
+            @ (EvaluatedCurve2::CircularArc { .. } | EvaluatedCurve2::Circle { .. }),
+        ) => {
+            intersect_circular_circular(first_circular.clone(), second_circular.clone(), precision)
+        }
         _ => intersect_general_curves(&first, &second, precision),
     };
     canonicalize_points(&mut result, precision);
@@ -306,14 +317,22 @@ fn intersect_general_curves(
     for i in 0..n_samples {
         let t1_start = i as f64 / n_samples as f64;
         let t1_end = (i + 1) as f64 / n_samples as f64;
-        let Ok(p1_start) = first.evaluate(t1_start) else { continue };
-        let Ok(p1_end) = first.evaluate(t1_end) else { continue };
+        let Ok(p1_start) = first.evaluate(t1_start) else {
+            continue;
+        };
+        let Ok(p1_end) = first.evaluate(t1_end) else {
+            continue;
+        };
 
         for j in 0..m_samples {
             let t2_start = j as f64 / m_samples as f64;
             let t2_end = (j + 1) as f64 / m_samples as f64;
-            let Ok(p2_start) = second.evaluate(t2_start) else { continue };
-            let Ok(p2_end) = second.evaluate(t2_end) else { continue };
+            let Ok(p2_start) = second.evaluate(t2_start) else {
+                continue;
+            };
+            let Ok(p2_end) = second.evaluate(t2_end) else {
+                continue;
+            };
 
             let tol = precision.linear_agreement;
             let b1 = crate::geometry::Aabb2::from_points(p1_start, p1_end).expanded(tol);
@@ -356,14 +375,20 @@ fn intersect_general_curves(
                 v = (v - dv).clamp(0.0, 1.0);
             }
 
-            let Ok(final_pt1) = first.evaluate(u) else { continue };
-            let Ok(final_pt2) = second.evaluate(v) else { continue };
+            let Ok(final_pt1) = first.evaluate(u) else {
+                continue;
+            };
+            let Ok(final_pt2) = second.evaluate(v) else {
+                continue;
+            };
             if final_pt1.distance(final_pt2) <= precision.linear_agreement * 2.0 {
                 let point = final_pt1;
                 if !intersections.iter().any(|ix: &CurveIntersection| {
-                    (ix.first_parameter - u).abs() < 1.0e-4 && (ix.second_parameter - v).abs() < 1.0e-4
+                    (ix.first_parameter - u).abs() < 1.0e-4
+                        && (ix.second_parameter - v).abs() < 1.0e-4
                 }) {
-                    let is_tangent = if let (Ok(t1), Ok(t2)) = (first.tangent(u), second.tangent(v)) {
+                    let is_tangent = if let (Ok(t1), Ok(t2)) = (first.tangent(u), second.tangent(v))
+                    {
                         if let (Some(n1), Some(n2)) = (t1.normalized(), t2.normalized()) {
                             n1.cross(n2).abs() < 1.0e-3
                         } else {

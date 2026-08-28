@@ -167,8 +167,8 @@ fn semicircle_and_diameter_compile_with_bitwise_connected_authored_endpoints() {
     assert_eq!(output.len(), 2);
     for index in 0..output.len() {
         let (_, end) = planar_endpoints(output[index].clone()).expect("nonperiodic curve");
-        let (next_start, _) =
-            planar_endpoints(output[(index + 1) % output.len()].clone()).expect("nonperiodic curve");
+        let (next_start, _) = planar_endpoints(output[(index + 1) % output.len()].clone())
+            .expect("nonperiodic curve");
         assert_eq!(end.x.to_bits(), next_start.x.to_bits());
         assert_eq!(end.y.to_bits(), next_start.y.to_bits());
     }

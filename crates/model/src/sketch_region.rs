@@ -114,7 +114,10 @@ pub fn reflected_profile_across_u(mut profile: PlanarProfile2) -> PlanarProfile2
                 knots,
                 weights,
             } => PlanarCurve2::Bspline {
-                control_points: control_points.iter().map(|p| reflect_profile_point(*p)).collect(),
+                control_points: control_points
+                    .iter()
+                    .map(|p| reflect_profile_point(*p))
+                    .collect(),
                 degree: *degree,
                 knots: knots.clone(),
                 weights: weights.clone(),

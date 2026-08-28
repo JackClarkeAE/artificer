@@ -70,7 +70,10 @@ impl ModelDisplayMode {
     }
 
     pub const fn shows_triangles(self) -> bool {
-        matches!(self, Self::Diagnostic | Self::ShadedEdges | Self::HiddenLinesRemoved)
+        matches!(
+            self,
+            Self::Diagnostic | Self::ShadedEdges | Self::HiddenLinesRemoved
+        )
     }
 }
 
@@ -1775,7 +1778,6 @@ fn show_document_impl(
     let mut section_cut_segments: Vec<[Pos2; 2]> = Vec::new();
 
     if display_mode.shows_triangles() {
-
         for triangle in &triangles {
             if !visible_rect.intersects(triangle.screen_bounds) {
                 continue;
@@ -1793,9 +1795,24 @@ fn show_document_impl(
                 if (d0 < 0.0 || d1 < 0.0 || d2 < 0.0) && (d0 > 0.0 || d1 > 0.0 || d2 > 0.0) {
                     let mut cut_pts = Vec::new();
                     let edges = [
-                        (triangle.model_vertices[0], triangle.model_vertices[1], d0, d1),
-                        (triangle.model_vertices[1], triangle.model_vertices[2], d1, d2),
-                        (triangle.model_vertices[2], triangle.model_vertices[0], d2, d0),
+                        (
+                            triangle.model_vertices[0],
+                            triangle.model_vertices[1],
+                            d0,
+                            d1,
+                        ),
+                        (
+                            triangle.model_vertices[1],
+                            triangle.model_vertices[2],
+                            d1,
+                            d2,
+                        ),
+                        (
+                            triangle.model_vertices[2],
+                            triangle.model_vertices[0],
+                            d2,
+                            d0,
+                        ),
                     ];
                     for (p0, p1, da, db) in edges {
                         if (da < 0.0 && db > 0.0) || (da > 0.0 && db < 0.0) {
@@ -1838,8 +1855,8 @@ fn show_document_impl(
                 .filter(|preview| preview.body == triangle.body)
                 .and_then(|preview| preview.candidate.as_deref())
                 .is_some_and(|candidate| candidate.changed_faces.contains(&triangle.source));
-            let cut_preview_face =
-                cut_preview_faces.is_some_and(|changed_faces| changed_faces.contains(&triangle.source));
+            let cut_preview_face = cut_preview_faces
+                .is_some_and(|changed_faces| changed_faces.contains(&triangle.source));
             if cut_preview_face {
                 // The staged body is the exact regularized difference. Red marks
                 // the newly exposed cut boundary; the translucent swept-volume
@@ -3232,7 +3249,9 @@ fn painted_visible_edge_intervals(
     triangles: &[ProjectedTriangle],
 ) -> Vec<[f32; 2]> {
     match display_mode {
-        ModelDisplayMode::Diagnostic | ModelDisplayMode::ShadedEdges | ModelDisplayMode::HiddenLinesRemoved => {
+        ModelDisplayMode::Diagnostic
+        | ModelDisplayMode::ShadedEdges
+        | ModelDisplayMode::HiddenLinesRemoved => {
             visible_edge_intervals(edge, depths, body, edge_key, triangles)
         }
         ModelDisplayMode::Wireframe => vec![[0.0, 1.0]],
