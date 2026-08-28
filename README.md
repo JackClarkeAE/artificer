@@ -66,3 +66,10 @@ The deeper design record — architecture decisions, the kernel roadmap, and the
 ## Status
 
 Artificer is young and moving quickly. The exact kernel, sketching, extrusions, booleans, blends, parametric history, part library, and assemblies all work today and are held to the test gates described above; plenty of everyday CAD surface area is still to come. Issues and pull requests are welcome.
+
+## Licensing
+
+Artificer is available under a **dual-licensing model**:
+
+- **Open Source (AGPLv3)**: The default public license is the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-or-later`). You are free to use, modify, and redistribute Artificer in open-source projects under copyleft terms.
+- **Commercial / Enterprise Licensing**: For organizations wishing to integrate Artificer or its geometric kernel into closed-source proprietary software, commercial applications, or hosted cloud services without copyleft obligations, commercial licensing is available. Please reach out via GitHub or contact the maintainers for commercial terms.

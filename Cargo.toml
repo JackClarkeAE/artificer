@@ -21,6 +21,7 @@ resolver = "3"
 version = "0.9.4"
 edition = "2024"
 rust-version = "1.95"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
