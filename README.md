@@ -1,75 +1,252 @@
+<div align="center">
+
 # Artificer
 
-**Exact parametric CAD, in pure Rust.**
+**The exact boundary-representation geometric modeling kernel and parametric CAD suite, written from scratch in pure Rust.**
 
-Artificer is a mechanical CAD application built on its own boundary-representation kernel. Every curve and surface is carried as analytic geometry — lines, circles, planes, cylinders, cones, tori, spheres — and every operation either produces a certified result or refuses cleanly, leaving your model untouched. There is no tolerance slider and no "nearly closed" solid: volume, area, and centre of mass come from closed-form integrals over the real surfaces, so a measurement is the measurement, not a mesh estimate.
+[![CI](https://github.com/JackClarkeAE/artificer/actions/workflows/ci.yml/badge.svg)](https://github.com/JackClarkeAE/artificer/actions)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Dual License: Commercial](https://img.shields.io/badge/License-Commercial-purple.svg)](#licensing)
+[![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95+-orange.svg)](https://www.rust-lang.org)
 
-![Artificer workbench](apps/workbench/tests/snapshots/workbench_two_visible_bodies.png)
+[Key Features](#key-features) •
+[The Kernel](#the-exact-geometry-kernel) •
+[Programmable API & Server](#programmable-api--headless-engine) •
+[Interactive Workbench](#desktop-cad-workbench) •
+[Quickstart](#quickstart) •
+[Architecture](#architecture) •
+[Roadmap](#roadmap)
 
-## Why exact?
+<br/>
 
-Mainstream kernels approximate: surfaces meet within a tolerance, booleans heal gaps, and a model that looks solid can fail downstream in CAM, simulation, or 3D printing. Artificer takes the opposite bet. Geometry is exact by construction, validation is transactional, and anything the kernel cannot certify is refused with a named reason instead of patched over. If Artificer says your part is a valid solid with a volume of 199.010 mm³, both halves of that sentence are provable.
+![Artificer Workbench](apps/workbench/tests/snapshots/workbench_two_visible_bodies.png)
 
-## Highlights
+</div>
 
-- **Sketching that flows** — strokes commit as you draw them, with live dimensions on the canvas, exact closed-profile detection, fillets, chamfers, trims, patterns, and compound primitives (polygons, slots) that stay editable as recipes.
-- **Analytic modelling** — extrusions, face Add/Cut, whole-face push/pull, booleans between solids at any relative orientation, and blends that sweep true torus and sphere carriers. Fillet a cylinder's rims at its own radius and you get a mathematically exact sphere.
-- **Parametric history** — every feature is an exact command in a deterministic journal. Documents replay to the same solid, byte for byte, verified by content digests. Suppress, restore, and edit features with atomic rebuilds.
-- **Assemblies and parts** — a content-addressed part library, rigid component placement, grounding, and revolute joints with motion preview.
-- **Materials and mass** — assign a material and get mass and centre of mass from the kernel's exact volume and centroid. Anything the kernel cannot certify is reported as unavailable, never invented.
-- **Interchange** — STL and STEP export at authoritative tessellation quality, never from the display mesh.
+---
 
-![Exact sketching](apps/workbench/tests/snapshots/workbench_sketch_xy_rectangle.png)
+## What is Artificer?
 
-## Download
+Artificer is an industrial-grade, pure-Rust mechanical CAD ecosystem powered by its own custom **exact boundary-representation (B-rep) geometry kernel**.
 
-Prebuilt binaries are on the [releases page](https://github.com/JackClarkeAE/artificer/releases):
+Unlike traditional CAD software that relies on legacy C++ kernels with floating-point tolerance approximations and mesh-healing heuristics, Artificer represents every surface, curve, and boundary analytically. Operations either evaluate to a mathematically certified manifold solid or refuse cleanly with a deterministic reason.
 
-- **Windows** (x86-64) — run the `Setup.exe`. It installs for the current user and updates itself from this page. The installer is unsigned, so SmartScreen will ask once: *More info → Run anyway*.
-- **Linux** (x86-64) — download the `.AppImage`, make it executable (`chmod +x`), and run it. It updates itself in place.
-- **macOS** (Apple Silicon) — unzip and open `Artificer.app`. Gatekeeper requires right-click → Open on first launch. This build does not update itself: macOS requires notarisation for that, which is not in place yet, so watch the releases page for new versions.
+Whether you are designing physical mechanisms in the **desktop CAD workbench**, automating parametric model generation via the **headless JSON-RPC server**, or embedding the **geometry kernel** directly into your own Rust applications, Artificer guarantees reproducible, bit-identical precision across platforms.
 
-Artificer checks the releases page for a new version when it starts, and never installs one without being asked. **File → About Artificer** shows what is available, downloads it, and installs it on an explicit restart.
+---
 
-If you are running a build from before 0.3.0, upgrading to the installer is a one-time manual download — the old archives have no way to update themselves. Plain archives are published alongside the installers for this release only.
+## Key Features
 
-## Build from source
+- 📐 **100% Exact Analytic Geometry** — Lines, circles, planes, cylinders, cones, tori, and spheres are evaluated directly from closed-form equations. No chord approximations, no tolerance accumulation, and no "nearly watertight" solids.
+- ⚡ **Closed-Form Calculus** — Volume, surface area, center of mass, and moments of inertia are integrated analytically over true surface topologies rather than estimated from facet meshes.
+- 🔄 **Deterministic Parametric History** — All modeling operations are recorded as pure, transactional journal steps. Every model state is content-addressed with cryptographic digests for bit-identical rebuilds.
+- 🌐 **Headless Automation & API Server** — First-class JSON-RPC 2.0 API server, Rust client SDK, and `.art` scripting DSL for cloud CAD workflows, generative engineering, and automated test pipelines.
+- ✏️ **Flow-State 2D Sketching** — Instant planar loop and multi-region detection, live in-canvas dimension editing, parametric sketch recipes, and automatic profile classification.
+- 🔩 **Assemblies & Part Library** — Integrated component catalogs, rigid 3D spatial placements, grounding semantics, and kinematic revolute joints with live motion simulation.
+- 📦 **Dual-Tier Faceted & Exact Booleans** — Robust topological difference, union, and intersection operations across arbitrary orientations and non-manifold interactions.
+- 🎨 **Modern Native GPU Desktop App** — Ultra-responsive UI built with `wgpu` and `egui`, featuring dynamic view cube orientation, realtime edge-contrast rendering, and custom theme engines.
 
-Requires stable Rust (1.95+).
+---
 
-```sh
-cargo run --release -p artificer-workbench     # launch the workbench
-cargo test --workspace --all-targets           # full test suite
-./scripts/build-standalone.sh                  # unsigned app bundle (macOS) or executable
-./scripts/pack-release.sh                      # Velopack installer (Windows, Linux)
+## The Exact Geometry Kernel
+
+At the core of Artificer is `crates/kernel`, a self-contained B-rep engine designed without external C/C++ dependencies:
+
+```
+                  ┌─────────────────────────────────────────┐
+                  │          Geometry Kernel API            │
+                  └────────────────────┬────────────────────┘
+                                       │
+            ┌──────────────────────────┴──────────────────────────┐
+            ▼                                                     ▼
+┌───────────────────────────────┐             ┌───────────────────────────────────┐
+│     Authoritative B-rep       │             │       Certified Predicates        │
+│  • Half-Edge Topology         │             │  • Exact Orientation Filters      │
+│  • Analytic Carrier Surfaces  │             │  • Closed-Form Intersections      │
+│  • Manifold Validation Gates  │             │  • Interval Arithmetic Arithmetic │
+└───────────────┬───────────────┘             └─────────────────┬─────────────────┘
+                │                                               │
+                └──────────────────────┬────────────────────────┘
+                                       ▼
+                  ┌─────────────────────────────────────────┐
+                  │    Exact Calculus & Solid Operations    │
+                  │  • Analytic Surface Integrals (Mass)    │
+                  │  • Toric / Spherical Variable Blends    │
+                  │  • Faceted & Exact BSP Boolean Engines  │
+                  └─────────────────────────────────────────┘
 ```
 
-`pack-release.sh` needs the [`vpk`](https://docs.velopack.io) CLI, a .NET global tool: install the .NET 8 SDK, then `dotnet tool install -g vpk`.
+### Analytic Topology
+In Artificer, topological faces point to exact mathematical surfaces:
+- **Planes**: $P(u, v) = O + u\vec{U} + v\vec{V}$
+- **Cylinders**: $C(u, v) = O + R(\cos(u)\vec{U} + \sin(u)\vec{V}) + v\vec{W}$
+- **Tori**: Swept circular cross-sections with exact major and minor radii.
+- **Spheres**: Exact spherical quadrics.
 
-If test binaries start taking tens of seconds to *launch* on macOS (0 % CPU, stuck before the first test), the dev build's kept object files have piled up in `target/debug/deps` and Gatekeeper is scanning that directory before each start. Run `./scripts/prune-build-objects.sh` (or `cargo clean --profile dev`), and add your terminal or editor to System Settings → Privacy & Security → Developer Tools so locally built binaries skip the assessment altogether.
+When you fillet a cylinder's rim at its own radius, Artificer produces an exact mathematical sphere carrier, preserving analytic surface continuity throughout downstream operations.
 
-## How it fits together
+### Transactional Solid Validation
+Every kernel mutation must pass rigorous topological manifold checks:
+- **Euler-Poincaré Formula Verification**: $V - E + F - (L - F) = 2(S - G)$
+- **Edge-Use Counting**: Exactly two coedges per manifold edge with opposite loop orientations.
+- **Closed Loop Orientation**: Counter-clockwise outer bounds and clockwise inner voids.
+- **Self-Intersection Free**: All faces, edges, and vertices are verified non-overlapping.
 
-| Crate | What it holds |
-|---|---|
-| `crates/kernel` | The exact B-rep core: topology, validation, booleans, blends, measures |
-| `crates/geometry` | Certified predicates — interval-filtered orientation, closure, self-intersection |
-| `crates/sketch` | Exact 2D profile authoring, independent of any UI |
-| `crates/protocol` | The command vocabulary connecting front ends to the kernel |
-| `crates/model` | Parametric documents: features, parameters, replay |
-| `apps/workbench` | The desktop application (egui/wgpu), with `ui-core`, `viewport`, and `sketch-ui` beside it |
-| `apps/cli` | Runs and replays recorded kernel cases deterministically |
-| `addons/scan` | Scan-to-CAD: from triangle meshes to aligned analytic geometry |
+---
 
-The deeper design record — architecture decisions, the kernel roadmap, and the exactness contracts each feature is pinned by — lives in [`docs/architecture`](docs/architecture).
+## Programmable API & Headless Engine
 
-## Status
+Artificer is built from the ground up to be scriptable, automatable, and embeddable.
 
-Artificer is young and moving quickly. The exact kernel, sketching, extrusions, booleans, blends, parametric history, part library, and assemblies all work today and are held to the test gates described above; plenty of everyday CAD surface area is still to come. Issues and pull requests are welcome.
+### 1. JSON-RPC 2.0 API Server (`apps/api-server`)
+Run headless CAD pipelines on servers, in Docker containers, or inside CI/CD workflows:
+
+```sh
+# Start the API server on localhost
+cargo run --release -p artificer-api-server -- --port 9000
+```
+
+Send commands using standard JSON-RPC:
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "execute",
+  "params": {
+    "command": {
+      "kind": "make_box",
+      "origin": [0.0, 0.0, 0.0],
+      "size": [100.0, 50.0, 25.0],
+      "label": "base_block"
+    }
+  }
+}
+```
+
+### 2. Parametric Scripting DSL (`.art`)
+Write clean, readable parametric scripts evaluated directly by the kernel:
+
+```rust
+// bracket.art — Parametric bracket with mounting holes
+param width: f64 = 100.0;
+param depth: f64 = 50.0;
+param thickness: f64 = 10.0;
+
+let base = box(origin: [0, 0, 0], size: [width, depth, thickness], label: "base");
+let top = base.top_face;
+
+drill_hole(face: top, center: [-30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_l");
+drill_hole(face: top, center: [ 30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_r");
+```
+
+### 3. Rust Native API (`crates/api`)
+Embed CAD capabilities directly inside your Rust crates:
+
+```rust
+use artificer_api::{Session, ApiCommand, CancellationToken};
+use artificer_protocol::Point3;
+
+let mut session = Session::new();
+let token = CancellationToken::default();
+
+session.execute(ApiCommand::MakeBox {
+    label: "cube".into(),
+    origin: Point3::new(0.0, 0.0, 0.0),
+    size: [50.0, 50.0, 50.0],
+}, &token)?;
+
+let measures = session.query().mass_properties(None)?;
+println!("Exact Volume: {:.6} mm³", measures.volume);
+```
+
+---
+
+## Desktop CAD Workbench
+
+The interactive studio (`apps/workbench`) provides an agile, professional CAD environment:
+
+<div align="center">
+
+![Sketching Mode](apps/workbench/tests/snapshots/workbench_sketch_xy_rectangle.png)
+
+*Continuous 2D sketch constraint solver with real-time profile classification*
+
+</div>
+
+- **Dynamic Sketch Profiling**: Sketching automatically discovers bounded planar cells, holes, and island regions without manual profile closures. Shift-click to select and extrude multiple regions simultaneously.
+- **Parametric Feature Timeline**: Reorder, suppress, or modify dimensions on historical steps with automated atomic dependency rebuilds.
+- **Direct Surface Modeling**: Push/pull faces, create midplanes and datum planes, add bosses, blind pockets, through-cuts, and chamfers directly from model surface selections.
+- **Live 3D Viewport**: Zero-lag GPU rendering with hidden line culling, silhouette boundary classification, dynamic view cube, orthographic/trimetric projection modes, and customizable UI palettes.
+
+---
+
+## Quickstart
+
+### Prerequisites
+- Stable Rust (1.95 or newer)
+- Modern C/GPU toolchain (Metal on macOS, Vulkan/DX12 on Windows, Vulkan/Wayland/X11 on Linux)
+
+### Installation & Launch
+
+```sh
+# Clone the repository
+git clone https://github.com/JackClarkeAE/artificer.git
+cd artificer
+
+# Launch the interactive desktop CAD workbench
+cargo run --release -p artificer-workbench
+
+# Run the full kernel & workbench test suite
+cargo test --workspace
+
+# Start the headless API server daemon
+cargo run --release -p artificer-api-server -- --port 8080
+```
+
+### Prebuilt Desktop Binaries
+Standalone packages are published on the [Releases Page](https://github.com/JackClarkeAE/artificer/releases):
+- **Windows**: `Artificer-Setup.exe`
+- **Linux**: `Artificer.AppImage`
+- **macOS**: `Artificer-macOS-arm64.zip` (Apple Silicon)
+
+---
+
+## Architecture
+
+The Artificer workspace is organized into modular, independently testable crates:
+
+| Layer | Crate | Purpose |
+|---|---|---|
+| **Core Kernel** | [`crates/kernel`](crates/kernel) | Authoritative analytic B-rep modeling, Euler topology verification, torus/sphere blends, mass properties |
+| **Geometry** | [`crates/geometry`](crates/geometry) | Certified interval arithmetic predicates, orientation filters, ray/surface intersection math |
+| **Compute** | [`crates/compute`](crates/compute) | Hardware-accelerated spatial classifiers and SIMD/GPU evaluation primitives |
+| **Sketch Engine** | [`crates/sketch`](crates/sketch) | Exact 2D authoring, arrangement cell decomposition, loop stitching, and profile extraction |
+| **Protocol** | [`crates/protocol`](crates/protocol) | Zero-copy serializable command vocabulary connecting front-ends, APIs, and the kernel |
+| **Parametric Model** | [`crates/model`](crates/model) | Content-addressed feature DAG, parameter bindings, journal replay, and document schema |
+| **API & Exporters** | [`crates/api`](crates/api) | Programmable Rust API, `.art` script parser, headless renderer, STL, OBJ, and STEP interchange |
+| **API Server** | [`apps/api-server`](apps/api-server) | Standalone JSON-RPC 2.0 daemon and headless batch runner |
+| **Viewport Engine** | [`crates/viewport`](crates/viewport) | 3D rendering pipeline, silhouette curves, screen-space depth sorting, and gizmo manipulators |
+| **Sketch UI** | [`crates/sketch-ui`](crates/sketch-ui) | 2D canvas interactions, snap systems, live dimension boxes, and geometry tool widgets |
+| **Workbench** | [`apps/workbench`](apps/workbench) | Complete native desktop CAD studio (egui/wgpu) |
+| **CLI & Testkit** | [`apps/cli`](apps/cli) / [`crates/testkit`](crates/testkit) | Deterministic test harnesses, headless journal regression suites, and verification tools |
+
+---
+
+## Roadmap
+
+- [x] **M1–M5: Core Geometry & Primitives** — Analytic B-rep topology, planar profiles, primitive solids, exact calculus.
+- [x] **M6: Booleans & Blends** — Robust faceted boolean tier, toric/spherical fillets, and chamfers.
+- [x] **M7: Assemblies & Parametric Architecture** — Content-addressed part library, joint kinematics, parametric journal.
+- [x] **M7.5: Headless API & Scripting** — JSON-RPC daemon, `.art` DSL, programmatic query engine.
+- [ ] **M8: Advanced Kinematic Construction** — Guide-rail path sweeps, multi-section lofts, draft angles, and surface offsets.
+- [ ] **M9: Direct B-rep Deformations** — Local surface replacement, face twisting, and freeform NURBS trimming.
+- [ ] **M10: Production Interoperability** — Native STEP AP203/AP214/AP242 reader and writer, IGES import, and DXF drawing sheets.
+
+---
 
 ## Licensing
 
-Artificer is available under a **dual-licensing model**:
+Artificer is offered under a **dual-licensing model**:
 
-- **Open Source (AGPLv3)**: The default public license is the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-or-later`). You are free to use, modify, and redistribute Artificer in open-source projects under copyleft terms.
-- **Commercial / Enterprise Licensing**: For organizations wishing to integrate Artificer or its geometric kernel into closed-source proprietary software, commercial applications, or hosted cloud services without copyleft obligations, commercial licensing is available. Please reach out via GitHub or contact the maintainers for commercial terms.
+- **Open Source (AGPLv3)**: The default public license is the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-or-later`). You are free to use, modify, and redistribute Artificer under open-source copyleft terms.
+- **Commercial / Enterprise Licensing**: For organizations wishing to integrate Artificer, its geometry kernel, or the headless API into proprietary software, cloud platforms, or closed-source commercial applications without copyleft obligations, commercial licenses are available. Contact the maintainers or open an inquiry on GitHub.

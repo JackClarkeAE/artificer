@@ -1,0 +1,8 @@
+// filleted_cube.art — Cube with all 12 edges filleted
+
+param size: f64 = 40.0;
+param radius: f64 = 4.0;
+
+let base = box(origin: [0, 0, 0], size: [size, size, size], label: "cube");
+let all_edges = base.edges();
+fillet(edges: all_edges, radius: radius, label: "filleted_cube");

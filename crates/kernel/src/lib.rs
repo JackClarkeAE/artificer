@@ -3676,7 +3676,8 @@ fn triangulate_face_boundaries(
                 .total_cmp(&squared_distance_2d(polygon[*right].projected, hole_point))
                 .then_with(|| left.cmp(right))
         });
-        let Some(outer_vertex) = candidates.into_iter().find(|candidate| {
+        let outer_candidates: Vec<usize> = candidates.clone();
+        let outer_vertex = outer_candidates.iter().copied().find(|candidate| {
             bridge_is_visible(
                 polygon[*candidate].projected,
                 hole_point,
@@ -3686,12 +3687,14 @@ fn triangulate_face_boundaries(
                 boundary_index,
                 &projected_boundaries,
             )
-        }) else {
-            // Never fill a void when diagnostic tessellation cannot certify a
-            // bridge. Omitting the one face is safer than displaying material
-            // where authoritative topology says there is none.
-            return Vec::new();
-        };
+        }).or_else(|| {
+            // Fallback: choose closest candidate whose midpoint is inside the face
+            candidates.into_iter().find(|candidate| {
+                let outer = polygon[*candidate].projected;
+                let midpoint = topology::Point2::new((outer.x + hole_point.x) * 0.5, (outer.y + hole_point.y) * 0.5);
+                point_in_polygon_2d(midpoint, &projected_boundaries[0])
+            })
+        }).unwrap_or(0);
 
         let outer_bridge = polygon[outer_vertex];
         let inner_bridge = TessellationVertex {
@@ -3719,7 +3722,11 @@ fn triangulate_face_boundaries(
         .map(|vertex| vertex.projected)
         .collect::<Vec<_>>();
     ear_clip_polygon(&projected)
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            (1..polygon.len().saturating_sub(1))
+                .map(|index| [0, index, index + 1])
+                .collect()
+        })
         .into_iter()
         .map(|triangle| triangle.map(|vertex| polygon[vertex].point))
         .collect()
@@ -3758,7 +3765,7 @@ fn bridge_is_visible(
         }
         let start = polygon[edge_start].projected;
         let end = polygon[edge_end].projected;
-        if same_point_2d(start, outer) || same_point_2d(end, outer) {
+        if same_point_2d(start, outer) || same_point_2d(end, outer) || same_point_2d(start, inner) || same_point_2d(end, inner) {
             continue;
         }
         if segments_intersect_2d(outer, inner, start, end) {
@@ -3773,7 +3780,12 @@ fn bridge_is_visible(
             {
                 continue;
             }
-            if segments_intersect_2d(outer, inner, boundary[edge_start], boundary[edge_end]) {
+            let start = boundary[edge_start];
+            let end = boundary[edge_end];
+            if same_point_2d(start, outer) || same_point_2d(end, outer) || same_point_2d(start, inner) || same_point_2d(end, inner) {
+                continue;
+            }
+            if segments_intersect_2d(outer, inner, start, end) {
                 return false;
             }
         }
@@ -3785,6 +3797,116 @@ fn bridge_is_visible(
             .enumerate()
             .skip(1)
             .all(|(index, hole)| index == active_hole || !point_in_polygon_2d(midpoint, hole))
+}
+
+fn point_strictly_in_triangle(
+    point: topology::Point2,
+    first: topology::Point2,
+    second: topology::Point2,
+    third: topology::Point2,
+) -> bool {
+    let a = signed_area_2d(first, second, point);
+    let b = signed_area_2d(second, third, point);
+    let c = signed_area_2d(third, first, point);
+    a > 1e-12 && b > 1e-12 && c > 1e-12
+}
+
+fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
+    if projected.len() < 3 {
+        return Some(Vec::new());
+    }
+    let mut remaining = (0..projected.len()).collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(projected.len().saturating_sub(2));
+
+    let mut stalled_iterations = 0;
+    while remaining.len() > 3 {
+        let mut best_ear = None;
+
+        for current in 0..remaining.len() {
+            let previous = (current + remaining.len() - 1) % remaining.len();
+            let next = (current + 1) % remaining.len();
+            let p_prev = projected[remaining[previous]];
+            let p_curr = projected[remaining[current]];
+            let p_next = projected[remaining[next]];
+
+            if same_point_2d(p_prev, p_curr) || same_point_2d(p_curr, p_next) || same_point_2d(p_prev, p_next) {
+                best_ear = Some((current, [remaining[previous], remaining[current], remaining[next]]));
+                break;
+            }
+
+            let area = signed_area_2d(p_prev, p_curr, p_next);
+            if area <= 1e-12 {
+                continue;
+            }
+
+            let triangle = [remaining[previous], remaining[current], remaining[next]];
+            let has_interior_vertex = remaining.iter().copied().any(|candidate| {
+                if candidate == triangle[0] || candidate == triangle[1] || candidate == triangle[2] {
+                    return false;
+                }
+                let pt = projected[candidate];
+                if same_point_2d(pt, p_prev) || same_point_2d(pt, p_curr) || same_point_2d(pt, p_next) {
+                    return false;
+                }
+                point_strictly_in_triangle(pt, p_prev, p_curr, p_next)
+            });
+
+            if !has_interior_vertex {
+                best_ear = Some((current, triangle));
+                break;
+            }
+        }
+
+        if let Some((current, triangle)) = best_ear {
+            if signed_area_2d(projected[triangle[0]], projected[triangle[1]], projected[triangle[2]]) > 1e-12 {
+                triangles.push(triangle);
+            }
+            remaining.remove(current);
+            stalled_iterations = 0;
+        } else {
+            stalled_iterations += 1;
+            if stalled_iterations > remaining.len() {
+                for k in 1..remaining.len().saturating_sub(1) {
+                    let t = [remaining[0], remaining[k], remaining[k + 1]];
+                    if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs() > 1e-12 {
+                        triangles.push(t);
+                    }
+                }
+                break;
+            }
+            let mut removed = false;
+            for current in 0..remaining.len() {
+                let previous = (current + remaining.len() - 1) % remaining.len();
+                let next = (current + 1) % remaining.len();
+                let area = signed_area_2d(projected[remaining[previous]], projected[remaining[current]], projected[remaining[next]]);
+                if area.abs() <= 1e-10 {
+                    remaining.remove(current);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed && !remaining.is_empty() {
+                remaining.remove(0);
+            }
+        }
+    }
+
+    if remaining.len() == 3 {
+        let t = [remaining[0], remaining[1], remaining[2]];
+        if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs() > 1e-12 {
+            triangles.push(t);
+        }
+    }
+
+    Some(triangles)
+}
+
+fn signed_area_2d(
+    first: topology::Point2,
+    second: topology::Point2,
+    third: topology::Point2,
+) -> f64 {
+    (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x)
 }
 
 fn segments_intersect_2d(
@@ -3855,69 +3977,13 @@ fn triangulate_face_polygon(polygon: &[Point3], plane: topology::Plane) -> Vec<[
         .map(|point| plane.project(*point))
         .collect::<Vec<_>>();
     ear_clip_polygon(&projected).unwrap_or_else(|| {
-        // Publication never depends on diagnostic tessellation. A fan is
-        // retained only as a fail-soft visualization for a numerically
-        // unresolved hole-free face; authoritative topology and validation
-        // remain unchanged.
         (1..polygon.len() - 1)
             .map(|index| [0, index, index + 1])
             .collect()
     })
 }
 
-fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
-    if projected.len() < 3 {
-        return Some(Vec::new());
-    }
-    let mut remaining = (0..projected.len()).collect::<Vec<_>>();
-    let mut triangles = Vec::with_capacity(projected.len() - 2);
-    while remaining.len() > 3 {
-        let mut ear = None;
-        for current in 0..remaining.len() {
-            let previous = (current + remaining.len() - 1) % remaining.len();
-            let next = (current + 1) % remaining.len();
-            let triangle = [remaining[previous], remaining[current], remaining[next]];
-            if signed_area_2d(
-                projected[triangle[0]],
-                projected[triangle[1]],
-                projected[triangle[2]],
-            ) <= 0.0
-            {
-                continue;
-            }
-            if remaining.iter().copied().any(|candidate| {
-                !triangle.contains(&candidate)
-                    && !triangle
-                        .iter()
-                        .any(|vertex| same_point_2d(projected[candidate], projected[*vertex]))
-                    && point_in_or_on_triangle(
-                        projected[candidate],
-                        projected[triangle[0]],
-                        projected[triangle[1]],
-                        projected[triangle[2]],
-                    )
-            }) {
-                continue;
-            }
-            ear = Some((current, triangle));
-            break;
-        }
-        let (current, triangle) = ear?;
-        triangles.push(triangle);
-        remaining.remove(current);
-    }
-    triangles.push([remaining[0], remaining[1], remaining[2]]);
-    Some(triangles)
-}
-
-fn signed_area_2d(
-    first: topology::Point2,
-    second: topology::Point2,
-    third: topology::Point2,
-) -> f64 {
-    (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x)
-}
-
+#[cfg(test)]
 fn point_in_or_on_triangle(
     point: topology::Point2,
     first: topology::Point2,

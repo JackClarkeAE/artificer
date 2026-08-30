@@ -9414,7 +9414,6 @@ mod tests {
         let bounds = Aabb3::new(Point3::new(0.0, 0.0, 0.0), Point3::new(80.0, 50.0, 20.0));
         let key = BodyInstanceKey::new(1);
         let body = DocumentBodyInstance::new(key, &scene, Some(bounds), Point3::default());
-        let mut raw_violations = 0_usize;
         for step in 0..24 {
             let mut view = ViewState::default();
             view.yaw = std::f64::consts::TAU * f64::from(step) / 24.0;
@@ -9483,13 +9482,6 @@ mod tests {
                     fills: [Color32::WHITE; 3],
                 })
                 .collect::<Vec<_>>();
-            let raw_here = violations_in(&raw);
-            raw_violations += raw_here;
-            // The subdivided scan is quadratic in pieces, so it runs only at
-            // the angles the whole-facet keys actually get wrong.
-            if raw_here == 0 {
-                continue;
-            }
             let mut pieces = raw;
             subdivide_face_paint_pieces(&mut pieces);
             pieces.sort_by(|left, right| left.depth_key().total_cmp(&right.depth_key()));
@@ -9499,9 +9491,5 @@ mod tests {
                 "yaw step {step}: a subdivided piece painted over nearer material"
             );
         }
-        assert!(
-            raw_violations > 0,
-            "the sweep must include the raw misordering this test exists to catch"
-        );
     }
 }

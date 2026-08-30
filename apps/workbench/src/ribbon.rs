@@ -638,13 +638,7 @@ impl KernelLabApp {
                 if let Some(blocked) = free(self) {
                     return blocked;
                 }
-                if (1..=2).contains(&self.selected_faces.len()) {
-                    CommandAvailability::Enabled
-                } else {
-                    CommandAvailability::disabled(
-                        "Select one planar face for a coincident plane, or two parallel faces for a midplane.",
-                    )
-                }
+                CommandAvailability::Enabled
             }
             ModelCommand::Extrude => self.extrude_availability(),
             ModelCommand::Revolve => self.preset_feature_availability(SolidFeaturePreset::Revolve),
@@ -846,7 +840,6 @@ impl KernelLabApp {
             && !already_extruded
             && distance_valid
             && sketch_edit_complete
-            && !linked_sketch_support
             && (eligibility.can_stage() || awaiting_profile_pick);
         let active_sketch_consumed = self
             .active_sketch_index

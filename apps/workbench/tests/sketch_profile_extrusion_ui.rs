@@ -826,3 +826,34 @@ fn a_second_sketch_is_its_own_feature_and_the_first_still_extrudes() {
         "{timeline:?}"
     );
 }
+
+#[test]
+fn shift_select_multiple_sketch_regions_in_viewport() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle_around_an_off_centre_circle(&mut harness);
+    click_button(&mut harness, "Finish sketch");
+
+    let anchors = harness.state().model_sketch_region_anchors(0);
+    assert_eq!(anchors.len(), 2);
+
+    // Select first region
+    assert!(harness.state_mut().select_committed_sketch_region_additive(0, anchors[0], false));
+    assert_eq!(harness.state().selected_sketch_region_count(), 1);
+
+    // Shift-select second region
+    assert!(harness.state_mut().select_committed_sketch_region_additive(0, anchors[1], true));
+    assert_eq!(harness.state().selected_sketch_region_count(), 2);
+
+    // Both regions should now extrude together (full rectangle without hole)
+    click_button(&mut harness, "Extrude");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("committed exact extrusion")
+        .volume;
+    // 8.0 * 4.0 * 2.0 (extrusion distance 2.0) = 64.0
+    assert!((volume - 64.0).abs() <= 1.0e-8, "volume: {volume}");
+}
