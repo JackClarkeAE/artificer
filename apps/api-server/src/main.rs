@@ -4,12 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use artificer_api::CancellationToken;
 use artificer_api::export::{export_obj, export_stl_binary};
 use artificer_api::scripting::compile_script;
 use artificer_api::server::serve_stdio;
 use artificer_api::session::Session;
 use artificer_api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
-use artificer_api::CancellationToken;
 
 const USAGE: &str = "\
 USAGE:
@@ -60,7 +60,12 @@ fn run_app() -> Result<(), Box<dyn Error>> {
             let token = CancellationToken::default();
             for cmd in commands {
                 let res = session.execute(cmd, &token)?;
-                println!("  \u{2713} {}: {} ({:?})", res.step_label, res.topology, res.elapsed());
+                println!(
+                    "  \u{2713} {}: {} ({:?})",
+                    res.step_label,
+                    res.topology,
+                    res.elapsed()
+                );
             }
 
             println!("Success! Final snapshot {}", session.snapshot.id());
@@ -155,7 +160,9 @@ fn required_arg(arg: Option<String>, err_msg: &str) -> Result<String, Box<dyn Er
     arg.ok_or_else(|| err_msg.into())
 }
 
-fn parse_cli_flags(args: impl Iterator<Item = String>) -> Result<(BTreeMap<String, f64>, StandardView), Box<dyn Error>> {
+fn parse_cli_flags(
+    args: impl Iterator<Item = String>,
+) -> Result<(BTreeMap<String, f64>, StandardView), Box<dyn Error>> {
     let mut params = BTreeMap::new();
     let mut view = StandardView::Isometric;
     let mut iter = args.peekable();
@@ -173,7 +180,9 @@ fn parse_cli_flags(args: impl Iterator<Item = String>) -> Result<(BTreeMap<Strin
             params.insert(k.trim().to_owned(), num);
         } else if arg == "--view" {
             let Some(view_str) = iter.next() else {
-                return Err("--view requires a preset (isometric, trimetric, front, top, right)".into());
+                return Err(
+                    "--view requires a preset (isometric, trimetric, front, top, right)".into(),
+                );
             };
             view = match view_str.to_lowercase().as_str() {
                 "isometric" | "iso" => StandardView::Isometric,
@@ -192,7 +201,9 @@ fn parse_cli_flags(args: impl Iterator<Item = String>) -> Result<(BTreeMap<Strin
     Ok((params, view))
 }
 
-fn parse_param_flags(args: impl Iterator<Item = String>) -> Result<BTreeMap<String, f64>, Box<dyn Error>> {
+fn parse_param_flags(
+    args: impl Iterator<Item = String>,
+) -> Result<BTreeMap<String, f64>, Box<dyn Error>> {
     let (params, _) = parse_cli_flags(args)?;
     Ok(params)
 }

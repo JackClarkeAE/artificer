@@ -3677,24 +3677,32 @@ fn triangulate_face_boundaries(
                 .then_with(|| left.cmp(right))
         });
         let outer_candidates: Vec<usize> = candidates.clone();
-        let outer_vertex = outer_candidates.iter().copied().find(|candidate| {
-            bridge_is_visible(
-                polygon[*candidate].projected,
-                hole_point,
-                *candidate,
-                hole_vertex,
-                &polygon,
-                boundary_index,
-                &projected_boundaries,
-            )
-        }).or_else(|| {
-            // Fallback: choose closest candidate whose midpoint is inside the face
-            candidates.into_iter().find(|candidate| {
-                let outer = polygon[*candidate].projected;
-                let midpoint = topology::Point2::new((outer.x + hole_point.x) * 0.5, (outer.y + hole_point.y) * 0.5);
-                point_in_polygon_2d(midpoint, &projected_boundaries[0])
+        let outer_vertex = outer_candidates
+            .iter()
+            .copied()
+            .find(|candidate| {
+                bridge_is_visible(
+                    polygon[*candidate].projected,
+                    hole_point,
+                    *candidate,
+                    hole_vertex,
+                    &polygon,
+                    boundary_index,
+                    &projected_boundaries,
+                )
             })
-        }).unwrap_or(0);
+            .or_else(|| {
+                // Fallback: choose closest candidate whose midpoint is inside the face
+                candidates.into_iter().find(|candidate| {
+                    let outer = polygon[*candidate].projected;
+                    let midpoint = topology::Point2::new(
+                        (outer.x + hole_point.x) * 0.5,
+                        (outer.y + hole_point.y) * 0.5,
+                    );
+                    point_in_polygon_2d(midpoint, &projected_boundaries[0])
+                })
+            })
+            .unwrap_or(0);
 
         let outer_bridge = polygon[outer_vertex];
         let inner_bridge = TessellationVertex {
@@ -3765,7 +3773,11 @@ fn bridge_is_visible(
         }
         let start = polygon[edge_start].projected;
         let end = polygon[edge_end].projected;
-        if same_point_2d(start, outer) || same_point_2d(end, outer) || same_point_2d(start, inner) || same_point_2d(end, inner) {
+        if same_point_2d(start, outer)
+            || same_point_2d(end, outer)
+            || same_point_2d(start, inner)
+            || same_point_2d(end, inner)
+        {
             continue;
         }
         if segments_intersect_2d(outer, inner, start, end) {
@@ -3782,7 +3794,11 @@ fn bridge_is_visible(
             }
             let start = boundary[edge_start];
             let end = boundary[edge_end];
-            if same_point_2d(start, outer) || same_point_2d(end, outer) || same_point_2d(start, inner) || same_point_2d(end, inner) {
+            if same_point_2d(start, outer)
+                || same_point_2d(end, outer)
+                || same_point_2d(start, inner)
+                || same_point_2d(end, inner)
+            {
                 continue;
             }
             if segments_intersect_2d(outer, inner, start, end) {
@@ -3829,8 +3845,14 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
             let p_curr = projected[remaining[current]];
             let p_next = projected[remaining[next]];
 
-            if same_point_2d(p_prev, p_curr) || same_point_2d(p_curr, p_next) || same_point_2d(p_prev, p_next) {
-                best_ear = Some((current, [remaining[previous], remaining[current], remaining[next]]));
+            if same_point_2d(p_prev, p_curr)
+                || same_point_2d(p_curr, p_next)
+                || same_point_2d(p_prev, p_next)
+            {
+                best_ear = Some((
+                    current,
+                    [remaining[previous], remaining[current], remaining[next]],
+                ));
                 break;
             }
 
@@ -3841,11 +3863,15 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
 
             let triangle = [remaining[previous], remaining[current], remaining[next]];
             let has_interior_vertex = remaining.iter().copied().any(|candidate| {
-                if candidate == triangle[0] || candidate == triangle[1] || candidate == triangle[2] {
+                if candidate == triangle[0] || candidate == triangle[1] || candidate == triangle[2]
+                {
                     return false;
                 }
                 let pt = projected[candidate];
-                if same_point_2d(pt, p_prev) || same_point_2d(pt, p_curr) || same_point_2d(pt, p_next) {
+                if same_point_2d(pt, p_prev)
+                    || same_point_2d(pt, p_curr)
+                    || same_point_2d(pt, p_next)
+                {
                     return false;
                 }
                 point_strictly_in_triangle(pt, p_prev, p_curr, p_next)
@@ -3858,7 +3884,12 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
         }
 
         if let Some((current, triangle)) = best_ear {
-            if signed_area_2d(projected[triangle[0]], projected[triangle[1]], projected[triangle[2]]) > 1e-12 {
+            if signed_area_2d(
+                projected[triangle[0]],
+                projected[triangle[1]],
+                projected[triangle[2]],
+            ) > 1e-12
+            {
                 triangles.push(triangle);
             }
             remaining.remove(current);
@@ -3868,7 +3899,9 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
             if stalled_iterations > remaining.len() {
                 for k in 1..remaining.len().saturating_sub(1) {
                     let t = [remaining[0], remaining[k], remaining[k + 1]];
-                    if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs() > 1e-12 {
+                    if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs()
+                        > 1e-12
+                    {
                         triangles.push(t);
                     }
                 }
@@ -3878,7 +3911,11 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
             for current in 0..remaining.len() {
                 let previous = (current + remaining.len() - 1) % remaining.len();
                 let next = (current + 1) % remaining.len();
-                let area = signed_area_2d(projected[remaining[previous]], projected[remaining[current]], projected[remaining[next]]);
+                let area = signed_area_2d(
+                    projected[remaining[previous]],
+                    projected[remaining[current]],
+                    projected[remaining[next]],
+                );
                 if area.abs() <= 1e-10 {
                     remaining.remove(current);
                     removed = true;

@@ -3,14 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use artificer_kernel::{
-    CancellationToken, ExecutionOutcome, NativeKernel, Snapshot,
-};
+use artificer_kernel::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
-    ExecuteRequest, KernelCommand, OperationReport,
-    PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
-    Point2, Point3, PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, Vector3,
+    ExecuteRequest, KernelCommand, OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3,
+    PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId,
+    RevolveAngle, SnapshotId, Vector3,
 };
 
 use crate::commands::{ApiCommand, SketchEntity, SketchPlane};
@@ -78,15 +76,24 @@ impl Session {
         let step_label = command.label().to_owned();
 
         let outcome: ExecutionOutcome = match &command {
-            ApiCommand::BooleanUnion { target, tool, .. } => {
-                self.execute_boolean_op(target.0.as_str(), tool.0.as_str(), BooleanOperation::Union, token)?
-            }
-            ApiCommand::BooleanDifference { target, tool, .. } => {
-                self.execute_boolean_op(target.0.as_str(), tool.0.as_str(), BooleanOperation::Difference, token)?
-            }
-            ApiCommand::BooleanIntersection { target, tool, .. } => {
-                self.execute_boolean_op(target.0.as_str(), tool.0.as_str(), BooleanOperation::Intersection, token)?
-            }
+            ApiCommand::BooleanUnion { target, tool, .. } => self.execute_boolean_op(
+                target.0.as_str(),
+                tool.0.as_str(),
+                BooleanOperation::Union,
+                token,
+            )?,
+            ApiCommand::BooleanDifference { target, tool, .. } => self.execute_boolean_op(
+                target.0.as_str(),
+                tool.0.as_str(),
+                BooleanOperation::Difference,
+                token,
+            )?,
+            ApiCommand::BooleanIntersection { target, tool, .. } => self.execute_boolean_op(
+                target.0.as_str(),
+                tool.0.as_str(),
+                BooleanOperation::Intersection,
+                token,
+            )?,
             _ => {
                 let kernel_cmd = self.lower_command(&command)?;
                 let request = ExecuteRequest {
@@ -119,7 +126,10 @@ impl Session {
                         EntityInfo {
                             kind: out_entity.kind,
                             entity_ref: *out_entity,
-                            geometry_description: format!("{:?} {}", out_entity.kind, out_entity.entity),
+                            geometry_description: format!(
+                                "{:?} {}",
+                                out_entity.kind, out_entity.entity
+                            ),
                             role: Some(role.name.clone()),
                             ordinal: role.ordinal,
                         },
@@ -155,8 +165,7 @@ impl Session {
         self.redo_stack.clear();
 
         self.step_order.push(step_label.clone());
-        self.step_reports
-            .insert(step_label.clone(), outcome.report);
+        self.step_reports.insert(step_label.clone(), outcome.report);
         self.step_snapshots
             .insert(step_label, outcome.snapshot.id());
         self.snapshot_cache
@@ -174,7 +183,11 @@ impl Session {
         operation: BooleanOperation,
         token: &CancellationToken,
     ) -> Result<ExecutionOutcome, ApiError> {
-        let target_snap_id = self.step_snapshots.get(target_step).copied().unwrap_or(self.snapshot.id());
+        let target_snap_id = self
+            .step_snapshots
+            .get(target_step)
+            .copied()
+            .unwrap_or(self.snapshot.id());
         let tool_snap_id = self.step_snapshots.get(tool_step).copied().ok_or_else(|| {
             ApiError::new(
                 ApiErrorCode::SelectorNotFound,
@@ -185,7 +198,9 @@ impl Session {
         let target_snap = self.snapshot_cache.get(&target_snap_id).ok_or_else(|| {
             ApiError::new(
                 ApiErrorCode::SessionError,
-                format!("Snapshot {target_snap_id} for target step \"{target_step}\" not found in cache"),
+                format!(
+                    "Snapshot {target_snap_id} for target step \"{target_step}\" not found in cache"
+                ),
             )
         })?;
 
@@ -205,7 +220,8 @@ impl Session {
             operation,
         };
 
-        NativeKernel::execute_boolean(target_snap, tool_snap, &request, token).map_err(ApiError::from)
+        NativeKernel::execute_boolean(target_snap, tool_snap, &request, token)
+            .map_err(ApiError::from)
     }
 
     fn lower_command(&self, cmd: &ApiCommand) -> Result<KernelCommand, ApiError> {
@@ -254,12 +270,8 @@ impl Session {
                 })
             }
             ApiCommand::PushPull { face, distance, .. } => {
-                let target_face = resolve_selector(
-                    face,
-                    &self.snapshot,
-                    &self.step_order,
-                    &self.step_reports,
-                )?;
+                let target_face =
+                    resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?;
                 Ok(KernelCommand::PushPullFace {
                     target_face,
                     distance: *distance,
@@ -272,12 +284,8 @@ impl Session {
                 depth,
                 ..
             } => {
-                let target_face = resolve_selector(
-                    face,
-                    &self.snapshot,
-                    &self.step_order,
-                    &self.step_reports,
-                )?;
+                let target_face =
+                    resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?;
                 let support = NativeKernel::planar_face_support(&self.snapshot, target_face)
                     .map_err(ApiError::from)?;
                 Ok(KernelCommand::DrillHole {
@@ -361,9 +369,7 @@ impl Session {
                 "Sketch step must be followed by an Extrude or Revolve feature",
             )),
             ApiCommand::Extrude {
-                sketch,
-                distance,
-                ..
+                sketch, distance, ..
             } => {
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 Ok(KernelCommand::ExtrudePlanarProfile {
@@ -372,10 +378,7 @@ impl Session {
                     distance: *distance,
                 })
             }
-            ApiCommand::Revolve {
-                sketch,
-                ..
-            } => {
+            ApiCommand::Revolve { sketch, .. } => {
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 let axis = PlanarAxis2 {
                     start: Point2::new(0.0, 0.0),
@@ -394,7 +397,10 @@ impl Session {
         }
     }
 
-    fn build_sketch_profile(&self, sketch: &crate::commands::StepLabel) -> Result<(PlanarFrame3, PlanarProfile2), ApiError> {
+    fn build_sketch_profile(
+        &self,
+        sketch: &crate::commands::StepLabel,
+    ) -> Result<(PlanarFrame3, PlanarProfile2), ApiError> {
         let sketch_entry = self
             .journal
             .entries
@@ -447,7 +453,11 @@ impl Session {
                                 end: *end,
                             });
                         }
-                        SketchEntity::Rectangle { origin, width, height } => {
+                        SketchEntity::Rectangle {
+                            origin,
+                            width,
+                            height,
+                        } => {
                             let p0 = *origin;
                             let p1 = Point2::new(origin.x + width, origin.y);
                             let p2 = Point2::new(origin.x + width, origin.y + height);
@@ -464,7 +474,12 @@ impl Session {
                                 direction: ArcDirection::CounterClockwise,
                             });
                         }
-                        SketchEntity::Arc { center, radius, start_angle, end_angle } => {
+                        SketchEntity::Arc {
+                            center,
+                            radius,
+                            start_angle,
+                            end_angle,
+                        } => {
                             let start_x = center.x + radius * start_angle.cos();
                             let start_y = center.y + radius * start_angle.sin();
                             let end_x = center.x + radius * end_angle.cos();
@@ -529,10 +544,7 @@ impl Session {
             self.journal.entries.pop();
             Ok(())
         } else {
-            Err(ApiError::new(
-                ApiErrorCode::SessionError,
-                "Nothing to undo",
-            ))
+            Err(ApiError::new(ApiErrorCode::SessionError, "Nothing to undo"))
         }
     }
 
@@ -541,10 +553,7 @@ impl Session {
             self.execute(entry.command, &CancellationToken::default())?;
             Ok(())
         } else {
-            Err(ApiError::new(
-                ApiErrorCode::SessionError,
-                "Nothing to redo",
-            ))
+            Err(ApiError::new(ApiErrorCode::SessionError, "Nothing to redo"))
         }
     }
 

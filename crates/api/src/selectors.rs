@@ -27,9 +27,7 @@ pub enum EntitySelector {
     /// Select by geometric property in the current snapshot.
     ByGeometry(GeometricSelector),
     /// Direct, snapshot-bound entity reference.
-    Direct {
-        entity_ref: EntityRef,
-    },
+    Direct { entity_ref: EntityRef },
 }
 
 impl EntitySelector {
@@ -92,10 +90,7 @@ pub enum GeometricSelector {
         match_kind: NormalMatch,
     },
     /// Select the entity of `kind` closest to a 3D coordinate.
-    NearestTo {
-        point: Point3,
-        kind: EntityKind,
-    },
+    NearestTo { point: Point3, kind: EntityKind },
     /// Filter entities by geometric carrier type.
     ByType {
         surface_type: SurfaceFilter,
@@ -155,16 +150,16 @@ pub enum SelectorResolutionError {
         selector_description: String,
         message: String,
     },
-    #[error("Ambiguous selector: {selector_description}. Found {candidate_count} candidates. Suggestion: {suggestion}")]
+    #[error(
+        "Ambiguous selector: {selector_description}. Found {candidate_count} candidates. Suggestion: {suggestion}"
+    )]
     Ambiguous {
         selector_description: String,
         candidate_count: usize,
         suggestion: String,
     },
     #[error("Stale reference: {message}")]
-    StaleReference {
-        message: String,
-    },
+    StaleReference { message: String },
 }
 
 impl From<SelectorResolutionError> for ApiError {
@@ -386,10 +381,9 @@ fn resolve_geometric_selector(
             direction,
             match_kind,
         } => {
-            let dir_len = (direction.x * direction.x
-                + direction.y * direction.y
-                + direction.z * direction.z)
-                .sqrt();
+            let dir_len =
+                (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
+                    .sqrt();
             if dir_len <= 1e-9 {
                 return Err(ApiError::new(
                     ApiErrorCode::InvalidInput,
@@ -433,15 +427,13 @@ fn resolve_geometric_selector(
             for (face_id, (sum_n, count)) in face_normals {
                 let count_f = count as f64;
                 let avg_n = Vector3::new(sum_n.x / count_f, sum_n.y / count_f, sum_n.z / count_f);
-                let len =
-                    (avg_n.x * avg_n.x + avg_n.y * avg_n.y + avg_n.z * avg_n.z).sqrt();
+                let len = (avg_n.x * avg_n.x + avg_n.y * avg_n.y + avg_n.z * avg_n.z).sqrt();
                 if len <= 1e-9 {
                     continue;
                 }
                 let unit_n = Vector3::new(avg_n.x / len, avg_n.y / len, avg_n.z / len);
-                let dot = unit_n.x * target_dir.x
-                    + unit_n.y * target_dir.y
-                    + unit_n.z * target_dir.z;
+                let dot =
+                    unit_n.x * target_dir.x + unit_n.y * target_dir.y + unit_n.z * target_dir.z;
 
                 let score = match match_kind {
                     NormalMatch::Closest => dot,
@@ -498,8 +490,7 @@ fn resolve_geometric_selector(
                     }
                     for (face_id, (sum_p, count)) in face_centers {
                         let cf = count as f64;
-                        let center =
-                            Point3::new(sum_p.x / cf, sum_p.y / cf, sum_p.z / cf);
+                        let center = Point3::new(sum_p.x / cf, sum_p.y / cf, sum_p.z / cf);
                         let dx = center.x - point.x;
                         let dy = center.y - point.y;
                         let dz = center.z - point.z;
@@ -566,8 +557,12 @@ fn resolve_geometric_selector(
 
             for edge in &scene.edges {
                 let incidents = edge.incident_faces;
-                let has_a = incidents.iter().any(|f| f.is_some_and(|r| r.entity == ref_a.entity));
-                let has_b = incidents.iter().any(|f| f.is_some_and(|r| r.entity == ref_b.entity));
+                let has_a = incidents
+                    .iter()
+                    .any(|f| f.is_some_and(|r| r.entity == ref_a.entity));
+                let has_b = incidents
+                    .iter()
+                    .any(|f| f.is_some_and(|r| r.entity == ref_b.entity));
                 if has_a && has_b {
                     return Ok(EntityRef {
                         snapshot: current_snapshot.id(),

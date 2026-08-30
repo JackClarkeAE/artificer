@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use artificer_api::CancellationToken;
 use artificer_api::commands::ApiCommand;
 use artificer_api::export::{export_obj, export_stl_ascii, export_stl_binary};
 use artificer_api::scripting::compile_script;
@@ -7,7 +8,6 @@ use artificer_api::selectors::{EntitySelector, GeometricSelector, NormalMatch};
 use artificer_api::server::SharedSession;
 use artificer_api::session::Session;
 use artificer_api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
-use artificer_api::CancellationToken;
 use artificer_protocol::{Point2, Point3, Vector3};
 
 #[test]
@@ -73,7 +73,10 @@ fn test_history_and_geometric_selectors() {
         match_kind: NormalMatch::Closest,
     });
 
-    let entity_info = session.query().entity_info(&geom_sel).expect("Query face info");
+    let entity_info = session
+        .query()
+        .entity_info(&geom_sel)
+        .expect("Query face info");
     assert_eq!(entity_info.kind, artificer_protocol::EntityKind::Face);
 }
 
@@ -264,16 +267,20 @@ fn test_sketch_and_extrude() {
         .expect_err("Sketch by itself cannot be executed without extrude/revolve");
 
     // Push sketch to journal manually for extrude to consume
-    session.journal.push(artificer_api::journal::JournalEntry::new(ApiCommand::Sketch {
-        label: "sk1".to_owned(),
-        on: artificer_api::commands::SketchPlane::XY,
-        entities: vec![artificer_api::commands::SketchEntity::Rectangle {
-            origin: Point2::new(0.0, 0.0),
-            width: 30.0,
-            height: 20.0,
-        }],
-        constraints: Vec::new(),
-    }));
+    session
+        .journal
+        .push(artificer_api::journal::JournalEntry::new(
+            ApiCommand::Sketch {
+                label: "sk1".to_owned(),
+                on: artificer_api::commands::SketchPlane::XY,
+                entities: vec![artificer_api::commands::SketchEntity::Rectangle {
+                    origin: Point2::new(0.0, 0.0),
+                    width: 30.0,
+                    height: 20.0,
+                }],
+                constraints: Vec::new(),
+            },
+        ));
 
     let ext_res = session
         .execute(
@@ -468,15 +475,19 @@ fn test_three_holes_and_crossing_side_cut() {
         .expect("Drill side hole");
 
     // 4. Render snapshot
-    let snap_res = session.snapshot(SnapshotOptions {
-        camera: CameraSpec::preset(StandardView::Trimetric),
-        format: artificer_api::snapshot::SnapshotFormat::Svg,
-        display_mode: "shaded".to_owned(),
-        show_labels: false,
-        highlight: vec![],
-    }).expect("snapshot");
+    let snap_res = session
+        .snapshot(SnapshotOptions {
+            camera: CameraSpec::preset(StandardView::Trimetric),
+            format: artificer_api::snapshot::SnapshotFormat::Svg,
+            display_mode: "shaded".to_owned(),
+            show_labels: false,
+            highlight: vec![],
+        })
+        .expect("snapshot");
 
-    let SnapshotOutput::Svg(svg) = snap_res else { panic!("expected SVG"); };
+    let SnapshotOutput::Svg(svg) = snap_res else {
+        panic!("expected SVG");
+    };
     assert!(!svg.is_empty());
     assert!(svg.contains("<svg"));
     println!("Generated SVG snapshot: {} bytes", svg.len());
