@@ -1,0 +1,13 @@
+// bearing_mount.art — Example parametric CAD model
+
+param width: f64 = 60.0;
+param depth: f64 = 40.0;
+param height: f64 = 25.0;
+param bore_diameter: f64 = 14.0;
+
+// Base block
+let base = box(origin: [0, 0, 0], size: [width, depth, height], label: "base");
+
+// Center bore hole on the top face
+let top = base.face("top_face");
+drill(face: top, center: [0.0, 0.0], diameter: bore_diameter, depth: height, label: "bore");

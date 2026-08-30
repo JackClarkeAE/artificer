@@ -1,0 +1,15 @@
+[package]
+name = "artificer-api-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+artificer-api = { path = "../../crates/api" }
+artificer-protocol = { path = "../../crates/protocol" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

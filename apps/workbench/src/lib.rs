@@ -298,6 +298,12 @@ enum ConstructionPlaneSource {
         second_body: BodyId,
         second_face: EntityRef,
     },
+    FromOrigin {
+        plane_index: u8,
+    },
+    FromPlane {
+        id: u64,
+    },
 }
 
 /// Top-level presentation mode of the Artificer workbench.
@@ -553,6 +559,8 @@ impl PendingOperation {
             Self::CreateConstructionPlane { source, .. } => match source {
                 ConstructionPlaneSource::OnFace { .. } => "Create plane on face",
                 ConstructionPlaneSource::BetweenFaces { .. } => "Create midplane",
+                ConstructionPlaneSource::FromOrigin { .. } => "Create origin datum plane",
+                ConstructionPlaneSource::FromPlane { .. } => "Create construction plane",
             },
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
@@ -615,6 +623,12 @@ impl PendingOperation {
                 }
                 ConstructionPlaneSource::BetweenFaces { .. } => {
                     "Commit a datum plane halfway between two parallel planar faces"
+                }
+                ConstructionPlaneSource::FromOrigin { .. } => {
+                    "Commit a datum plane on the selected origin plane"
+                }
+                ConstructionPlaneSource::FromPlane { .. } => {
+                    "Commit a datum plane on the selected construction plane"
                 }
             },
             Self::BooleanBodies { .. } => {
@@ -2797,6 +2811,8 @@ impl KernelLabApp {
 
     /// Selects one region of a committed sketch by the anchor the model
     /// viewport reports for it.
+    /// Selects the exact bounded cell containing `anchor` in the committed
+    /// sketch `sketch_index`.
     ///
     /// This is the seam the viewport click uses. It is renderer-independent so
     /// the same path is reachable without a projected pointer position.
@@ -2805,6 +2821,15 @@ impl KernelLabApp {
         sketch_index: usize,
         anchor: [f64; 2],
     ) -> bool {
+        self.select_committed_sketch_region_additive(sketch_index, anchor, false)
+    }
+
+    pub fn select_committed_sketch_region_additive(
+        &mut self,
+        sketch_index: usize,
+        anchor: [f64; 2],
+        additive: bool,
+    ) -> bool {
         // A draft sketch has no document identity to re-activate from; it is
         // already the live canvas, and its regions are just as pickable.
         if self.active_sketch_index != Some(sketch_index)
@@ -2812,10 +2837,12 @@ impl KernelLabApp {
         {
             return false;
         }
-        self.clear_model_entity_selection();
+        if !additive {
+            self.clear_model_entity_selection();
+        }
         let selected = self
             .sketch
-            .select_region_at_point(SketchPoint::new(anchor[0], anchor[1]), false);
+            .select_region_at_point(SketchPoint::new(anchor[0], anchor[1]), additive);
         if selected || self.sketch.selected_region_count() > 0 {
             self.document_status =
                 Some("Committed sketch region selected · choose Extrude, Add, or Cut".to_owned());
@@ -6531,7 +6558,39 @@ impl KernelLabApp {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
-        if !(1..=2).contains(&self.selected_faces.len()) {
+        if self.selected_faces.is_empty() {
+            if let Some(id) = self.selected_construction_plane
+                && let Some(plane) = self.construction_planes.iter().find(|p| p.id == id).cloned()
+            {
+                self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
+                    frame: plane.frame,
+                    half_u: plane.half_u,
+                    half_v: plane.half_v,
+                    source: ConstructionPlaneSource::FromPlane { id: plane.id },
+                });
+                self.document_status = Some("Construction plane staged · confirm with Enter or the green tick".into());
+                return;
+            }
+            let plane = self.selected_origin_plane;
+            let frame = sketch_plane_frame(plane);
+            let plane_index = match plane {
+                SketchPlane::XY => 0,
+                SketchPlane::YZ => 1,
+                SketchPlane::XZ => 2,
+            };
+            self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
+                frame,
+                half_u: ORIGIN_PLANE_HALF_EXTENT_MM,
+                half_v: ORIGIN_PLANE_HALF_EXTENT_MM,
+                source: ConstructionPlaneSource::FromOrigin { plane_index },
+            });
+            self.document_status = Some(format!(
+                "{} construction plane staged · confirm with Enter or the green tick",
+                origin_plane_label(plane)
+            ));
+            return;
+        }
+        if self.selected_faces.len() > 2 {
             self.document_status = Some(
                 "Select one planar face for a coincident plane, or two parallel planar faces for a midplane"
                     .into(),
@@ -15182,7 +15241,8 @@ impl KernelLabApp {
                             self.measured_face = Some(face);
                         }
                     } else if let Some(region) = output.selected_sketch_region {
-                        self.select_committed_sketch_region(region.sketch_index, region.anchor);
+                        let additive = ui.input(|input| input.modifiers.shift);
+                        self.select_committed_sketch_region_additive(region.sketch_index, region.anchor, additive);
                     } else if let Some(vertex) = output.selected_vertex
                         && let Some(index) = self
                             .bodies

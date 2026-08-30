@@ -1,8 +1,10 @@
 [workspace]
 members = [
+    "apps/api-server",
     "apps/compute-bench",
     "apps/cli",
     "apps/workbench",
+    "crates/api",
     "crates/catalog",
     "crates/compute",
     "crates/geometry",
@@ -18,7 +20,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.9.4"
+version = "0.9.5"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"
