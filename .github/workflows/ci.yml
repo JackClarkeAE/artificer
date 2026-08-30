@@ -276,6 +276,11 @@ jobs:
           set -euo pipefail
           channel_asset="releases.${{ runner.os == 'Windows' && 'win' || 'linux' }}.json"
           gh release delete-asset "$GITHUB_REF_NAME" "$channel_asset" --yes 2>/dev/null || true
+          for file in artifacts/releases/*; do
+            [ -f "$file" ] || continue
+            filename="$(basename "$file")"
+            gh release delete-asset "$GITHUB_REF_NAME" "$filename" --yes 2>/dev/null || true
+          done
           vpk upload github \
             --repoUrl "https://github.com/${{ github.repository }}" \
             --token "$GH_TOKEN" \
