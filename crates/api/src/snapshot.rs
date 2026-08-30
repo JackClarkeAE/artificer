@@ -298,8 +298,10 @@ fn render_svg_scene(
     // Sort triangles by depth (back to front)
     let mut triangles = scene.triangles.iter().collect::<Vec<_>>();
     triangles.sort_by(|a, b| {
-        let za = (project(a.vertices[0]).2 + project(a.vertices[1]).2 + project(a.vertices[2]).2) / 3.0;
-        let zb = (project(b.vertices[0]).2 + project(b.vertices[1]).2 + project(b.vertices[2]).2) / 3.0;
+        let za =
+            (project(a.vertices[0]).2 + project(a.vertices[1]).2 + project(a.vertices[2]).2) / 3.0;
+        let zb =
+            (project(b.vertices[0]).2 + project(b.vertices[1]).2 + project(b.vertices[2]).2) / 3.0;
         za.total_cmp(&zb)
     });
 
@@ -336,7 +338,9 @@ fn render_svg_scene(
     svg.push_str("  </g>\n");
 
     // Render edge lines
-    svg.push_str("  <g fill=\"none\" stroke=\"#d5e2ee\" stroke-width=\"1.8\" stroke-linecap=\"round\">\n");
+    svg.push_str(
+        "  <g fill=\"none\" stroke=\"#d5e2ee\" stroke-width=\"1.8\" stroke-linecap=\"round\">\n",
+    );
     for edge in &scene.edges {
         let p0 = screen_point(edge.endpoints[0]);
         let p1 = screen_point(edge.endpoints[1]);

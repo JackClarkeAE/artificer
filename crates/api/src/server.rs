@@ -95,7 +95,9 @@ impl SharedSession {
         let id = req.id.clone();
         let mut session = match self.session.lock() {
             Ok(s) => s,
-            Err(e) => return JsonRpcResponse::err(id, -32603, format!("Session lock poisoned: {e}")),
+            Err(e) => {
+                return JsonRpcResponse::err(id, -32603, format!("Session lock poisoned: {e}"));
+            }
         };
 
         let token = CancellationToken::default();
@@ -105,7 +107,9 @@ impl SharedSession {
             "execute" => {
                 let cmd: ApiCommand = match serde_json::from_value(params) {
                     Ok(c) => c,
-                    Err(e) => return JsonRpcResponse::err(id, -32602, format!("Invalid command: {e}")),
+                    Err(e) => {
+                        return JsonRpcResponse::err(id, -32602, format!("Invalid command: {e}"));
+                    }
                 };
                 match session.execute(cmd, &token) {
                     Ok(res) => match serde_json::to_value(res) {
@@ -129,7 +133,9 @@ impl SharedSession {
             "query.entity_info" => {
                 let sel: EntitySelector = match serde_json::from_value(params) {
                     Ok(s) => s,
-                    Err(e) => return JsonRpcResponse::err(id, -32602, format!("Invalid selector: {e}")),
+                    Err(e) => {
+                        return JsonRpcResponse::err(id, -32602, format!("Invalid selector: {e}"));
+                    }
                 };
                 match session.query().entity_info(&sel) {
                     Ok(info) => match serde_json::to_value(info) {
@@ -147,7 +153,13 @@ impl SharedSession {
                 }
                 let m_params: MeasureParams = match serde_json::from_value(params) {
                     Ok(p) => p,
-                    Err(e) => return JsonRpcResponse::err(id, -32602, format!("Invalid measure params: {e}")),
+                    Err(e) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            -32602,
+                            format!("Invalid measure params: {e}"),
+                        );
+                    }
                 };
                 match session.query().measure(&m_params.from, &m_params.to) {
                     Ok(m) => match serde_json::to_value(m) {
@@ -199,7 +211,13 @@ impl SharedSession {
                 }
                 let s_params: ScriptParams = match serde_json::from_value(params) {
                     Ok(p) => p,
-                    Err(e) => return JsonRpcResponse::err(id, -32602, format!("Invalid script params: {e}")),
+                    Err(e) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            -32602,
+                            format!("Invalid script params: {e}"),
+                        );
+                    }
                 };
                 let commands = match compile_script(&s_params.source, &s_params.params) {
                     Ok(cmds) => cmds,

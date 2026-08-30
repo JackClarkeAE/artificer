@@ -11,12 +11,12 @@ use thiserror::Error;
 
 use crate::commands::{ApiCommand, StepLabel};
 use crate::debug::{ApiError, ApiErrorCode};
-use crate::scripting::ast::{
-    AstNode, BinaryOperator, Expression, UnaryOperator,
-};
+use crate::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
 use crate::scripting::lexer::tokenize;
 use crate::scripting::parser::Parser;
-use crate::selectors::{EntitySelector, Extremum, GeometricSelector, Metric, NormalMatch, SurfaceFilter};
+use crate::selectors::{
+    EntitySelector, Extremum, GeometricSelector, Metric, NormalMatch, SurfaceFilter,
+};
 
 #[derive(Debug, Error)]
 pub enum ScriptError {
@@ -111,7 +111,9 @@ impl Value {
                 arr[1].as_number()?,
                 arr[2].as_number()?,
             )),
-            other => Err(ScriptError::Eval(format!("Expected [x, y, z] array, got {other:?}"))),
+            other => Err(ScriptError::Eval(format!(
+                "Expected [x, y, z] array, got {other:?}"
+            ))),
         }
     }
 
@@ -122,7 +124,9 @@ impl Value {
                 arr[1].as_number()?,
                 arr[2].as_number()?,
             )),
-            other => Err(ScriptError::Eval(format!("Expected [x, y, z] vector, got {other:?}"))),
+            other => Err(ScriptError::Eval(format!(
+                "Expected [x, y, z] vector, got {other:?}"
+            ))),
         }
     }
 
@@ -131,14 +135,18 @@ impl Value {
             Self::Array(arr) if arr.len() == 2 => {
                 Ok(Point2::new(arr[0].as_number()?, arr[1].as_number()?))
             }
-            other => Err(ScriptError::Eval(format!("Expected [x, y] array, got {other:?}"))),
+            other => Err(ScriptError::Eval(format!(
+                "Expected [x, y] array, got {other:?}"
+            ))),
         }
     }
 
     fn as_selector(&self) -> Result<EntitySelector, ScriptError> {
         match self {
             Self::Selector(sel) => Ok(sel.clone()),
-            other => Err(ScriptError::Eval(format!("Expected entity selector, got {other:?}"))),
+            other => Err(ScriptError::Eval(format!(
+                "Expected entity selector, got {other:?}"
+            ))),
         }
     }
 }
@@ -381,7 +389,9 @@ fn eval_function_call(
             let spec = if !positional_args.is_empty() {
                 eval_expr(&positional_args[0], env)?.as_string()?.to_owned()
             } else {
-                return Err(ScriptError::Eval("faces() requires a selector string, e.g. \">Z\"".to_owned()));
+                return Err(ScriptError::Eval(
+                    "faces() requires a selector string, e.g. \">Z\"".to_owned(),
+                ));
             };
 
             let sel = match spec.as_str() {
@@ -426,7 +436,9 @@ fn eval_function_call(
             let spec = if !positional_args.is_empty() {
                 eval_expr(&positional_args[0], env)?.as_string()?.to_owned()
             } else {
-                return Err(ScriptError::Eval("edges() requires a selector string, e.g. \"|Z\"".to_owned()));
+                return Err(ScriptError::Eval(
+                    "edges() requires a selector string, e.g. \"|Z\"".to_owned(),
+                ));
             };
 
             let sel = match spec.as_str() {
@@ -532,6 +544,8 @@ fn eval_method_call(
                 .collect();
             Ok(Value::Array(edge_selectors))
         }
-        other => Err(ScriptError::Eval(format!("Unknown method `{other}` on step"))),
+        other => Err(ScriptError::Eval(format!(
+            "Unknown method `{other}` on step"
+        ))),
     }
 }

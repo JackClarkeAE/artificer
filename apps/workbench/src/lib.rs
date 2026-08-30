@@ -6560,7 +6560,11 @@ impl KernelLabApp {
         }
         if self.selected_faces.is_empty() {
             if let Some(id) = self.selected_construction_plane
-                && let Some(plane) = self.construction_planes.iter().find(|p| p.id == id).cloned()
+                && let Some(plane) = self
+                    .construction_planes
+                    .iter()
+                    .find(|p| p.id == id)
+                    .cloned()
             {
                 self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
                     frame: plane.frame,
@@ -6568,7 +6572,8 @@ impl KernelLabApp {
                     half_v: plane.half_v,
                     source: ConstructionPlaneSource::FromPlane { id: plane.id },
                 });
-                self.document_status = Some("Construction plane staged · confirm with Enter or the green tick".into());
+                self.document_status =
+                    Some("Construction plane staged · confirm with Enter or the green tick".into());
                 return;
             }
             let plane = self.selected_origin_plane;
@@ -15242,7 +15247,11 @@ impl KernelLabApp {
                         }
                     } else if let Some(region) = output.selected_sketch_region {
                         let additive = ui.input(|input| input.modifiers.shift);
-                        self.select_committed_sketch_region_additive(region.sketch_index, region.anchor, additive);
+                        self.select_committed_sketch_region_additive(
+                            region.sketch_index,
+                            region.anchor,
+                            additive,
+                        );
                     } else if let Some(vertex) = output.selected_vertex
                         && let Some(index) = self
                             .bodies

@@ -838,11 +838,19 @@ fn shift_select_multiple_sketch_regions_in_viewport() {
     assert_eq!(anchors.len(), 2);
 
     // Select first region
-    assert!(harness.state_mut().select_committed_sketch_region_additive(0, anchors[0], false));
+    assert!(
+        harness
+            .state_mut()
+            .select_committed_sketch_region_additive(0, anchors[0], false)
+    );
     assert_eq!(harness.state().selected_sketch_region_count(), 1);
 
     // Shift-select second region
-    assert!(harness.state_mut().select_committed_sketch_region_additive(0, anchors[1], true));
+    assert!(
+        harness
+            .state_mut()
+            .select_committed_sketch_region_additive(0, anchors[1], true)
+    );
     assert_eq!(harness.state().selected_sketch_region_count(), 2);
 
     // Both regions should now extrude together (full rectangle without hole)

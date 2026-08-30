@@ -1,8 +1,6 @@
 //! Recursive-descent parser for the .art language.
 
-use crate::scripting::ast::{
-    AstNode, BinaryOperator, Expression, UnaryOperator,
-};
+use crate::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
 use crate::scripting::lexer::{SpannedToken, Token};
 
 pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
@@ -82,7 +80,11 @@ impl Parser {
         let (line, col) = self.current_span();
         let name = match self.advance() {
             Token::Ident(s) => s,
-            other => return Err(format!("Expected parameter identifier at {line}:{col}, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "Expected parameter identifier at {line}:{col}, got {other:?}"
+                ));
+            }
         };
 
         let mut param_type = "f64".to_owned();
@@ -112,7 +114,11 @@ impl Parser {
         let (line, col) = self.current_span();
         let name = match self.advance() {
             Token::Ident(s) => s,
-            other => return Err(format!("Expected variable name at {line}:{col}, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "Expected variable name at {line}:{col}, got {other:?}"
+                ));
+            }
         };
 
         self.expect(Token::Equal)?;
@@ -186,7 +192,11 @@ impl Parser {
                 let (line, col) = self.current_span();
                 let method = match self.advance() {
                     Token::Ident(s) => s,
-                    other => return Err(format!("Expected method name at {line}:{col}, got {other:?}")),
+                    other => {
+                        return Err(format!(
+                            "Expected method name at {line}:{col}, got {other:?}"
+                        ));
+                    }
                 };
 
                 let (named_args, positional_args) = self.parse_arguments()?;

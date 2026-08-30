@@ -3,9 +3,7 @@
 use std::collections::BTreeMap;
 
 use artificer_kernel::NativeKernel;
-use artificer_protocol::{
-    Aabb3, EntityId, EntityKind, Point3, SnapshotId, TopologyCounts,
-};
+use artificer_protocol::{Aabb3, EntityId, EntityKind, Point3, SnapshotId, TopologyCounts};
 use serde::{Deserialize, Serialize};
 
 use crate::debug::{ApiError, ApiErrorCode, EntityInfo};
@@ -81,35 +79,41 @@ impl<'a> QueryHandle<'a> {
         let scene = NativeKernel::debug_scene(&self.session.snapshot);
         let mut face_entities: BTreeMap<EntityId, EntityInfo> = BTreeMap::new();
         for tri in &scene.triangles {
-            face_entities.entry(tri.source_face.entity).or_insert_with(|| EntityInfo {
-                kind: EntityKind::Face,
-                entity_ref: tri.source_face,
-                geometry_description: format!("Face {}", tri.source_face.entity),
-                role: None,
-                ordinal: None,
-            });
+            face_entities
+                .entry(tri.source_face.entity)
+                .or_insert_with(|| EntityInfo {
+                    kind: EntityKind::Face,
+                    entity_ref: tri.source_face,
+                    geometry_description: format!("Face {}", tri.source_face.entity),
+                    role: None,
+                    ordinal: None,
+                });
         }
 
         let mut edge_entities: BTreeMap<EntityId, EntityInfo> = BTreeMap::new();
         for edge in &scene.edges {
-            edge_entities.entry(edge.source_edge.entity).or_insert_with(|| EntityInfo {
-                kind: EntityKind::Edge,
-                entity_ref: edge.source_edge,
-                geometry_description: format!("Edge {}", edge.source_edge.entity),
-                role: None,
-                ordinal: None,
-            });
+            edge_entities
+                .entry(edge.source_edge.entity)
+                .or_insert_with(|| EntityInfo {
+                    kind: EntityKind::Edge,
+                    entity_ref: edge.source_edge,
+                    geometry_description: format!("Edge {}", edge.source_edge.entity),
+                    role: None,
+                    ordinal: None,
+                });
         }
 
         let mut vertex_entities: BTreeMap<EntityId, EntityInfo> = BTreeMap::new();
         for v in &scene.vertices {
-            vertex_entities.entry(v.source_vertex.entity).or_insert_with(|| EntityInfo {
-                kind: EntityKind::Vertex,
-                entity_ref: v.source_vertex,
-                geometry_description: format!("Vertex {}", v.source_vertex.entity),
-                role: None,
-                ordinal: None,
-            });
+            vertex_entities
+                .entry(v.source_vertex.entity)
+                .or_insert_with(|| EntityInfo {
+                    kind: EntityKind::Vertex,
+                    entity_ref: v.source_vertex,
+                    geometry_description: format!("Vertex {}", v.source_vertex.entity),
+                    role: None,
+                    ordinal: None,
+                });
         }
 
         Ok(TopologyInfo {
@@ -128,9 +132,10 @@ impl<'a> QueryHandle<'a> {
         )?;
 
         let role_name = match selector {
-            EntitySelector::ByHistory { role, ordinal, .. } => {
-                Some(format!("{role}{}", ordinal.map_or(String::new(), |o| format!("[{o}]"))))
-            }
+            EntitySelector::ByHistory { role, ordinal, .. } => Some(format!(
+                "{role}{}",
+                ordinal.map_or(String::new(), |o| format!("[{o}]"))
+            )),
             _ => None,
         };
 
@@ -210,9 +215,15 @@ impl<'a> QueryHandle<'a> {
                         let mut count = 0usize;
                         for tri in &scene.triangles {
                             if tri.source_face.entity == entity_ref.entity {
-                                sum_p.x += (tri.vertices[0].x + tri.vertices[1].x + tri.vertices[2].x) / 3.0;
-                                sum_p.y += (tri.vertices[0].y + tri.vertices[1].y + tri.vertices[2].y) / 3.0;
-                                sum_p.z += (tri.vertices[0].z + tri.vertices[1].z + tri.vertices[2].z) / 3.0;
+                                sum_p.x +=
+                                    (tri.vertices[0].x + tri.vertices[1].x + tri.vertices[2].x)
+                                        / 3.0;
+                                sum_p.y +=
+                                    (tri.vertices[0].y + tri.vertices[1].y + tri.vertices[2].y)
+                                        / 3.0;
+                                sum_p.z +=
+                                    (tri.vertices[0].z + tri.vertices[1].z + tri.vertices[2].z)
+                                        / 3.0;
                                 count += 1;
                             }
                         }
@@ -227,7 +238,10 @@ impl<'a> QueryHandle<'a> {
                     }
                     _ => Err(ApiError::new(
                         ApiErrorCode::InvalidInput,
-                        format!("Cannot measure position of entity kind {:?}", entity_ref.kind),
+                        format!(
+                            "Cannot measure position of entity kind {:?}",
+                            entity_ref.kind
+                        ),
                     )),
                 }
             }
