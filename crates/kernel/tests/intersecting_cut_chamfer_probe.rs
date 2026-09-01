@@ -169,8 +169,11 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
         outcome.report.warnings
     );
     assert!(
-        NativeKernel::validate(&outcome.snapshot, artificer_protocol::ValidationProfile::Solid)
-            .valid
+        NativeKernel::validate(
+            &outcome.snapshot,
+            artificer_protocol::ValidationProfile::Solid
+        )
+        .valid
     );
     let before = slot_cut.measures().volume;
     let after = outcome.snapshot.measures().volume;

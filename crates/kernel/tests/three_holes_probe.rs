@@ -64,7 +64,11 @@ fn a_block_with_three_round_holes_is_exact_and_displays_both_caps() {
         NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
             .expect("extrude three holes should succeed");
     let snapshot = &outcome.snapshot;
-    assert!(outcome.report.warnings.is_empty(), "{:?}", outcome.report.warnings);
+    assert!(
+        outcome.report.warnings.is_empty(),
+        "{:?}",
+        outcome.report.warnings
+    );
     assert!(NativeKernel::validate(snapshot, ValidationProfile::Solid).valid);
 
     // Two caps, four walls, and two half-cylinder walls per hole.

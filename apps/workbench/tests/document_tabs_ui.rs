@@ -3,10 +3,7 @@
 
 use artificer_workbench::documents::WorkbenchShell;
 use egui::accesskit::Role;
-use egui_kittest::{
-    Harness,
-    kittest::{NodeT as _, Queryable as _},
-};
+use egui_kittest::{Harness, kittest::Queryable as _};
 
 fn harness() -> Harness<'static, WorkbenchShell> {
     Harness::builder()

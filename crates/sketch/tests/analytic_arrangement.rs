@@ -274,8 +274,12 @@ fn point_kissing_loops_each_remain_selectable_but_refuse_a_pinched_union() {
         .cell_at_point(SketchPoint2::new(3.0, 3.0), &precision)
         .expect("upper kissing square");
     assert!(
-        compile_selected_profile(&arrangement, std::slice::from_ref(&lower.signature), &precision)
-            .is_ok()
+        compile_selected_profile(
+            &arrangement,
+            std::slice::from_ref(&lower.signature),
+            &precision
+        )
+        .is_ok()
     );
     assert!(matches!(
         compile_selected_profile(
@@ -317,7 +321,11 @@ fn a_polygon_inscribed_in_a_circle_splits_it_into_selectable_segments() {
     ));
     let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
     assert_eq!(arrangement.cells.len(), 5, "{:?}", arrangement.diagnostics);
-    assert!(arrangement.diagnostics.is_empty(), "{:?}", arrangement.diagnostics);
+    assert!(
+        arrangement.diagnostics.is_empty(),
+        "{:?}",
+        arrangement.diagnostics
+    );
     let inner = arrangement
         .cell_at_point(SketchPoint2::new(0.0, 0.0), &precision)
         .expect("the inscribed diamond");
@@ -358,7 +366,11 @@ fn spokes_from_a_shared_centre_divide_a_square_into_quadrants() {
     }
     let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
     assert_eq!(arrangement.cells.len(), 4, "{:?}", arrangement.diagnostics);
-    assert!(arrangement.diagnostics.is_empty(), "{:?}", arrangement.diagnostics);
+    assert!(
+        arrangement.diagnostics.is_empty(),
+        "{:?}",
+        arrangement.diagnostics
+    );
 }
 
 #[test]
