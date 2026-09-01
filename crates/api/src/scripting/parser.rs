@@ -5,14 +5,25 @@ use crate::scripting::lexer::{SpannedToken, Token};
 
 pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
 
+/// The deepest expression nesting the parser follows. A script is a few
+/// hundred lines of feature calls, never a deeply nested term; the limit
+/// exists so that a hostile `((((...` over the wire is an error rather than
+/// a stack overflow that takes the whole server with it.
+pub const MAX_EXPRESSION_DEPTH: usize = 64;
+
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<SpannedToken>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -131,7 +142,16 @@ impl Parser {
     }
 
     pub fn parse_expression(&mut self) -> Result<Expression, String> {
-        self.parse_add_sub()
+        if self.depth >= MAX_EXPRESSION_DEPTH {
+            let (line, col) = self.current_span();
+            return Err(format!(
+                "Expression nested deeper than {MAX_EXPRESSION_DEPTH} levels at {line}:{col}"
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_add_sub();
+        self.depth -= 1;
+        result
     }
 
     fn parse_add_sub(&mut self) -> Result<Expression, String> {

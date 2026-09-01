@@ -231,12 +231,8 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "artificer-api"
 version = "0.9.5"
 dependencies = [
- "artificer-geometry",
  "artificer-kernel",
- "artificer-model",
  "artificer-protocol",
- "artificer-sketch",
- "artificer-testkit",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

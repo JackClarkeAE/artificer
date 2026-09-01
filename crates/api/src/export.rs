@@ -23,10 +23,49 @@ pub struct ExportResult {
     pub triangle_count: usize,
 }
 
+/// The facet normal of one triangle from its winding, which is what STL
+/// readers expect; a carrier normal at one vertex differs from it on every
+/// curved face.
+fn facet_normal(vertices: [artificer_protocol::Point3; 3]) -> artificer_protocol::Vector3 {
+    let [a, b, c] = vertices;
+    let ab = (b.x - a.x, b.y - a.y, b.z - a.z);
+    let ac = (c.x - a.x, c.y - a.y, c.z - a.z);
+    let n = (
+        ab.1 * ac.2 - ab.2 * ac.1,
+        ab.2 * ac.0 - ab.0 * ac.2,
+        ab.0 * ac.1 - ab.1 * ac.0,
+    );
+    let length = (n.0 * n.0 + n.1 * n.1 + n.2 * n.2).sqrt();
+    if length > 0.0 && length.is_finite() {
+        artificer_protocol::Vector3::new(n.0 / length, n.1 / length, n.2 / length)
+    } else {
+        artificer_protocol::Vector3::new(0.0, 0.0, 0.0)
+    }
+}
+
+/// A name safe to embed in a text header: one line, ASCII printable.
+fn header_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Exports the snapshot tessellation as a binary STL byte buffer.
 pub fn export_stl_binary(snapshot: &Snapshot) -> Result<Vec<u8>, ApiError> {
     let scene = NativeKernel::debug_scene(snapshot);
     let triangle_count = scene.triangles.len();
+    let count = u32::try_from(triangle_count).map_err(|_| {
+        ApiError::new(
+            crate::debug::ApiErrorCode::InvalidInput,
+            "The model has more triangles than binary STL can count",
+        )
+    })?;
 
     let mut buffer = Vec::with_capacity(84 + triangle_count * 50);
 
@@ -37,10 +76,10 @@ pub fn export_stl_binary(snapshot: &Snapshot) -> Result<Vec<u8>, ApiError> {
     buffer.extend_from_slice(&header);
 
     // Number of triangles (u32, little-endian)
-    buffer.extend_from_slice(&(triangle_count as u32).to_le_bytes());
+    buffer.extend_from_slice(&count.to_le_bytes());
 
     for tri in &scene.triangles {
-        let n = tri.normals[0];
+        let n = facet_normal(tri.vertices);
         let v0 = tri.vertices[0];
         let v1 = tri.vertices[1];
         let v2 = tri.vertices[2];
@@ -73,11 +112,12 @@ pub fn export_stl_binary(snapshot: &Snapshot) -> Result<Vec<u8>, ApiError> {
 /// Exports the snapshot tessellation as an ASCII STL string.
 pub fn export_stl_ascii(snapshot: &Snapshot, solid_name: &str) -> Result<String, ApiError> {
     let scene = NativeKernel::debug_scene(snapshot);
+    let solid_name = header_name(solid_name);
     let mut out = String::new();
 
     writeln!(out, "solid {solid_name}").unwrap();
     for tri in &scene.triangles {
-        let n = tri.normals[0];
+        let n = facet_normal(tri.vertices);
         let v0 = tri.vertices[0];
         let v1 = tri.vertices[1];
         let v2 = tri.vertices[2];
@@ -98,6 +138,7 @@ pub fn export_stl_ascii(snapshot: &Snapshot, solid_name: &str) -> Result<String,
 /// Exports the snapshot tessellation as a Wavefront OBJ string.
 pub fn export_obj(snapshot: &Snapshot, model_name: &str) -> Result<String, ApiError> {
     let scene = NativeKernel::debug_scene(snapshot);
+    let model_name = header_name(model_name);
     let mut out = String::new();
 
     writeln!(out, "# Artificer Wavefront OBJ Export: {model_name}").unwrap();

@@ -430,7 +430,9 @@ fn eval_function_call(
                     )));
                 }
             };
-            Ok(Value::Selector(EntitySelector::ByGeometry(sel)))
+            Ok(Value::Selector(EntitySelector::ByGeometry {
+                selector: sel,
+            }))
         }
         "edges" => {
             let spec = if !positional_args.is_empty() {
@@ -442,9 +444,18 @@ fn eval_function_call(
             };
 
             let sel = match spec.as_str() {
-                "|Z" => GeometricSelector::ByType {
+                "|Z" => GeometricSelector::EdgesParallelTo {
+                    direction: Vector3::new(0.0, 0.0, 1.0),
+                },
+                "|Y" => GeometricSelector::EdgesParallelTo {
+                    direction: Vector3::new(0.0, 1.0, 0.0),
+                },
+                "|X" => GeometricSelector::EdgesParallelTo {
+                    direction: Vector3::new(1.0, 0.0, 0.0),
+                },
+                "planar" => GeometricSelector::ByType {
                     surface_type: SurfaceFilter::Planar,
-                    kind: EntityKind::Edge,
+                    kind: EntityKind::Face,
                 },
                 _ => {
                     return Err(ScriptError::Eval(format!(
@@ -452,7 +463,9 @@ fn eval_function_call(
                     )));
                 }
             };
-            Ok(Value::Selector(EntitySelector::ByGeometry(sel)))
+            Ok(Value::Selector(EntitySelector::ByGeometry {
+                selector: sel,
+            }))
         }
         other => Err(ScriptError::Eval(format!("Unknown function: `{other}`"))),
     }

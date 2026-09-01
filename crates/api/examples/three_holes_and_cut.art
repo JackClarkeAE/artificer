@@ -1,11 +1,20 @@
-// Block with 3 circle holes and a crossing side cut
-let base = box(size=[100.0, 100.0, 40.0]);
-let s1 = sketch(on=base.top_face);
-s1.circle(center=[25.0, 25.0], radius=8.0);
-s1.circle(center=[75.0, 25.0], radius=8.0);
-s1.circle(center=[50.0, 75.0], radius=8.0);
-let cut1 = extrude(sketch=s1, distance=40.0, op="cut");
-let s2 = sketch(on=cut1.face("-Y"));
-s2.circle(center=[50.0, 20.0], radius=10.0);
-let cut2 = extrude(sketch=s2, distance=30.0, op="cut");
-snapshot("three_holes_and_cut.svg", view="trimetric");
+// three_holes_and_cut.art — a block with three round holes and a side cut
+// that crosses two of them.
+//
+// Hole centres are given in the target face's own frame, whose origin is
+// the face centre. The side cut is a round bore drilled from the -Y face;
+// where it crosses the two front holes the kernel answers from its faceted
+// tier and labels the result as an approximation.
+
+param hole_diameter: f64 = 16.0;
+param cut_diameter: f64 = 20.0;
+
+let base = box(size: [100.0, 100.0, 40.0], label: "base");
+let top = base.face("top_face");
+
+drill(face: top, center: [-15.0, -25.0], diameter: hole_diameter, depth: 40.0, label: "hole_a");
+drill(face: faces(">Z"), center: [15.0, -25.0], diameter: hole_diameter, depth: 40.0, label: "hole_b");
+drill(face: faces(">Z"), center: [0.0, 25.0], diameter: hole_diameter, depth: 40.0, label: "hole_c");
+
+// Cross the two front holes from the -Y side, 30 mm deep.
+drill(face: faces("<Y"), center: [0.0, 0.0], diameter: cut_diameter, depth: 30.0, label: "side_cut");

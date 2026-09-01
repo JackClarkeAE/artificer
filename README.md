@@ -102,41 +102,45 @@ Artificer is built from the ground up to be scriptable, automatable, and embedda
 Run headless CAD pipelines on servers, in Docker containers, or inside CI/CD workflows:
 
 ```sh
-# Start the API server on localhost
-cargo run --release -p artificer-api-server -- --port 9000
+# Start the JSON-RPC server: one request per line on stdin, one response per line on stdout
+cargo run --release -p artificer-api-server -- serve
 ```
 
-Send commands using standard JSON-RPC:
+Send commands using standard JSON-RPC 2.0 (batches and notifications included):
 ```json
 {
   "jsonrpc": "2.0",
   "id": "1",
   "method": "execute",
   "params": {
-    "command": {
-      "kind": "make_box",
-      "origin": [0.0, 0.0, 0.0],
-      "size": [100.0, 50.0, 25.0],
-      "label": "base_block"
-    }
+    "type": "make_box",
+    "label": "base_block",
+    "origin": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "size": [100.0, 50.0, 25.0]
   }
 }
 ```
 
+Domain errors come back as JSON-RPC error `-32000` with the structured `ApiError` (code, suggestion, candidate entities, kernel diagnostics) in `error.data`.
+
 ### 2. Parametric Scripting DSL (`.art`)
 Write clean, readable parametric scripts evaluated directly by the kernel:
 
-```rust
+```text
 // bracket.art — Parametric bracket with mounting holes
 param width: f64 = 100.0;
 param depth: f64 = 50.0;
 param thickness: f64 = 10.0;
 
 let base = box(origin: [0, 0, 0], size: [width, depth, thickness], label: "base");
-let top = base.top_face;
+let top = base.face("top_face");
 
-drill_hole(face: top, center: [-30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_l");
-drill_hole(face: top, center: [ 30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_r");
+// Hole centres are in the face's own frame, whose origin is the face centre.
+drill(face: top, center: [-30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_l");
+drill(face: faces(">Z"), center: [30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_r");
+
+// Fillet every vertical edge of the block at once.
+fillet(edges: edges("|Z"), radius: 2.0, label: "soften");
 ```
 
 ### 3. Rust Native API (`crates/api`)
@@ -155,8 +159,9 @@ session.execute(ApiCommand::MakeBox {
     size: [50.0, 50.0, 50.0],
 }, &token)?;
 
-let measures = session.query().mass_properties(None)?;
+let measures = session.snapshot.measures();
 println!("Exact Volume: {:.6} mm³", measures.volume);
+println!("Bounds: {:?}", session.query().bounds()?);
 ```
 
 ---
@@ -199,8 +204,8 @@ cargo run --release -p artificer-workbench
 # Run the full kernel & workbench test suite
 cargo test --workspace
 
-# Start the headless API server daemon
-cargo run --release -p artificer-api-server -- --port 8080
+# Start the headless JSON-RPC server on stdin/stdout
+cargo run --release -p artificer-api-server -- serve
 ```
 
 ### Prebuilt Desktop Binaries
@@ -223,7 +228,7 @@ The Artificer workspace is organized into modular, independently testable crates
 | **Sketch Engine** | [`crates/sketch`](crates/sketch) | Exact 2D authoring, arrangement cell decomposition, loop stitching, and profile extraction |
 | **Protocol** | [`crates/protocol`](crates/protocol) | Zero-copy serializable command vocabulary connecting front-ends, APIs, and the kernel |
 | **Parametric Model** | [`crates/model`](crates/model) | Content-addressed feature DAG, parameter bindings, journal replay, and document schema |
-| **API & Exporters** | [`crates/api`](crates/api) | Programmable Rust API, `.art` script parser, headless renderer, STL, OBJ, and STEP interchange |
+| **API & Exporters** | [`crates/api`](crates/api) | Programmable Rust API, `.art` script parser, headless SVG/PNG renderer, STL and OBJ export |
 | **API Server** | [`apps/api-server`](apps/api-server) | Standalone JSON-RPC 2.0 daemon and headless batch runner |
 | **Viewport Engine** | [`crates/viewport`](crates/viewport) | 3D rendering pipeline, silhouette curves, screen-space depth sorting, and gizmo manipulators |
 | **Sketch UI** | [`crates/sketch-ui`](crates/sketch-ui) | 2D canvas interactions, snap systems, live dimension boxes, and geometry tool widgets |

@@ -68,10 +68,12 @@ fn test_history_and_geometric_selectors() {
     assert!(res.success);
 
     // Geometric selector: face pointing towards +Z
-    let geom_sel = EntitySelector::ByGeometry(GeometricSelector::FaceByNormal {
-        direction: Vector3::new(0.0, 0.0, 1.0),
-        match_kind: NormalMatch::Closest,
-    });
+    let geom_sel = EntitySelector::ByGeometry {
+        selector: GeometricSelector::FaceByNormal {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            match_kind: NormalMatch::Closest,
+        },
+    };
 
     let entity_info = session
         .query()
@@ -249,8 +251,9 @@ fn test_sketch_and_extrude() {
     let mut session = Session::new();
     let token = CancellationToken::default();
 
-    // 1. Sketch a 30x20 rectangle on XY plane
-    session
+    // 1. Sketch a 30x20 rectangle on the XY plane. A sketch is recorded as
+    //    a step of its own and leaves the model empty until it is extruded.
+    let sketch_res = session
         .execute(
             ApiCommand::Sketch {
                 label: "sk1".to_owned(),
@@ -264,23 +267,10 @@ fn test_sketch_and_extrude() {
             },
             &token,
         )
-        .expect_err("Sketch by itself cannot be executed without extrude/revolve");
-
-    // Push sketch to journal manually for extrude to consume
-    session
-        .journal
-        .push(artificer_api::journal::JournalEntry::new(
-            ApiCommand::Sketch {
-                label: "sk1".to_owned(),
-                on: artificer_api::commands::SketchPlane::XY,
-                entities: vec![artificer_api::commands::SketchEntity::Rectangle {
-                    origin: Point2::new(0.0, 0.0),
-                    width: 30.0,
-                    height: 20.0,
-                }],
-                constraints: Vec::new(),
-            },
-        ));
+        .expect("a sketch records as a step");
+    assert!(sketch_res.success);
+    assert_eq!(sketch_res.topology.solids, 0);
+    assert_eq!(session.journal.len(), 1);
 
     let ext_res = session
         .execute(
@@ -462,10 +452,12 @@ fn test_three_holes_and_crossing_side_cut() {
         .execute(
             ApiCommand::DrillHole {
                 label: "side_hole".to_owned(),
-                face: EntitySelector::ByGeometry(GeometricSelector::FaceByNormal {
-                    direction: Vector3::new(0.0, -1.0, 0.0),
-                    match_kind: NormalMatch::Closest,
-                }),
+                face: EntitySelector::ByGeometry {
+                    selector: GeometricSelector::FaceByNormal {
+                        direction: Vector3::new(0.0, -1.0, 0.0),
+                        match_kind: NormalMatch::Closest,
+                    },
+                },
                 center: Point2::new(0.0, 0.0),
                 diameter: 20.0,
                 depth: 30.0,
@@ -491,4 +483,273 @@ fn test_three_holes_and_crossing_side_cut() {
     assert!(!svg.is_empty());
     assert!(svg.contains("<svg"));
     println!("Generated SVG snapshot: {} bytes", svg.len());
+}
+
+#[test]
+fn a_deeply_nested_script_is_an_error_not_a_stack_overflow() {
+    let depth = 100_000;
+    let source = format!("let x = {}1{};", "(".repeat(depth), ")".repeat(depth));
+    let error = artificer_api::scripting::compile_script(&source, &BTreeMap::new())
+        .expect_err("nesting past the limit is refused");
+    assert!(error.to_string().contains("nested deeper"), "{error}");
+}
+
+#[test]
+fn geometric_selectors_round_trip_through_json() {
+    let selector = EntitySelector::ByGeometry {
+        selector: GeometricSelector::FaceByNormal {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            match_kind: NormalMatch::Closest,
+        },
+    };
+    let json = serde_json::to_string(&selector).expect("serialize");
+    assert!(json.contains("\"type\":\"by_geometry\""), "{json}");
+    assert!(json.contains("\"criterion\":\"face_by_normal\""), "{json}");
+    let back: EntitySelector = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, selector);
+
+    // A journal that names faces geometrically replays.
+    let mut session = Session::new();
+    let token = CancellationToken::default();
+    session
+        .execute(
+            ApiCommand::MakeBox {
+                label: "base".to_owned(),
+                origin: Point3::new(0.0, 0.0, 0.0),
+                size: [40.0, 30.0, 20.0],
+            },
+            &token,
+        )
+        .expect("box");
+    session
+        .execute(
+            ApiCommand::DrillHole {
+                label: "hole".to_owned(),
+                face: selector,
+                center: Point2::new(0.0, 0.0),
+                diameter: 8.0,
+                depth: 20.0,
+            },
+            &token,
+        )
+        .expect("drill through a geometrically selected face");
+    let journal = session.export_journal().expect("journal");
+    let replayed = Session::from_journal(&journal).expect("a geometric journal replays");
+    assert_eq!(replayed.snapshot.id(), session.snapshot.id());
+}
+
+#[test]
+fn a_sketch_with_a_hole_extrudes_into_a_holed_block() {
+    let mut session = Session::new();
+    let token = CancellationToken::default();
+    session
+        .execute(
+            ApiCommand::Sketch {
+                label: "plate".to_owned(),
+                on: artificer_api::commands::SketchPlane::XY,
+                entities: vec![
+                    artificer_api::commands::SketchEntity::Rectangle {
+                        origin: Point2::new(0.0, 0.0),
+                        width: 60.0,
+                        height: 40.0,
+                    },
+                    artificer_api::commands::SketchEntity::Circle {
+                        center: Point2::new(30.0, 20.0),
+                        radius: 5.0,
+                    },
+                    // A triangle drawn as three lines, chained by endpoints.
+                    artificer_api::commands::SketchEntity::Line {
+                        start: Point2::new(5.0, 5.0),
+                        end: Point2::new(15.0, 5.0),
+                    },
+                    artificer_api::commands::SketchEntity::Line {
+                        start: Point2::new(15.0, 5.0),
+                        end: Point2::new(10.0, 15.0),
+                    },
+                    artificer_api::commands::SketchEntity::Line {
+                        start: Point2::new(5.0, 5.0),
+                        end: Point2::new(10.0, 15.0),
+                    },
+                ],
+                constraints: Vec::new(),
+            },
+            &token,
+        )
+        .expect("sketch records");
+    let result = session
+        .execute(
+            ApiCommand::Extrude {
+                label: "block".to_owned(),
+                sketch: artificer_api::commands::StepLabel("plate".to_owned()),
+                regions: Vec::new(),
+                distance: 10.0,
+                operation: artificer_api::commands::ExtrudeOp::New,
+            },
+            &token,
+        )
+        .expect("a rectangle with a round and a triangular hole extrudes");
+    assert!(result.success);
+    let expected =
+        60.0 * 40.0 * 10.0 - std::f64::consts::PI * 25.0 * 10.0 - 0.5 * 10.0 * 10.0 * 10.0;
+    let volume = session.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "volume {volume} should be {expected}"
+    );
+}
+
+#[test]
+fn an_open_sketch_chain_is_refused_with_its_loose_end_named() {
+    let mut session = Session::new();
+    let token = CancellationToken::default();
+    session
+        .execute(
+            ApiCommand::Sketch {
+                label: "open".to_owned(),
+                on: artificer_api::commands::SketchPlane::XY,
+                entities: vec![
+                    artificer_api::commands::SketchEntity::Line {
+                        start: Point2::new(0.0, 0.0),
+                        end: Point2::new(10.0, 0.0),
+                    },
+                    artificer_api::commands::SketchEntity::Line {
+                        start: Point2::new(10.0, 0.0),
+                        end: Point2::new(10.0, 10.0),
+                    },
+                ],
+                constraints: Vec::new(),
+            },
+            &token,
+        )
+        .expect("sketch records");
+    let error = session
+        .execute(
+            ApiCommand::Extrude {
+                label: "nope".to_owned(),
+                sketch: artificer_api::commands::StepLabel("open".to_owned()),
+                regions: Vec::new(),
+                distance: 5.0,
+                operation: artificer_api::commands::ExtrudeOp::New,
+            },
+            &token,
+        )
+        .expect_err("an open chain cannot extrude");
+    assert!(error.message.contains("open chain"), "{error}");
+}
+
+#[test]
+fn labels_must_be_unique_and_boolean_targets_must_exist() {
+    let mut session = Session::new();
+    let token = CancellationToken::default();
+    let make = |label: &str| ApiCommand::MakeBox {
+        label: label.to_owned(),
+        origin: Point3::new(0.0, 0.0, 0.0),
+        size: [10.0, 10.0, 10.0],
+    };
+    session.execute(make("a"), &token).expect("first box");
+    let duplicate = session
+        .execute(make("a"), &token)
+        .expect_err("a reused label is refused");
+    assert!(duplicate.message.contains("already used"), "{duplicate}");
+
+    session.execute(make("b"), &token).expect("second box");
+    let missing = session
+        .execute(
+            ApiCommand::BooleanUnion {
+                label: "u".to_owned(),
+                target: artificer_api::commands::StepLabel("typo".to_owned()),
+                tool: artificer_api::commands::StepLabel("b".to_owned()),
+            },
+            &token,
+        )
+        .expect_err("a misspelt target is an error, not the current model");
+    assert!(missing.message.contains("typo"), "{missing}");
+}
+
+#[test]
+fn the_server_follows_json_rpc_framing() {
+    let server = SharedSession::new();
+    // A notification is executed but not answered.
+    let notification = r#"{"jsonrpc":"2.0","method":"execute","params":{"type":"make_box","label":"n","origin":{"x":0,"y":0,"z":0},"size":[10,10,10]}}"#;
+    assert_eq!(server.handle_message(notification), None);
+    // It did run: the bounds are those of the box.
+    let bounds = server
+        .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"query.bounds"}"#)
+        .expect("a request is answered");
+    assert!(bounds.contains("\"max\""), "{bounds}");
+    // A batch answers every request that carries an id, as an array.
+    let batch = r#"[{"jsonrpc":"2.0","id":2,"method":"query.bounds"},{"jsonrpc":"2.0","method":"query.bounds"},{"jsonrpc":"2.0","id":3,"method":"nope"}]"#;
+    let answer = server.handle_message(batch).expect("batch answer");
+    let parsed: serde_json::Value = serde_json::from_str(&answer).expect("json");
+    let answers = parsed.as_array().expect("an array");
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[1]["error"]["code"], -32601);
+    // The protocol version is checked.
+    let wrong = server
+        .handle_message(r#"{"jsonrpc":"1.0","id":4,"method":"query.bounds"}"#)
+        .expect("answered");
+    assert!(wrong.contains("-32600"), "{wrong}");
+    // Malformed snapshot params are the caller's mistake.
+    let bad = server
+        .handle_message(
+            r#"{"jsonrpc":"2.0","id":5,"method":"snapshot","params":{"camera":"garbage"}}"#,
+        )
+        .expect("answered");
+    assert!(bad.contains("-32602"), "{bad}");
+    // Domain errors carry the structured error in `data`.
+    let domain = server
+        .handle_message(r#"{"jsonrpc":"2.0","id":6,"method":"execute","params":{"type":"make_box","label":"n","origin":{"x":0,"y":0,"z":0},"size":[1,1,1]}}"#)
+        .expect("answered");
+    let parsed: serde_json::Value = serde_json::from_str(&domain).expect("json");
+    assert_eq!(parsed["error"]["code"], -32000);
+    assert_eq!(parsed["error"]["data"]["code"], "invalid_input");
+}
+
+#[test]
+fn a_png_snapshot_is_a_real_png() {
+    let mut session = Session::new();
+    session
+        .execute(
+            ApiCommand::MakeBox {
+                label: "b".to_owned(),
+                origin: Point3::new(0.0, 0.0, 0.0),
+                size: [20.0, 20.0, 20.0],
+            },
+            &CancellationToken::default(),
+        )
+        .expect("box");
+    let options = artificer_api::snapshot::SnapshotOptions {
+        format: artificer_api::snapshot::SnapshotFormat::Png,
+        ..Default::default()
+    };
+    let output = session.snapshot(options).expect("png");
+    let artificer_api::snapshot::SnapshotOutput::Png(bytes) = output else {
+        panic!("a PNG was requested");
+    };
+    assert_eq!(
+        &bytes[..8],
+        &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+    );
+    assert_eq!(&bytes[12..16], b"IHDR");
+    assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND");
+}
+
+#[test]
+fn the_shipped_examples_compile_and_run() {
+    for example in [
+        "examples/bearing_mount.art",
+        "examples/filleted_cube.art",
+        "examples/three_holes_and_cut.art",
+    ] {
+        let source = std::fs::read_to_string(example).expect(example);
+        let commands = artificer_api::scripting::compile_script(&source, &BTreeMap::new())
+            .unwrap_or_else(|error| panic!("{example}: {error}"));
+        let mut session = Session::new();
+        for command in commands {
+            session
+                .execute(command, &CancellationToken::default())
+                .unwrap_or_else(|error| panic!("{example}: {error}"));
+        }
+        assert!(session.snapshot.counts().solids >= 1, "{example}");
+    }
 }
