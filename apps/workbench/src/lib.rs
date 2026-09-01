@@ -12646,9 +12646,10 @@ impl KernelLabApp {
                     let unit = match input.kind {
                         ToolInputKind::Length | ToolInputKind::SignedLength => "mm",
                         ToolInputKind::Angle => "°",
-                        ToolInputKind::Integer | ToolInputKind::Choice | ToolInputKind::Boolean => {
-                            ""
-                        }
+                        ToolInputKind::Integer
+                        | ToolInputKind::Choice
+                        | ToolInputKind::Boolean
+                        | ToolInputKind::Text => "",
                     };
                     if !unit.is_empty() {
                         ui.label(RichText::new(unit).small().color(theme::muted()));

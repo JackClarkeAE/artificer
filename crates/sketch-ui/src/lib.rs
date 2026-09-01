@@ -1441,13 +1441,31 @@ impl RetainedRecipeParameter {
         }
     }
 
+    /// A free-text parameter: the characters a text recipe sets.
+    fn text(stable_key: &'static str, label: &'static str, content: &str) -> Self {
+        Self {
+            stable_key,
+            label,
+            text: content.to_owned(),
+            unit: "",
+            value: None,
+            domain: ToolNumberDomain::Text,
+            read_only_reason: None,
+            error: None,
+        }
+    }
+
+    const fn is_text(&self) -> bool {
+        matches!(self.domain, ToolNumberDomain::Text)
+    }
+
     fn view(&self) -> SelectedRecipeParameter {
         SelectedRecipeParameter {
             stable_key: self.stable_key,
             label: self.label,
             text: self.text.clone(),
             unit: self.unit,
-            editable: self.value.is_some(),
+            editable: self.value.is_some() || self.is_text(),
             read_only_reason: self.read_only_reason,
             error: self.error,
         }
@@ -1470,7 +1488,12 @@ enum ToolNumberDomain {
     Finite,
     NonZero,
     NonZeroLength,
-    Integer { minimum: u16, maximum: u16 },
+    Integer {
+        minimum: u16,
+        maximum: u16,
+    },
+    /// Not a number at all: free text, kept verbatim.
+    Text,
 }
 
 #[derive(Clone, Debug)]
@@ -1529,7 +1552,20 @@ impl RetainedToolNumber {
 struct ActiveToolInputs {
     numbers: BTreeMap<(ToolVariant, &'static str), RetainedToolNumber>,
     flags: BTreeMap<(ToolVariant, &'static str), bool>,
+    texts: BTreeMap<(ToolVariant, &'static str), String>,
 }
+
+/// Default free-text value of a tool field, when the field is text rather
+/// than a number or a flag.
+fn tool_text_default(variant: ToolVariant, stable_key: &'static str) -> Option<&'static str> {
+    match (variant, stable_key) {
+        (ToolVariant::Text, "content") => Some(DEFAULT_TEXT_CONTENT),
+        _ => None,
+    }
+}
+
+const DEFAULT_TEXT_CONTENT: &str = "TEXT";
+const DEFAULT_TEXT_HEIGHT: f64 = 10.0;
 
 fn format_tool_number(value: f64) -> String {
     if value.fract().abs() <= f64::EPSILON {
@@ -1578,7 +1614,8 @@ fn validate_tool_number(text: &str, domain: ToolNumberDomain) -> Result<f64, Too
         | ToolNumberDomain::Finite
         | ToolNumberDomain::NonZero
         | ToolNumberDomain::NonZeroLength
-        | ToolNumberDomain::Integer { .. } => Ok(value),
+        | ToolNumberDomain::Integer { .. }
+        | ToolNumberDomain::Text => Ok(value),
     }
 }
 
@@ -1597,6 +1634,8 @@ fn tool_number_spec(
                 maximum: CORE_MAX_POLYGON_SIDES,
             },
         )),
+        (ToolVariant::Text, "height") => Some((DEFAULT_TEXT_HEIGHT, positive)),
+        (ToolVariant::Text, "angle") => Some((0.0, finite)),
         (ToolVariant::Fillet, "radius") => Some((DEFAULT_FILLET_RADIUS, positive)),
         (ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer, "distance_1") => {
             Some((DEFAULT_CHAMFER_DISTANCE, positive))
@@ -1824,6 +1863,20 @@ fn selected_recipe_editor_for(
             ],
             BOUND_REFERENCE_NOTE,
         ),
+        CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } => (
+            "Text",
+            vec![
+                RetainedRecipeParameter::text("content", "Text", content),
+                literal_length_parameter("height", "Height", height),
+                literal_angle_parameter("angle", "Angle", angle),
+            ],
+            "The baseline anchor stays fixed; edit the text, its capital height, or its angle.",
+        ),
         CoreRecipe::TwoPointSlot { width, .. } => (
             "Two-point slot",
             vec![literal_length_parameter("width", "Width", width)],
@@ -1972,6 +2025,61 @@ fn recipe_parameter_value(editor: &SelectedRecipeEditor, key: &'static str) -> O
         .iter()
         .find(|parameter| parameter.stable_key == key)
         .and_then(|parameter| parameter.value)
+}
+
+fn recipe_parameter_text(editor: &SelectedRecipeEditor, key: &'static str) -> Option<String> {
+    editor
+        .parameters
+        .iter()
+        .find(|parameter| {
+            parameter.stable_key == key && matches!(parameter.domain, ToolNumberDomain::Text)
+        })
+        .map(|parameter| parameter.text.clone())
+}
+
+/// The recipe a text click stages: one line of `content` at capital height
+/// `height`, its baseline through `anchor` at `angle` radians from `+u`.
+fn text_recipe(anchor: SketchPoint, content: &str, height: f64, angle: f64) -> Option<CoreRecipe> {
+    if content.chars().all(char::is_whitespace) {
+        return None;
+    }
+    Some(CoreRecipe::Text {
+        anchor: core_point_input(anchor),
+        content: content.to_owned(),
+        height: CoreValue::Literal(CoreLength::new(height).ok()?),
+        angle: CoreValue::Literal(CoreAngle::radians(angle).ok()?),
+    })
+}
+
+/// The outline segments of `content` placed at `anchor`, for the live
+/// preview under the pointer before the anchor click. An unsettable text
+/// (empty, or a glyph the typeface lacks) previews nothing rather than
+/// something misleading.
+fn text_preview_geometries(
+    anchor: SketchPoint,
+    content: &str,
+    height: f64,
+    angle: f64,
+) -> Vec<SketchGeometry> {
+    let Ok(outlines) = artificer_sketch::text::text_outlines(content, height) else {
+        return Vec::new();
+    };
+    let (sin, cos) = angle.sin_cos();
+    let place = |point: artificer_sketch::SketchPoint2| {
+        SketchPoint::new(
+            anchor.u + point.u * cos - point.v * sin,
+            anchor.v + point.u * sin + point.v * cos,
+        )
+    };
+    let mut geometries = Vec::new();
+    for outline in &outlines.loops {
+        for index in 0..outline.points.len() {
+            let start = place(outline.points[index]);
+            let end = place(outline.points[(index + 1) % outline.points.len()]);
+            geometries.push(SketchGeometry::segment(start, end));
+        }
+    }
+    geometries
 }
 
 fn replace_literal_length(
@@ -2208,6 +2316,18 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             replace_literal_length(outer_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
+        CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } => {
+            if let Some(text) = recipe_parameter_text(editor, "content") {
+                *content = text;
+            }
+            replace_literal_length(height, recipe_parameter_value(editor, "height"))?;
+            replace_literal_angle(angle, recipe_parameter_value(editor, "angle"))?;
+        }
         CoreRecipe::TwoPointSlot { width, .. } => {
             replace_literal_length(width, recipe_parameter_value(editor, "width"))?;
         }
@@ -2331,6 +2451,9 @@ fn translate_core_recipe(recipe: &mut CoreRecipe, delta_u: f64, delta_v: f64) {
         CoreRecipe::InnerDiameterPolygon { center, .. }
         | CoreRecipe::OuterDiameterPolygon { center, .. } => {
             translate_core_point_input(center, delta_u, delta_v);
+        }
+        CoreRecipe::Text { anchor, .. } => {
+            translate_core_point_input(anchor, delta_u, delta_v);
         }
         CoreRecipe::TwoPointSlot {
             first_cap_center,
@@ -4107,6 +4230,12 @@ fn exact_creation_preview_geometries(state: &SketchCanvasState) -> Option<Vec<Sk
             let reference = state.polygon_reference_from_inputs(center, pointer);
             regular_polygon_preview(state.exact_tool, center, reference, state.polygon_sides)
         }
+        ToolVariant::Text => {
+            let content = state.active_tool_text("content")?;
+            let height = state.active_tool_number("height")?;
+            let angle = state.active_tool_number("angle")?.to_radians();
+            Some(text_preview_geometries(pointer, &content, height, angle))
+        }
         ToolVariant::TwoPointSlot | ToolVariant::CentreToOuterPointSlot => {
             let axis_start = state.creation_anchor?;
             let axis_end = state.slot_axis_from_inputs(axis_start, state.arc_start?);
@@ -5228,6 +5357,9 @@ impl SketchCanvasState {
     /// using their in-canvas dimensional editor.
     #[must_use]
     pub fn active_tool_input_text(&self, stable_key: &'static str) -> Option<String> {
+        if let Some(text) = self.active_tool_text(stable_key) {
+            return Some(text);
+        }
         let (default, _) = tool_number_spec(self.exact_tool, stable_key)?;
         Some(
             self.tool_inputs
@@ -5237,12 +5369,31 @@ impl SketchCanvasState {
         )
     }
 
+    /// The value of one free-text tool field, when the active tool has one.
+    #[must_use]
+    pub fn active_tool_text(&self, stable_key: &'static str) -> Option<String> {
+        let default = tool_text_default(self.exact_tool, stable_key)?;
+        Some(
+            self.tool_inputs
+                .texts
+                .get(&(self.exact_tool, stable_key))
+                .cloned()
+                .unwrap_or_else(|| default.to_owned()),
+        )
+    }
+
     /// Applies one typed edit while retaining the previous valid preview
     /// value. Returns false only when the field does not belong to this tool
     /// or while an immutable operation is awaiting confirmation.
     pub fn set_active_tool_input_text(&mut self, stable_key: &'static str, text: String) -> bool {
         if self.pending.is_some() {
             return false;
+        }
+        if tool_text_default(self.exact_tool, stable_key).is_some() {
+            self.tool_inputs
+                .texts
+                .insert((self.exact_tool, stable_key), text);
+            return true;
         }
         let Some((default, domain)) = tool_number_spec(self.exact_tool, stable_key) else {
             return false;
@@ -5275,7 +5426,8 @@ impl SketchCanvasState {
             .numbers
             .get_mut(&(self.exact_tool, stable_key))
         else {
-            return tool_number_spec(self.exact_tool, stable_key).is_some();
+            return tool_number_spec(self.exact_tool, stable_key).is_some()
+                || tool_text_default(self.exact_tool, stable_key).is_some();
         };
         input.restore_last_valid();
         true
@@ -5450,6 +5602,7 @@ impl SketchCanvasState {
             ToolVariant::CentreStartEndArc | ToolVariant::ThreePointArc => SketchTool::Arc,
             ToolVariant::InnerDiameterPolygon
             | ToolVariant::OuterDiameterPolygon
+            | ToolVariant::Text
             | ToolVariant::TwoPointSlot
             | ToolVariant::CentreToOuterPointSlot => SketchTool::Point,
         };
@@ -5964,7 +6117,10 @@ impl SketchCanvasState {
                 .parameters
                 .iter_mut()
                 .find(|parameter| parameter.stable_key == stable_key)?;
-            let old_value = parameter.value?;
+            if !parameter.is_text() {
+                parameter.value?;
+            }
+            let old_value = parameter.value;
             parameter.text = text;
             parameter.error = None;
             (
@@ -5975,7 +6131,11 @@ impl SketchCanvasState {
             )
         };
 
-        let parsed = {
+        // Free text is kept as typed; the recipe replay below decides
+        // whether it can be set.
+        let parsed = if matches!(domain, ToolNumberDomain::Text) {
+            None
+        } else {
             let named_values = &self.named_values;
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
@@ -5993,7 +6153,7 @@ impl SketchCanvasState {
             match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
-                    value
+                    Some(value)
                 }
                 Err(error) => {
                     parameter.error = Some(RecipeParameterError::Numeric(error));
@@ -6019,8 +6179,8 @@ impl SketchCanvasState {
                 .parameters
                 .iter_mut()
                 .find(|parameter| parameter.stable_key == stable_key)?;
-            debug_assert_eq!(parameter.value, Some(parsed));
-            parameter.value = Some(old_value);
+            debug_assert_eq!(parameter.value, parsed);
+            parameter.value = old_value;
             parameter.error = Some(RecipeParameterError::ReplayRejected);
             return self.pending.as_ref().map(|pending| pending.subject);
         };
@@ -7610,6 +7770,16 @@ impl SketchCanvasState {
             | ToolVariant::FitPointSpline
             | ToolVariant::ControlVertexSpline => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
+            ToolVariant::Text => {
+                if self.active_tool_parameter_issue().is_some() {
+                    return None;
+                }
+                let content = self.active_tool_text("content")?;
+                let height = self.active_tool_number("height")?;
+                let angle = self.active_tool_number("angle")?.to_radians();
+                let recipe = text_recipe(point, &content, height, angle)?;
+                self.stage_recipe(recipe, "Add sketch text").ok()
+            }
             ToolVariant::SingleLine => {
                 if let Some(start) = self.creation_anchor.take() {
                     self.update_dimension_pointer(point);
@@ -14643,6 +14813,72 @@ mod tests {
             assert_eq!(state.authoring().active_entities().count(), 8);
             assert!(state.certified_sketch_profile().is_some());
         }
+    }
+
+    #[test]
+    fn the_text_tool_stages_glyph_outlines_from_one_anchor_click() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::Text));
+        assert_eq!(state.gesture_progress().required_points, 1);
+        assert_eq!(
+            state.active_tool_input_text("content").as_deref(),
+            Some(DEFAULT_TEXT_CONTENT)
+        );
+        assert!(state.set_active_tool_input_text("content", "O".to_owned()));
+        assert!(state.set_active_tool_input_text("height", "12".to_owned()));
+        assert!(state.set_active_tool_input_text("angle", "90".to_owned()));
+        assert!(state.active_tool_input_error("height").is_none());
+
+        let id = state
+            .handle_creation_click(SketchPoint::new(5.0, 5.0))
+            .expect("the anchor click stages the text");
+        let CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } = pending_recipe(&state)
+        else {
+            panic!("the text tool stages the text recipe")
+        };
+        assert_eq!(content, "O");
+        assert!((literal_length(*height) - 12.0).abs() <= EPSILON);
+        assert!((literal_angle(*angle) - std::f64::consts::FRAC_PI_2).abs() <= EPSILON);
+        let entities = state.pending().expect("pending text").entities().len();
+        assert!(
+            entities >= 16,
+            "an O is two loops of chords, got {entities}"
+        );
+
+        assert_eq!(state.commit_pending(), Ok(id));
+        assert_eq!(state.authoring().active_operations().count(), 1);
+        assert_eq!(state.authoring().active_entities().count(), entities);
+        assert!(
+            state.certified_sketch_profile().is_some(),
+            "the letter's stroke is a closed profile"
+        );
+
+        // The committed text is one operation whose text can be retyped:
+        // selecting any of its chords exposes the whole recipe.
+        let chord = state.entities().first().expect("committed chord").id;
+        state.set_selected(None);
+        assert!(state.set_selected(Some(chord)));
+        let view = state
+            .selected_recipe_editor()
+            .expect("a selected text exposes its recipe");
+        assert_eq!(view.title, "Text");
+        let content = view
+            .parameters
+            .iter()
+            .find(|parameter| parameter.stable_key == "content")
+            .expect("content parameter");
+        assert_eq!(content.text, "O");
+        assert!(content.editable);
+        assert!(
+            view.parameters
+                .iter()
+                .any(|parameter| parameter.stable_key == "height")
+        );
     }
 
     #[test]

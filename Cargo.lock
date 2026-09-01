@@ -325,8 +325,10 @@ dependencies = [
  "artificer-compute",
  "artificer-geometry",
  "artificer-protocol",
+ "epaint_default_fonts",
  "serde",
  "serde_json",
+ "skrifa",
  "thiserror 2.0.19",
 ]
 

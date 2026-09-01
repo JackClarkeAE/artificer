@@ -166,6 +166,7 @@ pub enum ToolVariant {
     ThreePointArc,
     InnerDiameterPolygon,
     OuterDiameterPolygon,
+    Text,
     TwoPointSlot,
     CentreToOuterPointSlot,
     Trim,
@@ -188,7 +189,7 @@ pub enum ToolVariant {
 }
 
 impl ToolVariant {
-    pub const COUNT: usize = 34;
+    pub const COUNT: usize = 35;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
@@ -205,6 +206,7 @@ impl ToolVariant {
         Self::ThreePointArc,
         Self::InnerDiameterPolygon,
         Self::OuterDiameterPolygon,
+        Self::Text,
         Self::TwoPointSlot,
         Self::CentreToOuterPointSlot,
         Self::Trim,
@@ -229,6 +231,19 @@ impl ToolVariant {
     #[must_use]
     pub fn descriptor(self) -> &'static ToolDescriptor {
         &TOOL_DESCRIPTORS[self as usize]
+    }
+
+    /// The label on the family tile while this variant is its current
+    /// choice. Families of one kind of shape keep their own name; a variant
+    /// that is a different thing altogether, like text under the closed-
+    /// shapes tile, names itself so the tile never lies about what a click
+    /// will draw.
+    #[must_use]
+    pub fn tile_label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            _ => self.family().descriptor().tile_label,
+        }
     }
 
     #[must_use]
@@ -262,6 +277,8 @@ pub enum ToolInputKind {
     Integer,
     Choice,
     Boolean,
+    /// Free text, such as the characters a text tool sets.
+    Text,
 }
 
 /// One deterministic field in a tool's Tab order.
@@ -344,6 +361,7 @@ pub enum ToolIcon {
     ThreePointArc,
     InnerPolygon,
     OuterPolygon,
+    Text,
     TwoPointSlot,
     CentreSlot,
     Trim,
@@ -461,6 +479,7 @@ const ARC_VARIANTS: &[ToolVariant] = &[ToolVariant::CentreStartEndArc, ToolVaria
 const POLYGON_VARIANTS: &[ToolVariant] = &[
     ToolVariant::InnerDiameterPolygon,
     ToolVariant::OuterDiameterPolygon,
+    ToolVariant::Text,
 ];
 const SLOT_VARIANTS: &[ToolVariant] = &[
     ToolVariant::TwoPointSlot,
@@ -691,6 +710,10 @@ const OUTER_POLYGON_PHASES: &[PointAcquisitionPhase] = &[
     phase("centre", "Click the polygon centre."),
     phase("vertex", "Click one outer polygon vertex."),
 ];
+const TEXT_PHASES: &[PointAcquisitionPhase] = &[phase(
+    "anchor",
+    "Click where the text baseline starts; the palette sets the text, height, and angle.",
+)];
 const TWO_POINT_SLOT_PHASES: &[PointAcquisitionPhase] = &[
     phase("cap_start", "Click the first cap centre."),
     phase("cap_end", "Click the second cap centre."),
@@ -819,6 +842,26 @@ const INNER_POLYGON_INPUTS: &[ToolInputField] = &[
         "Rotation",
         ToolInputKind::Angle,
         "finite directed angle",
+    ),
+];
+const TEXT_INPUTS: &[ToolInputField] = &[
+    input(
+        "content",
+        "Text",
+        ToolInputKind::Text,
+        "one line of characters the bundled typeface can set",
+    ),
+    input(
+        "height",
+        "Height",
+        ToolInputKind::Length,
+        "positive finite capital-letter height",
+    ),
+    input(
+        "angle",
+        "Angle",
+        ToolInputKind::Angle,
+        "finite baseline direction",
     ),
 ];
 const OUTER_POLYGON_INPUTS: &[ToolInputField] = &[
@@ -1279,6 +1322,26 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         ToolOutputRole::ProfileGeometry,
         CapabilityRequirement::EditableSketch,
         "Polygon creation requires an editable sketch.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::Text,
+        "sketch.text",
+        ToolFamily::Polygon,
+        "Sketch text",
+        "Set a line of text as exact outline loops.",
+        "Click where the baseline starts. Every letter becomes closed loops of exact lines that extrude like any profile; Tab edits the text, its capital height, and the baseline angle.",
+        "Click where the text baseline starts.",
+        "Choose polygon type; current default: Text.",
+        None,
+        ToolIcon::Text,
+        ToolCursor::Crosshair,
+        TEXT_PHASES,
+        TEXT_INPUTS,
+        SelectionRequirement::None,
+        ToolOutputRole::ProfileGeometry,
+        CapabilityRequirement::EditableSketch,
+        "Text creation requires an editable sketch.",
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
@@ -2068,7 +2131,7 @@ fn render_family(
         ui,
         primary_rect,
         current.descriptor(),
-        family.descriptor().tile_label,
+        current.tile_label(),
         active == current,
         primary_reason,
     );
@@ -2587,6 +2650,13 @@ impl<'a> IconPainter<'a> {
                 self.circle((0.50, 0.50), 0.38);
                 self.polygon((0.50, 0.50), 0.38, 6, 0.0);
                 self.line((0.50, 0.50), (0.83, 0.50));
+            }
+            ToolIcon::Text => {
+                // A capital A with its crossbar and a baseline: lettering.
+                self.line((0.22, 0.76), (0.50, 0.16));
+                self.line((0.50, 0.16), (0.78, 0.76));
+                self.line((0.33, 0.55), (0.67, 0.55));
+                self.line((0.14, 0.86), (0.86, 0.86));
             }
             ToolIcon::TwoPointSlot => {
                 self.line((0.28, 0.25), (0.72, 0.25));
