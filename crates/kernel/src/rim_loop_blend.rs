@@ -77,12 +77,12 @@ pub(crate) fn build_rim_loop_blend(
 
     // A hole loop runs clockwise with the material on its left, exactly as
     // the outer loop does, so the same inward offset grows a hole into the
-    // material around it. A fillet cannot round a sharp reflex corner; a
-    // chamfer between two straight runs mitres it along one straight line.
-    let reflex = match kind {
-        EdgeFinishKind::Chamfer => ReflexPolicy::MitreLines,
-        EdgeFinishKind::Fillet => ReflexPolicy::Refuse,
-    };
+    // material around it. A sharp reflex corner between two straight runs
+    // mitres: a chamfer's slants meet in a straight line, and a fillet's two
+    // equal cylinders meet in an ellipse — the Steinmetz seam — which the
+    // vocabulary admits. A reflex corner involving an arc would need a
+    // quartic and stays refused.
+    let reflex = ReflexPolicy::MitreLines;
     let spine = mitred_inward_offset(loops.target, distance, reflex, precision).map_err(
         |error| match error {
             LoopOffsetError::ReflexSharpCorner => RimLoopBlendError::ReflexCorner,
@@ -328,6 +328,36 @@ impl Builder<'_> {
         key
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn ellipse_edge(
+        &mut self,
+        vertices: [VertexKey; 2],
+        center: Point3,
+        u: Vector3,
+        v: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+        range: (f64, f64),
+    ) -> EdgeKey {
+        let key = EdgeKey(self.topology.edges.len());
+        let id = self.allocate();
+        self.topology.edges.push(Record {
+            id,
+            value: Edge {
+                vertices,
+                curve: Curve3::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                },
+                parameter_range: ParameterRange::new(range.0, range.1),
+            },
+        });
+        key
+    }
+
     /// Wraps the accumulated faces in one shell and solid.
     fn finish(mut self) -> Topology {
         let shell_key = ShellKey(self.topology.shells.len());
@@ -547,17 +577,25 @@ impl Builder<'_> {
 
     /// The band's boundary in its own parameter space. A cylinder measures the
     /// blend angle from the cap; a torus measures it from the wall.
+    ///
+    /// `wall_span` and `cap_span` are the band's extent along the wall rail
+    /// and along the spine. They coincide except beside a mitred reflex
+    /// corner, where the wall rail stops at the corner while the spine runs
+    /// on to the mitre, and the seam between them is the harmonic trace of
+    /// the elliptical mitre rather than a straight quarter-turn.
     #[allow(clippy::too_many_arguments)]
     fn band_uses(
         &self,
         band: SweptBand,
         wall_edge: EdgeKey,
-        end_seam: EdgeKey,
+        end_seam: (EdgeKey, SeamShape),
         cap_edge: EdgeKey,
-        start_seam: EdgeKey,
-        span: (f64, f64),
+        start_seam: (EdgeKey, SeamShape),
+        wall_span: (f64, f64),
+        cap_span: (f64, f64),
     ) -> Vec<(EdgeKey, Orientation, Curve2, ParameterRange)> {
-        let (low, high) = span;
+        let (wall_low, wall_high) = wall_span;
+        let (cap_low, cap_high) = cap_span;
         let (wall, cap) = band.minor_parameters();
         // A cylinder sweeps its blend angle across `x` and its length along
         // `y`; a torus sweeps azimuth across `x` and the blend angle along `y`.
@@ -565,23 +603,42 @@ impl Builder<'_> {
             SweptBand::Straight { .. } => Point2::new(blend, along),
             SweptBand::Revolved { .. } => Point2::new(along, blend),
         };
+        // On a straight band the seam of a mitred corner is `v = c + k·sin u`
+        // in the band's own `(u, v)`: `c` at the cap tangency (`u = 0`) and
+        // `c + k` at the wall tangency (`u = π/2`).
+        let harmonic = |at_cap: f64, at_wall: f64| Curve2::Harmonic {
+            mean: at_cap,
+            amplitude: at_wall - at_cap,
+            phase: std::f64::consts::FRAC_PI_2,
+        };
+        let end = match end_seam.1 {
+            SeamShape::Straight => {
+                Curve2::line_segment([point(wall, wall_high), point(cap, cap_high)])
+            }
+            SeamShape::Mitre => (
+                harmonic(cap_high, wall_high),
+                ParameterRange::new(wall, cap),
+            ),
+        };
+        let start = match start_seam.1 {
+            SeamShape::Straight => {
+                Curve2::line_segment([point(cap, cap_low), point(wall, wall_low)])
+            }
+            SeamShape::Mitre => (harmonic(cap_low, wall_low), ParameterRange::new(cap, wall)),
+        };
         vec![
             {
-                let (curve, range) = Curve2::line_segment([point(wall, low), point(wall, high)]);
+                let (curve, range) =
+                    Curve2::line_segment([point(wall, wall_low), point(wall, wall_high)]);
                 (wall_edge, Orientation::Forward, curve, range)
             },
+            (end_seam.0, Orientation::Forward, end.0, end.1),
             {
-                let (curve, range) = Curve2::line_segment([point(wall, high), point(cap, high)]);
-                (end_seam, Orientation::Forward, curve, range)
-            },
-            {
-                let (curve, range) = Curve2::line_segment([point(cap, high), point(cap, low)]);
+                let (curve, range) =
+                    Curve2::line_segment([point(cap, cap_high), point(cap, cap_low)]);
                 (cap_edge, Orientation::Reverse, curve, range)
             },
-            {
-                let (curve, range) = Curve2::line_segment([point(cap, low), point(wall, low)]);
-                (start_seam, Orientation::Reverse, curve, range)
-            },
+            (start_seam.0, Orientation::Reverse, start.0, start.1),
         ]
     }
 
@@ -752,6 +809,15 @@ impl Builder<'_> {
         }
         Ok(passive)
     }
+}
+
+/// How a band's seam runs from its wall tangency to its cap tangency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeamShape {
+    /// A quarter-turn generator of the band's own carrier.
+    Straight,
+    /// The harmonic trace of the elliptical mitre at a reflex corner.
+    Mitre,
 }
 
 /// The cap loops of one loop the finish leaves untouched.
@@ -1279,27 +1345,62 @@ fn build_filleted_prism(
     // wall runs clockwise, which the loop winding already expresses.
 
     // Tangent junctions need no corner treatment: the neighbouring bands
-    // already meet along one shared seam arc.
-    let sharp: Vec<bool> = (0..count)
+    // already meet along one shared seam arc. A sharp corner is convex when
+    // the material turns in on itself (the ball rolls round a sphere there)
+    // and reflex when it turns away: the two bands then run on past the
+    // corner and meet in an elliptical mitre.
+    let corner_turn: Vec<f64> = (0..count)
         .map(|index| {
             let previous = (index + count - 1) % count;
             let leaving = bands[previous].normals().1;
             let entering = bands[index].normals().0;
-            let turn = leaving
+            leaving
                 .x
                 .mul_add(entering.y, -(leaving.y * entering.x))
-                .atan2(leaving.x.mul_add(entering.x, leaving.y * entering.y));
-            turn.abs() > precision.angular_agreement_radians.max(1.0e-9)
+                .atan2(leaving.x.mul_add(entering.x, leaving.y * entering.y))
         })
         .collect();
+    let sharp: Vec<bool> = corner_turn
+        .iter()
+        .map(|turn| turn.abs() > precision.angular_agreement_radians.max(1.0e-9))
+        .collect();
+    let reflex: Vec<bool> = (0..count)
+        .map(|index| sharp[index] && corner_turn[index] < 0.0)
+        .collect();
+    let convex: Vec<bool> = (0..count)
+        .map(|index| sharp[index] && !reflex[index])
+        .collect();
+    for index in 0..count {
+        let previous = (index + count - 1) % count;
+        if reflex[index]
+            && !(matches!(bands[previous], SweptBand::Straight { .. })
+                && matches!(bands[index], SweptBand::Straight { .. }))
+        {
+            return Err(RimLoopBlendError::ReflexCorner);
+        }
+    }
     // Band tangency points: the wall point directly outward of each spine
-    // endpoint. At a sharp corner the spine is trimmed back to its mitre, so
-    // this is the setback; at a tangent junction it is the junction itself.
+    // endpoint. At a convex corner the spine is trimmed back to its mitre, so
+    // this is the setback; at a tangent junction it is the junction itself;
+    // at a reflex corner the wall rail runs all the way to the corner.
     let band_start: Vec<Point2> = (0..count)
-        .map(|index| wall_point(bands[index], spine.segments[index].start(), fillet))
+        .map(|index| {
+            if reflex[index] {
+                profile[index].start()
+            } else {
+                wall_point(bands[index], spine.segments[index].start(), fillet)
+            }
+        })
         .collect();
     let band_end: Vec<Point2> = (0..count)
-        .map(|index| wall_point(bands[index], spine.segments[index].end(), fillet))
+        .map(|index| {
+            let next = (index + 1) % count;
+            if reflex[next] {
+                profile[index].end()
+            } else {
+                wall_point(bands[index], spine.segments[index].end(), fillet)
+            }
+        })
         .collect();
     // The inward normal at each tangency point. On an arc that is the trimmed
     // azimuth's normal, which is what the seams and the sphere patch need; on
@@ -1322,12 +1423,18 @@ fn build_filleted_prism(
     let leaving: Vec<Point2> = (0..count)
         .map(|index| inward_at(bands[index], band_end[index], spine.segments[index].end()))
         .collect();
-    // Each band's trimmed parameter span: arc length over a run, azimuth over
-    // an arc. The spine shares it, the two carriers being concentric.
+    // Each band's parameter span along the wall rail: arc length from the
+    // spine's start over a run, azimuth over an arc. The spine shares it, the
+    // two carriers being concentric — except beside a reflex corner, where
+    // the wall rail stops at the corner and the spine runs on to the mitre.
     let span: Vec<(f64, f64)> = (0..count)
         .map(|index| match bands[index] {
-            SweptBand::Straight { .. } => {
-                (0.0, distance_between(band_start[index], band_end[index]))
+            SweptBand::Straight { direction, .. } => {
+                let origin = spine.segments[index].start();
+                let along = |point: Point2| {
+                    (point.x - origin.x).mul_add(direction.x, (point.y - origin.y) * direction.y)
+                };
+                (along(band_start[index]), along(band_end[index]))
             }
             SweptBand::Revolved { center, .. } => {
                 let angle = |point: Point2| (point.y - center.y).atan2(point.x - center.x);
@@ -1336,12 +1443,21 @@ fn build_filleted_prism(
             }
         })
         .collect();
+    let cap_span: Vec<(f64, f64)> = (0..count)
+        .map(|index| match bands[index] {
+            SweptBand::Straight { .. } => (
+                0.0,
+                distance_between(spine.segments[index].start(), spine.segments[index].end()),
+            ),
+            SweptBand::Revolved { .. } => span[index],
+        })
+        .collect();
 
-    // Each sharp corner must leave a usable setback on both neighbours, and
-    // every band must retain a usable span.
+    // Each convex corner must leave a usable setback on both neighbours, a
+    // reflex corner a usable mitre run, and every band a usable span.
     for index in 0..count {
         let previous = (index + count - 1) % count;
-        if sharp[index] {
+        if convex[index] {
             let corner = profile[index].start();
             let lead = distance_between(corner, band_start[index]);
             let trail = distance_between(band_end[previous], corner);
@@ -1349,7 +1465,14 @@ fn build_filleted_prism(
                 return Err(RimLoopBlendError::DistanceInvalid);
             }
         }
-        if distance_between(band_start[index], band_end[index]) < precision.min_feature_size
+        if reflex[index] {
+            let lead = span[index].0;
+            let trail = cap_span[previous].1 - span[previous].1;
+            if lead < precision.min_feature_size || trail < precision.min_feature_size {
+                return Err(RimLoopBlendError::DistanceInvalid);
+            }
+        }
+        if span[index].1 - span[index].0 < precision.min_feature_size
             && matches!(bands[index], SweptBand::Straight { .. })
         {
             return Err(RimLoopBlendError::DistanceInvalid);
@@ -1378,7 +1501,7 @@ fn build_filleted_prism(
         .collect();
     let start_vertex: Vec<VertexKey> = (0..count)
         .map(|index| {
-            if sharp[index] {
+            if convex[index] {
                 let point = builder.world(band_start[index], wall_top);
                 builder.vertex(point)
             } else {
@@ -1389,7 +1512,7 @@ fn build_filleted_prism(
     let end_vertex: Vec<VertexKey> = (0..count)
         .map(|index| {
             let next = (index + 1) % count;
-            if sharp[next] {
+            if convex[next] {
                 let point = builder.world(band_end[index], wall_top);
                 builder.vertex(point)
             } else {
@@ -1416,7 +1539,7 @@ fn build_filleted_prism(
         .collect();
     let lead: Vec<Option<EdgeKey>> = (0..count)
         .map(|index| {
-            sharp[index].then(|| {
+            convex[index].then(|| {
                 builder.profile_edge(
                     bands[index],
                     [wall_corner[index], start_vertex[index]],
@@ -1439,7 +1562,7 @@ fn build_filleted_prism(
     let trail: Vec<Option<EdgeKey>> = (0..count)
         .map(|index| {
             let next = (index + 1) % count;
-            sharp[next].then(|| {
+            convex[next].then(|| {
                 builder.profile_edge(
                     bands[index],
                     [end_vertex[index], wall_corner[next]],
@@ -1473,7 +1596,30 @@ fn build_filleted_prism(
         let previous = (index + count - 1) % count;
         let center = builder.world(spine.segments[index].start(), wall_top);
         let entering_axis = builder.direction(entering[index], -1.0);
-        if sharp[index] {
+        if reflex[index] {
+            // The mitre seam: the ellipse in which the two equal cylinders
+            // meet, from the corner at the wall top up to the mitre on the
+            // cap. Its centre is the axes' meeting point, its minor axis the
+            // fillet radius along the cap normal, and its major axis reaches
+            // the corner.
+            let corner = builder.world(profile[index].start(), wall_top);
+            let reach = corner - center;
+            let major_radius = reach.length();
+            if major_radius < fillet {
+                return Err(RimLoopBlendError::DomainUnsupported);
+            }
+            let shared = builder.ellipse_edge(
+                [wall_corner[index], cap[index]],
+                center,
+                reach / major_radius,
+                frame.normal,
+                major_radius,
+                fillet,
+                (0.0, quarter),
+            );
+            start_seam[index] = Some(shared);
+            end_seam[previous] = Some(shared);
+        } else if sharp[index] {
             let leaving_axis = builder.direction(leaving[previous], -1.0);
             end_seam[previous] = Some(builder.arc_edge(
                 [end_vertex[previous], cap[index]],
@@ -1514,7 +1660,7 @@ fn build_filleted_prism(
         .collect();
     let equator: Vec<Option<EdgeKey>> = (0..count)
         .map(|index| {
-            sharp[index].then(|| {
+            convex[index].then(|| {
                 let previous = (index + count - 1) % count;
                 let center = builder.world(spine.segments[index].start(), wall_top);
                 let radial = builder.direction(leaving[previous], -1.0);
@@ -1605,15 +1751,33 @@ fn build_filleted_prism(
 
     // Bands: a quarter cylinder over a run, a quarter torus over an arc.
     for index in 0..count {
+        let next = (index + 1) % count;
+        let seam_shape = |mitred: bool| {
+            if mitred {
+                SeamShape::Mitre
+            } else {
+                SeamShape::Straight
+            }
+        };
         let uses = builder.band_uses(
             bands[index],
             band_wall[index],
-            end_seam[index].expect("every band has an end seam"),
+            (
+                end_seam[index].expect("every band has an end seam"),
+                seam_shape(reflex[next]),
+            ),
             cap_edge[index],
-            start_seam[index].expect("every band has a start seam"),
+            (
+                start_seam[index].expect("every band has a start seam"),
+                seam_shape(reflex[index]),
+            ),
             (
                 span[index].0 * bands[index].sense(),
                 span[index].1 * bands[index].sense(),
+            ),
+            (
+                cap_span[index].0 * bands[index].sense(),
+                cap_span[index].1 * bands[index].sense(),
             ),
         );
         let loop_key = builder.push_loop(uses);
@@ -1625,10 +1789,10 @@ fn build_filleted_prism(
         );
     }
 
-    // Sphere patches and their ledges, at sharp corners only.
+    // Sphere patches and their ledges, at convex corners only.
     let ledge_plane = Plane::new(frame.origin + frame.normal * wall_top, frame.u, frame.v);
     for index in 0..count {
-        if !sharp[index] {
+        if !convex[index] {
             continue;
         }
         let previous = (index + count - 1) % count;

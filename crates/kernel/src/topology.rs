@@ -263,6 +263,19 @@ pub(crate) enum Curve3 {
         v: Vector3,
         radius: f64,
     },
+    /// `P(t) = center + a·cos t·u + b·sin t·v` with `u ⟂ v` unit and `a ≥ b`.
+    ///
+    /// The one curve beyond lines and circles that the vocabulary admits
+    /// (ADR 0026, K1): where a plane cuts a cylinder or cone obliquely, and
+    /// where two equal-radius cylinders with intersecting perpendicular axes
+    /// meet — the mitre seam of a fillet turning a sharp reflex corner.
+    Ellipse {
+        center: Point3,
+        u: Vector3,
+        v: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+    },
 }
 
 impl Curve3 {
@@ -298,6 +311,16 @@ impl Curve3 {
                 let parameter = parameter.rem_euclid(std::f64::consts::TAU);
                 center + u * (radius * parameter.cos()) + v * (radius * parameter.sin())
             }
+            Self::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                let parameter = parameter.rem_euclid(std::f64::consts::TAU);
+                center + u * (major_radius * parameter.cos()) + v * (minor_radius * parameter.sin())
+            }
         }
     }
 
@@ -307,6 +330,13 @@ impl Curve3 {
             Self::Circle { u, v, radius, .. } => {
                 u * (-radius * parameter.sin()) + v * (radius * parameter.cos())
             }
+            Self::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => u * (-major_radius * parameter.sin()) + v * (minor_radius * parameter.cos()),
         }
     }
 
@@ -319,8 +349,127 @@ impl Curve3 {
                 v,
                 radius,
             } => center.is_finite() && u.is_finite() && v.is_finite() && radius.is_finite(),
+            Self::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                center.is_finite()
+                    && u.is_finite()
+                    && v.is_finite()
+                    && major_radius.is_finite()
+                    && minor_radius.is_finite()
+            }
         }
     }
+}
+
+/// Arc length of the ellipse `(a cos t, b sin t)` from `from` to `to`, with
+/// `a ≥ b`: `a·[E(φ₁|k) − E(φ₀|k)]` for `φ = π/2 − t` and `k² = 1 − b²/a²`.
+///
+/// The incomplete elliptic integral of the second kind is evaluated through
+/// Carlson's symmetric forms, whose duplication iterations converge
+/// quadratically and deterministically to machine precision. ADR 0026 makes
+/// the policy normative: an elliptic integral so evaluated counts as a closed
+/// form, exactly as `cos` does — it evaluates a transcendental exactly; it
+/// does not approximate the geometry.
+pub(crate) fn elliptic_arc_length(major_radius: f64, minor_radius: f64, from: f64, to: f64) -> f64 {
+    if major_radius.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        || !minor_radius.is_finite()
+        || !from.is_finite()
+        || !to.is_finite()
+    {
+        return f64::NAN;
+    }
+    let modulus_square = 1.0 - (minor_radius / major_radius).powi(2);
+    let half = std::f64::consts::FRAC_PI_2;
+    let integral = |t: f64| incomplete_elliptic_e(half - t, modulus_square);
+    // `E` is odd and grows by one complete quarter per quarter turn, so the
+    // difference of the two antiderivatives is the signed arc length.
+    major_radius * (integral(from) - integral(to))
+}
+
+/// Legendre's incomplete elliptic integral of the second kind `E(φ | m)`,
+/// `m = k²`, for any real amplitude, by symmetry and periodicity reduced to
+/// `0 ≤ φ ≤ π/2` and then to Carlson's `R_F` and `R_D`.
+fn incomplete_elliptic_e(phi: f64, m: f64) -> f64 {
+    let half = std::f64::consts::FRAC_PI_2;
+    let complete = 2.0 * elliptic_e_quarter(half, m);
+    // E(φ + nπ) = E(φ) + n·E(π); E(−φ) = −E(φ).
+    let turns = (phi / std::f64::consts::PI).round();
+    let reduced = phi - turns * std::f64::consts::PI;
+    let quarter = if reduced < 0.0 {
+        -elliptic_e_quarter(-reduced, m)
+    } else {
+        elliptic_e_quarter(reduced, m)
+    };
+    turns * complete + quarter
+}
+
+/// `E(φ | m)` for `0 ≤ φ ≤ π/2`.
+fn elliptic_e_quarter(phi: f64, m: f64) -> f64 {
+    let (sin, cos) = phi.sin_cos();
+    let x = cos * cos;
+    let y = 1.0 - m * sin * sin;
+    sin * carlson_rf(x, y, 1.0) - m * sin.powi(3) * carlson_rd(x, y, 1.0) / 3.0
+}
+
+/// Carlson's `R_F(x, y, z)` by the duplication algorithm (Numerical Recipes,
+/// §6.11), to about `1e-15` relative.
+fn carlson_rf(mut x: f64, mut y: f64, mut z: f64) -> f64 {
+    const ERROR: f64 = 1.0e-8;
+    for _ in 0..64 {
+        let lambda = (x * y).sqrt() + (x * z).sqrt() + (y * z).sqrt();
+        x = 0.25 * (x + lambda);
+        y = 0.25 * (y + lambda);
+        z = 0.25 * (z + lambda);
+        let mean = (x + y + z) / 3.0;
+        let dx = 1.0 - x / mean;
+        let dy = 1.0 - y / mean;
+        let dz = 1.0 - z / mean;
+        if dx.abs().max(dy.abs()).max(dz.abs()) < ERROR {
+            let e2 = dx * dy - dz * dz;
+            let e3 = dx * dy * dz;
+            return (1.0 + (e2 / 24.0 - 0.1 - 3.0 * e3 / 44.0) * e2 + e3 / 14.0) / mean.sqrt();
+        }
+    }
+    f64::NAN
+}
+
+/// Carlson's `R_D(x, y, z)` by the duplication algorithm.
+fn carlson_rd(mut x: f64, mut y: f64, mut z: f64) -> f64 {
+    const ERROR: f64 = 1.0e-8;
+    let mut sum = 0.0;
+    let mut factor = 1.0;
+    for _ in 0..64 {
+        let sqrt_x = x.sqrt();
+        let sqrt_y = y.sqrt();
+        let sqrt_z = z.sqrt();
+        let lambda = sqrt_x * (sqrt_y + sqrt_z) + sqrt_y * sqrt_z;
+        sum += factor / (sqrt_z * (z + lambda));
+        factor *= 0.25;
+        x = 0.25 * (x + lambda);
+        y = 0.25 * (y + lambda);
+        z = 0.25 * (z + lambda);
+        let mean = (x + y + 3.0 * z) / 5.0;
+        let dx = 1.0 - x / mean;
+        let dy = 1.0 - y / mean;
+        let dz = 1.0 - z / mean;
+        if dx.abs().max(dy.abs()).max(dz.abs()) < ERROR {
+            let ea = dx * dy;
+            let eb = dz * dz;
+            let ec = ea - eb;
+            let ed = ea - 6.0 * eb;
+            let ee = ed + ec + ec;
+            let series = 1.0
+                + ed * (-3.0 / 14.0 + 9.0 / 88.0 * ed - 4.5 / 26.0 * dz * ee)
+                + dz * (ee / 6.0 + dz * (-9.0 / 22.0 * ec + 3.0 / 26.0 * dz * ea));
+            return 3.0 * sum + factor * series / (mean * mean.sqrt());
+        }
+    }
+    f64::NAN
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,6 +502,17 @@ impl Edge {
             Curve3::Circle { radius, .. } => {
                 radius * (self.parameter_range.end - self.parameter_range.start).abs()
             }
+            Curve3::Ellipse {
+                major_radius,
+                minor_radius,
+                ..
+            } => elliptic_arc_length(
+                major_radius,
+                minor_radius,
+                self.parameter_range.start,
+                self.parameter_range.end,
+            )
+            .abs(),
         }
     }
 
@@ -377,6 +537,14 @@ pub(crate) enum Curve2 {
         u: Vector2,
         v: Vector2,
         radius: f64,
+    },
+    /// `(θ, v(θ)) = (θ, mean + amplitude·cos(θ − phase))`: the trace on a
+    /// cylinder or cone of a plane section, and of the Steinmetz seam between
+    /// two equal cylinders. The parameter is the azimuth itself.
+    Harmonic {
+        mean: f64,
+        amplitude: f64,
+        phase: f64,
     },
 }
 
@@ -411,6 +579,11 @@ impl Curve2 {
                 center.x + radius * (u.x * parameter.cos() + v.x * parameter.sin()),
                 center.y + radius * (u.y * parameter.cos() + v.y * parameter.sin()),
             ),
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+            } => Point2::new(parameter, mean + amplitude * (parameter - phase).cos()),
         }
     }
 
@@ -424,6 +597,9 @@ impl Curve2 {
                 radius * (-u.x * parameter.sin() + v.x * parameter.cos()),
                 radius * (-u.y * parameter.sin() + v.y * parameter.cos()),
             ),
+            Self::Harmonic {
+                amplitude, phase, ..
+            } => Vector2::new(1.0, -amplitude * (parameter - phase).sin()),
         }
     }
 
@@ -436,6 +612,11 @@ impl Curve2 {
                 v,
                 radius,
             } => center.is_finite() && u.is_finite() && v.is_finite() && radius.is_finite(),
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+            } => mean.is_finite() && amplitude.is_finite() && phase.is_finite(),
         }
     }
 }

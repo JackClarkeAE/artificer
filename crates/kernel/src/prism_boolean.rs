@@ -820,6 +820,21 @@ fn reverse_face_orientation(
                         };
                         coedge.parameter_range = ParameterRange::new(range.end, range.start);
                     }
+                    Curve2::Harmonic {
+                        mean,
+                        amplitude,
+                        phase,
+                    } => {
+                        // Only a cylinder carries a harmonic, and its mirror
+                        // negates the azimuth: `cos(−θ − φ) = cos(θ + φ)`.
+                        // The reversed walk then runs from `−end` to `−start`.
+                        coedge.pcurve = Curve2::Harmonic {
+                            mean,
+                            amplitude,
+                            phase: -phase,
+                        };
+                        coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
+                    }
                 }
             }
         }

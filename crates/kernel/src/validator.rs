@@ -233,6 +233,24 @@ fn validate_geometry(
                 } else {
                     linear_tolerance - radius
                 }),
+            Curve3::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => (u.length() - 1.0)
+                .abs()
+                .max((v.length() - 1.0).abs())
+                .max(u.dot(v).abs())
+                .max((u.cross(v).length() - 1.0).abs())
+                .max(if minor_radius > linear_tolerance {
+                    0.0
+                } else {
+                    linear_tolerance - minor_radius
+                })
+                // The major axis is the first one by construction.
+                .max((minor_radius - major_radius).max(0.0)),
         };
         if !curve_frame_error.is_finite() || curve_frame_error > linear_tolerance {
             diagnostics.push(
@@ -251,7 +269,10 @@ fn validate_geometry(
                 format!("edge/{}/parameter-range", edge.id.get()),
             ));
         }
-        if matches!(edge.value.curve, Curve3::Circle { .. }) {
+        if matches!(
+            edge.value.curve,
+            Curve3::Circle { .. } | Curve3::Ellipse { .. }
+        ) {
             let sweep = (range.end - range.start).abs();
             if !sweep.is_finite()
                 || sweep <= f64::EPSILON
@@ -349,6 +370,24 @@ fn validate_geometry(
             if !sweep.is_finite()
                 || sweep <= f64::EPSILON
                 || sweep > std::f64::consts::TAU + linear_tolerance
+            {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::ParameterRangeInvalid,
+                        format!("coedge/{}/parameter-range", coedge.id.get()),
+                    )
+                    .with_measure(sweep, std::f64::consts::TAU),
+                );
+            }
+        } else if let Curve2::Harmonic { amplitude, .. } = coedge.value.pcurve {
+            // The azimuth is the parameter, so any finite span up to one
+            // turn is well-formed; a flat harmonic is a line in disguise.
+            let sweep =
+                (coedge.value.parameter_range.end - coedge.value.parameter_range.start).abs();
+            if !sweep.is_finite()
+                || sweep <= f64::EPSILON
+                || sweep > std::f64::consts::TAU + linear_tolerance
+                || amplitude.abs() <= linear_tolerance
             {
                 diagnostics.push(
                     Diagnostic::new(
@@ -779,6 +818,37 @@ fn pcurve_locus_error(
         }
         (
             Surface::Cylinder(cylinder),
+            Curve2::Harmonic { .. },
+            Curve3::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            },
+        ) => {
+            // The seam of two equal cylinders: every point of the ellipse
+            // sits at the cylinder's radius from its axis, and its minor
+            // radius is that radius. Eight samples around the whole ellipse
+            // prove the locus; the sampled and tangent errors tie the
+            // harmonic's parameterization to it.
+            let axis_length = cylinder.axis.length();
+            if axis_length <= f64::EPSILON {
+                return linear_tolerance.max(1.0) * 2.0;
+            }
+            let axis = cylinder.axis / axis_length;
+            let mut worst = (minor_radius - cylinder.radius).abs();
+            for step in 0..8 {
+                let t = f64::from(step) * std::f64::consts::FRAC_PI_4;
+                let point = center + u * (major_radius * t.cos()) + v * (minor_radius * t.sin());
+                let relative = point - cylinder.origin;
+                let radial = relative - axis * relative.dot(axis);
+                worst = worst.max((radial.length() - cylinder.radius).abs());
+            }
+            worst.max(tangent_error).max(sampled_error)
+        }
+        (
+            Surface::Cylinder(cylinder),
             Curve2::Line { endpoints },
             Curve3::Circle {
                 center,
@@ -1016,10 +1086,40 @@ fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
                 0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
                     + radius * radius * frame_determinant * sweep)
             }
+            Curve2::Harmonic {
+                mean,
+                amplitude,
+                phase,
+            } => harmonic_area_contribution(
+                mean,
+                amplitude,
+                phase,
+                coedge.parameter_range.start,
+                coedge.parameter_range.end,
+            ),
         };
         area += contribution;
     }
     area.is_finite().then_some(area)
+}
+
+/// `½∮(x dy − y dx)` along `(θ, m + A cos(θ − φ))` from `from` to `to`.
+///
+/// With `x = θ` and `y = m + A cos(θ − φ)`, the integrand is
+/// `−Aθ sin(θ − φ) − m − A cos(θ − φ)`, whose antiderivative is
+/// `Aθ cos(θ − φ) − 2A sin(θ − φ) − mθ`.
+pub(crate) fn harmonic_area_contribution(
+    mean: f64,
+    amplitude: f64,
+    phase: f64,
+    from: f64,
+    to: f64,
+) -> f64 {
+    let antiderivative = |t: f64| {
+        let (sin, cos) = (t - phase).sin_cos();
+        amplitude * t * cos - 2.0 * amplitude * sin - mean * t
+    };
+    0.5 * (antiderivative(to) - antiderivative(from))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1675,6 +1775,18 @@ pub(crate) fn calculate_exact_shell_measures(
                 ) + polar;
                 moment = moment + plane.normal * (square / 2.0);
             }
+            Surface::Cylinder(cylinder)
+                if let Some(contour) =
+                    cylinder_contour_measures(topology, &face.value, cylinder, anchor) =>
+            {
+                // The general path: the parameter region bounded by any
+                // mix of axis-aligned lines and harmonics, integrated by
+                // Green's theorem along the loops. A rectangle takes the
+                // arm below, which it must agree with to the last bit.
+                surface_area += contour.area.abs();
+                flux += contour.flux;
+                moment = moment + contour.moment;
+            }
             Surface::Cylinder(cylinder) => {
                 let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
                 let sign = cylinder.angular_sign;
@@ -1952,6 +2064,200 @@ struct AzimuthMoments {
     offset_radial: f64,
 }
 
+/// A polynomial in `cos θ` and `sin θ`, as terms `(coefficient, cosines,
+/// sines)`. Products of the surface integrands and the powers of a harmonic
+/// boundary all live here, and integrate term by term.
+#[derive(Clone, Debug)]
+struct TrigPoly(Vec<(f64, u32, u32)>);
+
+impl TrigPoly {
+    fn constant(value: f64) -> Self {
+        Self(vec![(value, 0, 0)])
+    }
+
+    fn cosine() -> Self {
+        Self(vec![(1.0, 1, 0)])
+    }
+
+    fn sine() -> Self {
+        Self(vec![(1.0, 0, 1)])
+    }
+
+    fn scaled(&self, factor: f64) -> Self {
+        Self(
+            self.0
+                .iter()
+                .map(|(coefficient, cosines, sines)| (coefficient * factor, *cosines, *sines))
+                .collect(),
+        )
+    }
+
+    fn plus(&self, other: &Self) -> Self {
+        let mut terms = self.0.clone();
+        terms.extend(other.0.iter().copied());
+        Self(terms)
+    }
+
+    fn times(&self, other: &Self) -> Self {
+        let mut terms = Vec::with_capacity(self.0.len() * other.0.len());
+        for (left, left_cos, left_sin) in &self.0 {
+            for (right, right_cos, right_sin) in &other.0 {
+                terms.push((left * right, left_cos + right_cos, left_sin + right_sin));
+            }
+        }
+        Self(terms)
+    }
+
+    fn power(&self, exponent: u32) -> Self {
+        let mut result = Self::constant(1.0);
+        for _ in 0..exponent {
+            result = result.times(self);
+        }
+        result
+    }
+
+    fn integrate(&self, from: f64, to: f64) -> f64 {
+        self.0
+            .iter()
+            .map(|(coefficient, cosines, sines)| {
+                coefficient * trig_power_integral(*cosines, *sines, from, to)
+            })
+            .sum()
+    }
+}
+
+/// `∫ cos^a t sin^b t dt` for any powers, by the classical reduction
+/// formulas applied to the antiderivative: closed form, no quadrature.
+fn trig_power_integral(cosines: u32, sines: u32, from: f64, to: f64) -> f64 {
+    fn antiderivative(a: u32, b: u32, t: f64) -> f64 {
+        let (sin, cos) = t.sin_cos();
+        let total = f64::from(a + b);
+        match (a, b) {
+            (0, 0) => t,
+            (1, 0) => sin,
+            (0, 1) => -cos,
+            (1, 1) => sin * sin / 2.0,
+            (_, b) if b >= 2 => {
+                -cos.powi(a as i32 + 1) * sin.powi(b as i32 - 1) / total
+                    + f64::from(b - 1) / total * antiderivative(a, b - 2, t)
+            }
+            _ => {
+                cos.powi(a as i32 - 1) * sin.powi(b as i32 + 1) / total
+                    + f64::from(a - 1) / total * antiderivative(a - 2, b, t)
+            }
+        }
+    }
+    antiderivative(cosines, sines, to) - antiderivative(cosines, sines, from)
+}
+
+/// `∬_D t(θ)·v^k dθ dv` over a cylinder face's parameter region, by Green's
+/// theorem as `−∮ t(θ)·v^{k+1}/(k+1) dθ` along its loops. The loops' own
+/// winding signs the result, so a clockwise face comes out negative exactly
+/// as its parameter area does. Only axis-aligned lines and harmonics bound
+/// the regions this closes; a sloped line returns `None` and the caller
+/// falls back to the rectangular form.
+fn cylinder_region_integral(
+    topology: &Topology,
+    face: &Face,
+    weight: &TrigPoly,
+    power: u32,
+) -> Option<f64> {
+    let mut total = 0.0;
+    for loop_key in face.loops() {
+        let loop_record = topology.loop_record(loop_key)?;
+        for coedge_key in &loop_record.value.coedges {
+            let coedge = topology.coedge(*coedge_key)?.value;
+            let range = coedge.parameter_range;
+            total += match coedge.pcurve {
+                Curve2::Line { .. } => {
+                    let [start, end] = coedge.pcurve_endpoints();
+                    let across = end.x - start.x;
+                    let along = end.y - start.y;
+                    let scale = across.abs().max(along.abs()).max(1.0);
+                    if across.abs() <= scale * 1.0e-12 {
+                        0.0
+                    } else if along.abs() <= scale * 1.0e-12 {
+                        let level = start.y.powi(power as i32 + 1) / f64::from(power + 1);
+                        -level * weight.integrate(start.x, end.x)
+                    } else {
+                        return None;
+                    }
+                }
+                Curve2::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                } => {
+                    let (sin_phase, cos_phase) = phase.sin_cos();
+                    let trace = TrigPoly::constant(mean)
+                        .plus(&TrigPoly::cosine().scaled(amplitude * cos_phase))
+                        .plus(&TrigPoly::sine().scaled(amplitude * sin_phase));
+                    let integrand = weight
+                        .times(&trace.power(power + 1))
+                        .scaled(-1.0 / f64::from(power + 1));
+                    integrand.integrate(range.start, range.end)
+                }
+                Curve2::Circle { .. } => return None,
+            };
+        }
+    }
+    total.is_finite().then_some(total)
+}
+
+struct CylinderContourMeasures {
+    area: f64,
+    flux: f64,
+    moment: Vector3,
+}
+
+/// Area, flux, and first moment of a cylinder face over an arbitrary
+/// parameter region, with `x = origin − anchor + R·r̂(θ) + v·axis` and
+/// `n dA = sign·r̂(θ)·R dθ dv`, where `r̂(θ) = cos θ·u + sign·sin θ·v`.
+fn cylinder_contour_measures(
+    topology: &Topology,
+    face: &Face,
+    cylinder: crate::topology::Cylinder,
+    anchor: Point3,
+) -> Option<CylinderContourMeasures> {
+    let sign = cylinder.angular_sign;
+    let radius = cylinder.radius;
+    let offset = cylinder.origin - anchor;
+    let along_u = offset.dot(cylinder.radial_u);
+    let along_v = offset.dot(cylinder.radial_v);
+    let axial = offset.dot(cylinder.axis);
+    let one = TrigPoly::constant(1.0);
+    let cosine = TrigPoly::cosine();
+    let sine = TrigPoly::sine().scaled(sign);
+    let integral =
+        |weight: &TrigPoly, power: u32| cylinder_region_integral(topology, face, weight, power);
+    // The radial unit vector integrated against v^k.
+    let radial = |power: u32| -> Option<Vector3> {
+        Some(
+            cylinder.radial_u * integral(&cosine, power)?
+                + cylinder.radial_v * integral(&sine, power)?,
+        )
+    };
+    let area = radius * integral(&one, 0)?;
+    // (x − p)·n = offset·r̂ + R.
+    let offset_radial = TrigPoly::constant(along_u)
+        .times(&cosine)
+        .plus(&TrigPoly::constant(along_v).times(&sine));
+    let flux = sign * radius * (integral(&offset_radial, 0)? + radius * integral(&one, 0)?);
+    // |x|² = |o|² + R² + v² + 2R(o·r̂) + 2v(o·a); moment = ½∮|x|² n dA.
+    let constant = offset.dot(offset) + radius * radius;
+    let radial_0 = radial(0)?;
+    let radial_1 = radial(1)?;
+    let radial_2 = radial(2)?;
+    let cross_u = cylinder.radial_u * integral(&offset_radial.times(&cosine), 0)?;
+    let cross_v = cylinder.radial_v * integral(&offset_radial.times(&sine), 0)?;
+    let moment = (radial_0 * constant
+        + radial_2
+        + (cross_u + cross_v) * (2.0 * radius)
+        + radial_1 * (2.0 * axial))
+        * (sign * radius / 2.0);
+    Some(CylinderContourMeasures { area, flux, moment })
+}
+
 fn azimuth_moments(
     radial_u: Vector3,
     radial_v: Vector3,
@@ -2052,6 +2358,9 @@ fn face_parameter_polar_moment(topology: &Topology, face: &Face) -> Option<f64> 
             let coedge = topology.coedge(*coedge_key)?.value;
             let range = coedge.parameter_range;
             total += match coedge.pcurve {
+                // Harmonics live on cylinders and cones; the polar moment is a
+                // planar quantity, so a face carrying one is outside this form.
+                Curve2::Harmonic { .. } => return None,
                 Curve2::Line { .. } => {
                     let from = coedge.pcurve.evaluate(range.start);
                     let to = coedge.pcurve.evaluate(range.end);
@@ -2554,6 +2863,24 @@ pub(crate) fn face_parameter_area_and_moment(
                 moment.x += center.x * segment_area + direction.x * offset_scale;
                 moment.y += center.y * segment_area + direction.y * offset_scale;
             }
+            if let Curve2::Harmonic {
+                mean,
+                amplitude,
+                phase,
+            } = coedge.pcurve
+            {
+                // The exact contour term of the harmonic, less the chord
+                // already counted, in the anchored frame (the anchor shift
+                // changes only the moment, which harmonics never feed).
+                let exact = harmonic_area_contribution(
+                    mean - anchor.y,
+                    amplitude,
+                    phase,
+                    coedge.parameter_range.start - anchor.x,
+                    coedge.parameter_range.end - anchor.x,
+                );
+                area += exact - chord_area;
+            }
         }
     }
     moment.x += anchor.x * area;
@@ -2581,29 +2908,27 @@ fn calculate_bounds(topology: &Topology) -> Option<Bounds3> {
         max.z = max.z.max(point.z);
     }
     for edge in &topology.edges {
-        let Curve3::Circle {
-            center,
-            u,
-            v,
-            radius,
-        } = edge.value.curve
-        else {
-            continue;
+        // Each coordinate of `c + a cos t u + b sin t v` is extremal where
+        // `tan t = (b v_i) / (a u_i)`; a circle is the case `a = b`.
+        let (u, v, major, minor) = match edge.value.curve {
+            Curve3::Circle { u, v, radius, .. } => (u, v, radius, radius),
+            Curve3::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => (u, v, major_radius, minor_radius),
+            Curve3::Line { .. } => continue,
         };
         for (u_component, v_component) in [(u.x, v.x), (u.y, v.y), (u.z, v.z)] {
             if u_component == 0.0 && v_component == 0.0 {
                 continue;
             }
-            let extremum = v_component.atan2(u_component);
+            let extremum = (minor * v_component).atan2(major * u_component);
             for angle in [extremum, extremum + std::f64::consts::PI] {
                 if angle_is_on_range(angle, edge.value.parameter_range) {
-                    let point = Curve3::Circle {
-                        center,
-                        u,
-                        v,
-                        radius,
-                    }
-                    .evaluate(angle);
+                    let point = edge.value.curve.evaluate(angle);
                     min.x = min.x.min(point.x);
                     min.y = min.y.min(point.y);
                     min.z = min.z.min(point.z);

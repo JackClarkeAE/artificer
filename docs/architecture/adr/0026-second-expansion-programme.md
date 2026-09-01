@@ -701,6 +701,17 @@ baselines as the referee:
 
 ### K1. The ellipse programme — one new curve, a much larger world
 
+Status (2026-09-01): the first slice has landed. `Curve3::Ellipse` and the
+`Curve2::Harmonic` pcurve exist and pass through the validator (frame and
+locus arms), transforms, hashing, bounds, tessellation (azimuth strips over
+harmonic-bounded cylinder faces), and measures (cylinder faces integrate
+over any parameter region by Green's theorem, with elliptic arc lengths by
+Carlson's forms). Their first consumer is the rim fillet, which now turns a
+sharp reflex corner between two straight runs through the Steinmetz seam,
+so fillets round square holes and L-shaped rims are exact. Oblique plane
+sections (stages 1–4 below) are still to come.
+
+
 **Why ellipses and nothing else:** the intersection of a plane with a
 cylinder or cone at any non-degenerate attitude is an ellipse; the
 intersection curve of two *equal-radius* cylinders with perpendicular

@@ -1389,6 +1389,17 @@ fn cap_pcurve_from_edge(edge: Edge, plane: Plane, reverse: bool) -> (Curve2, Par
                 edge.parameter_range
             },
         ),
+        // An ellipse never bounds a planar cap in this vocabulary: it is the
+        // seam of two cylinders. Should one arrive here, the chord keeps the
+        // loop closed and the validator's locus check names the mismatch.
+        Curve3::Ellipse { .. } => {
+            let endpoints = edge.endpoints();
+            Curve2::line_segment(if reverse {
+                [plane.project(endpoints[1]), plane.project(endpoints[0])]
+            } else {
+                endpoints.map(|point| plane.project(point))
+            })
+        }
     }
 }
 

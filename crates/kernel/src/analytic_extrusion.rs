@@ -679,6 +679,8 @@ pub(crate) fn topology_loop_segments(
             let start = coedge.pcurve.evaluate(coedge.parameter_range.start);
             let end = coedge.pcurve.evaluate(coedge.parameter_range.end);
             match coedge.pcurve {
+                // A harmonic is a trace on a cylinder, never a planar profile piece.
+                Curve2::Harmonic { .. } => None,
                 Curve2::Line { .. } => Some(Segment::Line { start, end }),
                 Curve2::Circle {
                     center,

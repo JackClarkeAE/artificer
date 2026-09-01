@@ -271,7 +271,7 @@ fn a_square_hole_rim_chamfers_into_four_planar_slants() {
 }
 
 #[test]
-fn a_square_hole_rim_fillet_is_approximated_and_says_so() {
+fn a_square_hole_rim_fillet_is_exact_with_elliptical_mitres() {
     let center = (50.0, 50.0);
     let half = HOLE_SIDE / 2.0;
     let base = block_with_holes(
@@ -283,36 +283,29 @@ fn a_square_hole_rim_fillet_is_approximated_and_says_so() {
     );
     let rim = hole_rim(&base, center, half, HEIGHT);
     // Two cylinders of equal radius meeting at a reflex corner intersect in
-    // an ellipse, outside the line-and-circle vocabulary, so the result is a
-    // labelled approximation rather than a silent one.
-    match finish(
+    // an ellipse, which the vocabulary now admits: the blend is exact, and
+    // each corner removes `f³(5/3 − π/2)` beyond the straight runs.
+    let outcome = finish(
         &base,
         rim,
         EdgeFinishKind::Fillet,
         DISTANCE,
         "square-hole-fillet",
-    ) {
-        Ok(outcome) => {
-            assert!(
-                outcome
-                    .report
-                    .warnings
-                    .iter()
-                    .any(|warning| warning.code.as_str() == "EDGE_FINISH_FACETED_APPROXIMATION"),
-                "a faceted blend must carry its approximation warning: {:?}",
-                outcome.report.warnings
-            );
-        }
-        Err(error) => {
-            assert!(
-                error
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code.as_str() == "EDGE_FINISH_BLEND_UNSUPPORTED"),
-                "unexpected refusal: {error:?}"
-            );
-        }
-    }
+    )
+    .expect("the square-hole fillet is exact");
+    assert!(
+        outcome.report.warnings.is_empty(),
+        "an exact blend carries no approximation warning: {:?}",
+        outcome.report.warnings
+    );
+    let straight = 4.0 * HOLE_SIDE * (1.0 - std::f64::consts::PI / 4.0) * DISTANCE * DISTANCE;
+    let corners = 4.0 * DISTANCE.powi(3) * (5.0 / 3.0 - std::f64::consts::PI / 2.0);
+    let expected = base.measures().volume - straight - corners;
+    let volume = outcome.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "volume {volume} should be {expected}"
+    );
 }
 
 #[test]

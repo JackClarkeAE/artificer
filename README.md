@@ -125,7 +125,7 @@ cargo run --release -p artificer-api-server -- export bracket.art bracket.stl
 ### What the kernel does today
 
 - Primitives, planar-profile extrusion with holes and islands, revolve, drafted extrusion as an exact loft to the profile's offset section, push/pull, holes, ribs, mirror, and linear patterns.
-- Exact chamfers and constant-radius fillets, including fillets that run around a whole hole rim, with spherical and toric corners.
+- Exact chamfers and constant-radius fillets, including fillets that run around a whole hole rim, with spherical corners where the rim turns in and elliptical mitre seams where it turns out.
 - Regularized Boolean union, difference, and intersection, with an exact engine for plane and cylinder operands and a faceted fallback that says so.
 - Analytic surface–surface intersections across the vocabulary, published as a supported-domain matrix.
 - Geometric selectors (`faces(">Z")`, `edges("|Z")`, by extremum, by type, parallel to a direction) that resolve deterministically or refuse with candidates.
@@ -235,7 +235,8 @@ The dependency rules between these layers are checked by `scripts/check-architec
 - [x] The kernel API: Rust, JSON-RPC, `.art` scripts, headless snapshots and export.
 - [x] Multi-document workbench, sketch text, drafted extrusion as the first loft rung.
 - [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces; shell.
-- [ ] The ellipse curve, unlocking oblique cuts, angled holes, pipe tees, and square-hole fillets exactly.
+- [x] The ellipse curve, first slice: the mitre seam of a fillet turning a sharp corner, so fillets round square holes and L-shaped rims are exact.
+- [ ] Oblique plane sections of cylinders and cones on the same curve: angled holes, mitred pipe ends, pipe tees.
 - [ ] Native STEP read and write with exact surfaces, IGES import, DXF drawing sheets.
 
 ---

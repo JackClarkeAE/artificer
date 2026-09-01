@@ -2846,9 +2846,10 @@ fn regularized_edge_finish(
                 "The rim-loop finish distance must leave a usable cap and wall.",
             ));
         }
-        // A sharp concave corner has no exact rolling-ball blend in the
-        // line-and-circle vocabulary; the faceted tier below approximates it
-        // and is labelled as such.
+        // A sharp reflex corner between two straight runs mitres exactly
+        // through an elliptical seam; one that involves an arc would need a
+        // quartic, so the faceted tier below approximates it and is labelled
+        // as such.
         Err(
             rim_loop_blend::RimLoopBlendError::ReflexCorner
             | rim_loop_blend::RimLoopBlendError::TargetInvalid
@@ -3149,6 +3150,13 @@ fn sampled_edge_segments(
             budget,
             precision,
         ),
+        // The semi-major axis bounds the sagitta of every chord.
+        Curve3::Ellipse { major_radius, .. } => arc_subdivisions(
+            major_radius,
+            edge.parameter_range.end - edge.parameter_range.start,
+            budget,
+            precision,
+        ),
     };
     (0..subdivisions)
         .map(|index| {
@@ -3216,6 +3224,9 @@ fn sampled_loop_polygon(
             Curve3::Circle { radius, .. } => {
                 arc_subdivisions(radius, range.end - range.start, budget, precision)
             }
+            Curve3::Ellipse { major_radius, .. } => {
+                arc_subdivisions(major_radius, range.end - range.start, budget, precision)
+            }
         };
         // Sample in the edge's own forward parameterization and reverse the
         // resulting points, rather than reversing the interval and sampling
@@ -3276,6 +3287,8 @@ fn face_frame_loop_curves(
             Orientation::Reverse => (edge.parameter_range.end, edge.parameter_range.start),
         };
         let curve = match edge.curve {
+            // No planar reference curve exists for an ellipse yet.
+            Curve3::Ellipse { .. } => return None,
             Curve3::Line { .. } => FaceBoundaryCurve2::Segment {
                 endpoints: [
                     project(edge.curve.evaluate(start)),
@@ -3651,12 +3664,22 @@ fn tessellate_cylinder_face(
     let Some(loop_record) = topology.loop_record(face.outer_loop) else {
         return Vec::new();
     };
-    let parameters = loop_record
+    let coedges = loop_record
         .value
         .coedges
         .iter()
         .filter_map(|coedge_key| topology.coedge(*coedge_key))
-        .flat_map(|coedge| coedge.value.pcurve_endpoints())
+        .map(|coedge| coedge.value)
+        .collect::<Vec<_>>();
+    if coedges
+        .iter()
+        .any(|coedge| matches!(coedge.pcurve, Curve2::Harmonic { .. }))
+    {
+        return tessellate_harmonic_cylinder_face(&coedges, cylinder, budget, precision);
+    }
+    let parameters = coedges
+        .iter()
+        .flat_map(|coedge| coedge.pcurve_endpoints())
         .collect::<Vec<_>>();
     let Some(first) = parameters.first().copied() else {
         return Vec::new();
@@ -3684,6 +3707,89 @@ fn tessellate_cylinder_face(
         let p01 = cylinder.evaluate(topology::Point2::new(u0, v_max));
         triangles.push([p00, p10, p11]);
         triangles.push([p00, p11, p01]);
+    }
+    triangles
+}
+
+/// Tessellates a cylinder face whose parameter region is bounded by a
+/// harmonic — the mitre seam of a fillet turning a reflex corner — as a
+/// sequence of azimuth strips. Each strip's axial extent is read off the
+/// boundary at its two azimuths, which is exact for the azimuth-monotone
+/// regions such seams bound.
+fn tessellate_harmonic_cylinder_face(
+    coedges: &[topology::Coedge],
+    cylinder: topology::Cylinder,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<[Point3; 3]> {
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    for coedge in coedges {
+        for point in coedge.pcurve_endpoints() {
+            u_min = u_min.min(point.x);
+            u_max = u_max.max(point.x);
+        }
+    }
+    if u_max.partial_cmp(&u_min) != Some(std::cmp::Ordering::Greater) {
+        return Vec::new();
+    }
+    let tolerance = (u_max - u_min) * 1.0e-9;
+    // The axial interval the region covers at one azimuth: the lowest and
+    // highest boundary crossings of that vertical line.
+    let extent = |theta: f64| -> Option<(f64, f64)> {
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        let mut note = |v: f64| {
+            low = low.min(v);
+            high = high.max(v);
+        };
+        for coedge in coedges {
+            let range = coedge.parameter_range;
+            match coedge.pcurve {
+                Curve2::Line { .. } => {
+                    let [start, end] = coedge.pcurve_endpoints();
+                    let across = end.x - start.x;
+                    if across.abs() <= tolerance {
+                        if (theta - start.x).abs() <= tolerance {
+                            note(start.y);
+                            note(end.y);
+                        }
+                    } else if (theta - start.x.min(end.x)) >= -tolerance
+                        && (start.x.max(end.x) - theta) >= -tolerance
+                    {
+                        note(start.y + (end.y - start.y) * (theta - start.x) / across);
+                    }
+                }
+                Curve2::Harmonic { .. } => {
+                    let from = range.start.min(range.end);
+                    let to = range.start.max(range.end);
+                    if theta >= from - tolerance && theta <= to + tolerance {
+                        note(coedge.pcurve.evaluate(theta.clamp(from, to)).y);
+                    }
+                }
+                Curve2::Circle { .. } => return None,
+            }
+        }
+        (low.is_finite() && high.is_finite() && high >= low).then_some((low, high))
+    };
+    let subdivisions = arc_subdivisions(cylinder.radius, u_max - u_min, budget, precision).max(4);
+    let mut triangles = Vec::with_capacity(subdivisions * 2);
+    for index in 0..subdivisions {
+        let u0 = (u_max - u_min).mul_add(index as f64 / subdivisions as f64, u_min);
+        let u1 = (u_max - u_min).mul_add((index + 1) as f64 / subdivisions as f64, u_min);
+        let (Some((low0, high0)), Some((low1, high1))) = (extent(u0), extent(u1)) else {
+            return Vec::new();
+        };
+        let p00 = cylinder.evaluate(topology::Point2::new(u0, low0));
+        let p10 = cylinder.evaluate(topology::Point2::new(u1, low1));
+        let p11 = cylinder.evaluate(topology::Point2::new(u1, high1));
+        let p01 = cylinder.evaluate(topology::Point2::new(u0, high0));
+        if high1 > low1 {
+            triangles.push([p00, p10, p11]);
+        }
+        if high0 > low0 {
+            triangles.push([p00, p11, p01]);
+        }
     }
     triangles
 }
@@ -4896,6 +5002,9 @@ fn validate_transform_candidate(
             .collect::<Vec<_>>();
         let carrier = match coedge.value.pcurve {
             Curve2::Line { .. } => Vec::new(),
+            Curve2::Harmonic {
+                mean, amplitude, ..
+            } => vec![mean.abs() + amplitude.abs()],
             Curve2::Circle {
                 center,
                 u,
@@ -4935,7 +5044,7 @@ fn validate_transform_candidate(
                 let endpoints = edge.value.endpoints();
                 endpoints[0].distance(endpoints[1])
             }
-            Curve3::Circle { .. } => edge.value.length(),
+            Curve3::Circle { .. } | Curve3::Ellipse { .. } => edge.value.length(),
         };
         shortest = shortest.min(represented);
     }
@@ -4977,7 +5086,7 @@ fn validate_transform_candidate(
                     let endpoints = after.value.endpoints();
                     endpoints[0].distance(endpoints[1])
                 }
-                Curve3::Circle { .. } => after.value.length(),
+                Curve3::Circle { .. } | Curve3::Ellipse { .. } => after.value.length(),
             };
             (represented - expected).abs()
         })
@@ -6669,6 +6778,26 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             hash_f64(&mut hasher, edge.value.parameter_range.start);
             hash_f64(&mut hasher, edge.value.parameter_range.end);
         }
+        if let Curve3::Ellipse {
+            center,
+            u,
+            v,
+            major_radius,
+            minor_radius,
+        } = edge.value.curve
+        {
+            hasher.update(b"analytic-ellipse-curve-v0");
+            hash_point(&mut hasher, center);
+            for vector in [u, v] {
+                hash_f64(&mut hasher, vector.x);
+                hash_f64(&mut hasher, vector.y);
+                hash_f64(&mut hasher, vector.z);
+            }
+            hash_f64(&mut hasher, major_radius);
+            hash_f64(&mut hasher, minor_radius);
+            hash_f64(&mut hasher, edge.value.parameter_range.start);
+            hash_f64(&mut hasher, edge.value.parameter_range.end);
+        }
     }
     hash_collection_header(&mut hasher, b"coedges", topology.coedges.len());
     for coedge in &topology.coedges {
@@ -6691,6 +6820,19 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
         {
             hasher.update(b"analytic-circle-pcurve-v0");
             for value in [center.x, center.y, u.x, u.y, v.x, v.y, radius] {
+                hash_f64(&mut hasher, value);
+            }
+            hash_f64(&mut hasher, coedge.value.parameter_range.start);
+            hash_f64(&mut hasher, coedge.value.parameter_range.end);
+        }
+        if let Curve2::Harmonic {
+            mean,
+            amplitude,
+            phase,
+        } = coedge.value.pcurve
+        {
+            hasher.update(b"analytic-harmonic-pcurve-v0");
+            for value in [mean, amplitude, phase] {
                 hash_f64(&mut hasher, value);
             }
             hash_f64(&mut hasher, coedge.value.parameter_range.start);
