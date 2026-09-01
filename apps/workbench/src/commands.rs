@@ -559,9 +559,9 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         RibbonGroupId::SketchView,
         CommandIcon::Edges,
         CommandSize::Small,
-        "3D Context",
-        "Project 3D Context",
-        "Project the 3D body's visible edges and background faces onto the sketch plane.",
+        "Project 3D",
+        "Project 3D Geometry",
+        "Reveal the body's geometry below the sketch surface as an x-ray under the face: pockets, bores, and walls that the face hides. The body itself is always shown.",
         None,
     ),
     // ---- View tab --------------------------------------------------------

@@ -109,6 +109,11 @@ pub struct SketchColours {
     pub context_edge: Color32,
     /// The selected face's boundary in a face sketch.
     pub context_selected_boundary: Color32,
+    /// Faces of the host body below the sketch surface, revealed by the
+    /// Project 3D Geometry toggle as an x-ray under the face.
+    pub context_below_face: Color32,
+    /// Edges of the host body below the sketch surface.
+    pub context_below_edge: Color32,
     /// Fill of bounded profile cells; selected cells use it stronger.
     pub region_fill: Color32,
     /// Fill of the cell under the pointer.
@@ -140,6 +145,8 @@ pub const LIGHT_SKETCH: SketchColours = SketchColours {
     context_face: Color32::from_rgb(226, 233, 240),
     context_edge: Color32::from_rgba_unmultiplied_const(96, 116, 140, 185),
     context_selected_boundary: Color32::from_rgb(18, 102, 189),
+    context_below_face: Color32::from_rgba_unmultiplied_const(214, 118, 24, 96),
+    context_below_edge: Color32::from_rgb(178, 84, 8),
     region_fill: Color32::from_rgb(18, 102, 189),
     region_hover: Color32::from_rgb(206, 128, 16),
     overlay_text: Color32::from_rgb(84, 96, 108),
@@ -170,6 +177,8 @@ pub const DARK_SKETCH: SketchColours = SketchColours {
     context_face: Color32::from_rgb(46, 53, 62),
     context_edge: Color32::from_rgba_unmultiplied_const(150, 168, 192, 185),
     context_selected_boundary: Color32::from_rgb(93, 165, 240),
+    context_below_face: Color32::from_rgba_unmultiplied_const(236, 150, 52, 104),
+    context_below_edge: Color32::from_rgb(244, 172, 84),
     region_fill: Color32::from_rgb(93, 165, 240),
     region_hover: Color32::from_rgb(225, 173, 88),
     overlay_text: Color32::from_rgb(155, 167, 181),
@@ -524,6 +533,8 @@ colour_roles!(
         context_face,
         context_edge,
         context_selected_boundary,
+        context_below_face,
+        context_below_edge,
         region_fill,
         region_hover,
         overlay_text,

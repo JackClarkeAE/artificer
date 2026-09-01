@@ -179,6 +179,12 @@ pub struct DebugEdge {
     /// The topology retains it for validation, while CAD presentation and
     /// picking may treat it as a smooth internal subdivision.
     pub is_smooth: bool,
+    /// True when two different exact carriers meet here with one shared
+    /// normal — the transition rail of a fillet. The rail is real topology
+    /// and stays selectable, but it is not a crease: presentation draws it
+    /// only where it happens to be the body's outline, or when the user
+    /// hovers or selects it.
+    pub is_tangent: bool,
     /// The faces this edge separates, in topology order. Presentation uses
     /// them to tell an outline edge — one incident face turned away from the
     /// camera — from an interior crease, which is most of why a drafting
@@ -1983,13 +1989,15 @@ impl NativeKernel {
             },
         );
 
-        let presentation_smooth_edges = presentation_smooth_edge_flags(&snapshot.topology);
+        let presentation_flags = presentation_edge_flags(&snapshot.topology);
+        let presentation_smooth_edges = &presentation_flags.smooth;
         let edge_incident_faces = edge_incident_faces(snapshot);
         let edges = compute.flat_map(
             "kernel.tessellation.edges",
             &snapshot.topology.edges,
             |index, edge| {
                 let is_smooth = presentation_smooth_edges[index];
+                let is_tangent = presentation_flags.tangent[index];
                 let incident_faces = edge_incident_faces[index];
                 sampled_edge_segments(edge.value, budget, precision)
                     .into_iter()
@@ -1997,11 +2005,19 @@ impl NativeKernel {
                         endpoints: endpoints.map(protocol_point),
                         source_edge: entity_ref(snapshot.id, edge.id.get(), EntityKind::Edge),
                         is_smooth,
+                        is_tangent,
                         incident_faces,
                     })
                     .collect()
             },
         );
+        // A vertex where only tangent rails and one crease meet is not a
+        // corner the eye can see; classify vertices against the crease graph.
+        let crease_hidden = presentation_smooth_edges
+            .iter()
+            .zip(&presentation_flags.tangent)
+            .map(|(smooth, tangent)| *smooth || *tangent)
+            .collect::<Vec<_>>();
 
         let vertices = snapshot
             .topology
@@ -2014,7 +2030,7 @@ impl NativeKernel {
                 is_smooth: presentation_vertex_is_smooth(
                     &snapshot.topology,
                     vertex_index,
-                    &presentation_smooth_edges,
+                    &crease_hidden,
                 ),
             })
             .collect();
@@ -2152,7 +2168,12 @@ fn presentation_vertex_is_smooth(
     }
 }
 
+#[cfg(test)]
 fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
+    presentation_edge_flags(topology).smooth
+}
+
+fn presentation_edge_flags(topology: &Topology) -> PresentationEdgeFlags {
     let prismatic_feature_roles = presentation_prismatic_feature_roles(topology);
     let incident_faces = edge_incident_face_indices(topology);
     let classifications = (0..topology.edges.len())
@@ -2238,7 +2259,12 @@ fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
         };
         smooth[edge_index] = false;
     }
-    smooth
+    let tangent = classifications
+        .iter()
+        .zip(&smooth)
+        .map(|(classification, smooth)| classification.tangent && !smooth)
+        .collect();
+    PresentationEdgeFlags { smooth, tangent }
 }
 
 /// Identifies faceted patches that are fragments of one extruded curve
@@ -2371,8 +2397,19 @@ fn edge_direction_from_vertex(
 #[derive(Clone, Copy)]
 struct PresentationEdgeClassification {
     smooth: bool,
+    /// The two carriers differ but share their normal along this edge: the
+    /// transition rail of an exact fillet. The edge is real topology and
+    /// stays selectable (a successor finish can target it), but it is not a
+    /// crease and must not draw as one.
+    tangent: bool,
     coplanar_subdivision: bool,
     same_feature_side_role: Option<u32>,
+}
+
+/// Per-edge presentation flags for one topology.
+struct PresentationEdgeFlags {
+    smooth: Vec<bool>,
+    tangent: Vec<bool>,
 }
 
 #[cfg(test)]
@@ -2420,18 +2457,22 @@ fn presentation_edge_classification(
 ) -> PresentationEdgeClassification {
     let hard = || PresentationEdgeClassification {
         smooth: false,
+        tangent: false,
         coplanar_subdivision: false,
         same_feature_side_role: None,
     };
     let Some([first, second]) = incident_faces.get(edge_index).map(Vec::as_slice) else {
         return hard();
     };
-    let endpoints = topology.edges[edge_index].value.endpoints();
-    let midpoint = Point3::new(
-        (endpoints[0].x + endpoints[1].x) * 0.5,
-        (endpoints[0].y + endpoints[1].y) * 0.5,
-        (endpoints[0].z + endpoints[1].z) * 0.5,
-    );
+    let edge = topology.edges[edge_index].value;
+    let endpoints = edge.endpoints();
+    // Normals are compared at a point on the curve itself. The chord midpoint
+    // of an arc sits inside the arc, where a torus or sphere carrier's normal
+    // is a different direction, and that difference is exactly the size of
+    // the tangency test below.
+    let midpoint = edge
+        .curve
+        .evaluate((edge.parameter_range.start + edge.parameter_range.end) * 0.5);
     let first_surface = topology.faces[*first].value.surface;
     let second_surface = topology.faces[*second].value.surface;
     let normal = |surface: Surface| -> Option<Vector3> {
@@ -2642,8 +2683,15 @@ fn presentation_edge_classification(
         || approximation_strip(*first)
             && approximation_strip(*second)
             && (same_rounded_strip || low_dihedral);
+    // Two different exact carriers whose normals agree along the edge meet
+    // tangentially: a fillet's plane/cylinder or cylinder/torus rail. The
+    // tolerance is tight because both normals come from closed forms; a
+    // faceted fan never gets this close, and a chamfer never does.
+    let same_carrier = coincident_planes || coincident_cylinder_strip || coincident_revolved_strip;
+    let tangent = !smooth && !same_carrier && normal_dot >= 1.0 - 1.0e-9;
     PresentationEdgeClassification {
         smooth,
+        tangent,
         coplanar_subdivision: coincident_planes,
         same_feature_side_role,
     }

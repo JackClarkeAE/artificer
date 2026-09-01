@@ -95,9 +95,9 @@ use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
     DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
     SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
-    SketchContextFitKey, SketchContextTriangle, SketchCurveDirection, SketchDimensionKind,
-    SketchEditError, SketchEntity, SketchEntityId, SketchGeometry, SketchPlane, SketchPoint,
-    SketchView, SketchViewportContext,
+    SketchContextFitKey, SketchContextLayer, SketchContextTriangle, SketchCurveDirection,
+    SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId, SketchGeometry,
+    SketchPlane, SketchPoint, SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
@@ -1762,24 +1762,69 @@ struct PendingFaceSketch {
 }
 
 impl FaceSketchDisplayContext {
-    fn update_filtered_geometry(&mut self, enabled: bool, max_depth: f64) {
-        if !enabled {
-            self.triangles.clear();
-            self.edges.clear();
-        } else {
-            self.triangles = self
+    /// Selects what the sketch canvas shows behind the sketch.
+    ///
+    /// The body on and above the sketch surface is always shown — that is
+    /// what the user is drawing on. `project_below` additionally reveals the
+    /// geometry hidden under the surface, down to `max_depth`, as an x-ray
+    /// layer: deeper faces are darker, so a pocket floor and a bore wall read
+    /// at different depths at a glance.
+    fn update_filtered_geometry(&mut self, project_below: bool, max_depth: f64) {
+        // Depth is signed along the outward face normal: zero on the face,
+        // positive for material raised from it, negative below it.
+        const SURFACE_TOLERANCE: f64 = 1.0e-4;
+        let depth_shade = |depth: f64| -> f32 {
+            if max_depth <= SURFACE_TOLERANCE {
+                return 0.0;
+            }
+            (1.0 - 0.7 * (-depth / max_depth).clamp(0.0, 1.0)) as f32
+        };
+        let mut triangles = Vec::new();
+        let mut edges = Vec::new();
+        if project_below {
+            let mut below = self
                 .raw_triangles
                 .iter()
-                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
-                .map(|(_, tri)| *tri)
-                .collect();
-            self.edges = self
-                .raw_edges
-                .iter()
-                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
-                .map(|(_, edge)| *edge)
-                .collect();
+                .filter(|(depth, _)| {
+                    *depth < -SURFACE_TOLERANCE && *depth >= -max_depth - SURFACE_TOLERANCE
+                })
+                .map(|(depth, triangle)| {
+                    (
+                        *depth,
+                        triangle
+                            .with_layer(SketchContextLayer::Below)
+                            .with_shade(triangle.shade * depth_shade(*depth)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            // Painter order: deepest first.
+            below.sort_by(|left, right| left.0.total_cmp(&right.0));
+            triangles.extend(below.into_iter().map(|(_, triangle)| triangle));
+            edges.extend(
+                self.raw_edges
+                    .iter()
+                    .filter(|(depth, _)| {
+                        *depth < -SURFACE_TOLERANCE && *depth >= -max_depth - SURFACE_TOLERANCE
+                    })
+                    .map(|(_, edge)| edge.with_layer(SketchContextLayer::Below)),
+            );
         }
+        let mut body = self
+            .raw_triangles
+            .iter()
+            .filter(|(depth, _)| *depth >= -SURFACE_TOLERANCE)
+            .map(|(depth, triangle)| (*depth, triangle.with_layer(SketchContextLayer::Body)))
+            .collect::<Vec<_>>();
+        body.sort_by(|left, right| left.0.total_cmp(&right.0));
+        triangles.extend(body.into_iter().map(|(_, triangle)| triangle));
+        edges.extend(
+            self.raw_edges
+                .iter()
+                .filter(|(depth, _)| *depth >= -SURFACE_TOLERANCE)
+                .map(|(_, edge)| edge.with_layer(SketchContextLayer::Body)),
+        );
+        self.triangles = triangles;
+        self.edges = edges;
     }
 
     fn viewport_context(&self) -> SketchViewportContext<'_> {
@@ -1788,6 +1833,98 @@ impl FaceSketchDisplayContext {
             .with_selected_face_inner_boundaries(&self.inner_boundaries)
             .with_snap_curves(&self.snap_curves)
             .with_axis_labels(self.axis_labels)
+    }
+}
+
+#[cfg(test)]
+mod face_sketch_context_layers {
+    use super::*;
+
+    fn context() -> FaceSketchDisplayContext {
+        let triangle = |offset: f64| {
+            SketchContextTriangle::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+                SketchPoint::new(offset, 1.0),
+            ])
+        };
+        let edge = |offset: f64| {
+            SketchContextEdge::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+            ])
+        };
+        FaceSketchDisplayContext {
+            fit_key: SketchContextFitKey::new([0; 32], 1),
+            axis_labels: ["U", "V"],
+            // A raised boss, the face itself, a shallow pocket floor, and a
+            // deep bore floor.
+            raw_triangles: vec![
+                (5.0, triangle(0.0)),
+                (0.0, triangle(10.0)),
+                (-4.0, triangle(20.0)),
+                (-40.0, triangle(30.0)),
+            ],
+            raw_edges: vec![(5.0, edge(0.0)), (0.0, edge(10.0)), (-4.0, edge(20.0))],
+            triangles: Vec::new(),
+            edges: Vec::new(),
+            boundary: Vec::new(),
+            inner_boundaries: Vec::new(),
+            snap_curves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_body_on_and_above_the_surface_is_always_shown_nearest_last() {
+        let mut context = context();
+        context.update_filtered_geometry(false, 50.0);
+        assert_eq!(context.triangles.len(), 2, "nothing below the face");
+        assert!(
+            context
+                .triangles
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        // Painter order: the face first, the raised boss over it.
+        assert_eq!(context.triangles[0].vertices[0].u, 10.0);
+        assert_eq!(context.triangles[1].vertices[0].u, 0.0);
+        assert_eq!(context.edges.len(), 2);
+    }
+
+    #[test]
+    fn projecting_below_adds_an_xray_layer_under_the_body_within_the_depth() {
+        let mut context = context();
+        context.update_filtered_geometry(true, 10.0);
+        let below = context
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.layer == SketchContextLayer::Below)
+            .collect::<Vec<_>>();
+        assert_eq!(below.len(), 1, "the 40 mm bore floor is beyond the depth");
+        assert_eq!(below[0].vertices[0].u, 20.0);
+        assert!(below[0].shade < 1.0, "a face below the surface is darker");
+        // The x-ray precedes the body in painter order.
+        assert_eq!(context.triangles[0].layer, SketchContextLayer::Below);
+        assert!(
+            context.triangles[1..]
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        assert_eq!(
+            context
+                .edges
+                .iter()
+                .filter(|edge| edge.layer == SketchContextLayer::Below)
+                .count(),
+            1
+        );
+
+        context.update_filtered_geometry(true, 50.0);
+        assert_eq!(context.triangles.len(), 4);
+        let deep = context.triangles[0];
+        let shallow = context.triangles[1];
+        assert_eq!(deep.vertices[0].u, 30.0, "deepest paints first");
+        assert!(deep.shade < shallow.shade, "deeper is darker");
     }
 }
 
@@ -2079,7 +2216,7 @@ impl Default for KernelLabApp {
             selected_origin_plane: SketchPlane::XY,
             sketch_support: SketchSupport::default(),
             face_sketch_context: None,
-            project_3d_body_context: true,
+            project_3d_body_context: false,
             project_3d_body_depth: 50.0,
             sketches: Vec::new(),
             active_sketch_index: None,
@@ -11697,6 +11834,8 @@ impl KernelLabApp {
                                 "context_selected_boundary",
                                 &mut sketch.context_selected_boundary,
                             ),
+                            ("context_below_face", &mut sketch.context_below_face),
+                            ("context_below_edge", &mut sketch.context_below_edge),
                         ],
                     );
                     section(
@@ -18729,6 +18868,29 @@ fn project_face_sketch_context(
     support: &PlanarFaceSupport,
 ) -> Option<FaceSketchDisplayContext> {
     let projection = FaceSketchProjection::from_frame(support.frame)?;
+    // The sketch looks at its face from outside the body. The frame's `u × v`
+    // is the face's own normal, but nothing above guarantees it points out of
+    // the material, so let the face's tessellation say: its triangles wind
+    // with the outward normal, and if they project clockwise here, the frame
+    // looks into the body and every depth flips sign.
+    let mut face_winding = 0.0_f64;
+    for triangle in scene
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.source_face == support.face)
+    {
+        let Some(projected) = triangle
+            .vertices
+            .map(|point| projection.project(point))
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let vertices = [projected[0].0, projected[1].0, projected[2].0];
+        face_winding += sketch_triangle_signed_area(vertices);
+    }
+    let outward = if face_winding < 0.0 { -1.0 } else { 1.0 };
     let projected_triangles = scene
         .triangles
         .iter()
@@ -18744,32 +18906,51 @@ fn project_face_sketch_context(
                 .collect::<Vec<_>>()
                 .try_into()
                 .ok()?;
-            let signed_area = sketch_triangle_signed_area(vertices);
+            let signed_area = sketch_triangle_signed_area(vertices) * outward;
             if !signed_area.is_finite() || signed_area <= 0.0 {
                 return None;
             }
-            let depth = projected.iter().map(|(_, depth)| depth).sum::<f64>() / 3.0;
             let vertex_depths: [f64; 3] = projected
                 .iter()
                 .map(|(_, depth)| *depth)
                 .collect::<Vec<_>>()
                 .try_into()
                 .ok()?;
-            Some((depth, vertex_depths, SketchContextTriangle::new(vertices)))
+            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
+            // Shade from the true 3D attitude of the facet: a face parallel
+            // to the sketch plane is brightest, one sloping away is darker.
+            // Walls at right angles have no projected area and never arrive.
+            let [a, b, c] = triangle.vertices;
+            let facet_normal = normalized_vector(cross_vector(
+                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+            ));
+            let attitude = facet_normal
+                .map(|normal| dot_vector(normal, projection.normal).abs())
+                .unwrap_or(1.0);
+            let shade = (0.55 + 0.45 * attitude) as f32;
+            Some((
+                depth,
+                vertex_depths,
+                SketchContextTriangle::new(vertices).with_shade(shade),
+            ))
         })
         .collect::<Vec<_>>();
     let raw_triangles: Vec<(f64, SketchContextTriangle)> = projected_triangles
         .iter()
-        .map(|(depth, _, triangle)| (depth.abs(), *triangle))
+        .map(|(depth, _, triangle)| (*depth, *triangle))
         .collect();
 
+    // Creases only: a bore's facet seams and a fillet's tangent rails are not
+    // lines the user should see through the face.
     let raw_edges: Vec<(f64, SketchContextEdge)> = scene
         .edges
         .iter()
+        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
         .filter_map(|edge| {
             let endpoints = edge.endpoints.map(|point| projection.project(point));
             let endpoints = [endpoints[0]?, endpoints[1]?];
-            let edge_depth = (endpoints[0].1.abs() + endpoints[1].1.abs()) * 0.5;
+            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
             projected_triangles
                 .iter()
                 .any(|(_, depths, triangle)| {

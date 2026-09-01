@@ -483,7 +483,7 @@ impl KernelLabApp {
                 if ui
                     .add(slider)
                     .on_hover_text(
-                        "Set the maximum depth relative to the sketch face for projected 3D body edges and surfaces.",
+                        "How far below the sketch surface to project. Deeper faces in the x-ray are drawn darker.",
                     )
                     .changed()
                 {

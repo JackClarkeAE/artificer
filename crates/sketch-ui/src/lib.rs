@@ -246,25 +246,72 @@ impl SketchPoint {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SketchContextTriangle {
     pub vertices: [SketchPoint; 3],
+    /// Brightness of the face relative to the palette's context colour, in
+    /// `0.0..=1.0`. Faces parallel to the sketch plane are brightest; a face
+    /// that slopes away from it, or lies deep below it, is darker.
+    pub shade: f32,
+    pub layer: SketchContextLayer,
 }
 
 impl SketchContextTriangle {
     #[must_use]
     pub const fn new(vertices: [SketchPoint; 3]) -> Self {
-        Self { vertices }
+        Self {
+            vertices,
+            shade: 1.0,
+            layer: SketchContextLayer::Body,
+        }
     }
+
+    #[must_use]
+    pub const fn with_shade(mut self, shade: f32) -> Self {
+        self.shade = shade;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_layer(mut self, layer: SketchContextLayer) -> Self {
+        self.layer = layer;
+        self
+    }
+}
+
+/// Where a projected body element sits relative to the sketch surface.
+///
+/// The body itself is always drawn when sketching on a face. Geometry below
+/// the surface is hidden by the face in a true view and only appears when
+/// the user asks to project it, so it is painted as an x-ray in its own
+/// colour and never mistaken for the visible body.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SketchContextLayer {
+    /// On or above the sketch surface: the host face and anything raised
+    /// from it.
+    #[default]
+    Body,
+    /// Below the sketch surface: pockets, bores, and walls under the face.
+    Below,
 }
 
 /// One body edge already projected into the active sketch's `(u, v)` frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SketchContextEdge {
     pub endpoints: [SketchPoint; 2],
+    pub layer: SketchContextLayer,
 }
 
 impl SketchContextEdge {
     #[must_use]
     pub const fn new(endpoints: [SketchPoint; 2]) -> Self {
-        Self { endpoints }
+        Self {
+            endpoints,
+            layer: SketchContextLayer::Body,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_layer(mut self, layer: SketchContextLayer) -> Self {
+        self.layer = layer;
+        self
     }
 }
 
@@ -10671,12 +10718,15 @@ fn paint_viewport_context(
     view: SketchView,
     context: &SketchViewportContext<'_>,
 ) {
+    // The x-ray of what lies below the surface goes down first, so the body
+    // that is really there paints over it wherever the two overlap.
     let mesh = projected_context_mesh(rect, view, context.triangles);
     if !mesh.indices.is_empty() {
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    let edge_stroke = Stroke::new(1.0, sketch_colours().context_edge);
+    let body_stroke = Stroke::new(1.0, sketch_colours().context_edge);
+    let below_stroke = Stroke::new(1.2, sketch_colours().context_below_edge);
     for edge in context.edges {
         let [first, second] = edge.endpoints;
         if !first.is_finite() || !second.is_finite() {
@@ -10686,8 +10736,17 @@ fn paint_viewport_context(
             view.sketch_to_screen(rect, first),
             view.sketch_to_screen(rect, second),
         ];
-        if screen_points_are_finite(&points) {
-            painter.line_segment(points, edge_stroke);
+        if !screen_points_are_finite(&points) {
+            continue;
+        }
+        match edge.layer {
+            SketchContextLayer::Body => {
+                painter.line_segment(points, body_stroke);
+            }
+            SketchContextLayer::Below => {
+                // Hidden-line convention: what is under the surface dashes.
+                painter.add(egui::Shape::dashed_line(&points, below_stroke, 6.0, 4.0));
+            }
         }
     }
 
@@ -10736,10 +10795,21 @@ fn projected_context_mesh(
     view: SketchView,
     triangles: &[SketchContextTriangle],
 ) -> egui::Mesh {
+    let colours = sketch_colours();
     let mut mesh = egui::Mesh::default();
     mesh.reserve_vertices(triangles.len() * 3);
     mesh.reserve_triangles(triangles.len());
-    for triangle in triangles {
+    // Below-surface faces first, then the body, so painter order inside each
+    // layer (far to near) is preserved and the body always wins overlaps.
+    let layered = triangles
+        .iter()
+        .filter(|triangle| triangle.layer == SketchContextLayer::Below)
+        .chain(
+            triangles
+                .iter()
+                .filter(|triangle| triangle.layer == SketchContextLayer::Body),
+        );
+    for triangle in layered {
         if triangle.vertices.iter().any(|point| !point.is_finite()) {
             continue;
         }
@@ -10749,13 +10819,40 @@ fn projected_context_mesh(
         if !screen_points_are_finite(&points) {
             continue;
         }
+        let base = match triangle.layer {
+            SketchContextLayer::Body => colours.context_face,
+            SketchContextLayer::Below => colours.context_below_face,
+        };
+        let colour = shaded_context_colour(base, triangle.shade, colours.background);
         let first = mesh.vertices.len() as u32;
         for point in points {
-            mesh.colored_vertex(point, sketch_colours().context_face);
+            mesh.colored_vertex(point, colour);
         }
         mesh.add_triangle(first, first + 1, first + 2);
     }
     mesh
+}
+
+/// Darkens or lightens a context colour toward the canvas ground by the
+/// triangle's shade, so a sloping or deep face reads as one even when it is
+/// the same carrier as its neighbour. Alpha is kept: the x-ray stays an
+/// x-ray.
+fn shaded_context_colour(base: Color32, shade: f32, ground: Color32) -> Color32 {
+    let shade = shade.clamp(0.0, 1.0);
+    // Shade 1.0 is the palette colour; shade 0.0 is one third of the way to
+    // the ground, which is visibly darker (or lighter, on a dark theme)
+    // without dissolving the face into the background.
+    let weight = 0.35 * (1.0 - shade);
+    let mix = |from: u8, to: u8| -> u8 {
+        let value = f32::from(from) + (f32::from(to) - f32::from(from)) * weight;
+        value.round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        mix(base.r(), ground.r()),
+        mix(base.g(), ground.g()),
+        mix(base.b(), ground.b()),
+        base.a(),
+    )
 }
 
 fn screen_points_are_finite(points: &[Pos2]) -> bool {

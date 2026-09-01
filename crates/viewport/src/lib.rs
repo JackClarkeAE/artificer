@@ -895,6 +895,9 @@ struct ProjectedModelEdge {
     screen: [Pos2; 2],
     visible: bool,
     smooth: bool,
+    /// A fillet's tangent rail: pickable, but painted only as an outline or
+    /// under the cursor. See `DebugEdge::is_tangent`.
+    tangent: bool,
     visible_intervals: Vec<[f32; 2]>,
     /// True where the body's material ends at this edge from the current
     /// camera. Outline edges take the heavier stroke; interior creases take
@@ -2743,6 +2746,7 @@ fn prepare_interaction_edge_frame_cache(
                     screen,
                     visible: true,
                     smooth: false,
+                    tangent: edge.is_tangent,
                     visible_intervals: if hidden { Vec::new() } else { vec![[0.0, 1.0]] },
                     outline: edge_is_outline(edge, front_facing),
                 }
@@ -2839,6 +2843,7 @@ fn prepare_edge_frame_cache(
                     screen,
                     visible,
                     smooth: edge.is_smooth,
+                    tangent: edge.is_tangent,
                     visible_intervals,
                     outline: edge_is_outline(edge, front_facing),
                 }
@@ -3133,7 +3138,10 @@ fn paint_edges(
         let selected =
             measured || Some(identity) == selected_edge || selected_edges.contains(&identity);
         let hovered = hovered_group.contains(&edge.source);
-        if edge.smooth && !selected && !hovered {
+        // Smooth subdivisions never paint; a tangent rail paints only where
+        // it is the body's outline against the background. Both surface the
+        // moment the user hovers or selects them.
+        if (edge.smooth || (edge.tangent && !edge.outline)) && !selected && !hovered {
             continue;
         }
         if edge.visible != visible_pass {
@@ -7501,6 +7509,7 @@ mod tests {
                     endpoints: [corners[pair[0]], corners[pair[1]]],
                     source_edge: edge(edge_base + offset as u64),
                     is_smooth: false,
+                    is_tangent: false,
                     incident_faces: [Some(face(face_id)), None],
                 });
             }
