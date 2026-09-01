@@ -140,15 +140,12 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
         },
     );
 
-    // 3. Chamfer the edge of the cube
+    // 3. Chamfer one outer top edge of the cube. The pocket walls are
+    //    curved, so no exact rung owns a lone edge of this body; the
+    //    faceted tier answers and must say so, with a valid solid whose
+    //    volume lost at most the full 45-degree wedge along the edge.
     let edge = outer_top_edge(&slot_cut);
-    let scene = NativeKernel::debug_scene(&slot_cut);
-    println!(
-        "Scene edges: {}, triangles: {}, vertices: {}",
-        scene.edges.len(),
-        scene.triangles.len(),
-        scene.vertices.len()
-    );
+    let distance = 2.0;
     let request = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
         request_id: RequestId::new("chamfer"),
@@ -157,12 +154,29 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
         command: KernelCommand::FinishEdges {
             target_edges: vec![edge],
             kind: EdgeFinishKind::Chamfer,
-            distance: 2.0,
+            distance,
         },
     };
-    let outcome = NativeKernel::execute(&slot_cut, &request, &CancellationToken::new());
-    if let Err(err) = &outcome {
-        println!("Outcome error: {err:?}");
-    }
-    assert!(outcome.is_ok(), "Chamfer failed: {:?}", outcome.err());
+    let outcome = NativeKernel::execute(&slot_cut, &request, &CancellationToken::new())
+        .unwrap_or_else(|error| panic!("the chamfer must build: {error:?}"));
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "EDGE_FINISH_FACETED_APPROXIMATION"),
+        "a faceted finish is labelled: {:?}",
+        outcome.report.warnings
+    );
+    assert!(
+        NativeKernel::validate(&outcome.snapshot, artificer_protocol::ValidationProfile::Solid)
+            .valid
+    );
+    let before = slot_cut.measures().volume;
+    let after = outcome.snapshot.measures().volume;
+    let wedge = 0.5 * distance * distance * SIZE;
+    assert!(
+        after < before && after >= before - wedge - 1.0e-6,
+        "volume {after} must lie within the chamfer wedge below {before}"
+    );
 }
