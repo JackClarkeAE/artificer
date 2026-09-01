@@ -5,6 +5,7 @@
 //! UI, renderer, or backend-abstraction dependency.
 
 mod analytic_extrusion;
+pub mod api;
 pub mod brep;
 mod corner_blend;
 mod cuboid;

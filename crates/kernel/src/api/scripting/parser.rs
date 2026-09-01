@@ -1,7 +1,7 @@
 //! Recursive-descent parser for the .art language.
 
-use crate::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
-use crate::scripting::lexer::{SpannedToken, Token};
+use crate::api::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
+use crate::api::scripting::lexer::{SpannedToken, Token};
 
 pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
 

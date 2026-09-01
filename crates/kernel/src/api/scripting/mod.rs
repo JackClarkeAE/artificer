@@ -9,12 +9,12 @@ use std::collections::BTreeMap;
 use artificer_protocol::{EntityKind, Point2, Point3, Vector3};
 use thiserror::Error;
 
-use crate::commands::{ApiCommand, StepLabel};
-use crate::debug::{ApiError, ApiErrorCode};
-use crate::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
-use crate::scripting::lexer::tokenize;
-use crate::scripting::parser::Parser;
-use crate::selectors::{
+use crate::api::commands::{ApiCommand, StepLabel};
+use crate::api::debug::{ApiError, ApiErrorCode};
+use crate::api::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
+use crate::api::scripting::lexer::tokenize;
+use crate::api::scripting::parser::Parser;
+use crate::api::selectors::{
     EntitySelector, Extremum, GeometricSelector, Metric, NormalMatch, SurfaceFilter,
 };
 

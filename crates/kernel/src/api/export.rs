@@ -2,10 +2,10 @@
 
 use std::fmt::Write as _;
 
-use artificer_kernel::{NativeKernel, Snapshot};
+use crate::{NativeKernel, Snapshot};
 use serde::{Deserialize, Serialize};
 
-use crate::debug::ApiError;
+use crate::api::debug::ApiError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,7 +62,7 @@ pub fn export_stl_binary(snapshot: &Snapshot) -> Result<Vec<u8>, ApiError> {
     let triangle_count = scene.triangles.len();
     let count = u32::try_from(triangle_count).map_err(|_| {
         ApiError::new(
-            crate::debug::ApiErrorCode::InvalidInput,
+            crate::api::debug::ApiErrorCode::InvalidInput,
             "The model has more triangles than binary STL can count",
         )
     })?;

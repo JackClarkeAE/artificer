@@ -2,15 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use artificer_kernel::{NativeKernel, Snapshot};
+use crate::{NativeKernel, Snapshot};
 use artificer_protocol::{
     EntityId, EntityKind, EntityRef, OperationReport, Point3, SnapshotId, Vector3,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::commands::StepLabel;
-use crate::debug::{ApiError, ApiErrorCode, EntityInfo};
+use crate::api::commands::StepLabel;
+use crate::api::debug::{ApiError, ApiErrorCode, EntityInfo};
 
 /// A stable or geometric reference to a topological entity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -276,7 +276,7 @@ fn exactly_one(matches: Vec<EntityRef>, description: &str) -> Result<EntityRef, 
 /// The straight edges whose every display segment runs along `direction`,
 /// in stable entity order.
 fn parallel_edges(
-    scene: &artificer_kernel::DebugScene,
+    scene: &crate::DebugScene,
     snapshot: SnapshotId,
     direction: Vector3,
 ) -> Result<Vec<EntityRef>, ApiError> {
@@ -326,11 +326,11 @@ fn parallel_edges(
 /// The faces of one surface class. Curved faces name their carrier in the
 /// scene; a face with triangles and no carrier is planar.
 fn faces_by_type(
-    scene: &artificer_kernel::DebugScene,
+    scene: &crate::DebugScene,
     snapshot: SnapshotId,
     filter: SurfaceFilter,
 ) -> Vec<EntityRef> {
-    use artificer_kernel::DisplaySurface;
+    use crate::DisplaySurface;
     let carriers = scene
         .carriers
         .iter()
@@ -776,7 +776,7 @@ fn resolve_geometric_selector(
             extremum,
             kind,
         } => {
-            use artificer_kernel::DisplaySurface;
+            use crate::DisplaySurface;
             // One number per entity, for the metric that applies to it.
             let mut scores: BTreeMap<EntityId, f64> = BTreeMap::new();
             match (metric, kind) {

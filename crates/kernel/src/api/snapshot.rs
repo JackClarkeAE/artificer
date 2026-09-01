@@ -3,12 +3,12 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use artificer_kernel::{FaceRole, NativeKernel, Snapshot};
+use crate::{FaceRole, NativeKernel, Snapshot};
 use artificer_protocol::{EntityRef, OperationReport, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
-use crate::debug::ApiError;
-use crate::selectors::EntitySelector;
+use crate::api::debug::ApiError;
+use crate::api::selectors::EntitySelector;
 
 /// Standard view angle presets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

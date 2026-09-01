@@ -3,7 +3,7 @@
 use artificer_protocol::{Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
-use crate::selectors::EntitySelector;
+use crate::api::selectors::EntitySelector;
 
 fn is_zero(value: &f64) -> bool {
     *value == 0.0

@@ -4,7 +4,6 @@ members = [
     "apps/compute-bench",
     "apps/cli",
     "apps/workbench",
-    "crates/api",
     "crates/catalog",
     "crates/compute",
     "crates/geometry",

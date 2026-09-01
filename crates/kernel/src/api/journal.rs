@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::ApiCommand;
+use crate::api::commands::ApiCommand;
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 

@@ -1838,152 +1838,6 @@ impl FaceSketchDisplayContext {
     }
 }
 
-#[cfg(test)]
-mod face_sketch_context_layers {
-    use super::*;
-
-    fn context() -> FaceSketchDisplayContext {
-        let triangle = |offset: f64| {
-            SketchContextTriangle::new([
-                SketchPoint::new(offset, 0.0),
-                SketchPoint::new(offset + 1.0, 0.0),
-                SketchPoint::new(offset, 1.0),
-            ])
-        };
-        let edge = |offset: f64| {
-            SketchContextEdge::new([
-                SketchPoint::new(offset, 0.0),
-                SketchPoint::new(offset + 1.0, 0.0),
-            ])
-        };
-        FaceSketchDisplayContext {
-            fit_key: SketchContextFitKey::new([0; 32], 1),
-            axis_labels: ["U", "V"],
-            // A raised boss, the face itself, a shallow pocket floor, and a
-            // deep bore floor.
-            raw_triangles: vec![
-                (5.0, triangle(0.0)),
-                (0.0, triangle(10.0)),
-                (-4.0, triangle(20.0)),
-                (-40.0, triangle(30.0)),
-            ],
-            raw_edges: vec![(5.0, edge(0.0)), (0.0, edge(10.0)), (-4.0, edge(20.0))],
-            triangles: Vec::new(),
-            edges: Vec::new(),
-            boundary: Vec::new(),
-            inner_boundaries: Vec::new(),
-            snap_curves: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn the_body_on_and_above_the_surface_is_always_shown_nearest_last() {
-        let mut context = context();
-        context.update_filtered_geometry(false, 50.0);
-        assert_eq!(context.triangles.len(), 2, "nothing below the face");
-        assert!(
-            context
-                .triangles
-                .iter()
-                .all(|triangle| triangle.layer == SketchContextLayer::Body)
-        );
-        // Painter order: the face first, the raised boss over it.
-        assert_eq!(context.triangles[0].vertices[0].u, 10.0);
-        assert_eq!(context.triangles[1].vertices[0].u, 0.0);
-        assert_eq!(context.edges.len(), 2);
-    }
-
-    #[test]
-    fn projecting_below_adds_an_xray_layer_under_the_body_within_the_depth() {
-        let mut context = context();
-        context.update_filtered_geometry(true, 10.0);
-        let below = context
-            .triangles
-            .iter()
-            .filter(|triangle| triangle.layer == SketchContextLayer::Below)
-            .collect::<Vec<_>>();
-        assert_eq!(below.len(), 1, "the 40 mm bore floor is beyond the depth");
-        assert_eq!(below[0].vertices[0].u, 20.0);
-        assert!(below[0].shade < 1.0, "a face below the surface is darker");
-        // The x-ray precedes the body in painter order.
-        assert_eq!(context.triangles[0].layer, SketchContextLayer::Below);
-        assert!(
-            context.triangles[1..]
-                .iter()
-                .all(|triangle| triangle.layer == SketchContextLayer::Body)
-        );
-        assert_eq!(
-            context
-                .edges
-                .iter()
-                .filter(|edge| edge.layer == SketchContextLayer::Below)
-                .count(),
-            1
-        );
-
-        context.update_filtered_geometry(true, 50.0);
-        assert_eq!(context.triangles.len(), 4);
-        let deep = context.triangles[0];
-        let shallow = context.triangles[1];
-        assert_eq!(deep.vertices[0].u, 30.0, "deepest paints first");
-        assert!(deep.shade < shallow.shade, "deeper is darker");
-    }
-}
-
-#[cfg(test)]
-mod drafted_extrusion_command {
-    use super::*;
-
-    fn square_profile() -> (PlanarFrame3, PlanarProfile2) {
-        (
-            PlanarFrame3::new(
-                Point3::new(0.0, 0.0, 0.0),
-                Vector3::new(1.0, 0.0, 0.0),
-                Vector3::new(0.0, 1.0, 0.0),
-            ),
-            PlanarProfile2::from_polygon(&[
-                ProtocolPoint2::new(0.0, 0.0),
-                ProtocolPoint2::new(10.0, 0.0),
-                ProtocolPoint2::new(10.0, 10.0),
-                ProtocolPoint2::new(0.0, 10.0),
-            ]),
-        )
-    }
-
-    #[test]
-    fn a_draft_angle_turns_a_new_body_extrusion_into_an_offset_loft() {
-        let (frame, profile) = square_profile();
-        let straight = build_planar_profile_extrusion_command(
-            frame,
-            profile.clone(),
-            None,
-            8.0,
-            0.0,
-            ExtrusionMode::NewBody,
-        );
-        assert!(matches!(
-            straight,
-            Some(KernelCommand::ExtrudePlanarProfile { distance, .. }) if distance == 8.0
-        ));
-        let drafted = build_planar_profile_extrusion_command(
-            frame,
-            profile,
-            None,
-            -8.0,
-            5.0,
-            ExtrusionMode::NewBody,
-        );
-        let Some(KernelCommand::LoftPlanarProfileOffset {
-            distance, offset, ..
-        }) = drafted
-        else {
-            panic!("a drafted new body lofts")
-        };
-        assert_eq!(distance, 8.0, "the sign moves into the frame");
-        assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
-    }
-}
-
 /// The selected-feature parameter field the user is typing in, with the
 /// rectangle it occupied last frame. A press outside that rectangle is an
 /// acceptance, and it has to be seen before any panel this frame reads
@@ -24235,5 +24089,151 @@ mod auto_commit_delete {
         assert!(app.sketch.selected().is_some());
         assert!(app.sketch.stage_delete_selected().is_ok());
         assert!(app.sketch.has_pending_edit());
+    }
+}
+
+#[cfg(test)]
+mod face_sketch_context_layers {
+    use super::*;
+
+    fn context() -> FaceSketchDisplayContext {
+        let triangle = |offset: f64| {
+            SketchContextTriangle::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+                SketchPoint::new(offset, 1.0),
+            ])
+        };
+        let edge = |offset: f64| {
+            SketchContextEdge::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+            ])
+        };
+        FaceSketchDisplayContext {
+            fit_key: SketchContextFitKey::new([0; 32], 1),
+            axis_labels: ["U", "V"],
+            // A raised boss, the face itself, a shallow pocket floor, and a
+            // deep bore floor.
+            raw_triangles: vec![
+                (5.0, triangle(0.0)),
+                (0.0, triangle(10.0)),
+                (-4.0, triangle(20.0)),
+                (-40.0, triangle(30.0)),
+            ],
+            raw_edges: vec![(5.0, edge(0.0)), (0.0, edge(10.0)), (-4.0, edge(20.0))],
+            triangles: Vec::new(),
+            edges: Vec::new(),
+            boundary: Vec::new(),
+            inner_boundaries: Vec::new(),
+            snap_curves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_body_on_and_above_the_surface_is_always_shown_nearest_last() {
+        let mut context = context();
+        context.update_filtered_geometry(false, 50.0);
+        assert_eq!(context.triangles.len(), 2, "nothing below the face");
+        assert!(
+            context
+                .triangles
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        // Painter order: the face first, the raised boss over it.
+        assert_eq!(context.triangles[0].vertices[0].u, 10.0);
+        assert_eq!(context.triangles[1].vertices[0].u, 0.0);
+        assert_eq!(context.edges.len(), 2);
+    }
+
+    #[test]
+    fn projecting_below_adds_an_xray_layer_under_the_body_within_the_depth() {
+        let mut context = context();
+        context.update_filtered_geometry(true, 10.0);
+        let below = context
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.layer == SketchContextLayer::Below)
+            .collect::<Vec<_>>();
+        assert_eq!(below.len(), 1, "the 40 mm bore floor is beyond the depth");
+        assert_eq!(below[0].vertices[0].u, 20.0);
+        assert!(below[0].shade < 1.0, "a face below the surface is darker");
+        // The x-ray precedes the body in painter order.
+        assert_eq!(context.triangles[0].layer, SketchContextLayer::Below);
+        assert!(
+            context.triangles[1..]
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        assert_eq!(
+            context
+                .edges
+                .iter()
+                .filter(|edge| edge.layer == SketchContextLayer::Below)
+                .count(),
+            1
+        );
+
+        context.update_filtered_geometry(true, 50.0);
+        assert_eq!(context.triangles.len(), 4);
+        let deep = context.triangles[0];
+        let shallow = context.triangles[1];
+        assert_eq!(deep.vertices[0].u, 30.0, "deepest paints first");
+        assert!(deep.shade < shallow.shade, "deeper is darker");
+    }
+}
+
+#[cfg(test)]
+mod drafted_extrusion_command {
+    use super::*;
+
+    fn square_profile() -> (PlanarFrame3, PlanarProfile2) {
+        (
+            PlanarFrame3::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+            PlanarProfile2::from_polygon(&[
+                ProtocolPoint2::new(0.0, 0.0),
+                ProtocolPoint2::new(10.0, 0.0),
+                ProtocolPoint2::new(10.0, 10.0),
+                ProtocolPoint2::new(0.0, 10.0),
+            ]),
+        )
+    }
+
+    #[test]
+    fn a_draft_angle_turns_a_new_body_extrusion_into_an_offset_loft() {
+        let (frame, profile) = square_profile();
+        let straight = build_planar_profile_extrusion_command(
+            frame,
+            profile.clone(),
+            None,
+            8.0,
+            0.0,
+            ExtrusionMode::NewBody,
+        );
+        assert!(matches!(
+            straight,
+            Some(KernelCommand::ExtrudePlanarProfile { distance, .. }) if distance == 8.0
+        ));
+        let drafted = build_planar_profile_extrusion_command(
+            frame,
+            profile,
+            None,
+            -8.0,
+            5.0,
+            ExtrusionMode::NewBody,
+        );
+        let Some(KernelCommand::LoftPlanarProfileOffset {
+            distance, offset, ..
+        }) = drafted
+        else {
+            panic!("a drafted new body lofts")
+        };
+        assert_eq!(distance, 8.0, "the sign moves into the frame");
+        assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
     }
 }

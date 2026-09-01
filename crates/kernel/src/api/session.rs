@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use artificer_kernel::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
+use crate::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
     ExecuteRequest, KernelCommand, OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3,
@@ -13,12 +13,12 @@ use artificer_protocol::{
 
 use artificer_protocol::FaceExtrusionOperation;
 
-use crate::commands::{ApiCommand, ExtrudeOp, SketchEntity, SketchPlane};
-use crate::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
-use crate::journal::{Journal, JournalEntry};
-use crate::query::QueryHandle;
-use crate::selectors::{resolve_selector, resolve_selector_set};
-use crate::snapshot::{SnapshotOptions, SnapshotOutput, render_snapshot};
+use crate::api::commands::{ApiCommand, ExtrudeOp, SketchEntity, SketchPlane};
+use crate::api::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
+use crate::api::journal::{Journal, JournalEntry};
+use crate::api::query::QueryHandle;
+use crate::api::selectors::{resolve_selector, resolve_selector_set};
+use crate::api::snapshot::{SnapshotOptions, SnapshotOutput, render_snapshot};
 
 /// A stateful session owning the kernel instance, current snapshot, and history.
 pub struct Session {
@@ -522,7 +522,7 @@ impl Session {
     /// deduplicated edge list and the kernel command that finishes it.
     fn edge_finish(
         &self,
-        edges: &[crate::selectors::EntitySelector],
+        edges: &[crate::api::selectors::EntitySelector],
         kind: EdgeFinishKind,
         distance: f64,
     ) -> Result<KernelCommand, ApiError> {
@@ -559,7 +559,7 @@ impl Session {
 
     fn build_sketch_profile(
         &self,
-        sketch: &crate::commands::StepLabel,
+        sketch: &crate::api::commands::StepLabel,
     ) -> Result<(PlanarFrame3, PlanarProfile2), ApiError> {
         let sketch_entry = self
             .journal
@@ -618,7 +618,7 @@ impl Session {
     /// The face a sketch was drawn on, when it was drawn on one.
     fn sketch_face(
         &self,
-        sketch: &crate::commands::StepLabel,
+        sketch: &crate::api::commands::StepLabel,
     ) -> Result<Option<artificer_protocol::EntityRef>, ApiError> {
         let entry = self
             .journal
@@ -698,13 +698,13 @@ impl Session {
 
     pub fn from_journal(json: &str) -> Result<Self, ApiError> {
         let journal = Journal::from_json(json)?;
-        if journal.schema_version != crate::journal::JOURNAL_SCHEMA_VERSION {
+        if journal.schema_version != crate::api::journal::JOURNAL_SCHEMA_VERSION {
             return Err(ApiError::new(
                 ApiErrorCode::InvalidInput,
                 format!(
                     "Journal schema version {} is not supported; this build reads version {}",
                     journal.schema_version,
-                    crate::journal::JOURNAL_SCHEMA_VERSION
+                    crate::api::journal::JOURNAL_SCHEMA_VERSION
                 ),
             ));
         }

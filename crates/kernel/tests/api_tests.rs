@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use artificer_api::CancellationToken;
-use artificer_api::commands::ApiCommand;
-use artificer_api::export::{export_obj, export_stl_ascii, export_stl_binary};
-use artificer_api::scripting::compile_script;
-use artificer_api::selectors::{EntitySelector, GeometricSelector, NormalMatch};
-use artificer_api::server::SharedSession;
-use artificer_api::session::Session;
-use artificer_api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
+use artificer_kernel::CancellationToken;
+use artificer_kernel::api::commands::ApiCommand;
+use artificer_kernel::api::export::{export_obj, export_stl_ascii, export_stl_binary};
+use artificer_kernel::api::scripting::compile_script;
+use artificer_kernel::api::selectors::{EntitySelector, GeometricSelector, NormalMatch};
+use artificer_kernel::api::server::SharedSession;
+use artificer_kernel::api::session::Session;
+use artificer_kernel::api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
 use artificer_protocol::{Point2, Point3, Vector3};
 
 #[test]
@@ -257,8 +257,8 @@ fn test_sketch_and_extrude() {
         .execute(
             ApiCommand::Sketch {
                 label: "sk1".to_owned(),
-                on: artificer_api::commands::SketchPlane::XY,
-                entities: vec![artificer_api::commands::SketchEntity::Rectangle {
+                on: artificer_kernel::api::commands::SketchPlane::XY,
+                entities: vec![artificer_kernel::api::commands::SketchEntity::Rectangle {
                     origin: Point2::new(0.0, 0.0),
                     width: 30.0,
                     height: 20.0,
@@ -276,10 +276,10 @@ fn test_sketch_and_extrude() {
         .execute(
             ApiCommand::Extrude {
                 label: "ext1".to_owned(),
-                sketch: artificer_api::commands::StepLabel("sk1".to_owned()),
+                sketch: artificer_kernel::api::commands::StepLabel("sk1".to_owned()),
                 regions: Vec::new(),
                 distance: 15.0,
-                operation: artificer_api::commands::ExtrudeOp::New,
+                operation: artificer_kernel::api::commands::ExtrudeOp::New,
                 draft_degrees: 0.0,
             },
             &token,
@@ -383,8 +383,8 @@ fn test_measure_query() {
     let query = session.query();
     let m = query
         .measure(
-            &artificer_api::query::MeasureTarget::Point(Point3::new(0.0, 0.0, 0.0)),
-            &artificer_api::query::MeasureTarget::Point(Point3::new(3.0, 4.0, 0.0)),
+            &artificer_kernel::api::query::MeasureTarget::Point(Point3::new(0.0, 0.0, 0.0)),
+            &artificer_kernel::api::query::MeasureTarget::Point(Point3::new(3.0, 4.0, 0.0)),
         )
         .expect("measure points");
 
@@ -471,7 +471,7 @@ fn test_three_holes_and_crossing_side_cut() {
     let snap_res = session
         .snapshot(SnapshotOptions {
             camera: CameraSpec::preset(StandardView::Trimetric),
-            format: artificer_api::snapshot::SnapshotFormat::Svg,
+            format: artificer_kernel::api::snapshot::SnapshotFormat::Svg,
             display_mode: "shaded".to_owned(),
             show_labels: false,
             highlight: vec![],
@@ -490,7 +490,7 @@ fn test_three_holes_and_crossing_side_cut() {
 fn a_deeply_nested_script_is_an_error_not_a_stack_overflow() {
     let depth = 100_000;
     let source = format!("let x = {}1{};", "(".repeat(depth), ")".repeat(depth));
-    let error = artificer_api::scripting::compile_script(&source, &BTreeMap::new())
+    let error = artificer_kernel::api::scripting::compile_script(&source, &BTreeMap::new())
         .expect_err("nesting past the limit is refused");
     assert!(error.to_string().contains("nested deeper"), "{error}");
 }
@@ -547,27 +547,27 @@ fn a_sketch_with_a_hole_extrudes_into_a_holed_block() {
         .execute(
             ApiCommand::Sketch {
                 label: "plate".to_owned(),
-                on: artificer_api::commands::SketchPlane::XY,
+                on: artificer_kernel::api::commands::SketchPlane::XY,
                 entities: vec![
-                    artificer_api::commands::SketchEntity::Rectangle {
+                    artificer_kernel::api::commands::SketchEntity::Rectangle {
                         origin: Point2::new(0.0, 0.0),
                         width: 60.0,
                         height: 40.0,
                     },
-                    artificer_api::commands::SketchEntity::Circle {
+                    artificer_kernel::api::commands::SketchEntity::Circle {
                         center: Point2::new(30.0, 20.0),
                         radius: 5.0,
                     },
                     // A triangle drawn as three lines, chained by endpoints.
-                    artificer_api::commands::SketchEntity::Line {
+                    artificer_kernel::api::commands::SketchEntity::Line {
                         start: Point2::new(5.0, 5.0),
                         end: Point2::new(15.0, 5.0),
                     },
-                    artificer_api::commands::SketchEntity::Line {
+                    artificer_kernel::api::commands::SketchEntity::Line {
                         start: Point2::new(15.0, 5.0),
                         end: Point2::new(10.0, 15.0),
                     },
-                    artificer_api::commands::SketchEntity::Line {
+                    artificer_kernel::api::commands::SketchEntity::Line {
                         start: Point2::new(5.0, 5.0),
                         end: Point2::new(10.0, 15.0),
                     },
@@ -581,10 +581,10 @@ fn a_sketch_with_a_hole_extrudes_into_a_holed_block() {
         .execute(
             ApiCommand::Extrude {
                 label: "block".to_owned(),
-                sketch: artificer_api::commands::StepLabel("plate".to_owned()),
+                sketch: artificer_kernel::api::commands::StepLabel("plate".to_owned()),
                 regions: Vec::new(),
                 distance: 10.0,
-                operation: artificer_api::commands::ExtrudeOp::New,
+                operation: artificer_kernel::api::commands::ExtrudeOp::New,
                 draft_degrees: 0.0,
             },
             &token,
@@ -608,13 +608,13 @@ fn an_open_sketch_chain_is_refused_with_its_loose_end_named() {
         .execute(
             ApiCommand::Sketch {
                 label: "open".to_owned(),
-                on: artificer_api::commands::SketchPlane::XY,
+                on: artificer_kernel::api::commands::SketchPlane::XY,
                 entities: vec![
-                    artificer_api::commands::SketchEntity::Line {
+                    artificer_kernel::api::commands::SketchEntity::Line {
                         start: Point2::new(0.0, 0.0),
                         end: Point2::new(10.0, 0.0),
                     },
-                    artificer_api::commands::SketchEntity::Line {
+                    artificer_kernel::api::commands::SketchEntity::Line {
                         start: Point2::new(10.0, 0.0),
                         end: Point2::new(10.0, 10.0),
                     },
@@ -628,10 +628,10 @@ fn an_open_sketch_chain_is_refused_with_its_loose_end_named() {
         .execute(
             ApiCommand::Extrude {
                 label: "nope".to_owned(),
-                sketch: artificer_api::commands::StepLabel("open".to_owned()),
+                sketch: artificer_kernel::api::commands::StepLabel("open".to_owned()),
                 regions: Vec::new(),
                 distance: 5.0,
-                operation: artificer_api::commands::ExtrudeOp::New,
+                operation: artificer_kernel::api::commands::ExtrudeOp::New,
                 draft_degrees: 0.0,
             },
             &token,
@@ -660,8 +660,8 @@ fn labels_must_be_unique_and_boolean_targets_must_exist() {
         .execute(
             ApiCommand::BooleanUnion {
                 label: "u".to_owned(),
-                target: artificer_api::commands::StepLabel("typo".to_owned()),
-                tool: artificer_api::commands::StepLabel("b".to_owned()),
+                target: artificer_kernel::api::commands::StepLabel("typo".to_owned()),
+                tool: artificer_kernel::api::commands::StepLabel("b".to_owned()),
             },
             &token,
         )
@@ -721,12 +721,12 @@ fn a_png_snapshot_is_a_real_png() {
             &CancellationToken::default(),
         )
         .expect("box");
-    let options = artificer_api::snapshot::SnapshotOptions {
-        format: artificer_api::snapshot::SnapshotFormat::Png,
+    let options = artificer_kernel::api::snapshot::SnapshotOptions {
+        format: artificer_kernel::api::snapshot::SnapshotFormat::Png,
         ..Default::default()
     };
     let output = session.snapshot(options).expect("png");
-    let artificer_api::snapshot::SnapshotOutput::Png(bytes) = output else {
+    let artificer_kernel::api::snapshot::SnapshotOutput::Png(bytes) = output else {
         panic!("a PNG was requested");
     };
     assert_eq!(
@@ -745,7 +745,7 @@ fn the_shipped_examples_compile_and_run() {
         "examples/three_holes_and_cut.art",
     ] {
         let source = std::fs::read_to_string(example).expect(example);
-        let commands = artificer_api::scripting::compile_script(&source, &BTreeMap::new())
+        let commands = artificer_kernel::api::scripting::compile_script(&source, &BTreeMap::new())
             .unwrap_or_else(|error| panic!("{example}: {error}"));
         let mut session = Session::new();
         for command in commands {
@@ -765,8 +765,8 @@ fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
         .execute(
             ApiCommand::Sketch {
                 label: "sk".to_owned(),
-                on: artificer_api::commands::SketchPlane::XY,
-                entities: vec![artificer_api::commands::SketchEntity::Rectangle {
+                on: artificer_kernel::api::commands::SketchPlane::XY,
+                entities: vec![artificer_kernel::api::commands::SketchEntity::Rectangle {
                     origin: Point2::new(0.0, 0.0),
                     width: 20.0,
                     height: 20.0,
@@ -780,10 +780,10 @@ fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
         .execute(
             ApiCommand::Extrude {
                 label: "draft".to_owned(),
-                sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+                sketch: artificer_kernel::api::commands::StepLabel("sk".to_owned()),
                 regions: Vec::new(),
                 distance: 10.0,
-                operation: artificer_api::commands::ExtrudeOp::New,
+                operation: artificer_kernel::api::commands::ExtrudeOp::New,
                 draft_degrees: -10.0,
             },
             &token,
@@ -807,10 +807,10 @@ fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
         .execute(
             ApiCommand::Extrude {
                 label: "draft_add".to_owned(),
-                sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+                sketch: artificer_kernel::api::commands::StepLabel("sk".to_owned()),
                 regions: Vec::new(),
                 distance: 5.0,
-                operation: artificer_api::commands::ExtrudeOp::Add,
+                operation: artificer_kernel::api::commands::ExtrudeOp::Add,
                 draft_degrees: 5.0,
             },
             &token,
@@ -821,10 +821,10 @@ fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
     // JSON keeps the draft, and omits it when it is zero.
     let json = serde_json::to_string(&ApiCommand::Extrude {
         label: "draft".to_owned(),
-        sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+        sketch: artificer_kernel::api::commands::StepLabel("sk".to_owned()),
         regions: Vec::new(),
         distance: 10.0,
-        operation: artificer_api::commands::ExtrudeOp::New,
+        operation: artificer_kernel::api::commands::ExtrudeOp::New,
         draft_degrees: 0.0,
     })
     .unwrap();
