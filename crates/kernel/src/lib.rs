@@ -811,19 +811,13 @@ impl NativeKernel {
                             request.precision,
                         )
                         .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                        certify_faceted_candidate(input.id, &topology, request.precision)?;
                         // The result is a tessellation, not a certified solid.
                         // Say so: every other report this kernel publishes means
                         // "exact", so a caller with no way to tell the
                         // difference will quote this body's volume as though it
                         // were.
-                        warnings.push(approximation_warning(
-                            "FACE_FEATURE_FACETED_APPROXIMATION",
-                            "This cut crosses geometry that the exact rewrite cannot split - curved walls, or an \
-                             interior void with material resuming beyond it - so the body was rebuilt from a \
-                             tessellation. Its faces, edges, and measures approximate the true solid rather than \
-                             certifying it: two round bores that cross meet in ellipses, which are outside this \
-                             kernel's line-and-circle curve vocabulary.",
-                        ));
+                        warnings.push(faceted_cut_warning());
                         (topology, None, true)
                     }
                     Err(PlanarProfileInputError::FaceFeature(
@@ -907,7 +901,7 @@ impl NativeKernel {
                                     boolean_precision.max_subdivisions.min(4);
                                 boolean_input.precision = Some(boolean_precision);
                                 let scene = NativeKernel::authoritative_scene(&boolean_input);
-                                faceted_boolean::subtract_crossing_profile(
+                                let topology = faceted_boolean::subtract_crossing_profile(
                                     &scene,
                                     *frame,
                                     profile,
@@ -915,7 +909,10 @@ impl NativeKernel {
                                     *distance,
                                     request.precision,
                                 )
-                                .map_err(|reason| planar_profile_input_error(input.id, reason))?
+                                .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                                certify_faceted_candidate(input.id, &topology, request.precision)?;
+                                warnings.push(faceted_cut_warning());
+                                topology
                             }
                             Err(_) => {
                                 return Err(planar_profile_input_error(
@@ -1123,86 +1120,17 @@ impl NativeKernel {
                 let topology = match analytic {
                     Ok(topology) => topology,
                     Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
-                        match prism_edge_finish::build_prism_edge_finishes(
-                            input.id,
-                            &input.topology,
+                        regularized_edge_finish(
+                            input,
                             &[*target_edge],
                             *kind,
                             *distance,
                             request.precision,
-                        ) {
-                            Ok(topology) => topology,
-                            Err(prism_edge_finish::PrismEdgeFinishError::DistanceInvalid) => {
-                                return Err(simple_invalid_input(
-                                    input.id,
-                                    "PRISM_EDGE_FINISH_DISTANCE_INVALID",
-                                    "The finish distance must fit inside both profile neighbours of the selected vertical edge.",
-                                ));
-                            }
-                            Err(prism_edge_finish::PrismEdgeFinishError::ConstructionFailed) => {
-                                return Err(simple_invalid_input(
-                                    input.id,
-                                    "PRISM_EDGE_FINISH_CONSTRUCTION_FAILED",
-                                    "The exact profile corner blend could not be certified for the selected vertical edge.",
-                                ));
-                            }
-                            Err(_) => match section_revolve::build_rim_blend(
-                                input.id,
-                                &input.topology,
-                                &[*target_edge],
-                                *kind,
-                                *distance,
-                                request.precision,
-                            ) {
-                                Ok(topology) => topology,
-                                Err(section_revolve::RimBlendError::DistanceInvalid) => {
-                                    return Err(simple_invalid_input(
-                                        input.id,
-                                        "RIM_BLEND_DISTANCE_INVALID",
-                                        "The rim fillet radius must stay inside both the wall radius and the wall height.",
-                                    ));
-                                }
-                                Err(_) => {
-                                    let scene = Self::authoritative_scene(input);
-                                    faceted_boolean::finish_edges(
-                                    Some(&input.topology),
-                                    &scene,
-                                    &[*target_edge],
-                                    *kind,
-                                    *distance,
-                                    request.precision,
-                                )
-                                .ok_or_else(|| {
-                                    simple_invalid_input(
-                                        input.id,
-                                        "EDGE_FINISH_BLEND_UNSUPPORTED",
-                                        "The selected successor edge could not form a certified regularized blend.",
-                                    )
-                                })?
-                                }
-                            },
-                        }
+                            &mut warnings,
+                        )?
                     }
-                    Err(reason) => {
-                        let (code, message) = match reason {
-                            edge_finish::EdgeFinishError::TargetInvalid => (
-                                "EDGE_FINISH_TARGET_INVALID",
-                                "The selected edge is not owned by this snapshot.",
-                            ),
-                            edge_finish::EdgeFinishError::DomainUnsupported => unreachable!(),
-                            edge_finish::EdgeFinishError::DistanceInvalid => (
-                                "EDGE_FINISH_DISTANCE_INVALID",
-                                "The edge-finish distance must fit inside both adjacent faces.",
-                            ),
-                            edge_finish::EdgeFinishError::ConstructionFailed => (
-                                "EDGE_FINISH_CONSTRUCTION_FAILED",
-                                "The exact chamfer or fillet profile could not be certified.",
-                            ),
-                        };
-                        return Err(simple_invalid_input(input.id, code, message));
-                    }
+                    Err(reason) => return Err(edge_finish_error(input.id, reason, false)),
                 };
-                let _ = kind;
                 (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::FinishEdges {
@@ -1220,208 +1148,17 @@ impl NativeKernel {
                 );
                 let topology = match analytic {
                     Ok(topology) => topology,
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if prism_edge_finish::build_prism_edge_finishes(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .is_ok() =>
-                    {
-                        prism_edge_finish::build_prism_edge_finishes(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .expect("prism edge finish is deterministic")
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if matches!(
-                            prism_edge_finish::build_prism_edge_finishes(
-                                input.id,
-                                &input.topology,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            ),
-                            Err(prism_edge_finish::PrismEdgeFinishError::DistanceInvalid)
-                        ) =>
-                    {
-                        return Err(simple_invalid_input(
-                            input.id,
-                            "PRISM_EDGE_FINISH_DISTANCE_INVALID",
-                            "The finish distance must fit inside both profile neighbours of every selected vertical edge.",
-                        ));
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if section_revolve::build_rim_blend(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .is_ok() =>
-                    {
-                        section_revolve::build_rim_blend(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .expect("rim blend build is deterministic")
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if matches!(
-                            section_revolve::build_rim_blend(
-                                input.id,
-                                &input.topology,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            ),
-                            Err(section_revolve::RimBlendError::DistanceInvalid)
-                        ) =>
-                    {
-                        return Err(simple_invalid_input(
-                            input.id,
-                            "RIM_BLEND_DISTANCE_INVALID",
-                            "The rim fillet radius must stay inside both the wall radius and the wall height.",
-                        ));
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if rim_loop_blend::build_rim_loop_blend(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .is_ok() =>
-                    {
-                        rim_loop_blend::build_rim_loop_blend(
-                            input.id,
-                            &input.topology,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                        )
-                        .expect("rim loop blend is deterministic")
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if matches!(
-                            rim_loop_blend::build_rim_loop_blend(
-                                input.id,
-                                &input.topology,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            ),
-                            Err(rim_loop_blend::RimLoopBlendError::ReflexCorner)
-                        ) =>
-                    {
-                        return Err(simple_invalid_input(
-                            input.id,
-                            "RIM_LOOP_REFLEX_CORNER",
-                            "A sharp concave profile corner cannot carry a rim-loop finish.",
-                        ));
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported)
-                        if matches!(
-                            rim_loop_blend::build_rim_loop_blend(
-                                input.id,
-                                &input.topology,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            ),
-                            Err(rim_loop_blend::RimLoopBlendError::DistanceInvalid)
-                        ) =>
-                    {
-                        return Err(simple_invalid_input(
-                            input.id,
-                            "RIM_LOOP_DISTANCE_INVALID",
-                            "The rim-loop finish distance must leave a usable cap and wall.",
-                        ));
-                    }
                     Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
-                        let regularized = if input.topology.faces.len() == 6 {
-                            let scene = Self::authoritative_scene(input);
-                            faceted_boolean::finish_edges(
-                                Some(&input.topology),
-                                &scene,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            )
-                        } else {
-                            let scene = Self::authoritative_scene(input);
-                            faceted_boolean::finish_edges(
-                                Some(&input.topology),
-                                &scene,
-                                target_edges,
-                                *kind,
-                                *distance,
-                                request.precision,
-                            )
-                            .filter(|topology| {
-                                validator::validate(topology, request.precision.linear_agreement)
-                                    .diagnostics
-                                    .is_empty()
-                            })
-                            .or_else(|| {
-                                finish_logical_successor_edges(
-                                    input,
-                                    target_edges,
-                                    *kind,
-                                    *distance,
-                                    request.precision,
-                                )
-                            })
-                        };
-                        regularized
-                        .ok_or_else(|| {
-                            simple_invalid_input(
-                                input.id,
-                                "EDGE_FINISH_BLEND_UNSUPPORTED",
-                                "The selected edge neighbourhoods could not form a certified regularized corner blend.",
-                            )
-                        })?
+                        regularized_edge_finish(
+                            input,
+                            target_edges,
+                            *kind,
+                            *distance,
+                            request.precision,
+                            &mut warnings,
+                        )?
                     }
-                    Err(reason) => {
-                        let (code, message) = match reason {
-                            edge_finish::EdgeFinishError::TargetInvalid => (
-                                "EDGE_FINISH_TARGET_INVALID",
-                                "Every selected edge must be unique and owned by this snapshot.",
-                            ),
-                            edge_finish::EdgeFinishError::DomainUnsupported => unreachable!(),
-                            edge_finish::EdgeFinishError::DistanceInvalid => (
-                                "EDGE_FINISH_DISTANCE_INVALID",
-                                "The edge-finish distance must fit inside every adjacent face.",
-                            ),
-                            edge_finish::EdgeFinishError::ConstructionFailed => (
-                                "EDGE_FINISH_CONSTRUCTION_FAILED",
-                                "The exact multi-edge chamfer or fillet profile could not be certified.",
-                            ),
-                        };
-                        return Err(simple_invalid_input(input.id, code, message));
-                    }
+                    Err(reason) => return Err(edge_finish_error(input.id, reason, true)),
                 };
                 (topology, HistoryMode::RegularizedFaceFeature)
             }
@@ -2137,6 +1874,11 @@ impl NativeKernel {
         budget: ChordBudget,
     ) -> DebugScene {
         let precision = snapshot.precision.unwrap_or_default();
+        let fallback = if matches!(budget, ChordBudget::Authoritative) {
+            TessellationFallback::Refuse
+        } else {
+            TessellationFallback::Display
+        };
         let triangles = compute.flat_map(
             "kernel.tessellation.faces",
             &snapshot.topology.faces,
@@ -2163,7 +1905,7 @@ impl NativeKernel {
                         if boundaries.first().is_none_or(|polygon| polygon.len() < 3) {
                             return triangles;
                         }
-                        for vertices in triangulate_face_boundaries(&boundaries, plane) {
+                        for vertices in triangulate_face_boundaries(&boundaries, plane, fallback) {
                             triangles.push(shaded_triangle(
                                 face.value.surface,
                                 vertices,
@@ -2505,7 +2247,11 @@ fn presentation_smooth_edge_flags(topology: &Topology) -> Vec<bool> {
 /// that ownership here makes the collection one selectable/display surface
 /// without erasing genuine intersections between different cylinders.
 fn presentation_prismatic_feature_roles(topology: &Topology) -> BTreeSet<u32> {
-    let mut normals = BTreeMap::<u32, Vec<Vector3>>::new();
+    // Every planar face of a role, with its area, so that the microscopic
+    // fragments a regularized Boolean welds at a seam cannot veto the
+    // carrier: their normals are whatever a few-micron triangle happens to
+    // have, and they carry no material worth a crease.
+    let mut faces = BTreeMap::<u32, Vec<(Vector3, f64)>>::new();
     for face in &topology.faces {
         let (FaceRole::FeatureSide(role), Surface::Plane(plane)) =
             (face.value.role, face.value.surface)
@@ -2517,12 +2263,23 @@ fn presentation_prismatic_feature_roles(topology: &Topology) -> BTreeSet<u32> {
             continue;
         }
         let normal = plane.normal / length;
+        let area = planar_face_area(topology, &face.value);
+        faces.entry(role).or_default().push((normal, area));
+    }
+    let mut normals = BTreeMap::<u32, Vec<Vector3>>::new();
+    for (role, faces) in faces {
+        let largest = faces.iter().map(|(_, area)| *area).fold(0.0_f64, f64::max);
         let role_normals = normals.entry(role).or_default();
-        if !role_normals
-            .iter()
-            .any(|candidate| candidate.dot(normal).abs() >= 1.0 - 1.0e-8)
-        {
-            role_normals.push(normal);
+        for (normal, area) in faces {
+            if area < largest * 1.0e-4 {
+                continue;
+            }
+            if !role_normals
+                .iter()
+                .any(|candidate| candidate.dot(normal).abs() >= 1.0 - 1.0e-8)
+            {
+                role_normals.push(normal);
+            }
         }
     }
 
@@ -2541,12 +2298,55 @@ fn presentation_prismatic_feature_roles(topology: &Topology) -> BTreeSet<u32> {
                 let length = cross.length();
                 (length.is_finite() && length > 1.0e-6).then_some(cross / length)
             })?;
+            // The panels of a faceted bore are coaxial by construction, but
+            // the regularized assembly welds their corners at up to a
+            // thousandth of a millimetre, so a panel a millimetre wide can
+            // tilt by a milliradian and still be the same logical carrier.
             normals
                 .iter()
-                .all(|normal| normal.dot(axis).abs() <= 1.0e-6)
+                .all(|normal| normal.dot(axis).abs() <= 1.0e-3)
                 .then_some(role)
         })
         .collect()
+}
+
+/// The area of a planar face's outer loop, from its vertices in loop order.
+/// Inner loops are ignored: this only ranks fragments against each other.
+fn planar_face_area(topology: &Topology, face: &topology::Face) -> f64 {
+    let Some(loop_record) = topology.loops.get(face.outer_loop.0) else {
+        return 0.0;
+    };
+    let points = loop_record
+        .value
+        .coedges
+        .iter()
+        .filter_map(|coedge_key| {
+            let coedge = topology.coedges.get(coedge_key.0)?.value;
+            let edge = topology.edges.get(coedge.edge.0)?.value;
+            let vertex = match coedge.orientation {
+                topology::Orientation::Forward => edge.vertices[0],
+                topology::Orientation::Reverse => edge.vertices[1],
+            };
+            topology
+                .vertices
+                .get(vertex.0)
+                .map(|record| record.value.point)
+        })
+        .collect::<Vec<_>>();
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut twice_area = Vector3::default();
+    for (index, start) in points.iter().enumerate() {
+        let end = points[(index + 1) % points.len()];
+        twice_area = twice_area
+            + Vector3::new(
+                (start.y - end.y) * (start.z + end.z),
+                (start.z - end.z) * (start.x + end.x),
+                (start.x - end.x) * (start.y + end.y),
+            );
+    }
+    0.5 * twice_area.length()
 }
 
 fn edge_direction_from_vertex(
@@ -2847,6 +2647,203 @@ fn presentation_edge_classification(
         coplanar_subdivision: coincident_planes,
         same_feature_side_role,
     }
+}
+
+fn faceted_cut_warning() -> ProtocolDiagnostic {
+    approximation_warning(
+        "FACE_FEATURE_FACETED_APPROXIMATION",
+        "This cut crosses geometry that the exact rewrite cannot split - curved walls, or an \
+         interior void with material resuming beyond it - so the body was rebuilt from a \
+         tessellation. Its faces, edges, and measures approximate the true solid rather than \
+         certifying it: two round bores that cross meet in ellipses, which are outside this \
+         kernel's line-and-circle curve vocabulary.",
+    )
+}
+
+/// A faceted candidate that fails the closed-solid validator is not this
+/// cut's answer. Naming the tier that failed, and why, beats the bare
+/// validation failure the generic gate would otherwise report.
+fn certify_faceted_candidate(
+    snapshot: SnapshotId,
+    topology: &Topology,
+    precision: PrecisionPolicy,
+) -> Result<(), KernelError> {
+    let validation = validator::validate(topology, precision.linear_agreement);
+    if validation.diagnostics.is_empty() {
+        return Ok(());
+    }
+    let mut diagnostics = vec![simple_diagnostic(
+        "FACE_FEATURE_FACETED_UNRESOLVED",
+        KernelStage::Construction,
+        "The crossing cut was rebuilt from a tessellation, but the rebuilt shell did not close: \
+         fragments where the cutter meets existing geometry could not be welded within the \
+         approximation budget.",
+    )];
+    diagnostics.extend(
+        validation
+            .diagnostics
+            .iter()
+            .map(|diagnostic| validator_diagnostic(snapshot, diagnostic)),
+    );
+    Err(error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Construction,
+        snapshot,
+        "the faceted cut could not be regularized into a closed solid",
+        diagnostics,
+    ))
+}
+
+/// The edge-finish ladder beyond the six-plane cuboid: each exact rung runs
+/// once, and its refusal either names the fault or hands the request to the
+/// next rung. The faceted tier is the last rung and says so in the warnings,
+/// because every other result this kernel publishes is exact.
+fn regularized_edge_finish(
+    input: &Snapshot,
+    targets: &[EntityRef],
+    kind: artificer_protocol::EdgeFinishKind,
+    distance: f64,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<Topology, KernelError> {
+    match prism_edge_finish::build_prism_edge_finishes(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology) => return Ok(topology),
+        Err(prism_edge_finish::PrismEdgeFinishError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "PRISM_EDGE_FINISH_DISTANCE_INVALID",
+                "The finish distance must fit inside both profile neighbours of every selected vertical edge.",
+            ));
+        }
+        Err(
+            prism_edge_finish::PrismEdgeFinishError::TargetInvalid
+            | prism_edge_finish::PrismEdgeFinishError::DomainUnsupported
+            | prism_edge_finish::PrismEdgeFinishError::ConstructionFailed,
+        ) => {}
+    }
+    match section_revolve::build_rim_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology) => return Ok(topology),
+        Err(section_revolve::RimBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "RIM_BLEND_DISTANCE_INVALID",
+                "The rim fillet radius must stay inside both the wall radius and the wall height.",
+            ));
+        }
+        Err(_) => {}
+    }
+    match rim_loop_blend::build_rim_loop_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology) => return Ok(topology),
+        Err(rim_loop_blend::RimLoopBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "RIM_LOOP_DISTANCE_INVALID",
+                "The rim-loop finish distance must leave a usable cap and wall.",
+            ));
+        }
+        // A sharp concave corner has no exact rolling-ball blend in the
+        // line-and-circle vocabulary; the faceted tier below approximates it
+        // and is labelled as such.
+        Err(
+            rim_loop_blend::RimLoopBlendError::ReflexCorner
+            | rim_loop_blend::RimLoopBlendError::TargetInvalid
+            | rim_loop_blend::RimLoopBlendError::DomainUnsupported,
+        ) => {}
+    }
+
+    let scene = NativeKernel::authoritative_scene(input);
+    let faceted = faceted_boolean::finish_edges(
+        Some(&input.topology),
+        &scene,
+        targets,
+        kind,
+        distance,
+        precision,
+    );
+    let regularized = if input.topology.faces.len() == 6 {
+        faceted
+    } else {
+        faceted
+            .filter(|topology| {
+                validator::validate(topology, precision.linear_agreement)
+                    .diagnostics
+                    .is_empty()
+            })
+            .or_else(|| finish_logical_successor_edges(input, targets, kind, distance, precision))
+    };
+    let topology = regularized.ok_or_else(|| {
+        simple_invalid_input(
+            input.id,
+            "EDGE_FINISH_BLEND_UNSUPPORTED",
+            "The selected edge neighbourhoods could not form a certified regularized corner blend.",
+        )
+    })?;
+    warnings.push(approximation_warning(
+        "EDGE_FINISH_FACETED_APPROXIMATION",
+        "This finish runs where no exact blend exists in this kernel's line-and-circle vocabulary - \
+         a hole with sharp concave corners, or edges the exact rungs cannot own - so the body was \
+         rebuilt from a tessellation. Its blend faces, edges, and measures approximate the true \
+         solid rather than certifying it.",
+    ));
+    Ok(topology)
+}
+
+fn edge_finish_error(
+    snapshot: SnapshotId,
+    reason: edge_finish::EdgeFinishError,
+    many: bool,
+) -> KernelError {
+    let (code, message) = match (reason, many) {
+        (edge_finish::EdgeFinishError::TargetInvalid, false) => (
+            "EDGE_FINISH_TARGET_INVALID",
+            "The selected edge is not owned by this snapshot.",
+        ),
+        (edge_finish::EdgeFinishError::TargetInvalid, true) => (
+            "EDGE_FINISH_TARGET_INVALID",
+            "Every selected edge must be unique and owned by this snapshot.",
+        ),
+        (edge_finish::EdgeFinishError::DistanceInvalid, false) => (
+            "EDGE_FINISH_DISTANCE_INVALID",
+            "The edge-finish distance must fit inside both adjacent faces.",
+        ),
+        (edge_finish::EdgeFinishError::DistanceInvalid, true) => (
+            "EDGE_FINISH_DISTANCE_INVALID",
+            "The edge-finish distance must fit inside every adjacent face.",
+        ),
+        (edge_finish::EdgeFinishError::ConstructionFailed, false) => (
+            "EDGE_FINISH_CONSTRUCTION_FAILED",
+            "The exact chamfer or fillet profile could not be certified.",
+        ),
+        (edge_finish::EdgeFinishError::ConstructionFailed, true) => (
+            "EDGE_FINISH_CONSTRUCTION_FAILED",
+            "The exact multi-edge chamfer or fillet profile could not be certified.",
+        ),
+        (edge_finish::EdgeFinishError::DomainUnsupported, _) => {
+            unreachable!("a domain refusal enters the regularized ladder instead")
+        }
+    };
+    simple_invalid_input(snapshot, code, message)
 }
 
 fn finish_logical_successor_edges(
@@ -3616,12 +3613,13 @@ struct TessellationVertex {
 fn triangulate_face_boundaries(
     boundaries: &[Vec<Point3>],
     plane: topology::Plane,
+    fallback: TessellationFallback,
 ) -> Vec<[Point3; 3]> {
     let Some(outer) = boundaries.first() else {
         return Vec::new();
     };
     if boundaries.len() == 1 {
-        return triangulate_face_polygon(outer, plane)
+        return triangulate_face_polygon(outer, plane, fallback)
             .into_iter()
             .map(|triangle| triangle.map(|vertex| outer[vertex]))
             .collect();
@@ -3676,33 +3674,46 @@ fn triangulate_face_boundaries(
                 .total_cmp(&squared_distance_2d(polygon[*right].projected, hole_point))
                 .then_with(|| left.cmp(right))
         });
-        let outer_candidates: Vec<usize> = candidates.clone();
-        let outer_vertex = outer_candidates
-            .iter()
-            .copied()
-            .find(|candidate| {
-                bridge_is_visible(
-                    polygon[*candidate].projected,
-                    hole_point,
-                    *candidate,
-                    hole_vertex,
-                    &polygon,
-                    boundary_index,
-                    &projected_boundaries,
-                )
-            })
-            .or_else(|| {
-                // Fallback: choose closest candidate whose midpoint is inside the face
-                candidates.into_iter().find(|candidate| {
-                    let outer = polygon[*candidate].projected;
-                    let midpoint = topology::Point2::new(
-                        (outer.x + hole_point.x) * 0.5,
-                        (outer.y + hole_point.y) * 0.5,
-                    );
-                    point_in_polygon_2d(midpoint, &projected_boundaries[0])
-                })
-            })
-            .unwrap_or(0);
+        let visible = candidates.iter().copied().find(|candidate| {
+            bridge_is_visible(
+                polygon[*candidate].projected,
+                hole_point,
+                *candidate,
+                hole_vertex,
+                &polygon,
+                boundary_index,
+                &projected_boundaries,
+            )
+        });
+        let outer_vertex =
+            match (visible, fallback) {
+                (Some(vertex), _) => vertex,
+                // Never fill a void when authoritative tessellation cannot
+                // certify a bridge. Omitting the one face is safer than handing
+                // the Boolean tier material where topology says there is none.
+                (None, TessellationFallback::Refuse) => return Vec::new(),
+                // For display only, accept the nearest bridge whose midpoint at
+                // least lies inside the outer boundary and outside every other
+                // hole; a bridge that crosses another hole would overlap it.
+                (None, TessellationFallback::Display) => {
+                    let Some(vertex) = candidates.iter().copied().find(|candidate| {
+                        let outer = polygon[*candidate].projected;
+                        let midpoint = topology::Point2::new(
+                            (outer.x + hole_point.x) * 0.5,
+                            (outer.y + hole_point.y) * 0.5,
+                        );
+                        point_in_polygon_2d(midpoint, &projected_boundaries[0])
+                            && projected_boundaries.iter().enumerate().skip(1).all(
+                                |(index, hole)| {
+                                    index == boundary_index || !point_in_polygon_2d(midpoint, hole)
+                                },
+                            )
+                    }) else {
+                        return Vec::new();
+                    };
+                    vertex
+                }
+            };
 
         let outer_bridge = polygon[outer_vertex];
         let inner_bridge = TessellationVertex {
@@ -3729,12 +3740,11 @@ fn triangulate_face_boundaries(
         .iter()
         .map(|vertex| vertex.projected)
         .collect::<Vec<_>>();
-    ear_clip_polygon(&projected)
-        .unwrap_or_else(|| {
-            (1..polygon.len().saturating_sub(1))
-                .map(|index| [0, index, index + 1])
-                .collect()
-        })
+    // A stitched polygon is never fanned: a fan from one vertex over a loop
+    // that carries bridges fills the very holes the bridges keep open. When
+    // the clip cannot resolve it, the face is omitted under either budget.
+    ear_clip_polygon(&projected, fallback)
+        .unwrap_or_default()
         .into_iter()
         .map(|triangle| triangle.map(|vertex| polygon[vertex].point))
         .collect()
@@ -3815,22 +3825,67 @@ fn bridge_is_visible(
             .all(|(index, hole)| index == active_hole || !point_in_polygon_2d(midpoint, hole))
 }
 
+/// How a face that the exact stitching cannot triangulate is treated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TessellationFallback {
+    /// Authoritative sampling: a face that cannot be certified is omitted,
+    /// never guessed, because this scene feeds the faceted Boolean tier and
+    /// faceted interchange export.
+    Refuse,
+    /// Display sampling: a hole may be bridged by a containment test and a
+    /// stalled clip may fall back to a fan, so the viewer sees material where
+    /// the topology certifies material even when the diagnostic stitch is
+    /// numerically unresolved. Nothing here reaches a snapshot or a measure.
+    Display,
+}
+
 fn point_strictly_in_triangle(
     point: topology::Point2,
     first: topology::Point2,
     second: topology::Point2,
     third: topology::Point2,
+    tolerance: f64,
 ) -> bool {
     let a = signed_area_2d(first, second, point);
     let b = signed_area_2d(second, third, point);
     let c = signed_area_2d(third, first, point);
-    a > 1e-12 && b > 1e-12 && c > 1e-12
+    a > tolerance && b > tolerance && c > tolerance
 }
 
-fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
+/// The squared diagonal of a polygon's bounding box: the scale every area
+/// tolerance below is relative to, so a part in metres and one in microns
+/// clip the same way.
+fn projected_extent_squared(projected: &[topology::Point2]) -> f64 {
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for point in projected {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    let extent = (max_x - min_x).mul_add(max_x - min_x, (max_y - min_y).powi(2));
+    if extent.is_finite() && extent > 0.0 {
+        extent
+    } else {
+        1.0
+    }
+}
+
+fn ear_clip_polygon(
+    projected: &[topology::Point2],
+    fallback: TessellationFallback,
+) -> Option<Vec<[usize; 3]>> {
     if projected.len() < 3 {
         return Some(Vec::new());
     }
+    let extent = projected_extent_squared(projected);
+    let area_tolerance = extent * 1.0e-12;
+    let collinear_tolerance = extent * 1.0e-10;
     let mut remaining = (0..projected.len()).collect::<Vec<_>>();
     let mut triangles = Vec::with_capacity(projected.len().saturating_sub(2));
 
@@ -3845,6 +3900,8 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
             let p_curr = projected[remaining[current]];
             let p_next = projected[remaining[next]];
 
+            // A bridge stitches a hole in through two coincident vertices;
+            // the zero-width ear between them is removed without a triangle.
             if same_point_2d(p_prev, p_curr)
                 || same_point_2d(p_curr, p_next)
                 || same_point_2d(p_prev, p_next)
@@ -3857,7 +3914,7 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
             }
 
             let area = signed_area_2d(p_prev, p_curr, p_next);
-            if area <= 1e-12 {
+            if area <= area_tolerance {
                 continue;
             }
 
@@ -3874,7 +3931,7 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
                 {
                     return false;
                 }
-                point_strictly_in_triangle(pt, p_prev, p_curr, p_next)
+                point_strictly_in_triangle(pt, p_prev, p_curr, p_next, area_tolerance)
             });
 
             if !has_interior_vertex {
@@ -3888,19 +3945,25 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
                 projected[triangle[0]],
                 projected[triangle[1]],
                 projected[triangle[2]],
-            ) > 1e-12
+            ) > area_tolerance
             {
                 triangles.push(triangle);
             }
             remaining.remove(current);
             stalled_iterations = 0;
         } else {
+            // No ear: the polygon is not simple at this tolerance. An
+            // authoritative scene must not guess; a display scene may drop a
+            // collinear vertex and, failing that, fan what remains.
+            if fallback == TessellationFallback::Refuse {
+                return None;
+            }
             stalled_iterations += 1;
             if stalled_iterations > remaining.len() {
                 for k in 1..remaining.len().saturating_sub(1) {
                     let t = [remaining[0], remaining[k], remaining[k + 1]];
                     if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs()
-                        > 1e-12
+                        > area_tolerance
                     {
                         triangles.push(t);
                     }
@@ -3916,7 +3979,7 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
                     projected[remaining[current]],
                     projected[remaining[next]],
                 );
-                if area.abs() <= 1e-10 {
+                if area.abs() <= collinear_tolerance {
                     remaining.remove(current);
                     removed = true;
                     break;
@@ -3930,7 +3993,8 @@ fn ear_clip_polygon(projected: &[topology::Point2]) -> Option<Vec<[usize; 3]>> {
 
     if remaining.len() == 3 {
         let t = [remaining[0], remaining[1], remaining[2]];
-        if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs() > 1e-12 {
+        if signed_area_2d(projected[t[0]], projected[t[1]], projected[t[2]]).abs() > area_tolerance
+        {
             triangles.push(t);
         }
     }
@@ -4005,7 +4069,11 @@ fn same_point_2d(left: topology::Point2, right: topology::Point2) -> bool {
     left.x == right.x && left.y == right.y
 }
 
-fn triangulate_face_polygon(polygon: &[Point3], plane: topology::Plane) -> Vec<[usize; 3]> {
+fn triangulate_face_polygon(
+    polygon: &[Point3],
+    plane: topology::Plane,
+    fallback: TessellationFallback,
+) -> Vec<[usize; 3]> {
     if polygon.len() < 3 {
         return Vec::new();
     }
@@ -4013,10 +4081,15 @@ fn triangulate_face_polygon(polygon: &[Point3], plane: topology::Plane) -> Vec<[
         .iter()
         .map(|point| plane.project(*point))
         .collect::<Vec<_>>();
-    ear_clip_polygon(&projected).unwrap_or_else(|| {
-        (1..polygon.len() - 1)
+    ear_clip_polygon(&projected, fallback).unwrap_or_else(|| match fallback {
+        // Publication never depends on diagnostic tessellation. A fan is
+        // retained only as a fail-soft visualization for a numerically
+        // unresolved hole-free face; authoritative topology and validation
+        // remain unchanged.
+        TessellationFallback::Display => (1..polygon.len() - 1)
             .map(|index| [0, index, index + 1])
-            .collect()
+            .collect(),
+        TessellationFallback::Refuse => Vec::new(),
     })
 }
 
@@ -10195,7 +10268,8 @@ mod tests {
             Vector3::new(0.0, 1.0, 0.0),
         );
 
-        let triangles = triangulate_face_boundaries(&[outer, inner], plane);
+        let triangles =
+            triangulate_face_boundaries(&[outer, inner], plane, TessellationFallback::Refuse);
         assert_eq!(triangles.len(), 8);
         let area = triangles
             .iter()
@@ -10235,7 +10309,11 @@ mod tests {
             Point3::new(3.0, 1.0, 0.0),
             Point3::new(3.0, -1.0, 0.0),
         ];
-        let triangles = triangulate_face_boundaries(&[outer, left_hole, right_hole], plane);
+        let triangles = triangulate_face_boundaries(
+            &[outer, left_hole, right_hole],
+            plane,
+            TessellationFallback::Refuse,
+        );
         assert_eq!(triangles.len(), 14);
         let area = triangles
             .iter()

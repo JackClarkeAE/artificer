@@ -43,6 +43,21 @@ pub(crate) enum SpineVertexKind {
         trim_in: f64,
         trim_out: f64,
     },
+    /// A sharp reflex corner between two straight runs: the offsets are
+    /// extended until they meet, so the spine keeps a corner there.
+    SharpReflex { interior_angle: f64 },
+}
+
+/// What a sharp reflex corner may become on the spine.
+///
+/// A fillet cannot round a reflex corner: the two blend bands would meet in a
+/// quartic curve, outside the analytic vocabulary. A chamfer between two
+/// straight runs can, because two slant planes meet in a straight mitre line,
+/// so a chamfer asks for `MitreLines` and a fillet for `Refuse`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReflexPolicy {
+    Refuse,
+    MitreLines,
 }
 
 /// The offset loop plus the per-vertex metadata a blend builder needs.
@@ -59,6 +74,7 @@ pub(crate) struct SpineLoop {
 pub(crate) fn mitred_inward_offset(
     source: &[Segment],
     distance: f64,
+    reflex: ReflexPolicy,
     precision: PrecisionPolicy,
 ) -> Result<SpineLoop, LoopOffsetError> {
     if source.len() < 2 || !distance.is_finite() || distance <= 0.0 {
@@ -90,7 +106,23 @@ pub(crate) fn mitred_inward_offset(
         }
         if turn < 0.0 {
             // A right turn on a counter-clockwise loop is a reflex corner.
-            return Err(LoopOffsetError::ReflexSharpCorner);
+            let both_straight = matches!(
+                (offsets[previous].kind, offsets[index].kind),
+                (CarrierKind::Line { .. }, CarrierKind::Line { .. })
+            );
+            if reflex == ReflexPolicy::Refuse || !both_straight {
+                return Err(LoopOffsetError::ReflexSharpCorner);
+            }
+            // Two offset lines always meet once; extending both to that point
+            // keeps the corner sharp on the spine.
+            let mitre = mitre_point(&offsets[previous], &offsets[index], precision)
+                .ok_or(LoopOffsetError::Degenerate)?;
+            ends[previous] = mitre;
+            starts[index] = mitre;
+            vertices.push(SpineVertexKind::SharpReflex {
+                interior_angle: std::f64::consts::PI - turn,
+            });
+            continue;
         }
         let mitre = mitre_point(&offsets[previous], &offsets[index], precision)
             .ok_or(LoopOffsetError::RadiusTooLarge)?;
@@ -117,7 +149,7 @@ pub(crate) fn mitred_inward_offset(
         }
         segments.push(trimmed);
     }
-    certify(&segments, precision)?;
+    certify(&segments, signed_area(source).signum(), precision)?;
     Ok(SpineLoop { segments, vertices })
 }
 
@@ -436,8 +468,15 @@ fn retarget(
     })
 }
 
-/// Rejects a spine that crosses itself or encloses no material.
-fn certify(segments: &[Segment], precision: PrecisionPolicy) -> Result<(), LoopOffsetError> {
+/// Rejects a spine that crosses itself or encloses no material. `sense` is
+/// the sign of the source loop's signed area: an outer boundary runs
+/// counter-clockwise, a hole clockwise, and the spine must keep its source's
+/// winding rather than invert through a collapse.
+fn certify(
+    segments: &[Segment],
+    sense: f64,
+    precision: PrecisionPolicy,
+) -> Result<(), LoopOffsetError> {
     let count = segments.len();
     for first in 0..count {
         for second in first + 1..count {
@@ -450,7 +489,7 @@ fn certify(segments: &[Segment], precision: PrecisionPolicy) -> Result<(), LoopO
             }
         }
     }
-    let area = signed_area(segments);
+    let area = signed_area(segments) * sense;
     if !area.is_finite() || area <= precision.min_feature_size * precision.min_feature_size {
         return Err(LoopOffsetError::SelfIntersects);
     }
@@ -495,8 +534,13 @@ mod tests {
 
     #[test]
     fn a_rectangle_offsets_to_a_mitred_rectangle() {
-        let spine = mitred_inward_offset(&rectangle(10.0, 6.0), 1.0, precision())
-            .expect("a rectangle offsets cleanly");
+        let spine = mitred_inward_offset(
+            &rectangle(10.0, 6.0),
+            1.0,
+            ReflexPolicy::Refuse,
+            precision(),
+        )
+        .expect("a rectangle offsets cleanly");
         assert_eq!(spine.segments.len(), 4);
         assert!(matches!(
             spine.vertices[0],
@@ -510,7 +554,12 @@ mod tests {
     #[test]
     fn an_oversized_offset_collapses_and_rejects() {
         // Half the short side leaves nothing behind.
-        let result = mitred_inward_offset(&rectangle(10.0, 6.0), 3.0, precision());
+        let result = mitred_inward_offset(
+            &rectangle(10.0, 6.0),
+            3.0,
+            ReflexPolicy::Refuse,
+            precision(),
+        );
         assert!(
             matches!(
                 result,
@@ -538,8 +587,25 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            mitred_inward_offset(&loop_, 1.0, precision()).err(),
+            mitred_inward_offset(&loop_, 1.0, ReflexPolicy::Refuse, precision()).err(),
             Some(LoopOffsetError::ReflexSharpCorner)
+        );
+        // A chamfer may mitre it: the offsets of the two runs meeting at (6,4)
+        // are extended to their intersection at (5,3), one unit inside both.
+        let spine = mitred_inward_offset(&loop_, 1.0, ReflexPolicy::MitreLines, precision())
+            .expect("straight reflex corners mitre for a chamfer");
+        assert_eq!(spine.segments.len(), 6);
+        assert!(matches!(
+            spine.vertices[3],
+            SpineVertexKind::SharpReflex { .. }
+        ));
+        let corner = spine.segments[3].start();
+        assert!((corner.x - 5.0).abs() < 1.0e-12 && (corner.y - 3.0).abs() < 1.0e-12);
+        // The inset L keeps the outer L's shape: 8 x 2 plus 4 x 5.
+        let area = signed_area(&spine.segments);
+        assert!(
+            (area - (8.0 * 2.0 + 4.0 * 5.0)).abs() < 1.0e-12,
+            "spine area was {area}"
         );
     }
 
@@ -575,11 +641,11 @@ mod tests {
         ];
         // A radius equal to the arc radius leaves a degenerate carrier.
         assert_eq!(
-            mitred_inward_offset(&loop_, radius, precision()).err(),
+            mitred_inward_offset(&loop_, radius, ReflexPolicy::Refuse, precision()).err(),
             Some(LoopOffsetError::RadiusTooLarge)
         );
         // A smaller radius is fine, and every junction stays tangent.
-        let spine = mitred_inward_offset(&loop_, 0.5, precision())
+        let spine = mitred_inward_offset(&loop_, 0.5, ReflexPolicy::Refuse, precision())
             .expect("a tangent stadium offsets cleanly");
         assert!(
             spine

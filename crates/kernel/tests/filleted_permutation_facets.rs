@@ -6,7 +6,7 @@
 //! 2. True boundary rails and transition creases are marked `is_smooth: false` (visible).
 //! 3. Solids remain valid and watertight.
 
-use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
+use artificer_kernel::{CancellationToken, DisplaySurface, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, CURRENT_PROTOCOL_VERSION, EdgeFinishKind, EntityRef, ExecuteRequest,
     FaceExtrusionOperation, KernelCommand, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2,
@@ -361,13 +361,26 @@ fn fillet_permutation_3_cuboid_whole_top_rim_loop() {
     );
     assert_fillet_presentation_invariants(&filleted_rim, "fp3-rim-fillet");
 
-    // Verify smooth corner blend patches
+    // A whole cap rim of a primitive cuboid is the same prism as an extruded
+    // square, so it enters the exact rim-loop path: four quarter-cylinder
+    // bands joined by four sphere corner patches, with no facet seams at all.
     let scene = NativeKernel::debug_scene(&filleted_rim);
-    let smooth_count = scene.edges.iter().filter(|e| e.is_smooth).count();
-    assert!(
-        smooth_count > 0,
-        "rim loop fillet corner blends must have smooth internal facet seams"
+    let spheres = scene
+        .carriers
+        .iter()
+        .filter(|carrier| matches!(carrier.surface, DisplaySurface::Sphere { .. }))
+        .count();
+    let cylinders = scene
+        .carriers
+        .iter()
+        .filter(|carrier| matches!(carrier.surface, DisplaySurface::Cylinder { .. }))
+        .count();
+    assert_eq!(
+        (spheres, cylinders),
+        (4, 4),
+        "rim loop fillet corner blends are exact sphere patches"
     );
+    assert_eq!(filleted_rim.counts().faces, 18);
 }
 
 #[test]

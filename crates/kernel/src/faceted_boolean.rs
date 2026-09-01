@@ -1454,6 +1454,22 @@ fn topology_from_polygons_with_heal_limit(
 ) -> Option<Topology> {
     let polygons = split_non_planar_polygons(polygons, epsilon);
     let polygons = conform_polygon_edges(polygons, epsilon);
+    // The BSP classifies a vertex as "on" a split plane within `epsilon`
+    // without moving it there, so after several splits two spellings of one
+    // corner can sit tens of `epsilon` apart where a cutter panel grazes an
+    // existing edge. Welding at a coarser distance collapses those into one
+    // vertex, and the sliver between them into nothing, instead of
+    // publishing a face a few microns wide that overlaps its neighbours.
+    // Welding first, then conforming again at the weld scale, means a
+    // T-junction whose stem vertex had a second spelling is still split.
+    // The distance scales with the body: the BSP's errors do, being the
+    // conditioning of intersections a body's own size, and an absolute
+    // weld that is right for a hundred-millimetre block would visibly bend
+    // the panels of a part a few millimetres across.
+    let extent = polygon_extent(&polygons);
+    let weld = (extent * 1.0e-5).max(epsilon);
+    let polygons = weld_polygon_vertices(polygons, weld);
+    let polygons = conform_polygon_edges(polygons, weld / 8.0);
     let mut pending = VecDeque::from(polygons);
     let mut topology = Topology::default();
     let mut next_id = 1_u64;
@@ -1466,8 +1482,8 @@ fn topology_from_polygons_with_heal_limit(
             continue;
         }
         let mut points = polygon.vertices;
-        points.dedup_by(|left, right| left.distance(*right) <= epsilon);
-        if points.len() >= 2 && points[0].distance(*points.last().unwrap()) <= epsilon {
+        points.dedup_by(|left, right| left.distance(*right) <= weld);
+        if points.len() >= 2 && points[0].distance(*points.last().unwrap()) <= weld {
             points.pop();
         }
         if points.len() < 3 {
@@ -1484,7 +1500,7 @@ fn topology_from_polygons_with_heal_limit(
                             .map(|key| topology.vertices[key.0].value.point)
                     },
                     point,
-                    epsilon,
+                    weld,
                 );
                 *vertex_map.entry(key).or_insert_with(|| {
                     let vertex_key = VertexKey(topology.vertices.len());
@@ -1496,6 +1512,40 @@ fn topology_from_polygons_with_heal_limit(
                 })
             })
             .collect::<Vec<_>>();
+        // Welding may map two neighbouring vertices of a sliver onto one key;
+        // collapse those before the loop is inspected, so a fragment that is
+        // still a polygon on its welded points is not thrown away.
+        vertex_keys.dedup();
+        while vertex_keys.len() > 1 && vertex_keys.first() == vertex_keys.last() {
+            vertex_keys.pop();
+        }
+        if vertex_keys.len() < 3 {
+            continue;
+        }
+        // A key that repeats non-consecutively is a pinch: the fragment
+        // touches itself at one welded vertex. Split it there into two simple
+        // loops and assemble each on its own; dropping the fragment would
+        // leave a hole in the shell that no later stage can close.
+        if let Some((first, second)) = repeated_key_pair(&vertex_keys) {
+            let welded = vertex_keys
+                .iter()
+                .map(|key| topology.vertices[key.0].value.point)
+                .collect::<Vec<_>>();
+            let inner = welded[first..second].to_vec();
+            let outer = welded[second..]
+                .iter()
+                .chain(welded[..first].iter())
+                .copied()
+                .collect::<Vec<_>>();
+            for part in [inner, outer] {
+                if part.len() >= 3
+                    && let Some(fragment) = Polygon::new_narrow(part, polygon.role, epsilon)
+                {
+                    pending.push_back(fragment);
+                }
+            }
+            continue;
+        }
         // Welding chooses one canonical model point for every quantized
         // vertex. Build the face plane and its pcurves from those same points,
         // not from polygon-local pre-weld coordinates; otherwise two BSP
@@ -1505,30 +1555,24 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .map(|key| topology.vertices[key.0].value.point)
             .collect();
-        let unique_vertex_count = vertex_keys
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        if unique_vertex_count != vertex_keys.len() {
+        // The face normal comes from the whole loop, never from one vertex
+        // triple: a sliver's first non-degenerate triple can be a few microns
+        // wide and point anywhere.
+        let newell = newell_normal(&points);
+        let newell_length = newell.length();
+        if !newell_length.is_finite() || newell_length <= epsilon * epsilon {
             continue;
         }
+        let normal = newell / newell_length;
         let Some(u) = points
             .iter()
             .copied()
             .skip(1)
             .map(|point| point - points[0])
+            .map(|direction| direction - normal * direction.dot(normal))
             .find(|direction| direction.length() > epsilon)
             .map(|direction| direction / direction.length())
         else {
-            continue;
-        };
-        let Some(normal) = (1..points.len().saturating_sub(1)).find_map(|first| {
-            (first + 1..points.len()).find_map(|second| {
-                let normal = (points[first] - points[0]).cross(points[second] - points[0]);
-                (normal.length() > epsilon).then(|| normal / normal.length())
-            })
-        }) else {
             continue;
         };
         let v = normal.cross(u);
@@ -1541,13 +1585,52 @@ fn topology_from_polygons_with_heal_limit(
         // the modeling tolerance while still making it microscopically
         // non-planar at the much stricter B-rep agreement tolerance. Split
         // only that fragment into planar triangles which reuse the same
-        // welded vertices. Presentation later marks their shared coplanar
-        // edges smooth, so this creates no selectable/display seam.
+        // welded vertices, and assemble those instead. Presentation later
+        // marks their shared coplanar edges smooth, so this creates no
+        // selectable/display seam.
         let planar_error = points
             .iter()
             .map(|point| ((*point - points[0]).dot(normal)).abs())
             .fold(0.0_f64, f64::max);
         if points.len() > 3 && planar_error > (epsilon * 1.0e-2).max(1.0e-7) {
+            let triangles = ear_clip(&projected);
+            let degenerate = triangles.iter().any(|triangle| {
+                signed_area(
+                    projected[triangle[0]],
+                    projected[triangle[1]],
+                    projected[triangle[2]],
+                )
+                .abs()
+                    <= epsilon * epsilon
+            });
+            if triangles.len() == points.len().saturating_sub(2) && !degenerate {
+                for triangle in triangles {
+                    if let Some(fragment) = Polygon::new_narrow(
+                        triangle.map(|index| points[index]).to_vec(),
+                        polygon.role,
+                        epsilon,
+                    ) {
+                        pending.push_back(fragment);
+                    }
+                }
+            } else {
+                // Fan from the centroid instead of from a corner: a corner
+                // fan produces a zero-area triangle wherever three
+                // consecutive vertices are collinear, which is exactly what
+                // a conformed T-junction looks like, and dropping that
+                // triangle would leave its neighbours' edges single-use.
+                let centre = polygon_centroid(&points);
+                for index in 0..points.len() {
+                    let next = (index + 1) % points.len();
+                    if let Some(fragment) = Polygon::new_narrow(
+                        vec![points[index], points[next], centre],
+                        polygon.role,
+                        epsilon,
+                    ) {
+                        pending.push_back(fragment);
+                    }
+                }
+            }
             continue;
         }
         let mut twice_area = projected
@@ -1741,14 +1824,41 @@ fn heal_planar_boundary_cycles(
             || path.into_iter().map(|index| boundary[index]).collect(),
             |(_, cycle)| cycle,
         );
-        let points = cycle
+        // Each record's start vertex, which the fan closure pairs with the
+        // record; and the vertices in walking order, which the planar closure
+        // triangulates. The two differ on an undirected fallback cycle, whose
+        // records are listed along the walk but keep their own required
+        // direction.
+        let record_points = cycle
             .iter()
             .map(|(vertex, _, _, _)| topology.vertices[*vertex].value.point)
             .collect::<Vec<_>>();
-        let cycle_span = boundary_cycle_span(&points);
-        let Some(split_plane) = SplitPlane::from_points(&points, epsilon * epsilon) else {
+        let Some(walk) = cycle_walk(&cycle) else {
             continue;
         };
+        let points = walk
+            .iter()
+            .map(|vertex| topology.vertices[*vertex].value.point)
+            .collect::<Vec<_>>();
+        let cycle_span = boundary_cycle_span(&points);
+        let Some(mut split_plane) = SplitPlane::from_points(&points, epsilon * epsilon) else {
+            continue;
+        };
+        // The missing face must use every boundary edge in the record's
+        // direction. Twice the vector area of those directed edges is the
+        // outward normal that satisfies them all, whatever order they are
+        // listed in; the split plane's sign is whatever its first vertex
+        // triple happened to give.
+        let required_normal = cycle
+            .iter()
+            .fold(Vector3::default(), |sum, (start, end, _, _)| {
+                let start = topology.vertices[*start].value.point.as_vector();
+                let end = topology.vertices[*end].value.point.as_vector();
+                sum + start.cross(end)
+            });
+        if required_normal.dot(split_plane.normal) < 0.0 {
+            split_plane.flip();
+        }
         let first_direction = points[1] - points[0];
         if first_direction.length() <= epsilon {
             continue;
@@ -1768,7 +1878,7 @@ fn heal_planar_boundary_cycles(
                     next_id,
                     shell_faces,
                     &cycle,
-                    &points,
+                    &record_points,
                     epsilon,
                 )
             {
@@ -1815,8 +1925,8 @@ fn heal_planar_boundary_cycles(
             }
             let mut coedges = Vec::with_capacity(3);
             for side in 0..3 {
-                let start = cycle[triangle[side]].0;
-                let end = cycle[triangle[(side + 1) % 3]].0;
+                let start = walk[triangle[side]];
+                let end = walk[triangle[(side + 1) % 3]];
                 let ordered = if start < end {
                     [start, end]
                 } else {
@@ -1871,6 +1981,46 @@ fn heal_planar_boundary_cycles(
             shell_faces.push(face_key);
         }
     }
+}
+
+/// The area-weighted normal of a closed loop (Newell's method): twice the
+/// loop's vector area, oriented by its winding. Unlike a vertex triple it is
+/// stable on slivers and on loops with reflex corners.
+fn newell_normal(points: &[Point3]) -> Vector3 {
+    let mut normal = Vector3::default();
+    for (index, start) in points.iter().enumerate() {
+        let end = points[(index + 1) % points.len()];
+        normal = normal
+            + Vector3::new(
+                (start.y - end.y) * (start.z + end.z),
+                (start.z - end.z) * (start.x + end.x),
+                (start.x - end.x) * (start.y + end.y),
+            );
+    }
+    normal
+}
+
+fn polygon_centroid(points: &[Point3]) -> Point3 {
+    let inverse_count = 1.0 / points.len().max(1) as f64;
+    let sum = points
+        .iter()
+        .fold(Vector3::default(), |sum, point| sum + point.as_vector())
+        * inverse_count;
+    Point3::new(sum.x, sum.y, sum.z)
+}
+
+/// The first pair of positions whose welded keys coincide without being
+/// consecutive, which is where a fragment pinches against itself.
+fn repeated_key_pair(keys: &[VertexKey]) -> Option<(usize, usize)> {
+    let count = keys.len();
+    for first in 0..count {
+        for second in first + 2..count {
+            if keys[first] == keys[second] && !(first == 0 && second == count - 1) {
+                return Some((first, second));
+            }
+        }
+    }
+    None
 }
 
 fn boundary_cycle_span(points: &[Point3]) -> f64 {
@@ -2013,6 +2163,35 @@ fn append_non_planar_boundary_fan(
 type BoundaryRecord = (usize, usize, EdgeKey, Orientation);
 type BoundaryCycle = (Vec<usize>, Vec<BoundaryRecord>);
 
+/// The vertices of a cycle in walking order, one per record, starting at
+/// the vertex the first record shares with the last. `None` when consecutive
+/// records do not share a vertex, which is not a cycle.
+fn cycle_walk(cycle: &[BoundaryRecord]) -> Option<Vec<usize>> {
+    let count = cycle.len();
+    if count < 3 {
+        return None;
+    }
+    let (first_start, first_end, _, _) = cycle[0];
+    let (last_start, last_end, _, _) = cycle[count - 1];
+    let mut current = if first_start == last_start || first_start == last_end {
+        first_start
+    } else {
+        first_end
+    };
+    let mut walk = Vec::with_capacity(count);
+    for (start, end, _, _) in cycle {
+        walk.push(current);
+        current = if current == *start {
+            *end
+        } else if current == *end {
+            *start
+        } else {
+            return None;
+        };
+    }
+    (current == walk[0]).then_some(walk)
+}
+
 fn find_undirected_boundary_cycle(
     boundary: &[BoundaryRecord],
     unused: &BTreeSet<usize>,
@@ -2153,6 +2332,52 @@ fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
         polygon.vertices = conformed;
     }
     polygons
+}
+
+/// The diagonal of the bounding box of every polygon vertex.
+fn polygon_extent(polygons: &[Polygon]) -> f64 {
+    let mut minimum = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut maximum = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for point in polygons.iter().flat_map(|polygon| &polygon.vertices) {
+        minimum = Point3::new(
+            minimum.x.min(point.x),
+            minimum.y.min(point.y),
+            minimum.z.min(point.z),
+        );
+        maximum = Point3::new(
+            maximum.x.max(point.x),
+            maximum.y.max(point.y),
+            maximum.z.max(point.z),
+        );
+    }
+    let extent = minimum.distance(maximum);
+    if extent.is_finite() { extent } else { 0.0 }
+}
+
+/// Replaces every polygon vertex by the canonical spelling of its welded
+/// bucket, so every later stage sees one point per corner. Polygons that
+/// collapse below three distinct vertices are dropped.
+fn weld_polygon_vertices(polygons: Vec<Polygon>, weld: f64) -> Vec<Polygon> {
+    let mut canonical = BTreeMap::<[i64; 3], Point3>::new();
+    let mut welded = Vec::with_capacity(polygons.len());
+    for mut polygon in polygons {
+        for vertex in &mut polygon.vertices {
+            let key = welded_key(|key| canonical.get(key).copied(), *vertex, weld);
+            *vertex = *canonical.entry(key).or_insert(*vertex);
+        }
+        polygon
+            .vertices
+            .dedup_by(|left, right| left.distance(*right) <= weld);
+        while polygon.vertices.len() > 1
+            && polygon.vertices[0].distance(*polygon.vertices.last().unwrap()) <= weld
+        {
+            polygon.vertices.pop();
+        }
+        if polygon.vertices.len() >= 3 {
+            welded.push(polygon);
+        }
+    }
+    welded
 }
 
 /// The bucket a point should weld into, given the buckets already occupied.

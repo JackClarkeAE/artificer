@@ -24,7 +24,7 @@
 use artificer_protocol::{EdgeFinishKind, EntityKind, EntityRef, PrecisionPolicy, SnapshotId};
 
 use crate::analytic_extrusion::Segment;
-use crate::loop_offset::{LoopOffsetError, SpineLoop, mitred_inward_offset};
+use crate::loop_offset::{LoopOffsetError, ReflexPolicy, SpineLoop, mitred_inward_offset};
 use crate::prism_edge_finish::{PrismProfile, extract_prism};
 use crate::topology::{
     Coedge, CoedgeKey, Cone, Curve2, Curve3, Cylinder, Edge, EdgeKey, EntityId, Face, FaceKey,
@@ -42,7 +42,9 @@ pub(crate) enum RimLoopBlendError {
     ReflexCorner,
 }
 
-/// Chamfers the complete outer rim loop of one cap.
+/// Chamfers or fillets one complete rim loop of a cap: the cap's outer
+/// boundary, or the boundary of one hole through it. Every other loop of the
+/// prism passes through untouched.
 pub(crate) fn build_rim_loop_blend(
     snapshot: SnapshotId,
     topology: &Topology,
@@ -60,32 +62,41 @@ pub(crate) fn build_rim_loop_blend(
     }
     let prism =
         extract_prism(topology, precision).map_err(|_| RimLoopBlendError::DomainUnsupported)?;
-    if !prism.holes().is_empty() {
-        return Err(RimLoopBlendError::DomainUnsupported);
-    }
     if !distance.is_finite()
         || distance < precision.min_feature_size
         || distance >= prism.height() - precision.min_feature_size
     {
         return Err(RimLoopBlendError::DistanceInvalid);
     }
-    let top = resolve_complete_cap_loop(topology, &prism, targets, precision)?;
+    let top = resolve_cap_rim(topology, &prism, targets, precision)?;
     // The bottom rim is the top rim of the same prism viewed from the far
     // cap, so mirroring the profile lets one builder serve both.
     let mirrored = (!top).then(|| prism.mirrored());
     let prism = mirrored.as_ref().unwrap_or(&prism);
+    let loops = BlendLoops::locate(topology, prism, targets, precision)?;
 
-    let spine =
-        mitred_inward_offset(prism.outer(), distance, precision).map_err(|error| match error {
+    // A hole loop runs clockwise with the material on its left, exactly as
+    // the outer loop does, so the same inward offset grows a hole into the
+    // material around it. A fillet cannot round a sharp reflex corner; a
+    // chamfer between two straight runs mitres it along one straight line.
+    let reflex = match kind {
+        EdgeFinishKind::Chamfer => ReflexPolicy::MitreLines,
+        EdgeFinishKind::Fillet => ReflexPolicy::Refuse,
+    };
+    let spine = mitred_inward_offset(loops.target, distance, reflex, precision).map_err(
+        |error| match error {
             LoopOffsetError::ReflexSharpCorner => RimLoopBlendError::ReflexCorner,
             LoopOffsetError::RadiusTooLarge | LoopOffsetError::SelfIntersects => {
                 RimLoopBlendError::DistanceInvalid
             }
             LoopOffsetError::Degenerate => RimLoopBlendError::DomainUnsupported,
-        })?;
+        },
+    )?;
     let blended = match kind {
-        EdgeFinishKind::Chamfer => build_chamfered_prism(prism, &spine, distance, precision),
-        EdgeFinishKind::Fillet => build_filleted_prism(prism, &spine, distance, precision),
+        EdgeFinishKind::Chamfer => {
+            build_chamfered_prism(prism, &loops, &spine, distance, precision)
+        }
+        EdgeFinishKind::Fillet => build_filleted_prism(prism, &loops, &spine, distance, precision),
     }?;
     Ok(if top {
         blended
@@ -108,9 +119,101 @@ fn swap_cap_roles(mut topology: Topology) -> Topology {
     topology
 }
 
-/// Confirms the targets are exactly one cap's complete outer rim, and reports
-/// whether that cap is the top one.
-fn resolve_complete_cap_loop(
+/// The loops of one cap as a blend sees them: the loop being finished, and
+/// the loops that pass through untouched.
+struct BlendLoops<'a> {
+    target: &'a [Segment],
+    target_is_outer: bool,
+    /// Every other loop, each flagged when it is the outer boundary.
+    passive: Vec<(&'a [Segment], bool)>,
+}
+
+impl<'a> BlendLoops<'a> {
+    /// Identifies which prism loop the targets are the rim of. The targets
+    /// have already been certified to lie on one rim; the loop is the one
+    /// with the same vertex count, centroid, and spread at that height, which
+    /// separates a hole from an outer boundary concentric with it.
+    fn locate(
+        topology: &Topology,
+        prism: &'a PrismProfile,
+        targets: &[EntityRef],
+        precision: PrecisionPolicy,
+    ) -> Result<Self, RimLoopBlendError> {
+        let frame = prism.frame();
+        let agreement = precision.linear_agreement.max(1.0e-9) * (1.0 + prism.height().abs());
+        let mut endpoints = Vec::with_capacity(targets.len() * 2);
+        for target in targets {
+            let edge = topology
+                .edges
+                .iter()
+                .find(|edge| edge.id.get() == target.entity.0)
+                .ok_or(RimLoopBlendError::TargetInvalid)?;
+            endpoints.extend(edge.value.endpoints().map(|point| point - frame.origin));
+        }
+        let (target_centroid, target_spread) = spread(&endpoints);
+
+        let mut located = None;
+        for (index, candidate) in prism.loops().enumerate() {
+            if candidate.len() != targets.len() {
+                continue;
+            }
+            let corners = candidate
+                .iter()
+                .map(|segment| {
+                    let planar = segment.start();
+                    frame.u * planar.x + frame.v * planar.y + frame.normal * prism.height()
+                })
+                .collect::<Vec<_>>();
+            let (centroid, loop_spread) = spread(&corners);
+            if (centroid - target_centroid).length() <= agreement
+                && (loop_spread - target_spread).abs() <= agreement
+            {
+                if located.is_some() {
+                    return Err(RimLoopBlendError::DomainUnsupported);
+                }
+                located = Some(index);
+            }
+        }
+        let target_index = located.ok_or(RimLoopBlendError::DomainUnsupported)?;
+        let mut target = None;
+        let mut passive = Vec::new();
+        for (index, candidate) in prism.loops().enumerate() {
+            if index == target_index {
+                target = Some(candidate);
+            } else {
+                passive.push((candidate, index == 0));
+            }
+        }
+        Ok(Self {
+            target: target.ok_or(RimLoopBlendError::DomainUnsupported)?,
+            target_is_outer: target_index == 0,
+            passive,
+        })
+    }
+}
+
+/// The centroid of a point set and its root-mean-square distance from it.
+fn spread(points: &[Vector3]) -> (Vector3, f64) {
+    let count = points.len().max(1) as f64;
+    let centroid = points
+        .iter()
+        .fold(Vector3::new(0.0, 0.0, 0.0), |sum, point| sum + *point)
+        / count;
+    let spread = (points
+        .iter()
+        .map(|point| {
+            let offset = *point - centroid;
+            offset.dot(offset)
+        })
+        .sum::<f64>()
+        / count)
+        .sqrt();
+    (centroid, spread)
+}
+
+/// Confirms the targets all lie on one cap rim, and reports whether that cap
+/// is the top one.
+fn resolve_cap_rim(
     topology: &Topology,
     prism: &PrismProfile,
     targets: &[EntityRef],
@@ -138,10 +241,6 @@ fn resolve_complete_cap_loop(
         .iter()
         .any(|height| (height - first).abs() > agreement)
     {
-        return Err(RimLoopBlendError::DomainUnsupported);
-    }
-    // The whole loop must be selected: one rim edge per profile segment.
-    if targets.len() != prism.outer().len() {
         return Err(RimLoopBlendError::DomainUnsupported);
     }
     let top = (first - prism.height()).abs() <= agreement;
@@ -512,17 +611,181 @@ impl Builder<'_> {
     }
 
     fn push_face(&mut self, surface: Surface, outer_loop: LoopKey, role: FaceRole) {
+        self.push_face_with_holes(surface, outer_loop, Vec::new(), role);
+    }
+
+    fn push_face_with_holes(
+        &mut self,
+        surface: Surface,
+        outer_loop: LoopKey,
+        inner_loops: Vec<LoopKey>,
+        role: FaceRole,
+    ) {
         let id = self.allocate();
         self.topology.faces.push(Record {
             id,
             value: Face {
                 surface,
                 outer_loop,
-                inner_loops: Vec::new(),
+                inner_loops,
                 role,
             },
         });
     }
+
+    /// Emits one loop the finish leaves untouched: a full-height wall over
+    /// every segment, and the two cap loops those walls' base and rim edges
+    /// bound, ready to be attached to the caps.
+    fn passive_loop(
+        &mut self,
+        segments: &[Segment],
+        is_outer: bool,
+        height: f64,
+        role_base: u32,
+    ) -> Result<PassiveLoop, RimLoopBlendError> {
+        let count = segments.len();
+        let bands: Vec<SweptBand> = segments
+            .iter()
+            .map(|segment| describe(*segment, *segment))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(RimLoopBlendError::DomainUnsupported)?;
+        let bottom: Vec<VertexKey> = (0..count)
+            .map(|index| {
+                let point = self.world(segments[index].start(), 0.0);
+                self.vertex(point)
+            })
+            .collect();
+        let top: Vec<VertexKey> = (0..count)
+            .map(|index| {
+                let point = self.world(segments[index].start(), height);
+                self.vertex(point)
+            })
+            .collect();
+        let base: Vec<EdgeKey> = (0..count)
+            .map(|index| {
+                let next = (index + 1) % count;
+                self.profile_edge(bands[index], [bottom[index], bottom[next]], 0.0, None)
+            })
+            .collect();
+        let vertical: Vec<EdgeKey> = (0..count)
+            .map(|index| self.line_edge(bottom[index], top[index]))
+            .collect();
+        let rim: Vec<EdgeKey> = (0..count)
+            .map(|index| {
+                let next = (index + 1) % count;
+                self.profile_edge(bands[index], [top[index], top[next]], height, None)
+            })
+            .collect();
+        for index in 0..count {
+            let next = (index + 1) % count;
+            let (low, high) = self.wall_extent(bands[index], segments[index]);
+            let uses = vec![
+                {
+                    let (curve, range) = pcurve(Point2::new(low, 0.0), Point2::new(high, 0.0));
+                    (base[index], Orientation::Forward, curve, range)
+                },
+                {
+                    let (curve, range) = pcurve(Point2::new(high, 0.0), Point2::new(high, height));
+                    (vertical[next], Orientation::Forward, curve, range)
+                },
+                {
+                    let (curve, range) =
+                        pcurve(Point2::new(high, height), Point2::new(low, height));
+                    (rim[index], Orientation::Reverse, curve, range)
+                },
+                {
+                    let (curve, range) = pcurve(Point2::new(low, height), Point2::new(low, 0.0));
+                    (vertical[index], Orientation::Reverse, curve, range)
+                },
+            ];
+            let loop_key = self.push_loop(uses);
+            let surface = self.wall_surface(bands[index], segments[index]);
+            self.push_face(
+                surface,
+                loop_key,
+                FaceRole::ExtrusionSide(
+                    role_base.saturating_add(u32::try_from(index).unwrap_or(u32::MAX)),
+                ),
+            );
+        }
+        let bottom_uses = (0..count)
+            .rev()
+            .map(|index| {
+                let (curve, range) =
+                    self.cap_pcurve(bands[index], segments[index], bands[index].angles(), true);
+                (base[index], Orientation::Reverse, curve, range)
+            })
+            .collect::<Vec<_>>();
+        let bottom_loop = self.push_loop(bottom_uses);
+        let top_uses = (0..count)
+            .map(|index| {
+                let (curve, range) =
+                    self.cap_pcurve(bands[index], segments[index], bands[index].angles(), false);
+                (rim[index], Orientation::Forward, curve, range)
+            })
+            .collect::<Vec<_>>();
+        let top_loop = self.push_loop(top_uses);
+        Ok(PassiveLoop {
+            is_outer,
+            bottom: bottom_loop,
+            top: top_loop,
+        })
+    }
+
+    /// Emits every passive loop, numbering their walls after the target's.
+    fn passive_loops(
+        &mut self,
+        loops: &BlendLoops<'_>,
+        height: f64,
+        first_role: usize,
+    ) -> Result<Vec<PassiveLoop>, RimLoopBlendError> {
+        let mut role_base = first_role;
+        let mut passive = Vec::with_capacity(loops.passive.len());
+        for (segments, is_outer) in &loops.passive {
+            passive.push(self.passive_loop(
+                segments,
+                *is_outer,
+                height,
+                u32::try_from(role_base).unwrap_or(u32::MAX),
+            )?);
+            role_base += segments.len();
+        }
+        Ok(passive)
+    }
+}
+
+/// The cap loops of one loop the finish leaves untouched.
+struct PassiveLoop {
+    is_outer: bool,
+    bottom: LoopKey,
+    top: LoopKey,
+}
+
+/// Assembles one cap's outer loop and holes from the blended target loop and
+/// the passive loops, whichever of them is the outer boundary.
+fn cap_loops(
+    target: LoopKey,
+    target_is_outer: bool,
+    passive: &[PassiveLoop],
+    pick: impl Fn(&PassiveLoop) -> LoopKey,
+) -> Result<(LoopKey, Vec<LoopKey>), RimLoopBlendError> {
+    let mut outer = target_is_outer.then_some(target);
+    let mut inner = if target_is_outer {
+        Vec::new()
+    } else {
+        vec![target]
+    };
+    for loop_ in passive {
+        if loop_.is_outer {
+            if outer.is_some() {
+                return Err(RimLoopBlendError::DomainUnsupported);
+            }
+            outer = Some(pick(loop_));
+        } else {
+            inner.push(pick(loop_));
+        }
+    }
+    Ok((outer.ok_or(RimLoopBlendError::DomainUnsupported)?, inner))
 }
 
 fn pcurve(from: Point2, to: Point2) -> (Curve2, ParameterRange) {
@@ -577,11 +840,12 @@ fn wall_point(band: SweptBand, spine_point: Point2, fillet: f64) -> Point2 {
 /// from the profile radius at the wall top to the spine radius at the cap.
 fn build_chamfered_prism(
     prism: &PrismProfile,
+    loops: &BlendLoops<'_>,
     spine: &SpineLoop,
     distance: f64,
     precision: PrecisionPolicy,
 ) -> Result<Topology, RimLoopBlendError> {
-    let profile = prism.outer();
+    let profile = loops.target;
     let count = profile.len();
     let wall_top = prism.height() - distance;
     let frame = prism.frame();
@@ -669,6 +933,9 @@ fn build_chamfered_prism(
         })
         .collect();
 
+    // Every loop the chamfer leaves alone, walls and cap loops together.
+    let passive = builder.passive_loops(loops, prism.height(), count)?;
+
     // Bottom cap: outward normal opposes the extrusion direction, so its frame
     // is mirrored and the loop runs backwards along the profile.
     let bottom_uses = (0..count)
@@ -680,9 +947,14 @@ fn build_chamfered_prism(
         })
         .collect::<Vec<_>>();
     let bottom_loop = builder.push_loop(bottom_uses);
-    builder.push_face(
+    let (bottom_outer, bottom_holes) =
+        cap_loops(bottom_loop, loops.target_is_outer, &passive, |loop_| {
+            loop_.bottom
+        })?;
+    builder.push_face_with_holes(
         Surface::Plane(Plane::new(frame.origin, frame.v, frame.u)),
-        bottom_loop,
+        bottom_outer,
+        bottom_holes,
         FaceRole::ExtrusionBottom,
     );
 
@@ -840,13 +1112,16 @@ fn build_chamfered_prism(
         })
         .collect::<Vec<_>>();
     let cap_loop = builder.push_loop(cap_uses);
-    builder.push_face(
+    let (cap_outer, cap_holes) =
+        cap_loops(cap_loop, loops.target_is_outer, &passive, |loop_| loop_.top)?;
+    builder.push_face_with_holes(
         Surface::Plane(Plane::new(
             frame.origin + frame.normal * prism.height(),
             frame.u,
             frame.v,
         )),
-        cap_loop,
+        cap_outer,
+        cap_holes,
         FaceRole::ExtrusionTop,
     );
 
@@ -985,11 +1260,12 @@ fn describe(profile: Segment, spine: Segment) -> Option<SweptBand> {
 /// plus a flat ledge at every sharp corner.
 fn build_filleted_prism(
     prism: &PrismProfile,
+    loops: &BlendLoops<'_>,
     spine: &SpineLoop,
     fillet: f64,
     precision: PrecisionPolicy,
 ) -> Result<Topology, RimLoopBlendError> {
-    let profile = prism.outer();
+    let profile = loops.target;
     let count = profile.len();
     let wall_top = prism.height() - fillet;
     let frame = prism.frame();
@@ -1185,6 +1461,9 @@ fn build_filleted_prism(
         })
         .collect();
 
+    // Every loop the fillet leaves alone, walls and cap loops together.
+    let passive = builder.passive_loops(loops, prism.height(), count)?;
+
     // Seam arcs rise from a band tangency point to the pole above its
     // junction. A tangent junction shares one seam between both neighbours.
     let quarter = std::f64::consts::FRAC_PI_2;
@@ -1262,9 +1541,14 @@ fn build_filleted_prism(
         })
         .collect::<Vec<_>>();
     let bottom_loop = builder.push_loop(bottom_uses);
-    builder.push_face(
+    let (bottom_outer, bottom_holes) =
+        cap_loops(bottom_loop, loops.target_is_outer, &passive, |loop_| {
+            loop_.bottom
+        })?;
+    builder.push_face_with_holes(
         Surface::Plane(Plane::new(frame.origin, frame.v, frame.u)),
-        bottom_loop,
+        bottom_outer,
+        bottom_holes,
         FaceRole::ExtrusionBottom,
     );
 
@@ -1444,13 +1728,16 @@ fn build_filleted_prism(
         })
         .collect::<Vec<_>>();
     let cap_loop = builder.push_loop(cap_uses);
-    builder.push_face(
+    let (cap_outer, cap_holes) =
+        cap_loops(cap_loop, loops.target_is_outer, &passive, |loop_| loop_.top)?;
+    builder.push_face_with_holes(
         Surface::Plane(Plane::new(
             frame.origin + frame.normal * prism.height(),
             frame.u,
             frame.v,
         )),
-        cap_loop,
+        cap_outer,
+        cap_holes,
         FaceRole::ExtrusionTop,
     );
 
@@ -1474,46 +1761,57 @@ fn turn_angle(incoming: Point2, outgoing: Point2) -> f64 {
     cross.atan2(dot)
 }
 
-/// The complete outer rim loop of the cap face containing `edge`.
+/// The complete rim loop of the cap face containing `edge`: the cap's outer
+/// boundary, or the boundary of one hole through it.
 ///
 /// Interactive selection expands through this so a rim loop enters an
-/// edge-set finish as one unit; a seed that is not on a cap outer loop falls
-/// back to its analytic carrier group.
+/// edge-set finish as one unit; a seed that is not on a cap loop falls back
+/// to its analytic carrier group.
 pub(crate) fn rim_loop_group(topology: &Topology, edge: EntityRef) -> Option<Vec<EntityRef>> {
     let edge_index = topology
         .edges
         .iter()
         .position(|record| record.id.get() == edge.entity.0)?;
     for face in &topology.faces {
-        if !matches!(
-            face.value.role,
-            FaceRole::ExtrusionTop | FaceRole::ExtrusionBottom
-        ) || face.value.surface.as_plane().is_none()
-        {
+        if !is_cap_role(face.value.role) || face.value.surface.as_plane().is_none() {
             continue;
         }
-        let loop_record = topology.loop_record(face.value.outer_loop)?;
-        let members = loop_record
-            .value
-            .coedges
-            .iter()
-            .filter_map(|coedge_key| topology.coedge(*coedge_key))
-            .map(|coedge| coedge.value.edge)
-            .collect::<Vec<_>>();
-        if members.iter().any(|member| member.0 == edge_index) {
-            return Some(
-                members
-                    .into_iter()
-                    .filter_map(|member| {
-                        topology.edges.get(member.0).map(|record| EntityRef {
-                            snapshot: edge.snapshot,
-                            kind: EntityKind::Edge,
-                            entity: artificer_protocol::EntityId(record.id.get()),
+        for loop_key in face.value.loops() {
+            let loop_record = topology.loop_record(loop_key)?;
+            let members = loop_record
+                .value
+                .coedges
+                .iter()
+                .filter_map(|coedge_key| topology.coedge(*coedge_key))
+                .map(|coedge| coedge.value.edge)
+                .collect::<Vec<_>>();
+            if members.iter().any(|member| member.0 == edge_index) {
+                return Some(
+                    members
+                        .into_iter()
+                        .filter_map(|member| {
+                            topology.edges.get(member.0).map(|record| EntityRef {
+                                snapshot: edge.snapshot,
+                                kind: EntityKind::Edge,
+                                entity: artificer_protocol::EntityId(record.id.get()),
+                            })
                         })
-                    })
-                    .collect(),
-            );
+                        .collect(),
+                );
+            }
         }
     }
     None
+}
+
+/// Whether a face role names a prism cap: an extrusion end, or the `±Z`
+/// face of a primitive cuboid, which is the same prism named by axis.
+const fn is_cap_role(role: FaceRole) -> bool {
+    matches!(
+        role,
+        FaceRole::ExtrusionTop
+            | FaceRole::ExtrusionBottom
+            | FaceRole::PositiveZ
+            | FaceRole::NegativeZ
+    )
 }
