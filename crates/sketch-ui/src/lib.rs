@@ -4594,6 +4594,8 @@ pub enum SnapKind {
     Center(SketchEntityId),
     Midpoint(SketchEntityId),
     Quadrant(SketchEntityId, u8),
+    /// Nearest point along an authored curve's interior.
+    OnCurve(SketchEntityId),
     SupportEndpoint,
     SupportCenter,
     SupportMidpoint,
@@ -4612,6 +4614,7 @@ impl SnapKind {
             Self::Center(_) => "Snap: centre",
             Self::Midpoint(_) => "Snap: midpoint",
             Self::Quadrant(_, _) => "Snap: quadrant",
+            Self::OnCurve(_) => "Snap: on curve",
             Self::SupportEndpoint => "Snap: edge vertex",
             Self::SupportCenter => "Snap: edge centre",
             Self::SupportMidpoint => "Snap: edge midpoint",
@@ -7404,6 +7407,7 @@ impl SketchCanvasState {
                 CoreSnapKey::Quadrant { entity: id, index } => {
                     SnapKind::Quadrant(entity(id), index)
                 }
+                CoreSnapKey::OnCurve { entity: id } => SnapKind::OnCurve(entity(id)),
             };
             return SnapResult {
                 point: SketchPoint::new(candidate.point.u, candidate.point.v),
@@ -11707,7 +11711,7 @@ fn paint_snap_marker(painter: &egui::Painter, rect: Rect, state: &SketchCanvasSt
         SnapKind::Quadrant(_, _) | SnapKind::SupportQuadrant => {
             painter.circle_stroke(position, 4.5, stroke);
         }
-        SnapKind::SupportEdge => {
+        SnapKind::OnCurve(_) | SnapKind::SupportEdge => {
             // The hourglass reads as "somewhere along this edge" rather than
             // naming a distinguished point, matching the usual nearest glyph.
             for [first, second] in [
@@ -13894,6 +13898,42 @@ mod tests {
         );
         assert!(matches!(quadrant.kind, SnapKind::Quadrant(_, 0)));
         assert_point_near(quadrant.point, SketchPoint::new(3.0, -1.0));
+    }
+
+    #[test]
+    fn a_stroke_ending_beside_an_edge_snaps_onto_the_edge_itself() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-2.0, -2.0),
+                SketchPoint::new(2.0, 2.0),
+            ))
+            .expect("rectangle should stage");
+        state.commit_pending().expect("rectangle should commit");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0));
+
+        // A hair inside the top edge, far from every named point: the
+        // pointer lands exactly on the edge so the line forms a T-junction.
+        let near_edge = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(0.3, 1.98)),
+        );
+        assert!(matches!(near_edge.kind, SnapKind::OnCurve(_)));
+        // The pointer round-trips through screen space in single precision,
+        // so only the coordinate the snap decides is exact.
+        assert!((near_edge.point.v - 2.0).abs() <= EPSILON);
+        assert!((near_edge.point.u - 0.3).abs() <= 1.0e-4);
+
+        // Well clear of the edge the grid still wins.
+        let clear = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(0.3, 1.0)),
+        );
+        assert_eq!(clear.kind, SnapKind::Grid);
     }
 
     /// A unit circle's support curve, split into two half turns the way a

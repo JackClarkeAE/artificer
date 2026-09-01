@@ -668,11 +668,7 @@ pub fn build_arrangement_with_pool(
     }
 
     arrangement.half_edges = build_half_edges(&arrangement.fragments);
-    link_half_edges(
-        &mut arrangement.half_edges,
-        &arrangement.junctions,
-        &mut arrangement.diagnostics,
-    );
+    link_half_edges(&mut arrangement.half_edges, &mut arrangement.diagnostics);
     let mut positive_loops = walk_positive_loops(
         &arrangement.half_edges,
         precision,
@@ -1033,7 +1029,6 @@ fn build_half_edges(fragments: &[ArrangementFragment]) -> Vec<ArrangementHalfEdg
 
 fn link_half_edges(
     half_edges: &mut [ArrangementHalfEdge],
-    junctions: &[ArrangementJunction],
     diagnostics: &mut Vec<ArrangementDiagnostic>,
 ) {
     let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1051,17 +1046,14 @@ fn link_half_edges(
                 ambiguous_junctions.insert(*junction);
             }
         }
-        let has_authored_endpoint = junctions[*junction]
-            .key
-            .keys()
-            .iter()
-            .any(|key| matches!(key, JunctionKey::Endpoint(_)));
-        if edges.len() >= 4 && has_authored_endpoint {
-            diagnostics.push(ArrangementDiagnostic::KissingJunction {
-                junction: junctions[*junction].key.clone(),
-            });
-            ambiguous_junctions.insert(*junction);
-        }
+        // A junction with four or more departures is an ordinary vertex of
+        // the rotation system as long as its departures are distinguishable,
+        // which the coincidence check above has just certified. Polygons
+        // inscribed in a circle, spokes meeting at a centre, and a vertex
+        // snapped onto another curve all produce such junctions. Two loops
+        // that merely kiss at a point are still refused, but where it
+        // matters: selecting both cells is a pinched union, which
+        // `compile_selected_profile` rejects with `PinchedBoundary`.
     }
     for edge in half_edges.iter_mut() {
         let twin = edge.twin;
