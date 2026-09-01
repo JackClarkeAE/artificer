@@ -15,6 +15,7 @@ mod command_icons;
 pub mod commands;
 mod development_log;
 pub mod document_replay;
+pub mod documents;
 mod export;
 pub mod feature_editor;
 pub mod library_catalog;
@@ -1805,6 +1806,12 @@ pub struct KernelLabApp {
     document: ModelDocument,
     document_path: PathBuf,
     document_path_text: String,
+    /// The name the document tab and header show: "Document 1" until the
+    /// shell names it otherwise.
+    document_title: String,
+    /// Requests this document makes of the shell that hosts it (a new tab,
+    /// closing its own), drained by the shell every frame.
+    shell_requests: Vec<documents::ShellRequest>,
     document_settings: DocumentSettings,
     construction_planes: Vec<ConstructionPlane>,
     next_construction_plane_id: u64,
@@ -2005,6 +2012,8 @@ impl Default for KernelLabApp {
             document: ModelDocument::default(),
             document_path,
             document_path_text,
+            document_title: "Document 1".to_owned(),
+            shell_requests: Vec::new(),
             document_settings: DocumentSettings::default(),
             construction_planes: Vec::new(),
             next_construction_plane_id: 1,
@@ -2135,21 +2144,7 @@ impl KernelLabApp {
     #[must_use]
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_style(&creation_context.egui_ctx);
-        let mut app = Self {
-            animate_face_camera_transitions: true,
-            feature_preview_scheduler: Some(JobScheduler::new(2)),
-            ..Self::default()
-        };
-        app.reset_to_blank_workspace();
-        app.theme_preferences_path = Some(theme_preferences_path());
-        app.load_theme_preferences(&creation_context.egui_ctx);
-        app.user_preferences_path = Some(user_preferences_path());
-        app.load_user_preferences();
-        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
-            app.document_status = Some(format!(
-                "Local Part Library is using its verified built-in fallback: {error}"
-            ));
-        }
+        let mut app = Self::new_document(&creation_context.egui_ctx);
         match DevelopmentRecorder::start_default() {
             Ok(recorder) => {
                 eprintln!(
@@ -2161,6 +2156,30 @@ impl KernelLabApp {
             Err(error) => {
                 eprintln!("Artificer could not start its local development log: {error}");
             }
+        }
+        app
+    }
+
+    /// A further document for the running application: a blank workspace
+    /// with the user's theme and preferences and its own Part Library
+    /// handle, but no development log of its own and no style installation,
+    /// both of which belong to the process rather than to a document.
+    #[must_use]
+    pub fn new_document(egui_ctx: &egui::Context) -> Self {
+        let mut app = Self {
+            animate_face_camera_transitions: true,
+            feature_preview_scheduler: Some(JobScheduler::new(2)),
+            ..Self::default()
+        };
+        app.reset_to_blank_workspace();
+        app.theme_preferences_path = Some(theme_preferences_path());
+        app.load_theme_preferences(egui_ctx);
+        app.user_preferences_path = Some(user_preferences_path());
+        app.load_user_preferences();
+        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
+            app.document_status = Some(format!(
+                "Local Part Library is using its verified built-in fallback: {error}"
+            ));
         }
         app
     }
@@ -2386,6 +2405,28 @@ impl KernelLabApp {
 
     pub fn native_document_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&self.document).map_err(|error| error.to_string())
+    }
+
+    /// The name shown on this document's tab and in its header.
+    #[must_use]
+    pub fn document_title(&self) -> &str {
+        &self.document_title
+    }
+
+    pub fn set_document_title(&mut self, title: impl Into<String>) {
+        self.document_title = title.into();
+    }
+
+    /// Asks the hosting shell for something a single document cannot do
+    /// for itself. Without a shell the request is simply dropped when
+    /// nobody drains it.
+    pub fn request_from_shell(&mut self, request: documents::ShellRequest) {
+        self.shell_requests.push(request);
+    }
+
+    /// Drains the requests made since the last frame.
+    pub fn take_shell_requests(&mut self) -> Vec<documents::ShellRequest> {
+        std::mem::take(&mut self.shell_requests)
     }
 
     #[must_use]
@@ -10481,6 +10522,19 @@ impl KernelLabApp {
         let response = ui
             .menu_button("File", |ui| {
                 ui.set_min_width(190.0);
+                // A new document opens in its own tab beside this one; the
+                // shell that hosts the tabs answers the request.
+                let new_document = ui
+                    .button("New document")
+                    .on_hover_text("Open a blank document in a new tab");
+                new_document.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New document")
+                });
+                if new_document.clicked() {
+                    self.request_from_shell(documents::ShellRequest::NewDocument);
+                    ui.close();
+                }
+                ui.separator();
                 let path = self.document_path.clone();
                 let save = ui
                     .add_enabled(!operation_pending, egui::Button::new("Save"))
@@ -10581,7 +10635,7 @@ impl KernelLabApp {
             ui.separator();
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Document 1")
+                RichText::new(self.document_title.clone())
                     .font(FontId::proportional(14.0))
                     .color(theme::text())
                     .strong(),
