@@ -1389,6 +1389,25 @@ pub enum KernelCommand {
         #[serde(with = "finite_f64")]
         distance: f64,
     },
+    /// Lofts certified planar regions from the frame plane to a parallel
+    /// section at `distance` whose boundary is each region's mitred offset by
+    /// `offset`: positive grows the section, negative shrinks it, so the
+    /// draft angle is `atan(offset / distance)`.
+    ///
+    /// This is the first rung of the loft ladder — sections that are offsets
+    /// of one another. Straight edges sweep planes and arcs sweep cones, so
+    /// the result stays inside the analytic vocabulary. A sharp corner must
+    /// join two straight edges: an arc meeting its neighbour at a corner would
+    /// sweep a wall bounded by a conic, and is refused by name.
+    LoftPlanarProfileOffset {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+        profile: PlanarProfile2,
+        #[serde(with = "finite_f64")]
+        distance: f64,
+        #[serde(with = "finite_f64")]
+        offset: f64,
+    },
     /// Revolves one certified planar region a full turn about an axis lying in
     /// its own frame.
     ///

@@ -1407,7 +1407,7 @@ fn build_analytic_region(extrusion: &ValidatedAnalyticRegionExtrusion) -> Topolo
     topology
 }
 
-fn push_vertex(topology: &mut Topology, next_id: &mut u64, point: Point3) -> VertexKey {
+pub(crate) fn push_vertex(topology: &mut Topology, next_id: &mut u64, point: Point3) -> VertexKey {
     let key = VertexKey(topology.vertices.len());
     topology.vertices.push(Record {
         id: allocate_id(next_id),
@@ -1416,7 +1416,7 @@ fn push_vertex(topology: &mut Topology, next_id: &mut u64, point: Point3) -> Ver
     key
 }
 
-fn push_edge(topology: &mut Topology, next_id: &mut u64, edge: Edge) -> EdgeKey {
+pub(crate) fn push_edge(topology: &mut Topology, next_id: &mut u64, edge: Edge) -> EdgeKey {
     let key = EdgeKey(topology.edges.len());
     topology.edges.push(Record {
         id: allocate_id(next_id),
@@ -1425,7 +1425,7 @@ fn push_edge(topology: &mut Topology, next_id: &mut u64, edge: Edge) -> EdgeKey 
     key
 }
 
-fn push_boundary_edge(
+pub(crate) fn push_boundary_edge(
     topology: &mut Topology,
     next_id: &mut u64,
     vertices: [VertexKey; 2],
@@ -1459,13 +1459,13 @@ fn push_boundary_edge(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct BoundaryUse {
-    edge: EdgeKey,
-    orientation: Orientation,
-    curve: (Curve2, ParameterRange),
+pub(crate) struct BoundaryUse {
+    pub(crate) edge: EdgeKey,
+    pub(crate) orientation: Orientation,
+    pub(crate) curve: (Curve2, ParameterRange),
 }
 
-fn cap_pcurve(segment: Segment, swap: bool, reverse: bool) -> (Curve2, ParameterRange) {
+pub(crate) fn cap_pcurve(segment: Segment, swap: bool, reverse: bool) -> (Curve2, ParameterRange) {
     let map = |point: Point2| {
         if swap {
             Point2::new(point.y, point.x)
@@ -1513,7 +1513,11 @@ fn cap_pcurve(segment: Segment, swap: bool, reverse: bool) -> (Curve2, Parameter
     }
 }
 
-fn push_loop(topology: &mut Topology, next_id: &mut u64, uses: Vec<BoundaryUse>) -> LoopKey {
+pub(crate) fn push_loop(
+    topology: &mut Topology,
+    next_id: &mut u64,
+    uses: Vec<BoundaryUse>,
+) -> LoopKey {
     let mut coedge_keys = Vec::with_capacity(uses.len());
     for boundary_use in uses {
         let key = CoedgeKey(topology.coedges.len());
@@ -1538,7 +1542,7 @@ fn push_loop(topology: &mut Topology, next_id: &mut u64, uses: Vec<BoundaryUse>)
     key
 }
 
-fn push_cap_face(
+pub(crate) fn push_cap_face(
     topology: &mut Topology,
     next_id: &mut u64,
     surface: Surface,
@@ -1648,13 +1652,13 @@ fn push_side_face(
     });
 }
 
-fn allocate_id(next_id: &mut u64) -> EntityId {
+pub(crate) fn allocate_id(next_id: &mut u64) -> EntityId {
     let id = EntityId::from_raw(*next_id);
     *next_id += 1;
     id
 }
 
-fn merge_topologies(topologies: Vec<Topology>) -> Topology {
+pub(crate) fn merge_topologies(topologies: Vec<Topology>) -> Topology {
     let mut merged = Topology::default();
     let mut next_id = 1_u64;
     for mut topology in topologies {

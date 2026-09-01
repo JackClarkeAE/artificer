@@ -476,6 +476,7 @@ enum PendingOperation {
         cancel_mode: WorkbenchMode,
         finish_sketch_on_commit: bool,
         distance: f64,
+        draft_degrees: f64,
         frame: PlanarFrame3,
         target_face: Option<EntityRef>,
         support_digest: Option<SemanticDigest>,
@@ -496,6 +497,7 @@ struct AsyncFeaturePreviewIntent {
     profile: PlanarProfile2,
     target_face: Option<EntityRef>,
     distance: f64,
+    draft_degrees: f64,
     mode: ExtrusionMode,
 }
 
@@ -1928,6 +1930,60 @@ mod face_sketch_context_layers {
     }
 }
 
+#[cfg(test)]
+mod drafted_extrusion_command {
+    use super::*;
+
+    fn square_profile() -> (PlanarFrame3, PlanarProfile2) {
+        (
+            PlanarFrame3::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+            PlanarProfile2::from_polygon(&[
+                ProtocolPoint2::new(0.0, 0.0),
+                ProtocolPoint2::new(10.0, 0.0),
+                ProtocolPoint2::new(10.0, 10.0),
+                ProtocolPoint2::new(0.0, 10.0),
+            ]),
+        )
+    }
+
+    #[test]
+    fn a_draft_angle_turns_a_new_body_extrusion_into_an_offset_loft() {
+        let (frame, profile) = square_profile();
+        let straight = build_planar_profile_extrusion_command(
+            frame,
+            profile.clone(),
+            None,
+            8.0,
+            0.0,
+            ExtrusionMode::NewBody,
+        );
+        assert!(matches!(
+            straight,
+            Some(KernelCommand::ExtrudePlanarProfile { distance, .. }) if distance == 8.0
+        ));
+        let drafted = build_planar_profile_extrusion_command(
+            frame,
+            profile,
+            None,
+            -8.0,
+            5.0,
+            ExtrusionMode::NewBody,
+        );
+        let Some(KernelCommand::LoftPlanarProfileOffset {
+            distance, offset, ..
+        }) = drafted
+        else {
+            panic!("a drafted new body lofts")
+        };
+        assert_eq!(distance, 8.0, "the sign moves into the frame");
+        assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
+    }
+}
+
 /// The selected-feature parameter field the user is typing in, with the
 /// rectangle it occupied last frame. A press outside that rectangle is an
 /// acceptance, and it has to be seen before any panel this frame reads
@@ -2054,6 +2110,8 @@ pub struct KernelLabApp {
     sketch_last_error: Option<SketchEditError>,
     sketch_finish_issue: Option<CertifiedProfileStatus>,
     extrusion_distance: f64,
+    /// Draft angle for a new-body extrusion, in degrees; zero is straight.
+    extrusion_draft_degrees: f64,
     extrusion_mode: ExtrusionMode,
     /// When false, signed face distance retains the convenient Add/Cut
     /// inference. Clicking an operation in Properties turns this on so the
@@ -2228,6 +2286,7 @@ impl Default for KernelLabApp {
             sketch_last_error: None,
             sketch_finish_issue: None,
             extrusion_distance: 4.0,
+            extrusion_draft_degrees: 0.0,
             extrusion_mode: ExtrusionMode::NewBody,
             extrusion_mode_explicit: false,
             extruded_sketch_revision: None,
@@ -6051,6 +6110,27 @@ impl KernelLabApp {
                         .map_err(|error| format!("invalid sketch-region extrusion: {error}"))?,
                 )
             }
+            KernelCommand::LoftPlanarProfileOffset {
+                profile,
+                distance,
+                offset,
+                ..
+            } => {
+                let profile = as_drawn(profile, None);
+                let selected_regions = authoring_region_signatures_for_profile(authoring, &profile)
+                    .ok_or_else(|| {
+                        "the drafted extrusion profile has no stable sketch-region selection"
+                            .to_owned()
+                    })?;
+                let draft_degrees = (offset / distance).atan().to_degrees();
+                ReplayAction::SketchRegionExtrusion(
+                    SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
+                        .and_then(|recipe| recipe.with_draft(draft_degrees))
+                        .map_err(|error| {
+                            format!("invalid drafted sketch-region extrusion: {error}")
+                        })?,
+                )
+            }
             KernelCommand::ExtrudeFaceProfile {
                 target_face,
                 vertices,
@@ -7662,6 +7742,11 @@ impl KernelLabApp {
             cancel_mode,
             finish_sketch_on_commit,
             distance: self.extrusion_distance,
+            draft_degrees: if target_face.is_none() {
+                self.extrusion_draft_degrees
+            } else {
+                0.0
+            },
             frame: self.sketch_support.frame(),
             target_face,
             support_digest: self.sketch_support.support_digest(),
@@ -7715,11 +7800,17 @@ impl KernelLabApp {
         match self.pending_operation.as_mut() {
             Some(PendingOperation::ExtrudeSketch {
                 distance,
+                draft_degrees,
                 mode,
                 target_face,
                 ..
             }) => {
                 *distance = self.extrusion_distance;
+                *draft_degrees = if target_face.is_none() {
+                    self.extrusion_draft_degrees
+                } else {
+                    0.0
+                };
                 *mode = if target_face.is_some() {
                     self.extrusion_mode
                 } else {
@@ -7772,6 +7863,7 @@ impl KernelLabApp {
             frame,
             target_face,
             distance,
+            draft_degrees,
             mode,
             ..
         } = self.pending_operation?
@@ -7783,6 +7875,7 @@ impl KernelLabApp {
             self.sketch_planar_profile_payload()?,
             target_face,
             distance,
+            draft_degrees,
             mode,
         )
     }
@@ -7851,6 +7944,7 @@ impl KernelLabApp {
             frame,
             target_face,
             distance,
+            draft_degrees,
             mode,
             ..
         }) = self.pending_operation
@@ -7873,6 +7967,7 @@ impl KernelLabApp {
             profile,
             target_face,
             distance,
+            draft_degrees,
             mode,
         };
 
@@ -8580,6 +8675,7 @@ impl KernelLabApp {
             cancel_mode: _,
             finish_sketch_on_commit,
             distance,
+            draft_degrees,
             frame,
             target_face,
             support_digest,
@@ -8717,9 +8813,14 @@ impl KernelLabApp {
                 .expect("a face-supported extrusion has a displayed body"),
             None => &empty_input,
         };
-        let Some(command) =
-            build_planar_profile_extrusion_command(frame, profile, target_face, distance, mode)
-        else {
+        let Some(command) = build_planar_profile_extrusion_command(
+            frame,
+            profile,
+            target_face,
+            distance,
+            draft_degrees,
+            mode,
+        ) else {
             self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                 KernelErrorCode::InvalidInput,
                 base_snapshot,
@@ -14015,6 +14116,23 @@ impl KernelLabApp {
                         .suffix(" mm"),
                 )
                 .changed();
+            if !face_supported {
+                // Draft is a new-body option: the walls lean by this angle,
+                // built as an exact loft to the profile's offset section.
+                intent_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.extrusion_draft_degrees)
+                            .speed(0.25)
+                            .range(-60.0..=60.0)
+                            .max_decimals(2)
+                            .prefix("Draft ")
+                            .suffix("°"),
+                    )
+                    .on_hover_text(
+                        "Draft angle. Positive leans the walls outward, negative inward. Straight edges become planes and tangent arcs become cones; an arc meeting a corner cannot draft.",
+                    )
+                    .changed();
+            }
             // The same field, written as arithmetic over document variables:
             // `depth`, `plate_width / 2`. Evaluated on Enter into the drag
             // value above, so what commits is always a plain number.
@@ -17444,6 +17562,7 @@ fn build_async_feature_preview(
         intent.profile.clone(),
         intent.target_face,
         intent.distance,
+        intent.draft_degrees,
         intent.mode,
     )?;
     let precision = input.precision_policy().unwrap_or_default();
@@ -18235,6 +18354,7 @@ fn build_planar_profile_extrusion_command(
     profile: PlanarProfile2,
     target_face: Option<EntityRef>,
     distance: f64,
+    draft_degrees: f64,
     mode: ExtrusionMode,
 ) -> Option<KernelCommand> {
     let operation = mode.feature_operation();
@@ -18257,6 +18377,16 @@ fn build_planar_profile_extrusion_command(
             distance,
             operation,
         }),
+        // A drafted new body is a loft to the profile's offset section: the
+        // same command replay issues from the sketch-region recipe.
+        (None, None) if draft_degrees != 0.0 && draft_degrees.is_finite() => {
+            Some(KernelCommand::LoftPlanarProfileOffset {
+                frame,
+                profile,
+                distance,
+                offset: distance * draft_degrees.to_radians().tan(),
+            })
+        }
         (None, None) => Some(KernelCommand::ExtrudePlanarProfile {
             frame,
             profile,
@@ -21312,6 +21442,7 @@ mod extrusion_workbench_tests {
             cancel_mode,
             finish_sketch_on_commit,
             distance: 0.0,
+            draft_degrees: 0.0,
             frame,
             target_face,
             support_digest,

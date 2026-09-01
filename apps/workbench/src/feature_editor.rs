@@ -97,6 +97,12 @@ pub fn editable_scalars(command: &KernelCommand) -> Vec<EditableScalar> {
         | KernelCommand::ExtrudePolygon { distance, .. } => {
             vec![EditableScalar::length("Distance", *distance)]
         }
+        // A loft's offset is signed and may be anything but zero-collapsing,
+        // so only the distance is offered as a plain length here; the draft
+        // itself is edited through the sketch-region recipe.
+        KernelCommand::LoftPlanarProfileOffset { distance, .. } => {
+            vec![EditableScalar::length("Distance", *distance)]
+        }
         _ => Vec::new(),
     }
 }
@@ -147,6 +153,16 @@ pub fn with_scalar(command: &KernelCommand, index: usize, value: f64) -> Option<
         | (KernelCommand::ExtrudeFaceProfile { distance, .. }, 0)
         | (KernelCommand::ExtrudeFacePlanarProfile { distance, .. }, 0)
         | (KernelCommand::ExtrudePolygon { distance, .. }, 0) => *distance = value,
+        (
+            KernelCommand::LoftPlanarProfileOffset {
+                distance, offset, ..
+            },
+            0,
+        ) => {
+            // Keep the draft angle: the offset scales with the height.
+            *offset *= value / *distance;
+            *distance = value;
+        }
         _ => return None,
     }
     Some(edited)

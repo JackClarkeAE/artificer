@@ -18,6 +18,7 @@ mod faceted_boolean;
 // sphere-corner, and ledge assembly that consumes it is still to come.
 mod analytic_boolean;
 #[allow(dead_code)]
+mod loft;
 mod loop_offset;
 mod planar_profile;
 mod prism_boolean;
@@ -682,6 +683,40 @@ impl NativeKernel {
                     )
                     .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                     (extrusion.topology, HistoryMode::Generated)
+                }
+            }
+            KernelCommand::LoftPlanarProfileOffset {
+                frame,
+                profile,
+                distance,
+                offset,
+            } => {
+                validate_extrusion_source(input)?;
+                let minimum = request
+                    .precision
+                    .modeling_resolution
+                    .max(request.precision.min_feature_size);
+                if offset.abs() <= minimum {
+                    // No draft is a straight extrusion; build it as one so the
+                    // walls are the cylinders and planes an extrusion makes.
+                    let extrusion = validate_analytic_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                    (build_analytic_extrusion(&extrusion), HistoryMode::Generated)
+                } else {
+                    let loft = loft::validate_offset_loft(
+                        *frame,
+                        profile,
+                        *distance,
+                        *offset,
+                        request.precision,
+                    )
+                    .map_err(|reason| loft_input_error(input.id, reason))?;
+                    (loft::build_offset_loft(&loft), HistoryMode::Generated)
                 }
             }
             KernelCommand::ExtrudeFaceProfile {
@@ -4505,6 +4540,55 @@ fn face_feature_input_error(snapshot: SnapshotId, reason: FaceFeatureInputError)
             message,
         )],
     )
+}
+
+fn loft_input_error(snapshot: SnapshotId, reason: loft::LoftInputError) -> KernelError {
+    use loft::LoftInputError;
+    match reason {
+        LoftInputError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        LoftInputError::OffsetNonFinite => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_OFFSET_NON_FINITE",
+            "the loft section offset must be a finite length",
+        ),
+        LoftInputError::OffsetInfeasible(loop_offset::LoopOffsetError::RadiusTooLarge) => {
+            planar_profile_error(
+                snapshot,
+                KernelErrorCode::InvalidInput,
+                "LOFT_SECTION_COLLAPSES",
+                "the offset section collapses: an edge or an arc vanishes before the section is reached",
+            )
+        }
+        LoftInputError::OffsetInfeasible(loop_offset::LoopOffsetError::SelfIntersects) => {
+            planar_profile_error(
+                snapshot,
+                KernelErrorCode::InvalidInput,
+                "LOFT_SECTION_SELF_INTERSECTS",
+                "the offset section crosses itself: a neck of the profile closes up",
+            )
+        }
+        LoftInputError::OffsetInfeasible(_) => planar_profile_error(
+            snapshot,
+            KernelErrorCode::NumericallyIndeterminate,
+            "LOFT_SECTION_DEGENERATE",
+            "the offset section could not be formed from this profile",
+        ),
+        LoftInputError::CornerNotTangent => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "LOFT_CORNER_NOT_TANGENT",
+            "a sharp corner of the profile involves an arc; its drafted walls would meet in a \
+             conic, which is outside the line-and-circle vocabulary. Make the arc tangent to \
+             its neighbours or replace it with straight edges.",
+        ),
+        LoftInputError::CoordinateLimit => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTION_COORDINATE_LIMIT",
+            "the offset section leaves the certified coordinate range",
+        ),
+    }
 }
 
 fn planar_profile_input_error(

@@ -405,11 +405,32 @@ impl Session {
                 regions,
                 distance,
                 operation,
+                draft_degrees,
                 ..
             } => {
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 let profile = select_regions(profile, regions)?;
+                if !draft_degrees.is_finite() || draft_degrees.abs() >= 90.0 {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "A draft angle must be finite and less than 90 degrees",
+                    ));
+                }
+                if *draft_degrees != 0.0 && *operation != ExtrudeOp::New {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "Only a new-body extrusion can draft; add and cut extrusions build straight walls",
+                    ));
+                }
                 match operation {
+                    ExtrudeOp::New if *draft_degrees != 0.0 => {
+                        Ok(KernelCommand::LoftPlanarProfileOffset {
+                            frame,
+                            profile,
+                            distance: *distance,
+                            offset: *distance * draft_degrees.to_radians().tan(),
+                        })
+                    }
                     ExtrudeOp::New => Ok(KernelCommand::ExtrudePlanarProfile {
                         frame,
                         profile,

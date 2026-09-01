@@ -280,6 +280,7 @@ fn test_sketch_and_extrude() {
                 regions: Vec::new(),
                 distance: 15.0,
                 operation: artificer_api::commands::ExtrudeOp::New,
+                draft_degrees: 0.0,
             },
             &token,
         )
@@ -584,6 +585,7 @@ fn a_sketch_with_a_hole_extrudes_into_a_holed_block() {
                 regions: Vec::new(),
                 distance: 10.0,
                 operation: artificer_api::commands::ExtrudeOp::New,
+                draft_degrees: 0.0,
             },
             &token,
         )
@@ -630,6 +632,7 @@ fn an_open_sketch_chain_is_refused_with_its_loose_end_named() {
                 regions: Vec::new(),
                 distance: 5.0,
                 operation: artificer_api::commands::ExtrudeOp::New,
+                draft_degrees: 0.0,
             },
             &token,
         )
@@ -752,4 +755,83 @@ fn the_shipped_examples_compile_and_run() {
         }
         assert!(session.snapshot.counts().solids >= 1, "{example}");
     }
+}
+
+#[test]
+fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
+    let mut session = Session::new();
+    let token = CancellationToken::default();
+    session
+        .execute(
+            ApiCommand::Sketch {
+                label: "sk".to_owned(),
+                on: artificer_api::commands::SketchPlane::XY,
+                entities: vec![artificer_api::commands::SketchEntity::Rectangle {
+                    origin: Point2::new(0.0, 0.0),
+                    width: 20.0,
+                    height: 20.0,
+                }],
+                constraints: Vec::new(),
+            },
+            &token,
+        )
+        .expect("sketch");
+    let drafted = session
+        .execute(
+            ApiCommand::Extrude {
+                label: "draft".to_owned(),
+                sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+                regions: Vec::new(),
+                distance: 10.0,
+                operation: artificer_api::commands::ExtrudeOp::New,
+                draft_degrees: -10.0,
+            },
+            &token,
+        )
+        .expect("a drafted new body");
+    assert_eq!(drafted.topology.faces, 6);
+    // A 10 degree inward draft over 10 mm pulls each wall in by 10·tan(10°).
+    let inset = 10.0 * 10.0_f64.to_radians().tan();
+    let top = 20.0 - 2.0 * inset;
+    let expected = 10.0 / 3.0 * (400.0 + top * top + (400.0 * top * top).sqrt());
+    let volume = session.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "{volume} vs {expected}"
+    );
+    assert!(matches!(
+        session.journal.entries.last().map(|entry| &entry.command),
+        Some(ApiCommand::Extrude { draft_degrees, .. }) if *draft_degrees == -10.0
+    ));
+    let added = session
+        .execute(
+            ApiCommand::Extrude {
+                label: "draft_add".to_owned(),
+                sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+                regions: Vec::new(),
+                distance: 5.0,
+                operation: artificer_api::commands::ExtrudeOp::Add,
+                draft_degrees: 5.0,
+            },
+            &token,
+        )
+        .expect_err("add and cut extrusions build straight walls");
+    assert!(added.message.contains("new-body"), "{}", added.message);
+
+    // JSON keeps the draft, and omits it when it is zero.
+    let json = serde_json::to_string(&ApiCommand::Extrude {
+        label: "draft".to_owned(),
+        sketch: artificer_api::commands::StepLabel("sk".to_owned()),
+        regions: Vec::new(),
+        distance: 10.0,
+        operation: artificer_api::commands::ExtrudeOp::New,
+        draft_degrees: 0.0,
+    })
+    .unwrap();
+    assert!(!json.contains("draft_degrees"));
+    let parsed: ApiCommand = serde_json::from_str(
+        r#"{"type":"extrude","label":"d","sketch":"sk","distance":10.0,"operation":"new","draft_degrees":5.0}"#,
+    )
+    .unwrap();
+    assert!(matches!(parsed, ApiCommand::Extrude { draft_degrees, .. } if draft_degrees == 5.0));
 }

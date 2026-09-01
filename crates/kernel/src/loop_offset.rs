@@ -32,6 +32,10 @@ pub(crate) enum LoopOffsetError {
 }
 
 /// How the spine treats one source vertex.
+///
+/// The corner measurements are recorded for the blend builders that will
+/// set back a corner patch; today's consumers decide by kind alone.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SpineVertexKind {
     /// The neighbours were tangent-continuous, so their offsets already meet.
@@ -77,9 +81,30 @@ pub(crate) fn mitred_inward_offset(
     reflex: ReflexPolicy,
     precision: PrecisionPolicy,
 ) -> Result<SpineLoop, LoopOffsetError> {
-    if source.len() < 2 || !distance.is_finite() || distance <= 0.0 {
+    if !distance.is_finite() || distance <= 0.0 {
         return Err(LoopOffsetError::Degenerate);
     }
+    mitred_offset(source, distance, reflex, precision)
+}
+
+/// Offsets a counter-clockwise loop by a signed `distance`: inward when
+/// positive, outward when negative.
+///
+/// Outward offsetting mirrors the corner cases. A convex corner's outward
+/// offsets diverge and are extended until they meet, exactly as a reflex
+/// corner's inward offsets are; a reflex corner's outward offsets overlap and
+/// are trimmed at their crossing, as a convex corner's inward offsets are.
+/// `reflex` governs whichever corners need extending.
+pub(crate) fn mitred_offset(
+    source: &[Segment],
+    distance: f64,
+    reflex: ReflexPolicy,
+    precision: PrecisionPolicy,
+) -> Result<SpineLoop, LoopOffsetError> {
+    if source.len() < 2 || !distance.is_finite() || distance == 0.0 {
+        return Err(LoopOffsetError::Degenerate);
+    }
+    let outward = distance < 0.0;
     let count = source.len();
 
     // Offset each carrier independently first; corners reconcile afterwards.
@@ -104,8 +129,11 @@ pub(crate) fn mitred_inward_offset(
             vertices.push(SpineVertexKind::Tangent);
             continue;
         }
-        if turn < 0.0 {
-            // A right turn on a counter-clockwise loop is a reflex corner.
+        // A right turn on a counter-clockwise loop is a reflex corner, whose
+        // inward offsets diverge; offsetting outward, it is the convex
+        // corners whose offsets diverge instead.
+        let diverging = if outward { turn > 0.0 } else { turn < 0.0 };
+        if diverging {
             let both_straight = matches!(
                 (offsets[previous].kind, offsets[index].kind),
                 (CarrierKind::Line { .. }, CarrierKind::Line { .. })
@@ -144,13 +172,42 @@ pub(crate) fn mitred_inward_offset(
     let mut segments = Vec::with_capacity(count);
     for index in 0..count {
         let trimmed = retarget(&offsets[index], starts[index], ends[index])?;
-        if segment_length(trimmed) < precision.min_feature_size {
+        if segment_length(trimmed) < precision.min_feature_size
+            || consumed(&offsets[index], trimmed, source[index], precision)
+        {
             return Err(LoopOffsetError::RadiusTooLarge);
         }
         segments.push(trimmed);
     }
     certify(&segments, signed_area(source).signum(), precision)?;
     Ok(SpineLoop { segments, vertices })
+}
+
+/// Whether trimming consumed the whole carrier: the two mitres crossed, so
+/// the piece left between them runs against its source. That is a collapsed
+/// section even when the loop as a whole still winds the right way — a
+/// square offset past its centre comes back as a smaller square with every
+/// side reversed, and the winding test alone would pass it.
+fn consumed(
+    carrier: &OffsetCarrier,
+    trimmed: Segment,
+    source: Segment,
+    precision: PrecisionPolicy,
+) -> bool {
+    match (carrier.kind, trimmed, source) {
+        (CarrierKind::Line { direction }, Segment::Line { start, end }, _) => {
+            between(start, end).dot(direction) <= 0.0
+        }
+        (
+            CarrierKind::Arc { .. },
+            Segment::Arc { sweep, .. },
+            Segment::Arc {
+                sweep: source_sweep,
+                ..
+            },
+        ) => sweep.abs() > source_sweep.abs() + precision.angular_agreement_radians,
+        _ => false,
+    }
 }
 
 /// One offset carrier, still untrimmed.
