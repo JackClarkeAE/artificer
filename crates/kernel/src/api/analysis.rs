@@ -26,7 +26,150 @@ use crate::{CancellationToken, NativeKernel, Snapshot};
 
 /// The shape of the document this module publishes. A reader that
 /// understands version `n` can refuse anything else outright.
-pub const ANALYSIS_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added the clearance profile a study was judged against and
+/// the per-pair verdict that follows from it.
+pub const ANALYSIS_SCHEMA_VERSION: u32 = 2;
+
+/// A fit the assembly is being checked against: how small a gap is too
+/// small, and how large a gap is larger than the fit needed.
+///
+/// The window is what turns a measurement into an answer. "0.42 mm" says
+/// nothing on its own; "0.42 mm, and this press fit wants 0.10 to 0.20"
+/// says the part is loose, and "0.02 mm" against the same window says it
+/// will not go together.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClearanceProfile {
+    /// A stable key, so a document can store a choice and a report can
+    /// name it without depending on the display name.
+    pub key: String,
+    pub name: String,
+    /// The smallest gap that passes, in millimetres.
+    pub minimum: f64,
+    /// The largest gap the fit needs, in millimetres. Absent where the fit
+    /// has no upper complaint, which is what a plain "do these parts
+    /// clash" check is. An absent bound rather than an infinite one
+    /// because infinity is not a JSON number and this document is
+    /// published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<f64>,
+    /// What the profile is for, in one line.
+    pub note: String,
+}
+
+/// A profile the kernel ships, as a table entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuiltInProfile {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub minimum: f64,
+    pub maximum: Option<f64>,
+    pub note: &'static str,
+}
+
+impl BuiltInProfile {
+    #[must_use]
+    pub fn profile(self) -> ClearanceProfile {
+        ClearanceProfile {
+            key: self.key.to_owned(),
+            name: self.name.to_owned(),
+            minimum: self.minimum,
+            maximum: self.maximum,
+            note: self.note.to_owned(),
+        }
+    }
+}
+
+/// The profiles the kernel ships, loosest tolerance last.
+///
+/// These are process figures, not opinions about a design: the printed
+/// ones are the gaps those processes need before two parts that were
+/// modelled to touch will actually go together, and the machined one is
+/// an ordinary running fit. A design with its own numbers builds its own
+/// [`ClearanceProfile`]; nothing here is privileged.
+pub const BUILT_IN_PROFILES: [BuiltInProfile; 5] = [
+    BuiltInProfile {
+        key: "machined-running",
+        name: "Machined running fit",
+        minimum: 0.02,
+        maximum: Some(0.08),
+        note: "A milled or turned part that has to turn or slide in service.",
+    },
+    BuiltInProfile {
+        key: "resin-fine",
+        name: "Resin fine fit",
+        minimum: 0.05,
+        maximum: Some(0.15),
+        note: "Masked stereolithography, where the layer is thin and the part is stiff.",
+    },
+    BuiltInProfile {
+        key: "fdm-press",
+        name: "FDM press fit",
+        minimum: 0.10,
+        maximum: Some(0.20),
+        note: "A fused-filament part meant to be pushed together and stay together.",
+    },
+    BuiltInProfile {
+        key: "fdm-sliding",
+        name: "FDM sliding fit",
+        minimum: 0.30,
+        maximum: Some(0.50),
+        note: "A fused-filament part that has to move after it is assembled.",
+    },
+    BuiltInProfile {
+        key: "assembly",
+        name: "Assembly check",
+        minimum: 0.0,
+        maximum: None,
+        note: "No fit at all: parts must simply not occupy the same space.",
+    },
+];
+
+/// Looks a shipped profile up by its key.
+#[must_use]
+pub fn built_in_profile(key: &str) -> Option<ClearanceProfile> {
+    BUILT_IN_PROFILES
+        .iter()
+        .find(|profile| profile.key == key)
+        .map(|profile| profile.profile())
+}
+
+/// What one pair's closest approach means under a profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitVerdict {
+    /// The gap sits inside the window: the fit is the one that was asked
+    /// for.
+    Pass,
+    /// Closer than the profile allows, or the bodies overlap outright.
+    /// This is the only verdict that fails a study.
+    TooClose,
+    /// Clear by more than the fit needed. Not a failure — a part that was
+    /// meant to be held and is not.
+    Loose,
+}
+
+impl FitVerdict {
+    /// The verdict a measured pair earns under a profile.
+    ///
+    /// Contact is judged on the measurement, not on the state: two bodies
+    /// that touch have a gap of zero, and zero is below every window whose
+    /// minimum is positive. A profile that asks for no gap at all passes
+    /// them, which is what an assembly check means.
+    #[must_use]
+    pub fn of(state: ClearanceState, distance: f64, profile: &ClearanceProfile) -> Self {
+        if state == ClearanceState::Interfering {
+            return Self::TooClose;
+        }
+        if distance < profile.minimum {
+            Self::TooClose
+        } else if profile.maximum.is_none_or(|maximum| distance <= maximum) {
+            Self::Pass
+        } else {
+            Self::Loose
+        }
+    }
+}
 
 /// One body taking part in a study, at the placement it occupies.
 #[derive(Clone, Debug)]
@@ -76,6 +219,11 @@ pub struct PairReport {
     /// interferes: the Boolean engine's own refusal code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlap_unavailable: Option<String>,
+    /// What this pair's closest approach means under the study's profile.
+    /// Absent when the study was run without one, because a measurement
+    /// with nothing to be measured against is not a pass or a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<FitVerdict>,
 }
 
 fn is_zero(value: &f64) -> bool {
@@ -99,10 +247,63 @@ pub struct InterferenceReport {
     /// it belongs to. Absent when no pair is clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tightest: Option<Tightest>,
+    /// The fit this study was judged against, when it was judged at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ClearanceProfile>,
+    /// How many pairs the profile calls too close. Zero is the study
+    /// passing; anything else is the count of the fits that do not work.
+    /// Zero also when there is no profile, which is why `profile` is what
+    /// a reader checks before believing it.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub failing: usize,
+    /// How many pairs are clear by more than the fit needed.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pub loose: usize,
     /// `approximate` when any pair's measurement was, so a reader can tell
     /// at a glance whether the study rests on chords anywhere.
     pub tier: Tier,
     pub elapsed_ms: u64,
+}
+
+fn is_zero_count(value: &usize) -> bool {
+    *value == 0
+}
+
+impl InterferenceReport {
+    /// Judges every pair against a profile, in place.
+    ///
+    /// Nothing is measured again: the closest approach of each pair is
+    /// already the number a fit is decided on, so changing the fit changes
+    /// the verdicts and nothing else. Passing `None` withdraws the
+    /// judgement and leaves the measurements standing.
+    pub fn judge(&mut self, profile: Option<ClearanceProfile>) {
+        for pair in &mut self.pairs {
+            pair.verdict = profile
+                .as_ref()
+                .map(|profile| FitVerdict::of(pair.state, pair.distance, profile));
+        }
+        self.failing = self.verdicts(FitVerdict::TooClose);
+        self.loose = self.verdicts(FitVerdict::Loose);
+        self.profile = profile;
+    }
+
+    fn verdicts(&self, verdict: FitVerdict) -> usize {
+        self.pairs
+            .iter()
+            .filter(|pair| pair.verdict == Some(verdict))
+            .count()
+    }
+
+    /// The pair a profile fails on hardest: the tightest of the pairs it
+    /// calls too close. Its witness points are where on the two bodies
+    /// that worst reading was taken.
+    #[must_use]
+    pub fn worst_fit(&self) -> Option<&PairReport> {
+        self.pairs
+            .iter()
+            .filter(|pair| pair.verdict == Some(FitVerdict::TooClose))
+            .min_by(|left, right| left.distance.total_cmp(&right.distance))
+    }
 }
 
 /// The closest that any pair which is not in contact comes.
@@ -156,6 +357,7 @@ pub fn interference_study(
                 bound: report.bound,
                 overlap_volume,
                 overlap_unavailable,
+                verdict: None,
             });
         }
     }
@@ -185,6 +387,9 @@ pub fn interference_study(
         touching,
         clear,
         tightest,
+        profile: None,
+        failing: 0,
+        loose: 0,
         tier,
         elapsed_ms: started.elapsed().as_millis() as u64,
     }

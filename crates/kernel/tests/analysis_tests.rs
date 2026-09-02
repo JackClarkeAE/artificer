@@ -5,7 +5,8 @@ use std::f64::consts::PI;
 
 use artificer_kernel::CancellationToken;
 use artificer_kernel::api::analysis::{
-    ANALYSIS_SCHEMA_VERSION, Subject, clearance_fields, interference_study, study_session_steps,
+    ANALYSIS_SCHEMA_VERSION, FitVerdict, Subject, built_in_profile, clearance_fields,
+    interference_study, study_session_steps,
 };
 use artificer_kernel::api::interference::{ClearanceState, Placement};
 use artificer_kernel::api::session::Session;
@@ -233,5 +234,148 @@ fn a_study_paints_each_subject_by_its_clearance_to_the_others() {
         clearance_fields(&subjects, &cancelled)
             .iter()
             .all(Vec::is_empty)
+    );
+}
+
+#[test]
+fn a_profile_turns_a_measurement_into_a_pass_or_a_failure() {
+    // Three plates in a row, 0.15 mm and then 0.40 mm apart. An FDM press
+    // fit wants 0.10 to 0.20 and a sliding fit 0.30 to 0.50, so one gap is
+    // the fit under each and the other is wrong under it.
+    let session = session(
+        "let a = box(size: [10, 10, 10], label: \"a\");
+let b = box(origin: [10.15, 0, 0], size: [10, 10, 10], label: \"b\");
+let c = box(origin: [20.55, 0, 0], size: [10, 10, 10], label: \"c\");
+",
+    );
+    let mut report = study_session_steps(
+        &session,
+        &names(&["a", "b", "c"]),
+        &CancellationToken::default(),
+    )
+    .expect("a study");
+
+    // Unjudged, a study has measurements and no verdicts.
+    assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+    assert_eq!(report.failing, 0);
+    assert!(report.profile.is_none());
+
+    let press = built_in_profile("fdm-press").expect("a shipped profile");
+    report.judge(Some(press.clone()));
+    assert_eq!(report.profile.as_ref(), Some(&press));
+
+    fn verdict(
+        report: &artificer_kernel::api::analysis::InterferenceReport,
+        a: &str,
+        b: &str,
+    ) -> FitVerdict {
+        report
+            .pairs
+            .iter()
+            .find(|pair| pair.a == a && pair.b == b)
+            .and_then(|pair| pair.verdict)
+            .unwrap_or_else(|| panic!("no verdict for {a}/{b}"))
+    }
+    assert_eq!(
+        verdict(&report, "a", "b"),
+        FitVerdict::Pass,
+        "0.15 is the fit"
+    );
+    assert_eq!(
+        verdict(&report, "b", "c"),
+        FitVerdict::Loose,
+        "0.40 is twice what this press fit needs"
+    );
+    assert_eq!(
+        verdict(&report, "a", "c"),
+        FitVerdict::Loose,
+        "10.55 mm is not a fit at all"
+    );
+    assert_eq!(report.failing, 0, "nothing is too close");
+    assert_eq!(report.loose, 2);
+    assert!(report.worst_fit().is_none(), "nothing failed");
+
+    // A sliding fit wants 0.30 to 0.50, so the 0.15 gap now fails and the
+    // report names it and where on the two bodies it was read.
+    report.judge(built_in_profile("fdm-sliding"));
+    assert_eq!(verdict(&report, "a", "b"), FitVerdict::TooClose);
+    assert_eq!(
+        verdict(&report, "b", "c"),
+        FitVerdict::Pass,
+        "the gap the press fit called loose is this one's fit"
+    );
+    assert_eq!(report.failing, 1);
+    assert_eq!(report.loose, 1);
+    let worst = report.worst_fit().expect("a failing pair");
+    assert_eq!((worst.a.as_str(), worst.b.as_str()), ("a", "b"));
+    assert!((worst.distance - 0.15).abs() <= 1.0e-9);
+    assert!((worst.witness_a.x - 10.0).abs() <= 1.0e-9);
+    assert!((worst.witness_b.x - 10.15).abs() <= 1.0e-9);
+
+    // And withdrawing the profile leaves the measurements standing.
+    report.judge(None);
+    assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+    assert_eq!(report.failing, 0);
+    assert!((report.pairs[0].distance - 0.15).abs() <= 1.0e-9);
+}
+
+#[test]
+fn contact_passes_only_the_profile_that_asks_for_no_gap() {
+    let session = session(
+        "let a = box(size: [10, 10, 10], label: \"a\");
+let b = box(origin: [10, 0, 0], size: [10, 10, 10], label: \"b\");
+",
+    );
+    let mut report =
+        study_session_steps(&session, &names(&["a", "b"]), &CancellationToken::default())
+            .expect("a study");
+    assert_eq!(report.pairs[0].state, ClearanceState::Touching);
+
+    report.judge(built_in_profile("assembly"));
+    assert_eq!(
+        report.pairs[0].verdict,
+        Some(FitVerdict::Pass),
+        "touching parts do not occupy the same space"
+    );
+    assert_eq!(report.failing, 0);
+
+    report.judge(built_in_profile("fdm-press"));
+    assert_eq!(
+        report.pairs[0].verdict,
+        Some(FitVerdict::TooClose),
+        "a press fit needs a gap and there is none"
+    );
+    assert_eq!(report.failing, 1);
+}
+
+#[test]
+fn an_interfering_pair_fails_every_profile_including_the_open_ended_one() {
+    let session = session(
+        "let a = box(size: [20, 20, 20], label: \"a\");
+let b = box(origin: [10, 10, 10], size: [20, 20, 20], label: \"b\");
+",
+    );
+    let mut report =
+        study_session_steps(&session, &names(&["a", "b"]), &CancellationToken::default())
+            .expect("a study");
+    assert_eq!(report.pairs[0].state, ClearanceState::Interfering);
+
+    for profile in artificer_kernel::api::analysis::BUILT_IN_PROFILES {
+        report.judge(Some(profile.profile()));
+        assert_eq!(
+            report.pairs[0].verdict,
+            Some(FitVerdict::TooClose),
+            "{} let an overlap pass",
+            profile.key
+        );
+        assert_eq!(report.failing, 1);
+    }
+    // The open-ended profile publishes no upper bound rather than an
+    // infinite one, because infinity is not a JSON number.
+    let assembly = built_in_profile("assembly").expect("a shipped profile");
+    assert!(assembly.maximum.is_none());
+    assert!(
+        serde_json::to_value(&assembly).unwrap()["maximum"].is_null(),
+        "an absent bound, not a null number"
     );
 }

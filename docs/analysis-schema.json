@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://artificer.dev/schemas/interference-report-1.json",
+  "$id": "https://artificer.dev/schemas/interference-report-2.json",
   "title": "Artificer interference report",
-  "description": "The machine-readable answer to whether an assembly fits: every unordered pair of the named bodies, how close they come, where, and whether they are apart, touching or inside one another. Measured over a bounding-volume hierarchy of each body's facets rather than through a Boolean, so it answers for pairs the Boolean engine refuses; the overlap volume, which does need one, is present only where the engine could supply it. Produced by the JSON-RPC method `analysis.interference` and by `api::analysis::interference_study`. schema_version 1.",
+  "description": "The machine-readable answer to whether an assembly fits: every unordered pair of the named bodies, how close they come, where, and whether they are apart, touching or inside one another. Measured over a bounding-volume hierarchy of each body's facets rather than through a Boolean, so it answers for pairs the Boolean engine refuses; the overlap volume, which does need one, is present only where the engine could supply it. A study run against a clearance profile also carries that profile and a per-pair verdict against it. Produced by the JSON-RPC method `analysis.interference` and by `api::analysis::interference_study`. schema_version 2.",
   "type": "object",
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "kernel_version": {
       "type": "string"
@@ -45,6 +45,19 @@
     "elapsed_ms": {
       "type": "integer",
       "minimum": 0
+    },
+    "profile": {
+      "$ref": "#/$defs/profile"
+    },
+    "failing": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many pairs the profile calls too close. Absent, or zero, when the study passes or was never judged."
+    },
+    "loose": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many pairs are clear by more than the fit needed. Not failures."
     }
   },
   "required": [
@@ -135,6 +148,9 @@
         "overlap_unavailable": {
           "type": "string",
           "description": "The Boolean engine's refusal code, when a pair interferes but its overlap volume could not be computed. The clearance beside it still stands."
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
         }
       },
       "required": [
@@ -166,6 +182,46 @@
         "a",
         "b",
         "distance"
+      ],
+      "additionalProperties": false
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "too_close",
+        "loose"
+      ],
+      "description": "pass: the gap sits inside the profile's window. too_close: nearer than the profile allows, or the bodies overlap outright; this is the only verdict that fails a study. loose: clear by more than the fit needed, which is a part that was meant to be held and is not."
+    },
+    "profile": {
+      "type": "object",
+      "description": "The fit a study was judged against. Absent when the study only measured.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "A stable key, so a choice can be stored and named without depending on the display name."
+        },
+        "name": {
+          "type": "string"
+        },
+        "minimum": {
+          "type": "number",
+          "description": "The smallest gap that passes, in millimetres."
+        },
+        "maximum": {
+          "type": "number",
+          "description": "The largest gap the fit needs, in millimetres. Absent where the fit has no upper complaint, which is what a plain clash check is."
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "minimum",
+        "note"
       ],
       "additionalProperties": false
     }

@@ -581,11 +581,23 @@ fn interference_studies_conform_to_the_published_schema() {
             &CancellationToken::default(),
         )
         .expect("a study");
-        let document = serde_json::to_value(study).unwrap();
-        let mut path = Vec::new();
-        let mut problems = Vec::new();
-        check(&schema, &schema, &document, &mut path, &mut problems);
-        assert!(problems.is_empty(), "{problems:#?}");
+        // Unjudged, and then under every profile the kernel ships: the
+        // open-ended one is the case that would publish an infinity if the
+        // upper bound were a number rather than an absence.
+        let profiles = std::iter::once(None).chain(
+            artificer_kernel::api::analysis::BUILT_IN_PROFILES
+                .iter()
+                .map(|profile| Some(profile.profile())),
+        );
+        for profile in profiles {
+            let mut study = study.clone();
+            study.judge(profile);
+            let document = serde_json::to_value(study).unwrap();
+            let mut path = Vec::new();
+            let mut problems = Vec::new();
+            check(&schema, &schema, &document, &mut path, &mut problems);
+            assert!(problems.is_empty(), "{problems:#?}");
+        }
     }
 }
 

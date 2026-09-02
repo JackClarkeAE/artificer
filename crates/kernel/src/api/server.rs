@@ -325,6 +325,13 @@ impl SharedSession {
                 struct Subjects {
                     #[serde(default)]
                     subjects: Vec<String>,
+                    /// A shipped profile by key, or a whole profile of the
+                    /// caller's own. Omitted, the study measures without
+                    /// judging.
+                    #[serde(default)]
+                    profile: Option<String>,
+                    #[serde(default)]
+                    fit: Option<crate::api::analysis::ClearanceProfile>,
                 }
                 let request: Subjects = match serde_json::from_value(params) {
                     Ok(request) => request,
@@ -336,12 +343,28 @@ impl SharedSession {
                         );
                     }
                 };
+                let profile = match (&request.profile, request.fit.clone()) {
+                    (Some(key), _) => match crate::api::analysis::built_in_profile(key) {
+                        Some(profile) => Some(profile),
+                        None => {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                format!("No clearance profile named \"{key}\""),
+                            );
+                        }
+                    },
+                    (None, fit) => fit,
+                };
                 match crate::api::analysis::study_session_steps(
                     &session,
                     &request.subjects,
                     &CancellationToken::default(),
                 ) {
-                    Ok(report) => respond(id, &report),
+                    Ok(mut report) => {
+                        report.judge(profile);
+                        respond(id, &report)
+                    }
                     Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
                 }
             }

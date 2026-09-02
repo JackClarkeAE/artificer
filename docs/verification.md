@@ -374,6 +374,56 @@ rather than only when the surfaces do; such a pair keeps a positive
 distance, the gap to the wall around it, with the state saying it is
 inside.
 
+### Clearance profiles
+
+A measurement is not yet an answer. "0.42 mm" says nothing on its own;
+"0.42 mm, and this press fit wants 0.10 to 0.20" says the part is loose,
+and "0.02 mm" against the same window says it will not go together. A
+clearance profile is that window — a minimum gap that passes, and a
+maximum beyond which the fit is looser than it needed to be — and a study
+run against one carries a verdict for every pair.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"analysis.interference",
+ "params":{"subjects":["hub","shaft"],"profile":"fdm-press"}}
+```
+
+```rust
+use artificer_kernel::api::analysis::built_in_profile;
+report.judge(built_in_profile("fdm-press"));
+```
+
+The kernel ships five, and none of them is privileged — a design with its
+own numbers passes its own `ClearanceProfile`, and the `fit` parameter
+takes one over the wire:
+
+| Key | Window | For |
+| --- | --- | --- |
+| `machined-running` | 0.02–0.08 mm | A milled or turned part that has to turn or slide in service. |
+| `resin-fine` | 0.05–0.15 mm | Masked stereolithography, where the layer is thin and the part is stiff. |
+| `fdm-press` | 0.10–0.20 mm | A fused-filament part meant to be pushed together and stay together. |
+| `fdm-sliding` | 0.30–0.50 mm | A fused-filament part that has to move after it is assembled. |
+| `assembly` | 0 mm and over | No fit at all: parts must simply not occupy the same space. |
+
+Each pair earns one of three verdicts. `pass` is the gap the fit asked
+for. `too_close` is nearer than the profile allows, or an overlap
+outright, and it is the only verdict that fails a study — `failing` counts
+them and `worst_fit` names the tightest, whose witness points are where on
+the two bodies that reading was taken. `loose` is clear by more than the
+fit needed: not a failure, but a part that was meant to be held and is
+not.
+
+Two edges are worth stating. Contact is judged on the measurement rather
+than on the state, so two bodies that touch have a gap of zero and zero is
+below every window whose minimum is positive; the assembly check, whose
+minimum is zero, is the one that passes them. And the open-ended profile
+publishes no upper bound rather than an infinite one, because infinity is
+not a JSON number and this document is published.
+
+Judging is not measuring. `judge` re-reads the closest approach each pair
+already has, so changing the fit changes the verdicts, the heat map's
+window and nothing else; withdrawing it leaves every measurement standing.
+
 ### The heat map
 
 The pair table says which pairs fail. The heat map says where on the
@@ -408,6 +458,14 @@ take, so "these parts pass through one another" never reads as "these
 parts are close". The readings are bound to the tessellation they were
 measured on: a body rebuilt by an edit simply has no reading until the
 study is run again.
+
+The scale is the profile's own window when there is one, so the picture
+and the table agree — green on the model means the same thing as `pass` in
+the pair list, red is too close, blue is looser than needed. Without a
+profile there is no window to draw, so the readings are ramped over their
+own range instead, from the tightest to the ninetieth percentile rather
+than to the largest: one body parked far across the workspace would
+otherwise stretch the scale until every real fit read as tight.
 
 ## 9. Not in this release
 

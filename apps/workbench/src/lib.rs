@@ -103,6 +103,7 @@ use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
     paint_tool_icon,
 };
+use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
 use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
 
 use crate::theme::install_style;
@@ -1790,14 +1791,48 @@ impl ClearanceHeatMap {
     }
 }
 
-/// Builds the heat map a study leaves behind.
+/// The one line a study leaves in the status bar.
 ///
-/// The ramp spans zero to the ninetieth percentile of the readings rather
-/// than to the largest of them: one body parked far across the workspace
-/// would otherwise stretch the scale until every real fit read as tight.
+/// Under a profile it is the fit's answer, because that is the question
+/// that was asked, and it names the pair the fit fails worst on. Without
+/// one there is no fit to report, only the measurement.
+fn study_status(report: &artificer_kernel::api::analysis::InterferenceReport) -> String {
+    if let Some(profile) = report.profile.as_ref() {
+        return match (report.failing, report.worst_fit()) {
+            (0, _) if report.loose == 0 => format!("{}: every pair fits", profile.name),
+            (0, _) => format!(
+                "{}: every pair fits · {} looser than needed",
+                profile.name, report.loose
+            ),
+            (failing, Some(worst)) => format!(
+                "{}: {failing} of {} pairs too close · worst {} \u{2194} {} at {:.3} mm",
+                profile.name,
+                report.pairs.len(),
+                worst.a,
+                worst.b,
+                worst.distance
+            ),
+            (failing, None) => format!("{}: {failing} pairs too close", profile.name),
+        };
+    }
+    match (report.interfering, report.touching) {
+        (0, 0) => format!(
+            "No interference across {} pairs{}",
+            report.pairs.len(),
+            report.tightest.as_ref().map_or(String::new(), |tightest| {
+                format!("; tightest {:.3} mm", tightest.distance)
+            })
+        ),
+        (0, touching) => format!("{touching} pairs touch; none overlap"),
+        (interfering, _) => format!("{interfering} pairs interfere"),
+    }
+}
+
+/// Builds the heat map a study leaves behind.
 fn heat_map_from(
     bodies: &[BodyId],
     fields: Vec<Vec<f64>>,
+    profile: Option<&ClearanceProfile>,
     previous: Option<&ClearanceHeatMap>,
 ) -> Option<ClearanceHeatMap> {
     let fields = bodies
@@ -1812,6 +1847,41 @@ fn heat_map_from(
     if fields.iter().all(|(_, values)| values.is_empty()) {
         return None;
     }
+    Some(ClearanceHeatMap {
+        palette: heat_palette(profile, &fields),
+        fields,
+        epoch: previous.map_or(1, |held| held.epoch + 1),
+        // A study is asked for; its picture arrives with it. What the user
+        // then chooses to do with the toggle survives the next study.
+        visible: previous.is_none_or(|held| held.visible),
+    })
+}
+
+/// The scale the readings are painted against.
+///
+/// With a profile, it is the profile's own window: the picture and the
+/// verdict then agree, and green on the model means the same thing as
+/// `pass` in the table. Without one there is no window to draw, so the
+/// readings are ramped over their own range instead.
+fn heat_palette(
+    profile: Option<&ClearanceProfile>,
+    fields: &[(BodyId, Vec<f32>)],
+) -> viewport::HeatPalette {
+    profile.map_or_else(
+        || measured_ramp(fields),
+        |profile| viewport::HeatPalette::Window {
+            minimum: profile.minimum as f32,
+            maximum: profile.maximum.unwrap_or(f64::INFINITY) as f32,
+        },
+    )
+}
+
+/// A ramp over the readings themselves, for a study with no fit to judge.
+///
+/// It spans zero to the ninetieth percentile rather than to the largest
+/// reading: one body parked far across the workspace would otherwise
+/// stretch the scale until every real fit read as tight.
+fn measured_ramp(fields: &[(BodyId, Vec<f32>)]) -> viewport::HeatPalette {
     let mut readings = fields
         .iter()
         .flat_map(|(_, values)| values.iter().copied())
@@ -1824,14 +1894,7 @@ fn heat_map_from(
         let (_, value, _) = readings.select_nth_unstable_by(index, f32::total_cmp);
         value.max(1.0e-3)
     };
-    Some(ClearanceHeatMap {
-        fields,
-        palette: viewport::HeatPalette::Gradient { near: 0.0, far },
-        epoch: previous.map_or(1, |held| held.epoch + 1),
-        // A study is asked for; its picture arrives with it. What the user
-        // then chooses to do with the toggle survives the next study.
-        visible: previous.is_none_or(|held| held.visible),
-    })
+    viewport::HeatPalette::Gradient { near: 0.0, far }
 }
 
 #[derive(Clone, Debug)]
@@ -2140,6 +2203,10 @@ pub struct KernelLabApp {
     /// it. A study is a reading, not a feature: it never enters the
     /// history and never touches a snapshot.
     interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
+    /// The fit every study is judged against, and the window the heat map
+    /// is painted to. `None` measures without judging, which is what a
+    /// first look at an assembly is.
+    clearance_profile: Option<ClearanceProfile>,
     /// The clearance heat map from that study, painted over the bodies it
     /// was measured on. Kept beside the report rather than inside it: the
     /// report is a published document, and this is a picture of it.
@@ -2312,6 +2379,7 @@ impl Default for KernelLabApp {
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
             interference: None,
+            clearance_profile: None,
             heat_map: None,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
@@ -9672,21 +9740,44 @@ impl KernelLabApp {
             return;
         }
         let cancellation = CancellationToken::new();
-        let report = interference_study(&subjects, self.document_precision(), &cancellation);
+        let mut report = interference_study(&subjects, self.document_precision(), &cancellation);
+        report.judge(self.clearance_profile.clone());
         let fields = clearance_fields(&subjects, &cancellation);
-        self.heat_map = heat_map_from(&visible, fields, self.heat_map.as_ref());
-        self.document_status = Some(match (report.interfering, report.touching) {
-            (0, 0) => format!(
-                "No interference across {} pairs{}",
-                report.pairs.len(),
-                report.tightest.as_ref().map_or(String::new(), |tightest| {
-                    format!("; tightest {:.3} mm", tightest.distance)
-                })
-            ),
-            (0, touching) => format!("{touching} pairs touch; none overlap"),
-            (interfering, _) => format!("{interfering} pairs interfere"),
-        });
+        self.heat_map = heat_map_from(
+            &visible,
+            fields,
+            self.clearance_profile.as_ref(),
+            self.heat_map.as_ref(),
+        );
+        self.document_status = Some(study_status(&report));
         self.interference = Some(report);
+    }
+
+    /// Chooses the fit every study is judged against.
+    ///
+    /// Nothing is measured again. The closest approach of each pair is
+    /// already the number a fit is decided on, so a new fit re-reads the
+    /// same study and repaints the same readings against a different
+    /// window.
+    pub fn set_clearance_profile(&mut self, profile: Option<ClearanceProfile>) {
+        self.clearance_profile = profile.clone();
+        if let Some(heat_map) = self.heat_map.as_mut() {
+            heat_map.palette = heat_palette(profile.as_ref(), &heat_map.fields);
+        }
+        if let Some(report) = self.interference.as_mut() {
+            report.judge(profile);
+            self.document_status = Some(study_status(report));
+        } else {
+            self.document_status = Some(match self.clearance_profile.as_ref() {
+                Some(profile) => format!("{} will judge the next study", profile.name),
+                None => "Studies will measure without judging a fit".to_owned(),
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn clearance_profile(&self) -> Option<&ClearanceProfile> {
+        self.clearance_profile.as_ref()
     }
 
     /// The precision the document's bodies were built under.
@@ -9773,10 +9864,24 @@ impl KernelLabApp {
         let Some(report) = self.interference.clone() else {
             return;
         };
-        let (colour, headline) = match (report.interfering, report.touching) {
-            (0, 0) => (theme::good(), "Clear".to_owned()),
-            (0, touching) => (theme::accent(), format!("{touching} touching")),
-            (interfering, _) => (theme::bad(), format!("{interfering} interfering")),
+        // Under a fit, the headline is the fit's answer: a study that
+        // measured three clear pairs still fails if the fit wanted them
+        // held, and the card has to lead with that rather than with
+        // "clear".
+        let (colour, headline) = match report.profile.as_ref() {
+            Some(_) if report.failing > 0 => {
+                (theme::bad(), format!("{} too close", report.failing))
+            }
+            Some(_) if report.loose > 0 => (
+                theme::accent(),
+                format!("{} looser than needed", report.loose),
+            ),
+            Some(_) => (theme::good(), "Every pair fits".to_owned()),
+            None => match (report.interfering, report.touching) {
+                (0, 0) => (theme::good(), "Clear".to_owned()),
+                (0, touching) => (theme::accent(), format!("{touching} touching")),
+                (interfering, _) => (theme::bad(), format!("{interfering} interfering")),
+            },
         };
         status_line(ui, &headline, colour);
         ui.label(
@@ -9792,6 +9897,62 @@ impl KernelLabApp {
             .small()
             .color(theme::muted()),
         );
+        ui.add_space(6.0);
+
+        // The fit is picked here rather than before the study, because
+        // choosing it re-reads the measurements this study already has
+        // instead of asking for new ones.
+        ui.label(RichText::new("Fit").small().color(theme::muted()));
+        let mut chosen: Option<Option<ClearanceProfile>> = None;
+        let selected = report
+            .profile
+            .as_ref()
+            .map_or("Measured range", |profile| profile.name.as_str())
+            .to_owned();
+        egui::ComboBox::from_id_salt("clearance_profile_picker")
+            .selected_text(selected)
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(report.profile.is_none(), "Measured range")
+                    .on_hover_text(
+                        "Measure without judging: the heat map ramps over the readings themselves.",
+                    )
+                    .clicked()
+                {
+                    chosen = Some(None);
+                }
+                for built_in in artificer_kernel::api::analysis::BUILT_IN_PROFILES {
+                    let held = report
+                        .profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.key == built_in.key);
+                    let window = built_in.maximum.map_or_else(
+                        || format!("{:.2} mm and over", built_in.minimum),
+                        |maximum| format!("{:.2}–{maximum:.2} mm", built_in.minimum),
+                    );
+                    if ui
+                        .selectable_label(held, format!("{}  ·  {window}", built_in.name))
+                        .on_hover_text(built_in.note)
+                        .clicked()
+                    {
+                        chosen = Some(Some(built_in.profile()));
+                    }
+                }
+            });
+        if let Some(profile) = chosen {
+            self.set_clearance_profile(profile);
+        }
+        if let Some(worst) = report.worst_fit() {
+            ui.label(
+                RichText::new(format!(
+                    "Worst: {} ↔ {} at {:.3} mm",
+                    worst.a, worst.b, worst.distance
+                ))
+                .small()
+                .color(theme::bad()),
+            );
+        }
         ui.add_space(6.0);
 
         let mut pairs = report.pairs.clone();
@@ -9821,6 +9982,16 @@ impl KernelLabApp {
                 ),
                 ClearanceState::Touching => (theme::accent(), "touching".to_owned()),
                 ClearanceState::Clear => (theme::muted(), format!("{:.3} mm apart", pair.distance)),
+            };
+            // The verdict overrides the measurement's own colour, because
+            // under a fit it is the verdict that is being read.
+            let (colour, reading) = match pair.verdict {
+                Some(FitVerdict::TooClose) => (theme::bad(), format!("{reading} · too close")),
+                Some(FitVerdict::Pass) => (theme::good(), format!("{reading} · fits")),
+                Some(FitVerdict::Loose) => {
+                    (theme::accent(), format!("{reading} · looser than needed"))
+                }
+                None => (colour, reading),
             };
             ui.horizontal_top(|ui| {
                 let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
@@ -23791,6 +23962,115 @@ mod extrusion_workbench_tests {
         app.heat_map = None;
         app.run_interference_study();
         assert!(app.heat_map.is_some(), "a fresh study builds a fresh map");
+    }
+
+    #[test]
+    fn a_fit_judges_the_study_that_is_already_measured_and_repaints_it() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.run_interference_study();
+
+        // A study with no fit measures and does not judge, and its heat map
+        // ramps over the readings rather than against a window.
+        let report = app.interference_report().expect("a study");
+        assert!(report.profile.is_none());
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+        assert!(matches!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Gradient { .. }
+        ));
+
+        let press = artificer_kernel::api::analysis::built_in_profile("fdm-press")
+            .expect("a shipped profile");
+        let measured = app
+            .interference_report()
+            .expect("a study")
+            .pairs
+            .iter()
+            .map(|pair| pair.distance)
+            .collect::<Vec<_>>();
+        app.set_clearance_profile(Some(press.clone()));
+
+        // Nothing was measured again: the same numbers, now with verdicts.
+        let report = app.interference_report().expect("a study");
+        assert_eq!(
+            report
+                .pairs
+                .iter()
+                .map(|pair| pair.distance)
+                .collect::<Vec<_>>(),
+            measured,
+            "choosing a fit re-reads the study, it does not re-run it"
+        );
+        assert_eq!(report.profile.as_ref(), Some(&press));
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_some()));
+        assert_eq!(
+            report.failing
+                + report.loose
+                + report
+                    .pairs
+                    .iter()
+                    .filter(|pair| pair.verdict == Some(FitVerdict::Pass))
+                    .count(),
+            report.pairs.len(),
+            "every pair earns exactly one verdict"
+        );
+
+        // And the heat map now paints the fit's own window, so green on the
+        // model means the same thing as "fits" in the table.
+        assert_eq!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Window {
+                minimum: 0.10,
+                maximum: 0.20,
+            }
+        );
+
+        // The choice outlives the study and is applied to the next one.
+        app.run_interference_study();
+        assert_eq!(
+            app.interference_report().expect("a study").profile.as_ref(),
+            Some(&press)
+        );
+
+        // Withdrawing it leaves the measurements and takes back the window.
+        app.set_clearance_profile(None);
+        let report = app.interference_report().expect("a study");
+        assert!(report.profile.is_none());
+        assert_eq!(report.failing, 0);
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+        assert!(matches!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Gradient { .. }
+        ));
+    }
+
+    #[test]
+    fn a_fit_can_be_chosen_before_any_study_and_judges_the_first_one() {
+        let mut app = KernelLabApp::default();
+        app.set_clearance_profile(artificer_kernel::api::analysis::built_in_profile(
+            "assembly",
+        ));
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("next study")),
+            "{:?}",
+            app.document_status
+        );
+
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.run_interference_study();
+        let report = app.interference_report().expect("a study");
+        assert_eq!(
+            report.profile.as_ref().map(|profile| profile.key.as_str()),
+            Some("assembly")
+        );
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_some()));
+        // An assembly check has no upper complaint, so nothing is loose.
+        assert_eq!(report.loose, 0);
     }
 
     #[test]
