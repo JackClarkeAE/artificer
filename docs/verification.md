@@ -581,9 +581,10 @@ plane — but it only rests on it, so a two-dimensional difference against
 that section removes a strip that is on the union's own boundary. The
 answer is wrong, and it is wrong quietly.
 
-Getting it right means classifying a face against the other solid as one
-of four things — inside, outside, on the boundary facing the same way, on
-the boundary facing the opposite way — and choosing per operation:
+The rule itself is not the hard part. Classify a face against the other
+solid as one of four things — inside, outside, on the boundary facing the
+same way, on the boundary facing the opposite way — and choose per
+operation:
 
 | | co-oriented | anti-oriented |
 | --- | --- | --- |
@@ -591,11 +592,25 @@ the boundary facing the opposite way — and choosing per operation:
 | Intersection | keep it once | drop it from both |
 | Difference | drop it from both | keep it on the target |
 
-That is a different classification core, not an addition to this one, so
-it is not in this release. Everything downstream is already built to live
-without it: an interference study needs no Boolean at all, and reports the
-clearance of pairs the engine refuses while naming the refusal in place of
-the overlap volume it could not compute.
+That table has been built and measured: every case in it — flush contact,
+partial contact, an operand seated in a step, and operands overlapping
+across shared planes — returns the volume derived by hand for it. What
+stops it shipping is one layer down. A coplanar pair of faces reduces to a
+pair of two-dimensional regions whose boundaries run along one another,
+and the profile Boolean refuses those for the same reason, with the same
+four-way table as its answer. Teaching it that table works, and it also
+changes what the engine does with a *tangency* — a slot's wall running
+along a circle it touches — where coincidence really is a degeneracy with
+a faceted rung below it to fall to. Separating the two, so a shared face
+is carried and a tangency still falls through, is the remaining work; it
+is a distinction between contacts rather than a bigger table.
+
+Until it is separated, the transverse engine keeps the whole domain and
+the refusal stands, because a Boolean that returns a plausible solid with
+the wrong volume is worse than one that says no. Everything downstream is
+already built to live without it: an interference study needs no Boolean
+at all, and reports the clearance of pairs the engine refuses while naming
+the refusal in place of the overlap volume it could not compute.
 
 ## 12. Not in this release
 
