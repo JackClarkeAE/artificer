@@ -221,3 +221,69 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
     assert_eq!(restored.state().component_poses(), poses);
     assert_eq!(restored.state().assembly_joint_summaries(), summaries);
 }
+
+#[test]
+fn a_revolute_joint_poses_its_component_and_stands_the_turntable_down() {
+    let mut harness = two_component_assembly();
+    // No mechanism yet: the animation is the turntable, and every
+    // component stands where the document assembled it.
+    assert!(!harness.state().animation_drives_joints());
+    assert_eq!(
+        harness.state().solved_component_poses(),
+        harness.state().component_poses()
+    );
+
+    click_scrolled_button(&mut harness, "Add revolute joint");
+    click_button(&mut harness, "Confirm operation");
+    assert_eq!(harness.state().assembly_joint_count(), 1);
+
+    let joints = harness.state().drivable_joints();
+    assert_eq!(joints.len(), 1, "one revolute joint to drive");
+    let hinge = joints[0].id;
+    assert!(
+        joints[0].limits.is_none(),
+        "the workbench's joint is unlimited, so its slider shows one turn"
+    );
+
+    // At rest the mechanism is the assembled document, exactly.
+    assert_eq!(harness.state().joint_angle(hinge), 0.0);
+    assert_eq!(
+        harness.state().solved_component_poses(),
+        harness.state().component_poses()
+    );
+
+    // Driving it moves the jointed component and nothing else. The joint
+    // sits on the component's own pivot, so a half turn carries it to the
+    // far side of that pivot.
+    let assembled = harness.state().component_poses();
+    let jointed = harness
+        .state()
+        .active_component_instance_id()
+        .expect("an active component");
+    harness
+        .state_mut()
+        .set_joint_angle(hinge, std::f64::consts::PI);
+    harness.run();
+
+    let posed = harness.state().solved_component_poses();
+    assert_eq!(
+        posed.len(),
+        assembled.len(),
+        "posing adds and removes no components"
+    );
+    for (solved, rest) in posed.iter().zip(&assembled) {
+        assert_eq!(solved.0, rest.0);
+        if solved.0 == jointed {
+            assert_ne!(solved.1, rest.1, "the jointed component moved");
+        } else {
+            assert_eq!(solved.1, rest.1, "an unjointed component did not");
+        }
+    }
+
+    // The document itself never moved: a joint coordinate is a pose, not
+    // an edit.
+    assert_eq!(harness.state().component_poses(), assembled);
+
+    // And the animation now belongs to the mechanism.
+    assert!(harness.state().animation_drives_joints());
+}

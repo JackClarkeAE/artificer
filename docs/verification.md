@@ -467,12 +467,65 @@ own range instead, from the tightest to the ninetieth percentile rather
 than to the largest: one body parked far across the workspace would
 otherwise stretch the scale until every real fit read as tight.
 
-## 9. Not in this release
+## 9. Joints, and where the parts actually are
+
+A document stores each component's *assembled* pose: where it sits when
+every joint is at zero. A joint says how that pose is allowed to change.
+The solver in `artificer_model::kinematics` turns the two into the third
+thing the viewport, an interference study and an export all need — the
+world pose of every component at a given set of driver values.
+
+```rust
+use artificer_model::kinematics::{solve, JointDriver};
+let posed = solve(&document, &[JointDriver::new(hinge, angle)])?;
+```
+
+A revolute joint carries an origin and an axis in the assembled world
+frame, which is where they were picked. Driving it by θ turns the child
+about that world line, and the child's whole subtree with it: turning a
+hinge carries the door, and the handle on the door. So each component gets
+a *motion* — the rigid transform between where it was assembled and where
+the drivers have put it — and its world pose is that motion applied to its
+assembled pose. Every motion is the identity at zero, which is what makes
+the assembled document the thing the drivers move away from rather than a
+separate configuration nobody authored.
+
+A fixed joint contributes the identity, which is exactly what "fixed"
+means: the child follows its parent and adds nothing of its own. A
+disabled joint does the same — it is still a structural edge, it simply
+has no coordinate to set. A component with no parent joint is a root and
+stands where it was put; grounding is what forbids a component a parent,
+not what pins it.
+
+Five things are refused by name rather than guessed at: a driver for a
+joint that is not in the document, for a fixed one, or for a disabled one;
+a second driver for a joint that already has one; and a driver outside the
+joint's own limits. That last one is a refusal rather than a clamp on
+purpose — a limit is a promise the model makes about the mechanism, and a
+sweep that silently stopped at the stop would report clearances the
+mechanism never reaches. Cycles are refused too. The document's own
+editing rules already prevent them, but a document that arrived from disk
+has not been through those rules, and a solver that loops forever on one
+is worse than a solver that names it.
+
+In the workbench each drivable joint gets a coordinate, and posing one is
+not an edit: the document's stored poses do not move, only where the parts
+are drawn. The animation drives those coordinates — a joint with limits
+sweeps between them and back, one without turns continuously — and while
+it holds them the coordinates are its to set, which resetting the phase
+hands back. The turntable that spun the active body on the spot is what a
+document with no joints still gets, because on such a document there is no
+mechanism to animate.
+
+## 10. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. An interference
-study is static: it measures the poses the bodies are in, and nothing
-sweeps them through a motion yet. Shell covers
+study is static: it measures the poses the bodies are in, and driving a
+mechanism through its travel while it measures is the next slice. Joints
+are fixed and revolute; sliding, cylindrical and ball joints are not in
+the vocabulary yet, and a mechanism whose loop closes is refused rather
+than solved. Shell covers
 prisms and solids of revolution; a blended or domed body is refused
 rather than approximated, and opening the cap of a cone waits on the
 Boolean engine. Probes read the

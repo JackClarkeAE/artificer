@@ -105,6 +105,8 @@ use crate::sketch_toolbar::{
 };
 use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
 use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
+use artificer_model::JointId;
+use artificer_model::kinematics::{self, JointDriver, Kinematics};
 
 use crate::theme::install_style;
 const ORIGIN_PLANE_HALF_EXTENT_MM: f64 = 25.0;
@@ -1753,6 +1755,16 @@ struct WorkbenchBody {
     material: Option<String>,
 }
 
+/// One joint the user can pose, as the controls need it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrivableJoint {
+    pub id: JointId,
+    pub name: String,
+    /// The travel the joint allows, in radians, or `None` for a joint with
+    /// no limits at all.
+    pub limits: Option<(f64, f64)>,
+}
+
 /// The clearance measured over every visible body, ready to paint.
 ///
 /// One reading per facet corner, in the scene order the viewport walks, so
@@ -2203,6 +2215,13 @@ pub struct KernelLabApp {
     /// it. A study is a reading, not a feature: it never enters the
     /// history and never touches a snapshot.
     interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
+    /// The angle each revolute joint is held at, in radians. A joint with
+    /// no entry rests at zero, which is the pose the document assembled.
+    joint_drivers: BTreeMap<JointId, f64>,
+    /// Where the joints put every component this frame. Re-solved once a
+    /// frame rather than cached against edits, because a stale pose is a
+    /// part drawn somewhere it is not.
+    kinematics: Kinematics,
     /// The fit every study is judged against, and the window the heat map
     /// is painted to. `None` measures without judging, which is what a
     /// first look at an assembly is.
@@ -2379,6 +2398,8 @@ impl Default for KernelLabApp {
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
             interference: None,
+            joint_drivers: BTreeMap::new(),
+            kinematics: Kinematics::default(),
             clearance_profile: None,
             heat_map: None,
             camera_before_plane_sketch: None,
@@ -2606,6 +2627,36 @@ impl KernelLabApp {
                     component.id.get(),
                     [translation.x(), translation.y(), translation.z()],
                     [rotation.w(), rotation.x(), rotation.y(), rotation.z()],
+                )
+            })
+            .collect()
+    }
+
+    /// Where the joints put every component, in the shape
+    /// [`Self::component_poses`] reports the assembled ones.
+    ///
+    /// The two agree exactly when every joint is at rest. What separates
+    /// them is the mechanism.
+    #[must_use]
+    pub fn solved_component_poses(&self) -> Vec<(u64, [f64; 3], [f64; 4])> {
+        self.document
+            .component_instances()
+            .iter()
+            .map(|component| {
+                let pose = self.kinematics.pose(component.id).unwrap_or(component.pose);
+                (
+                    component.id.get(),
+                    [
+                        pose.translation.x(),
+                        pose.translation.y(),
+                        pose.translation.z(),
+                    ],
+                    [
+                        pose.rotation.w(),
+                        pose.rotation.x(),
+                        pose.rotation.y(),
+                        pose.rotation.z(),
+                    ],
                 )
             })
             .collect()
@@ -4339,8 +4390,12 @@ impl KernelLabApp {
         let Some(component) = self.component_for_body(body) else {
             return viewport::RigidOccurrenceTransform::identity();
         };
-        let translation = component.pose.translation;
-        let rotation = component.pose.rotation;
+        // The joints have the last word on where a component is: the pose
+        // the document stores is where it was assembled, and the solver
+        // says where the drivers have since put it.
+        let pose = self.kinematics.pose(component.id).unwrap_or(component.pose);
+        let translation = pose.translation;
+        let rotation = pose.rotation;
         viewport::RigidOccurrenceTransform::new(
             Vector3::new(translation.x(), translation.y(), translation.z()),
             RotationQuaternion::new(rotation.w(), rotation.x(), rotation.y(), rotation.z()),
@@ -10962,6 +11017,123 @@ impl KernelLabApp {
         self.document_status = Some(format!("{} committed", preset.label()));
     }
 
+    /// Every revolute joint that can be driven, in document order, with the
+    /// range it is allowed to turn through.
+    ///
+    /// A disabled joint is left out: it is still a structural edge, so its
+    /// child follows its parent, but it has no coordinate to set.
+    #[must_use]
+    pub fn drivable_joints(&self) -> Vec<DrivableJoint> {
+        self.document
+            .joints()
+            .iter()
+            .filter(|joint| joint.enabled)
+            .filter_map(|joint| match joint.kind {
+                JointKind::Revolute { limits, .. } => Some(DrivableJoint {
+                    id: joint.id,
+                    name: joint.name.clone(),
+                    limits: limits.map(|limits| (limits.min_radians(), limits.max_radians())),
+                }),
+                JointKind::Fixed => None,
+            })
+            .collect()
+    }
+
+    /// The angle one joint is held at.
+    #[must_use]
+    pub fn joint_angle(&self, joint: JointId) -> f64 {
+        self.joint_drivers.get(&joint).copied().unwrap_or(0.0)
+    }
+
+    /// Holds one joint at an angle, inside its own limits.
+    ///
+    /// The slider cannot leave the range, so this clamps rather than
+    /// refusing: a control that silently did nothing at its own end stop
+    /// would read as broken. The solver still refuses an out-of-range
+    /// driver, which is the guard for callers that are not a slider.
+    pub fn set_joint_angle(&mut self, joint: JointId, radians: f64) {
+        if !radians.is_finite() {
+            return;
+        }
+        let Some(record) = self.document.joint(joint) else {
+            return;
+        };
+        let JointKind::Revolute { limits, .. } = record.kind else {
+            return;
+        };
+        let name = record.name.clone();
+        let radians = limits.map_or(radians, |limits| {
+            radians.clamp(limits.min_radians(), limits.max_radians())
+        });
+        self.joint_drivers.insert(joint, radians);
+        self.refresh_kinematics();
+        self.document_status = Some(format!("{name} at {:.1}°", radians.to_degrees()));
+    }
+
+    /// Re-poses every component from the joints and the current drivers.
+    ///
+    /// Once a frame, because a pose cached against edits goes stale the
+    /// moment a joint is added, removed or disabled, and a stale pose is a
+    /// part drawn somewhere it is not. A document with a handful of
+    /// components costs a handful of quaternion products.
+    fn refresh_kinematics(&mut self) {
+        let drivers = self
+            .drivable_joints()
+            .into_iter()
+            .map(|joint| {
+                let angle = self.animated_joint_angle(joint.id, joint.limits);
+                JointDriver::new(joint.id, angle)
+            })
+            .collect::<Vec<_>>();
+        // A document whose joints cannot be solved keeps the poses it was
+        // assembled at rather than throwing parts across the workspace.
+        self.kinematics = kinematics::solve(&self.document, &drivers).unwrap_or_default();
+    }
+
+    /// The angle a joint is at this frame: what the user set it to, or,
+    /// while the animation is playing, a sweep through its own range.
+    ///
+    /// This is what replaces the turntable on a document that has a
+    /// mechanism. A joint with limits swings between them and back; one
+    /// without turns continuously, because that is what an unlimited
+    /// revolute joint does.
+    fn animated_joint_angle(&self, joint: JointId, limits: Option<(f64, f64)>) -> f64 {
+        if !self.animation_holds_joints() {
+            return self.joint_angle(joint);
+        }
+        let phase = self.motion.phase;
+        match limits {
+            None => phase,
+            Some((min, max)) => {
+                // A triangle wave over the phase: out to one stop, back to
+                // the other, so a hinge sweeps its travel instead of
+                // jumping back at the end of the turn.
+                let sweep = (phase / std::f64::consts::PI).rem_euclid(2.0);
+                let fraction = if sweep <= 1.0 { sweep } else { 2.0 - sweep };
+                min + (max - min) * fraction
+            }
+        }
+    }
+
+    /// Whether the animation drives a mechanism rather than spinning the
+    /// active body on the spot.
+    #[must_use]
+    pub fn animation_drives_joints(&self) -> bool {
+        !self.drivable_joints().is_empty()
+    }
+
+    /// Whether the animation, rather than the sliders, is saying where the
+    /// joints are.
+    ///
+    /// A scrubbed phase counts as much as a playing one: the phase is a
+    /// position in the motion whether it is moving or held, and a mechanism
+    /// cannot be in two configurations at once. Pausing returns the phase
+    /// to zero, which hands the joints back to their coordinates.
+    #[must_use]
+    pub fn animation_holds_joints(&self) -> bool {
+        self.animation_drives_joints() && (self.motion.playing || self.motion.phase != 0.0)
+    }
+
     fn advance_motion(&mut self, context: &egui::Context) {
         if !self.motion.playing {
             self.last_motion_time = None;
@@ -15263,6 +15435,56 @@ impl KernelLabApp {
                 }
             });
         });
+        self.joint_controls(ui);
+    }
+
+    /// One coordinate per drivable joint, and what the animation does with
+    /// them.
+    ///
+    /// This is the mechanism's own control. A document with no joints has
+    /// nothing here and keeps the turntable, which is the only thing there
+    /// is to animate when nothing is jointed.
+    fn joint_controls(&mut self, ui: &mut egui::Ui) {
+        let joints = self.drivable_joints();
+        if joints.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("JOINTS").small().color(theme::muted()));
+        let animated = self.animation_holds_joints();
+        ui.label(
+            RichText::new(if animated {
+                "The animation is posing these. Reset the phase to take them back."
+            } else {
+                "Drag to pose the mechanism. Every part below a joint follows it."
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        let mut change = None;
+        for joint in &joints {
+            let (min, max) = joint
+                .limits
+                .unwrap_or((-std::f64::consts::PI, std::f64::consts::PI));
+            let mut degrees = self
+                .animated_joint_angle(joint.id, joint.limits)
+                .to_degrees();
+            let slider = ui.add_enabled(
+                !animated,
+                egui::Slider::new(&mut degrees, min.to_degrees()..=max.to_degrees())
+                    .text(&joint.name)
+                    .suffix("°"),
+            );
+            if slider.changed() {
+                change = Some((joint.id, degrees.to_radians()));
+            }
+            if joint.limits.is_none() {
+                slider.on_hover_text("This joint has no limits: the range shown is one turn.");
+            }
+        }
+        if let Some((joint, radians)) = change {
+            self.set_joint_angle(joint, radians);
+        }
     }
 
     fn transform_controls(&mut self, ui: &mut egui::Ui, scope: TransformControlsScope) {
@@ -16108,6 +16330,7 @@ impl KernelLabApp {
         // camera back. Lifting the readings out of the document for the
         // duration is what lets both be true at once.
         let heat_map = self.heat_map.take();
+        let drives_joints = self.animation_drives_joints();
 
         let frame_output = Frame::new()
             .fill(theme::viewport_bottom())
@@ -16228,7 +16451,15 @@ impl KernelLabApp {
                         self.active_tool,
                         &mut self.display_transform,
                         &mut self.view,
-                        self.motion.phase,
+                        // On a document with a mechanism the phase drives
+                        // the joints instead, and spinning the active body
+                        // on top of that would be two motions at once. The
+                        // turntable is what a document with no joints gets.
+                        if drives_joints {
+                            0.0
+                        } else {
+                            self.motion.phase
+                        },
                         feature_preview.as_ref(),
                         &sketch_overlays,
                         &selected_sketch_regions,
@@ -17112,6 +17343,7 @@ impl eframe::App for KernelLabApp {
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }
+        self.refresh_kinematics();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

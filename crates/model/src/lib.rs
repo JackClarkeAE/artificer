@@ -9,6 +9,7 @@
 
 pub mod assembly;
 pub mod components;
+pub mod kinematics;
 pub mod parameterized;
 pub mod parameters;
 pub mod persistent;
@@ -6400,6 +6401,208 @@ mod tests {
             })
         );
         assert_eq!(document.to_native(), before_second_parent);
+    }
+
+    fn placed(x: f64, y: f64, z: f64) -> RigidComponentPose {
+        RigidComponentPose::new(
+            ComponentTranslation::new(x, y, z).expect("translation should validate"),
+            CanonicalQuaternion::identity(),
+        )
+    }
+
+    /// A hinge on the world Z axis through the origin, with the door on it.
+    fn hinge_document() -> (
+        ModelDocument,
+        ComponentInstanceId,
+        ComponentInstanceId,
+        JointId,
+    ) {
+        let mut document = ModelDocument::default();
+        let frame = append_component(&mut document, "Frame", 100.0, 1)
+            .created_component_instance
+            .expect("frame should exist");
+        let door = append_component(&mut document, "Door", 80.0, 2)
+            .created_component_instance
+            .expect("door should exist");
+        document
+            .set_component_pose(door, placed(10.0, 0.0, 0.0))
+            .expect("door pose should apply");
+        document
+            .set_component_grounded(frame, true)
+            .expect("the frame is the ground");
+        let hinge = document
+            .add_joint(JointDraft::new(
+                "Hinge",
+                JointParent::Component(frame),
+                door,
+                JointKind::Revolute {
+                    origin: JointOrigin::new(0.0, 0.0, 0.0).expect("origin should validate"),
+                    axis: JointAxis::new(0.0, 0.0, 1.0).expect("axis should normalize"),
+                    limits: None,
+                },
+            ))
+            .expect("hinge should append");
+        (document, frame, door, hinge)
+    }
+
+    #[test]
+    fn a_driven_hinge_carries_its_child_about_the_world_axis_it_was_given() {
+        use kinematics::{JointDriver, solve};
+
+        let (document, frame, door, hinge) = hinge_document();
+
+        // At rest, every component stands exactly where the document
+        // assembled it. That is what makes the assembled document the
+        // thing the drivers move away from.
+        let rest = solve(&document, &[]).expect("a rest pose");
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest.pose(door), Some(placed(10.0, 0.0, 0.0)));
+        assert_eq!(rest.pose(frame), Some(RigidComponentPose::identity()));
+
+        // A quarter turn about world Z carries the door from +x to +y, and
+        // leaves the frame it hangs on where it was.
+        let posed = solve(
+            &document,
+            &[JointDriver::new(hinge, std::f64::consts::FRAC_PI_2)],
+        )
+        .expect("a driven pose");
+        let door_pose = posed.pose(door).expect("the door");
+        assert!(door_pose.translation.x().abs() <= 1.0e-12, "{door_pose:?}");
+        assert!(
+            (door_pose.translation.y() - 10.0).abs() <= 1.0e-12,
+            "{door_pose:?}"
+        );
+        assert_eq!(posed.pose(frame), Some(RigidComponentPose::identity()));
+
+        // The door turned as well as moved: a quarter turn about z is
+        // (cos 45, 0, 0, sin 45), which the canonical form keeps as-is.
+        let half = std::f64::consts::FRAC_PI_4;
+        assert!((door_pose.rotation.w() - half.cos()).abs() <= 1.0e-12);
+        assert!((door_pose.rotation.z() - half.sin()).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn a_joint_carries_the_whole_subtree_below_it() {
+        use kinematics::{JointDriver, solve};
+
+        // A handle fixed to the door: turning the hinge has to take it too,
+        // and turning it about the hinge's line rather than its own.
+        let (mut document, _, door, hinge) = hinge_document();
+        let handle = append_component(&mut document, "Handle", 20.0, 3)
+            .created_component_instance
+            .expect("handle should exist");
+        document
+            .set_component_pose(handle, placed(18.0, 0.0, 0.0))
+            .expect("handle pose should apply");
+        document
+            .add_joint(JointDraft::new(
+                "Handle mount",
+                JointParent::Component(door),
+                handle,
+                JointKind::Fixed,
+            ))
+            .expect("fixed joint should append");
+
+        let posed = solve(
+            &document,
+            &[JointDriver::new(hinge, std::f64::consts::FRAC_PI_2)],
+        )
+        .expect("a driven pose");
+        let handle_pose = posed.pose(handle).expect("the handle");
+        assert!(
+            handle_pose.translation.x().abs() <= 1.0e-12,
+            "{handle_pose:?}"
+        );
+        assert!(
+            (handle_pose.translation.y() - 18.0).abs() <= 1.0e-12,
+            "{handle_pose:?}"
+        );
+
+        // The handle stays 8 mm from the door through the motion, which is
+        // what "fixed" has to mean.
+        let door_pose = posed.pose(door).expect("the door");
+        let gap = (handle_pose.translation.x() - door_pose.translation.x())
+            .hypot(handle_pose.translation.y() - door_pose.translation.y());
+        assert!((gap - 8.0).abs() <= 1.0e-12, "gap {gap}");
+    }
+
+    #[test]
+    fn a_driver_is_refused_by_name_rather_than_clamped_or_ignored() {
+        use kinematics::{JointDriver, KinematicsError, solve};
+
+        let (mut document, frame, door, hinge) = hinge_document();
+        let quarter = std::f64::consts::FRAC_PI_2;
+
+        // Two drivers for one joint is a caller error, not the last one
+        // winning.
+        assert_eq!(
+            solve(
+                &document,
+                &[JointDriver::new(hinge, 0.1), JointDriver::new(hinge, 0.2)]
+            ),
+            Err(KinematicsError::DuplicateDriver(hinge))
+        );
+        assert_eq!(
+            solve(&document, &[JointDriver::new(hinge, f64::NAN)]),
+            Err(KinematicsError::NonFiniteDriver(hinge))
+        );
+
+        // A fixed joint has nothing to drive.
+        let fixed = document
+            .add_joint(JointDraft::new(
+                "Frame fixture",
+                JointParent::World,
+                frame,
+                JointKind::Fixed,
+            ))
+            .expect("world joint should append");
+        assert_eq!(
+            solve(&document, &[JointDriver::new(fixed, 0.1)]),
+            Err(KinematicsError::JointIsFixed(fixed))
+        );
+
+        // A limit is a promise about the mechanism, so a driver past it is
+        // named rather than quietly clamped into range: a sweep that
+        // stopped at the stop would report clearances the mechanism never
+        // reaches.
+        document
+            .remove_joint(hinge)
+            .expect("hinge should be removable");
+        let limited = document
+            .add_joint(JointDraft::new(
+                "Limited hinge",
+                JointParent::Component(frame),
+                door,
+                JointKind::Revolute {
+                    origin: JointOrigin::new(0.0, 0.0, 0.0).expect("origin should validate"),
+                    axis: JointAxis::new(0.0, 0.0, 1.0).expect("axis should normalize"),
+                    limits: Some(
+                        RevoluteLimits::new(0.0, quarter).expect("limits should validate"),
+                    ),
+                },
+            ))
+            .expect("limited hinge should append");
+        assert!(solve(&document, &[JointDriver::new(limited, quarter)]).is_ok());
+        assert_eq!(
+            solve(&document, &[JointDriver::new(limited, quarter + 0.001)]),
+            Err(KinematicsError::OutsideLimits { joint: limited })
+        );
+        assert_eq!(
+            solve(&document, &[JointDriver::new(limited, -0.001)]),
+            Err(KinematicsError::OutsideLimits { joint: limited })
+        );
+
+        // A disabled joint is still a structural edge, but it cannot be
+        // driven, and its child rests where the document assembled it.
+        document
+            .set_joint_enabled(limited, false)
+            .expect("the joint should disable");
+        assert_eq!(
+            solve(&document, &[JointDriver::new(limited, 0.1)]),
+            Err(KinematicsError::JointIsDisabled(limited))
+        );
+        let resting = solve(&document, &[]).expect("a rest pose");
+        assert_eq!(resting.pose(door), Some(placed(10.0, 0.0, 0.0)));
     }
 
     #[test]
