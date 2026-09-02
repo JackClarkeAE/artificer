@@ -144,3 +144,15 @@ fn the_run_button_and_menus_are_reachable() {
     harness.get_by_role_and_label(Role::TextInput, "Script");
     harness.get_by_role_and_label(Role::CheckBox, "Auto-run");
 }
+
+#[test]
+fn clicking_a_named_face_selects_it_and_the_console_names_it() {
+    let mut harness = harness(WELCOME_SCRIPT);
+    settle_past(&mut harness, 0);
+    harness
+        .get_by_role_and_label(Role::Button, "Face flange_top")
+        .click();
+    harness.step();
+    harness.step();
+    harness.get_by_label_contains("Selected face: flange_top · planar, facing up");
+}

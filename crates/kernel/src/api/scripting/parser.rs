@@ -76,6 +76,7 @@ impl Parser {
         match self.peek() {
             Token::Param => self.parse_param_decl(),
             Token::Let => self.parse_let_binding(),
+            Token::For => self.parse_for_loop(),
             _ => {
                 let expr = self.parse_expression()?;
                 if self.peek() == &Token::Semi {
@@ -119,6 +120,44 @@ impl Parser {
             param_type,
             default_value,
             line: decl_line,
+        })
+    }
+
+    fn parse_for_loop(&mut self) -> Result<AstNode, String> {
+        let (line, col) = self.current_span();
+        self.advance(); // 'for'
+        let (name_line, name_col) = self.current_span();
+        let variable = match self.advance() {
+            Token::Ident(s) => s,
+            other => {
+                return Err(format!(
+                    "Expected a loop variable at {name_line}:{name_col}, got {other:?}"
+                ));
+            }
+        };
+        self.expect(Token::In)?;
+        let start = self.parse_expression()?;
+        self.expect(Token::DotDot)?;
+        let end = self.parse_expression()?;
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        while self.peek() != &Token::RBrace {
+            if self.peek() == &Token::Eof {
+                let (eof_line, eof_col) = self.current_span();
+                return Err(format!(
+                    "The loop starting at {line}:{col} has no closing brace at {eof_line}:{eof_col}"
+                ));
+            }
+            body.push(self.parse_statement()?);
+        }
+        self.expect(Token::RBrace)?;
+        Ok(AstNode::For {
+            variable,
+            start,
+            end,
+            body,
+            line,
+            col,
         })
     }
 

@@ -20,12 +20,15 @@ use artificer_kernel::api::commands::ApiCommand;
 use artificer_kernel::api::debug::ApiError;
 use artificer_kernel::api::export::{export_obj, export_stl_binary};
 use artificer_kernel::api::scripting::{
-    ScriptError, ScriptParameter, compile_script, script_parameters,
+    ScriptError, ScriptParameter, compile_program, script_parameters,
 };
+use artificer_kernel::api::selectors::EntitySelector;
 use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, DebugScene, NativeKernel, Snapshot};
 use artificer_protocol::Vector3;
-use artificer_protocol::{Aabb3, DiagnosticSeverity, Point3, TopologyCounts};
+use artificer_protocol::{
+    Aabb3, DiagnosticSeverity, EntityKind, EntityRef, Point3, TopologyCounts,
+};
 use artificer_ui_core::navigation::NavigationPreset;
 use artificer_ui_core::presentation::{ActiveTool, DisplayTransform, SectionCutPlane, ViewState};
 use artificer_ui_core::theme::{self, WorkbenchTheme};
@@ -87,6 +90,35 @@ pub struct StepReport {
     pub notes: Vec<String>,
 }
 
+/// A face of the finished body and the names it answers to.
+///
+/// The first name is the one the script gave it with a `let` bound to a
+/// selector, when there is one; otherwise it is the step and role that
+/// made the face, which `step.face("role")` selects. The description is
+/// read off the geometry so a person can tell which face a name means.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceName {
+    pub entity: EntityRef,
+    /// The script's own name for the face, from `let name = <selector>`.
+    pub script_name: Option<String>,
+    /// `step.role`, from the step that produced the face.
+    pub history_name: String,
+    /// Planar or curved, which way it faces, and where its centre is.
+    pub description: String,
+}
+
+impl FaceName {
+    /// The name to show: the script's, or the history's.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.script_name.as_deref().unwrap_or(&self.history_name)
+    }
+}
+
+/// The face roles one step reported, by `(role, ordinal)`, keyed by the
+/// step's label: the raw material of history names.
+type ReportedRoles = Vec<(String, Vec<(String, Option<u32>)>)>;
+
 /// Why a run stopped short of the end of the script.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunError {
@@ -128,11 +160,19 @@ pub struct RunOutcome {
     /// stays visible up to the step that failed.
     pub snapshot: Option<Snapshot>,
     pub scene: Option<DebugScene>,
+    /// Every face of the finished body with its names, script names first.
+    pub faces: Vec<FaceName>,
     pub elapsed: Duration,
     pub cancelled: bool,
 }
 
 impl RunOutcome {
+    /// The name record of one face of the finished body.
+    #[must_use]
+    pub fn face_name(&self, entity: EntityRef) -> Option<&FaceName> {
+        self.faces.iter().find(|face| face.entity == entity)
+    }
+
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.error.is_none() && !self.cancelled
@@ -163,12 +203,13 @@ fn run_script_generation(
         error: None,
         snapshot: None,
         scene: None,
+        faces: Vec::new(),
         elapsed: Duration::ZERO,
         cancelled: false,
     };
 
-    let commands = match compile_script(source, overrides) {
-        Ok(commands) => commands,
+    let program = match compile_program(source, overrides) {
+        Ok(program) => program,
         Err(error) => {
             outcome.error = Some(RunError::from_script(&error));
             outcome.elapsed = started.elapsed();
@@ -178,16 +219,35 @@ fn run_script_generation(
 
     let mut session = Session::new();
     let mut built_anything = false;
-    for command in commands {
+    // The roles every step reported, for naming faces afterwards.
+    let mut reported: ReportedRoles = Vec::new();
+    for command in program.commands {
         if token.is_cancelled() {
             outcome.cancelled = true;
             break;
         }
+        // An edge finish reports every face of the body under a generic
+        // role; those say nothing about which face is which, so they never
+        // name one. The faces it made keep the fallback name.
+        let edge_finish = matches!(
+            command,
+            ApiCommand::Fillet { .. } | ApiCommand::Chamfer { .. }
+        );
         match session.execute(command.clone(), token) {
             Ok(result) => {
                 if !matches!(command, ApiCommand::Sketch { .. }) {
                     built_anything = true;
                 }
+                reported.push((
+                    result.step_label.clone(),
+                    result
+                        .entities
+                        .values()
+                        .filter(|info| info.kind == EntityKind::Face)
+                        .filter_map(|info| info.role.clone().map(|role| (role, info.ordinal)))
+                        .filter(|(role, _)| !(edge_finish && role == "face"))
+                        .collect(),
+                ));
                 outcome.steps.push(StepReport {
                     label: result.step_label,
                     topology: result.topology,
@@ -213,11 +273,152 @@ fn run_script_generation(
 
     if built_anything && !outcome.cancelled {
         let snapshot = session.snapshot.clone();
-        outcome.scene = Some(NativeKernel::debug_scene(&snapshot));
+        let scene = NativeKernel::debug_scene(&snapshot);
+        outcome.faces = name_faces(&session, &scene, &reported, &program.names);
+        outcome.scene = Some(scene);
         outcome.snapshot = Some(snapshot);
     }
     outcome.elapsed = started.elapsed();
     outcome
+}
+
+/// Names every face of the session's current body.
+///
+/// History names come from the steps in order, so a face carries the name
+/// of the last step that made or reshaped it. Script names come from the
+/// program's selector bindings, resolved against the finished body; a
+/// binding that no longer finds a face, or finds an edge, names nothing.
+fn name_faces(
+    session: &Session,
+    scene: &DebugScene,
+    reported: &ReportedRoles,
+    names: &[(String, EntitySelector)],
+) -> Vec<FaceName> {
+    let query = session.query();
+    let mut history: BTreeMap<u64, String> = BTreeMap::new();
+    for (step, roles) in reported {
+        for (role, ordinal) in roles {
+            // A step reports the faces it carried over as well as the
+            // ones it made; only the makers name a face, and the first
+            // maker wins, so a rim keeps its revolve's name through every
+            // later hole.
+            if role.contains("preserved") {
+                continue;
+            }
+            let selector = match ordinal {
+                Some(ordinal) => {
+                    EntitySelector::history_face_ordinal(step.clone(), role.clone(), *ordinal)
+                }
+                None => EntitySelector::history_face(step.clone(), role.clone()),
+            };
+            if let Ok(info) = query.entity_info(&selector) {
+                let name = match ordinal {
+                    Some(ordinal) => format!("{step}.{role}[{ordinal}]"),
+                    None => format!("{step}.{role}"),
+                };
+                history.entry(info.entity_ref.entity.0).or_insert(name);
+            }
+        }
+    }
+    let mut script: BTreeMap<u64, String> = BTreeMap::new();
+    for (name, selector) in names {
+        if let Ok(info) = query.entity_info(selector)
+            && info.kind == EntityKind::Face
+        {
+            script
+                .entry(info.entity_ref.entity.0)
+                .or_insert_with(|| name.clone());
+        }
+    }
+    let mut faces: Vec<FaceName> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for triangle in &scene.triangles {
+        let entity = triangle.source_face;
+        if !seen.insert(entity.entity.0) {
+            continue;
+        }
+        faces.push(FaceName {
+            entity,
+            script_name: script.get(&entity.entity.0).cloned(),
+            history_name: history
+                .get(&entity.entity.0)
+                .cloned()
+                .unwrap_or_else(|| format!("face {}", entity.entity.0)),
+            description: describe_face(scene, entity),
+        });
+    }
+    // Script names first, then history names, each in name order.
+    faces.sort_by(|a, b| {
+        b.script_name
+            .is_some()
+            .cmp(&a.script_name.is_some())
+            .then_with(|| a.display_name().cmp(b.display_name()))
+    });
+    faces
+}
+
+/// Planar or curved, which way it faces, and where its centre is, read
+/// off the face's facets.
+fn describe_face(scene: &DebugScene, face: EntityRef) -> String {
+    let mut count = 0.0_f64;
+    let mut centre = [0.0_f64; 3];
+    let mut normal = [0.0_f64; 3];
+    let mut first_normal = None::<[f64; 3]>;
+    let mut planar = true;
+    for triangle in scene.triangles.iter().filter(|t| t.source_face == face) {
+        for (vertex, n) in triangle.vertices.iter().zip(triangle.normals.iter()) {
+            count += 1.0;
+            centre[0] += vertex.x;
+            centre[1] += vertex.y;
+            centre[2] += vertex.z;
+            normal[0] += n.x;
+            normal[1] += n.y;
+            normal[2] += n.z;
+            let this = [n.x, n.y, n.z];
+            match first_normal {
+                None => first_normal = Some(this),
+                Some(first) => {
+                    let dot = first[0] * this[0] + first[1] * this[1] + first[2] * this[2];
+                    if dot < 1.0 - 1.0e-6 {
+                        planar = false;
+                    }
+                }
+            }
+        }
+    }
+    if count == 0.0 {
+        return String::new();
+    }
+    let centre = centre.map(|c| c / count);
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    let facing = if planar && length > 1.0e-9 {
+        let unit = normal.map(|n| n / length);
+        let axes = [
+            ("+X", [1.0, 0.0, 0.0]),
+            ("-X", [-1.0, 0.0, 0.0]),
+            ("+Y", [0.0, 1.0, 0.0]),
+            ("-Y", [0.0, -1.0, 0.0]),
+            ("up", [0.0, 0.0, 1.0]),
+            ("down", [0.0, 0.0, -1.0]),
+        ];
+        axes.iter()
+            .find(|(_, axis)| unit[0] * axis[0] + unit[1] * axis[1] + unit[2] * axis[2] > 0.999)
+            .map_or_else(
+                || {
+                    format!(
+                        "planar, normal ({:.2}, {:.2}, {:.2})",
+                        unit[0], unit[1], unit[2]
+                    )
+                },
+                |(word, _)| format!("planar, facing {word}"),
+            )
+    } else {
+        "curved".to_owned()
+    };
+    format!(
+        "{facing}, centre ({:.1}, {:.1}, {:.1})",
+        centre[0], centre[1], centre[2]
+    )
 }
 
 /// The one-based line a step label is declared on, found by its `label:`
@@ -249,7 +450,7 @@ struct Worker {
 // Syntax highlighting
 // ---------------------------------------------------------------------------
 
-const KEYWORDS: &[&str] = &["param", "let", "f64", "true", "false"];
+const KEYWORDS: &[&str] = &["param", "let", "for", "in", "f64", "true", "false"];
 
 /// The builtins the scripting module answers to, highlighted so a typo in a
 /// call name shows before the run does.
@@ -1296,6 +1497,65 @@ impl ScriptStudio {
         ui.separator();
     }
 
+    /// The faces the script named, and every other face by the step that
+    /// made it. Clicking one selects it in the viewport, so a person can
+    /// match a name to a face before asking for a change to it.
+    fn faces_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(outcome) = &self.outcome else {
+            return;
+        };
+        if outcome.faces.is_empty() {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("FACES")
+                .font(FontId::proportional(10.0))
+                .color(theme::muted())
+                .strong(),
+        );
+        ui.add_space(4.0);
+        let mut pick = None;
+        for face in &outcome.faces {
+            let selected = self
+                .selected_face
+                .is_some_and(|selection| selection.face == face.entity);
+            let colour = if face.script_name.is_some() {
+                theme::accent()
+            } else {
+                theme::text()
+            };
+            let row = ui
+                .selectable_label(
+                    selected,
+                    RichText::new(face.display_name()).color(colour).small(),
+                )
+                .on_hover_text(if face.script_name.is_some() {
+                    format!("{}\nalso {}", face.description, face.history_name)
+                } else {
+                    face.description.clone()
+                });
+            row.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    true,
+                    format!("Face {}", face.display_name()),
+                )
+            });
+            if row.clicked() {
+                pick = Some(face.entity);
+            }
+        }
+        if let Some(entity) = pick {
+            self.selected_face = Some(DocumentFaceSelection {
+                body: BODY,
+                face: entity,
+            });
+        }
+        ui.add_space(4.0);
+        ui.separator();
+    }
+
     fn customizer_panel(&mut self, ui: &mut egui::Ui) {
         if self.section.active {
             self.section_panel(ui);
@@ -1323,6 +1583,9 @@ impl ScriptStudio {
                 .color(theme::muted())
                 .small(),
             );
+            ui.add_space(6.0);
+            ui.separator();
+            self.faces_panel(ui);
             return;
         }
         let mut changed = false;
@@ -1391,6 +1654,9 @@ impl ScriptStudio {
         if changed {
             self.run_requested = true;
         }
+        ui.add_space(6.0);
+        ui.separator();
+        self.faces_panel(ui);
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {
@@ -1430,11 +1696,22 @@ impl ScriptStudio {
             }
             if let Some(face) = self.selected_face {
                 ui.separator();
-                ui.label(
-                    RichText::new(format!("face #{}", face.face.entity.0))
-                        .color(theme::accent())
-                        .small(),
-                );
+                let named = self
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.face_name(face.face));
+                let text = match named {
+                    Some(named) => format!("{} · {}", named.display_name(), named.description),
+                    None => format!("face {}", face.face.entity.0),
+                };
+                let label = ui.label(RichText::new(text.clone()).color(theme::accent()).small());
+                label.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        true,
+                        format!("Selected face: {text}"),
+                    )
+                });
             }
         });
         ui.add_space(2.0);
@@ -1705,6 +1982,54 @@ mod tests {
         assert!(outcome.steps.len() >= 3);
         assert!(outcome.scene.is_some());
         assert!(outcome.snapshot.is_some());
+    }
+
+    #[test]
+    fn the_hub_names_its_faces_from_the_script_and_from_history() {
+        let outcome = run_script(WELCOME_SCRIPT, &BTreeMap::new(), &CancellationToken::new());
+        assert!(outcome.succeeded(), "{:?}", outcome.error);
+        let named: Vec<&str> = outcome
+            .faces
+            .iter()
+            .filter_map(|face| face.script_name.as_deref())
+            .collect();
+        assert_eq!(named, ["flange_bottom", "flange_top", "hub_top"]);
+        let flange_top = outcome
+            .faces
+            .iter()
+            .find(|face| face.script_name.as_deref() == Some("flange_top"))
+            .unwrap();
+        assert!(
+            flange_top.description.starts_with("planar, facing up"),
+            "{}",
+            flange_top.description
+        );
+        assert!(
+            flange_top.description.contains("8.0)"),
+            "{}",
+            flange_top.description
+        );
+        // Every face has a history name, and the bolt walls carry their step.
+        assert!(
+            outcome
+                .faces
+                .iter()
+                .all(|face| !face.history_name.is_empty())
+        );
+        assert!(
+            outcome
+                .faces
+                .iter()
+                .any(|face| face.history_name.starts_with("bolt_0.")),
+            "{:?}",
+            outcome
+                .faces
+                .iter()
+                .map(|f| f.history_name.clone())
+                .collect::<Vec<_>>()
+        );
+        // Script names come first in the list.
+        assert!(outcome.faces[0].script_name.is_some());
     }
 
     #[test]

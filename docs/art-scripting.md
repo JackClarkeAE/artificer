@@ -51,6 +51,13 @@ drill(face: plate.face("top_face"), center: [0, 0], diameter: 5, depth: 6, label
 - **Expressions**: numbers (`12`, `1.5`), strings (`"top"`), arrays
   (`[1, 2, 3]`), identifiers, unary minus, `+ - * /`, parentheses, calls and
   methods. `pi` is predefined.
+- **`for name in start..end { ... }`** runs its body once for each whole
+  number from `start` up to but not including `end`. Both bounds are
+  expressions, so a `param` can set the count. A script may run at most
+  10 000 loop iterations in total.
+- **`+` joins text.** When either side is a string, `+` concatenates:
+  `"bolt_" + i` is `bolt_3` for `i = 3` (whole numbers print without a
+  fraction). This is how a loop gives each step its own label.
 - A step is *executed* when it is a statement, whether or not it is bound
   with `let`. A call that only appears inside another call's arguments (a
   `line(...)` inside `sketch(...)`, a `nearest(...)` inside `drill(...)`) is
@@ -362,6 +369,27 @@ roles listed under `box`; drills report `FeatureSide` walls and a
 `FeatureEnd` floor; extrusions report their side and end faces. When a role
 has several entities, `ordinal:` picks one and `.edges(count:)` lists them.
 
+### Naming faces: `let name = <selector>`
+
+```art
+let flange_top = nearest(point: [pitch * cos(between), pitch * sin(between), flange_thickness]);
+let hub_top = faces(">Z");
+```
+
+A top-level `let` bound to a selector is a **named face**. The name works in
+the script wherever a selector does, and it is also reported to the host:
+Script Studio resolves every such name against the finished body, lists
+them in its FACES panel, and shows the name when the face is clicked in the
+viewport, together with a description read off the geometry ("planar,
+facing up, centre (0.4, 0.1, 8.0)"). Faces the script did not name are
+listed by the step and role that made them, such as `hub.face[3]` or
+`bolt_0.face_extrude.pocket.wall_face[2]`, which `hub.face("face", ordinal: 3)`
+would select.
+
+Name every face you expect to talk about. A name is resolved when it is
+used, so it must still find the right face after every earlier step: put
+the reference point of a `nearest` where later holes will not land.
+
 ---
 
 ## 8. Math
@@ -437,6 +465,7 @@ param flange_radius: f64 = 45.0;
 param flange_thickness: f64 = 8.0;
 param bore_diameter: f64 = 12.0;
 param bolt_diameter: f64 = 6.5;
+param bolt_count: f64 = 4;
 
 // One (r, z) section on the XZ plane, with the bore as its inner wall.
 let bore_radius = bore_diameter / 2;
@@ -459,14 +488,21 @@ fillet(edges: [nearest(point: [0, bore_radius, hub_height], kind: "edge"),
                nearest(point: [0, -bore_radius, hub_height], kind: "edge")],
        radius: 1, label: "bore_rim");
 
-// Bolt holes on a pitch circle. The flange top is found by a point on it
-// between two holes, so the selector keeps finding it as holes appear.
+// Named faces, for people and agents to refer to.
+let hub_top = faces(">Z");
+let flange_bottom = faces("<Z");
 let pitch = (hub_radius + flange_radius) / 2;
-let flange_top = nearest(point: [pitch * cos(45), pitch * sin(45), flange_thickness]);
-drill(face: flange_top, center: [pitch * cos(0), pitch * sin(0)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_0");
-drill(face: flange_top, center: [pitch * cos(90), pitch * sin(90)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_1");
-drill(face: flange_top, center: [pitch * cos(180), pitch * sin(180)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_2");
-drill(face: flange_top, center: [pitch * cos(270), pitch * sin(270)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_3");
+let between = 180 / bolt_count;
+let flange_top = nearest(point: [pitch * cos(between), pitch * sin(between), flange_thickness]);
+
+// bolt_count bolt holes on a pitch circle, evenly spaced. The flange top
+// is found by a point between two holes, so it stays findable as holes
+// appear, whatever the count.
+for i in 0..bolt_count {
+    let angle = 360 * i / bolt_count;
+    drill(face: flange_top, center: [pitch * cos(angle), pitch * sin(angle)],
+          diameter: bolt_diameter, depth: flange_thickness, label: "bolt_" + i);
+}
 ```
 
 ### Two bodies joined, then pocketed
@@ -485,7 +521,39 @@ extrude(sketch: pocket, distance: 6, operation: "cut", label: "pocket_cut");
 
 ---
 
-## 11. Writing scripts that work first time
+## 11. Working with a person in the loop
+
+The names in a script are the vocabulary a person and an agent share. The
+intended workflow, with the flanged hub open in Script Studio:
+
+1. The person clicks a face. The console shows its name, `flange_top`, and
+   what it is: planar, facing up, centre at z = 8. The FACES panel lists
+   every name the script gave, and every other face by the step that made
+   it.
+2. The person asks: *"increase the number of bolt holes on `flange_top` to
+   six."*
+3. The agent reads the script, finds the loop that drills on `flange_top`,
+   and sees that its count is the parameter `bolt_count`. It changes
+   `param bolt_count: f64 = 4;` to `6`, or, if the count were a literal,
+   introduces the parameter. Nothing else moves: the reference point for
+   `flange_top` is written in terms of `bolt_count`, so it still lands
+   between holes.
+4. Script Studio re-runs the script on save; the person sees six holes and
+   the same face still named `flange_top`.
+
+For an agent, the rules that make this reliable:
+
+- Address faces by their script names. If a request names a face that has
+  only a history name (`hub.face[3]`), first give it a script name with a
+  `let` and a selector that will keep finding it, then use that name.
+- Prefer changing a `param` to rewriting geometry; add a `param` when a
+  request implies one ("how many", "how thick", "how far apart").
+- Keep every label unique; in a loop, build labels from the loop variable.
+- Preserve the order the script already has, particularly fillets before
+  holes, and re-run before answering: the console names the failing step
+  and line if the change did not build.
+
+## 12. Writing scripts that work first time
 
 - Give every step a label; make labels unique.
 - Prefer a face sketch plus `operation: "add"` or `"cut"` for features on an
@@ -500,7 +568,7 @@ extrude(sketch: pocket, distance: 6, operation: "cut", label: "pocket_cut");
 - Test with `cargo run -p artificer-api-server -- run part.art`; the output
   names the failing step and why.
 
-## 12. Not in 0.2
+## 13. Not in 0.2
 
 Partial revolves, sweeps and lofts between arbitrary sections, shells,
 concave fillets between a boss and its plate, text as sketch geometry from a

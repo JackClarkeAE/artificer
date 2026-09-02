@@ -998,3 +998,48 @@ fn a_direction_selector_prefers_the_face_farthest_along_it() {
     assert_eq!(resolve(&top), resolve(&boss_top), "the boss top is the top");
     assert_eq!(resolve(&bottom), resolve(&plate_bottom));
 }
+
+#[test]
+fn a_for_loop_repeats_steps_with_joined_labels() {
+    use artificer_kernel::api::scripting::compile_program;
+    let script = r#"
+        param holes: f64 = 3;
+        let b = box(size: [60, 20, 10], label: "b");
+        let top = faces(">Z");
+        for i in 0..holes {
+            drill(face: top, center: [(i - 1) * 15, 0], diameter: 4, depth: 5, label: "hole_" + i);
+        }
+    "#;
+    let program = compile_program(script, &BTreeMap::new()).expect("compile");
+    let labels: Vec<&str> = program.commands.iter().map(ApiCommand::label).collect();
+    assert_eq!(labels, ["b", "hole_0", "hole_1", "hole_2"]);
+    assert_eq!(program.names.len(), 1);
+    assert_eq!(program.names[0].0, "top");
+
+    let mut session = Session::new();
+    for command in program.commands {
+        session
+            .execute(command, &CancellationToken::default())
+            .expect("execute");
+    }
+    let volume = session.snapshot.measures().volume;
+    let expected = 60.0 * 20.0 * 10.0 - 3.0 * std::f64::consts::PI * 4.0 * 5.0;
+    assert!(((volume - expected) / expected).abs() < 1.0e-9, "{volume}");
+
+    // Overriding the count re-runs the loop with more holes.
+    let mut overrides = BTreeMap::new();
+    overrides.insert("holes".to_owned(), 2.0);
+    let fewer = compile_script(script, &overrides).expect("compile");
+    assert_eq!(fewer.len(), 3);
+
+    // A runaway range is an error with the loop's location, not a hang.
+    let runaway = "for i in 0..1000000 { let b = box(size: [1, 1, 1], label: \"b\" + i); }";
+    let error = compile_script(runaway, &BTreeMap::new()).expect_err("too many iterations");
+    assert!(error.message().contains("iterations"), "{error}");
+    assert_eq!(error.location(), Some((1, 1)));
+
+    // `+` joins strings and whole numbers without a fraction.
+    let joined = "let b = box(size: [1, 1, 1], label: \"part_\" + 2 * 3 + \"_\" + 0.5);";
+    let commands = compile_script(joined, &BTreeMap::new()).expect("compile");
+    assert_eq!(commands[0].label(), "part_6_0.5");
+}

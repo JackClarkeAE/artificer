@@ -182,46 +182,149 @@ pub fn compile_script(
     source: &str,
     param_overrides: &BTreeMap<String, f64>,
 ) -> Result<Vec<ApiCommand>, ScriptError> {
+    compile_program(source, param_overrides).map(|program| program.commands)
+}
+
+/// A compiled script: its commands, and the names it gave to faces and
+/// edges along the way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptProgram {
+    pub commands: Vec<ApiCommand>,
+    /// Every top-level `let name = <selector>` in script order. A host
+    /// resolves each against the finished body to show the user which face
+    /// or edge the script calls by that name.
+    pub names: Vec<(String, EntitySelector)>,
+}
+
+/// The most loop iterations one script may run in total, so a runaway range
+/// is an error rather than a session that never returns.
+pub const MAX_LOOP_ITERATIONS: usize = 10_000;
+
+/// Evaluates a `.art` script with optional parameter overrides, returning
+/// its commands and the selector names it bound.
+pub fn compile_program(
+    source: &str,
+    param_overrides: &BTreeMap<String, f64>,
+) -> Result<ScriptProgram, ScriptError> {
     let tokens = tokenize(source).map_err(ScriptError::parse)?;
     let mut parser = Parser::new(tokens);
     let ast_nodes = parser.parse_program().map_err(ScriptError::parse)?;
 
     let mut env = prelude();
-    let mut commands = Vec::new();
+    let mut program = ScriptProgram {
+        commands: Vec::new(),
+        names: Vec::new(),
+    };
+    let mut budget = MAX_LOOP_ITERATIONS;
+    run_block(
+        &ast_nodes,
+        param_overrides,
+        &mut env,
+        &mut program,
+        &mut budget,
+        true,
+    )?;
+    Ok(program)
+}
 
-    for node in ast_nodes {
+fn run_block(
+    nodes: &[AstNode],
+    param_overrides: &BTreeMap<String, f64>,
+    env: &mut BTreeMap<String, Value>,
+    program: &mut ScriptProgram,
+    budget: &mut usize,
+    top_level: bool,
+) -> Result<(), ScriptError> {
+    for node in nodes {
         match node {
             AstNode::ParamDecl {
                 name,
                 default_value,
+                line,
                 ..
             } => {
-                let val = if let Some(&override_val) = param_overrides.get(&name) {
+                if !top_level {
+                    return Err(ScriptError::Eval {
+                        message:
+                            "A `param` is declared at the top of the script, not inside a loop"
+                                .to_owned(),
+                        location: Some((*line, 1)),
+                    });
+                }
+                let val = if let Some(&override_val) = param_overrides.get(name) {
                     Value::Number(override_val)
                 } else {
-                    eval_expr(&default_value, &env)?
+                    eval_expr(default_value, env)?
                 };
-                env.insert(name, val);
+                env.insert(name.clone(), val);
             }
             AstNode::LetBinding { name, value } => {
-                let evaluated = eval_expr(&value, &env)?;
-                if let Value::Command(cmd) = &evaluated {
-                    commands.push(cmd.clone());
-                    env.insert(name, Value::Step(StepLabel(cmd.label().to_owned())));
-                } else {
-                    env.insert(name, evaluated);
+                let evaluated = eval_expr(value, env)?;
+                match &evaluated {
+                    Value::Command(cmd) => {
+                        program.commands.push(cmd.clone());
+                        env.insert(name.clone(), Value::Step(StepLabel(cmd.label().to_owned())));
+                    }
+                    Value::Selector(selector) => {
+                        if top_level {
+                            program.names.retain(|(existing, _)| existing != name);
+                            program.names.push((name.clone(), selector.clone()));
+                        }
+                        env.insert(name.clone(), evaluated);
+                    }
+                    _ => {
+                        env.insert(name.clone(), evaluated);
+                    }
                 }
             }
             AstNode::Statement(expr) => {
-                let evaluated = eval_expr(&expr, &env)?;
+                let evaluated = eval_expr(expr, env)?;
                 if let Value::Command(cmd) = evaluated {
-                    commands.push(cmd);
+                    program.commands.push(cmd);
+                }
+            }
+            AstNode::For {
+                variable,
+                start,
+                end,
+                body,
+                line,
+                col,
+            } => {
+                let at = |error: ScriptError| error.at(*line, *col);
+                let start = eval_expr(start, env).map_err(at)?.as_number().map_err(at)?;
+                let end = eval_expr(end, env).map_err(at)?.as_number().map_err(at)?;
+                if start.fract() != 0.0 || end.fract() != 0.0 {
+                    return Err(at(ScriptError::eval(format!(
+                        "A `for` range counts whole numbers; got {start}..{end}"
+                    ))));
+                }
+                let mut index = start;
+                while index < end {
+                    if *budget == 0 {
+                        return Err(at(ScriptError::eval(format!(
+                            "The script runs more than {MAX_LOOP_ITERATIONS} loop iterations"
+                        ))));
+                    }
+                    *budget -= 1;
+                    env.insert(variable.clone(), Value::Number(index));
+                    run_block(body, param_overrides, env, program, budget, false)?;
+                    index += 1.0;
                 }
             }
         }
     }
+    Ok(())
+}
 
-    Ok(commands)
+/// A number as script text: whole numbers without a fraction, so
+/// `"bolt_" + 3` is `bolt_3`.
+fn number_text(number: f64) -> String {
+    if number.fract() == 0.0 && number.abs() < 1.0e15 {
+        format!("{}", number as i64)
+    } else {
+        number.to_string()
+    }
 }
 
 /// The names every script starts with.
@@ -457,8 +560,27 @@ fn eval_expr(expr: &Expression, env: &BTreeMap<String, Value>) -> Result<Value, 
             }
         }
         Expression::BinaryOp { left, op, right } => {
-            let l = eval_expr(left, env)?.as_number()?;
-            let r = eval_expr(right, env)?.as_number()?;
+            let left = eval_expr(left, env)?;
+            let right = eval_expr(right, env)?;
+            // `+` joins text: a string with a string or a number, either
+            // way round, which is how a loop builds its labels.
+            if *op == BinaryOperator::Add
+                && matches!(left, Value::String(_)) | matches!(right, Value::String(_))
+            {
+                let text = |value: &Value| -> Result<String, ScriptError> {
+                    match value {
+                        Value::String(text) => Ok(text.clone()),
+                        Value::Number(number) => Ok(number_text(*number)),
+                        other => Err(ScriptError::eval(format!(
+                            "`+` joins strings and numbers, got {}",
+                            other.describe()
+                        ))),
+                    }
+                };
+                return Ok(Value::String(format!("{}{}", text(&left)?, text(&right)?)));
+            }
+            let l = left.as_number()?;
+            let r = right.as_number()?;
             let res = match op {
                 BinaryOperator::Add => l + r,
                 BinaryOperator::Sub => l - r,

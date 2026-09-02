@@ -16,6 +16,16 @@ pub enum AstNode {
         value: Expression,
     },
     Statement(Expression),
+    /// `for name in start..end { ... }`: the body runs once per whole
+    /// number from `start` up to but not including `end`.
+    For {
+        variable: String,
+        start: Expression,
+        end: Expression,
+        body: Vec<AstNode>,
+        line: usize,
+        col: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

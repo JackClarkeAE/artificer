@@ -34,6 +34,7 @@ This release turns the kernel's scripting language into a product of its own and
 - **Section analysis.** The workbench and Script Studio clip the model to one side of a plane and cap the cut, so the inside of a part can be checked for the solid it should be.
 - **Oblique sections of cylinders are exact.** Angled holes, mitred cylinder ends and oblique cuts of round bodies meet on the ellipse curve through the analytic Boolean engine, with no faceting.
 - **Sketch constraints from the canvas.** Coincident, horizontal, vertical, parallel, perpendicular, equal, tangent and collinear relations are applied by clicking geometry, from a constraint group on the sketch bar.
+- **Named faces and loops, for a person in the loop.** A `let` bound to a selector names a face. Script Studio lists the names, shows one when its face is clicked, and describes the face in plain words, so a request such as "six bolt holes on `flange_top`" needs no guessing. `for` loops with `"bolt_" + i` labels make counts into parameters an agent can change. The agent workflow is written up in the language reference.
 - **Selectors that mean what they say.** `faces(">Z")` is the highest upward face on a stepped part, and the nearest-face selector measures to the surface, so a point placed on a face finds it.
 - **Presentation.** The three origin planes read as translucent datum cards with corner labels; the camera no longer zooms in when an extrusion commits; the outline of a revolved body no longer breaks at its seam.
 
@@ -210,9 +211,13 @@ The third program is for people who would rather type a model than draw one. Scr
 
 *The flanged hub example: the script, the exact model it builds, its parameters as a customizer, and every step in the console.*
 
-![Script Studio section](docs/images/script-studio-section.png)
+![Script Studio section](docs/images/section.png)
 
-*The same part under section analysis, cut through the flange: the bore and the four bolt holes in a solid cap.*
+*The same part under section analysis, cut through the axis: the cut faces are capped, the bore and a bolt hole show in the caps, and the FACES panel lists the names the script gave.*
+
+![Filleted flange](docs/images/fillet.png)
+
+*`filleted_flange.art`: every rim of the hub rounded with exact torus blends, each fillet naming both half-circle edges of its rim.*
 
 </div>
 

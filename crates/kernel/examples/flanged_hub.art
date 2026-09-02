@@ -11,6 +11,7 @@ param flange_radius: f64 = 45.0;
 param flange_thickness: f64 = 8.0;
 param bore_diameter: f64 = 12.0;
 param bolt_diameter: f64 = 6.5;
+param bolt_count: f64 = 4;
 
 // The section: flange along the bottom, hub rising beside the axis, and
 // the bore as the inner wall. Lines chain into one closed loop.
@@ -25,22 +26,30 @@ let section = sketch(on: "XZ", label: "section", entities: [
 ]);
 let hub = revolve(sketch: section, axis: [0, 0, 1], angle: 360, label: "hub");
 
+// Named faces. A `let` bound to a selector names the face it finds, and
+// Script Studio shows that name when the face is clicked, so a request
+// like "six bolt holes on flange_top" needs no guessing about which face.
+let hub_top = faces(">Z");
+let flange_bottom = faces("<Z");
+let pitch = (hub_radius + flange_radius) / 2;
+let between = 180 / bolt_count;
+let flange_top = nearest(point: [pitch * cos(between), pitch * sin(between), flange_thickness]);
+
 // Exact torus blends on the hub's top rim and the bore's rim. A round rim
 // is two half-circle edges, so each fillet names both. These go before the
 // bolt holes: a cut that reaches a blended face falls to the faceted tier.
 fillet(edges: [nearest(point: [0, hub_radius, hub_height], kind: "edge"),
                nearest(point: [0, -hub_radius, hub_height], kind: "edge")],
        radius: 1.5, label: "hub_rim");
-fillet(edges: [nearest(point: [0, bore_diameter / 2, hub_height], kind: "edge"),
-               nearest(point: [0, -bore_diameter / 2, hub_height], kind: "edge")],
+fillet(edges: [nearest(point: [0, bore_radius, hub_height], kind: "edge"),
+               nearest(point: [0, -bore_radius, hub_height], kind: "edge")],
        radius: 1, label: "bore_rim");
 
-// Four bolt holes on the flange, on a pitch circle between hub and rim.
-// The flange top is found by a point on it between two of the holes, so
-// the selector keeps finding the flange after the first hole is cut.
-let pitch = (hub_radius + flange_radius) / 2;
-let flange_top = nearest(point: [pitch * cos(45), pitch * sin(45), flange_thickness], kind: "face");
-drill(face: flange_top, center: [pitch * cos(0), pitch * sin(0)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_0");
-drill(face: flange_top, center: [pitch * cos(90), pitch * sin(90)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_1");
-drill(face: flange_top, center: [pitch * cos(180), pitch * sin(180)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_2");
-drill(face: flange_top, center: [pitch * cos(270), pitch * sin(270)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_3");
+// Bolt holes on a pitch circle, bolt_count of them, evenly spaced. The
+// flange top is found by a point on it between two holes, so the selector
+// keeps finding it as holes appear.
+for i in 0..bolt_count {
+    let angle = 360 * i / bolt_count;
+    drill(face: flange_top, center: [pitch * cos(angle), pitch * sin(angle)],
+          diameter: bolt_diameter, depth: flange_thickness, label: "bolt_" + i);
+}
