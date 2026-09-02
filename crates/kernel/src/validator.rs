@@ -379,6 +379,49 @@ fn validate_geometry(
                     .with_measure(sweep, std::f64::consts::TAU),
                 );
             }
+        } else if let Curve2::Ellipse {
+            u,
+            v,
+            major_radius,
+            minor_radius,
+            ..
+        } = coedge.value.pcurve
+        {
+            let frame_error = (u.x.hypot(u.y) - 1.0)
+                .abs()
+                .max((v.x.hypot(v.y) - 1.0).abs())
+                .max((u.x * v.x + u.y * v.y).abs())
+                .max(((u.x * v.y - u.y * v.x).abs() - 1.0).abs())
+                .max(
+                    if minor_radius > linear_tolerance && major_radius >= minor_radius {
+                        0.0
+                    } else {
+                        linear_tolerance
+                    },
+                );
+            if !frame_error.is_finite() || frame_error > linear_tolerance {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::CurveFrameInvalid,
+                        format!("coedge/{}/pcurve", coedge.id.get()),
+                    )
+                    .with_measure(frame_error, linear_tolerance),
+                );
+            }
+            let sweep =
+                (coedge.value.parameter_range.end - coedge.value.parameter_range.start).abs();
+            if !sweep.is_finite()
+                || sweep <= f64::EPSILON
+                || sweep > std::f64::consts::TAU + linear_tolerance
+            {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::ParameterRangeInvalid,
+                        format!("coedge/{}/parameter-range", coedge.id.get()),
+                    )
+                    .with_measure(sweep, std::f64::consts::TAU),
+                );
+            }
         } else if let Curve2::Harmonic { amplitude, .. } = coedge.value.pcurve {
             // The azimuth is the parameter, so any finite span up to one
             // turn is well-formed; a flat harmonic is a line in disguise.
@@ -1036,6 +1079,41 @@ fn pcurve_locus_error(
             let iso = (endpoints[1].y - endpoints[0].y).abs();
             ring_radius.max(iso).max(sampled_error)
         }
+        (
+            Surface::Plane(plane),
+            Curve2::Ellipse {
+                center: pcenter,
+                u: pu,
+                v: pv,
+                major_radius: pmajor,
+                minor_radius: pminor,
+            },
+            Curve3::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            },
+        ) => {
+            // Same centre, same axes (mapped through the plane), same radii,
+            // same parameter: an affine map of a circle is checked the way a
+            // circle is, with the sampled and tangent errors tying the
+            // parameterization.
+            let mapped_center = plane.evaluate(pcenter);
+            let mapped_u = plane.u * pu.x + plane.v * pu.y;
+            let mapped_v = plane.u * pv.x + plane.v * pv.y;
+            let scale = major_radius.max(pmajor);
+            mapped_center
+                .distance(center)
+                .max((pmajor - major_radius).abs())
+                .max((pminor - minor_radius).abs())
+                .max((mapped_u - u).length() * scale)
+                .max((mapped_v - v).length() * scale)
+                .max((pcurve_delta - edge_delta).abs() * scale)
+                .max(tangent_error)
+                .max(sampled_error)
+        }
         _ => f64::INFINITY,
     };
 
@@ -1097,6 +1175,18 @@ fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
                 coedge.parameter_range.start,
                 coedge.parameter_range.end,
             ),
+            Curve2::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                let sweep = coedge.parameter_range.end - coedge.parameter_range.start;
+                let frame_determinant = u.x * v.y - u.y * v.x;
+                0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
+                    + major_radius * minor_radius * frame_determinant * sweep)
+            }
         };
         area += contribution;
     }
@@ -2198,6 +2288,7 @@ fn cylinder_region_integral(
                     integrand.integrate(range.start, range.end)
                 }
                 Curve2::Circle { .. } => return None,
+                Curve2::Ellipse { .. } => return None,
             };
         }
     }
@@ -2417,6 +2508,35 @@ fn face_parameter_polar_moment(topology: &Topology, face: &Face) -> Option<f64> 
                         }
                     }
                     sum / 4.0
+                }
+                Curve2::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                } => {
+                    // `¼∮|w|²(w × dw)` with `w = c + a cos t u + b sin t v`,
+                    // a trigonometric polynomial of the parameter.
+                    let centre = Point2::new(center.x - origin.x, center.y - origin.y);
+                    let x = TrigPoly::constant(centre.x)
+                        .plus(&TrigPoly::cosine().scaled(major_radius * u.x))
+                        .plus(&TrigPoly::sine().scaled(minor_radius * v.x));
+                    let y = TrigPoly::constant(centre.y)
+                        .plus(&TrigPoly::cosine().scaled(major_radius * u.y))
+                        .plus(&TrigPoly::sine().scaled(minor_radius * v.y));
+                    let dx = TrigPoly::sine()
+                        .scaled(-major_radius * u.x)
+                        .plus(&TrigPoly::cosine().scaled(minor_radius * v.x));
+                    let dy = TrigPoly::sine()
+                        .scaled(-major_radius * u.y)
+                        .plus(&TrigPoly::cosine().scaled(minor_radius * v.y));
+                    let square = x.power(2).plus(&y.power(2));
+                    let turn = x.times(&dy).plus(&y.times(&dx).scaled(-1.0));
+                    square
+                        .times(&turn)
+                        .scaled(0.25)
+                        .integrate(range.start, range.end)
                 }
             };
         }
@@ -2862,6 +2982,39 @@ pub(crate) fn face_parameter_area_and_moment(
                 area += segment_area;
                 moment.x += center.x * segment_area + direction.x * offset_scale;
                 moment.y += center.y * segment_area + direction.y * offset_scale;
+            }
+            if let Curve2::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } = coedge.pcurve
+            {
+                // The exact contour terms of the elliptical arc, `∮x dy`,
+                // `∮½x² dy` and `−∮½y² dx`, integrate in closed form as
+                // trigonometric polynomials of the parameter; the chord's
+                // share, counted above, comes off again.
+                let center = Point2::new(center.x - anchor.x, center.y - anchor.y);
+                let x = TrigPoly::constant(center.x)
+                    .plus(&TrigPoly::cosine().scaled(major_radius * u.x))
+                    .plus(&TrigPoly::sine().scaled(minor_radius * v.x));
+                let y = TrigPoly::constant(center.y)
+                    .plus(&TrigPoly::cosine().scaled(major_radius * u.y))
+                    .plus(&TrigPoly::sine().scaled(minor_radius * v.y));
+                let dx = TrigPoly::sine()
+                    .scaled(-major_radius * u.x)
+                    .plus(&TrigPoly::cosine().scaled(minor_radius * v.x));
+                let dy = TrigPoly::sine()
+                    .scaled(-major_radius * u.y)
+                    .plus(&TrigPoly::cosine().scaled(minor_radius * v.y));
+                let (from, to) = (coedge.parameter_range.start, coedge.parameter_range.end);
+                let exact_area = x.times(&dy).integrate(from, to);
+                let exact_moment_x = x.power(2).times(&dy).scaled(0.5).integrate(from, to);
+                let exact_moment_y = y.power(2).times(&dx).scaled(-0.5).integrate(from, to);
+                area += exact_area - chord_area;
+                moment.x += exact_moment_x - chord_cross * (start.x + end.x) / 6.0;
+                moment.y += exact_moment_y - chord_cross * (start.y + end.y) / 6.0;
             }
             if let Curve2::Harmonic {
                 mean,

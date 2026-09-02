@@ -236,7 +236,8 @@ The dependency rules between these layers are checked by `scripts/check-architec
 - [x] Multi-document workbench, sketch text, drafted extrusion as the first loft rung.
 - [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces; shell.
 - [x] The ellipse curve, first slice: the mitre seam of a fillet turning a sharp corner, so fillets round square holes and L-shaped rims are exact.
-- [ ] Oblique plane sections of cylinders and cones on the same curve: angled holes, mitred pipe ends, pipe tees.
+- [x] Oblique plane sections of cylinders on the same curve, through the analytic Boolean: angled holes, mitred cylinder ends, oblique cuts of round bodies.
+- [ ] Oblique cone sections, and pipe tees (equal cylinders crossing) on the same ellipse.
 - [ ] Native STEP read and write with exact surfaces, IGES import, DXF drawing sheets.
 
 ---

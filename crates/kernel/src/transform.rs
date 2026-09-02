@@ -165,6 +165,17 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                     *amplitude *= transform.scale;
                 }
             }
+            Curve2::Ellipse {
+                center,
+                major_radius,
+                minor_radius,
+                ..
+            } => {
+                center.x *= transform.scale;
+                center.y *= transform.scale;
+                *major_radius *= transform.scale;
+                *minor_radius *= transform.scale;
+            }
         }
     }
     for face in &mut output.faces {

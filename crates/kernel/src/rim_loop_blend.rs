@@ -480,6 +480,7 @@ impl Builder<'_> {
                 let radius = match segment {
                     Segment::Arc { radius, .. } => radius,
                     Segment::Line { .. } => 0.0,
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } => 0.0,
                 };
                 let (u, v) = if mirrored {
                     (Vector2::new(0.0, 1.0), Vector2::new(1.0, 0.0))

@@ -1315,6 +1315,14 @@ fn sampled_loop(profile_loop: &AnalyticLoop, precision: PrecisionPolicy) -> Vec<
                     });
                 }
             }
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                for step in 0..16 {
+                    points.push(SampledLoopPoint {
+                        point: segment.point_at(f64::from(step) / 16.0),
+                        source_curve,
+                    });
+                }
+            }
         }
         previous = Some(*segment);
     }

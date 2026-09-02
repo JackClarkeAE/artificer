@@ -708,8 +708,24 @@ harmonic-bounded cylinder faces), and measures (cylinder faces integrate
 over any parameter region by Green's theorem, with elliptic arc lengths by
 Carlson's forms). Their first consumer is the rim fillet, which now turns a
 sharp reflex corner between two straight runs through the Steinmetz seam,
-so fillets round square holes and L-shaped rims are exact. Oblique plane
-sections (stages 1–4 below) are still to come.
+so fillets round square holes and L-shaped rims are exact.
+
+Status (2026-09-02): the second slice has landed — stages 1 and 2 below
+for cylinders. `surface_intersection` names the oblique plane×cylinder
+ellipse (with the parameter at the cylinder's seam, so both faces part it
+at the same azimuths); `Curve2::Ellipse` is a pcurve on planes; the 2D
+engine's `Segment` carries elliptical chords and harmonic traces, with
+crossings against other carriers bracketed and bisected on the exact
+curves; and the analytic Boolean closes a full-turn section on a cylinder
+face round the outside of its parameter window, in bands between chains,
+so a plane through a whole cylinder is a region rather than a cut line
+there. The face-cut command tries the analytic engine before the faceted
+tier, so an angled bore leaves a box through an ellipse without an
+approximation warning. Gates: the mitred cylinder's volume `πR²·h̄` and
+surface area, an angled hole's volume `πR²·L`, and a later pocket that
+reads the ellipse and harmonic loops back as chords. Oblique cone
+sections (a rational trace in the cone's parameters, not a harmonic) and
+the Steinmetz tee (stage 3) are still to come.
 
 
 **Why ellipses and nothing else:** the intersection of a plane with a

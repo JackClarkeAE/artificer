@@ -524,6 +524,7 @@ fn reversed(segment: Segment) -> Segment {
             start_angle: start_angle + sweep,
             sweep: -sweep,
         },
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
     }
 }
 
@@ -1270,6 +1271,9 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                     role,
                     reversed,
                 );
+            }
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                unreachable!("revolved sections carry lines and arcs only")
             }
         }
     }

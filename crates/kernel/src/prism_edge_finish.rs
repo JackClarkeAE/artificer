@@ -102,6 +102,9 @@ fn mirror_loop(source: &[Segment]) -> Vec<Segment> {
                 start_angle: -(start_angle + sweep),
                 sweep,
             },
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                unreachable!("planar profiles carry lines and arcs only")
+            }
         })
         .collect()
 }
@@ -537,6 +540,9 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                             ArcDirection::Clockwise
                         },
                     },
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                        unreachable!("planar profiles carry lines and arcs only")
+                    }
                 }
             })
             .collect(),

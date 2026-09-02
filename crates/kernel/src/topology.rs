@@ -546,6 +546,16 @@ pub(crate) enum Curve2 {
         amplitude: f64,
         phase: f64,
     },
+    /// `center + major·cos(t)·u + minor·sin(t)·v`: the trace on a plane of
+    /// an oblique section through a cylinder. `u` and `v` are unit and
+    /// perpendicular in parameter space.
+    Ellipse {
+        center: Point2,
+        u: Vector2,
+        v: Vector2,
+        major_radius: f64,
+        minor_radius: f64,
+    },
 }
 
 impl Curve2 {
@@ -584,6 +594,20 @@ impl Curve2 {
                 amplitude,
                 phase,
             } => Point2::new(parameter, mean + amplitude * (parameter - phase).cos()),
+            Self::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                let parameter = parameter.rem_euclid(std::f64::consts::TAU);
+                let (sin, cos) = parameter.sin_cos();
+                Point2::new(
+                    center.x + major_radius * cos * u.x + minor_radius * sin * v.x,
+                    center.y + major_radius * cos * u.y + minor_radius * sin * v.y,
+                )
+            }
         }
     }
 
@@ -600,6 +624,19 @@ impl Curve2 {
             Self::Harmonic {
                 amplitude, phase, ..
             } => Vector2::new(1.0, -amplitude * (parameter - phase).sin()),
+            Self::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => {
+                let (sin, cos) = parameter.sin_cos();
+                Vector2::new(
+                    -major_radius * sin * u.x + minor_radius * cos * v.x,
+                    -major_radius * sin * u.y + minor_radius * cos * v.y,
+                )
+            }
         }
     }
 
@@ -617,6 +654,19 @@ impl Curve2 {
                 amplitude,
                 phase,
             } => mean.is_finite() && amplitude.is_finite() && phase.is_finite(),
+            Self::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                center.is_finite()
+                    && u.is_finite()
+                    && v.is_finite()
+                    && major_radius.is_finite()
+                    && minor_radius.is_finite()
+            }
         }
     }
 }

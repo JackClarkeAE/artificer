@@ -281,6 +281,7 @@ fn project_segment(segment: Segment, frame: Frame, plane: Plane, height: f64) ->
                 sweep,
             }
         }
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other,
     }
 }
 
@@ -1437,6 +1438,9 @@ fn push_boundary_edge(
             },
             parameter_range: ParameterRange::new(start_angle, start_angle + sweep),
         },
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            unreachable!("planar profiles carry lines and arcs only")
+        }
     };
     push_edge(topology, next_id, edge)
 }
@@ -1491,6 +1495,9 @@ fn push_feature_side(
                 Curve2::line_segment([Point2::new(end, distance), Point2::new(start, distance)]),
                 Curve2::line_segment([Point2::new(start, distance), Point2::new(start, 0.0)]),
             )
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            unreachable!("planar profiles carry lines and arcs only")
         }
     };
     let loop_key = push_loop(

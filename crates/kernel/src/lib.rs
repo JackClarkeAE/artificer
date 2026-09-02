@@ -819,48 +819,113 @@ impl NativeKernel {
                                 ),
                             ));
                         }
-                        // Crossing curved voids use the faceted Boolean tier.
-                        // The ordinary display tessellation may contain
-                        // thousands of triangles for a single circle and is
-                        // an unsuitable Boolean operand (two crossed bores
-                        // previously caused explosive BSP fragmentation).
-                        // Bound this construction mesh independently; the
-                        // immutable analytic predecessor remains untouched.
-                        let mut boolean_input = input.clone();
-                        let mut boolean_precision = request.precision;
-                        boolean_precision.max_subdivisions =
-                            boolean_precision.max_subdivisions.min(4);
-                        boolean_input.precision = Some(boolean_precision);
-                        let scene = NativeKernel::authoritative_scene(&boolean_input);
-                        let topology = faceted_boolean::subtract_crossing_profile(
-                            &scene,
-                            *frame,
+                        // A crossing cut whose operands the general analytic
+                        // engine can carry — planes and cylinders, at any
+                        // attitude — is exact there: an angled bore leaves
+                        // through a face as an ellipse, not as facets.
+                        let outward = plane.normal / normal_length;
+                        // The tool occupies the space below the face and
+                        // extrudes back up to it, so its frame must wind
+                        // with the outward normal whichever way the sketch
+                        // frame happens to.
+                        let frame_normal = ProtocolVector3::new(
+                            frame.u.y * frame.v.z - frame.u.z * frame.v.y,
+                            frame.u.z * frame.v.x - frame.u.x * frame.v.z,
+                            frame.u.x * frame.v.y - frame.u.y * frame.v.x,
+                        );
+                        let winds_outward = frame_normal.x * outward.x
+                            + frame_normal.y * outward.y
+                            + frame_normal.z * outward.z
+                            > 0.0;
+                        let (tool_u, tool_v) = if winds_outward {
+                            (frame.u, frame.v)
+                        } else {
+                            (frame.v, frame.u)
+                        };
+                        // The tool overshoots the face a little so its cap
+                        // never lies on the face's own plane, which the
+                        // engine would refuse as coincident contact; the
+                        // overshoot is outside the body and removes nothing.
+                        let overshoot =
+                            (*distance * 0.01).max(request.precision.min_feature_size * 8.0);
+                        let analytic_tool = validate_analytic_profile_extrusion(
+                            PlanarFrame3::new(
+                                ProtocolPoint3::new(
+                                    frame.origin.x - outward.x * *distance,
+                                    frame.origin.y - outward.y * *distance,
+                                    frame.origin.z - outward.z * *distance,
+                                ),
+                                tool_u,
+                                tool_v,
+                            ),
                             profile,
-                            plane.normal / normal_length * -1.0,
-                            *distance,
-                            // NOTE: this is deliberately the request's budget,
-                            // not the clamped `boolean_precision` above, even
-                            // though the comment on that clamp reads as though
-                            // both meshes should share it. Handing the cutter
-                            // the clamped budget halves the fragmentation
-                            // (2959 -> 1551 faces) but drops one bore's panel
-                            // fan below the eight-normal threshold in
-                            // `presentation_prismatic_feature_roles`, so its
-                            // seams stop being recognised as one logical
-                            // cylinder and are drawn as creases instead. Change
-                            // it together with the coplanar merge that removes
-                            // the fan altogether, not before.
+                            *distance + overshoot,
                             request.precision,
                         )
-                        .map_err(|reason| planar_profile_input_error(input.id, reason))?;
-                        certify_faceted_candidate(input.id, &topology, request.precision)?;
-                        // The result is a tessellation, not a certified solid.
-                        // Say so: every other report this kernel publishes means
-                        // "exact", so a caller with no way to tell the
-                        // difference will quote this body's volume as though it
-                        // were.
-                        warnings.push(faceted_cut_warning());
-                        (topology, None, true)
+                        .ok()
+                        .map(|tool| build_analytic_extrusion(&tool));
+                        let exact = analytic_tool.as_ref().and_then(|tool| {
+                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, tool)
+                                .then(|| {
+                                    analytic_boolean::build_analytic_boolean(
+                                        &input.topology,
+                                        tool,
+                                        BooleanOperation::Difference,
+                                        request.precision,
+                                    )
+                                    .ok()
+                                })
+                                .flatten()
+                        });
+                        if let Some(topology) = exact {
+                            // The faces are the engine's own records, matched
+                            // back to history the way every regularized
+                            // Boolean's are.
+                            (topology, None, true)
+                        } else {
+                            // Crossing curved voids use the faceted Boolean tier.
+                            // The ordinary display tessellation may contain
+                            // thousands of triangles for a single circle and is
+                            // an unsuitable Boolean operand (two crossed bores
+                            // previously caused explosive BSP fragmentation).
+                            // Bound this construction mesh independently; the
+                            // immutable analytic predecessor remains untouched.
+                            let mut boolean_input = input.clone();
+                            let mut boolean_precision = request.precision;
+                            boolean_precision.max_subdivisions =
+                                boolean_precision.max_subdivisions.min(4);
+                            boolean_input.precision = Some(boolean_precision);
+                            let scene = NativeKernel::authoritative_scene(&boolean_input);
+                            let topology = faceted_boolean::subtract_crossing_profile(
+                                &scene,
+                                *frame,
+                                profile,
+                                plane.normal / normal_length * -1.0,
+                                *distance,
+                                // NOTE: this is deliberately the request's budget,
+                                // not the clamped `boolean_precision` above, even
+                                // though the comment on that clamp reads as though
+                                // both meshes should share it. Handing the cutter
+                                // the clamped budget halves the fragmentation
+                                // (2959 -> 1551 faces) but drops one bore's panel
+                                // fan below the eight-normal threshold in
+                                // `presentation_prismatic_feature_roles`, so its
+                                // seams stop being recognised as one logical
+                                // cylinder and are drawn as creases instead. Change
+                                // it together with the coplanar merge that removes
+                                // the fan altogether, not before.
+                                request.precision,
+                            )
+                            .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                            certify_faceted_candidate(input.id, &topology, request.precision)?;
+                            // The result is a tessellation, not a certified solid.
+                            // Say so: every other report this kernel publishes means
+                            // "exact", so a caller with no way to tell the
+                            // difference will quote this body's volume as though it
+                            // were.
+                            warnings.push(faceted_cut_warning());
+                            (topology, None, true)
+                        }
                     }
                     Err(PlanarProfileInputError::FaceFeature(
                         FaceFeatureInputError::ProfileOutsideFace,
@@ -929,13 +994,62 @@ impl NativeKernel {
                             FaceExtrusionOperation::Add => BooleanOperation::Union,
                             FaceExtrusionOperation::Cut => BooleanOperation::Difference,
                         };
-                        let topology = match prism_boolean::build_prism_boolean(
+                        // Past the prism reductions, the general analytic
+                        // engine carries any body of planes and cylinders —
+                        // one already bored at an angle, say. Its tool
+                        // overshoots the face so no cap lies on the face's
+                        // own plane; the overshoot lies outside the body for
+                        // a cut and inside it for an add, and changes nothing.
+                        let analytic = || -> Option<Topology> {
+                            let overshoot =
+                                (*distance * 0.01).max(request.precision.min_feature_size * 8.0);
+                            let analytic_origin = match operation {
+                                FaceExtrusionOperation::Cut => tool_origin,
+                                FaceExtrusionOperation::Add => ProtocolPoint3::new(
+                                    tool_origin.x - unit.x * overshoot,
+                                    tool_origin.y - unit.y * overshoot,
+                                    tool_origin.z - unit.z * overshoot,
+                                ),
+                            };
+                            let tool = validate_analytic_profile_extrusion(
+                                PlanarFrame3::new(analytic_origin, frame.u, frame.v),
+                                profile,
+                                *distance + overshoot,
+                                request.precision,
+                            )
+                            .ok()
+                            .map(|tool| build_analytic_extrusion(&tool))?;
+                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool)
+                                .then(|| {
+                                    analytic_boolean::build_analytic_boolean(
+                                        &input.topology,
+                                        &tool,
+                                        boolean_operation,
+                                        request.precision,
+                                    )
+                                    .ok()
+                                })
+                                .flatten()
+                        };
+                        let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
                             &tool,
                             boolean_operation,
                             request.precision,
-                        ) {
+                        );
+                        // An add whose profile misses the face has no
+                        // interface, and stays a refusal; only a cut goes on
+                        // to the general engine.
+                        let analytic_cut = || -> Option<Topology> {
+                            (*operation == FaceExtrusionOperation::Cut)
+                                .then(analytic)
+                                .flatten()
+                        };
+                        let topology = match prism {
                             Ok(topology) => topology,
+                            Err(_) if analytic_cut().is_some() => {
+                                analytic_cut().expect("checked above")
+                            }
                             Err(_) if *operation == FaceExtrusionOperation::Cut => {
                                 let mut boolean_input = input.clone();
                                 let mut boolean_precision = request.precision;
@@ -3768,6 +3882,7 @@ fn tessellate_harmonic_cylinder_face(
                     }
                 }
                 Curve2::Circle { .. } => return None,
+                Curve2::Ellipse { .. } => return None,
             }
         }
         (low.is_finite() && high.is_finite() && high >= low).then_some((low, high))
@@ -5013,6 +5128,15 @@ fn validate_transform_candidate(
             } => vec![
                 center.x.abs() + radius * u.x.hypot(v.x),
                 center.y.abs() + radius * u.y.hypot(v.y),
+            ],
+            Curve2::Ellipse {
+                center,
+                major_radius,
+                minor_radius,
+                ..
+            } => vec![
+                center.x.abs() + major_radius + minor_radius,
+                center.y.abs() + major_radius + minor_radius,
             ],
         };
         endpoints.into_iter().chain(carrier)
@@ -6838,6 +6962,30 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             hash_f64(&mut hasher, coedge.value.parameter_range.start);
             hash_f64(&mut hasher, coedge.value.parameter_range.end);
         }
+        if let Curve2::Ellipse {
+            center,
+            u,
+            v,
+            major_radius,
+            minor_radius,
+        } = coedge.value.pcurve
+        {
+            hasher.update(b"analytic-ellipse-pcurve-v0");
+            for value in [
+                center.x,
+                center.y,
+                u.x,
+                u.y,
+                v.x,
+                v.y,
+                major_radius,
+                minor_radius,
+            ] {
+                hash_f64(&mut hasher, value);
+            }
+            hash_f64(&mut hasher, coedge.value.parameter_range.start);
+            hash_f64(&mut hasher, coedge.value.parameter_range.end);
+        }
     }
     hash_collection_header(&mut hasher, b"loops", topology.loops.len());
     for loop_record in &topology.loops {
@@ -7914,8 +8062,10 @@ mod tests {
                 expected_snapshot: NativeKernel::empty().id(),
                 precision: PrecisionPolicy::default(),
                 command: KernelCommand::MakeRevolvedAnnulus {
+                    // Its caps sit clear of the box's edges, so no cap plane
+                    // runs along an edge the turn below leaves in place.
                     frame: PlanarFrame3::new(
-                        ProtocolPoint3::new(2.0, 2.0, 0.0),
+                        ProtocolPoint3::new(2.0, 2.0, -5.0),
                         ProtocolVector3::new(1.0, 0.0, 0.0),
                         ProtocolVector3::new(0.0, 1.0, 0.0),
                     ),
@@ -7989,8 +8139,12 @@ mod tests {
         );
 
         // Turn the cuboid so no face is perpendicular or parallel to the
-        // cylinder's axis, and the pair genuinely leaves the vocabulary: the
-        // carriers meet in ellipses.
+        // cylinder's axis: the carriers meet in ellipses, which the
+        // vocabulary carries, so the drill is exact. The turn is small
+        // enough that the bore runs from the turned bottom face to the
+        // turned top face without grazing a side, so its axis length is the
+        // box's height over the cosine of the turn (a quaternion of
+        // half-angle 0.15 turns by 0.3).
         let turned = NativeKernel::execute(
             &cuboid,
             &ExecuteRequest {
@@ -8002,7 +8156,7 @@ mod tests {
                     transform: SimilarityTransform3 {
                         translation: ProtocolVector3::new(0.0, 0.0, 0.0),
                         rotation: {
-                            let (sin, cos) = (0.35_f64).sin_cos();
+                            let (sin, cos) = (0.15_f64).sin_cos();
                             RotationQuaternion::new(cos, sin, 0.0, 0.0)
                         },
                         uniform_scale: 1.0,
@@ -8013,13 +8167,52 @@ mod tests {
         )
         .expect("a rotation is always exact")
         .snapshot;
-        let refused = NativeKernel::execute_boolean(
+        let turned_drill = NativeKernel::execute_boolean(
             &turned,
             &upright,
             &boolean_request(&turned, &upright, BooleanOperation::Difference),
             &CancellationToken::new(),
         )
-        .expect_err("an oblique plane through a cylinder is an ellipse");
+        .expect("an oblique bore through a turned box is an exact ellipse pair");
+        assert!(turned_drill.report.warnings.is_empty());
+        assert!(NativeKernel::validate(&turned_drill.snapshot, ValidationProfile::Solid).valid);
+        let expected = 1000.0 - std::f64::consts::PI * 10.0 / (0.3_f64).cos();
+        assert!(
+            ((turned_drill.snapshot.measures().volume - expected) / expected).abs() < 1.0e-9,
+            "turned drill volume {} should equal {expected}",
+            turned_drill.snapshot.measures().volume
+        );
+        // Two cylinders on skew axes meet in a curve no vocabulary here
+        // names, and the refusal says which carriers those are.
+        let skew = NativeKernel::execute(
+            &NativeKernel::empty(),
+            &ExecuteRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                request_id: RequestId::new("boolean-skew-cylinder"),
+                expected_snapshot: NativeKernel::empty().id(),
+                precision: PrecisionPolicy::default(),
+                command: KernelCommand::MakeRevolvedAnnulus {
+                    frame: PlanarFrame3::new(
+                        ProtocolPoint3::new(0.0, -5.0, 5.0),
+                        ProtocolVector3::new(1.0, 0.0, 0.0),
+                        ProtocolVector3::new(0.0, 0.0, 1.0),
+                    ),
+                    inner_radius: 0.0,
+                    outer_radius: 1.5,
+                    height: 20.0,
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .expect("a cylinder along y")
+        .snapshot;
+        let refused = NativeKernel::execute_boolean(
+            &upright,
+            &skew,
+            &boolean_request(&upright, &skew, BooleanOperation::Difference),
+            &CancellationToken::new(),
+        )
+        .expect_err("skew cylinders meet in a quartic");
         assert!(
             refused.diagnostics.iter().any(|diagnostic| {
                 diagnostic.code.as_str() == "BOOLEAN_SURFACE_PAIR_UNSUPPORTED"
@@ -8028,9 +8221,10 @@ mod tests {
         );
         // The refusal names the pair rather than the whole operand.
         assert!(
-            refused.diagnostics.iter().any(|diagnostic| {
-                diagnostic.message.contains("plane") && diagnostic.message.contains("cylinder")
-            }),
+            refused
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.matches("cylinder").count() >= 2 }),
             "the refusal should name the carrier pair: {refused:?}"
         );
     }

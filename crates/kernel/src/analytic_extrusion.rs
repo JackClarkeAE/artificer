@@ -49,19 +49,216 @@ pub(crate) enum Segment {
         start_angle: f64,
         sweep: f64,
     },
+    /// An elliptical arc, `center + major·cos(t)·u + minor·sin(t)·v` with
+    /// `v` the quarter turn left of the unit `u`, from `start_angle` over
+    /// `sweep`: the trace on a plane of an oblique section through a
+    /// cylinder. Sketch profiles never carry one; the analytic Boolean does.
+    Ellipse {
+        center: Point2,
+        u: Point2,
+        major: f64,
+        minor: f64,
+        start: Point2,
+        end: Point2,
+        start_angle: f64,
+        sweep: f64,
+    },
+    /// `(u, mean + amplitude·cos(u − phase))` from `start.x` to `end.x`:
+    /// the trace on a cylinder of an oblique plane section. Direction is the
+    /// sign of `end.x − start.x`.
+    Harmonic {
+        mean: f64,
+        amplitude: f64,
+        phase: f64,
+        start: Point2,
+        end: Point2,
+    },
 }
 
 impl Segment {
     pub(crate) const fn start(self) -> Point2 {
         match self {
-            Self::Line { start, .. } | Self::Arc { start, .. } => start,
+            Self::Line { start, .. }
+            | Self::Arc { start, .. }
+            | Self::Ellipse { start, .. }
+            | Self::Harmonic { start, .. } => start,
         }
     }
 
     pub(crate) const fn end(self) -> Point2 {
         match self {
-            Self::Line { end, .. } | Self::Arc { end, .. } => end,
+            Self::Line { end, .. }
+            | Self::Arc { end, .. }
+            | Self::Ellipse { end, .. }
+            | Self::Harmonic { end, .. } => end,
         }
+    }
+
+    /// The same carrier and span with the endpoints replaced, for welding.
+    pub(crate) const fn with_endpoints(self, start: Point2, end: Point2) -> Self {
+        match self {
+            Self::Line { .. } => Self::Line { start, end },
+            Self::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } => Self::Arc {
+                center,
+                start,
+                end,
+                radius,
+                start_angle,
+                sweep,
+            },
+            Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start_angle,
+                sweep,
+                ..
+            } => Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start,
+                end,
+                start_angle,
+                sweep,
+            },
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                ..
+            } => Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end,
+            },
+        }
+    }
+
+    /// The segment walked the other way.
+    pub(crate) fn reversed(self) -> Self {
+        match self {
+            Self::Line { start, end } => Self::Line {
+                start: end,
+                end: start,
+            },
+            Self::Arc {
+                center,
+                start,
+                end,
+                radius,
+                start_angle,
+                sweep,
+            } => Self::Arc {
+                center,
+                start: end,
+                end: start,
+                radius,
+                start_angle: start_angle + sweep,
+                sweep: -sweep,
+            },
+            Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start,
+                end,
+                start_angle,
+                sweep,
+            } => Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start: end,
+                end: start,
+                start_angle: start_angle + sweep,
+                sweep: -sweep,
+            },
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end,
+            } => Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start: end,
+                end: start,
+            },
+        }
+    }
+
+    /// The point at `fraction` of the way along, in the segment's own
+    /// parameter: chord fraction for a line, angle fraction for an arc or
+    /// ellipse, azimuth fraction for a harmonic.
+    pub(crate) fn point_at(self, fraction: f64) -> Point2 {
+        match self {
+            Self::Line { start, end } => Point2::new(
+                (end.x - start.x).mul_add(fraction, start.x),
+                (end.y - start.y).mul_add(fraction, start.y),
+            ),
+            Self::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } => {
+                let angle = sweep.mul_add(fraction, start_angle);
+                Point2::new(
+                    radius.mul_add(angle.cos(), center.x),
+                    radius.mul_add(angle.sin(), center.y),
+                )
+            }
+            Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start_angle,
+                sweep,
+                ..
+            } => {
+                let angle = sweep.mul_add(fraction, start_angle);
+                let (sin, cos) = angle.sin_cos();
+                let along = major * cos;
+                let across = minor * sin;
+                Point2::new(
+                    center.x + along * u.x - across * u.y,
+                    center.y + along * u.y + across * u.x,
+                )
+            }
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end,
+            } => {
+                let u = (end.x - start.x).mul_add(fraction, start.x);
+                Point2::new(u, mean + amplitude * (u - phase).cos())
+            }
+        }
+    }
+
+    /// Whether the segment's parameter runs the ellipse or harmonic carrier
+    /// backwards, which only matters to consumers that snap onto the carrier.
+    pub(crate) fn is_section_chord(self) -> bool {
+        matches!(self, Self::Ellipse { .. } | Self::Harmonic { .. })
     }
 
     /// Whether two consecutive exact profile pieces sweep the same logical
@@ -115,13 +312,46 @@ impl Segment {
                 0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
                     + radius * radius * sweep)
             }
+            // `½∮(x dy − y dx)` over `C + a cos t U + b sin t V` is the
+            // centre term of an arc plus `ab` in place of `r²`.
+            Self::Ellipse {
+                center,
+                major,
+                minor,
+                sweep,
+                ..
+            } => {
+                0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
+                    + major * minor * sweep)
+            }
+            // `½∫(u v′ − v) du = ½[u v] − ∫v du` by parts, and `∫v du` is
+            // the mean times the span plus the amplitude's sine difference.
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                ..
+            } => {
+                let integral = mean * (end.x - start.x)
+                    + amplitude * ((end.x - phase).sin() - (start.x - phase).sin());
+                0.5 * (end.x * end.y - start.x * start.y) - integral
+            }
         }
     }
 
-    fn length(self) -> f64 {
+    pub(crate) fn length(self) -> f64 {
         match self {
             Self::Line { start, end } => (end.x - start.x).hypot(end.y - start.y),
             Self::Arc { radius, sweep, .. } => radius * sweep.abs(),
+            // A section chord's length is only ever a tolerance scale, so a
+            // fine polyline measures it well enough.
+            Self::Ellipse { .. } | Self::Harmonic { .. } => (0..64)
+                .map(|index| {
+                    let a = self.point_at(f64::from(index) / 64.0);
+                    let b = self.point_at(f64::from(index + 1) / 64.0);
+                    (b.x - a.x).hypot(b.y - a.y)
+                })
+                .sum(),
         }
     }
 
@@ -146,6 +376,40 @@ impl Segment {
                 radius,
                 start_angle,
                 sweep,
+            },
+            Self::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start,
+                end,
+                start_angle,
+                sweep,
+            } => Self::Ellipse {
+                center: shift(center),
+                u,
+                major,
+                minor,
+                start: shift(start),
+                end: shift(end),
+                start_angle,
+                sweep,
+            },
+            // Shifting the azimuth moves the phase with it; shifting the
+            // axial coordinate moves the mean.
+            Self::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end,
+            } => Self::Harmonic {
+                mean: mean - anchor.y,
+                amplitude,
+                phase: phase - anchor.x,
+                start: shift(start),
+                end: shift(end),
             },
         }
     }
@@ -351,6 +615,7 @@ pub(crate) fn reversed_loop(profile_loop: AnalyticLoop) -> AnalyticLoop {
                 start_angle: start_angle + sweep,
                 sweep: -sweep,
             },
+            other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
         })
         .collect();
     AnalyticLoop {
@@ -659,6 +924,9 @@ fn point_segment_distance(point: Point2, segment: Segment) -> f64 {
                     .min((point.x - end.x).hypot(point.y - end.y))
             }
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            sampled_point_distance(point, segment)
+        }
     }
 }
 
@@ -679,8 +947,9 @@ pub(crate) fn topology_loop_segments(
             let start = coedge.pcurve.evaluate(coedge.parameter_range.start);
             let end = coedge.pcurve.evaluate(coedge.parameter_range.end);
             match coedge.pcurve {
-                // A harmonic is a trace on a cylinder, never a planar profile piece.
-                Curve2::Harmonic { .. } => None,
+                // Section traces are never planar profile pieces; the
+                // analytic Boolean reads them through `topology_loop_chords`.
+                Curve2::Harmonic { .. } | Curve2::Ellipse { .. } => None,
                 Curve2::Line { .. } => Some(Segment::Line { start, end }),
                 Curve2::Circle {
                     center,
@@ -705,6 +974,230 @@ pub(crate) fn topology_loop_segments(
             }
         })
         .collect()
+}
+
+/// A face loop as exact segments, section traces included: what the
+/// analytic Boolean reads, so a body that already carries an oblique cut
+/// can be cut again.
+pub(crate) fn topology_loop_chords(topology: &Topology, loop_key: LoopKey) -> Option<Vec<Segment>> {
+    let profile_loop = topology.loop_record(loop_key)?;
+    profile_loop
+        .value
+        .coedges
+        .iter()
+        .map(|coedge_key| {
+            let coedge = &topology.coedge(*coedge_key)?.value;
+            let range = coedge.parameter_range;
+            let start = coedge.pcurve.evaluate(range.start);
+            let end = coedge.pcurve.evaluate(range.end);
+            match coedge.pcurve {
+                Curve2::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                } => Some(Segment::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                    start,
+                    end,
+                }),
+                Curve2::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                } => {
+                    // The stored frame may be left- or right-handed; the
+                    // chord's `v` is always the left quarter turn of `u`, so a
+                    // right-handed frame walks the parameter backwards.
+                    let determinant = u.x * v.y - u.y * v.x;
+                    if determinant == 0.0 {
+                        return None;
+                    }
+                    let (start_angle, sweep) = if determinant > 0.0 {
+                        (range.start, range.end - range.start)
+                    } else {
+                        (-range.start, -(range.end - range.start))
+                    };
+                    Some(Segment::Ellipse {
+                        center,
+                        u: Point2::new(u.x, u.y),
+                        major: major_radius,
+                        minor: minor_radius,
+                        start,
+                        end,
+                        start_angle,
+                        sweep,
+                    })
+                }
+                Curve2::Line { .. } | Curve2::Circle { .. } => {
+                    topology_loop_segments_one(coedge, start, end)
+                }
+            }
+        })
+        .collect()
+}
+
+/// One line or circle coedge as a segment; shared by both loop readers.
+fn topology_loop_segments_one(
+    coedge: &crate::topology::Coedge,
+    start: Point2,
+    end: Point2,
+) -> Option<Segment> {
+    match coedge.pcurve {
+        Curve2::Line { .. } => Some(Segment::Line { start, end }),
+        Curve2::Circle {
+            center,
+            u,
+            v,
+            radius,
+        } => {
+            let determinant = u.x * v.y - u.y * v.x;
+            if determinant == 0.0 {
+                return None;
+            }
+            Some(Segment::Arc {
+                center,
+                start,
+                end,
+                radius,
+                start_angle: (start.y - center.y).atan2(start.x - center.x),
+                sweep: (coedge.parameter_range.end - coedge.parameter_range.start)
+                    * determinant.signum(),
+            })
+        }
+        Curve2::Harmonic { .. } | Curve2::Ellipse { .. } => None,
+    }
+}
+
+/// The fractions in `(0, 1)` at which a section chord's ordinate turns,
+/// so the chord splits into y-monotone pieces for ray casting.
+fn section_turning_fractions(segment: Segment) -> Vec<f64> {
+    let mut fractions = Vec::new();
+    let mut keep = |fraction: f64| {
+        if fraction > 1.0e-12 && fraction < 1.0 - 1.0e-12 {
+            fractions.push(fraction);
+        }
+    };
+    match segment {
+        Segment::Ellipse {
+            u,
+            major,
+            minor,
+            start_angle,
+            sweep,
+            ..
+        } => {
+            // `y(θ) = c + a·u.y·cos θ + b·u.x·sin θ` turns where its
+            // derivative `−a·u.y·sin θ + b·u.x·cos θ` vanishes.
+            let turn = (minor * u.x).atan2(major * u.y);
+            let low = start_angle.min(start_angle + sweep);
+            let high = start_angle.max(start_angle + sweep);
+            let first = ((low - turn) / std::f64::consts::PI).floor() as i64 - 1;
+            let last = ((high - turn) / std::f64::consts::PI).ceil() as i64 + 1;
+            for k in first..=last {
+                let angle = (k as f64).mul_add(std::f64::consts::PI, turn);
+                keep((angle - start_angle) / sweep);
+            }
+        }
+        Segment::Harmonic {
+            phase, start, end, ..
+        } => {
+            let span = end.x - start.x;
+            let low = start.x.min(end.x);
+            let high = start.x.max(end.x);
+            let first = ((low - phase) / std::f64::consts::PI).floor() as i64 - 1;
+            let last = ((high - phase) / std::f64::consts::PI).ceil() as i64 + 1;
+            for k in first..=last {
+                let azimuth = (k as f64).mul_add(std::f64::consts::PI, phase);
+                keep((azimuth - start.x) / span);
+            }
+        }
+        Segment::Line { .. } | Segment::Arc { .. } => {}
+    }
+    fractions.sort_by(f64::total_cmp);
+    fractions.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12);
+    fractions
+}
+
+/// Rightward ray crossings of a section chord, by the endpoint-straddle rule
+/// on each of its y-monotone pieces. The stored endpoints bound the outer
+/// pieces bit for bit, as the line and arc arms' do, and the crossing
+/// abscissa on a monotone piece is found by bisection on the parameter.
+fn section_ray_crossings(point: Point2, segment: Segment) -> usize {
+    let mut bounds = vec![0.0];
+    bounds.extend(section_turning_fractions(segment));
+    bounds.push(1.0);
+    let mut crossings = 0;
+    for pair in bounds.windows(2) {
+        let (from_fraction, to_fraction) = (pair[0], pair[1]);
+        let from = if from_fraction == 0.0 {
+            segment.start()
+        } else {
+            segment.point_at(from_fraction)
+        };
+        let to = if to_fraction == 1.0 {
+            segment.end()
+        } else {
+            segment.point_at(to_fraction)
+        };
+        if (from.y > point.y) == (to.y > point.y) {
+            continue;
+        }
+        let (mut low, mut high) = (from_fraction, to_fraction);
+        let rising = to.y > from.y;
+        for _ in 0..80 {
+            let middle = 0.5 * (low + high);
+            let sample = segment.point_at(middle);
+            if (sample.y > point.y) == rising {
+                high = middle;
+            } else {
+                low = middle;
+            }
+        }
+        let x = segment.point_at(0.5 * (low + high)).x;
+        if x > point.x {
+            crossings += 1;
+        }
+    }
+    crossings
+}
+
+/// Distance from a point to a section chord, through a fine polyline.
+fn sampled_point_distance(point: Point2, segment: Segment) -> f64 {
+    (0..64)
+        .map(|step| {
+            let a = segment.point_at(f64::from(step) / 64.0);
+            let b = segment.point_at(f64::from(step + 1) / 64.0);
+            point_segment_distance(point, Segment::Line { start: a, end: b })
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Whether two segments meet, with at least one a section chord, judged on
+/// fine polylines.
+fn sampled_segments_intersect(first: Segment, second: Segment, tolerance: f64) -> bool {
+    let polyline = |segment: Segment| -> Vec<Segment> {
+        if segment.is_section_chord() {
+            (0..64)
+                .map(|step| Segment::Line {
+                    start: segment.point_at(f64::from(step) / 64.0),
+                    end: segment.point_at(f64::from(step + 1) / 64.0),
+                })
+                .collect()
+        } else {
+            vec![segment]
+        }
+    };
+    let firsts = polyline(first);
+    let seconds = polyline(second);
+    firsts.iter().any(|a| {
+        seconds
+            .iter()
+            .any(|b| segments_intersect(*a, *b, tolerance))
+    })
 }
 
 pub(crate) fn segment_clearance(first: Segment, second: Segment) -> f64 {
@@ -792,6 +1285,8 @@ pub(crate) fn segment_clearance(first: Segment, second: Segment) -> f64 {
             }
         }
         (Segment::Line { .. }, Segment::Line { .. }) => {}
+        (Segment::Ellipse { .. } | Segment::Harmonic { .. }, _)
+        | (_, Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {}
     }
     minimum
 }
@@ -870,6 +1365,9 @@ pub(crate) fn point_inside_loop(point: Point2, profile_loop: &AnalyticLoop) -> b
                         }
                     }
                 }
+            }
+            section @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
+                crossings += section_ray_crossings(point, section);
             }
         }
     }
@@ -978,6 +1476,7 @@ fn segments_intersect(first: Segment, second: Segment, tolerance: f64) -> bool {
         (first @ Segment::Arc { .. }, second @ Segment::Arc { .. }) => {
             arcs_intersect(first, second, tolerance)
         }
+        _ => sampled_segments_intersect(first, second, tolerance),
     }
 }
 
@@ -1016,6 +1515,7 @@ fn adjacent_has_extra_contact(
                 .into_iter()
                 .any(away_from_allowed)
         }
+        _ => false,
     }
 }
 
@@ -1456,6 +1956,9 @@ pub(crate) fn push_boundary_edge(
             },
             parameter_range: ParameterRange::new(start_angle, start_angle + sweep),
         },
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            unreachable!("planar profiles carry lines and arcs only")
+        }
     };
     push_edge(topology, next_id, edge)
 }
@@ -1511,6 +2014,9 @@ pub(crate) fn cap_pcurve(segment: Segment, swap: bool, reverse: bool) -> (Curve2
                 },
                 if reverse { range.reversed() } else { range },
             )
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            unreachable!("planar profiles carry lines and arcs only")
         }
     }
 }
@@ -1623,6 +2129,9 @@ fn push_side_face(
                     Point2::new(start, 0.0),
                 ]),
             )
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            unreachable!("planar profiles carry lines and arcs only")
         }
     };
     let loop_key = push_loop(
