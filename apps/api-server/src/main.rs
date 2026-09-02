@@ -7,7 +7,9 @@ use std::process::ExitCode;
 use artificer_kernel::CancellationToken;
 use artificer_kernel::api::decompile::DecompileOptions;
 use artificer_kernel::api::diff::ScriptDiff;
-use artificer_kernel::api::export::{export_obj, export_stl_binary};
+use artificer_kernel::api::export::{
+    export_obj, export_step, export_step_faceted, export_stl_binary,
+};
 use artificer_kernel::api::scripting::{FileModules, compile_program_with, script_parameters};
 use artificer_kernel::api::server::serve_stdio;
 use artificer_kernel::api::session::Session;
@@ -23,7 +25,8 @@ COMMANDS:
     report <script.art>           Execute an .art script and print the session report as JSON
     params <script.art>           List the script's parameters without running it
     snapshot <script.art> <out>   Render an SVG visual snapshot of the script
-    export <script.art> <out>     Export 3D geometry (.stl or .obj)
+    export <script.art> <out>     Export 3D geometry: .stl, .obj, or .step (exact B-rep;
+                                  --faceted for the triangle surface model instead)
     journal <journal.json>        Replay a saved command journal; --art <out.art> writes it
                                   back as a script
     diff <a.art> <b.art>          Semantic diff of two scripts: parameters, steps and names;
@@ -55,6 +58,7 @@ struct Flags {
     params: BTreeMap<String, f64>,
     view: StandardView,
     json: bool,
+    faceted: bool,
     module_path: Vec<PathBuf>,
 }
 
@@ -64,6 +68,7 @@ impl Default for Flags {
             params: BTreeMap::new(),
             view: StandardView::Isometric,
             json: false,
+            faceted: false,
             module_path: Vec::new(),
         }
     }
@@ -215,14 +220,36 @@ fn run_app() -> Result<(), Box<dyn Error>> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("stl");
 
+            let name = Path::new(&script_path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("model");
             match ext {
                 "stl" => {
                     let bytes = export_stl_binary(&session.snapshot)?;
                     fs::write(&out_path, bytes)?;
                 }
                 "obj" => {
-                    let obj = export_obj(&session.snapshot, "model")?;
+                    let obj = export_obj(&session.snapshot, name)?;
                     fs::write(&out_path, obj)?;
+                }
+                "step" | "stp" => {
+                    // Exact B-rep unless the caller asked for facets.
+                    let step = if flags.faceted {
+                        export_step_faceted(&session.snapshot, name)
+                    } else {
+                        export_step(&session.snapshot, name)?
+                    };
+                    fs::write(&out_path, step)?;
+                    println!(
+                        "Exported {} STEP to {out_path}",
+                        if flags.faceted {
+                            "faceted"
+                        } else {
+                            "exact B-rep"
+                        }
+                    );
+                    return Ok(());
                 }
                 other => {
                     return Err(format!("Unsupported export format: .{other}").into());
@@ -334,6 +361,7 @@ fn parse_flags(args: impl Iterator<Item = String>) -> Result<Flags, Box<dyn Erro
                 };
             }
             "--json" => flags.json = true,
+            "--faceted" => flags.faceted = true,
             "--module-path" => {
                 let Some(directory) = iter.next() else {
                     return Err("--module-path requires a directory".into());

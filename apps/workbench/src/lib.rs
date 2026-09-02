@@ -103,6 +103,7 @@ use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
     paint_tool_icon,
 };
+use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
 
 use crate::theme::install_style;
 const ORIGIN_PLANE_HALF_EXTENT_MM: f64 = 25.0;
@@ -1529,22 +1530,53 @@ enum Attempt {
 /// What an open Export dialog is about to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportSubject {
-    Body { ordinal: u32, step: bool },
+    Body { ordinal: u32, format: BodyExport },
     Sketch { index: usize, ordinal: u32 },
-    Document { step: bool },
+    Document { format: BodyExport },
+}
+
+/// The three ways a body leaves the workbench.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyExport {
+    /// The committed tessellation as ASCII STL.
+    Stl,
+    /// The exact B-rep as AP214 `advanced_brep_shape_representation`: every
+    /// analytic face and curve as itself, through the kernel's exporter.
+    StepExact,
+    /// The committed tessellation as an AP214 faceted surface model.
+    StepFaceted,
+}
+
+impl BodyExport {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Stl => "stl",
+            Self::StepExact | Self::StepFaceted => "step",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stl => "STL",
+            Self::StepExact => "STEP (exact B-rep)",
+            Self::StepFaceted => "STEP (faceted)",
+        }
+    }
 }
 
 impl ExportSubject {
     const fn extension(self) -> &'static str {
         match self {
-            Self::Body { step: true, .. } | Self::Document { step: true } => "step",
-            Self::Body { step: false, .. } | Self::Document { step: false } => "stl",
+            Self::Body { format, .. } | Self::Document { format } => format.extension(),
             Self::Sketch { .. } => "dxf",
         }
     }
 
     fn title(self) -> String {
-        let format = self.extension().to_ascii_uppercase();
+        let format = match self {
+            Self::Body { format, .. } | Self::Document { format } => format.label().to_owned(),
+            Self::Sketch { .. } => "DXF".to_owned(),
+        };
         match self {
             Self::Body { ordinal, .. } => format!("EXPORT BODY {ordinal} AS {format}"),
             Self::Sketch { ordinal, .. } => format!("EXPORT SKETCH {ordinal} AS {format}"),
@@ -10771,15 +10803,37 @@ impl KernelLabApp {
                     .on_hover_text("Choose where to write an STL of the visible bodies")
                     .clicked()
                 {
-                    self.open_export_dialog(ExportSubject::Document { step: false });
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::Stl,
+                    });
                     ui.close();
                 }
                 if ui
-                    .add_enabled(!operation_pending, egui::Button::new("Export as STEP…"))
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Export as STEP (exact B-rep)…"),
+                    )
+                    .on_hover_text(
+                        "Choose where to write the visible bodies as exact analytic B-rep: every face and curve as itself, nothing tessellated",
+                    )
+                    .clicked()
+                {
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::StepExact,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Export as STEP (faceted)…"),
+                    )
                     .on_hover_text("Choose where to write a faceted STEP of the visible bodies")
                     .clicked()
                 {
-                    self.open_export_dialog(ExportSubject::Document { step: true });
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::StepFaceted,
+                    });
                     ui.close();
                 }
                 ui.separator();
@@ -11289,7 +11343,62 @@ impl KernelLabApp {
         if !self.bodies.iter().any(|body| body.ordinal == ordinal) {
             return;
         }
-        self.open_export_dialog(ExportSubject::Body { ordinal, step });
+        // STEP from a body's own row is the exact B-rep; the faceted
+        // variant is a document-level choice for mesh consumers.
+        let format = if step {
+            BodyExport::StepExact
+        } else {
+            BodyExport::Stl
+        };
+        self.open_export_dialog(ExportSubject::Body { ordinal, format });
+    }
+
+    /// Writes the bodies `include` admits as exact STEP, each in its
+    /// occurrence's position.
+    fn export_exact_step_to_path(
+        &self,
+        path: &Path,
+        include: impl Fn(&WorkbenchBody) -> bool,
+    ) -> Result<(), String> {
+        let bodies: Vec<(&Snapshot, String, StepPlacement)> = self
+            .bodies
+            .iter()
+            .filter(|body| include(body))
+            .map(|body| {
+                let placement = self.occurrence_transform_for_body(body.id);
+                let origin = placement.transform_point(Point3::new(0.0, 0.0, 0.0));
+                let image = |x: f64, y: f64, z: f64| {
+                    let point = placement.transform_point(Point3::new(x, y, z));
+                    [point.x - origin.x, point.y - origin.y, point.z - origin.z]
+                };
+                (
+                    &body.body.snapshot,
+                    format!("Body {}", body.ordinal),
+                    StepPlacement {
+                        columns: [
+                            image(1.0, 0.0, 0.0),
+                            image(0.0, 1.0, 0.0),
+                            image(0.0, 0.0, 1.0),
+                        ],
+                        translation: [origin.x, origin.y, origin.z],
+                    },
+                )
+            })
+            .collect();
+        if bodies.is_empty() {
+            return Err("no body to export".into());
+        }
+        let placed: Vec<(&Snapshot, &str, StepPlacement)> = bodies
+            .iter()
+            .map(|(snapshot, name, placement)| (*snapshot, name.as_str(), *placement))
+            .collect();
+        let product = self
+            .document_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Artificer");
+        let text = export_step_bodies_placed(&placed, product).map_err(|error| error.message)?;
+        export::atomic_write(path, text.as_bytes())
     }
 
     /// Opens the Export dialog on a chosen destination.
@@ -11326,32 +11435,36 @@ impl KernelLabApp {
             return;
         }
         let written = match subject {
-            ExportSubject::Body { ordinal, step } => {
+            ExportSubject::Body { ordinal, format } => {
                 let body_id = self
                     .bodies
                     .iter()
                     .find(|body| body.ordinal == ordinal)
                     .map(|body| body.id);
                 match body_id {
-                    Some(body_id) => {
-                        let triangles = self.export_triangles_for(|body| body.id == body_id);
-                        if step {
-                            write_faceted_step(&path, &triangles)
-                        } else {
-                            write_ascii_stl(&path, &triangles)
+                    Some(body_id) => match format {
+                        BodyExport::StepExact => {
+                            self.export_exact_step_to_path(&path, |body| body.id == body_id)
                         }
-                    }
+                        BodyExport::StepFaceted => write_faceted_step(
+                            &path,
+                            &self.export_triangles_for(|body| body.id == body_id),
+                        ),
+                        BodyExport::Stl => write_ascii_stl(
+                            &path,
+                            &self.export_triangles_for(|body| body.id == body_id),
+                        ),
+                    },
                     None => Err("that body is no longer in the document".into()),
                 }
             }
-            ExportSubject::Document { step } => {
-                let triangles = self.committed_export_triangles();
-                if step {
-                    write_faceted_step(&path, &triangles)
-                } else {
-                    write_ascii_stl(&path, &triangles)
+            ExportSubject::Document { format } => match format {
+                BodyExport::StepExact => self.export_exact_step_to_path(&path, |body| body.visible),
+                BodyExport::StepFaceted => {
+                    write_faceted_step(&path, &self.committed_export_triangles())
                 }
-            }
+                BodyExport::Stl => write_ascii_stl(&path, &self.committed_export_triangles()),
+            },
             ExportSubject::Sketch { index, .. } => match self.sketch_export_curves(index) {
                 Some(curves) => export::write_sketch_dxf(&path, &curves),
                 None => Err("that sketch is no longer in the document".into()),
@@ -12099,20 +12212,47 @@ impl KernelLabApp {
                             .desired_width(f32::INFINITY),
                     );
                     let step_path = PathBuf::from(self.step_export_path_text.trim());
-                    if ui
-                        .add_enabled(!operation_pending, egui::Button::new("Export faceted STEP"))
-                        .clicked()
-                    {
-                        self.document_status = Some(
-                            self.export_step_to_path(&step_path).map_or_else(
-                                |error| format!("STEP export failed: {error}"),
-                                |()| format!("Exported faceted STEP to {}", step_path.display()),
-                            ),
-                        );
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !operation_pending,
+                                egui::Button::new("Export STEP (exact B-rep)"),
+                            )
+                            .clicked()
+                        {
+                            self.document_status = Some(
+                                self.export_exact_step_to_path(&step_path, |body| body.visible)
+                                    .map_or_else(
+                                        |error| format!("STEP export failed: {error}"),
+                                        |()| {
+                                            format!(
+                                                "Exported exact STEP to {}",
+                                                step_path.display()
+                                            )
+                                        },
+                                    ),
+                            );
+                        }
+                        if ui
+                            .add_enabled(
+                                !operation_pending,
+                                egui::Button::new("Export STEP (faceted)"),
+                            )
+                            .clicked()
+                        {
+                            self.document_status = Some(
+                                self.export_step_to_path(&step_path).map_or_else(
+                                    |error| format!("STEP export failed: {error}"),
+                                    |()| {
+                                        format!("Exported faceted STEP to {}", step_path.display())
+                                    },
+                                ),
+                            );
+                        }
+                    });
                     ui.label(
                         RichText::new(
-                            "STL and this first STEP exporter use the committed visible tessellation in millimetres; previews are never exported.",
+                            "Exact STEP writes every analytic face and curve as itself; STL and faceted STEP use the committed visible tessellation. All in millimetres; previews are never exported.",
                         )
                         .small()
                         .color(theme::muted()),

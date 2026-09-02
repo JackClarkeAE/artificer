@@ -16,7 +16,7 @@ use crate::api::commands::ApiCommand;
 use crate::api::debug::ApiError;
 use crate::api::decompile::DecompileOptions;
 use crate::api::diff::ScriptDiff;
-use crate::api::export::{export_obj, export_stl_ascii};
+use crate::api::export::{export_obj, export_step, export_step_faceted, export_stl_ascii};
 use crate::api::probe::{ProbeRequest, probe};
 use crate::api::query::MeasureTarget;
 use crate::api::scripting::{InlineModules, compile_program_with, script_parameters};
@@ -481,6 +481,14 @@ impl SharedSession {
                 Ok(obj) => JsonRpcResponse::ok(id, serde_json::Value::String(obj)),
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
+            "export.step" => match export_step(&session.snapshot, "model") {
+                Ok(step) => JsonRpcResponse::ok(id, serde_json::Value::String(step)),
+                Err(error) => JsonRpcResponse::api_error(id, &error),
+            },
+            "export.step_faceted" => JsonRpcResponse::ok(
+                id,
+                serde_json::Value::String(export_step_faceted(&session.snapshot, "model")),
+            ),
             unknown => JsonRpcResponse::err(
                 id,
                 METHOD_NOT_FOUND,

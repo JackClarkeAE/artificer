@@ -1032,7 +1032,7 @@ fn radial_component(vector: Vector3, axis: Vector3) -> Vector3 {
 /// revolved surfaces all reduce to this one factor: `∂P/∂u × ∂P/∂v` differs
 /// from the geometric radial direction by exactly `angular_sign` times the
 /// handedness of the surface's own frame.
-fn frame_orientation(
+pub(crate) fn frame_orientation(
     radial_u: Vector3,
     radial_v: Vector3,
     axis: Vector3,

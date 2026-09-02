@@ -218,7 +218,34 @@ tool. The workbench's own document model is not yet bridged to the API
 journal, so a document built interactively reaches the studio through the
 JSON-RPC server or the command line rather than directly.
 
-## 6. Not in this release
+## 6. Exact STEP
+
+`artificer-api export part.art part.step` writes the body as AP214
+`advanced_brep_shape_representation`: every face keeps its analytic
+carrier (plane, cylinder, cone, sphere, torus as the five STEP elementary
+surfaces), every edge its exact curve (`line`, `circle`, `ellipse`), every
+coedge an `oriented_edge`, cavities as `brep_with_voids`, in millimetres.
+Nothing is tessellated, so a reader recovers the volume and area the
+kernel measures. `--faceted` writes the display triangles as a STEP
+surface model instead, for mesh consumers. Over JSON-RPC the methods are
+`export.step` and `export.step_faceted`; in Rust, `export_step`,
+`export_step_bodies` (several bodies as one product) and
+`export_step_faceted`. The workbench's Export dialog offers "STEP (exact
+B-rep)" and "STEP (faceted)".
+
+The exporter's own test reads every fixture back as a B-rep: references
+resolve, loops chain and close, every edge is used by exactly two faces in
+opposite senses, every vertex lies on its edge's curve, and every face's
+`same_sense` agrees with the kernel's outward normal at the face centre.
+The independent check is the OpenCascade oracle of ADR 0001:
+`tools/oracle-occt/step_measure.py` imports a file with OCCT and prints
+its volume and area, and with `ARTIFICER_STEP_ORACLE` pointing at it the
+test compares them with the kernel's exact measures at one part in a
+billion, over a fixture set covering every surface type, seams, a cavity,
+a blended body and an oblique cylinder section. That oracle is a
+development-machine tool, never a build dependency.
+
+## 7. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Probes read the
