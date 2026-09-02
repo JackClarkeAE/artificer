@@ -5,6 +5,9 @@ here is what the kernel implements today (Artificer 0.97, `.art` 0.3); nothing
 is aspirational. Where a feature has a limit, the limit is stated. Version 0.3
 adds functions, modules, typed parameters with units, ranges and descriptions,
 array indexing, and parameter introspection; sections 14 to 17 cover them.
+Section 18 covers the analysis surface — clearance, interference, clearance
+profiles and sweeping a mechanism through its travel — which reads a
+session and changes nothing in it.
 
 A `.art` script is a list of steps. Each step names a kernel command, and the
 kernel executes the steps in order against one session. The same script
@@ -700,11 +703,15 @@ For an agent, the rules that make this reliable:
 
 ## 13. Not in 0.3
 
-Partial revolves, sweeps and lofts between arbitrary sections, shells,
-concave fillets between a boss and its plate, text as sketch geometry from a
-script, threads, and assemblies. The workbench has several of these; the
+Partial revolves, sweeps and lofts between arbitrary sections, concave
+fillets between a boss and its plate, text as sketch geometry from a
+script, and threads. A script builds parts; joints and occurrences belong
+to a document, so a mechanism is assembled in the workbench and analysed
+through section 18 rather than written here. `shell` covers prisms and
+solids of revolution — a blended or domed body is refused by name. The
 scripting surface follows the kernel API as it grows. Functions cannot
-recurse, and a module's functions share one flat namespace with the script's.
+recurse, and a module's functions share one flat namespace with the
+script's.
 
 ---
 
@@ -856,3 +863,147 @@ the same list; in Rust it is `script_parameters(source)`. Defaults that
 depend on earlier parameters are evaluated in order. The session report's
 `parameters` field then shows the value every parameter took in a run, so
 a run can be reproduced from its report.
+
+---
+
+## 18. Analysis: does it fit
+
+A script builds parts. Whether they go together is a different question,
+and the kernel answers it without a Boolean: the work is distance between
+each body's display facets, gathered into a hierarchy, so it answers for
+pairs the Boolean engine refuses outright.
+
+Everything here reads the session and changes nothing in it. No step is
+journaled, the current body does not move, and the semantic digest is the
+same afterwards.
+
+### One gap, quickly
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"probe","params":{"probe":"clearance","a":"hub","b":"shaft"}}
+```
+
+Answers with the closest approach of the two bodies in millimetres, its
+tier, and the method. Use this when the question is about one pair.
+
+### Every pair at once
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"analysis.interference","params":{"subjects":["plate","post","pin"]}}
+```
+
+```rust
+use artificer_kernel::api::analysis::{interference_study, Subject};
+let report = interference_study(&subjects, precision, &CancellationToken::new());
+```
+
+Every unordered pair, each saying whether the two are `clear`, `touching`
+or `interfering`, how close they come, and where — a witness point on each
+body. An interfering pair also carries the volume the two share when the
+Boolean engine can carry those operands; when it cannot, the pair keeps
+its measured clearance and records the engine's refusal code in
+`overlap_unavailable` instead. The document's shape is published in
+[`docs/analysis-schema.json`](analysis-schema.json).
+
+**What the numbers are worth.** Between bodies whose faces are all planar
+the facets are the surfaces and `tier` is `exact`. Where a surface is
+curved its facets are chords of it: the measured gap is never smaller than
+the true gap and never larger than it by more than the `bound` the pair
+publishes, which is one chord budget per curved body. Compare against
+`distance - bound` when the answer has to be conservative.
+
+### Judging it against a fit
+
+A measurement is not an answer. `0.42 mm` says nothing until a fit says
+what it wanted.
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"analysis.profiles"}
+{"jsonrpc":"2.0","id":4,"method":"analysis.interference",
+ "params":{"subjects":["hub","shaft"],"profile":"fdm-press"}}
+```
+
+`analysis.profiles` lists the catalogue, so an agent discovers the keys
+rather than guessing them:
+
+| Key | Window | For |
+| --- | --- | --- |
+| `machined-running` | 0.02–0.08 mm | A milled or turned part that has to turn or slide. |
+| `resin-fine` | 0.05–0.15 mm | Masked stereolithography. |
+| `fdm-press` | 0.10–0.20 mm | Pushed together and meant to stay. |
+| `fdm-sliding` | 0.30–0.50 mm | Has to move after assembly. |
+| `assembly` | 0 mm and over | No fit: parts must simply not share space. |
+
+Pass `fit` instead of `profile` to supply a window of your own:
+`{"key":"harness","name":"Cable route","minimum":5.0,"note":"..."}`, with
+`maximum` omitted for a fit with no upper complaint.
+
+Each pair then earns a `verdict`. `pass` is the gap that was asked for.
+`too_close` is nearer than allowed, or an overlap, and it is the only
+verdict that fails a study — `failing` counts them. `loose` is clear by
+more than the fit needed: not a failure, but a part meant to be held that
+is not. An unknown profile key is refused by name rather than ignored.
+
+### Where on the part
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"analysis.clearance_field","params":{"subjects":["hub","shaft"]}}
+```
+
+The signed clearance at every corner of every display facet: positive is a
+gap, negative is penetration and its magnitude is how far inside. Each
+subject's readings come with the count, the nearest and the farthest
+beside them, so a caller that wants only the worst number need not walk
+the array. This is what the workbench paints as a heat map.
+
+### Over a whole motion
+
+A mechanism asks the harder question: does it fit *anywhere it can go*.
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"analysis.sweep","params":{
+  "subjects":["frame","arm"],
+  "steps":[
+    {"drivers":[0.0], "placements":[{}, {"rotation":[1,0,0,0]}]},
+    {"drivers":[0.4], "placements":[{}, {"rotation":[0.980,0,0,0.199]}]}
+  ],
+  "profile":"fdm-sliding"}}
+```
+
+A step is where every body sits at one position, in subject order. A
+placement is a unit quaternion `[w, x, y, z]` and a translation, both
+optional — `{}` is a body that does not move, which is what the frame of a
+mechanism is. The `drivers` ride along uninterpreted so the report can name
+the position a collision was found at; the kernel does not know what a
+joint is, which is what lets a sweep run over poses from a solver, a
+recording or a file alike.
+
+The sweep stops at the first collision: past that the parts have already
+passed through one another, so nothing beyond is a pose the real thing
+reaches. Read `steps_measured` against `steps_offered` to see how much of
+the travel was answered for, and `cancelled` to know the rest is
+unmeasured rather than clear. Its schema is
+[`docs/sweep-schema.json`](sweep-schema.json).
+
+### What the workbench adds
+
+Two things a script has no vocabulary for. **Insert part** in the Model
+tab's Create group brings a catalogue part into the design that is open,
+as its own body and occurrence, which is how an assembly is built up. And
+a **revolute joint** on an occurrence gives it a coordinate: the joint
+solver poses every component from the drivers, carrying each child's whole
+subtree, and the sweep above measures exactly the travel the play button
+shows. Section 9 of [`docs/verification.md`](verification.md) has the
+solver's rules and what it refuses.
+
+### Reading it as an agent
+
+- Ask `analysis.profiles` before naming a fit, and pass the key rather
+  than reproducing the numbers.
+- Decide on `failing` and the per-pair `verdict` when a profile is in
+  play; on `state` and `distance` when one is not.
+- Treat `approximate` as a flag to act on: subtract `bound` from
+  `distance` before concluding a part fits.
+- A refusal is data. `overlap_unavailable` names why a volume is missing
+  and leaves the clearance beside it standing; a study never fails because
+  the Boolean engine did.

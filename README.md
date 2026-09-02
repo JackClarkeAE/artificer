@@ -173,7 +173,7 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `param wall: f64 [mm] in 1..4 = 2 "wall";` | Parameters with a unit, a range and a description. |
 | `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
 
-Errors name their line and column, so an editor can point at them. `artificer-api report part.art` prints the machine-readable session report instead of prose, with every step's rung and tier, the body's exact measures and every face described. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
+Errors name their line and column, so an editor can point at them. `artificer-api report part.art` prints the machine-readable session report instead of prose, with every step's rung and tier, the body's exact measures and every face described. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method — including the analysis surface: clearance, interference studies judged against a clearance profile, the per-facet heat map, and sweeping a mechanism through its travel — is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
 
 ### What the kernel does today
 
