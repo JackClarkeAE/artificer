@@ -25,7 +25,7 @@
 
 ---
 
-## What is new in 0.6
+## What is new in 0.96
 
 This release turns the kernel's scripting language into a product of its own and pairs it with a live editor.
 

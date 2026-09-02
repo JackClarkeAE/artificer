@@ -1,7 +1,7 @@
 # The `.art` scripting language, version 0.2
 
 A reference for people and for AI agents writing Artificer scripts. Everything
-here is what the kernel implements today (Artificer 0.6, `.art` 0.2); nothing
+here is what the kernel implements today (Artificer 0.96, `.art` 0.2); nothing
 is aspirational. Where a feature has a limit, the limit is stated.
 
 A `.art` script is a list of steps. Each step names a kernel command, and the
