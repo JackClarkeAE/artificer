@@ -47,7 +47,12 @@ pub enum SketchPlane {
     XY,
     XZ,
     YZ,
-    OnFace(EntitySelector),
+    /// A face of the current body. The selector sits under its own key:
+    /// it carries a `type` tag of its own, which the plane's tag would
+    /// otherwise collide with on the wire.
+    OnFace {
+        face: EntitySelector,
+    },
 }
 
 /// A 2D geometric entity in a sketch.

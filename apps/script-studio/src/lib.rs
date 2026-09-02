@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 use artificer_kernel::api::commands::ApiCommand;
 use artificer_kernel::api::debug::ApiError;
+use artificer_kernel::api::decompile::DecompileOptions;
+use artificer_kernel::api::diff::ScriptDiff;
 use artificer_kernel::api::export::{export_obj, export_stl_binary};
 use artificer_kernel::api::scripting::{
     FileModules, ModuleResolver, NoModules, ScriptError, ScriptParameter, compile_program_with,
@@ -167,6 +169,9 @@ pub struct RunOutcome {
     pub scene: Option<DebugScene>,
     /// Every face of the finished body with its names, script names first.
     pub faces: Vec<FaceName>,
+    /// The session journal as JSON, for export and for the round trip
+    /// back into a script.
+    pub journal: Option<String>,
     pub elapsed: Duration,
     pub cancelled: bool,
 }
@@ -222,6 +227,7 @@ fn run_script_generation(
         snapshot: None,
         scene: None,
         faces: Vec::new(),
+        journal: None,
         elapsed: Duration::ZERO,
         cancelled: false,
     };
@@ -312,6 +318,7 @@ fn run_script_generation(
         outcome.faces = name_faces(&session, &scene, &reported, &program.names);
         outcome.scene = Some(scene);
         outcome.snapshot = Some(snapshot);
+        outcome.journal = session.export_journal().ok();
     }
     outcome.elapsed = started.elapsed();
     outcome
@@ -684,6 +691,8 @@ enum PathPurpose {
     SaveAs,
     ExportStl,
     ExportObj,
+    ExportJournal,
+    ImportJournal,
 }
 
 impl PathPurpose {
@@ -693,6 +702,8 @@ impl PathPurpose {
             Self::SaveAs => "Save script as",
             Self::ExportStl => "Export STL",
             Self::ExportObj => "Export OBJ",
+            Self::ExportJournal => "Export journal",
+            Self::ImportJournal => "Pull a journal into the script",
         }
     }
 
@@ -700,9 +711,59 @@ impl PathPurpose {
         match self {
             Self::Open => "Open",
             Self::SaveAs => "Save",
-            Self::ExportStl | Self::ExportObj => "Export",
+            Self::ExportStl | Self::ExportObj | Self::ExportJournal => "Export",
+            Self::ImportJournal => "Compare",
         }
     }
+}
+
+/// A journal decompiled to a script, waiting for the user to accept it in
+/// place of the open script, with what would change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingImport {
+    /// Where the journal came from.
+    pub origin: String,
+    /// The decompiled script.
+    pub script: String,
+    /// What replacing the open script with it changes, semantically.
+    pub diff: ScriptDiff,
+    /// Why the open script could not be compared, when it could not.
+    pub note: Option<String>,
+}
+
+/// Decompiles a journal and compares it with the open script.
+pub fn pull_journal(
+    current_source: &str,
+    current_path: Option<&Path>,
+    journal_json: &str,
+    origin: &str,
+) -> Result<PendingImport, String> {
+    let session = Session::from_journal(journal_json).map_err(|error| error.message)?;
+    let script = session
+        .to_art(&DecompileOptions::default())
+        .map_err(|error| error.message)?;
+    let modules: Box<dyn ModuleResolver> = match current_path {
+        Some(path) => Box::new(FileModules::beside(path)),
+        None => Box::new(NoModules),
+    };
+    let incoming = compile_program_with(&script, &BTreeMap::new(), &NoModules)
+        .map_err(|error| format!("The decompiled script does not compile: {error}"))?;
+    let (diff, note) =
+        match compile_program_with(current_source, &BTreeMap::new(), modules.as_ref()) {
+            Ok(current) => (ScriptDiff::between(&current, &incoming), None),
+            Err(error) => (
+                ScriptDiff::default(),
+                Some(format!(
+                    "The open script does not compile, so no comparison is possible: {error}"
+                )),
+            ),
+        };
+    Ok(PendingImport {
+        origin: origin.to_owned(),
+        script,
+        diff,
+        note,
+    })
 }
 
 struct PathPrompt {
@@ -734,6 +795,7 @@ pub struct ScriptStudio {
     highlighter: Highlighter,
     status: Option<String>,
     prompt: Option<PathPrompt>,
+    pending_import: Option<PendingImport>,
     jump_to_line: Option<usize>,
     show_customizer: bool,
     theme_choice: WorkbenchTheme,
@@ -838,6 +900,7 @@ impl ScriptStudio {
             highlighter: Highlighter::default(),
             status: None,
             prompt: None,
+            pending_import: None,
             jump_to_line: None,
             show_customizer: true,
             theme_choice: theme::active_theme(),
@@ -1114,7 +1177,15 @@ impl ScriptStudio {
             PathPurpose::ExportObj => {
                 export_obj(snapshot, &name).map(|text| std::fs::write(path, text))
             }
-            PathPurpose::Open | PathPurpose::SaveAs => return,
+            PathPurpose::ExportJournal => {
+                let journal = self
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.journal.clone())
+                    .unwrap_or_default();
+                Ok(std::fs::write(path, journal))
+            }
+            PathPurpose::Open | PathPurpose::SaveAs | PathPurpose::ImportJournal => return,
         };
         self.status = Some(match written {
             Ok(Ok(())) => format!("Exported {}", path.display()),
@@ -1145,11 +1216,141 @@ impl ScriptStudio {
                 .unwrap_or_else(|| "model.art".to_owned()),
             PathPurpose::ExportStl => format!("{}.stl", self.model_name()),
             PathPurpose::ExportObj => format!("{}.obj", self.model_name()),
+            PathPurpose::ExportJournal | PathPurpose::ImportJournal => {
+                format!("{}.journal.json", self.model_name())
+            }
         };
         self.prompt = Some(PathPrompt {
             purpose,
             text: suggestion,
         });
+    }
+
+    /// Reads a journal, decompiles it, and holds the result for the user
+    /// to compare with the open script and accept or discard.
+    fn import_journal(&mut self, path: &Path) {
+        let json = match std::fs::read_to_string(path) {
+            Ok(json) => json,
+            Err(error) => {
+                self.status = Some(format!("Could not read {}: {error}", path.display()));
+                return;
+            }
+        };
+        match pull_journal(
+            &self.source,
+            self.path.as_deref(),
+            &json,
+            &path.display().to_string(),
+        ) {
+            Ok(pending) => {
+                self.status = Some(format!(
+                    "Decompiled {}: {} change{}",
+                    path.display(),
+                    pending.diff.entries.len(),
+                    if pending.diff.entries.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                self.pending_import = Some(pending);
+            }
+            Err(error) => {
+                self.status = Some(format!("Could not pull {}: {error}", path.display()));
+            }
+        }
+    }
+
+    /// The journal import awaiting a decision, if any.
+    #[must_use]
+    pub fn pending_import(&self) -> Option<&PendingImport> {
+        self.pending_import.as_ref()
+    }
+
+    /// Replaces the open script with the pending decompiled one.
+    pub fn accept_import(&mut self) {
+        if let Some(pending) = self.pending_import.take() {
+            self.source = pending.script;
+            self.framed_bounds = None;
+            self.customizer.clear();
+            self.refresh_customizer();
+            self.run_requested = true;
+            self.status = Some(format!("Pulled {} into the script", pending.origin));
+        }
+    }
+
+    pub fn discard_import(&mut self) {
+        self.pending_import = None;
+    }
+
+    fn import_window(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_import.as_ref() else {
+            return;
+        };
+        let mut accepted = false;
+        let mut discarded = false;
+        egui::Window::new("Pull journal into script")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.label(
+                    RichText::new(format!("From {}", pending.origin))
+                        .color(theme::muted())
+                        .small(),
+                );
+                ui.add_space(4.0);
+                if let Some(note) = &pending.note {
+                    ui.label(RichText::new(note).color(theme::warn()).small());
+                } else if pending.diff.is_empty() {
+                    ui.label(
+                        RichText::new("The journal builds exactly what the open script builds.")
+                            .color(theme::muted()),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!(
+                            "Replacing the open script changes {} thing{}:",
+                            pending.diff.entries.len(),
+                            if pending.diff.entries.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ))
+                        .color(theme::text()),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .id_salt("import-diff")
+                        .show(ui, |ui| {
+                            for line in pending.diff.lines() {
+                                ui.label(RichText::new(format!("  {line}")).monospace());
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("Replace script").strong()))
+                        .clicked()
+                    {
+                        accepted = true;
+                    }
+                    if ui.button("Keep mine").clicked() {
+                        discarded = true;
+                    }
+                });
+            });
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            discarded = true;
+        }
+        if accepted {
+            self.accept_import();
+        } else if discarded {
+            self.discard_import();
+        }
     }
 
     fn accept_prompt(&mut self, prompt: PathPrompt) {
@@ -1161,9 +1362,10 @@ impl ScriptStudio {
         match prompt.purpose {
             PathPurpose::Open => self.open_path(&path),
             PathPurpose::SaveAs => self.save_to(&path),
-            PathPurpose::ExportStl | PathPurpose::ExportObj => {
+            PathPurpose::ExportStl | PathPurpose::ExportObj | PathPurpose::ExportJournal => {
                 self.export_to(&path, prompt.purpose);
             }
+            PathPurpose::ImportJournal => self.import_journal(&path),
         }
     }
 
@@ -1294,6 +1496,23 @@ impl ScriptStudio {
                     .clicked()
                 {
                     self.open_prompt(PathPurpose::ExportObj);
+                    ui.close();
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(exportable, egui::Button::new("Export journal…"))
+                    .on_hover_text("The session journal as JSON, for the JSON-RPC server, the command line, or another Script Studio")
+                    .clicked()
+                {
+                    self.open_prompt(PathPurpose::ExportJournal);
+                    ui.close();
+                }
+                if ui
+                    .button("Pull journal into script…")
+                    .on_hover_text("Decompile a journal to a script and see what it changes before it replaces the open one")
+                    .clicked()
+                {
+                    self.open_prompt(PathPurpose::ImportJournal);
                     ui.close();
                 }
             });
@@ -1962,7 +2181,7 @@ impl ScriptStudio {
 
 impl eframe::App for ScriptStudio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.prompt.is_none() {
+        if self.prompt.is_none() && self.pending_import.is_none() {
             self.handle_shortcuts(ctx);
         }
         self.tick(ctx);
@@ -2011,6 +2230,7 @@ impl eframe::App for ScriptStudio {
 
         let ctx = ui.ctx().clone();
         self.path_prompt(&ctx);
+        self.import_window(&ctx);
     }
 }
 
@@ -2106,6 +2326,50 @@ mod tests {
         );
         // Script names come first in the list.
         assert!(outcome.faces[0].script_name.is_some());
+    }
+
+    #[test]
+    fn a_journal_pulls_back_into_the_script_behind_a_semantic_diff() {
+        let outcome = run_script(WELCOME_SCRIPT, &BTreeMap::new(), &CancellationToken::new());
+        let journal = outcome.journal.clone().expect("the run keeps its journal");
+        // Against the script that made it, no step differs: the decompiler
+        // names parameters after the dimensions, and a journal carries no
+        // script names.
+        let pending = pull_journal(WELCOME_SCRIPT, None, &journal, "hub.journal.json").unwrap();
+        assert!(pending.note.is_none());
+        assert!(
+            pending.script.contains("let hub = revolve("),
+            "{}",
+            pending.script
+        );
+        assert!(
+            pending
+                .diff
+                .lines()
+                .iter()
+                .all(|line| line.starts_with("param ") || line.starts_with("name ")),
+            "{:?}",
+            pending.diff.lines()
+        );
+        // Against a script with one hole fewer, the diff names the step.
+        let fewer =
+            WELCOME_SCRIPT.replace("param bolt_count: f64 = 4;", "param bolt_count: f64 = 3;");
+        let pending = pull_journal(&fewer, None, &journal, "hub.journal.json").unwrap();
+        assert!(
+            pending
+                .diff
+                .lines()
+                .iter()
+                .any(|line| line.starts_with("step \"bolt_3\"")),
+            "{:?}",
+            pending.diff.lines()
+        );
+        // The decompiled script builds the same body.
+        let rebuilt = run_script(&pending.script, &BTreeMap::new(), &CancellationToken::new());
+        assert_eq!(
+            rebuilt.snapshot.unwrap().semantic_digest(),
+            outcome.snapshot.unwrap().semantic_digest()
+        );
     }
 
     #[test]

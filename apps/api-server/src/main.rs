@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use artificer_kernel::CancellationToken;
+use artificer_kernel::api::decompile::DecompileOptions;
+use artificer_kernel::api::diff::ScriptDiff;
 use artificer_kernel::api::export::{export_obj, export_stl_binary};
 use artificer_kernel::api::scripting::{FileModules, compile_program_with, script_parameters};
 use artificer_kernel::api::server::serve_stdio;
@@ -22,7 +24,10 @@ COMMANDS:
     params <script.art>           List the script's parameters without running it
     snapshot <script.art> <out>   Render an SVG visual snapshot of the script
     export <script.art> <out>     Export 3D geometry (.stl or .obj)
-    journal <journal.json>        Replay a saved command journal
+    journal <journal.json>        Replay a saved command journal; --art <out.art> writes it
+                                  back as a script
+    diff <a.art> <b.art>          Semantic diff of two scripts: parameters, steps and names;
+                                  exits non-zero when they differ
     help                          Show this help message
 
 OPTIONS:
@@ -228,6 +233,12 @@ fn run_app() -> Result<(), Box<dyn Error>> {
         }
         "journal" => {
             let journal_path = required_arg(args.next(), "journal requires <journal.json>")?;
+            let rest = args.collect::<Vec<_>>();
+            let art_path = match rest.as_slice() {
+                [] => None,
+                [flag, path] if flag == "--art" => Some(PathBuf::from(path)),
+                _ => return Err(format!("journal takes only --art <out.art>\n\n{USAGE}").into()),
+            };
             let json = fs::read_to_string(&journal_path)?;
             let session = Session::from_journal(&json)?;
             println!(
@@ -235,7 +246,38 @@ fn run_app() -> Result<(), Box<dyn Error>> {
                 session.snapshot.id(),
                 session.snapshot.counts()
             );
+            if let Some(art_path) = art_path {
+                let script = session.to_art(&DecompileOptions::default())?;
+                fs::write(&art_path, script)?;
+                println!("Wrote {}", art_path.display());
+            }
             Ok(())
+        }
+        "diff" => {
+            let a_path = required_arg(args.next(), "diff requires <a.art> <b.art>")?;
+            let b_path = required_arg(args.next(), "diff requires <a.art> <b.art>")?;
+            let flags = parse_flags(args)?;
+            let a_source = fs::read_to_string(&a_path)?;
+            let b_source = fs::read_to_string(&b_path)?;
+            let old =
+                compile_program_with(&a_source, &flags.params, &flags.modules(Path::new(&a_path)))?;
+            let new =
+                compile_program_with(&b_source, &flags.params, &flags.modules(Path::new(&b_path)))?;
+            let diff = ScriptDiff::between(&old, &new);
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else if diff.is_empty() {
+                println!("No semantic difference.");
+            } else {
+                for line in diff.lines() {
+                    println!("  {line}");
+                }
+            }
+            if diff.is_empty() {
+                Ok(())
+            } else {
+                Err("the scripts differ".into())
+            }
         }
         "help" | "--help" | "-h" => {
             println!("{USAGE}");

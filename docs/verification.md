@@ -167,7 +167,58 @@ returns over JSON-RPC, now carries `rung`, `tier` and `warnings` alongside
 the validation diagnostics, so a caller that drives the kernel one step at
 a time sees the same certification the report summarises.
 
-## 5. Not in this release
+## 5. Journals back to scripts, and scripts compared
+
+A session's journal, the command list the JSON-RPC server, the command
+line and Script Studio all record, can be written back as a `.art` script:
+
+```sh
+cargo run --release -p artificer-api-server -- journal session.journal.json --art session.art
+```
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"journal.art"}
+```
+
+```rust
+let script = session.to_art(&DecompileOptions::default())?;
+```
+
+Every step becomes a `let` bound to its feature call under its own label,
+so the rebuilt session has the same step labels and the same snapshot
+digest. Dimensions (distances, diameters, radii, heights, spacings,
+counts, drafts) become `param`s named `<label>_<field>` with their current
+values (`ParamPolicy::None` writes them inline). Selectors are written as
+the language spells them; a snapshot-bound reference, which no script can
+write, becomes the history selector of the step that produced the entity.
+A step the faceted tier built is preceded by an `// approximate` comment
+and rebuilds on the same tier. The script's own `let` names, when the
+session ran a script, are written after the steps.
+
+Two scripts are compared by what they compile to, not by their text:
+
+```sh
+cargo run --release -p artificer-api-server -- diff a.art b.art --json
+```
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"script.diff","params":{"a":"...","b":"...","params_a":{},"params_b":{},"modules":{}}}
+```
+
+The result lists parameters added, removed or changed with old and new
+values; steps added, removed, moved or changed, the last with the fields
+that differ; names added, removed or renamed (the same selector under a
+new name), and names that now select differently. A script diffed against
+itself is empty; the command line exits non-zero when the scripts differ.
+
+In Script Studio, **File → Pull journal into script…** decompiles a journal
+file and shows this diff against the open script before replacing it;
+**File → Export journal…** writes the current run's journal for another
+tool. The workbench's own document model is not yet bridged to the API
+journal, so a document built interactively reaches the studio through the
+JSON-RPC server or the command line rather than directly.
+
+## 6. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Probes read the

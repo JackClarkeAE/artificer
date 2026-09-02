@@ -467,6 +467,7 @@ const BUILTINS: &[&str] = &[
     "intersection",
     "faces",
     "edges",
+    "edge_between",
     "nearest",
     "sqrt",
     "abs",
@@ -1429,13 +1430,25 @@ impl<'a> Interp<'a> {
             })),
             // ---- selectors --------------------------------------------------
             "faces" => {
+                if positional_args.is_empty() {
+                    return named_selector(EntityKind::Face, &args).map(Value::Selector);
+                }
                 let spec = self.positional_string("faces", positional_args, env, "\">Z\"")?;
                 Ok(Value::Selector(face_selector(&spec)?))
             }
             "edges" => {
+                if positional_args.is_empty() {
+                    return named_selector(EntityKind::Edge, &args).map(Value::Selector);
+                }
                 let spec = self.positional_string("edges", positional_args, env, "\"|Z\"")?;
                 Ok(Value::Selector(edge_selector(&spec)?))
             }
+            "edge_between" => Ok(Value::Selector(EntitySelector::ByGeometry {
+                selector: GeometricSelector::EdgeBetween {
+                    face_a: Box::new(args.required("a")?.as_selector()?),
+                    face_b: Box::new(args.required("b")?.as_selector()?),
+                },
+            })),
             "nearest" => {
                 let point = args.required("point")?.as_point3()?;
                 let kind = match args.values.get("kind") {
@@ -1911,6 +1924,75 @@ impl<'a> Args<'a> {
     }
 }
 
+/// The named forms of `faces(...)` and `edges(...)`, which reach every
+/// geometric selector the API has: `direction:` with an optional `match:`
+/// for faces by normal or edges by direction, and `metric:` with
+/// `extremum:` for the largest or smallest.
+fn named_selector(kind: EntityKind, args: &Args<'_>) -> Result<EntitySelector, ScriptError> {
+    let call = if kind == EntityKind::Face {
+        "faces"
+    } else {
+        "edges"
+    };
+    if let Some(direction) = args.values.get("direction") {
+        let direction = direction.as_vector3()?;
+        let selector = if kind == EntityKind::Face {
+            let match_kind = match args.values.get("match") {
+                None => NormalMatch::Closest,
+                Some(value) => match value.as_string()? {
+                    "closest" => NormalMatch::Closest,
+                    "farthest" => NormalMatch::Farthest,
+                    "parallel" => NormalMatch::Parallel,
+                    "perpendicular" => NormalMatch::Perpendicular,
+                    other => {
+                        return Err(ScriptError::eval(format!(
+                            "faces(): `match` is \"closest\", \"farthest\", \"parallel\" or \"perpendicular\", not \"{other}\""
+                        )));
+                    }
+                },
+            };
+            GeometricSelector::FaceByNormal {
+                direction,
+                match_kind,
+            }
+        } else {
+            GeometricSelector::EdgesParallelTo { direction }
+        };
+        return Ok(EntitySelector::ByGeometry { selector });
+    }
+    if let Some(metric) = args.values.get("metric") {
+        let metric = match metric.as_string()? {
+            "area" => Metric::Area,
+            "length" => Metric::Length,
+            "radius" => Metric::Radius,
+            other => {
+                return Err(ScriptError::eval(format!(
+                    "{call}(): `metric` is \"area\", \"length\" or \"radius\", not \"{other}\""
+                )));
+            }
+        };
+        let extremum = match args.required("extremum")?.as_string()? {
+            "max" | "largest" | "longest" => Extremum::Maximum,
+            "min" | "smallest" | "shortest" => Extremum::Minimum,
+            other => {
+                return Err(ScriptError::eval(format!(
+                    "{call}(): `extremum` is \"max\" or \"min\", not \"{other}\""
+                )));
+            }
+        };
+        return Ok(EntitySelector::ByGeometry {
+            selector: GeometricSelector::ByExtremum {
+                metric,
+                extremum,
+                kind,
+            },
+        });
+    }
+    Err(ScriptError::eval(format!(
+        "{call}() takes a selector string, or `direction:` with `match:`, or `metric:` with `extremum:`"
+    )))
+}
+
 fn face_selector(spec: &str) -> Result<EntitySelector, ScriptError> {
     let by_normal = |direction: Vector3| GeometricSelector::FaceByNormal {
         direction,
@@ -1941,9 +2023,21 @@ fn face_selector(spec: &str) -> Result<EntitySelector, ScriptError> {
             surface_type: SurfaceFilter::Cylindrical,
             kind: EntityKind::Face,
         },
+        "spherical" => GeometricSelector::ByType {
+            surface_type: SurfaceFilter::Spherical,
+            kind: EntityKind::Face,
+        },
+        "conical" => GeometricSelector::ByType {
+            surface_type: SurfaceFilter::Conical,
+            kind: EntityKind::Face,
+        },
+        "toroidal" => GeometricSelector::ByType {
+            surface_type: SurfaceFilter::Toroidal,
+            kind: EntityKind::Face,
+        },
         _ => {
             return Err(ScriptError::eval(format!(
-                "Unknown face selector `{spec}`; use >X <X >Y <Y >Z <Z, top/bottom/front/back/left/right, largest, smallest, planar or cylindrical"
+                "Unknown face selector `{spec}`; use >X <X >Y <Y >Z <Z, top/bottom/front/back/left/right, largest, smallest, planar, cylindrical, spherical, conical or toroidal"
             )));
         }
     };
@@ -1985,7 +2079,9 @@ fn sketch_plane(value: &Value) -> Result<SketchPlane, ScriptError> {
                 "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, not \"{name}\""
             ))),
         },
-        Value::Selector(selector) => Ok(SketchPlane::OnFace(selector.clone())),
+        Value::Selector(selector) => Ok(SketchPlane::OnFace {
+            face: selector.clone(),
+        }),
         other => Err(ScriptError::eval(format!(
             "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, got {}",
             other.describe()

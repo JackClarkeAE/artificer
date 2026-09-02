@@ -7,6 +7,8 @@
 
 pub mod commands;
 pub mod debug;
+pub mod decompile;
+pub mod diff;
 pub mod export;
 pub mod journal;
 pub mod probe;
@@ -21,6 +23,8 @@ pub mod snapshot;
 pub use crate::CancellationToken;
 pub use commands::*;
 pub use debug::*;
+pub use decompile::*;
+pub use diff::*;
 pub use export::*;
 pub use journal::*;
 pub use probe::*;

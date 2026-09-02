@@ -346,6 +346,23 @@ On a stepped part, `faces(">Z")` is the top step, not the plate under it.
 | `"|X"`, `"|Y"`, `"|Z"` | Every straight edge parallel to the axis (a set). |
 | `"longest"`, `"shortest"` | By length. |
 
+### Named forms: any direction, any extremum, the edge between two faces
+
+The string forms above cover the axes and the common extremes. The named
+forms reach every geometric selector the API has:
+
+```art
+faces(direction: [1, 0, 1], match: "closest")   // closest, farthest, parallel, perpendicular
+faces(metric: "area", extremum: "max")          // area or radius; max or min
+edges(direction: [0, 0, 1])                     // every edge parallel to a direction (a set)
+edges(metric: "length", extremum: "min")
+edge_between(a: faces(">Z"), b: faces(">X"))    // the edge two faces share
+```
+
+`faces("spherical")`, `faces("conical")` and `faces("toroidal")` join
+`planar` and `cylindrical`. The decompiler (see `docs/verification.md`)
+writes whichever form is shortest.
+
 ### By position: `nearest`
 
 ```art

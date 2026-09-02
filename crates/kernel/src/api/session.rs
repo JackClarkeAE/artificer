@@ -642,7 +642,7 @@ impl Session {
                         u: Vector3::new(0.0, 1.0, 0.0),
                         v: Vector3::new(0.0, 0.0, 1.0),
                     },
-                    SketchPlane::OnFace(face_sel) => {
+                    SketchPlane::OnFace { face: face_sel } => {
                         let face_ref = resolve_selector(
                             face_sel,
                             &self.snapshot,
@@ -684,7 +684,7 @@ impl Session {
             })?;
         match &entry.command {
             ApiCommand::Sketch {
-                on: SketchPlane::OnFace(face),
+                on: SketchPlane::OnFace { face },
                 ..
             } => resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)
                 .map(Some),

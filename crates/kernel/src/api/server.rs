@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::commands::ApiCommand;
 use crate::api::debug::ApiError;
+use crate::api::decompile::DecompileOptions;
+use crate::api::diff::ScriptDiff;
 use crate::api::export::{export_obj, export_stl_ascii};
 use crate::api::probe::{ProbeRequest, probe};
 use crate::api::query::MeasureTarget;
@@ -407,6 +409,43 @@ impl SharedSession {
                 Ok(journal) => JsonRpcResponse::ok(id, serde_json::Value::String(journal)),
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
+            "journal.art" => match session.to_art(&DecompileOptions::default()) {
+                Ok(script) => JsonRpcResponse::ok(id, serde_json::Value::String(script)),
+                Err(error) => JsonRpcResponse::api_error(id, &error),
+            },
+            "script.diff" => {
+                #[derive(Deserialize)]
+                struct DiffParams {
+                    a: String,
+                    b: String,
+                    #[serde(default)]
+                    params_a: BTreeMap<String, f64>,
+                    #[serde(default)]
+                    params_b: BTreeMap<String, f64>,
+                    #[serde(default)]
+                    modules: BTreeMap<String, String>,
+                }
+                let diff: DiffParams = match serde_json::from_value(params) {
+                    Ok(diff) => diff,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid diff params: {error}"),
+                        );
+                    }
+                };
+                let modules = InlineModules::new(diff.modules);
+                let old = match compile_program_with(&diff.a, &diff.params_a, &modules) {
+                    Ok(program) => program,
+                    Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                };
+                let new = match compile_program_with(&diff.b, &diff.params_b, &modules) {
+                    Ok(program) => program,
+                    Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                };
+                respond(id, &ScriptDiff::between(&old, &new))
+            }
             "script.run" => {
                 let script: ScriptParams = match serde_json::from_value(params) {
                     Ok(script) => script,
