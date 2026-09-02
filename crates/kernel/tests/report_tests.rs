@@ -815,3 +815,118 @@ fn check(
         }
     }
 }
+
+#[test]
+fn the_server_analyses_clearance_profiles_fields_and_sweeps_over_json_rpc() {
+    let server = SharedSession::new();
+    let source = "let post = box(origin: [-3, 12, -10], size: [6, 8, 20], label: \"post\");
+let arm = box(origin: [0, -2, -2], size: [20, 4, 4], label: \"arm\");
+";
+    let run = server.handle_request(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"script.run","params":{{"source":{}}}}}"#,
+        serde_json::to_string(source).unwrap()
+    ));
+    assert_eq!(run.error, None, "{run:?}");
+
+    // The catalogue, so an agent can discover the keys rather than guess.
+    let profiles =
+        server.handle_request(r#"{"jsonrpc":"2.0","id":2,"method":"analysis.profiles"}"#);
+    assert_eq!(profiles.error, None);
+    let listed = profiles.result.unwrap();
+    let keys = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["key"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(keys.contains(&"fdm-sliding".to_owned()), "{keys:?}");
+    assert!(keys.contains(&"assembly".to_owned()), "{keys:?}");
+    // The open-ended one publishes no upper bound rather than an infinity.
+    let assembly = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|profile| profile["key"] == "assembly")
+        .unwrap();
+    assert!(assembly.get("maximum").is_none(), "{assembly}");
+
+    // A study judged against one of them, by key.
+    let judged = server.handle_request(
+        r#"{"jsonrpc":"2.0","id":3,"method":"analysis.interference","params":{"subjects":["post","arm"],"profile":"fdm-sliding"}}"#,
+    );
+    assert_eq!(judged.error, None, "{judged:?}");
+    let study = judged.result.unwrap();
+    assert_eq!(study["profile"]["key"], "fdm-sliding");
+    assert!(study["pairs"][0]["verdict"].is_string(), "{study}");
+
+    // An unknown key is named rather than silently ignored.
+    let unknown = server.handle_request(
+        r#"{"jsonrpc":"2.0","id":4,"method":"analysis.interference","params":{"subjects":["post","arm"],"profile":"nope"}}"#,
+    );
+    assert!(
+        unknown.error.unwrap().message.contains("nope"),
+        "an unknown fit is refused by name"
+    );
+
+    // The heat map's readings, with a summary beside them so a caller that
+    // only wants the worst number need not walk the array.
+    let field = server.handle_request(
+        r#"{"jsonrpc":"2.0","id":5,"method":"analysis.clearance_field","params":{"subjects":["post","arm"]}}"#,
+    );
+    assert_eq!(field.error, None, "{field:?}");
+    let fields = field.result.unwrap();
+    assert_eq!(fields["fields"].as_array().unwrap().len(), 2);
+    let arm_field = &fields["fields"][1];
+    assert_eq!(arm_field["subject"], "arm");
+    assert!(arm_field["samples"].as_u64().unwrap() > 0);
+    assert_eq!(
+        arm_field["values"].as_array().unwrap().len(),
+        arm_field["samples"].as_u64().unwrap() as usize,
+        "the summary counts the values it sits beside"
+    );
+    assert!(arm_field["nearest"].as_f64().unwrap() > 0.0, "{arm_field}");
+
+    // And a sweep: the arm swung a quarter turn towards the post, which it
+    // ends up passing through.
+    let steps = (0..24)
+        .map(|step| {
+            let radians = std::f64::consts::FRAC_PI_2 * f64::from(step) / 23.0;
+            let half = radians / 2.0;
+            serde_json::json!({
+                "drivers": [radians],
+                "placements": [
+                    {},
+                    {"rotation": [half.cos(), 0.0, 0.0, half.sin()]}
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let swept = server.handle_request(&format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"analysis.sweep","params":{{"subjects":["post","arm"],"steps":{}}}}}"#,
+        serde_json::to_string(&steps).unwrap()
+    ));
+    assert_eq!(swept.error, None, "{swept:?}");
+    let report = swept.result.unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["steps_offered"], 24);
+    let collision = &report["collision"];
+    assert!(!collision.is_null(), "the arm goes through the post");
+    assert!(collision["step"].as_u64().unwrap() > 0, "not at rest");
+    assert!(
+        report["steps_measured"].as_u64().unwrap() == collision["step"].as_u64().unwrap() + 1,
+        "the sweep stopped where it collided: {report}"
+    );
+
+    // A sweep needs positions, and says so rather than answering for none.
+    let empty = server.handle_request(
+        r#"{"jsonrpc":"2.0","id":7,"method":"analysis.sweep","params":{"subjects":["post","arm"],"steps":[]}}"#,
+    );
+    assert!(
+        empty
+            .error
+            .unwrap()
+            .message
+            .contains("at least one position"),
+        "an empty sweep is refused"
+    );
+}

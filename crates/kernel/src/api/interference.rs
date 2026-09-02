@@ -30,7 +30,7 @@ use crate::{DebugScene, NativeKernel, Snapshot};
 /// The rigid placement of a body in the world an interference study is run
 /// in. Assembly occurrences carry one; two bodies of the same session share
 /// the identity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     /// Column-major rotation: `columns[i]` is the image of basis vector `i`.
     pub columns: [[f64; 3]; 3],

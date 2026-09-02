@@ -393,6 +393,10 @@ use artificer_kernel::api::analysis::built_in_profile;
 report.judge(built_in_profile("fdm-press"));
 ```
 
+`analysis.profiles` lists the catalogue — key, name, window and note — so a
+caller discovers the keys rather than guessing them, and a key that is not
+in it is refused by name rather than quietly ignored.
+
 The kernel ships five, and none of them is privileged — a design with its
 own numbers passes its own `ClearanceProfile`, and the `fit` parameter
 takes one over the wire:
@@ -431,10 +435,18 @@ parts they fail, and it is the same measurement read at a different
 resolution: for every corner of every display facet, the signed clearance
 to the nearest of the other bodies.
 
+```json
+{"jsonrpc":"2.0","id":1,"method":"analysis.clearance_field","params":{"subjects":["hub","shaft"]}}
+```
+
 ```rust
 use artificer_kernel::api::analysis::clearance_fields;
 let fields = clearance_fields(&subjects, &CancellationToken::new());
 ```
+
+Over the wire each subject's readings arrive with the count, the nearest
+and the farthest beside them, so a caller that only wants the worst number
+need not walk the array to find it.
 
 Positive is a gap; negative is penetration, and its magnitude is how far
 inside the nearest other body that corner sits. A body with nothing to
@@ -527,10 +539,26 @@ own document, with its own schema in
 [`docs/sweep-schema.json`](sweep-schema.json) and the same conformance
 guard the others have.
 
+```json
+{"jsonrpc":"2.0","id":1,"method":"analysis.sweep","params":{
+  "subjects":["frame","arm"],
+  "steps":[
+    {"drivers":[0.0], "placements":[{}, {"rotation":[1,0,0,0]}]},
+    {"drivers":[0.4], "placements":[{}, {"rotation":[0.980,0,0,0.199]}]}
+  ],
+  "profile":"fdm-sliding"}}
+```
+
 ```rust
 use artificer_kernel::api::sweep::{interference_sweep, SweepStep};
 let sweep = interference_sweep(&subjects, &steps, precision, profile, &token, &mut progress);
 ```
+
+A placement over the wire is a unit quaternion `[w, x, y, z]` and a
+translation, both optional: `{}` is a body that does not move. `profile`
+names a shipped fit by key, or `fit` carries a whole profile of the
+caller's own. The response is the sweep report; the per-corner fields stay
+on the Rust side, where the renderer that paints them lives.
 
 A step is where every body sits at one position of the mechanism. The
 kernel does not know what a joint is: the caller solves the mechanism and

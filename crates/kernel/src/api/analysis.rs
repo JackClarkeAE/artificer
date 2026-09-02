@@ -504,6 +504,22 @@ pub fn study_session_steps(
     steps: &[String],
     cancellation: &CancellationToken,
 ) -> Result<InterferenceReport, crate::api::debug::ApiError> {
+    let subjects = session_subjects(session, steps)?;
+    Ok(interference_study(
+        &subjects,
+        session.precision,
+        cancellation,
+    ))
+}
+
+/// The subjects named steps of a session stand for, at the identity.
+///
+/// Two is the minimum: one body has nothing to be measured against, and a
+/// study of it would be a study of nothing.
+pub fn session_subjects(
+    session: &crate::api::session::Session,
+    steps: &[String],
+) -> Result<Vec<Subject>, crate::api::debug::ApiError> {
     use crate::api::debug::{ApiError, ApiErrorCode};
 
     if steps.len() < 2 {
@@ -528,9 +544,5 @@ pub fn study_session_steps(
         })?;
         subjects.push(Subject::new(label.clone(), snapshot.clone()));
     }
-    Ok(interference_study(
-        &subjects,
-        session.precision,
-        cancellation,
-    ))
+    Ok(subjects)
 }

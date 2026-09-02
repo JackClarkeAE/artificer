@@ -368,6 +368,164 @@ impl SharedSession {
                     Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
                 }
             }
+            "analysis.profiles" => respond(
+                id,
+                &crate::api::analysis::BUILT_IN_PROFILES
+                    .iter()
+                    .map(|profile| profile.profile())
+                    .collect::<Vec<_>>(),
+            ),
+            "analysis.clearance_field" => {
+                #[derive(serde::Deserialize)]
+                struct Fields {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                }
+                let request: Fields = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid clearance field request: {error}"),
+                        );
+                    }
+                };
+                match crate::api::analysis::session_subjects(&session, &request.subjects) {
+                    Ok(subjects) => {
+                        let fields = crate::api::analysis::clearance_fields(
+                            &subjects,
+                            &CancellationToken::default(),
+                        );
+                        respond(
+                            id,
+                            &serde_json::json!({
+                                "subjects": request.subjects,
+                                "fields": fields
+                                    .iter()
+                                    .zip(&request.subjects)
+                                    .map(|(values, name)| {
+                                        serde_json::json!({
+                                            "subject": name,
+                                            "samples": values.len(),
+                                            "nearest": values
+                                                .iter()
+                                                .copied()
+                                                .fold(f64::INFINITY, f64::min),
+                                            "farthest": values
+                                                .iter()
+                                                .copied()
+                                                .filter(|value| value.is_finite())
+                                                .fold(f64::NEG_INFINITY, f64::max),
+                                            "values": values,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            }),
+                        )
+                    }
+                    Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
+                }
+            }
+            "analysis.sweep" => {
+                use crate::api::interference::Placement;
+                use crate::api::sweep::{SweepStep, interference_sweep};
+
+                #[derive(serde::Deserialize)]
+                struct WirePlacement {
+                    /// A unit quaternion `[w, x, y, z]`; the identity when
+                    /// omitted, which is what a body that does not move takes.
+                    #[serde(default = "identity_rotation")]
+                    rotation: [f64; 4],
+                    #[serde(default)]
+                    translation: [f64; 3],
+                }
+                #[derive(serde::Deserialize)]
+                struct WireStep {
+                    #[serde(default)]
+                    drivers: Vec<f64>,
+                    #[serde(default)]
+                    placements: Vec<WirePlacement>,
+                }
+                #[derive(serde::Deserialize)]
+                struct Request {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                    #[serde(default)]
+                    steps: Vec<WireStep>,
+                    #[serde(default)]
+                    profile: Option<String>,
+                    #[serde(default)]
+                    fit: Option<crate::api::analysis::ClearanceProfile>,
+                }
+                const fn identity_rotation() -> [f64; 4] {
+                    [1.0, 0.0, 0.0, 0.0]
+                }
+
+                let request: Request = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid sweep: {error}"),
+                        );
+                    }
+                };
+                let profile = match (&request.profile, request.fit.clone()) {
+                    (Some(key), _) => match crate::api::analysis::built_in_profile(key) {
+                        Some(profile) => Some(profile),
+                        None => {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                format!("No clearance profile named \"{key}\""),
+                            );
+                        }
+                    },
+                    (None, fit) => fit,
+                };
+                let subjects =
+                    match crate::api::analysis::session_subjects(&session, &request.subjects) {
+                        Ok(subjects) => subjects,
+                        Err(error) => {
+                            return JsonRpcResponse::err(id, INVALID_PARAMS, &error.message);
+                        }
+                    };
+                let mut steps = Vec::with_capacity(request.steps.len());
+                for step in request.steps {
+                    let mut placements = Vec::with_capacity(step.placements.len());
+                    for placement in step.placements {
+                        let Some(placed) =
+                            Placement::from_quaternion(placement.rotation, placement.translation)
+                        else {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                "A placement's rotation is not a usable quaternion",
+                            );
+                        };
+                        placements.push(placed);
+                    }
+                    steps.push(SweepStep::new(step.drivers, placements));
+                }
+                if steps.is_empty() {
+                    return JsonRpcResponse::err(
+                        id,
+                        INVALID_PARAMS,
+                        "A sweep needs at least one position of the mechanism",
+                    );
+                }
+                let sweep = interference_sweep(
+                    &subjects,
+                    &steps,
+                    session.precision,
+                    profile.as_ref(),
+                    &CancellationToken::default(),
+                    &mut |_, _| {},
+                );
+                respond(id, &sweep.report)
+            }
             "probe" => {
                 let request: ProbeRequest = match serde_json::from_value(params) {
                     Ok(request) => request,
