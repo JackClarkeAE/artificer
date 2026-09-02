@@ -187,6 +187,28 @@ pub enum ApiCommand {
 }
 
 impl ApiCommand {
+    /// The command's kind as it appears on the wire: `make_box`,
+    /// `drill_hole`, `boolean_union`, and so on.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::MakeBox { .. } => "make_box",
+            Self::MakeCylinder { .. } => "make_cylinder",
+            Self::Sketch { .. } => "sketch",
+            Self::Extrude { .. } => "extrude",
+            Self::Revolve { .. } => "revolve",
+            Self::PushPull { .. } => "push_pull",
+            Self::DrillHole { .. } => "drill_hole",
+            Self::Fillet { .. } => "fillet",
+            Self::Chamfer { .. } => "chamfer",
+            Self::Mirror { .. } => "mirror",
+            Self::LinearPattern { .. } => "linear_pattern",
+            Self::BooleanUnion { .. } => "boolean_union",
+            Self::BooleanDifference { .. } => "boolean_difference",
+            Self::BooleanIntersection { .. } => "boolean_intersection",
+        }
+    }
+
     #[must_use]
     pub fn label(&self) -> &str {
         match self {

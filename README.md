@@ -25,6 +25,14 @@
 
 ---
 
+## What is new since 0.96
+
+Work on the next release is about verification-driven CAD: letting a program, not only a person, read what the kernel did and check the result.
+
+- **The session report.** `artificer-api report part.art` (or `run --json`) prints a versioned JSON document: every step with the strategy **rung** that certified it (`face-feature/exact-prism`, `edge-finish/rim-blend`, `boolean/analytic`, ...) and whether it was exact or fell to the faceted tier, the body's exact volume, area and centroid, every face and edge described from its analytic carrier, the names the script gave, and the failing step with its diagnostic codes and script line when a run stops short. The shape is published as a JSON Schema in [`docs/report-schema.json`](docs/report-schema.json) and a test keeps its list of diagnostic codes equal to what the kernel source emits. The JSON-RPC methods `script.report`, `report` and `query.describe` give the same over the wire.
+- **Probes that change nothing.** `probe` answers volume, surface area, face area, edge length, minimum distance, the overlap volume of two bodies, point containment and thinnest wall, each with a tier and the method behind it, and leaves the session's digest untouched. The reference is [`docs/verification.md`](docs/verification.md).
+- **Every step result** now carries its rung, tier and construction warnings, and Script Studio prints them in the console.
+
 ## What is new in 0.96
 
 This release turns the kernel's scripting language into a product of its own and pairs it with a live editor.
@@ -152,7 +160,7 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
 | `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
 
-Errors name their line and column, so an editor can point at them. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
+Errors name their line and column, so an editor can point at them. `artificer-api report part.art` prints the machine-readable session report instead of prose, with every step's rung and tier, the body's exact measures and every face described. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
 
 ### What the kernel does today
 
@@ -175,6 +183,7 @@ Language models and agents are good at saying what a part should be and poor at 
 - **Deterministic replay.** Journals replay to bit-identical snapshots with content digests, which makes results cacheable, diffable, and safe to verify independently.
 - **Headless eyes.** Snapshots render to PNG or SVG from standard or explicit cameras, so a vision-capable model can look at what it built without a GPU or a window.
 - **Exact measurements.** Volumes, areas, centroids, bounds, and distances are closed-form answers, not mesh estimates, so a planner can trust a number it reads back.
+- **A report, not prose.** A run ends in a versioned JSON report naming the rung that certified each step, whether it was exact, the body's measures, every face and edge, and the first failure with its codes; probes answer questions about the model without changing it. See [`docs/verification.md`](docs/verification.md).
 
 The same properties are what make the kernel a sound foundation for any programmatic CAD: generative design, automated tooling, cloud pipelines, and your own front end.
 

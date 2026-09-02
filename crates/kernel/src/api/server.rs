@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::commands::ApiCommand;
 use crate::api::debug::ApiError;
 use crate::api::export::{export_obj, export_stl_ascii};
+use crate::api::probe::{ProbeRequest, probe};
 use crate::api::query::MeasureTarget;
 use crate::api::scripting::compile_script;
 use crate::api::selectors::EntitySelector;
@@ -288,6 +289,62 @@ impl SharedSession {
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
             "query.features" => respond(id, &session.query().features()),
+            "query.describe" => {
+                let selector: EntitySelector = match serde_json::from_value(params) {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid selector: {error}"),
+                        );
+                    }
+                };
+                match session.query().describe(&selector) {
+                    Ok(description) => respond(id, &description),
+                    Err(error) => JsonRpcResponse::api_error(id, &error),
+                }
+            }
+            "report" => respond(id, &session.report()),
+            "probe" => {
+                let request: ProbeRequest = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid probe: {error}"),
+                        );
+                    }
+                };
+                match probe(&session, &request) {
+                    Ok(result) => respond(id, &result),
+                    Err(error) => JsonRpcResponse::api_error(id, &error),
+                }
+            }
+            "script.report" => {
+                #[derive(Deserialize)]
+                struct ScriptParams {
+                    source: String,
+                    #[serde(default)]
+                    params: BTreeMap<String, f64>,
+                }
+                let script: ScriptParams = match serde_json::from_value(params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid script params: {error}"),
+                        );
+                    }
+                };
+                // A failed step is part of the report, not a transport
+                // error: the caller reads `status`, `failure`, and every
+                // step that did commit.
+                let outcome = session.run_script(&script.source, &script.params, &token);
+                respond(id, &session.report_with(outcome.failure))
+            }
             "snapshot" => {
                 // Absent params mean the default isometric SVG; present but
                 // malformed params are the caller's mistake and say so.

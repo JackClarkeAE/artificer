@@ -892,7 +892,7 @@ fn resolve_geometric_selector(
 /// Squared distance from a point to a triangle, on the triangle's interior,
 /// an edge or a corner, whichever is nearest (Ericson, Real-Time Collision
 /// Detection, 5.1.5).
-fn point_triangle_distance_sq(p: Point3, tri: &[Point3; 3]) -> f64 {
+pub(crate) fn point_triangle_distance_sq(p: Point3, tri: &[Point3; 3]) -> f64 {
     let sub = |a: Point3, b: Point3| Vector3::new(a.x - b.x, a.y - b.y, a.z - b.z);
     let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
     let scale =

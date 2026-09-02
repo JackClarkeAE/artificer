@@ -18,6 +18,7 @@ USAGE:
 COMMANDS:
     serve                         Start the JSON-RPC server on stdin/stdout
     run <script.art>              Execute an .art script file and print result summary
+    report <script.art>           Execute an .art script and print the session report as JSON
     snapshot <script.art> <out>   Render an SVG visual snapshot of the script
     export <script.art> <out>     Export 3D geometry (.stl or .obj)
     journal <journal.json>        Replay a saved command journal
@@ -25,6 +26,9 @@ COMMANDS:
 
 OPTIONS:
     --param <KEY=VALUE>           Override script parameter (can be specified multiple times)
+    --json                        With `run`: print the session report as JSON instead of prose.
+                                  A failed run still prints the report, with `status: failed`
+                                  and the failing step, and exits non-zero.
 ";
 
 fn main() -> ExitCode {
@@ -50,21 +54,39 @@ fn run_app() -> Result<(), Box<dyn Error>> {
             serve_stdio()?;
             Ok(())
         }
-        "run" => {
+        "run" | "report" => {
             let script_path = required_arg(args.next(), "run requires <script.art>")?;
-            let params = parse_param_flags(args)?;
+            let (params, json) = parse_run_flags(args)?;
+            let json = json || command == "report";
             let source = fs::read_to_string(&script_path)?;
-            let commands = compile_script(&source, &params)?;
 
             let mut session = Session::new();
             let token = CancellationToken::default();
+            if json {
+                let outcome = session.run_script(&source, &params, &token);
+                let failed = !outcome.succeeded();
+                let report = session.report_with(outcome.failure);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                if failed {
+                    return Err(
+                        "the script did not run to completion; see the report's `failure`".into(),
+                    );
+                }
+                return Ok(());
+            }
+
+            let commands = compile_script(&source, &params)?;
             for cmd in commands {
                 let res = session.execute(cmd, &token)?;
                 println!(
-                    "  \u{2713} {}: {} ({:?})",
+                    "  \u{2713} {}: {} ({:?}){}",
                     res.step_label,
                     res.topology,
-                    res.elapsed()
+                    res.elapsed(),
+                    match res.rung.as_deref() {
+                        Some(rung) => format!(" [{rung}, {:?}]", res.tier),
+                        None => String::new(),
+                    }
                 );
             }
 
@@ -158,6 +180,25 @@ fn run_app() -> Result<(), Box<dyn Error>> {
 
 fn required_arg(arg: Option<String>, err_msg: &str) -> Result<String, Box<dyn Error>> {
     arg.ok_or_else(|| err_msg.into())
+}
+
+/// The `run` flags: parameter overrides and whether to print JSON.
+fn parse_run_flags(
+    args: impl Iterator<Item = String>,
+) -> Result<(BTreeMap<String, f64>, bool), Box<dyn Error>> {
+    let mut json = false;
+    let rest = args
+        .filter(|arg| {
+            if arg == "--json" {
+                json = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    let (params, _) = parse_cli_flags(rest.into_iter())?;
+    Ok((params, json))
 }
 
 fn parse_cli_flags(

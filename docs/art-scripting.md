@@ -422,6 +422,17 @@ The kernel measures the final body's volume, surface area and centroid, and
 exports it as binary or ASCII STL and as OBJ. Script Studio shows the volume,
 area and size in its console.
 
+For a program rather than a person, ask for the **session report**: `run
+part.art --json` (or `report part.art`) prints a versioned JSON document
+with every step's rung and tier, the body's exact measures, every face and
+edge described, and the names the script gave, or the failing step with the
+kernel's diagnostic codes and the script line. The JSON-RPC methods
+`script.report`, `report`, `probe` and `query.describe` give the same over
+the wire, and probes answer volume, area, distance, overlap, containment
+and wall-thickness questions without changing the session. The reference is
+[`docs/verification.md`](verification.md); the schema is
+[`docs/report-schema.json`](report-schema.json).
+
 ---
 
 ## 10. Examples

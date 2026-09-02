@@ -1807,9 +1807,57 @@ pub struct OperationReport {
     pub validation: ValidationReport,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Diagnostic>,
+    /// The strategy rung that certified this result: which of an
+    /// operation's ladder of constructions produced the topology. Names
+    /// are stable, slash-separated paths such as `face-feature/exact-prism`
+    /// or `edge-finish/rim-blend`; `None` only on reports written before
+    /// the kernel recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rung: Option<String>,
+}
+
+/// Whether a result is exact, or came from the faceted approximation tier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    #[default]
+    Exact,
+    Approximate,
+}
+
+impl Tier {
+    /// The worse of two tiers: a body built by any approximate step is
+    /// approximate as a whole.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        if self == Self::Approximate || other == Self::Approximate {
+            Self::Approximate
+        } else {
+            Self::Exact
+        }
+    }
 }
 
 impl OperationReport {
+    /// Exact unless the faceted tier reported its approximation warning,
+    /// which every approximate rung attaches.
+    #[must_use]
+    pub fn tier(&self) -> Tier {
+        let approximate = self
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str().ends_with("_FACETED_APPROXIMATION"))
+            || self
+                .rung
+                .as_deref()
+                .is_some_and(|rung| rung.ends_with("/faceted"));
+        if approximate {
+            Tier::Approximate
+        } else {
+            Tier::Exact
+        }
+    }
+
     pub fn sort_deterministically(&mut self) {
         for record in &mut self.history {
             record.sort_entities();
@@ -2423,6 +2471,7 @@ mod tests {
                 ],
             },
             warnings: Vec::new(),
+            rung: Some("primitive/cuboid".to_owned()),
         };
 
         report.sort_deterministically();

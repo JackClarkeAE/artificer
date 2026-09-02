@@ -8,7 +8,7 @@ use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
     ExecuteRequest, KernelCommand, OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3,
     PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId,
-    RevolveAngle, SnapshotId, Vector3,
+    RevolveAngle, SnapshotId, Tier, Vector3,
 };
 
 use artificer_protocol::FaceExtrusionOperation;
@@ -17,7 +17,7 @@ use crate::api::commands::{ApiCommand, ExtrudeOp, SketchEntity, SketchPlane};
 use crate::api::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
 use crate::api::journal::{Journal, JournalEntry};
 use crate::api::query::QueryHandle;
-use crate::api::selectors::{resolve_selector, resolve_selector_set};
+use crate::api::selectors::{EntitySelector, resolve_selector, resolve_selector_set};
 use crate::api::snapshot::{SnapshotOptions, SnapshotOutput, render_snapshot};
 
 /// A stateful session owning the kernel instance, current snapshot, and history.
@@ -31,8 +31,16 @@ pub struct Session {
     pub step_order: Vec<String>,
     pub step_reports: BTreeMap<String, OperationReport>,
     pub step_snapshots: BTreeMap<String, SnapshotId>,
+    /// How long each step took to execute, by label.
+    pub step_elapsed_ms: BTreeMap<String, u64>,
     pub undo_stack: Vec<(Snapshot, JournalEntry, Option<OperationReport>)>,
     pub redo_stack: Vec<JournalEntry>,
+    /// The resolved parameters of the script this session ran, when it ran
+    /// one; the session report carries them so a result can be reproduced.
+    pub parameters: BTreeMap<String, f64>,
+    /// The names a script gave to faces and edges with `let name =
+    /// <selector>`, resolved against the current body by the report.
+    pub names: Vec<(String, EntitySelector)>,
 }
 
 impl Default for Session {
@@ -64,8 +72,11 @@ impl Session {
             step_order: Vec::new(),
             step_reports: BTreeMap::new(),
             step_snapshots: BTreeMap::new(),
+            step_elapsed_ms: BTreeMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            parameters: BTreeMap::new(),
+            names: Vec::new(),
         }
     }
 
@@ -164,6 +175,7 @@ impl Session {
             }
         }
 
+        let tier = outcome.report.tier();
         let result = CommandResult {
             success: outcome.report.validation.valid,
             step_label: step_label.clone(),
@@ -172,12 +184,20 @@ impl Session {
             bounds: outcome.snapshot.measures().bounds,
             entities: entity_map,
             diagnostics: outcome.report.validation.diagnostics.clone(),
+            warnings: outcome.report.warnings.clone(),
+            rung: outcome.report.rung.clone(),
+            tier,
             elapsed_ms,
             summary: format!(
-                "Step \"{}\" committed snapshot {}. {}",
+                "Step \"{}\" committed snapshot {}. {}{}",
                 step_label,
                 outcome.snapshot.id(),
-                outcome.snapshot.counts()
+                outcome.snapshot.counts(),
+                if tier == Tier::Approximate {
+                    " Approximate: the faceted tier built this step."
+                } else {
+                    ""
+                }
             ),
         };
 
@@ -192,6 +212,7 @@ impl Session {
 
         self.step_order.push(step_label.clone());
         self.step_reports.insert(step_label.clone(), outcome.report);
+        self.step_elapsed_ms.insert(step_label.clone(), elapsed_ms);
         self.step_snapshots
             .insert(step_label, outcome.snapshot.id());
         self.snapshot_cache
@@ -226,6 +247,8 @@ impl Session {
         self.step_order.push(step_label.clone());
         self.step_snapshots
             .insert(step_label.clone(), self.snapshot.id());
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        self.step_elapsed_ms.insert(step_label.clone(), elapsed_ms);
         self.journal.push(entry);
         CommandResult {
             success: true,
@@ -235,7 +258,10 @@ impl Session {
             bounds: self.snapshot.measures().bounds,
             entities: BTreeMap::new(),
             diagnostics: Vec::new(),
-            elapsed_ms: start_time.elapsed().as_millis() as u64,
+            warnings: Vec::new(),
+            rung: None,
+            tier: Tier::Exact,
+            elapsed_ms,
             summary: format!(
                 "Sketch \"{step_label}\" recorded; extrude or revolve it to build geometry."
             ),
@@ -700,6 +726,7 @@ impl Session {
             if let Some(last_label) = self.step_order.pop() {
                 self.step_reports.remove(&last_label);
                 self.step_snapshots.remove(&last_label);
+                self.step_elapsed_ms.remove(&last_label);
             }
             self.journal.entries.pop();
             Ok(())

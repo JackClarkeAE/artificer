@@ -1,0 +1,1057 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artificer.dev/schemas/session-report-1.json",
+  "title": "Artificer session report",
+  "description": "The machine-readable account of an Artificer kernel session: every committed step with the strategy rung that certified it and whether it was exact, the current body with exact measures and every face and edge, the names the script gave, and the first failure if the run stopped short. Produced by `artificer-api report <script.art>`, `artificer-api run --json`, and the JSON-RPC methods `report` and `script.report`. schema_version 1.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kernel_version": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "failed"
+      ]
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "approximate"
+      ],
+      "description": "exact: every construction behind the value is analytic. approximate: the faceted tier or display facets are involved."
+    },
+    "precision": {
+      "$ref": "#/$defs/precision"
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      },
+      "description": "Script parameters as resolved for this run."
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "failure": {
+      "$ref": "#/$defs/failure"
+    },
+    "body": {
+      "$ref": "#/$defs/body"
+    },
+    "names": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/named_entity"
+      }
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "kernel_version",
+    "status",
+    "tier",
+    "precision",
+    "steps",
+    "elapsed_ms"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "point": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false,
+      "description": "A point in model millimetres."
+    },
+    "vector": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false,
+      "description": "A direction; unit length where the field says so."
+    },
+    "entity_ref": {
+      "type": "object",
+      "properties": {
+        "snapshot": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "entity": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "vertex",
+            "edge",
+            "coedge",
+            "loop",
+            "face",
+            "shell",
+            "solid"
+          ]
+        }
+      },
+      "required": [
+        "snapshot",
+        "entity",
+        "kind"
+      ],
+      "additionalProperties": false,
+      "description": "A snapshot-bound entity reference."
+    },
+    "bounds": {
+      "type": "object",
+      "properties": {
+        "min": {
+          "$ref": "#/$defs/point"
+        },
+        "max": {
+          "$ref": "#/$defs/point"
+        }
+      },
+      "required": [
+        "min",
+        "max"
+      ],
+      "additionalProperties": false
+    },
+    "topology": {
+      "type": "object",
+      "properties": {
+        "vertices": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "edges": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "coedges": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "loops": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "faces": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "shells": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "solids": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "vertices",
+        "edges",
+        "coedges",
+        "loops",
+        "faces",
+        "shells",
+        "solids"
+      ],
+      "additionalProperties": false
+    },
+    "precision": {
+      "type": "object",
+      "properties": {
+        "unit": {
+          "type": "string",
+          "enum": [
+            "millimetre",
+            "metre",
+            "inch"
+          ]
+        },
+        "modeling_resolution": {
+          "type": "number"
+        },
+        "linear_agreement": {
+          "type": "number"
+        },
+        "angular_agreement_radians": {
+          "type": "number"
+        },
+        "parameter_resolution": {
+          "type": "number"
+        },
+        "approximation_budget": {
+          "type": "number"
+        },
+        "max_entity_uncertainty": {
+          "type": "number"
+        },
+        "max_operation_uncertainty": {
+          "type": "number"
+        },
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_subdivisions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_abs_coordinate": {
+          "type": "number"
+        },
+        "min_feature_size": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "unit",
+        "modeling_resolution",
+        "linear_agreement",
+        "angular_agreement_radians",
+        "parameter_resolution",
+        "approximation_budget",
+        "max_entity_uncertainty",
+        "max_operation_uncertainty",
+        "max_iterations",
+        "max_subdivisions",
+        "max_abs_coordinate",
+        "min_feature_size"
+      ],
+      "additionalProperties": true,
+      "description": "The kernel's precision policy for the session."
+    },
+    "diagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/diagnostic_code"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warning",
+            "error"
+          ]
+        },
+        "stage": {
+          "type": "string",
+          "enum": [
+            "protocol",
+            "preflight",
+            "construction",
+            "validation",
+            "commit"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "severity",
+        "stage",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "diagnostic_code": {
+      "type": "string",
+      "enum": [
+        "BOOLEAN_ANALYTIC_RECONSTRUCTION_PENDING",
+        "BOOLEAN_CONTACT_UNSUPPORTED",
+        "BOOLEAN_EMPTY_OPERAND",
+        "BOOLEAN_EMPTY_OR_UNRESOLVED_RESULT",
+        "BOOLEAN_PRECISION_POLICY_MISMATCH",
+        "BOOLEAN_STALE_OPERAND",
+        "BOOLEAN_SURFACE_PAIR_UNSUPPORTED",
+        "COEDGE_USE_COUNT",
+        "COORDINATE_LIMIT_EXCEEDED",
+        "CUBOID_EXTENT_TOO_SMALL",
+        "CUBOID_INPUT_NON_FINITE",
+        "CURVE_FRAME_INVALID",
+        "DANGLING_ENTITY_REFERENCE",
+        "EDGE_ENDPOINT_MISMATCH",
+        "EDGE_FINISH_BLEND_UNSUPPORTED",
+        "EDGE_FINISH_CONSTRUCTION_FAILED",
+        "EDGE_FINISH_DISTANCE_INVALID",
+        "EDGE_FINISH_FACETED_APPROXIMATION",
+        "EDGE_FINISH_TARGET_INVALID",
+        "EDGE_USE_COUNT",
+        "EDGE_USE_ORIENTATION",
+        "ENTITY_NOT_FINITE",
+        "EULER_CHARACTERISTIC_INVALID",
+        "EXTRUDE_AREA_TOO_SMALL",
+        "EXTRUDE_COORDINATE_LIMIT_EXCEEDED",
+        "EXTRUDE_DISTANCE_NON_POSITIVE",
+        "EXTRUDE_FEATURE_TOO_SMALL",
+        "EXTRUDE_FRAME_DEGENERATE",
+        "EXTRUDE_INPUT_NON_FINITE",
+        "EXTRUDE_PRECISION_UNREPRESENTABLE",
+        "EXTRUDE_PROFILE_NUMERICALLY_INDETERMINATE",
+        "EXTRUDE_PROFILE_SELF_INTERSECTING",
+        "EXTRUDE_REPEATED_VERTEX",
+        "EXTRUDE_SOURCE_NOT_EMPTY",
+        "EXTRUDE_TOO_FEW_VERTICES",
+        "EXTRUDE_TOO_MANY_VERTICES",
+        "FACE_FEATURE_COORDINATE_LIMIT",
+        "FACE_FEATURE_CUT_EXIT_UNRESOLVED",
+        "FACE_FEATURE_DISTANCE_NON_POSITIVE",
+        "FACE_FEATURE_FACETED_APPROXIMATION",
+        "FACE_FEATURE_FACETED_UNRESOLVED",
+        "FACE_FEATURE_FRAME_NOT_ORTHONORMAL",
+        "FACE_FEATURE_FRAME_OFF_TARGET",
+        "FACE_FEATURE_FRAME_OFF_TARGET_PLANE",
+        "FACE_FEATURE_HISTORY_INCOMPLETE",
+        "FACE_FEATURE_INPUT_NON_FINITE",
+        "FACE_FEATURE_PRECISION_UNREPRESENTABLE",
+        "FACE_FEATURE_PROFILE_HOLE_INVALID",
+        "FACE_FEATURE_PROFILE_NUMERICALLY_INDETERMINATE",
+        "FACE_FEATURE_PROFILE_OUTSIDE_FACE",
+        "FACE_FEATURE_PROFILE_SELF_INTERSECTING",
+        "FACE_FEATURE_REPEATED_VERTEX",
+        "FACE_FEATURE_SOURCE_UNSUPPORTED",
+        "FACE_FEATURE_SWEEP_COLLISION",
+        "FACE_FEATURE_TARGET_DEGENERATE",
+        "FACE_FEATURE_TARGET_MISSING",
+        "FACE_FEATURE_TARGET_NOT_ALIGNED_TO_FRAME",
+        "FACE_FEATURE_TARGET_NOT_FACE",
+        "FACE_FEATURE_TARGET_NOT_PLANAR",
+        "FACE_FEATURE_TARGET_STALE",
+        "FACE_FEATURE_TOO_FEW_VERTICES",
+        "FACE_FEATURE_TOO_MANY_VERTICES",
+        "FACE_FEATURE_TOO_SMALL",
+        "FACE_HOLE_OUTSIDE",
+        "FACE_LOOP_INTERSECTION",
+        "FACE_ORIENTATION_INVALID",
+        "FACE_PUSH_PULL_COORDINATE_LIMIT",
+        "FACE_PUSH_PULL_DISTANCE_ZERO",
+        "FACE_PUSH_PULL_HISTORY_INCOMPLETE",
+        "FACE_PUSH_PULL_INPUT_NON_FINITE",
+        "FACE_PUSH_PULL_PRECISION_UNREPRESENTABLE",
+        "FACE_PUSH_PULL_SOURCE_UNSUPPORTED",
+        "FACE_PUSH_PULL_SUPPORT_CONTACT",
+        "FACE_PUSH_PULL_TARGET_HAS_HOLES",
+        "FACE_PUSH_PULL_TARGET_MISSING",
+        "FACE_PUSH_PULL_TARGET_NOT_EXTRUSION_CAP",
+        "FACE_PUSH_PULL_TARGET_NOT_FACE",
+        "FACE_PUSH_PULL_TARGET_NOT_PLANAR",
+        "FACE_PUSH_PULL_TARGET_STALE",
+        "FACE_PUSH_PULL_TOO_SMALL",
+        "FACE_USE_COUNT",
+        "HOLE_DIAMETER_INVALID",
+        "LINEAR_PATTERN_DOMAIN_UNSUPPORTED",
+        "LINEAR_PATTERN_FAILED",
+        "LOFT_CORNER_NOT_TANGENT",
+        "LOFT_OFFSET_NON_FINITE",
+        "LOFT_SECTION_COLLAPSES",
+        "LOFT_SECTION_COORDINATE_LIMIT",
+        "LOFT_SECTION_DEGENERATE",
+        "LOFT_SECTION_SELF_INTERSECTS",
+        "LOOP_NOT_CLOSED",
+        "LOOP_TOO_SHORT",
+        "LOOP_USE_COUNT",
+        "MIRROR_DOMAIN_UNSUPPORTED",
+        "MIRROR_FAILED",
+        "OPERATION_CANCELLED",
+        "PARAMETER_RANGE_INVALID",
+        "PCURVE_ENDPOINT_MISMATCH",
+        "PCURVE_LOCUS_MISMATCH",
+        "PLANAR_PROFILE_ANALYTIC_ROUTE_REQUIRED",
+        "PLANAR_PROFILE_EMPTY",
+        "PLANAR_PROFILE_HOLED_FRAME_UNSUPPORTED",
+        "PLANAR_PROFILE_LOOP_DISCONNECTED",
+        "PLANAR_PROFILE_LOOP_EMPTY",
+        "PLANAR_PROFILE_REGIONS_OVERLAP",
+        "PLANAR_PROFILE_TOO_MANY_CURVES",
+        "PLANAR_PROFILE_TOO_MANY_LOOPS",
+        "PLANAR_PROFILE_TOO_MANY_REGIONS",
+        "PLANAR_SUPPORT_BOUNDARY_UNAVAILABLE",
+        "PLANAR_SUPPORT_FACE_MISSING",
+        "PLANAR_SUPPORT_FRAME_INDETERMINATE",
+        "PLANAR_SUPPORT_INNER_BOUNDARY_UNAVAILABLE",
+        "PLANAR_SUPPORT_REFERENCE_INVALID",
+        "PLANAR_SUPPORT_SURFACE_UNSUPPORTED",
+        "PRECISION_POLICY_INVALID",
+        "PRECISION_POLICY_MISMATCH",
+        "PRISM_EDGE_FINISH_DISTANCE_INVALID",
+        "PROTOCOL_VERSION_UNSUPPORTED",
+        "REVOLVE_ANNULUS_DIMENSIONS_INVALID",
+        "REVOLVE_AXIS_DEGENERATE",
+        "REVOLVE_OBLIQUE_AXIS_CONTACT",
+        "REVOLVE_PROFILE_CROSSES_AXIS",
+        "REVOLVE_SECTION_NOT_CONTIGUOUS",
+        "REVOLVE_SINGLE_REGION_ONLY",
+        "RIB_SECTION_INVALID",
+        "RIM_BLEND_DISTANCE_INVALID",
+        "RIM_LOOP_DISTANCE_INVALID",
+        "SHELL_DISCONNECTED",
+        "SHELL_USE_COUNT",
+        "SOLID_VOLUME_NON_POSITIVE",
+        "STALE_SNAPSHOT",
+        "SURFACE_FRAME_INVALID",
+        "TRANSFORM_COORDINATE_LIMIT_EXCEEDED",
+        "TRANSFORM_FEATURE_TOO_SMALL",
+        "TRANSFORM_INPUT_NON_FINITE",
+        "TRANSFORM_PRECISION_UNREPRESENTABLE",
+        "TRANSFORM_QUATERNION_INVALID",
+        "TRANSFORM_SCALE_NON_POSITIVE",
+        "TRANSFORM_SOURCE_UNSUPPORTED",
+        "VALIDATION_PROFILE_NOT_SATISFIED"
+      ],
+      "description": "Every diagnostic and refusal code the kernel emits. A test in crates/kernel/tests/report_tests.rs keeps this list in step with the source."
+    },
+    "command_kind": {
+      "type": "string",
+      "enum": [
+        "make_box",
+        "make_cylinder",
+        "sketch",
+        "extrude",
+        "revolve",
+        "push_pull",
+        "drill_hole",
+        "fillet",
+        "chamfer",
+        "mirror",
+        "linear_pattern",
+        "boolean_union",
+        "boolean_difference",
+        "boolean_intersection"
+      ]
+    },
+    "entity_record": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "`role` or `role[ordinal]`, as `step.face(\"role\")` selects it."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "vertex",
+            "edge",
+            "coedge",
+            "loop",
+            "face",
+            "shell",
+            "solid"
+          ]
+        },
+        "entity": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "role",
+        "kind",
+        "entity"
+      ],
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/$defs/command_kind"
+        },
+        "rung": {
+          "type": "string",
+          "pattern": "^[a-z-]+/[a-z-]+$",
+          "description": "The strategy rung that certified the step, e.g. face-feature/exact-prism. A rung ending in /faceted is approximate."
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "approximate"
+          ],
+          "description": "exact: every construction behind the value is analytic. approximate: the faceted tier or display facets are involved."
+        },
+        "elapsed_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "snapshot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "topology": {
+          "$ref": "#/$defs/topology"
+        },
+        "bounds": {
+          "$ref": "#/$defs/bounds"
+        },
+        "volume": {
+          "type": "number",
+          "description": "Exact volume of the body after the step, mm^3."
+        },
+        "surface_area": {
+          "type": "number"
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "entities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/entity_record"
+          }
+        }
+      },
+      "required": [
+        "label",
+        "command",
+        "tier",
+        "elapsed_ms",
+        "snapshot_id",
+        "digest",
+        "topology",
+        "volume",
+        "surface_area"
+      ],
+      "additionalProperties": false,
+      "description": "One committed step."
+    },
+    "failure": {
+      "type": "object",
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "compile",
+            "execute"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_input",
+            "selector_not_found",
+            "selector_ambiguous",
+            "kernel_error",
+            "validation_failed",
+            "session_error",
+            "script_error",
+            "io_error"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "suggestion": {
+          "type": "string"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "phase",
+        "command",
+        "code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "description": "The failure that stopped the run."
+    },
+    "face_geometry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "plane"
+            },
+            "origin": {
+              "$ref": "#/$defs/point"
+            }
+          },
+          "required": [
+            "surface",
+            "origin"
+          ],
+          "additionalProperties": true,
+          "description": "A plane; the face's own `normal` field is its outward normal."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "cylinder"
+            },
+            "origin": {
+              "$ref": "#/$defs/point"
+            },
+            "axis": {
+              "$ref": "#/$defs/vector"
+            },
+            "radius": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "surface",
+            "origin",
+            "axis",
+            "radius"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "cone"
+            },
+            "apex": {
+              "$ref": "#/$defs/point"
+            },
+            "axis": {
+              "$ref": "#/$defs/vector"
+            },
+            "half_angle_degrees": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "surface",
+            "apex",
+            "axis",
+            "half_angle_degrees"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "sphere"
+            },
+            "center": {
+              "$ref": "#/$defs/point"
+            },
+            "radius": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "surface",
+            "center",
+            "radius"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "torus"
+            },
+            "origin": {
+              "$ref": "#/$defs/point"
+            },
+            "axis": {
+              "$ref": "#/$defs/vector"
+            },
+            "major_radius": {
+              "type": "number"
+            },
+            "minor_radius": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "surface",
+            "origin",
+            "axis",
+            "major_radius",
+            "minor_radius"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "face": {
+      "type": "object",
+      "properties": {
+        "face": {
+          "$ref": "#/$defs/entity_ref"
+        },
+        "surface": {
+          "type": "string",
+          "enum": [
+            "plane",
+            "cylinder",
+            "cone",
+            "sphere",
+            "torus"
+          ]
+        },
+        "origin": {
+          "$ref": "#/$defs/point"
+        },
+        "normal": {
+          "$ref": "#/$defs/vector"
+        },
+        "axis": {
+          "$ref": "#/$defs/vector"
+        },
+        "apex": {
+          "$ref": "#/$defs/point"
+        },
+        "center": {
+          "$ref": "#/$defs/point"
+        },
+        "radius": {
+          "type": "number"
+        },
+        "half_angle_degrees": {
+          "type": "number"
+        },
+        "major_radius": {
+          "type": "number"
+        },
+        "minor_radius": {
+          "type": "number"
+        },
+        "area": {
+          "type": "number",
+          "description": "Exact area, mm^2."
+        },
+        "centre": {
+          "$ref": "#/$defs/point",
+          "description": "Area centroid of a planar face; a point at the parametric centre of a curved one."
+        },
+        "loops": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "One, plus one per hole through the face."
+        },
+        "summary": {
+          "type": "string"
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Script names first, then history names."
+        }
+      },
+      "required": [
+        "face",
+        "surface",
+        "area",
+        "centre",
+        "normal",
+        "loops",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "description": "One face of the body: its carrier (see face_geometry for the fields each surface kind carries), exact area, centre, outward normal, and names.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/face_geometry"
+        }
+      ]
+    },
+    "edge": {
+      "type": "object",
+      "properties": {
+        "edge": {
+          "$ref": "#/$defs/entity_ref"
+        },
+        "curve": {
+          "type": "string",
+          "enum": [
+            "line",
+            "circular_arc",
+            "elliptical_arc"
+          ]
+        },
+        "start": {
+          "$ref": "#/$defs/point"
+        },
+        "end": {
+          "$ref": "#/$defs/point"
+        },
+        "center": {
+          "$ref": "#/$defs/point"
+        },
+        "normal": {
+          "$ref": "#/$defs/vector"
+        },
+        "radius": {
+          "type": "number"
+        },
+        "major_radius": {
+          "type": "number"
+        },
+        "minor_radius": {
+          "type": "number"
+        },
+        "sweep_degrees": {
+          "type": "number"
+        },
+        "length": {
+          "type": "number",
+          "description": "Exact arc length, mm."
+        },
+        "midpoint": {
+          "$ref": "#/$defs/point"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "edge",
+        "curve",
+        "start",
+        "end",
+        "length",
+        "midpoint",
+        "summary"
+      ],
+      "additionalProperties": false,
+      "description": "One edge of the body: its carrier curve, exact length, midpoint, and names."
+    },
+    "surface_counts": {
+      "type": "object",
+      "properties": {
+        "planes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cylinders": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cones": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "spheres": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tori": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "planes",
+        "cylinders",
+        "cones",
+        "spheres",
+        "tori"
+      ],
+      "additionalProperties": false
+    },
+    "body": {
+      "type": "object",
+      "properties": {
+        "snapshot_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "topology": {
+          "$ref": "#/$defs/topology"
+        },
+        "bounds": {
+          "$ref": "#/$defs/bounds"
+        },
+        "volume": {
+          "type": "number",
+          "description": "Exact volume from the shell integral, mm^3."
+        },
+        "surface_area": {
+          "type": "number"
+        },
+        "centroid": {
+          "$ref": "#/$defs/point"
+        },
+        "surfaces": {
+          "$ref": "#/$defs/surface_counts"
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "exact",
+            "approximate"
+          ],
+          "description": "exact: every construction behind the value is analytic. approximate: the faceted tier or display facets are involved."
+        },
+        "approximate_feature_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Steps so far that fell to the faceted tier."
+        },
+        "faces": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/face"
+          }
+        },
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/edge"
+          }
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "digest",
+        "topology",
+        "volume",
+        "surface_area",
+        "surfaces",
+        "tier",
+        "approximate_feature_count",
+        "faces",
+        "edges"
+      ],
+      "additionalProperties": false,
+      "description": "The current body."
+    },
+    "named_entity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "script",
+            "history"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "vertex",
+            "edge",
+            "coedge",
+            "loop",
+            "face",
+            "shell",
+            "solid"
+          ]
+        },
+        "entity": {
+          "$ref": "#/$defs/entity_ref"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "kind",
+        "entity",
+        "summary"
+      ],
+      "additionalProperties": false
+    },
+    "tier": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "approximate"
+      ],
+      "description": "exact: every construction behind the value is analytic. approximate: the faceted tier or display facets are involved."
+    }
+  }
+}

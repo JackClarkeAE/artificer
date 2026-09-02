@@ -9,6 +9,7 @@ pub mod api;
 pub mod brep;
 mod corner_blend;
 mod cuboid;
+mod describe;
 mod edge_finish;
 mod exact_face_feature;
 mod extrusion;
@@ -74,6 +75,9 @@ use crate::topology::{
 };
 use crate::transform::{Similarity, TransformInputError, transform_topology};
 
+pub use crate::describe::{
+    EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, SurfaceCounts,
+};
 pub use crate::topology::FaceRole;
 
 /// Immutable, validated model state.
@@ -553,6 +557,11 @@ impl NativeKernel {
         // fallback does, because its answer is an approximation and nothing
         // else in the report distinguishes it from an exact one.
         let mut warnings = Vec::new();
+        // The rung of the strategy ladder that certifies this result. Every
+        // arm names its own; a ladder with several rungs names the one that
+        // answered. The report carries it so a consumer can tell an exact
+        // construction from the faceted tier without parsing prose.
+        let mut rung: &'static str = "";
         let (topology, history_mode) = match &request.command {
             KernelCommand::MakeCuboid {
                 origin,
@@ -566,6 +575,7 @@ impl NativeKernel {
                     [*size_x, *size_y, *size_z],
                     request.precision,
                 )?;
+                rung = "primitive/cuboid";
                 (
                     build_cuboid(
                         internal_point(*origin),
@@ -617,6 +627,7 @@ impl NativeKernel {
                     request.precision,
                 )
                 .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                rung = "primitive/revolved-annulus";
                 (build_analytic_extrusion(&extrusion), HistoryMode::Generated)
             }
             KernelCommand::RevolvePlanarProfile {
@@ -629,6 +640,7 @@ impl NativeKernel {
                 let revolved =
                     revolve::validate_revolve(*frame, profile, *axis, *angle, request.precision)
                         .map_err(|reason| revolve_input_error(input.id, reason))?;
+                rung = "revolve/full-turn";
                 (revolve::build_revolve(&revolved), HistoryMode::Generated)
             }
             KernelCommand::TransformSnapshot { transform } => {
@@ -642,6 +654,7 @@ impl NativeKernel {
                     similarity,
                     request.precision,
                 )?;
+                rung = "transform/similarity";
                 (candidate, HistoryMode::OneToOne)
             }
             KernelCommand::ExtrudePolygon {
@@ -654,6 +667,7 @@ impl NativeKernel {
                     validate_extrusion_input(*frame, vertices, *distance, request.precision)
                         .map_err(|reason| extrusion_input_error(input.id, reason))?;
                 let profile_vertices = extrusion.vertex_count();
+                rung = "extrusion/polygon";
                 (
                     build_extrusion(&extrusion),
                     HistoryMode::Extrusion { profile_vertices },
@@ -673,8 +687,10 @@ impl NativeKernel {
                         request.precision,
                     )
                     .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                    rung = "extrusion/analytic-profile";
                     (build_analytic_extrusion(&extrusion), HistoryMode::Generated)
                 } else {
+                    rung = "extrusion/linear-profile";
                     let extrusion = validate_linear_profile_extrusion(
                         input.id,
                         *frame,
@@ -707,8 +723,10 @@ impl NativeKernel {
                         request.precision,
                     )
                     .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                    rung = "loft/straight";
                     (build_analytic_extrusion(&extrusion), HistoryMode::Generated)
                 } else {
+                    rung = "loft/offset-section";
                     let loft = loft::validate_offset_loft(
                         *frame,
                         profile,
@@ -745,6 +763,7 @@ impl NativeKernel {
                         EntityKind::Face,
                     )
                 });
+                rung = "face-feature/exact-prism";
                 (
                     build_face_feature(&feature),
                     HistoryMode::FaceFeature {
@@ -780,6 +799,7 @@ impl NativeKernel {
                                 EntityKind::Face,
                             )
                         });
+                        rung = "face-feature/exact-prism";
                         (feature.topology, exit_face, false)
                     }
                     Err(PlanarProfileInputError::FaceFeature(
@@ -881,8 +901,10 @@ impl NativeKernel {
                             // The faces are the engine's own records, matched
                             // back to history the way every regularized
                             // Boolean's are.
+                            rung = "face-feature/analytic-boolean";
                             (topology, None, true)
                         } else {
+                            rung = "face-feature/faceted";
                             // Crossing curved voids use the faceted Boolean tier.
                             // The ordinary display tessellation may contain
                             // thousands of triangles for a single circle and is
@@ -1110,6 +1132,7 @@ impl NativeKernel {
                     precision: request.precision,
                 })
                 .map_err(|reason| face_push_pull_input_error(input.id, reason))?;
+                rung = "push-pull/planar";
                 (
                     build_face_push_pull(&input.topology, &push_pull),
                     HistoryMode::FacePushPull {
@@ -1143,6 +1166,7 @@ impl NativeKernel {
                     request.precision,
                 )
                 .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+                rung = "drill/exact-prism";
                 (feature.topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::AddRib {
@@ -1186,6 +1210,7 @@ impl NativeKernel {
                     precision: request.precision,
                 })
                 .map_err(|reason| face_feature_input_error(input.id, reason))?;
+                rung = "rib/exact-prism";
                 (
                     build_face_feature(&feature),
                     HistoryMode::RegularizedFaceFeature,
@@ -1219,6 +1244,7 @@ impl NativeKernel {
                 .ok_or_else(|| {
                     simple_invalid_input(input.id, "MIRROR_FAILED", "Mirror produced no solid.")
                 })?;
+                rung = "mirror/faceted";
                 (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::LinearPatternSnapshot {
@@ -1258,6 +1284,7 @@ impl NativeKernel {
                         "Pattern produced no solid.",
                     )
                 })?;
+                rung = "pattern/faceted";
                 (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::FinishEdge {
@@ -1274,16 +1301,21 @@ impl NativeKernel {
                     request.precision,
                 );
                 let topology = match analytic {
-                    Ok(topology) => topology,
+                    Ok(topology) => {
+                        rung = "edge-finish/analytic";
+                        topology
+                    }
                     Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
-                        regularized_edge_finish(
+                        let (topology, certified_by) = regularized_edge_finish(
                             input,
                             &[*target_edge],
                             *kind,
                             *distance,
                             request.precision,
                             &mut warnings,
-                        )?
+                        )?;
+                        rung = certified_by;
+                        topology
                     }
                     Err(reason) => return Err(edge_finish_error(input.id, reason, false)),
                 };
@@ -1303,16 +1335,21 @@ impl NativeKernel {
                     request.precision,
                 );
                 let topology = match analytic {
-                    Ok(topology) => topology,
+                    Ok(topology) => {
+                        rung = "edge-finish/analytic";
+                        topology
+                    }
                     Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
-                        regularized_edge_finish(
+                        let (topology, certified_by) = regularized_edge_finish(
                             input,
                             target_edges,
                             *kind,
                             *distance,
                             request.precision,
                             &mut warnings,
-                        )?
+                        )?;
+                        rung = certified_by;
+                        topology
                     }
                     Err(reason) => return Err(edge_finish_error(input.id, reason, true)),
                 };
@@ -1372,6 +1409,7 @@ impl NativeKernel {
             },
             validation,
             warnings,
+            rung: Some(rung.to_owned()),
         };
         report.sort_deterministically();
         Ok(ExecutionOutcome { snapshot, report })
@@ -1476,11 +1514,13 @@ impl NativeKernel {
         // Beyond the prism reductions, the general analytic engine runs the
         // full imprint/classify/regularize/sew pipeline for operands whose
         // faces it can carry. Everything is exact; nothing tessellates.
+        let mut rung = "boolean/prism";
         let topology = match analytic {
             Ok(topology) => topology,
             Err(_) => {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
+                    rung = "boolean/analytic";
                     match perf_span!(
                         "kernel.boolean.analytic",
                         target.topology.faces.len() + tool.topology.faces.len(),
@@ -1626,6 +1666,7 @@ impl NativeKernel {
             history,
             validation,
             warnings: Vec::new(),
+            rung: Some(rung.to_owned()),
         };
         report.sort_deterministically();
         Ok(ExecutionOutcome { snapshot, report })
@@ -2903,7 +2944,7 @@ fn regularized_edge_finish(
     distance: f64,
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
-) -> Result<Topology, KernelError> {
+) -> Result<(Topology, &'static str), KernelError> {
     match prism_edge_finish::build_prism_edge_finishes(
         input.id,
         &input.topology,
@@ -2912,7 +2953,7 @@ fn regularized_edge_finish(
         distance,
         precision,
     ) {
-        Ok(topology) => return Ok(topology),
+        Ok(topology) => return Ok((topology, "edge-finish/prism")),
         Err(prism_edge_finish::PrismEdgeFinishError::DistanceInvalid) => {
             return Err(simple_invalid_input(
                 input.id,
@@ -2934,7 +2975,7 @@ fn regularized_edge_finish(
         distance,
         precision,
     ) {
-        Ok(topology) => return Ok(topology),
+        Ok(topology) => return Ok((topology, "edge-finish/rim-blend")),
         Err(section_revolve::RimBlendError::DistanceInvalid) => {
             return Err(simple_invalid_input(
                 input.id,
@@ -2952,7 +2993,7 @@ fn regularized_edge_finish(
         distance,
         precision,
     ) {
-        Ok(topology) => return Ok(topology),
+        Ok(topology) => return Ok((topology, "edge-finish/rim-loop-blend")),
         Err(rim_loop_blend::RimLoopBlendError::DistanceInvalid) => {
             return Err(simple_invalid_input(
                 input.id,
@@ -2980,6 +3021,7 @@ fn regularized_edge_finish(
         distance,
         precision,
     );
+    let mut certified_by = "edge-finish/faceted";
     let regularized = if input.topology.faces.len() == 6 {
         faceted
     } else {
@@ -2989,7 +3031,10 @@ fn regularized_edge_finish(
                     .diagnostics
                     .is_empty()
             })
-            .or_else(|| finish_logical_successor_edges(input, targets, kind, distance, precision))
+            .or_else(|| {
+                certified_by = "edge-finish/logical-successor";
+                finish_logical_successor_edges(input, targets, kind, distance, precision)
+            })
     };
     let topology = regularized.ok_or_else(|| {
         simple_invalid_input(
@@ -3005,7 +3050,7 @@ fn regularized_edge_finish(
          rebuilt from a tessellation. Its blend faces, edges, and measures approximate the true \
          solid rather than certifying it.",
     ));
-    Ok(topology)
+    Ok((topology, certified_by))
 }
 
 fn edge_finish_error(

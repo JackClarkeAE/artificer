@@ -623,6 +623,7 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             warnings: Vec::new(),
+            rung: None,
         }
     }
 

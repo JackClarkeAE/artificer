@@ -194,6 +194,9 @@ pub struct ScriptProgram {
     /// resolves each against the finished body to show the user which face
     /// or edge the script calls by that name.
     pub names: Vec<(String, EntitySelector)>,
+    /// Every numeric `param` with the value it took in this run: the
+    /// override when one was given, the evaluated default otherwise.
+    pub parameters: BTreeMap<String, f64>,
 }
 
 /// The most loop iterations one script may run in total, so a runaway range
@@ -214,6 +217,7 @@ pub fn compile_program(
     let mut program = ScriptProgram {
         commands: Vec::new(),
         names: Vec::new(),
+        parameters: BTreeMap::new(),
     };
     let mut budget = MAX_LOOP_ITERATIONS;
     run_block(
@@ -256,6 +260,9 @@ fn run_block(
                 } else {
                     eval_expr(default_value, env)?
                 };
+                if let Value::Number(number) = val {
+                    program.parameters.insert(name.clone(), number);
+                }
                 env.insert(name.clone(), val);
             }
             AstNode::LetBinding { name, value } => {

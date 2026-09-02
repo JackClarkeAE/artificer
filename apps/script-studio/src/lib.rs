@@ -27,7 +27,7 @@ use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, DebugScene, NativeKernel, Snapshot};
 use artificer_protocol::Vector3;
 use artificer_protocol::{
-    Aabb3, DiagnosticSeverity, EntityKind, EntityRef, Point3, TopologyCounts,
+    Aabb3, DiagnosticSeverity, EntityKind, EntityRef, Point3, Tier, TopologyCounts,
 };
 use artificer_ui_core::navigation::NavigationPreset;
 use artificer_ui_core::presentation::{ActiveTool, DisplayTransform, SectionCutPlane, ViewState};
@@ -248,16 +248,27 @@ fn run_script_generation(
                         .filter(|(role, _)| !(edge_finish && role == "face"))
                         .collect(),
                 ));
+                let mut notes: Vec<String> = result
+                    .warnings
+                    .iter()
+                    .chain(&result.diagnostics)
+                    .filter(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect();
+                if let Some(rung) = &result.rung {
+                    notes.push(format!(
+                        "{} · {rung}",
+                        match result.tier {
+                            Tier::Exact => "exact",
+                            Tier::Approximate => "approximate",
+                        }
+                    ));
+                }
                 outcome.steps.push(StepReport {
                     label: result.step_label,
                     topology: result.topology,
                     elapsed_ms: result.elapsed_ms,
-                    notes: result
-                        .diagnostics
-                        .iter()
-                        .filter(|diagnostic| diagnostic.severity != DiagnosticSeverity::Error)
-                        .map(|diagnostic| diagnostic.message.clone())
-                        .collect(),
+                    notes,
                 });
             }
             Err(error) => {
@@ -337,7 +348,10 @@ fn name_faces(
         if !seen.insert(entity.entity.0) {
             continue;
         }
-        let description = describe_face(scene, entity);
+        // The kernel's own description, off the exact carrier; the facets
+        // are only the fallback when the carrier cannot be evaluated.
+        let description = NativeKernel::describe_face(&session.snapshot, entity)
+            .map_or_else(|_| describe_face(scene, entity), |face| face.summary);
         faces.push(FaceName {
             entity,
             script_name: script.get(&entity.entity.0).cloned(),
