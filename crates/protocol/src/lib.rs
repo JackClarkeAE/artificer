@@ -1494,6 +1494,13 @@ pub enum KernelCommand {
         spacing: f64,
         count: u16,
     },
+    /// Hollows a prismatic solid to one uniform `wall`, open at the listed
+    /// faces: one cap, two opposite caps, or none for a closed hollow.
+    ShellSnapshot {
+        open_faces: Vec<EntityRef>,
+        #[serde(with = "finite_f64")]
+        wall: f64,
+    },
     /// Finishes one complete axis-aligned cuboid edge in the first exact,
     /// production-gated domain.
     FinishEdge {

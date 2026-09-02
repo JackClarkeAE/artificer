@@ -312,6 +312,18 @@ impl Writer<'_> {
                 self.dimension(&label, "radius", *radius),
                 quoted(&label)
             ),
+            ApiCommand::Shell { open, wall, .. } => {
+                let open = if open.is_empty() {
+                    String::new()
+                } else {
+                    format!("open: {}, ", self.selectors(open)?)
+                };
+                format!(
+                    "shell({open}wall: {}, label: {})",
+                    self.dimension(&label, "wall", *wall),
+                    quoted(&label)
+                )
+            }
             ApiCommand::Chamfer {
                 edges, distance, ..
             } => format!(

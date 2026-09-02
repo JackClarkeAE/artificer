@@ -874,6 +874,18 @@ impl Session {
                 plane_origin: *plane_origin,
                 plane_normal: *plane_normal,
             }),
+            ApiCommand::Shell { open, wall, .. } => {
+                let open_faces = open
+                    .iter()
+                    .map(|face| {
+                        resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(KernelCommand::ShellSnapshot {
+                    open_faces,
+                    wall: *wall,
+                })
+            }
             ApiCommand::LinearPattern {
                 direction,
                 spacing,
@@ -1362,6 +1374,20 @@ fn point_inside_polygon(point: Point2, polygon: &[Point2]) -> bool {
 /// The closed loops a sketch's entities form. Circles and rectangles are
 /// loops of their own; lines and arcs are chained end to end, in either
 /// direction, until every one has been used and every chain has closed.
+/// Moves one end of a line or arc onto `point`, for exact chaining.
+fn set_endpoint(curve: &mut PlanarCurve2, at_start: bool, point: Point2) {
+    match curve {
+        PlanarCurve2::Line { start, end } | PlanarCurve2::CircularArc { start, end, .. } => {
+            if at_start {
+                *start = point;
+            } else {
+                *end = point;
+            }
+        }
+        PlanarCurve2::Circle { .. } | PlanarCurve2::Bspline { .. } => {}
+    }
+}
+
 fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, ApiError> {
     const JOIN: f64 = 1.0e-9;
     let mut loops = Vec::new();
@@ -1473,13 +1499,22 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
             };
             let candidate = open.remove(index);
             let (start, _) = endpoints(&candidate);
-            let oriented = if near(start, cursor) {
+            let mut oriented = if near(start, cursor) {
                 candidate
             } else {
                 reversed(&candidate)
             };
+            // The kernel wants the chain exact, and an arc's computed end
+            // can miss the next line's start by rounding: the junction is
+            // the point already on the chain.
+            set_endpoint(&mut oriented, true, cursor);
             cursor = endpoints(&oriented).1;
             chain.push(oriented);
+        }
+        if chain.len() > 1
+            && let Some(last) = chain.last_mut()
+        {
+            set_endpoint(last, false, loop_start);
         }
         loops.push(chain);
     }

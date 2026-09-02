@@ -217,6 +217,14 @@ pub enum ApiCommand {
         step: StepLabel,
         placement: PatternPlacement,
     },
+    /// Hollows the current body to one uniform wall, open at the given
+    /// faces: one cap, two opposite caps, or none for a closed hollow.
+    Shell {
+        label: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open: Vec<EntitySelector>,
+        wall: f64,
+    },
     BooleanUnion {
         label: String,
         target: StepLabel,
@@ -252,6 +260,7 @@ impl ApiCommand {
             Self::Mirror { .. } => "mirror",
             Self::LinearPattern { .. } => "linear_pattern",
             Self::FeaturePattern { .. } => "feature_pattern",
+            Self::Shell { .. } => "shell",
             Self::BooleanUnion { .. } => "boolean_union",
             Self::BooleanDifference { .. } => "boolean_difference",
             Self::BooleanIntersection { .. } => "boolean_intersection",
@@ -273,6 +282,7 @@ impl ApiCommand {
             | Self::Mirror { label, .. }
             | Self::LinearPattern { label, .. }
             | Self::FeaturePattern { label, .. }
+            | Self::Shell { label, .. }
             | Self::BooleanUnion { label, .. }
             | Self::BooleanDifference { label, .. }
             | Self::BooleanIntersection { label, .. } => label,

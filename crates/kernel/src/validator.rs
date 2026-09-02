@@ -2553,7 +2553,7 @@ fn face_parameter_polar_moment(topology: &Topology, face: &Face) -> Option<f64> 
 }
 
 /// Parameter-space extent of a face's outer loop.
-fn pcurve_extent(topology: &Topology, face: &Face) -> Option<(f64, f64, f64, f64)> {
+pub(crate) fn pcurve_extent(topology: &Topology, face: &Face) -> Option<(f64, f64, f64, f64)> {
     let loop_record = topology.loop_record(face.outer_loop)?;
     let mut u_min = f64::INFINITY;
     let mut u_max = f64::NEG_INFINITY;

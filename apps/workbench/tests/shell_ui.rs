@@ -114,7 +114,8 @@ fn document_properties_popout_changes_units_and_exposes_real_file_actions() {
         "Save .ARTIFICER",
         "Open .ARTIFICER",
         "Export STL",
-        "Export faceted STEP",
+        "Export STEP (exact B-rep)",
+        "Export STEP (faceted)",
     ] {
         assert!(
             harness

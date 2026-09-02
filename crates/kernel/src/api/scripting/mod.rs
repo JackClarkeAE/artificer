@@ -462,6 +462,7 @@ const BUILTINS: &[&str] = &[
     "chamfer",
     "mirror",
     "pattern",
+    "shell",
     "union",
     "difference",
     "intersection",
@@ -1392,6 +1393,14 @@ impl<'a> Interp<'a> {
                 label: args.label()?,
                 edges: args.required("edges")?.as_selectors()?,
                 distance: args.number("distance")?,
+            })),
+            "shell" => Ok(Value::Command(ApiCommand::Shell {
+                label: args.label()?,
+                open: match args.values.get("open") {
+                    None => Vec::new(),
+                    Some(open) => open.as_selectors()?,
+                },
+                wall: args.number("wall")?,
             })),
             // ---- whole-body operations -------------------------------------
             "mirror" => Ok(Value::Command(ApiCommand::Mirror {

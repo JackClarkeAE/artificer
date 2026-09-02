@@ -32,6 +32,7 @@ mod revolve;
 mod rim_loop_blend;
 mod section_revolve;
 mod sew;
+mod shell;
 mod step_export;
 mod surface_intersection;
 mod topology;
@@ -1242,6 +1243,88 @@ impl NativeKernel {
                         })?;
                 rung = "mirror/exact";
                 (topology, HistoryMode::OneToOne)
+            }
+            KernelCommand::ShellSnapshot { open_faces, wall } => {
+                // A shell is a composition of certified constructions: the
+                // open cap's inward offset cut as a pocket, or a core built
+                // from that offset and taken away by the Boolean ladder.
+                // The inner operation's outcome is the shell's, under the
+                // shell's own rung.
+                let plan = shell::plan_shell(
+                    input.id,
+                    &input.topology,
+                    open_faces,
+                    *wall,
+                    request.precision,
+                )
+                .map_err(|reason| {
+                    simple_invalid_input(input.id, reason.code(), reason.message())
+                })?;
+                let mut outcome = match plan {
+                    shell::ShellPlan::Pocket {
+                        target_face,
+                        frame,
+                        profile,
+                        distance,
+                    } => {
+                        let pocket = ExecuteRequest {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            request_id: artificer_protocol::RequestId::new("shell::pocket"),
+                            expected_snapshot: input.id,
+                            precision: request.precision,
+                            command: KernelCommand::ExtrudeFacePlanarProfile {
+                                target_face,
+                                frame,
+                                profile,
+                                distance,
+                                operation: FaceExtrusionOperation::Cut,
+                            },
+                        };
+                        Self::execute(input, &pocket, cancellation)?
+                    }
+                    shell::ShellPlan::Hollow {
+                        frame,
+                        profile,
+                        distance,
+                    } => {
+                        let empty = Self::empty();
+                        let core = ExecuteRequest {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            request_id: artificer_protocol::RequestId::new("shell::core"),
+                            expected_snapshot: empty.id(),
+                            precision: request.precision,
+                            command: KernelCommand::ExtrudePlanarProfile {
+                                frame,
+                                profile,
+                                distance,
+                            },
+                        };
+                        let core = Self::execute(&empty, &core, cancellation)?;
+                        let hollow = BooleanRequest {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            request_id: artificer_protocol::RequestId::new("shell::hollow"),
+                            expected_target_snapshot: input.id,
+                            expected_tool_snapshot: core.snapshot.id(),
+                            precision: request.precision,
+                            operation: BooleanOperation::Difference,
+                        };
+                        Self::execute_boolean(input, &core.snapshot, &hollow, cancellation)?
+                    }
+                };
+                let faceted = outcome
+                    .report
+                    .rung
+                    .as_deref()
+                    .is_some_and(|rung| rung.ends_with("/faceted"));
+                outcome.report.rung = Some(
+                    match (open_faces.is_empty(), faceted) {
+                        (_, true) => "shell/faceted",
+                        (true, false) => "shell/closed-prism",
+                        (false, false) => "shell/open-prism",
+                    }
+                    .to_owned(),
+                );
+                return Ok(outcome);
             }
             KernelCommand::LinearPatternSnapshot {
                 direction,

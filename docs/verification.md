@@ -76,6 +76,7 @@ are stable, slash-separated paths:
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
 | `pattern/faceted` | A whole-body linear pattern, which is faceted in this release. |
+| `shell/open-prism`, `shell/closed-prism` | A shell: the open face's inward offset cut as a pocket, or a core one wall in from every face taken away by the Boolean ladder. |
 | `transform/similarity` | A rigid transform. |
 
 A rung ending in `/faceted` is the approximate tier; the step also carries
@@ -273,9 +274,29 @@ feature was built on is followed by history through every later step, so
 a boss the feature itself added does not capture a `faces(">Z")`
 selector.
 
+### Shell
+
+`shell` (`shell_snapshot` on the kernel wire) hollows a prismatic body to
+one uniform wall, open at one face, at two opposite faces, or closed. It
+composes constructions the kernel already certifies: the mitred loop
+offset the rim blends use, the exact face cut, the prism constructor and
+the Boolean engine. The answers are closed-form and the tests hold the
+kernel to them: a `b × d × h` box open at the top has volume
+`bdh − (b−2w)(d−2w)(h−w)`, a cylinder open at the top is the annular cup
+`πr²h − π(r−w)²(h−w)`, a closed box keeps a void `(b−2w)(d−2w)(h−2w)`
+and reports two shells, a hole through the open face keeps a wall around
+it, and `probe.min_wall` reads the wall back to `1e-9` on planar walls
+(to the facet chord on curved ones). A wall that leaves no floor or no
+core, a body that is not a prism about the open face, two open faces
+that are not opposite, or a wall thicker than half the narrowest neck are
+refused by name: `SHELL_WALL_INVALID`, `SHELL_DOMAIN_UNSUPPORTED`,
+`SHELL_OPEN_FACES_UNSUPPORTED`, `SHELL_SELF_INTERSECTS`.
+
 ## 8. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
-measures are volume, surface area, centroid and bounds. Probes read the
+measures are volume, surface area, centroid and bounds. Shell covers
+prisms: a revolved body other than a cylinder, or a blended one, is
+refused rather than approximated. Probes read the
 current session only; comparing two reports is a job for the caller until
 the semantic diff lands.

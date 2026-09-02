@@ -113,7 +113,8 @@ edits the current one:
   "new"`, and `revolve`. The result becomes the current body. Every earlier
   body stays in the session under its step label.
 - **Edit the current body**: `drill`, `push_pull`, `fillet`, `chamfer`,
-  `mirror`, `pattern`, and `extrude` with `operation: "add"` or `"cut"`.
+  `mirror`, `pattern`, `shell`, and `extrude` with `operation: "add"` or
+  `"cut"`.
 - **Combine two bodies**: `union`, `difference`, `intersection` take the
   bodies two earlier steps left behind, by label, and the result becomes the
   current body.
@@ -344,6 +345,39 @@ selector that names it.
 
 Without `step:`, `pattern(direction:, spacing:, count:)` copies the whole
 current body along a row on the faceted tier, as before.
+
+### `shell`
+
+```art
+let block = box(size: [60, 40, 25], label: "block");
+shell(open: faces(">Z"), wall: 3, label: "tray");          // open at the top
+shell(open: [faces(">Z"), faces("<Z")], wall: 3, label: "tube");
+shell(wall: 3, label: "hollow");                            // closed, with a void
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `open` | no | The face to open, or an array of two opposite faces. Left out, the body is hollowed closed. |
+| `wall` | yes | The wall thickness, the same everywhere. |
+
+`shell` hollows the current body to one uniform wall. Open at one face it
+cuts a pocket: the face's outline offset inward by the wall, mitred at
+sharp corners, to within one wall of the far face. Open at two opposite
+faces the pocket goes through. Closed, the body keeps a void one wall in
+from every face, so the report shows two shells. A hole through the open
+face keeps a wall around it. Every case is exact and reads back: a shelled
+`60 × 40 × 25` box open at the top has volume
+`60·40·25 − 54·34·22`, and `probe.min_wall` reads the wall. Rungs are
+`shell/open-prism` and `shell/closed-prism`.
+
+The domain is the prism about the open face: that face and the one
+opposite it are parallel planes and every other face is a plane or a
+cylinder along their normal, with an outline of lines and arcs. A box is a
+prism along each axis, so it opens on any face; an extrusion or a cylinder
+opens on its caps; a slot with round ends offsets its arcs exactly. A
+blended body, a revolved section other than a cylinder, or a wall thicker
+than half the narrowest neck of the outline is refused by name
+(`SHELL_DOMAIN_UNSUPPORTED`, `SHELL_WALL_INVALID`, `SHELL_SELF_INTERSECTS`).
 
 ### `union`, `difference`, `intersection`
 
