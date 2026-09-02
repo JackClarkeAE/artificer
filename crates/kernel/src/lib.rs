@@ -22,6 +22,7 @@ mod analytic_boolean;
 #[allow(dead_code)]
 mod loft;
 mod loop_offset;
+mod mirror;
 mod planar_profile;
 mod prism_boolean;
 mod prism_edge_finish;
@@ -1224,30 +1225,23 @@ impl NativeKernel {
             } => {
                 validate_transform_source(input)?;
                 let normal = Vector3::new(plane_normal.x, plane_normal.y, plane_normal.z);
-                if normal.length() <= request.precision.angular_agreement_radians
-                    || input
-                        .topology
-                        .faces
-                        .iter()
-                        .any(|face| !matches!(face.value.surface, Surface::Plane(_)))
-                {
+                if normal.length() <= request.precision.angular_agreement_radians {
                     return Err(simple_invalid_input(
                         input.id,
                         "MIRROR_DOMAIN_UNSUPPORTED",
-                        "Mirror currently requires a non-zero plane normal and an all-planar body.",
+                        "Mirror requires a non-zero plane normal.",
                     ));
                 }
-                let topology = faceted_boolean::mirror_scene(
-                    &Self::authoritative_scene(input),
-                    internal_point(*plane_origin),
-                    normal,
-                    request.precision,
-                )
-                .ok_or_else(|| {
-                    simple_invalid_input(input.id, "MIRROR_FAILED", "Mirror produced no solid.")
-                })?;
-                rung = "mirror/faceted";
-                (topology, HistoryMode::RegularizedFaceFeature)
+                // A reflection is exact on every carrier: the body is
+                // reflected as itself and each face reversed to face
+                // outward again, with every entity keeping its identity.
+                let topology =
+                    mirror::mirror_topology(&input.topology, internal_point(*plane_origin), normal)
+                        .map_err(|reason| {
+                            simple_invalid_input(input.id, "MIRROR_FAILED", reason.message())
+                        })?;
+                rung = "mirror/exact";
+                (topology, HistoryMode::OneToOne)
             }
             KernelCommand::LinearPatternSnapshot {
                 direction,

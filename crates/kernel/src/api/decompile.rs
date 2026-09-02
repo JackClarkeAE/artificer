@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use artificer_protocol::{EntityKind, EntityRef, Point2, Point3, Tier, Vector3};
 
-use crate::api::commands::{ApiCommand, ExtrudeOp, SketchEntity, SketchPlane};
+use crate::api::commands::{ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane};
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::journal::Journal;
 use crate::api::selectors::{
@@ -342,6 +342,43 @@ impl Writer<'_> {
                 self.dimension(&label, "count", f64::from(*count)),
                 quoted(&label)
             ),
+            ApiCommand::FeaturePattern {
+                step, placement, ..
+            } => {
+                let source = self.step_ident(&step.0)?;
+                match placement {
+                    PatternPlacement::Linear {
+                        direction,
+                        spacing,
+                        count,
+                    } => format!(
+                        "pattern(step: {source}, direction: {}, spacing: {}, count: {}, label: {})",
+                        vector3(*direction),
+                        self.dimension(&label, "spacing", *spacing),
+                        self.dimension(&label, "count", f64::from(*count)),
+                        quoted(&label)
+                    ),
+                    PatternPlacement::Circular {
+                        axis_origin,
+                        axis_direction,
+                        count,
+                        angle_step_degrees,
+                    } => {
+                        let angle = if *angle_step_degrees == 0.0 {
+                            String::new()
+                        } else {
+                            format!(", angle: {}", number(*angle_step_degrees))
+                        };
+                        format!(
+                            "pattern(step: {source}, axis: {}, axis_origin: {}, count: {}{angle}, label: {})",
+                            vector3(*axis_direction),
+                            point3(*axis_origin),
+                            self.dimension(&label, "count", f64::from(*count)),
+                            quoted(&label)
+                        )
+                    }
+                }
+            }
             ApiCommand::BooleanUnion { target, tool, .. } => format!(
                 "union(target: {}, tool: {}, label: {})",
                 self.step_ident(&target.0)?,

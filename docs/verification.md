@@ -73,7 +73,9 @@ are stable, slash-separated paths:
 | `edge-finish/analytic`, `edge-finish/prism`, `edge-finish/rim-blend`, `edge-finish/rim-loop-blend`, `edge-finish/logical-successor` | Exact fillets and chamfers, by the rung that carried them. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
 | `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
-| `mirror/faceted`, `pattern/faceted` | Mirror and linear pattern, which are faceted in this release. |
+| `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
+| `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
+| `pattern/faceted` | A whole-body linear pattern, which is faceted in this release. |
 | `transform/similarity` | A rigid transform. |
 
 A rung ending in `/faceted` is the approximate tier; the step also carries
@@ -245,7 +247,33 @@ billion, over a fixture set covering every surface type, seams, a cavity,
 a blended body and an oblique cylinder section. That oracle is a
 development-machine tool, never a build dependency.
 
-## 7. Not in this release
+## 7. Exact mirror and feature patterns
+
+`mirror` is exact for any body. Every carrier is reflected as itself and
+every face is then reversed by the kernel's own convention, so the mirror
+of a filleted part is a filleted part: the same face, edge and vertex
+counts, the same volume and surface area to the last place, and the
+centroid reflected through the plane. The rung is `mirror/exact`, and
+features built on the mirrored body afterwards take the rungs they would
+on the original.
+
+A feature pattern (`pattern(step: ...)` in a script,
+`feature_pattern` on the wire) repeats a drilled hole or a face-sketch
+extrusion at rigid placements on its face: a row, or a turn about an axis
+normal to the face. It does not copy geometry. Each instance is the same
+feature replayed by the kernel, committed as a step `<label>/<n>` with
+its own rung, so the report shows six `face-feature/exact-prism` drills
+under one `pattern/replay` step, the volume of a plate with six patterned
+holes is the plate less six holes in closed form, the replay is
+digest-stable across sessions and journal replays, and a rim fillet on
+any instance certifies through the ordinary blend ladder. A placement
+that would carry an instance off its face is refused by instance number,
+and a refused or failed pattern leaves nothing behind. The face the
+feature was built on is followed by history through every later step, so
+a boss the feature itself added does not capture a `faces(">Z")`
+selector.
+
+## 8. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Probes read the

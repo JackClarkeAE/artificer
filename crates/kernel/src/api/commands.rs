@@ -95,6 +95,39 @@ pub enum SketchConstraint {
     Fixed,
 }
 
+/// Where a feature pattern puts its instances. `count` is the total
+/// including the original.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PatternPlacement {
+    /// Instances every `spacing` along `direction`, which must lie in the
+    /// feature's face.
+    Linear {
+        direction: Vector3,
+        spacing: f64,
+        count: u16,
+    },
+    /// Instances turned about an axis normal to the feature's face, every
+    /// `angle_step_degrees` (a full turn shared equally when zero).
+    Circular {
+        axis_origin: Point3,
+        axis_direction: Vector3,
+        count: u16,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        angle_step_degrees: f64,
+    },
+}
+
+impl PatternPlacement {
+    /// The total number of instances, the original included.
+    #[must_use]
+    pub const fn count(&self) -> u16 {
+        match self {
+            Self::Linear { count, .. } | Self::Circular { count, .. } => *count,
+        }
+    }
+}
+
 /// Commands for geometry operations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -174,6 +207,16 @@ pub enum ApiCommand {
         spacing: f64,
         count: u16,
     },
+    /// Repeats an earlier feature, a drilled hole or an extrusion from a
+    /// sketch on a face, at rigid placements on the same face: a row or a
+    /// circular array. Each instance is the same exact feature replayed,
+    /// committed as the step `<label>/<n>`.
+    FeaturePattern {
+        label: String,
+        /// The step to repeat.
+        step: StepLabel,
+        placement: PatternPlacement,
+    },
     BooleanUnion {
         label: String,
         target: StepLabel,
@@ -208,6 +251,7 @@ impl ApiCommand {
             Self::Chamfer { .. } => "chamfer",
             Self::Mirror { .. } => "mirror",
             Self::LinearPattern { .. } => "linear_pattern",
+            Self::FeaturePattern { .. } => "feature_pattern",
             Self::BooleanUnion { .. } => "boolean_union",
             Self::BooleanDifference { .. } => "boolean_difference",
             Self::BooleanIntersection { .. } => "boolean_intersection",
@@ -228,6 +272,7 @@ impl ApiCommand {
             | Self::Chamfer { label, .. }
             | Self::Mirror { label, .. }
             | Self::LinearPattern { label, .. }
+            | Self::FeaturePattern { label, .. }
             | Self::BooleanUnion { label, .. }
             | Self::BooleanDifference { label, .. }
             | Self::BooleanIntersection { label, .. } => label,

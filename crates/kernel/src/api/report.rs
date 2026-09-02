@@ -410,11 +410,13 @@ impl Session {
     }
 
     fn step_record(&self, label: &str) -> Option<StepRecord> {
-        let entry = self
-            .journal
-            .entries
-            .iter()
-            .find(|entry| entry.label == label)?;
+        let kind = self.step_kinds.get(label).cloned().or_else(|| {
+            self.journal
+                .entries
+                .iter()
+                .find(|entry| entry.label == label)
+                .map(|entry| entry.command.kind().to_owned())
+        })?;
         let snapshot_id = *self.step_snapshots.get(label)?;
         let snapshot = self.snapshot_cache.get(&snapshot_id)?;
         let measures = snapshot.measures();
@@ -447,7 +449,7 @@ impl Session {
         });
         Some(StepRecord {
             label: label.to_owned(),
-            command: entry.command.kind().to_owned(),
+            command: kind,
             rung: report.and_then(|report| report.rung.clone()),
             tier: report.map_or(Tier::Exact, |report| report.tier()),
             elapsed_ms,

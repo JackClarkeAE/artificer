@@ -486,6 +486,13 @@ fn the_schema_lists_every_diagnostic_code_the_kernel_can_emit() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 pending.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|name| name == "step_export.rs")
+            {
+                // The STEP writer's upper-case literals are entity type
+                // names in the file it writes, not diagnostic codes.
+                continue;
             } else if path.extension().is_some_and(|extension| extension == "rs") {
                 let source = std::fs::read_to_string(&path).unwrap();
                 emitted.extend(uppercase_literals(&source));

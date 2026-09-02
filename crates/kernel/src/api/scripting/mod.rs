@@ -31,7 +31,7 @@ use artificer_protocol::{EntityKind, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::commands::{
-    ApiCommand, ExtrudeOp, SketchConstraint, SketchEntity, SketchPlane, StepLabel,
+    ApiCommand, ExtrudeOp, PatternPlacement, SketchConstraint, SketchEntity, SketchPlane, StepLabel,
 };
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::scripting::ast::{
@@ -1406,6 +1406,34 @@ impl<'a> Interp<'a> {
                         "pattern(): `count` is a whole number of copies",
                     ));
                 }
+                // With `step:` the pattern replays one feature at each
+                // placement; without it, it copies the whole body.
+                if let Some(step) = args.values.get("step") {
+                    let step = step.as_step()?;
+                    let placement = if let Some(axis) = args.values.get("axis") {
+                        PatternPlacement::Circular {
+                            axis_origin: args.point3_or("axis_origin", origin)?,
+                            axis_direction: axis.as_vector3()?,
+                            count: count as u16,
+                            angle_step_degrees: args.number_or("angle", 0.0)?,
+                        }
+                    } else if args.values.contains_key("direction") {
+                        PatternPlacement::Linear {
+                            direction: args.required("direction")?.as_vector3()?,
+                            spacing: args.number("spacing")?,
+                            count: count as u16,
+                        }
+                    } else {
+                        return Err(ScriptError::eval(
+                            "pattern(step: ...) takes `axis:` (with `axis_origin:` and `angle:`) for a circular array, or `direction:` and `spacing:` for a row",
+                        ));
+                    };
+                    return Ok(Value::Command(ApiCommand::FeaturePattern {
+                        label: args.label()?,
+                        step,
+                        placement,
+                    }));
+                }
                 Ok(Value::Command(ApiCommand::LinearPattern {
                     label: args.label()?,
                     direction: args.required("direction")?.as_vector3()?,
@@ -1801,8 +1829,9 @@ impl Value {
             Self::Step(label) => Ok(label.clone()),
             Self::Command(command) => Ok(StepLabel(command.label().to_owned())),
             Self::Body { step, .. } => Ok(step.clone()),
+            Self::String(label) if !label.is_empty() => Ok(StepLabel(label.clone())),
             other => Err(ScriptError::eval(format!(
-                "Expected a step (a `let` bound to a feature call) or a body, got {}",
+                "Expected a step (a `let` bound to a feature call, or its label as a string) or a body, got {}",
                 other.describe()
             ))),
         }

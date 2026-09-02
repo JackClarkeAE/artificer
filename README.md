@@ -34,6 +34,7 @@ Work on the next release is about verification-driven CAD: letting a program, no
 - **Every step result** now carries its rung, tier and construction warnings, and Script Studio prints them in the console.
 - **Exact STEP.** `artificer-api export part.art part.step` (JSON-RPC `export.step`, the workbench's "STEP (exact B-rep)") writes the body as AP214 `advanced_brep_shape_representation`: planes, cylinders, cones, spheres and tori as the five STEP elementary surfaces, lines, circles and ellipses as themselves, cavities as `brep_with_voids`, nothing tessellated. The exporter's tests read every file back as a manifold B-rep and check each face's sense against the kernel's own normals; `tools/oracle-occt/step_measure.py` is the OpenCascade oracle a development machine runs to confirm imported volume and area to one part in a billion. Faceted STEP stays for mesh consumers (`--faceted`, "STEP (faceted)").
 - **Journals back to scripts, and scripts compared.** `artificer-api journal session.json --art out.art` (JSON-RPC `journal.art`, `Session::to_art`) writes a session's journal as a `.art` script that rebuilds the same digest, with dimensions as `param`s, snapshot-bound references regenerated as history selectors, and faceted-tier steps annotated. `artificer-api diff a.art b.art --json` (JSON-RPC `script.diff`) compares two scripts semantically: parameters, steps added, removed, moved or changed, names renamed or retargeted. Script Studio pulls a journal into the open script behind that diff, and exports its own.
+- **Exact mirror, and patterns of features.** `mirror` reflects any body exactly: every carrier is reflected as itself, blends included, so the mirrored part keeps its face count, volume and area with its centroid reflected, and takes exact features afterwards. `pattern(step: hole, axis: [0, 0, 1], axis_origin:, count: 6)` and `pattern(step: hole, direction:, spacing:, count:)` repeat a drilled hole or a face-sketch extrusion around an axis or along a row by replaying the same exact feature at each placement, each instance a step of its own under one journal entry, so a rim fillet on a patterned hole certifies through the same blend ladder as on the original.
 - **`.art` 0.3: functions, modules and typed parameters.** `fn standoff(on: face, at: [f64; 2], height: f64, label: str) -> body { ... return boss with faces { top: boss.top }; }` packages steps that recur, with labels scoped to the call so a loop of calls stays unique without string arithmetic, and exported faces that keep resolving after later steps. `use "lib/standoffs.art";` shares functions and constants between scripts. `param wall: f64 [mm] in 1.2..4.0 = 2.0 "wall thickness";` carries a unit, a range and a description, and `artificer-api params part.art --json` (or JSON-RPC `script.params`) lists them without running the script. Unbound names, arity and type mismatches, recursion and import cycles refuse with a line and column.
 
 ## What is new in 0.96
@@ -158,7 +159,8 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `extrude(sketch:, distance:, operation: "new" \| "add" \| "cut", draft:, regions:, label:)` | A prism, or a drafted loft for a new body. |
 | `revolve(sketch:, axis:, axis_origin:, angle:, operation:, label:)` | A solid of revolution. |
 | `drill(face:, center:, diameter:, depth:)`, `push_pull(face:, distance:)`, `fillet(edges:, radius:)`, `chamfer(edges:, distance:)` | Face and edge features. |
-| `mirror(origin:, normal:)`, `pattern(direction:, spacing:, count:)` | Whole-body operations. |
+| `mirror(origin:, normal:)` | Reflects the current body exactly. |
+| `pattern(step:, axis:, axis_origin:, count:, angle:)`, `pattern(step:, direction:, spacing:, count:)` | Repeats a drilled hole or a face-sketch extrusion around an axis or along a row. |
 | `union(target:, tool:)`, `difference(target:, tool:)`, `intersection(target:, tool:)` | Booleans between two steps. |
 | `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
 | `fn name(a: f64, on: face, label: str) -> body { ... return step with faces { top: ... }; }` | Functions with typed arguments, call-scoped labels and exported faces. |
@@ -170,7 +172,7 @@ Errors name their line and column, so an editor can point at them. `artificer-ap
 
 ### What the kernel does today
 
-- Primitives, planar-profile extrusion with holes and islands, revolve, drafted extrusion as an exact loft to the profile's offset section, push/pull, holes, ribs, mirror, and linear patterns.
+- Primitives, planar-profile extrusion with holes and islands, revolve, drafted extrusion as an exact loft to the profile's offset section, push/pull, holes, ribs, exact mirror, and circular and linear patterns of face features.
 - Exact chamfers and constant-radius fillets, including fillets that run around a whole hole rim, with spherical corners where the rim turns in and elliptical mitre seams where it turns out.
 - Regularized Boolean union, difference, and intersection, with an exact engine for plane and cylinder operands and a faceted fallback that says so.
 - Analytic surface–surface intersections across the vocabulary, published as a supported-domain matrix.

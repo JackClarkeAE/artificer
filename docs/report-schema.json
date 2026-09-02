@@ -463,6 +463,7 @@
         "chamfer",
         "mirror",
         "linear_pattern",
+        "feature_pattern",
         "boolean_union",
         "boolean_difference",
         "boolean_intersection"

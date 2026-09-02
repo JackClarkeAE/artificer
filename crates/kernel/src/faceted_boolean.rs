@@ -1014,34 +1014,6 @@ fn edge_inward_directions(
     (fallback.len() == 2).then(|| [fallback[0], fallback[1]])
 }
 
-pub(crate) fn mirror_scene(
-    scene: &DebugScene,
-    plane_origin: Point3,
-    plane_normal: Vector3,
-    precision: PrecisionPolicy,
-) -> Option<Topology> {
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
-    let normal = plane_normal / plane_normal.length();
-    let polygons = scene
-        .triangles
-        .iter()
-        .filter_map(|triangle| {
-            let mut vertices = triangle
-                .vertices
-                .map(internal_point)
-                .map(|point| point + normal * (-2.0 * (point - plane_origin).dot(normal)))
-                .to_vec();
-            vertices.reverse();
-            Polygon::new(vertices, triangle.role, epsilon)
-        })
-        .collect();
-    topology_from_polygons(polygons, epsilon)
-}
-
 pub(crate) fn linear_pattern_scene(
     scene: &DebugScene,
     direction: Vector3,

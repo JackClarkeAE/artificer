@@ -292,16 +292,58 @@ faces the blends do not touch. `crates/kernel/examples/filleted_flange.art`
 rounds every rim of a flanged hub; `flanged_hub.art` shows the order that
 keeps rim fillets and bolt holes on the same part exact.
 
-### `mirror` and `pattern`
+### `mirror`
 
 ```art
-mirror(origin: [0, 0, 0], normal: [1, 0, 0], label: "other_half");
-pattern(direction: [1, 0, 0], spacing: 25, count: 4, label: "row");
+mirror(origin: [0, 0, 0], normal: [1, 0, 0], label: "flipped");
 ```
 
-`mirror` reflects the current body across the plane and joins the two.
-`pattern` repeats the current body `count` times along `direction` with the
-given `spacing`; `count` includes the original.
+`mirror` reflects the current body across the plane through `origin` with
+the given `normal`. It is exact for any body: every carrier is reflected
+as itself, so planes stay planes and blends stay torus bands, and the
+mirrored body keeps its face, edge and vertex count, its volume and its
+surface area, with its centroid reflected through the plane. Later
+features build on the mirrored body as they would on the original. The
+rung is `mirror/exact`.
+
+### `pattern`
+
+A feature pattern repeats one earlier feature, a `drill` or an `extrude`
+with `operation: "add"` or `"cut"` drawn on a face, at rigid placements on
+the same face. Each instance is the same exact feature replayed, committed
+as a step of its own named `<label>/<n>`, so a pattern of exact features
+is exact and later blends on any instance certify through the same
+ladder as on the original.
+
+```art
+let hole = drill(face: faces(">Z"), center: [25, 0], diameter: 6, depth: 10, label: "hole");
+
+// Six holes on the 25 mm circle about the face's axis.
+pattern(step: hole, axis: [0, 0, 1], axis_origin: [0, 0, 10], count: 6, label: "bolts");
+
+// A row: four holes 20 mm apart along Y.
+pattern(step: hole, direction: [0, 1, 0], spacing: 20, count: 4, label: "row");
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `step` | yes | The feature to repeat: a `let` bound to a `drill` or `extrude` call, or its label as a string. |
+| `axis`, `axis_origin` | circular | The turning axis, which must be normal to the feature's face; `axis_origin` defaults to the world origin. |
+| `angle` | no | Degrees between instances in a circular pattern; a full turn shared equally when left out. |
+| `direction`, `spacing` | linear | The row's direction, which must lie in the feature's face, and the distance between instances. |
+| `count` | yes | Instances in total, the original included; 2 to 128. |
+
+The face the feature was built on is followed by history, so a boss the
+feature itself added does not capture a `faces(">Z")` selector. A
+placement that would carry an instance off that face is refused by
+instance number, and a pattern commits whole or not at all: one journal
+entry, one undo. The pattern step reports the rung `pattern/replay`; its
+instances carry the rungs that built them, and `pattern.face("role")`
+reaches the last instance. The pattern step also stands in for a probe or
+selector that names it.
+
+Without `step:`, `pattern(direction:, spacing:, count:)` copies the whole
+current body along a row on the faceted tier, as before.
 
 ### `union`, `difference`, `intersection`
 
