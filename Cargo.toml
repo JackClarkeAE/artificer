@@ -3,6 +3,7 @@ members = [
     "apps/api-server",
     "apps/compute-bench",
     "apps/cli",
+    "apps/script-studio",
     "apps/workbench",
     "crates/catalog",
     "crates/compute",

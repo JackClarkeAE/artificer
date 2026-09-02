@@ -87,6 +87,7 @@ impl Parser {
     }
 
     fn parse_param_decl(&mut self) -> Result<AstNode, String> {
+        let (decl_line, _) = self.current_span();
         self.advance(); // 'param'
         let (line, col) = self.current_span();
         let name = match self.advance() {
@@ -117,6 +118,7 @@ impl Parser {
             name,
             param_type,
             default_value,
+            line: decl_line,
         })
     }
 
@@ -225,6 +227,8 @@ impl Parser {
                     method,
                     named_args,
                     positional_args,
+                    line,
+                    col,
                 };
             } else {
                 break;
@@ -248,6 +252,7 @@ impl Parser {
             }
             Token::Ident(name) => {
                 let name = name.clone();
+                let (line, col) = self.current_span();
                 self.advance();
                 if self.peek() == &Token::LParen {
                     let (named_args, positional_args) = self.parse_arguments()?;
@@ -255,6 +260,8 @@ impl Parser {
                         name,
                         named_args,
                         positional_args,
+                        line,
+                        col,
                     })
                 } else {
                     Ok(Expression::Identifier(name))

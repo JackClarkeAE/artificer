@@ -25,14 +25,15 @@
 
 ---
 
-## Two products, one repository
+## Three products, one repository
 
-Artificer is two things, deliberately kept apart:
+Artificer is three things, deliberately kept apart:
 
 | | What it is | Where it lives | Depends on |
 |---|---|---|---|
 | **Artificer Kernel** | A standalone exact B-rep modelling kernel with its programmatic API built in: a Rust API, a JSON-RPC 2.0 server, the `.art` scripting language, headless PNG/SVG rendering, and STL/OBJ export. | [`crates/kernel`](crates/kernel) | Nothing but its own geometry, compute, and protocol crates. No UI, no GPU, no C or C++. |
 | **Artificer Workbench** | A native desktop parametric CAD application: sketching, features, assemblies, a part library, and a parametric history. | [`apps/workbench`](apps/workbench) | The kernel, through the same protocol every other client uses. |
+| **Artificer Script Studio** | A live `.art` visualiser in the OpenSCAD shape: the script on the left, the exact model on the right, a customizer built from the script's parameters, and a console that points at the failing line. | [`apps/script-studio`](apps/script-studio) | The kernel, through its API session, and the workbench's viewport and theme. |
 
 The separation is enforced, not aspirational. The CI architecture audit fails the build if a UI or rendering dependency enters the kernel crate, and the kernel is exercised end to end by a headless test suite that never opens a window. You can embed the kernel in your own application, drive it from another language over JSON-RPC, or script it from a file, and you get exactly the same geometry the workbench would build.
 
@@ -122,6 +123,22 @@ cargo run --release -p artificer-api-server -- snapshot bracket.art bracket.png
 cargo run --release -p artificer-api-server -- export bracket.art bracket.stl
 ```
 
+The whole API is reachable from a script, one builtin per command, with named arguments and angles in degrees:
+
+| Builtin | Makes |
+|---|---|
+| `box(size:, origin:, label:)`, `cylinder(radius: or diameter:, height:, center:, axis:, label:)` | A new body. |
+| `sketch(on: "XY" \| "XZ" \| "YZ" \| face, entities: [...], label:)` with `line(start:, end:)`, `circle(center:, radius:)`, `arc(center:, radius:, start_angle:, end_angle:)`, `rect(origin: or center:, width:, height:)` | A profile on a plane or a face. Lines and arcs chain into loops; nested loops become holes. |
+| `extrude(sketch:, distance:, operation: "new" \| "add" \| "cut", draft:, regions:, label:)` | A prism, or a drafted loft for a new body. |
+| `revolve(sketch:, axis:, axis_origin:, angle:, operation:, label:)` | A solid of revolution. |
+| `drill(face:, center:, diameter:, depth:)`, `push_pull(face:, distance:)`, `fillet(edges:, radius:)`, `chamfer(edges:, distance:)` | Face and edge features. |
+| `mirror(origin:, normal:)`, `pattern(direction:, spacing:, count:)` | Whole-body operations. |
+| `union(target:, tool:)`, `difference(target:, tool:)`, `intersection(target:, tool:)` | Booleans between two steps. |
+| `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
+| `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
+
+Errors name their line and column, so an editor can point at them. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer.
+
 ### What the kernel does today
 
 - Primitives, planar-profile extrusion with holes and islands, revolve, drafted extrusion as an exact loft to the profile's offset section, push/pull, holes, ribs, mirror, and linear patterns.
@@ -169,6 +186,30 @@ The desktop application is the reference client for the kernel and a complete si
 
 ---
 
+## Artificer Script Studio
+
+The third program is for people who would rather type a model than draw one. Script Studio is a live `.art` editor in the shape OpenSCAD made familiar, built on the same kernel, viewport, and theme as the workbench.
+
+<div align="center">
+
+![Script Studio](docs/images/script-studio.png)
+
+*The flanged hub example: the script, the exact model it builds, its parameters as a customizer, and every step in the console.*
+
+</div>
+
+- **Live.** Every edit re-runs the script on a worker thread after a short pause; a run that an edit supersedes is cancelled rather than waited for, and the last good model stays on screen while you type.
+- **Customizer.** The script's `param` lines become a panel of values you can drag. A dragged value re-runs the script without touching the text, and one click puts the script's own default back.
+- **Console.** Every step lists its label, topology, and time. A parse or evaluation error names its line and column, a failing step names the line that labels it, and clicking the error puts the cursor there.
+- **Editor.** Syntax colouring for the `.art` vocabulary, line numbers, and the error's line washed in red.
+- **Files.** Open and save scripts, drop a file onto the window, export the model as STL or OBJ, and start from the bundled examples.
+
+```sh
+cargo run --release -p artificer-script-studio -- crates/kernel/examples/flanged_hub.art
+```
+
+---
+
 ## Quickstart
 
 ### Prerequisites
@@ -194,17 +235,20 @@ cargo run --release -p artificer-api-server -- run crates/kernel/examples/bearin
 # The desktop workbench
 cargo run --release -p artificer-workbench
 
+# The live .art visualiser, on a script of your own
+cargo run --release -p artificer-script-studio -- crates/kernel/examples/flanged_hub.art
+
 # Everything
 cargo test --workspace
 ```
 
-### Prebuilt workbench binaries
+### Prebuilt binaries
 
-Installers are published on the [Releases page](https://github.com/JackClarkeAE/artificer/releases):
+Installers are published on the [Releases page](https://github.com/JackClarkeAE/artificer/releases). Each one carries the workbench and Script Studio side by side:
 
-- Windows: `Artificer-Setup.exe`
-- Linux: `Artificer.AppImage`
-- macOS (Apple Silicon): `Artificer-macOS-arm64.zip`
+- Windows: `Artificer-Setup.exe` installs `Artificer.exe` and `ArtificerScriptStudio.exe`
+- Linux: `Artificer.AppImage`, with `ArtificerScriptStudio` alongside it in the plain archive
+- macOS (Apple Silicon): `Artificer-macOS-arm64.zip` with `Artificer.app` and `Artificer Script Studio.app`
 
 ---
 
@@ -221,6 +265,7 @@ Installers are published on the [Releases page](https://github.com/JackClarkeAE/
 | **Kernel server** | [`apps/api-server`](apps/api-server) | The command-line front for the kernel API: `serve`, `run`, `snapshot`, `export`, `journal`. |
 | **Presentation** | [`crates/viewport`](crates/viewport), [`crates/sketch-ui`](crates/sketch-ui), [`crates/ui-core`](crates/ui-core) | The 3D viewport, the sketch canvas, and the shared theme and widgets. None of these can see the kernel's internals. |
 | **Workbench** | [`apps/workbench`](apps/workbench) | The desktop application. |
+| **Script Studio** | [`apps/script-studio`](apps/script-studio) | The live `.art` visualiser: editor, customizer, console, and the shared viewport, driving the kernel through its API session. |
 | **Test kit** | [`crates/testkit`](crates/testkit), [`apps/cli`](apps/cli) | Deterministic cases, journals, and the conformance runner. |
 
 The dependency rules between these layers are checked by `scripts/check-architecture-boundaries.sh` on every CI run. Design decisions are recorded as ADRs under [`docs/architecture/adr`](docs/architecture/adr), and the kernel programme itself in [`docs/architecture/geometry-kernel`](docs/architecture/geometry-kernel).

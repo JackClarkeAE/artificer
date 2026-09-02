@@ -109,14 +109,27 @@ impl Session {
             )?,
             _ => {
                 let kernel_cmd = self.lower_command(&command)?;
+                // A command that starts a body of its own runs from an empty
+                // snapshot rather than the current one: the kernel's
+                // constructors replace whatever they are given, so building
+                // from the current snapshot would only refuse a second body.
+                // Every body therefore lives in its own step chain, and the
+                // Booleans join those chains by step label.
+                let empty;
+                let input = if Self::starts_new_body(&command) {
+                    empty = NativeKernel::empty();
+                    &empty
+                } else {
+                    &self.snapshot
+                };
                 let request = ExecuteRequest {
                     protocol_version: CURRENT_PROTOCOL_VERSION,
                     request_id: RequestId::new(format!("session::{step_label}")),
-                    expected_snapshot: self.snapshot.id(),
+                    expected_snapshot: input.id(),
                     precision: self.precision,
                     command: kernel_cmd,
                 };
-                NativeKernel::execute(&self.snapshot, &request, token).map_err(ApiError::from)?
+                NativeKernel::execute(input, &request, token).map_err(ApiError::from)?
             }
         };
 
@@ -187,6 +200,18 @@ impl Session {
         self.journal.push(entry);
 
         Ok(result)
+    }
+
+    /// Whether a command builds a body of its own instead of editing the
+    /// current one.
+    fn starts_new_body(command: &ApiCommand) -> bool {
+        match command {
+            ApiCommand::MakeBox { .. } | ApiCommand::MakeCylinder { .. } => true,
+            ApiCommand::Extrude { operation, .. } | ApiCommand::Revolve { operation, .. } => {
+                *operation == ExtrudeOp::New
+            }
+            _ => false,
+        }
     }
 
     /// A sketch is authoring intent rather than a kernel operation: it is

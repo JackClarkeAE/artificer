@@ -8,6 +8,8 @@ pub enum AstNode {
         name: String,
         param_type: String,
         default_value: Expression,
+        /// The line the declaration starts on, for a customizer to point at.
+        line: usize,
     },
     LetBinding {
         name: String,
@@ -35,12 +37,17 @@ pub enum Expression {
         name: String,
         named_args: Vec<(String, Expression)>,
         positional_args: Vec<Expression>,
+        /// Where the call is written, so an evaluation error can say so.
+        line: usize,
+        col: usize,
     },
     MethodCall {
         target: Box<Expression>,
         method: String,
         named_args: Vec<(String, Expression)>,
         positional_args: Vec<Expression>,
+        line: usize,
+        col: usize,
     },
 }
 

@@ -743,6 +743,7 @@ fn the_shipped_examples_compile_and_run() {
         "examples/bearing_mount.art",
         "examples/filleted_cube.art",
         "examples/three_holes_and_cut.art",
+        "examples/flanged_hub.art",
     ] {
         let source = std::fs::read_to_string(example).expect(example);
         let commands = artificer_kernel::api::scripting::compile_script(&source, &BTreeMap::new())
@@ -834,4 +835,117 @@ fn a_drafted_extrusion_lofts_to_the_offset_section_and_only_for_new_bodies() {
     )
     .unwrap();
     assert!(matches!(parsed, ApiCommand::Extrude { draft_degrees, .. } if draft_degrees == 5.0));
+}
+
+#[test]
+fn a_script_sketches_extrudes_and_joins_bodies() {
+    let script = r#"
+        param size: f64 = 20.0;
+        let plate = sketch(on: "XY", label: "plate", entities: [
+            rect(origin: [0, 0], width: size * 2, height: size),
+        ]);
+        let base = extrude(sketch: plate, distance: 5, label: "base");
+        let boss = cylinder(center: [size, size / 2, 5], radius: 4, height: 10, label: "boss");
+        let joined = union(target: base, tool: boss, label: "joined");
+        // A face sketch's origin is the face centre: the boss top.
+        let pocket = sketch(on: faces(">Z"), label: "pocket", entities: [
+            circle(center: [0, 0], radius: 2),
+        ]);
+        extrude(sketch: pocket, distance: 6, operation: "cut", label: "bore");
+    "#;
+    let commands = compile_script(script, &BTreeMap::new()).expect("compile");
+    assert_eq!(commands.len(), 6);
+    let mut session = Session::new();
+    for command in commands {
+        session
+            .execute(command, &CancellationToken::default())
+            .expect("execute");
+    }
+    let volume = session.snapshot.measures().volume;
+    let expected =
+        40.0 * 20.0 * 5.0 + std::f64::consts::PI * 16.0 * 10.0 - std::f64::consts::PI * 4.0 * 6.0;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "volume {volume} should be {expected}"
+    );
+}
+
+#[test]
+fn a_script_revolves_a_section_and_drafts_an_extrusion() {
+    let script = r#"
+        let ring = sketch(on: "XZ", label: "ring", entities: [
+            rect(origin: [10, 0], width: 5, height: 4),
+        ]);
+        let tube = revolve(sketch: ring, axis: [0, 0, 1], label: "tube");
+    "#;
+    let commands = compile_script(script, &BTreeMap::new()).expect("compile");
+    let mut session = Session::new();
+    for command in commands {
+        session
+            .execute(command, &CancellationToken::default())
+            .expect("execute");
+    }
+    let volume = session.snapshot.measures().volume;
+    let expected = std::f64::consts::PI * (15.0_f64.powi(2) - 10.0_f64.powi(2)) * 4.0;
+    assert!(((volume - expected) / expected).abs() < 1.0e-9, "{volume}");
+
+    let drafted = r#"
+        let square = sketch(on: "XY", label: "square", entities: [rect(width: 20, height: 20)]);
+        extrude(sketch: square, distance: 10, draft: 5, label: "frustum");
+    "#;
+    let commands = compile_script(drafted, &BTreeMap::new()).expect("compile");
+    assert!(matches!(
+        commands[1],
+        ApiCommand::Extrude { draft_degrees, .. } if draft_degrees == 5.0
+    ));
+}
+
+#[test]
+fn script_math_builtins_and_pi_evaluate_in_degrees() {
+    let script = r#"
+        param r: f64 = 10.0;
+        let s = box(size: [r * cos(60), sqrt(16) + max(1, 2, 3), round(pi * 2)], label: "b");
+    "#;
+    let commands = compile_script(script, &BTreeMap::new()).expect("compile");
+    let ApiCommand::MakeBox { size, .. } = &commands[0] else {
+        panic!("a box");
+    };
+    assert!((size[0] - 5.0).abs() < 1.0e-12);
+    assert!((size[1] - 7.0).abs() < 1.0e-12);
+    assert!((size[2] - 6.0).abs() < 1.0e-12);
+}
+
+#[test]
+fn a_script_error_names_its_line_and_column() {
+    let script = "let a = box(size: [1, 2, 3], label: \"a\");\n\nlet b = cylinder(radius: 2);\n";
+    let error = compile_script(script, &BTreeMap::new()).expect_err("height is missing");
+    assert_eq!(error.location(), Some((3, 9)), "{error}");
+    assert!(error.to_string().contains("line 3"), "{error}");
+    assert!(error.message().contains("height"), "{error}");
+
+    let unparsable = "let a = box(size: [1, 2, 3]\nlet b = 4;";
+    let error = compile_script(unparsable, &BTreeMap::new()).expect_err("unclosed call");
+    assert!(error.location().is_some(), "{error}");
+}
+
+#[test]
+fn script_parameters_list_in_order_with_evaluated_defaults() {
+    let script = r#"
+        param width: f64 = 40.0;
+        param half = width / 2;
+        param label_only: f64 = 3;
+        let b = box(size: [width, half, 1], label: "b");
+    "#;
+    let parameters = artificer_kernel::api::scripting::script_parameters(script).expect("params");
+    let names: Vec<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["width", "half", "label_only"]);
+    assert_eq!(parameters[1].default, Some(20.0));
+    assert_eq!(parameters[0].line, 2);
+}
+
+#[test]
+fn edge_selectors_never_answer_with_faces() {
+    let script = r#"chamfer(edges: edges("planar"), distance: 1, label: "c");"#;
+    let error = compile_script(script, &BTreeMap::new()).expect_err("planar is not an edge rule");
+    assert!(error.message().contains("Unknown edge selector"), "{error}");
 }

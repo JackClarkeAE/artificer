@@ -648,28 +648,23 @@ fn resolve_geometric_selector(
 
             match kind {
                 EntityKind::Face => {
-                    let mut face_centers: BTreeMap<EntityId, (Point3, usize)> = BTreeMap::new();
+                    // The nearest face is the one whose surface passes
+                    // closest to the point, so a point placed on a face
+                    // (a drill centre, say) finds that face and not the
+                    // face whose centroid happens to be nearest. Faces
+                    // that tie, such as the two faces sharing an edge the
+                    // point sits on, resolve to the lower entity id.
+                    let mut face_distances: BTreeMap<EntityId, f64> = BTreeMap::new();
                     for tri in &scene.triangles {
-                        let c = Point3::new(
-                            (tri.vertices[0].x + tri.vertices[1].x + tri.vertices[2].x) / 3.0,
-                            (tri.vertices[0].y + tri.vertices[1].y + tri.vertices[2].y) / 3.0,
-                            (tri.vertices[0].z + tri.vertices[1].z + tri.vertices[2].z) / 3.0,
-                        );
-                        let entry = face_centers
+                        let d2 = point_triangle_distance_sq(*point, &tri.vertices);
+                        let entry = face_distances
                             .entry(tri.source_face.entity)
-                            .or_insert((Point3::new(0.0, 0.0, 0.0), 0));
-                        entry.0.x += c.x;
-                        entry.0.y += c.y;
-                        entry.0.z += c.z;
-                        entry.1 += 1;
+                            .or_insert(f64::INFINITY);
+                        if d2 < *entry {
+                            *entry = d2;
+                        }
                     }
-                    for (face_id, (sum_p, count)) in face_centers {
-                        let cf = count as f64;
-                        let center = Point3::new(sum_p.x / cf, sum_p.y / cf, sum_p.z / cf);
-                        let dx = center.x - point.x;
-                        let dy = center.y - point.y;
-                        let dz = center.z - point.z;
-                        let d2 = dx * dx + dy * dy + dz * dz;
+                    for (face_id, d2) in face_distances {
                         if d2 < best_dist_sq {
                             best_dist_sq = d2;
                             best_entity = Some(face_id);
@@ -858,4 +853,79 @@ fn resolve_geometric_selector(
             exactly_one(winners, &format!("{extremum:?} {metric:?} {kind:?}"))
         }
     }
+}
+
+/// Squared distance from a point to a triangle, on the triangle's interior,
+/// an edge or a corner, whichever is nearest (Ericson, Real-Time Collision
+/// Detection, 5.1.5).
+fn point_triangle_distance_sq(p: Point3, tri: &[Point3; 3]) -> f64 {
+    let sub = |a: Point3, b: Point3| Vector3::new(a.x - b.x, a.y - b.y, a.z - b.z);
+    let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
+    let scale =
+        |a: Point3, v: Vector3, t: f64| Point3::new(a.x + v.x * t, a.y + v.y * t, a.z + v.z * t);
+    let dist_sq = |q: Point3| {
+        let d = sub(p, q);
+        dot(d, d)
+    };
+    let [a, b, c] = *tri;
+    let ab = sub(b, a);
+    let ac = sub(c, a);
+    let ap = sub(p, a);
+    let d1 = dot(ab, ap);
+    let d2 = dot(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return dist_sq(a);
+    }
+    let bp = sub(p, b);
+    let d3 = dot(ab, bp);
+    let d4 = dot(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return dist_sq(b);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = if (d1 - d3).abs() > 0.0 {
+            d1 / (d1 - d3)
+        } else {
+            0.0
+        };
+        return dist_sq(scale(a, ab, v));
+    }
+    let cp = sub(p, c);
+    let d5 = dot(ab, cp);
+    let d6 = dot(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return dist_sq(c);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = if (d2 - d6).abs() > 0.0 {
+            d2 / (d2 - d6)
+        } else {
+            0.0
+        };
+        return dist_sq(scale(a, ac, w));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let denominator = (d4 - d3) + (d5 - d6);
+        let w = if denominator > 0.0 {
+            (d4 - d3) / denominator
+        } else {
+            0.0
+        };
+        return dist_sq(scale(b, sub(c, b), w));
+    }
+    let denominator = va + vb + vc;
+    if denominator.abs() <= f64::MIN_POSITIVE {
+        return dist_sq(a).min(dist_sq(b)).min(dist_sq(c));
+    }
+    let v = vb / denominator;
+    let w = vc / denominator;
+    let q = Point3::new(
+        a.x + ab.x * v + ac.x * w,
+        a.y + ab.y * v + ac.y * w,
+        a.z + ab.z * v + ac.z * w,
+    );
+    dist_sq(q)
 }

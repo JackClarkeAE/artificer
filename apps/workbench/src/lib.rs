@@ -193,7 +193,7 @@ pub struct DocumentSettings {
     pub length_unit: DisplayLengthUnit,
     /// Retained so older workspace files keep parsing and older builds keep
     /// reading newer files; the navigation profile itself is a user
-    /// preference now (see [`UserPreferencesFile`]), not document state.
+    /// preference now (see `UserPreferencesFile`), not document state.
     #[serde(default, with = "legacy_navigation")]
     pub navigation: navigation::NavigationPreset,
 }

@@ -311,6 +311,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "artificer-script-studio"
+version = "0.9.5"
+dependencies = [
+ "artificer-kernel",
+ "artificer-protocol",
+ "artificer-ui-core",
+ "artificer-viewport",
+ "eframe",
+ "egui",
+ "egui_kittest",
+]
+
+[[package]]
 name = "artificer-sketch"
 version = "0.9.5"
 dependencies = [

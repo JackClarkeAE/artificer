@@ -61,12 +61,16 @@ MESSAGE
         platform=windows
         binary="artificer-workbench.exe"
         main_exe="Artificer.exe"
+        studio_binary="artificer-script-studio.exe"
+        studio_exe="ArtificerScriptStudio.exe"
         icon="${icon_dir}/artificer.ico"
         ;;
     *)
         platform=linux
         binary="artificer-workbench"
         main_exe="Artificer"
+        studio_binary="artificer-script-studio"
+        studio_exe="ArtificerScriptStudio"
         icon="${icon_dir}/artificer.png"
         ;;
 esac
@@ -86,12 +90,16 @@ MESSAGE
 fi
 
 echo "Building Artificer ${version} for ${platform}..."
+# The workbench and Script Studio ship together: one install, two programs,
+# with the workbench as the package's main executable.
 cargo build \
     --manifest-path "${workspace_dir}/Cargo.toml" \
     --locked \
     --release \
     --package artificer-workbench \
-    --bin artificer-workbench
+    --bin artificer-workbench \
+    --package artificer-script-studio \
+    --bin artificer-script-studio
 
 # A fresh staging directory every time: `vpk` packages the whole folder, so a
 # file left behind by an earlier build would ship inside the release.
@@ -99,6 +107,7 @@ rm -rf "${publish_dir}"
 mkdir -p "${publish_dir}" "${output_dir}"
 rm -f "${output_dir}"/*"${version}"* "${output_dir}"/*"${version#v}"*
 install -m 0755 "${workspace_dir}/target/release/${binary}" "${publish_dir}/${main_exe}"
+install -m 0755 "${workspace_dir}/target/release/${studio_binary}" "${publish_dir}/${studio_exe}"
 
 # The pack id is permanent. It names the install directory, the update cache,
 # and the channel feed, so changing it would orphan every existing install
