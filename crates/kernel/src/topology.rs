@@ -725,12 +725,33 @@ pub(crate) struct Cylinder {
     pub(crate) angular_sign: f64,
 }
 
+/// `sin` and `cos` of an angle parameter, exact at whole turns.
+///
+/// A periodic face closes on its seam from both sides: one panel evaluates
+/// the seam at `0`, the other at `2π`, and `sin(2π)` is `-2.4e-16` rather
+/// than zero. The two panels then place the same seam vertex at two different
+/// points, and presentation, which matches a chord to the facets that carry
+/// it by exact coordinates, drops the chords on one side of every seam. An
+/// angle within a nanoradian of a whole turn is the whole turn. Only whole
+/// turns need this: every other sample is evaluated from the same float on
+/// both sides, and rounding it would only create the disagreement it exists
+/// to remove.
+pub(crate) fn seam_snapped_sin_cos(angle: f64) -> (f64, f64) {
+    let turns = angle / std::f64::consts::TAU;
+    if (turns - turns.round()).abs() <= 1.0e-9 {
+        (0.0, 1.0)
+    } else {
+        angle.sin_cos()
+    }
+}
+
 impl Cylinder {
     pub(crate) fn evaluate(self, point: Point2) -> Point3 {
         let angle = self.angular_sign * point.x;
+        let (sin, cos) = seam_snapped_sin_cos(angle);
         self.origin
-            + self.radial_u * (self.radius * angle.cos())
-            + self.radial_v * (self.radius * angle.sin())
+            + self.radial_u * (self.radius * cos)
+            + self.radial_v * (self.radius * sin)
             + self.axis * point.y
     }
 
@@ -762,9 +783,11 @@ pub(crate) struct Torus {
 impl Torus {
     pub(crate) fn evaluate(self, point: Point2) -> Point3 {
         let angle = self.angular_sign * point.x;
-        let radial = self.radial_u * angle.cos() + self.radial_v * angle.sin();
-        let ring = self.major_radius + self.minor_radius * point.y.cos();
-        self.origin + radial * ring + self.axis * (self.minor_radius * point.y.sin())
+        let (sin, cos) = seam_snapped_sin_cos(angle);
+        let radial = self.radial_u * cos + self.radial_v * sin;
+        let (sin_v, cos_v) = seam_snapped_sin_cos(point.y);
+        let ring = self.major_radius + self.minor_radius * cos_v;
+        self.origin + radial * ring + self.axis * (self.minor_radius * sin_v)
     }
 
     pub(crate) fn is_finite(self) -> bool {
@@ -800,7 +823,8 @@ impl Cone {
 
     pub(crate) fn evaluate(self, point: Point2) -> Point3 {
         let angle = self.angular_sign * point.x;
-        let radial = self.radial_u * angle.cos() + self.radial_v * angle.sin();
+        let (sin, cos) = seam_snapped_sin_cos(angle);
+        let radial = self.radial_u * cos + self.radial_v * sin;
         self.origin + radial * self.ring_radius(point.y) + self.axis * point.y
     }
 
@@ -833,10 +857,10 @@ pub(crate) struct Sphere {
 impl Sphere {
     pub(crate) fn evaluate(self, point: Point2) -> Point3 {
         let angle = self.angular_sign * point.x;
-        let radial = self.radial_u * angle.cos() + self.radial_v * angle.sin();
-        self.origin
-            + radial * (self.radius * point.y.cos())
-            + self.axis * (self.radius * point.y.sin())
+        let (sin, cos) = seam_snapped_sin_cos(angle);
+        let radial = self.radial_u * cos + self.radial_v * sin;
+        let (sin_v, cos_v) = seam_snapped_sin_cos(point.y);
+        self.origin + radial * (self.radius * cos_v) + self.axis * (self.radius * sin_v)
     }
 
     pub(crate) fn is_finite(self) -> bool {

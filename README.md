@@ -25,6 +25,20 @@
 
 ---
 
+## What is new in 0.6
+
+This release turns the kernel's scripting language into a product of its own and pairs it with a live editor.
+
+- **`.art` scripting, version 0.2.** The language now reaches the whole kernel: sketches from lines, circles, arcs and rectangles on world planes or on faces; extrude with add, cut and draft; revolve; drill, push/pull, fillet, chamfer, mirror and pattern; union, difference and intersection between bodies; face and edge selectors by direction, position and history; the trigonometry in degrees. Errors name their line and column, and parameters have defaults a host can override. The full reference, written for people and for AI agents, is [`docs/art-scripting.md`](docs/art-scripting.md).
+- **Artificer Script Studio.** A third program in the shape OpenSCAD made familiar: the script on the left, the exact model on the right, the `param` lines as a customizer, and a console that points at the failing line. It re-runs as you type, keeps the last good model on screen through an error, sections the model on any origin plane, and exports STL and OBJ.
+- **Section analysis.** The workbench and Script Studio clip the model to one side of a plane and cap the cut, so the inside of a part can be checked for the solid it should be.
+- **Oblique sections of cylinders are exact.** Angled holes, mitred cylinder ends and oblique cuts of round bodies meet on the ellipse curve through the analytic Boolean engine, with no faceting.
+- **Sketch constraints from the canvas.** Coincident, horizontal, vertical, parallel, perpendicular, equal, tangent and collinear relations are applied by clicking geometry, from a constraint group on the sketch bar.
+- **Selectors that mean what they say.** `faces(">Z")` is the highest upward face on a stepped part, and the nearest-face selector measures to the surface, so a point placed on a face finds it.
+- **Presentation.** The three origin planes read as translucent datum cards with corner labels; the camera no longer zooms in when an extrusion commits; the outline of a revolved body no longer breaks at its seam.
+
+---
+
 ## Three products, one repository
 
 Artificer is three things, deliberately kept apart:
@@ -137,7 +151,7 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
 | `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
 
-Errors name their line and column, so an editor can point at them. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer.
+Errors name their line and column, so an editor can point at them. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
 
 ### What the kernel does today
 
@@ -195,6 +209,10 @@ The third program is for people who would rather type a model than draw one. Scr
 ![Script Studio](docs/images/script-studio.png)
 
 *The flanged hub example: the script, the exact model it builds, its parameters as a customizer, and every step in the console.*
+
+![Script Studio section](docs/images/script-studio-section.png)
+
+*The same part under section analysis, cut through the flange: the bore and the four bolt holes in a solid cap.*
 
 </div>
 

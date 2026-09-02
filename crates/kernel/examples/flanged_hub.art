@@ -12,20 +12,28 @@ param flange_thickness: f64 = 8.0;
 param bore_diameter: f64 = 12.0;
 param bolt_diameter: f64 = 6.5;
 
-// The section: flange along the bottom, hub rising from the axis. Lines
-// chain into one loop and the closing edge lies on the axis.
+// The section: flange along the bottom, hub rising beside the axis, and
+// the bore as the inner wall. Lines chain into one closed loop.
+let bore_radius = bore_diameter / 2;
 let section = sketch(on: "XZ", label: "section", entities: [
-    line(start: [0, 0], end: [flange_radius, 0]),
+    line(start: [bore_radius, 0], end: [flange_radius, 0]),
     line(start: [flange_radius, 0], end: [flange_radius, flange_thickness]),
     line(start: [flange_radius, flange_thickness], end: [hub_radius, flange_thickness]),
     line(start: [hub_radius, flange_thickness], end: [hub_radius, hub_height]),
-    line(start: [hub_radius, hub_height], end: [0, hub_height]),
-    line(start: [0, hub_height], end: [0, 0]),
+    line(start: [hub_radius, hub_height], end: [bore_radius, hub_height]),
+    line(start: [bore_radius, hub_height], end: [bore_radius, 0]),
 ]);
 let hub = revolve(sketch: section, axis: [0, 0, 1], angle: 360, label: "hub");
 
-// A bore down the middle, in the top face's own frame.
-drill(face: faces(">Z"), center: [0, 0], diameter: bore_diameter, depth: hub_height, label: "bore");
+// Exact torus blends on the hub's top rim and the bore's rim. A round rim
+// is two half-circle edges, so each fillet names both. These go before the
+// bolt holes: a cut that reaches a blended face falls to the faceted tier.
+fillet(edges: [nearest(point: [0, hub_radius, hub_height], kind: "edge"),
+               nearest(point: [0, -hub_radius, hub_height], kind: "edge")],
+       radius: 1.5, label: "hub_rim");
+fillet(edges: [nearest(point: [0, bore_diameter / 2, hub_height], kind: "edge"),
+               nearest(point: [0, -bore_diameter / 2, hub_height], kind: "edge")],
+       radius: 1, label: "bore_rim");
 
 // Four bolt holes on the flange, on a pitch circle between hub and rim.
 // The flange top is found by a point on it between two of the holes, so

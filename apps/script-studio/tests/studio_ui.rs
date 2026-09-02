@@ -106,6 +106,34 @@ fn a_customizer_change_reruns_the_script() {
 }
 
 #[test]
+fn the_section_plane_clips_the_model_and_shows_its_controls() {
+    use artificer_script_studio::{SectionAxis, SectionPlane};
+    let mut harness = harness(WELCOME_SCRIPT);
+    settle_past(&mut harness, 0);
+    // The toggle lives in the View menu; the panel appears once it is on.
+    harness.get_by_role_and_label(Role::Button, "View").click();
+    harness.step();
+    harness.get_by_role_and_label(Role::CheckBox, "Section analysis");
+    harness.state_mut().set_section(SectionPlane {
+        active: true,
+        axis: SectionAxis::Z,
+        offset: 4.0,
+        flipped: true,
+    });
+    harness.step();
+    harness.step();
+    // The plane reaches the renderer as a clipping plane, kept side below.
+    let plane = harness
+        .state()
+        .section()
+        .cut_plane()
+        .expect("an active section has a plane");
+    assert!(plane.distance_to_point(artificer_protocol::Point3::new(0.0, 0.0, 0.0)) > 0.0);
+    assert!(plane.distance_to_point(artificer_protocol::Point3::new(0.0, 0.0, 20.0)) < 0.0);
+    harness.get_by_role_and_label(Role::SpinButton, "Section offset");
+}
+
+#[test]
 fn the_run_button_and_menus_are_reachable() {
     let mut harness = harness(WELCOME_SCRIPT);
     let first = settle_past(&mut harness, 0);

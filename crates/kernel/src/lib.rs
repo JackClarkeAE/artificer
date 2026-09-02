@@ -257,7 +257,7 @@ impl DisplaySurface {
     pub fn evaluate(self, u: f64, v: f64) -> ProtocolPoint3 {
         let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
         let angle = angular_sign * u;
-        let (sin, cos) = angle.sin_cos();
+        let (sin, cos) = topology::seam_snapped_sin_cos(angle);
         let radial = ProtocolVector3::new(
             radial_u.x.mul_add(cos, radial_v.x * sin),
             radial_u.y.mul_add(cos, radial_v.y * sin),
@@ -269,7 +269,7 @@ impl DisplaySurface {
                 base_radius, slope, ..
             } => (slope.mul_add(v, base_radius), v),
             Self::Sphere { radius, .. } => {
-                let (sin_v, cos_v) = v.sin_cos();
+                let (sin_v, cos_v) = topology::seam_snapped_sin_cos(v);
                 (radius * cos_v, radius * sin_v)
             }
             Self::Torus {
@@ -277,7 +277,7 @@ impl DisplaySurface {
                 minor_radius,
                 ..
             } => {
-                let (sin_v, cos_v) = v.sin_cos();
+                let (sin_v, cos_v) = topology::seam_snapped_sin_cos(v);
                 (
                     minor_radius.mul_add(cos_v, major_radius),
                     minor_radius * sin_v,
@@ -3503,14 +3503,14 @@ impl RevolvedGrid {
         let columns = (0..=azimuthal)
             .map(|column| {
                 let u = (u_max - u_min).mul_add(column as f64 / azimuthal as f64, u_min);
-                let (sin, cos) = (angular_sign * u).sin_cos();
+                let (sin, cos) = topology::seam_snapped_sin_cos(angular_sign * u);
                 radial_u * cos + radial_v * sin
             })
             .collect();
         let rows = (0..=meridional)
             .map(|row| {
                 let v = (v_max - v_min).mul_add(row as f64 / meridional as f64, v_min);
-                v.sin_cos()
+                topology::seam_snapped_sin_cos(v)
             })
             .collect();
         Self { columns, rows }

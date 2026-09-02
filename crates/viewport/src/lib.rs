@@ -1559,12 +1559,81 @@ fn show_document_impl(
     // the caps are built from.
     let mut section_cut_chords: Vec<[Point3; 2]> = Vec::new();
     if let Some(plane) = view.section_cut_plane.filter(|plane| plane.active) {
+        // The cap loops need the whole cut, and projection has already
+        // culled every facet turned away from the camera, so the chords come
+        // from the bodies' own facets rather than from the clip below.
+        section_cut_chords = section_cut_chords_of(bodies, plane);
         let mut kept = Vec::with_capacity(triangles.len());
+        let mut front_chords = Vec::new();
         for triangle in &triangles {
-            section_clip_triangle(triangle, plane, &mut kept, &mut section_cut_chords);
+            section_clip_triangle(triangle, plane, &mut kept, &mut front_chords);
         }
         triangles = kept;
     }
+    // The cut faces, built once the kept material is known. From the
+    // discarded side they cover the material behind the plane, so every line
+    // under them is hidden; from the kept side the body is in front of them
+    // and they are neither painted nor occluding.
+    let section_caps = view
+        .section_cut_plane
+        .filter(|plane| plane.active && plane.distance_to_point(view.eye_position()) < 0.0)
+        .map(|plane| {
+            let normal = Vector3::new(plane.normal.x, plane.normal.y, plane.normal.z);
+            section_cap_regions(&section_cut_chords, normal)
+                .iter()
+                .filter_map(|region| triangulate_preview_region(region, normal))
+                .flatten()
+                .collect::<Vec<[Point3; 3]>>()
+        })
+        .unwrap_or_default();
+    let occluders_with_caps;
+    let occluders: &[ProjectedTriangle] = if section_caps.is_empty() {
+        &triangles
+    } else {
+        let cap_body = bodies
+            .first()
+            .map_or(BodyInstanceKey::new(0), |body| body.key);
+        let cap_source = bodies.first().map_or(
+            EntityRef {
+                snapshot: artificer_protocol::SnapshotId::new([0; 16]),
+                entity: artificer_protocol::EntityId(u64::MAX),
+                kind: artificer_protocol::EntityKind::Face,
+            },
+            |body| EntityRef {
+                snapshot: body.scene.snapshot,
+                entity: artificer_protocol::EntityId(u64::MAX),
+                kind: artificer_protocol::EntityKind::Face,
+            },
+        );
+        let mut occluders = triangles.clone();
+        occluders.extend(section_caps.iter().map(|cap| {
+            let camera = cap.map(|point| view.project(point));
+            let points = camera.map(|point| projection.camera_point(point));
+            let vertex_depths = camera.map(|point| point.depth);
+            ProjectedTriangle {
+                points,
+                screen_bounds: points_bounds(&points),
+                model_vertices: *cap,
+                model_edges: [
+                    ModelEdgeKey::new([cap[0], cap[1]]),
+                    ModelEdgeKey::new([cap[1], cap[2]]),
+                    ModelEdgeKey::new([cap[2], cap[0]]),
+                ],
+                vertex_depths,
+                maximum_depth: vertex_depths
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max),
+                depth: vertex_depths.iter().sum::<f64>() / 3.0,
+                body: cap_body,
+                source: cap_source,
+                role: FaceRole::FeatureEnd,
+                lighting: [VertexLighting::default(); 3],
+            }
+        }));
+        occluders_with_caps = occluders;
+        &occluders_with_caps
+    };
 
     // Pointer picking is irrelevant while the camera owns the gesture. Dense
     // Boolean candidates can have thousands of vertices; suppressing their
@@ -1585,7 +1654,7 @@ fn show_document_impl(
         visible_edge_keys
             .as_ref()
             .map_or_else(EdgeFrameCache::default, |visible_edge_keys| {
-                if orbiting && !exact_hidden_lines_affordable(bodies, &triangles) {
+                if orbiting && !exact_hidden_lines_affordable(bodies, occluders) {
                     prepare_interaction_edge_frame_cache(
                         bodies,
                         active_body,
@@ -1594,7 +1663,7 @@ fn show_document_impl(
                         animation_phase,
                         projection,
                         visible_edge_keys,
-                        &triangles,
+                        occluders,
                     )
                 } else if orbiting {
                     // An ordinary part affords exact hidden lines on every
@@ -1610,7 +1679,7 @@ fn show_document_impl(
                         animation_phase,
                         projection,
                         visible_edge_keys,
-                        &triangles,
+                        occluders,
                     )
                 } else {
                     let key = exact_edge_frame_key(
@@ -1636,7 +1705,7 @@ fn show_document_impl(
                             animation_phase,
                             projection,
                             visible_edge_keys,
-                            &triangles,
+                            occluders,
                         );
                         if let Some(memo) = &mut edge_frame_memo {
                             **memo = Some(EdgeFrameMemo {
@@ -1787,7 +1856,6 @@ fn show_document_impl(
             .find(|body| body.key == key)
             .and_then(|body| body.tint)
     };
-    let section_plane = view.section_cut_plane.filter(|p| p.active);
     let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
     let section_cut_segments = section_cut_chords
@@ -1905,29 +1973,19 @@ fn show_document_impl(
     // body reads as solid rather than as a shell with its inside showing.
     // Painted only when the camera looks at the cut from the discarded side;
     // from the kept side the body itself is in front of the cap.
-    if let Some(plane) = section_plane
-        && plane.distance_to_point(view.eye_position()) < 0.0
-    {
-        let normal = Vector3::new(plane.normal.x, plane.normal.y, plane.normal.z);
+    if !section_caps.is_empty() {
         let mut mesh = Mesh::default();
-        for region in section_cap_regions(&section_cut_chords, normal) {
-            let Some(cap) = triangulate_preview_region(&region, normal) else {
-                continue;
-            };
-            for triangle in cap {
-                let first = mesh.vertices.len() as u32;
-                for point in triangle {
-                    mesh.colored_vertex(
-                        projection.camera_point(view.project(point)),
-                        SECTION_CAP_FILL,
-                    );
-                }
-                mesh.add_triangle(first, first + 1, first + 2);
+        for triangle in &section_caps {
+            let first = mesh.vertices.len() as u32;
+            for point in triangle {
+                mesh.colored_vertex(
+                    projection.camera_point(view.project(*point)),
+                    SECTION_CAP_FILL,
+                );
             }
+            mesh.add_triangle(first, first + 1, first + 2);
         }
-        if !mesh.is_empty() {
-            painter.add(Shape::mesh(mesh));
-        }
+        painter.add(Shape::mesh(mesh));
     }
     // Paint section cut outline contours if active
     if !section_cut_segments.is_empty() {
@@ -2912,6 +2970,10 @@ fn silhouette_chords(
         .flat_map(|carrier| {
             carrier_silhouette_chords(carrier, model_view)
                 .into_iter()
+                // A silhouette on the discarded side of a section is gone
+                // with the material it outlined; one the plane crosses keeps
+                // its kept part, like any edge.
+                .filter_map(|chord| section_clip_segment(view, chord))
                 .map(|chord| (carrier.source_face, chord))
         })
         .collect()
@@ -4940,6 +5002,63 @@ fn section_lerp(a: SectionVertex, b: SectionVertex, t: f64) -> SectionVertex {
 
 /// Keeps the part of a facet on the section plane's kept side, cut at the
 /// plane, and records the chord the cut leaves in the facet.
+/// The chords a section plane cuts across every facet of every body, in
+/// model space, whether or not the facet faces the camera: a cap loop that
+/// misses the back of the part never closes.
+///
+/// A facet the plane crosses contributes the segment between its two
+/// crossings. A facet lying against the plane on the discarded side, with
+/// one edge in it, contributes that edge: its kept neighbour across the edge
+/// is never cut, so nothing else records it, and a cut through a revolve's
+/// seam runs along every seam edge this way.
+fn section_cut_chords_of(
+    bodies: &[DocumentBodyInstance<'_>],
+    plane: SectionCutPlane,
+) -> Vec<[Point3; 2]> {
+    let tolerance = 1.0e-9;
+    let mut chords = Vec::new();
+    for body in bodies {
+        for triangle in &body.scene.triangles {
+            let vertices = triangle.vertices;
+            let distances = vertices.map(|point| plane.distance_to_point(point));
+            if distances.iter().all(|distance| *distance >= -tolerance) {
+                continue;
+            }
+            if distances.iter().all(|distance| *distance <= tolerance) {
+                let on_plane = distances.map(|distance| distance.abs() <= tolerance);
+                if on_plane.iter().filter(|flag| **flag).count() == 2 {
+                    let ends = (0..3)
+                        .filter(|index| on_plane[*index])
+                        .map(|index| vertices[index])
+                        .collect::<Vec<_>>();
+                    if let [first, second] = ends.as_slice() {
+                        chords.push([*first, *second]);
+                    }
+                }
+                continue;
+            }
+            let mut cut = Vec::with_capacity(2);
+            for index in 0..3 {
+                let next = (index + 1) % 3;
+                let (da, db) = (distances[index], distances[next]);
+                if (da >= 0.0) != (db >= 0.0) {
+                    let parameter = da / (da - db);
+                    let (a, b) = (vertices[index], vertices[next]);
+                    cut.push(Point3::new(
+                        a.x + (b.x - a.x) * parameter,
+                        a.y + (b.y - a.y) * parameter,
+                        a.z + (b.z - a.z) * parameter,
+                    ));
+                }
+            }
+            if let [first, second] = cut.as_slice() {
+                chords.push([*first, *second]);
+            }
+        }
+    }
+    chords
+}
+
 fn section_clip_triangle(
     triangle: &ProjectedTriangle,
     plane: SectionCutPlane,

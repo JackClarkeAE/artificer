@@ -24,9 +24,10 @@ use artificer_kernel::api::scripting::{
 };
 use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, DebugScene, NativeKernel, Snapshot};
+use artificer_protocol::Vector3;
 use artificer_protocol::{Aabb3, DiagnosticSeverity, Point3, TopologyCounts};
 use artificer_ui_core::navigation::NavigationPreset;
-use artificer_ui_core::presentation::{ActiveTool, DisplayTransform, ViewState};
+use artificer_ui_core::presentation::{ActiveTool, DisplayTransform, SectionCutPlane, ViewState};
 use artificer_ui_core::theme::{self, WorkbenchTheme};
 use artificer_viewport::{
     BodyInstanceKey, DocumentBodyInstance, DocumentFaceSelection, EdgeFrameMemo,
@@ -46,6 +47,10 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     (
         "Flanged hub",
         include_str!("../../../crates/kernel/examples/flanged_hub.art"),
+    ),
+    (
+        "Filleted flange",
+        include_str!("../../../crates/kernel/examples/filleted_flange.art"),
     ),
     (
         "Bearing mount",
@@ -490,6 +495,67 @@ pub struct ScriptStudio {
     jump_to_line: Option<usize>,
     show_customizer: bool,
     theme_choice: WorkbenchTheme,
+    display_mode: ModelDisplayMode,
+    section: SectionPlane,
+}
+
+/// The world axis a section plane is normal to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SectionAxis {
+    X,
+    #[default]
+    Y,
+    Z,
+}
+
+impl SectionAxis {
+    pub const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::X => "YZ",
+            Self::Y => "XZ",
+            Self::Z => "XY",
+        }
+    }
+
+    const fn normal(self) -> Vector3 {
+        match self {
+            Self::X => Vector3::new(1.0, 0.0, 0.0),
+            Self::Y => Vector3::new(0.0, 1.0, 0.0),
+            Self::Z => Vector3::new(0.0, 0.0, 1.0),
+        }
+    }
+}
+
+/// The section analysis plane: the model is clipped to one side of it and
+/// the cut faces are capped, so the inside of a part can be inspected.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SectionPlane {
+    pub active: bool,
+    pub axis: SectionAxis,
+    /// Where the plane sits along its axis.
+    pub offset: f64,
+    /// Keep the other side instead.
+    pub flipped: bool,
+}
+
+impl SectionPlane {
+    /// The renderer's clipping plane, or `None` while the section is off.
+    /// The kept side satisfies `normal · p + offset >= 0`.
+    #[must_use]
+    pub fn cut_plane(self) -> Option<SectionCutPlane> {
+        if !self.active {
+            return None;
+        }
+        let sign = if self.flipped { -1.0 } else { 1.0 };
+        let normal = self.axis.normal();
+        Some(SectionCutPlane::new(
+            Vector3::new(normal.x * sign, normal.y * sign, normal.z * sign),
+            -sign * self.offset,
+        ))
+    }
 }
 
 impl ScriptStudio {
@@ -533,6 +599,8 @@ impl ScriptStudio {
             jump_to_line: None,
             show_customizer: true,
             theme_choice: theme::active_theme(),
+            display_mode: ModelDisplayMode::ShadedEdges,
+            section: SectionPlane::default(),
         };
         studio.refresh_customizer();
         studio
@@ -581,6 +649,25 @@ impl ScriptStudio {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    #[must_use]
+    pub const fn section(&self) -> SectionPlane {
+        self.section
+    }
+
+    /// Sets the section plane, as the View menu and the section panel do.
+    pub fn set_section(&mut self, section: SectionPlane) {
+        self.section = section;
+    }
+
+    #[must_use]
+    pub const fn display_mode(&self) -> ModelDisplayMode {
+        self.display_mode
+    }
+
+    pub fn set_display_mode(&mut self, mode: ModelDisplayMode) {
+        self.display_mode = mode;
     }
 
     #[must_use]
@@ -973,6 +1060,24 @@ impl ScriptStudio {
                     self.view.reset_orientation();
                     ui.close();
                 }
+                ui.separator();
+                for (mode, label) in [
+                    (ModelDisplayMode::ShadedEdges, "Shaded with edges"),
+                    (ModelDisplayMode::HiddenLinesRemoved, "Hidden lines removed"),
+                    (ModelDisplayMode::Wireframe, "Wireframe"),
+                ] {
+                    if ui.radio(self.display_mode == mode, label).clicked() {
+                        self.display_mode = mode;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                let section = ui
+                    .checkbox(&mut self.section.active, "Section analysis")
+                    .on_hover_text("Clip the model to one side of a plane and cap the cut");
+                section.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Checkbox, true, "Section analysis")
+                });
                 ui.checkbox(&mut self.show_customizer, "Customizer");
                 ui.separator();
                 for choice in WorkbenchTheme::ALL {
@@ -1134,7 +1239,67 @@ impl ScriptStudio {
         }
     }
 
+    fn section_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("SECTION")
+                .font(FontId::proportional(10.0))
+                .color(theme::muted())
+                .strong(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for axis in SectionAxis::ALL {
+                let choice = ui
+                    .selectable_label(self.section.axis == axis, axis.label())
+                    .on_hover_text(format!("Cut parallel to the {} plane", axis.label()));
+                if choice.clicked() {
+                    self.section.axis = axis;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let extent = self.framed_bounds.map_or(50.0, |bounds| {
+                let size = match self.section.axis {
+                    SectionAxis::X => bounds.max.x - bounds.min.x,
+                    SectionAxis::Y => bounds.max.y - bounds.min.y,
+                    SectionAxis::Z => bounds.max.z - bounds.min.z,
+                };
+                size.abs().max(1.0)
+            });
+            let offset = ui
+                .add(
+                    egui::DragValue::new(&mut self.section.offset)
+                        .speed(extent * 0.005)
+                        .max_decimals(3),
+                )
+                .on_hover_text("Where the plane sits along its axis");
+            offset.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "Section offset")
+            });
+            if ui
+                .button("Flip")
+                .on_hover_text("Keep the other side of the plane")
+                .clicked()
+            {
+                self.section.flipped = !self.section.flipped;
+            }
+            if ui
+                .button("Off")
+                .on_hover_text("Show the whole model again")
+                .clicked()
+            {
+                self.section.active = false;
+            }
+        });
+        ui.add_space(4.0);
+        ui.separator();
+    }
+
     fn customizer_panel(&mut self, ui: &mut egui::Ui) {
+        if self.section.active {
+            self.section_panel(ui);
+        }
         ui.add_space(6.0);
         ui.label(
             RichText::new("CUSTOMIZER")
@@ -1357,12 +1522,13 @@ impl ScriptStudio {
             .map(|scene| vec![DocumentBodyInstance::new(BODY, scene, bounds, pivot)])
             .unwrap_or_default();
         let time = ui.input(|input| input.time);
+        self.view.section_cut_plane = self.section.cut_plane();
         let output = show_document_with_feature_drag(
             ui,
             &bodies,
             bounds,
             true,
-            ModelDisplayMode::ShadedEdges,
+            self.display_mode,
             self.selected_face,
             None,
             None,
