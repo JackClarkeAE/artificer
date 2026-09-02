@@ -3160,6 +3160,18 @@ impl KernelLabApp {
         self.shell.visibility()
     }
 
+    /// Opens the part library so a catalogue part can be brought into the
+    /// design that is open.
+    ///
+    /// The library is where the part and its parameters are chosen, so this
+    /// raises that panel rather than inserting blind; the insertion itself
+    /// still passes through the confirmation gate every operation does.
+    pub fn open_part_library(&mut self) {
+        *self.part_library.open_mut() = true;
+        self.document_status =
+            Some("Library open · choose a part to insert into this design".to_owned());
+    }
+
     #[must_use]
     pub const fn part_library_open(&self) -> bool {
         self.part_library.is_open()

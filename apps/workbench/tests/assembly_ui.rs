@@ -353,3 +353,42 @@ fn a_sweep_measures_the_travel_the_animation_plays() {
         assert!(samples > 0, "body {body} has no readings");
     }
 }
+
+#[test]
+fn a_part_can_be_inserted_into_the_open_design_from_the_ribbon() {
+    let mut harness = new_harness();
+    harness.run();
+    assert!(
+        !harness.state().part_library_open(),
+        "the library starts closed"
+    );
+
+    // The Model tab's Create group offers it, alongside the sketch and the
+    // construction plane, because inserting a part is making something in
+    // this design rather than a view of it.
+    click_button(&mut harness, "Insert a part into this design");
+    assert!(
+        harness.state().part_library_open(),
+        "the command opens the library"
+    );
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("insert into this design")),
+        "{:?}",
+        harness.state().document_status_text()
+    );
+
+    // And the part lands in the design that was already open, as a second
+    // occurrence beside the one there rather than a new document.
+    enter_length(&mut harness, "80");
+    insert_component(&mut harness);
+    let first = harness.state().component_poses().len();
+    assert_eq!(first, 1, "one occurrence so far");
+
+    insert_component(&mut harness);
+    let poses = harness.state().component_poses();
+    assert_eq!(poses.len(), 2, "the second part joins the same design");
+    assert_ne!(poses[0].0, poses[1].0, "distinct occurrences");
+}

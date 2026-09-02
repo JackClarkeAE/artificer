@@ -670,6 +670,17 @@ impl KernelLabApp {
             None
         };
         match command {
+            ModelCommand::InsertPart => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    return CommandAvailability::disabled(
+                        "Finish the sketch first; a part is inserted into the model.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::NewSketch => {
                 if let Some(blocked) = free(self) {
                     return blocked;
@@ -962,6 +973,11 @@ impl KernelLabApp {
                     self.enter_sketch_mode();
                 }
             }
+            // The library is where a part is chosen and its parameters set,
+            // so the command opens it rather than duplicating that panel: an
+            // insertion still goes through the same confirmation gate every
+            // other operation does.
+            ModelCommand::InsertPart => self.open_part_library(),
             ModelCommand::ConstructionPlane => self.stage_construction_plane(),
             ModelCommand::Extrude => {
                 let eligibility = self.sketch_extrusion_eligibility();

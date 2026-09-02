@@ -163,6 +163,7 @@ pub enum CommandSize {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ModelCommand {
     NewSketch,
+    InsertPart,
     ConstructionPlane,
     Extrude,
     Revolve,
@@ -275,6 +276,18 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         // this is the name when nothing is selected and no sketch exists.
         "Create sketch",
         "Start or reopen a sketch. With a planar face selected the sketch is placed on that face.",
+        None,
+    ),
+    command(
+        ModelCommand::InsertPart,
+        "create.insert_part",
+        RibbonTab::Model,
+        RibbonGroupId::Create,
+        CommandIcon::Library,
+        CommandSize::Large,
+        "Insert part",
+        "Insert a part into this design",
+        "Bring a catalogue part into the design you have open, as its own body and occurrence, for assembly work. Opens the library; the part is placed once you confirm it.",
         None,
     ),
     command(
