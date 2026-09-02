@@ -91,6 +91,19 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 *v = transform.transform_vector(*v);
                 *radius *= transform.scale;
             }
+            Curve3::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => {
+                *center = transform.transform_point(*center);
+                *u = transform.transform_vector(*u);
+                *v = transform.transform_vector(*v);
+                *major_radius *= transform.scale;
+                *minor_radius *= transform.scale;
+            }
         }
     }
 
@@ -142,6 +155,26 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 center.x *= transform.scale;
                 center.y *= transform.scale;
                 *radius *= transform.scale;
+            }
+            // The azimuth is an angle; the axial trace is a length.
+            Curve2::Harmonic {
+                mean, amplitude, ..
+            } => {
+                if pcurve_owner[index] != PcurveOwner::Toroidal {
+                    *mean *= transform.scale;
+                    *amplitude *= transform.scale;
+                }
+            }
+            Curve2::Ellipse {
+                center,
+                major_radius,
+                minor_radius,
+                ..
+            } => {
+                center.x *= transform.scale;
+                center.y *= transform.scale;
+                *major_radius *= transform.scale;
+                *minor_radius *= transform.scale;
             }
         }
     }

@@ -224,6 +224,7 @@ fn prism_boolean_along(
                 sweep,
             }
         }
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other,
     };
     let map_loop = |segments: &[Segment]| segments.iter().map(map_segment).collect::<Vec<_>>();
 
@@ -469,6 +470,9 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                         ArcDirection::Clockwise
                     },
                 },
+                Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                    unreachable!("planar profiles carry lines and arcs only")
+                }
             })
             .collect(),
     }
@@ -820,6 +824,41 @@ fn reverse_face_orientation(
                         };
                         coedge.parameter_range = ParameterRange::new(range.end, range.start);
                     }
+                    Curve2::Harmonic {
+                        mean,
+                        amplitude,
+                        phase,
+                    } => {
+                        // Only a cylinder carries a harmonic, and its mirror
+                        // negates the azimuth: `cos(−θ − φ) = cos(θ + φ)`.
+                        // The reversed walk then runs from `−end` to `−start`.
+                        coedge.pcurve = Curve2::Harmonic {
+                            mean,
+                            amplitude,
+                            phase: -phase,
+                        };
+                        coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
+                    }
+                    Curve2::Ellipse {
+                        center,
+                        u,
+                        v,
+                        major_radius,
+                        minor_radius,
+                    } => {
+                        let map_vector = |vector: crate::topology::Vector2| {
+                            let mapped = mirror(Point2::new(vector.x, vector.y));
+                            crate::topology::Vector2::new(mapped.x, mapped.y)
+                        };
+                        coedge.pcurve = Curve2::Ellipse {
+                            center: mirror(center),
+                            u: map_vector(u),
+                            v: map_vector(v),
+                            major_radius,
+                            minor_radius,
+                        };
+                        coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                    }
                 }
             }
         }
@@ -1034,6 +1073,38 @@ fn glue_layers(
                     },
                     ParameterRange::new(start_angle, start_angle + sweep),
                 ),
+                Segment::Ellipse {
+                    center,
+                    u,
+                    major,
+                    minor,
+                    start_angle,
+                    sweep,
+                    ..
+                } => (
+                    Curve2::Ellipse {
+                        center,
+                        u: crate::topology::Vector2::new(u.x, u.y),
+                        v: crate::topology::Vector2::new(-u.y, u.x),
+                        major_radius: major,
+                        minor_radius: minor,
+                    },
+                    ParameterRange::new(start_angle, start_angle + sweep),
+                ),
+                Segment::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                    start,
+                    end,
+                } => (
+                    Curve2::Harmonic {
+                        mean,
+                        amplitude,
+                        phase,
+                    },
+                    ParameterRange::new(start.x, end.x),
+                ),
             };
             let coedge_key = CoedgeKey(merged.coedges.len());
             merged.coedges.push(Record {
@@ -1180,6 +1251,7 @@ fn segment_midpoint(segment: Segment) -> Point2 {
                 radius.mul_add(angle.sin(), center.y),
             )
         }
+        _ => segment.point_at(0.5),
     }
 }
 

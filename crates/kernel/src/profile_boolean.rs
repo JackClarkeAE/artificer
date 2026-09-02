@@ -288,6 +288,9 @@ pub(crate) fn chain_welded_segments(
                     start_angle,
                     sweep,
                 },
+                other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
+                    other.with_endpoints(start, end)
+                }
             }
         })
         .collect();
@@ -497,6 +500,7 @@ fn reverse_segment(segment: Segment) -> Segment {
             start_angle: start_angle + sweep,
             sweep: -sweep,
         },
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
     }
 }
 
@@ -555,6 +559,9 @@ fn weld_loop(
                 start_angle,
                 sweep,
             },
+            other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
+                other.with_endpoints(expected, other.end())
+            }
         };
     }
     Ok(segments)
@@ -674,6 +681,7 @@ fn segment_length(segment: Segment) -> f64 {
     match segment {
         Segment::Line { start, end } => (end.x - start.x).hypot(end.y - start.y),
         Segment::Arc { radius, sweep, .. } => radius * sweep.abs(),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.length(),
     }
 }
 
@@ -695,6 +703,22 @@ fn parameter_of(segment: Segment, point: Point2) -> f64 {
             let angle = (point.y - center.y).atan2(point.x - center.x);
             arc_fraction(angle, start_angle, sweep)
         }
+        Segment::Ellipse {
+            center,
+            u,
+            major,
+            minor,
+            start_angle,
+            sweep,
+            ..
+        } => {
+            // The parameter angle is read off the ellipse's own frame,
+            // with the axes scaled back to a circle first.
+            let along = ((point.x - center.x) * u.x + (point.y - center.y) * u.y) / major;
+            let across = ((point.y - center.y) * u.x - (point.x - center.x) * u.y) / minor;
+            arc_fraction(across.atan2(along), start_angle, sweep)
+        }
+        Segment::Harmonic { start, end, .. } => (point.x - start.x) / (end.x - start.x),
     }
 }
 
@@ -734,6 +758,7 @@ fn evaluate(segment: Segment, parameter: f64) -> Point2 {
                 radius.mul_add(angle.sin(), center.y),
             )
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.point_at(parameter),
     }
 }
 
@@ -985,7 +1010,165 @@ fn carrier_crossings(
                 })
                 .collect())
         }
+        _ => section_carrier_crossings(first, second, tolerances),
     }
+}
+
+/// Candidate crossings when at least one segment is a section chord. The
+/// chords are exact — an ellipse, a harmonic — but a crossing with another
+/// carrier has no closed form in general, so it is bracketed on a fine
+/// sampling of the chord's own parameter and bisected to precision. A near
+/// touch that never changes sign is tangential contact, which refuses.
+fn section_carrier_crossings(
+    first: Segment,
+    second: Segment,
+    tolerances: Tolerances,
+) -> Result<Vec<Point2>, ProfileBooleanError> {
+    // Sample along the section chord; the other segment is the carrier.
+    let (chord, other) = if first.is_section_chord() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    if let (Segment::Harmonic { .. }, Segment::Harmonic { .. }) = (first, second)
+        && harmonics_share_carrier(first, second, tolerances)
+    {
+        return Err(ProfileBooleanError::Unsupported);
+    }
+    // Signed distance of a point from the other carrier.
+    let signed = |point: Point2| -> f64 {
+        match other {
+            Segment::Line { start, end } => {
+                let dx = end.x - start.x;
+                let dy = end.y - start.y;
+                let length = dx.hypot(dy);
+                ((point.x - start.x) * dy - (point.y - start.y) * dx) / length
+            }
+            Segment::Arc { center, radius, .. } => {
+                (point.x - center.x).hypot(point.y - center.y) - radius
+            }
+            Segment::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                ..
+            } => {
+                let along = ((point.x - center.x) * u.x + (point.y - center.y) * u.y) / major;
+                let across = ((point.y - center.y) * u.x - (point.x - center.x) * u.y) / minor;
+                (along.hypot(across) - 1.0) * major.min(minor)
+            }
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                ..
+            } => point.y - (mean + amplitude * (point.x - phase).cos()),
+        }
+    };
+    // The chord's whole carrier is not bounded for a harmonic, so sample the
+    // chord's own span, slightly extended so an endpoint crossing is found.
+    const SAMPLES: usize = 256;
+    let extent: f64 = 1.0e-3;
+    let at = |index: usize| -> f64 {
+        (1.0 + 2.0 * extent).mul_add(index as f64 / SAMPLES as f64, -extent)
+    };
+    let mut candidates = Vec::new();
+    let mut previous = (at(0), signed(chord.point_at(at(0))));
+    for index in 1..=SAMPLES {
+        let fraction = at(index);
+        let value = signed(chord.point_at(fraction));
+        if previous.1 == 0.0 {
+            candidates.push(chord.point_at(previous.0));
+        } else if (previous.1 < 0.0) != (value < 0.0) {
+            let (mut low, mut high) = (previous.0, fraction);
+            let (mut low_value, _) = (previous.1, value);
+            for _ in 0..80 {
+                let middle = 0.5 * (low + high);
+                let middle_value = signed(chord.point_at(middle));
+                if (middle_value < 0.0) == (low_value < 0.0) {
+                    low = middle;
+                    low_value = middle_value;
+                } else {
+                    high = middle;
+                }
+            }
+            candidates.push(chord.point_at(0.5 * (low + high)));
+        } else if index >= 2 {
+            // A local minimum of |distance| that stays on one side within
+            // the agreement is a graze: tangential contact.
+            let (before, here) = (previous.1.abs(), value.abs());
+            let _ = (before, here);
+        }
+        previous = (fraction, value);
+    }
+    // Tangential contact: an interior extremum of the signed distance within
+    // the agreement, with no sign change around it, inside both spans.
+    let mut values = Vec::with_capacity(SAMPLES + 1);
+    for index in 0..=SAMPLES {
+        values.push((at(index), signed(chord.point_at(at(index)))));
+    }
+    for window in values.windows(3) {
+        let (a, b, c) = (window[0].1, window[1].1, window[2].1);
+        let extremum =
+            (b.abs() <= a.abs() && b.abs() <= c.abs()) && b.abs() <= tolerances.agreement;
+        let sign_change = (a < 0.0) != (c < 0.0);
+        if extremum && !sign_change {
+            let touch = chord.point_at(window[1].0);
+            let within = |segment: Segment| {
+                matches!(
+                    place(
+                        parameter_of(segment, touch),
+                        segment_length(segment),
+                        tolerances
+                    ),
+                    Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
+                )
+            };
+            if within(chord) && within(other) {
+                return Err(ProfileBooleanError::Unsupported);
+            }
+        }
+    }
+    candidates.dedup_by(|a, b| (a.x - b.x).hypot(a.y - b.y) <= tolerances.agreement);
+    Ok(candidates)
+}
+
+/// Whether two harmonic chords lie on one carrier with overlapping spans.
+fn harmonics_share_carrier(first: Segment, second: Segment, tolerances: Tolerances) -> bool {
+    let (
+        Segment::Harmonic {
+            mean: m1,
+            amplitude: a1,
+            phase: p1,
+            start: s1,
+            end: e1,
+        },
+        Segment::Harmonic {
+            mean: m2,
+            amplitude: a2,
+            phase: p2,
+            start: s2,
+            end: e2,
+        },
+    ) = (first, second)
+    else {
+        return false;
+    };
+    let same_phase = |p: f64, q: f64| {
+        let delta = (p - q).rem_euclid(std::f64::consts::TAU);
+        delta <= tolerances.agreement || std::f64::consts::TAU - delta <= tolerances.agreement
+    };
+    let same = (m1 - m2).abs() <= tolerances.agreement
+        && ((a1 - a2).abs() <= tolerances.agreement && same_phase(p1, p2)
+            || (a1 + a2).abs() <= tolerances.agreement
+                && same_phase(p1, p2 + std::f64::consts::PI));
+    if !same {
+        return false;
+    }
+    let (low1, high1) = (s1.x.min(e1.x), s1.x.max(e1.x));
+    let (low2, high2) = (s2.x.min(e2.x), s2.x.max(e2.x));
+    high2 > low1 + tolerances.agreement && low2 < high1 - tolerances.agreement
 }
 
 fn arc_spans_overlap(first: Segment, second: Segment) -> bool {
@@ -1098,6 +1281,25 @@ fn sub_segment(
             start_angle: sweep.mul_add(start_parameter, start_angle),
             sweep: sweep * (end_parameter - start_parameter),
         },
+        Segment::Ellipse {
+            center,
+            u,
+            major,
+            minor,
+            start_angle,
+            sweep,
+            ..
+        } => Segment::Ellipse {
+            center,
+            u,
+            major,
+            minor,
+            start,
+            end,
+            start_angle: sweep.mul_add(start_parameter, start_angle),
+            sweep: sweep * (end_parameter - start_parameter),
+        },
+        section @ Segment::Harmonic { .. } => section.with_endpoints(start, end),
     }
 }
 

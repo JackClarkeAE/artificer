@@ -532,7 +532,7 @@ The evaluated profile-role curves are compiled into a bounded analytic arrangeme
 5. Build directed half-edges and twins.
 6. Sort outgoing half-edges by certified tangent direction, breaking a tie between tangent departures by signed curvature (left-bending after straight after right-bending), so a tangent contact is an ordinary junction rather than an ambiguity.
 7. Walk bounded cells with a DCEL-style rotation system.
-8. accept ordinary shared endpoints—including the G1 rail/cap and fillet joins—and interior tangencies (a circle resting on a side splits both carriers there, and pinches the surround into a loop that may visit that junction twice), while rejecting zero-area cells, coincident overlap, loop-to-loop kissing at authored endpoints, or numerically indeterminate ordering with typed diagnostics;
+8. accept ordinary shared endpoints—including the G1 rail/cap and fillet joins, polygon vertices resting on another curve, and spokes meeting at one centre—and interior tangencies (a circle resting on a side splits both carriers there, and pinches the surround into a loop that may visit that junction twice), while rejecting zero-area cells, coincident overlap, or numerically indeterminate ordering with typed diagnostics; two loops that kiss at a point each remain a selectable cell, and selecting both is refused later as a pinched boundary;
 9. canonicalize every cell into a stable `RegionSignature`; and
 10. cache the arrangement by sketch revision and dirty-curve set.
 

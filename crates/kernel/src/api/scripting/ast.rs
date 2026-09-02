@@ -8,12 +8,24 @@ pub enum AstNode {
         name: String,
         param_type: String,
         default_value: Expression,
+        /// The line the declaration starts on, for a customizer to point at.
+        line: usize,
     },
     LetBinding {
         name: String,
         value: Expression,
     },
     Statement(Expression),
+    /// `for name in start..end { ... }`: the body runs once per whole
+    /// number from `start` up to but not including `end`.
+    For {
+        variable: String,
+        start: Expression,
+        end: Expression,
+        body: Vec<AstNode>,
+        line: usize,
+        col: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -35,12 +47,17 @@ pub enum Expression {
         name: String,
         named_args: Vec<(String, Expression)>,
         positional_args: Vec<Expression>,
+        /// Where the call is written, so an evaluation error can say so.
+        line: usize,
+        col: usize,
     },
     MethodCall {
         target: Box<Expression>,
         method: String,
         named_args: Vec<(String, Expression)>,
         positional_args: Vec<Expression>,
+        line: usize,
+        col: usize,
     },
 }
 

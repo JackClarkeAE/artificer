@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use artificer_kernel::NativeKernel;
+use crate::NativeKernel;
 use artificer_protocol::{Aabb3, EntityId, EntityKind, Point3, SnapshotId, TopologyCounts};
 use serde::{Deserialize, Serialize};
 
-use crate::debug::{ApiError, ApiErrorCode, EntityInfo};
-use crate::selectors::{EntitySelector, resolve_selector};
-use crate::session::Session;
+use crate::api::debug::{ApiError, ApiErrorCode, EntityInfo};
+use crate::api::selectors::{EntitySelector, resolve_selector};
+use crate::api::session::Session;
 
 /// Summary information for a body in the current session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

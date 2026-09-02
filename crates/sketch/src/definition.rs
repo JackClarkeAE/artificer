@@ -998,6 +998,11 @@ pub enum SketchValidationError {
         count: u16,
     },
     InvalidSlotDimensions,
+    /// The text recipe could not be set: empty, a glyph the bundled
+    /// typeface lacks, or more outline vertices than a sketch may hold.
+    TextUnavailable {
+        reason: crate::text::TextOutlineError,
+    },
     MissingPoint {
         point: SketchPointId,
     },
@@ -1106,6 +1111,7 @@ impl fmt::Display for SketchValidationError {
             Self::InvalidSlotDimensions => {
                 formatter.write_str("slot width must be positive and smaller than overall length")
             }
+            Self::TextUnavailable { reason } => write!(formatter, "text cannot be set: {reason}"),
             Self::MissingPoint { point } => write!(formatter, "point {point} does not exist"),
             Self::MissingEntity { entity } => {
                 write!(formatter, "entity {entity} does not exist or is retired")

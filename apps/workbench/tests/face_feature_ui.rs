@@ -840,31 +840,31 @@ fn test_project_3d_body_context_toggle_and_ribbon_interaction() {
     let mut harness = harness();
     prepare_active_one_by_one_face_rectangle(&mut harness);
 
-    // Initial state: 3D context is enabled by default
-    assert!(harness.state().project_3d_body_context());
+    // Initial state: the body is shown, and nothing below the surface is
+    // projected until asked.
+    assert!(!harness.state().project_3d_body_context());
     let (initial_triangles, initial_edges) = harness
         .state()
         .face_sketch_context_counts()
         .expect("face context exists");
-    assert!(initial_triangles > 0);
+    assert!(initial_triangles > 0, "the body is always visible");
     assert!(initial_edges > 0);
 
-    // Click the "Project 3D Context" ribbon button to toggle it off
-    click_button(&mut harness, "Project 3D Context");
-    assert!(!harness.state().project_3d_body_context());
-
-    // Step harness to update the sketch viewport
+    // Turning the projection on reveals what lies below the face; it never
+    // takes the body away.
+    click_button(&mut harness, "Project 3D Geometry");
+    assert!(harness.state().project_3d_body_context());
     harness.step();
     let (toggled_triangles, toggled_edges) = harness
         .state()
         .face_sketch_context_counts()
         .expect("face context exists");
-    assert_eq!(toggled_triangles, 0);
-    assert_eq!(toggled_edges, 0);
+    assert!(toggled_triangles >= initial_triangles);
+    assert!(toggled_edges >= initial_edges);
 
-    // Click "Project 3D Context" again to toggle it back on
-    click_button(&mut harness, "Project 3D Context");
-    assert!(harness.state().project_3d_body_context());
+    // Off again restores the plain body backdrop.
+    click_button(&mut harness, "Project 3D Geometry");
+    assert!(!harness.state().project_3d_body_context());
     harness.step();
 
     let (restored_triangles, restored_edges) = harness
@@ -879,6 +879,8 @@ fn test_project_3d_body_context_toggle_and_ribbon_interaction() {
 fn test_project_3d_body_depth_slider_filtering() {
     let mut harness = harness();
     prepare_active_one_by_one_face_rectangle(&mut harness);
+    harness.state_mut().set_project_3d_body_context(true);
+    harness.step();
 
     // With depth = 50.0 mm (default), all features behind the face are captured
     let (full_triangles, full_edges) = harness

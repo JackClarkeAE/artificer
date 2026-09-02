@@ -4,12 +4,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use artificer_api::CancellationToken;
-use artificer_api::export::{export_obj, export_stl_binary};
-use artificer_api::scripting::compile_script;
-use artificer_api::server::serve_stdio;
-use artificer_api::session::Session;
-use artificer_api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
+use artificer_kernel::CancellationToken;
+use artificer_kernel::api::export::{export_obj, export_stl_binary};
+use artificer_kernel::api::scripting::compile_script;
+use artificer_kernel::api::server::serve_stdio;
+use artificer_kernel::api::session::Session;
+use artificer_kernel::api::snapshot::{CameraSpec, SnapshotOptions, SnapshotOutput, StandardView};
 
 const USAGE: &str = "\
 USAGE:

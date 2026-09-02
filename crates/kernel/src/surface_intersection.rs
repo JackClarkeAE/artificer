@@ -9,13 +9,14 @@
 //! than discovered at runtime. Everything inside it returns lines and circles
 //! derived algebraically; everything outside it returns
 //! [`IntersectionError::Unsupported`] so the caller can refuse the operation
-//! rather than approximate it. An ellipse from an oblique plane through a
-//! cylinder is *not* an error in the geometry — it is a curve this kernel
-//! cannot yet name, and saying so is the whole point.
+//! rather than approximate it. A conic from an oblique plane through a
+//! cone is *not* an error in the geometry — it is a curve this kernel
+//! cannot yet name, and saying so is the whole point. The ellipse an
+//! oblique plane cuts from a cylinder is in the vocabulary and is exact.
 //!
 //! | | Plane | Cylinder | Cone | Sphere | Torus |
 //! |---|---|---|---|---|---|
-//! | **Plane** | line | circle ⟂, lines ∥ | circle ⟂ | circle | circles ⟂, circles through the axis |
+//! | **Plane** | line | circle ⟂, ellipse oblique, lines ∥ | circle ⟂ | circle | circles ⟂, circles through the axis |
 //! | **Cylinder** | | coaxial, parallel axes | coaxial | centre on the axis | — |
 //! | **Cone** | | | coaxial | — | — |
 //! | **Sphere** | | | | any pair | — |
@@ -41,6 +42,21 @@ pub(crate) enum IntersectionCurve {
         u: Vector3,
         v: Vector3,
         radius: f64,
+    },
+    /// `center + major·cos(t)·u + minor·sin(t)·v`, with `u` and `v` unit and
+    /// perpendicular: the section of a cylinder by an oblique plane.
+    ///
+    /// `seam_angle` is the parameter `t` at the cylinder's azimuth zero and
+    /// `azimuth_rate` (`±1`) is `dθ/dt`, so that both faces subdivide the
+    /// ellipse at the same azimuths and the sewer welds their edges.
+    Ellipse {
+        center: Point3,
+        u: Vector3,
+        v: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+        seam_angle: f64,
+        azimuth_rate: f64,
     },
 }
 
@@ -187,9 +203,34 @@ fn plane_cylinder(plane: Plane, cylinder: Cylinder, tolerances: Tolerances) -> I
             },
         ]));
     }
-    if normal.dot(axis).abs() > tolerances.angular {
-        // An oblique cut is an ellipse, which this vocabulary cannot name.
-        return Err(IntersectionError::Unsupported);
+    let cosine = normal.dot(axis);
+    if cosine.abs() > tolerances.angular {
+        // An oblique cut is an ellipse: centred where the axis pierces the
+        // plane, its minor axis the cylinder's radius across the line of
+        // steepest descent, its major axis stretched by the cut's slant.
+        let height = offset.dot(normal) / cosine;
+        let center = cylinder.origin + axis * height;
+        let v = unit(axis.cross(normal))?;
+        let u = v.cross(normal);
+        // Where the major axis points round the cylinder, and which way the
+        // parameter runs round it.
+        let radial_u = unit(cylinder.radial_u)?;
+        let radial_v = unit(cylinder.radial_v)?;
+        let u_radial = u - axis * u.dot(axis);
+        let crest = u_radial.dot(radial_v).atan2(u_radial.dot(radial_u));
+        let tangential = radial_u * -crest.sin() + radial_v * crest.cos();
+        let azimuth_rate = if v.dot(tangential) >= 0.0 { 1.0 } else { -1.0 };
+        return Ok(SurfaceIntersection::Curves(vec![
+            IntersectionCurve::Ellipse {
+                center,
+                u,
+                v,
+                major_radius: cylinder.radius / cosine.abs(),
+                minor_radius: cylinder.radius,
+                seam_angle: -azimuth_rate * crest,
+                azimuth_rate,
+            },
+        ]));
     }
     // The plane runs along the axis: every point of the axis is the same
     // signed distance from it, so the pair meets in generators. `offset` runs
@@ -731,6 +772,18 @@ mod tests {
                     v,
                     radius,
                 } => center + (u * parameter.cos() + v * parameter.sin()) * radius,
+                IntersectionCurve::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                    ..
+                } => {
+                    center
+                        + u * (major_radius * parameter.cos())
+                        + v * (minor_radius * parameter.sin())
+                }
             };
             let residual = match surface {
                 Surface::Plane(plane) => (point - plane.origin).dot(plane.normal).abs(),
@@ -815,11 +868,28 @@ mod tests {
         );
 
         // Oblique: a genuine ellipse, and the vocabulary says so.
+        // An oblique plane cuts an ellipse: the radius across, the radius
+        // over the cosine of the slant along, seated on the axis.
         let oblique = plane([0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]);
-        assert_eq!(
-            intersect(oblique, cylinder, precision()),
-            Err(IntersectionError::Unsupported)
-        );
+        let Ok(SurfaceIntersection::Curves(section)) = intersect(oblique, cylinder, precision())
+        else {
+            panic!("an oblique plane cuts a cylinder in an ellipse");
+        };
+        assert_eq!(section.len(), 1);
+        let IntersectionCurve::Ellipse {
+            center,
+            major_radius,
+            minor_radius,
+            ..
+        } = section[0]
+        else {
+            panic!("the section is an ellipse");
+        };
+        assert!((minor_radius - 5.0).abs() < 1.0e-12);
+        assert!((major_radius - 5.0 * 2.0_f64.sqrt()).abs() < 1.0e-12);
+        assert!(center.x.abs() < 1.0e-12 && center.y.abs() < 1.0e-12 && center.z.abs() < 1.0e-12);
+        assert_on(cylinder, section[0]);
+        assert_on(oblique, section[0]);
     }
 
     #[test]

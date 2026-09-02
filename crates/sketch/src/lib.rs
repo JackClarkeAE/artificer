@@ -14,6 +14,7 @@ mod primitives;
 mod profile;
 mod queries;
 mod recipes;
+pub mod text;
 mod transaction;
 mod trim;
 

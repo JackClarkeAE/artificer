@@ -16,6 +16,7 @@ use std::f32::consts::TAU;
 pub enum CommandIcon {
     Sketch,
     Plane,
+    Section,
     Extrude,
     Revolve,
     Hole,
@@ -209,6 +210,19 @@ impl IconPainter<'_> {
             CommandIcon::Plane => {
                 self.closed_path(&[(0.10, 0.62), (0.44, 0.80), (0.90, 0.56), (0.56, 0.38)]);
                 self.dashed((0.50, 0.09), (0.50, 0.44));
+            }
+            CommandIcon::Section => {
+                // A block with its near half cut away, the cut face hatched.
+                self.closed_path(&[(0.14, 0.30), (0.50, 0.14), (0.86, 0.30), (0.50, 0.46)]);
+                self.line((0.14, 0.30), (0.14, 0.70));
+                self.line((0.14, 0.70), (0.50, 0.86));
+                self.line((0.50, 0.46), (0.50, 0.86));
+                self.line((0.50, 0.46), (0.86, 0.30));
+                self.line((0.86, 0.30), (0.86, 0.70));
+                self.line((0.86, 0.70), (0.50, 0.86));
+                self.line((0.54, 0.56), (0.70, 0.48));
+                self.line((0.54, 0.68), (0.82, 0.54));
+                self.line((0.58, 0.78), (0.82, 0.66));
             }
             CommandIcon::Extrude => {
                 self.rectangle((0.22, 0.60), (0.78, 0.86));

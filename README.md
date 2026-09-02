@@ -2,20 +2,20 @@
 
 # Artificer
 
-**The exact boundary-representation geometric modeling kernel and parametric CAD suite, written from scratch in pure Rust.**
+**An exact boundary-representation geometry kernel, and the parametric CAD workbench built on it. Pure Rust, from scratch.**
 
 [![CI](https://github.com/JackClarkeAE/artificer/actions/workflows/ci.yml/badge.svg)](https://github.com/JackClarkeAE/artificer/actions)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Dual License: Commercial](https://img.shields.io/badge/License-Commercial-purple.svg)](#licensing)
+[![Commercial licence available](https://img.shields.io/badge/License-Commercial-purple.svg)](#licensing)
 [![Rust: 1.95+](https://img.shields.io/badge/Rust-1.95+-orange.svg)](https://www.rust-lang.org)
 
-[Key Features](#key-features) •
-[The Kernel](#the-exact-geometry-kernel) •
-[Programmable API & Server](#programmable-api--headless-engine) •
-[Interactive Workbench](#desktop-cad-workbench) •
+[The Kernel](#the-artificer-kernel) •
+[Built for AI-driven CAD](#built-for-ai-driven-cad) •
+[The Workbench](#the-artificer-workbench) •
 [Quickstart](#quickstart) •
 [Architecture](#architecture) •
-[Roadmap](#roadmap)
+[Roadmap](#roadmap) •
+[Licensing](#licensing)
 
 <br/>
 
@@ -25,125 +25,56 @@
 
 ---
 
-## What is Artificer?
+## What is new in 0.96
 
-Artificer is an industrial-grade, pure-Rust mechanical CAD ecosystem powered by its own custom **exact boundary-representation (B-rep) geometry kernel**.
+This release turns the kernel's scripting language into a product of its own and pairs it with a live editor.
 
-Unlike traditional CAD software that relies on legacy C++ kernels with floating-point tolerance approximations and mesh-healing heuristics, Artificer represents every surface, curve, and boundary analytically. Operations either evaluate to a mathematically certified manifold solid or refuse cleanly with a deterministic reason.
-
-Whether you are designing physical mechanisms in the **desktop CAD workbench**, automating parametric model generation via the **headless JSON-RPC server**, or embedding the **geometry kernel** directly into your own Rust applications, Artificer guarantees reproducible, bit-identical precision across platforms.
-
----
-
-## Key Features
-
-- 📐 **100% Exact Analytic Geometry** — Lines, circles, planes, cylinders, cones, tori, and spheres are evaluated directly from closed-form equations. No chord approximations, no tolerance accumulation, and no "nearly watertight" solids.
-- ⚡ **Closed-Form Calculus** — Volume, surface area, center of mass, and moments of inertia are integrated analytically over true surface topologies rather than estimated from facet meshes.
-- 🔄 **Deterministic Parametric History** — All modeling operations are recorded as pure, transactional journal steps. Every model state is content-addressed with cryptographic digests for bit-identical rebuilds.
-- 🌐 **Headless Automation & API Server** — First-class JSON-RPC 2.0 API server, Rust client SDK, and `.art` scripting DSL for cloud CAD workflows, generative engineering, and automated test pipelines.
-- ✏️ **Flow-State 2D Sketching** — Instant planar loop and multi-region detection, live in-canvas dimension editing, parametric sketch recipes, and automatic profile classification.
-- 🔩 **Assemblies & Part Library** — Integrated component catalogs, rigid 3D spatial placements, grounding semantics, and kinematic revolute joints with live motion simulation.
-- 📦 **Dual-Tier Faceted & Exact Booleans** — Robust topological difference, union, and intersection operations across arbitrary orientations and non-manifold interactions.
-- 🎨 **Modern Native GPU Desktop App** — Ultra-responsive UI built with `wgpu` and `egui`, featuring dynamic view cube orientation, realtime edge-contrast rendering, and custom theme engines.
+- **`.art` scripting, version 0.2.** The language now reaches the whole kernel: sketches from lines, circles, arcs and rectangles on world planes or on faces; extrude with add, cut and draft; revolve; drill, push/pull, fillet, chamfer, mirror and pattern; union, difference and intersection between bodies; face and edge selectors by direction, position and history; the trigonometry in degrees. Errors name their line and column, and parameters have defaults a host can override. The full reference, written for people and for AI agents, is [`docs/art-scripting.md`](docs/art-scripting.md).
+- **Artificer Script Studio.** A third program in the shape OpenSCAD made familiar: the script on the left, the exact model on the right, the `param` lines as a customizer, and a console that points at the failing line. It re-runs as you type, keeps the last good model on screen through an error, sections the model on any origin plane, and exports STL and OBJ.
+- **Section analysis.** The workbench and Script Studio clip the model to one side of a plane and cap the cut, so the inside of a part can be checked for the solid it should be.
+- **Oblique sections of cylinders are exact.** Angled holes, mitred cylinder ends and oblique cuts of round bodies meet on the ellipse curve through the analytic Boolean engine, with no faceting.
+- **Sketch constraints from the canvas.** Coincident, horizontal, vertical, parallel, perpendicular, equal, tangent and collinear relations are applied by clicking geometry, from a constraint group on the sketch bar.
+- **Named faces and loops, for a person in the loop.** A `let` bound to a selector names a face. Script Studio lists the names, shows one when its face is clicked, and describes the face in plain words, so a request such as "six bolt holes on `flange_top`" needs no guessing. `for` loops with `"bolt_" + i` labels make counts into parameters an agent can change. The agent workflow is written up in the language reference.
+- **Selectors that mean what they say.** `faces(">Z")` is the highest upward face on a stepped part, and the nearest-face selector measures to the surface, so a point placed on a face finds it.
+- **Presentation.** The three origin planes read as translucent datum cards with corner labels; the camera no longer zooms in when an extrusion commits; the outline of a revolved body no longer breaks at its seam.
 
 ---
 
-## The Exact Geometry Kernel
+## Three products, one repository
 
-At the core of Artificer is `crates/kernel`, a self-contained B-rep engine designed without external C/C++ dependencies:
+Artificer is three things, deliberately kept apart:
 
-```
-                  ┌─────────────────────────────────────────┐
-                  │          Geometry Kernel API            │
-                  └────────────────────┬────────────────────┘
-                                       │
-            ┌──────────────────────────┴──────────────────────────┐
-            ▼                                                     ▼
-┌───────────────────────────────┐             ┌───────────────────────────────────┐
-│     Authoritative B-rep       │             │       Certified Predicates        │
-│  • Half-Edge Topology         │             │  • Exact Orientation Filters      │
-│  • Analytic Carrier Surfaces  │             │  • Closed-Form Intersections      │
-│  • Manifold Validation Gates  │             │  • Interval Arithmetic Arithmetic │
-└───────────────┬───────────────┘             └─────────────────┬─────────────────┘
-                │                                               │
-                └──────────────────────┬────────────────────────┘
-                                       ▼
-                  ┌─────────────────────────────────────────┐
-                  │    Exact Calculus & Solid Operations    │
-                  │  • Analytic Surface Integrals (Mass)    │
-                  │  • Toric / Spherical Variable Blends    │
-                  │  • Faceted & Exact BSP Boolean Engines  │
-                  └─────────────────────────────────────────┘
-```
+| | What it is | Where it lives | Depends on |
+|---|---|---|---|
+| **Artificer Kernel** | A standalone exact B-rep modelling kernel with its programmatic API built in: a Rust API, a JSON-RPC 2.0 server, the `.art` scripting language, headless PNG/SVG rendering, and STL/OBJ export. | [`crates/kernel`](crates/kernel) | Nothing but its own geometry, compute, and protocol crates. No UI, no GPU, no C or C++. |
+| **Artificer Workbench** | A native desktop parametric CAD application: sketching, features, assemblies, a part library, and a parametric history. | [`apps/workbench`](apps/workbench) | The kernel, through the same protocol every other client uses. |
+| **Artificer Script Studio** | A live `.art` visualiser in the OpenSCAD shape: the script on the left, the exact model on the right, a customizer built from the script's parameters, and a console that points at the failing line. | [`apps/script-studio`](apps/script-studio) | The kernel, through its API session, and the workbench's viewport and theme. |
 
-### Analytic Topology
-In Artificer, topological faces point to exact mathematical surfaces:
-- **Planes**: $P(u, v) = O + u\vec{U} + v\vec{V}$
-- **Cylinders**: $C(u, v) = O + R(\cos(u)\vec{U} + \sin(u)\vec{V}) + v\vec{W}$
-- **Tori**: Swept circular cross-sections with exact major and minor radii.
-- **Spheres**: Exact spherical quadrics.
-
-When you fillet a cylinder's rim at its own radius, Artificer produces an exact mathematical sphere carrier, preserving analytic surface continuity throughout downstream operations.
-
-### Transactional Solid Validation
-Every kernel mutation must pass rigorous topological manifold checks:
-- **Euler-Poincaré Formula Verification**: $V - E + F - (L - F) = 2(S - G)$
-- **Edge-Use Counting**: Exactly two coedges per manifold edge with opposite loop orientations.
-- **Closed Loop Orientation**: Counter-clockwise outer bounds and clockwise inner voids.
-- **Self-Intersection Free**: All faces, edges, and vertices are verified non-overlapping.
+The separation is enforced, not aspirational. The CI architecture audit fails the build if a UI or rendering dependency enters the kernel crate, and the kernel is exercised end to end by a headless test suite that never opens a window. You can embed the kernel in your own application, drive it from another language over JSON-RPC, or script it from a file, and you get exactly the same geometry the workbench would build.
 
 ---
 
-## Programmable API & Headless Engine
+## The Artificer Kernel
 
-Artificer is built from the ground up to be scriptable, automatable, and embeddable.
+Every surface, curve, and boundary in an Artificer model is analytic. There are no mesh approximations standing in for solids, no tolerance stacking, and no healing heuristics that quietly change your geometry. An operation either produces a certified manifold solid or refuses with a named, structured reason.
 
-### 1. JSON-RPC 2.0 API Server (`apps/api-server`)
-Run headless CAD pipelines on servers, in Docker containers, or inside CI/CD workflows:
+### Exact by construction
 
-```sh
-# Start the API server on localhost
-cargo run --release -p artificer-api-server -- --port 9000
-```
+- **Analytic geometry only.** Planes, cylinders, cones, spheres, and tori as surfaces; lines and circles as curves. A fillet on a cylinder's rim at its own radius is an exact sphere, not a patch of triangles.
+- **Closed-form calculus.** Volume, surface area, centroid, and inertia are integrated analytically over the true surfaces. Test gates pin them against independent derivations at one part in a billion.
+- **Transactional validation.** Every result passes Euler–Poincaré, edge-use, loop-orientation, locus, and self-intersection checks before it is published. A snapshot that fails is never returned.
+- **Certified or refused.** Each operation is a ladder of exact strategies. When none applies, the kernel says which rung refused and why, with a diagnostic code, rather than guessing. The one remaining approximate tier, for cuts that cross curved voids, is labelled as an approximation in its report.
+- **Deterministic and content-addressed.** Snapshots carry a semantic digest. The same commands produce bit-identical models on every platform, so replays, caches, and audits agree.
 
-Send commands using standard JSON-RPC:
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "1",
-  "method": "execute",
-  "params": {
-    "command": {
-      "kind": "make_box",
-      "origin": [0.0, 0.0, 0.0],
-      "size": [100.0, 50.0, 25.0],
-      "label": "base_block"
-    }
-  }
-}
-```
+### The API is part of the kernel
 
-### 2. Parametric Scripting DSL (`.art`)
-Write clean, readable parametric scripts evaluated directly by the kernel:
+The programmatic surface lives in `artificer_kernel::api` and ships with the kernel, not beside it. Three entry points cover most uses:
+
+**Rust.** Embed the kernel directly:
 
 ```rust
-// bracket.art — Parametric bracket with mounting holes
-param width: f64 = 100.0;
-param depth: f64 = 50.0;
-param thickness: f64 = 10.0;
-
-let base = box(origin: [0, 0, 0], size: [width, depth, thickness], label: "base");
-let top = base.top_face;
-
-drill_hole(face: top, center: [-30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_l");
-drill_hole(face: top, center: [ 30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_r");
-```
-
-### 3. Rust Native API (`crates/api`)
-Embed CAD capabilities directly inside your Rust crates:
-
-```rust
-use artificer_api::{Session, ApiCommand, CancellationToken};
+use artificer_kernel::CancellationToken;
+use artificer_kernel::api::{ApiCommand, Session};
 use artificer_protocol::Point3;
 
 let mut session = Session::new();
@@ -155,98 +86,242 @@ session.execute(ApiCommand::MakeBox {
     size: [50.0, 50.0, 50.0],
 }, &token)?;
 
-let measures = session.query().mass_properties(None)?;
-println!("Exact Volume: {:.6} mm³", measures.volume);
+let measures = session.snapshot.measures();
+println!("Exact volume: {:.6} mm³", measures.volume);
+println!("Bounds: {:?}", session.query().bounds()?);
 ```
+
+**JSON-RPC 2.0.** Run the kernel as a headless service on stdin/stdout, one request per line, batches and notifications included:
+
+```sh
+cargo run --release -p artificer-api-server -- serve
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "1",
+  "method": "execute",
+  "params": {
+    "type": "make_box",
+    "label": "base_block",
+    "origin": { "x": 0.0, "y": 0.0, "z": 0.0 },
+    "size": [100.0, 50.0, 25.0]
+  }
+}
+```
+
+Domain errors come back as JSON-RPC error `-32000` with the structured `ApiError` in `error.data`: a code, a plain-language message, a suggestion, candidate entities where a selector was ambiguous, and the kernel's own diagnostics.
+
+**`.art` scripts.** A small parametric language evaluated straight into kernel commands:
+
+```text
+// bracket.art — parametric bracket with mounting holes
+param width: f64 = 100.0;
+param depth: f64 = 50.0;
+param thickness: f64 = 10.0;
+
+let base = box(origin: [0, 0, 0], size: [width, depth, thickness], label: "base");
+let top = base.face("top_face");
+
+// Hole centres are in the face's own frame, whose origin is the face centre.
+drill(face: top, center: [-30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_l");
+drill(face: faces(">Z"), center: [30.0, 0.0], diameter: 8.0, depth: thickness, label: "hole_r");
+
+// Fillet every vertical edge of the block at once.
+fillet(edges: edges("|Z"), radius: 2.0, label: "soften");
+```
+
+```sh
+cargo run --release -p artificer-api-server -- run bracket.art --param width=120
+cargo run --release -p artificer-api-server -- snapshot bracket.art bracket.png
+cargo run --release -p artificer-api-server -- export bracket.art bracket.stl
+```
+
+The whole API is reachable from a script, one builtin per command, with named arguments and angles in degrees:
+
+| Builtin | Makes |
+|---|---|
+| `box(size:, origin:, label:)`, `cylinder(radius: or diameter:, height:, center:, axis:, label:)` | A new body. |
+| `sketch(on: "XY" \| "XZ" \| "YZ" \| face, entities: [...], label:)` with `line(start:, end:)`, `circle(center:, radius:)`, `arc(center:, radius:, start_angle:, end_angle:)`, `rect(origin: or center:, width:, height:)` | A profile on a plane or a face. Lines and arcs chain into loops; nested loops become holes. |
+| `extrude(sketch:, distance:, operation: "new" \| "add" \| "cut", draft:, regions:, label:)` | A prism, or a drafted loft for a new body. |
+| `revolve(sketch:, axis:, axis_origin:, angle:, operation:, label:)` | A solid of revolution. |
+| `drill(face:, center:, diameter:, depth:)`, `push_pull(face:, distance:)`, `fillet(edges:, radius:)`, `chamfer(edges:, distance:)` | Face and edge features. |
+| `mirror(origin:, normal:)`, `pattern(direction:, spacing:, count:)` | Whole-body operations. |
+| `union(target:, tool:)`, `difference(target:, tool:)`, `intersection(target:, tool:)` | Booleans between two steps. |
+| `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
+| `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
+
+Errors name their line and column, so an editor can point at them. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.
+
+### What the kernel does today
+
+- Primitives, planar-profile extrusion with holes and islands, revolve, drafted extrusion as an exact loft to the profile's offset section, push/pull, holes, ribs, mirror, and linear patterns.
+- Exact chamfers and constant-radius fillets, including fillets that run around a whole hole rim, with spherical corners where the rim turns in and elliptical mitre seams where it turns out.
+- Regularized Boolean union, difference, and intersection, with an exact engine for plane and cylinder operands and a faceted fallback that says so.
+- Analytic surface–surface intersections across the vocabulary, published as a supported-domain matrix.
+- Geometric selectors (`faces(">Z")`, `edges("|Z")`, by extremum, by type, parallel to a direction) that resolve deterministically or refuse with candidates.
+- Headless tessellation at display or authoritative chord budgets, SVG and PNG snapshots from any camera, and STL/OBJ export.
 
 ---
 
-## Desktop CAD Workbench
+## Built for AI-driven CAD
 
-The interactive studio (`apps/workbench`) provides an agile, professional CAD environment:
+Language models and agents are good at saying what a part should be and poor at nudging triangles. A kernel that serves them well has to be declarative, honest about failure, and inspectable without a screen. Artificer was shaped by those requirements:
+
+- **A closed, typed command vocabulary.** Every operation is a serialisable command with named fields and documented domains. There is no hidden UI state to reproduce; a model is its command journal.
+- **Refusals are data.** An operation that cannot be certified returns a diagnostic code, the reason, and where it applies a suggestion or the list of candidate entities. An agent can read the refusal and try the next thing instead of inheriting broken geometry.
+- **Stable references.** Faces and edges are addressed by geometric selectors and by persistent, provenance-tracked references, so a plan written before the model exists still resolves after it is built.
+- **Deterministic replay.** Journals replay to bit-identical snapshots with content digests, which makes results cacheable, diffable, and safe to verify independently.
+- **Headless eyes.** Snapshots render to PNG or SVG from standard or explicit cameras, so a vision-capable model can look at what it built without a GPU or a window.
+- **Exact measurements.** Volumes, areas, centroids, bounds, and distances are closed-form answers, not mesh estimates, so a planner can trust a number it reads back.
+
+The same properties are what make the kernel a sound foundation for any programmatic CAD: generative design, automated tooling, cloud pipelines, and your own front end.
+
+---
+
+## The Artificer Workbench
+
+The desktop application is the reference client for the kernel and a complete single-part and small-assembly modeller in its own right.
 
 <div align="center">
 
 ![Sketching Mode](apps/workbench/tests/snapshots/workbench_sketch_xy_rectangle.png)
 
-*Continuous 2D sketch constraint solver with real-time profile classification*
+*Sketching with live profile detection: every bounded region is selectable the moment it closes.*
 
 </div>
 
-- **Dynamic Sketch Profiling**: Sketching automatically discovers bounded planar cells, holes, and island regions without manual profile closures. Shift-click to select and extrude multiple regions simultaneously.
-- **Parametric Feature Timeline**: Reorder, suppress, or modify dimensions on historical steps with automated atomic dependency rebuilds.
-- **Direct Surface Modeling**: Push/pull faces, create midplanes and datum planes, add bosses, blind pockets, through-cuts, and chamfers directly from model surface selections.
-- **Live 3D Viewport**: Zero-lag GPU rendering with hidden line culling, silhouette boundary classification, dynamic view cube, orthographic/trimetric projection modes, and customizable UI palettes.
+- **Sketching.** Lines, rectangles, circles, arcs, polygons, slots, splines, text set from a bundled typeface as exact outlines, fillets, chamfers, trims, patterns, relations, and dimensions. Intersecting geometry splits into separately selectable regions. Live dimensions edit in place.
+- **Features.** Extrude, drafted extrude, revolve, push/pull, holes, ribs, mirror, patterns, chamfers, and fillets, each staged behind one confirmation gate and recorded in an editable parametric history.
+- **Face sketches.** Sketch on any planar face with the body always in view; project the geometry hidden below the surface as an x-ray when you need to line up with it.
+- **Assemblies and library.** A content-addressed part library, rigid placements, grounding, and revolute joints with live motion.
+- **Documents.** Several documents open at once in tabs along the top of the window; a portable native document format with a versioned schema.
+- **Viewport.** Exact silhouettes, hidden-line rendering, smooth shading from analytic normals, a view cube, and themes.
+
+---
+
+## Artificer Script Studio
+
+The third program is for people who would rather type a model than draw one. Script Studio is a live `.art` editor in the shape OpenSCAD made familiar, built on the same kernel, viewport, and theme as the workbench.
+
+<div align="center">
+
+![Script Studio](docs/images/script-studio.png)
+
+*The flanged hub example: the script, the exact model it builds, its parameters as a customizer, and every step in the console.*
+
+![Script Studio section](docs/images/section.png)
+
+*The same part under section analysis, cut through the axis: the cut faces are capped, the bore and a bolt hole show in the caps, and the FACES panel lists the names the script gave.*
+
+![Filleted flange](docs/images/fillet.png)
+
+*`filleted_flange.art`: every rim of the hub rounded with exact torus blends, each fillet naming both half-circle edges of its rim.*
+
+</div>
+
+- **Live.** Every edit re-runs the script on a worker thread after a short pause; a run that an edit supersedes is cancelled rather than waited for, and the last good model stays on screen while you type.
+- **Customizer.** The script's `param` lines become a panel of values you can drag. A dragged value re-runs the script without touching the text, and one click puts the script's own default back.
+- **Console.** Every step lists its label, topology, and time. A parse or evaluation error names its line and column, a failing step names the line that labels it, and clicking the error puts the cursor there.
+- **Editor.** Syntax colouring for the `.art` vocabulary, line numbers, and the error's line washed in red.
+- **Files.** Open and save scripts, drop a file onto the window, export the model as STL or OBJ, and start from the bundled examples.
+
+```sh
+cargo run --release -p artificer-script-studio -- crates/kernel/examples/flanged_hub.art
+```
 
 ---
 
 ## Quickstart
 
 ### Prerequisites
-- Stable Rust (1.95 or newer)
-- Modern C/GPU toolchain (Metal on macOS, Vulkan/DX12 on Windows, Vulkan/Wayland/X11 on Linux)
 
-### Installation & Launch
+- Stable Rust 1.95 or newer.
+- For the workbench only: a GPU toolchain (Metal on macOS, Vulkan or DX12 on Windows, Vulkan with Wayland or X11 on Linux). The kernel and its server need none.
+
+### Build and run
 
 ```sh
-# Clone the repository
 git clone https://github.com/JackClarkeAE/artificer.git
 cd artificer
 
-# Launch the interactive desktop CAD workbench
+# The kernel and its API: the headless test suite
+cargo test -p artificer-kernel
+
+# The JSON-RPC server on stdin/stdout
+cargo run --release -p artificer-api-server -- serve
+
+# Run, render, or export an .art script
+cargo run --release -p artificer-api-server -- run crates/kernel/examples/bearing_mount.art
+
+# The desktop workbench
 cargo run --release -p artificer-workbench
 
-# Run the full kernel & workbench test suite
-cargo test --workspace
+# The live .art visualiser, on a script of your own
+cargo run --release -p artificer-script-studio -- crates/kernel/examples/flanged_hub.art
 
-# Start the headless API server daemon
-cargo run --release -p artificer-api-server -- --port 8080
+# Everything
+cargo test --workspace
 ```
 
-### Prebuilt Desktop Binaries
-Standalone packages are published on the [Releases Page](https://github.com/JackClarkeAE/artificer/releases):
-- **Windows**: `Artificer-Setup.exe`
-- **Linux**: `Artificer.AppImage`
-- **macOS**: `Artificer-macOS-arm64.zip` (Apple Silicon)
+### Prebuilt binaries
+
+Installers are published on the [Releases page](https://github.com/JackClarkeAE/artificer/releases). Each one carries the workbench and Script Studio side by side:
+
+- Windows: `Artificer-Setup.exe` installs `Artificer.exe` and `ArtificerScriptStudio.exe`
+- Linux: `Artificer.AppImage`, with `ArtificerScriptStudio` alongside it in the plain archive
+- macOS (Apple Silicon): `Artificer-macOS-arm64.zip` with `Artificer.app` and `Artificer Script Studio.app`
 
 ---
 
 ## Architecture
 
-The Artificer workspace is organized into modular, independently testable crates:
-
 | Layer | Crate | Purpose |
 |---|---|---|
-| **Core Kernel** | [`crates/kernel`](crates/kernel) | Authoritative analytic B-rep modeling, Euler topology verification, torus/sphere blends, mass properties |
-| **Geometry** | [`crates/geometry`](crates/geometry) | Certified interval arithmetic predicates, orientation filters, ray/surface intersection math |
-| **Compute** | [`crates/compute`](crates/compute) | Hardware-accelerated spatial classifiers and SIMD/GPU evaluation primitives |
-| **Sketch Engine** | [`crates/sketch`](crates/sketch) | Exact 2D authoring, arrangement cell decomposition, loop stitching, and profile extraction |
-| **Protocol** | [`crates/protocol`](crates/protocol) | Zero-copy serializable command vocabulary connecting front-ends, APIs, and the kernel |
-| **Parametric Model** | [`crates/model`](crates/model) | Content-addressed feature DAG, parameter bindings, journal replay, and document schema |
-| **API & Exporters** | [`crates/api`](crates/api) | Programmable Rust API, `.art` script parser, headless renderer, STL, OBJ, and STEP interchange |
-| **API Server** | [`apps/api-server`](apps/api-server) | Standalone JSON-RPC 2.0 daemon and headless batch runner |
-| **Viewport Engine** | [`crates/viewport`](crates/viewport) | 3D rendering pipeline, silhouette curves, screen-space depth sorting, and gizmo manipulators |
-| **Sketch UI** | [`crates/sketch-ui`](crates/sketch-ui) | 2D canvas interactions, snap systems, live dimension boxes, and geometry tool widgets |
-| **Workbench** | [`apps/workbench`](apps/workbench) | Complete native desktop CAD studio (egui/wgpu) |
-| **CLI & Testkit** | [`apps/cli`](apps/cli) / [`crates/testkit`](crates/testkit) | Deterministic test harnesses, headless journal regression suites, and verification tools |
+| **Kernel** | [`crates/kernel`](crates/kernel) | The exact B-rep kernel: topology, analytic surfaces, strategy ladders, validation, measures, tessellation, and the `api` module (sessions, selectors, JSON-RPC server, `.art` scripting, snapshots, export). |
+| **Geometry** | [`crates/geometry`](crates/geometry) | Certified predicates, interval arithmetic, planar and spatial intersection mathematics. |
+| **Compute** | [`crates/compute`](crates/compute) | The work pool, cancellation, and performance spans the kernel runs on. |
+| **Protocol** | [`crates/protocol`](crates/protocol) | The serialisable command, snapshot, and diagnostic vocabulary shared by every client. |
+| **Sketch** | [`crates/sketch`](crates/sketch) | Exact 2D authoring: recipes, constraints, the arrangement into regions, profile compilation, text outlines. |
+| **Model** | [`crates/model`](crates/model) | The parametric document: features, persistent references, parameters, journals, and the native file schema. |
+| **Kernel server** | [`apps/api-server`](apps/api-server) | The command-line front for the kernel API: `serve`, `run`, `snapshot`, `export`, `journal`. |
+| **Presentation** | [`crates/viewport`](crates/viewport), [`crates/sketch-ui`](crates/sketch-ui), [`crates/ui-core`](crates/ui-core) | The 3D viewport, the sketch canvas, and the shared theme and widgets. None of these can see the kernel's internals. |
+| **Workbench** | [`apps/workbench`](apps/workbench) | The desktop application. |
+| **Script Studio** | [`apps/script-studio`](apps/script-studio) | The live `.art` visualiser: editor, customizer, console, and the shared viewport, driving the kernel through its API session. |
+| **Test kit** | [`crates/testkit`](crates/testkit), [`apps/cli`](apps/cli) | Deterministic cases, journals, and the conformance runner. |
+
+The dependency rules between these layers are checked by `scripts/check-architecture-boundaries.sh` on every CI run. Design decisions are recorded as ADRs under [`docs/architecture/adr`](docs/architecture/adr), and the kernel programme itself in [`docs/architecture/geometry-kernel`](docs/architecture/geometry-kernel).
 
 ---
 
 ## Roadmap
 
-- [x] **M1–M5: Core Geometry & Primitives** — Analytic B-rep topology, planar profiles, primitive solids, exact calculus.
-- [x] **M6: Booleans & Blends** — Robust faceted boolean tier, toric/spherical fillets, and chamfers.
-- [x] **M7: Assemblies & Parametric Architecture** — Content-addressed part library, joint kinematics, parametric journal.
-- [x] **M7.5: Headless API & Scripting** — JSON-RPC daemon, `.art` DSL, programmatic query engine.
-- [ ] **M8: Advanced Kinematic Construction** — Guide-rail path sweeps, multi-section lofts, draft angles, and surface offsets.
-- [ ] **M9: Direct B-rep Deformations** — Local surface replacement, face twisting, and freeform NURBS trimming.
-- [ ] **M10: Production Interoperability** — Native STEP AP203/AP214/AP242 reader and writer, IGES import, and DXF drawing sheets.
+- [x] Analytic B-rep topology, primitives, planar profiles, exact calculus.
+- [x] Regularized Booleans, chamfers, fillets, and hole-rim blends.
+- [x] Parametric documents, assemblies, part library, joints.
+- [x] The kernel API: Rust, JSON-RPC, `.art` scripts, headless snapshots and export.
+- [x] Multi-document workbench, sketch text, drafted extrusion as the first loft rung.
+- [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces; shell.
+- [x] The ellipse curve, first slice: the mitre seam of a fillet turning a sharp corner, so fillets round square holes and L-shaped rims are exact.
+- [x] Oblique plane sections of cylinders on the same curve, through the analytic Boolean: angled holes, mitred cylinder ends, oblique cuts of round bodies.
+- [ ] Oblique cone sections, and pipe tees (equal cylinders crossing) on the same ellipse.
+- [ ] Native STEP read and write with exact surfaces, IGES import, DXF drawing sheets.
 
 ---
 
 ## Licensing
 
-Artificer is offered under a **dual-licensing model**:
+Artificer is dual-licensed.
 
-- **Open Source (AGPLv3)**: The default public license is the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-or-later`). You are free to use, modify, and redistribute Artificer under open-source copyleft terms.
-- **Commercial / Enterprise Licensing**: For organizations wishing to integrate Artificer, its geometry kernel, or the headless API into proprietary software, cloud platforms, or closed-source commercial applications without copyleft obligations, commercial licenses are available. Contact the maintainers or open an inquiry on GitHub.
+**Open source: AGPL-3.0-or-later.** The kernel and the workbench are free software under the [GNU Affero General Public License, version 3 or later](LICENSE). You may use, study, modify, and redistribute them, including for commercial purposes, provided you honour the licence: derived works and network services built on Artificer must themselves be released under the AGPL, with their source available to their users.
+
+**Commercial licence.** Organisations that want to build proprietary or closed-source products, cloud services, or internal tools on the Artificer Kernel or Workbench without the AGPL's copyleft obligations can obtain a commercial licence. It covers embedding the kernel in your own software, running it as a service, and shipping the workbench under your own terms, with the same code and the same guarantees.
+
+| You are | You need |
+|---|---|
+| An individual, a student, a researcher, or an open-source project | Nothing more: the AGPL applies. |
+| A company whose product or service will itself be released under the AGPL | Nothing more: the AGPL applies. |
+| A company shipping or hosting a proprietary product built on Artificer | A commercial licence. |
+
+To enquire about a commercial licence, open an issue on GitHub titled "Commercial licence enquiry" or contact the maintainers. Contributions to the repository are accepted under the AGPL-3.0-or-later.

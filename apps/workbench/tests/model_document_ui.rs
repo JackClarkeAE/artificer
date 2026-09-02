@@ -421,11 +421,22 @@ fn two_new_body_extrusions_coexist_and_have_independent_browser_visibility() {
         harness.state().displayed_snapshot_id(),
         Some(first_body_snapshot)
     );
+    // Committing never zooms in on the new body; it widens the view only as
+    // far as it must, so both bodies are inside the framed sphere.
     let (document_center, document_radius) = harness.state().view_frame();
-    assert!((document_center.x - 1.5).abs() <= 1.0e-12);
-    assert!(document_center.y.abs() <= 1.0e-12);
-    assert!((document_center.z - 2.0).abs() <= 1.0e-12);
-    assert!((document_radius - 17.25_f64.sqrt()).abs() <= 1.0e-12);
+    for (center, radius) in [
+        ((0.0, 0.0, 2.0), 3.0_f64.hypot(2.0)),
+        ((4.0, 0.0, 2.0), 1.5_f64.hypot(2.0)),
+    ] {
+        let separation = ((document_center.x - center.0).powi(2)
+            + (document_center.y - center.1).powi(2)
+            + (document_center.z - center.2).powi(2))
+        .sqrt();
+        assert!(
+            separation + radius <= document_radius + 1.0e-9,
+            "body at {center:?} r {radius} outside frame {document_center:?} r {document_radius}"
+        );
+    }
     click_button(&mut harness, "Browser");
     assert!(
         harness

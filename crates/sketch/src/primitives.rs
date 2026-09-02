@@ -251,6 +251,57 @@ pub fn evaluate_recipe(
                 )?;
             }
         }
+        SketchRecipe::Text {
+            anchor,
+            content,
+            height,
+            angle,
+        } => {
+            let anchor = builder.bind_input(*anchor, PointOutputRole::Start)?;
+            let origin = builder.position(anchor)?;
+            let height = resolve_length(*height, inputs)?;
+            let angle = resolve_angle(*angle, inputs)?;
+            let outlines = crate::text::text_outlines(content, height)
+                .map_err(|error| SketchValidationError::TextUnavailable { reason: error })?;
+            let segment_count = outlines
+                .loops
+                .iter()
+                .map(|outline| outline.points.len())
+                .sum::<usize>();
+            if segment_count > MAX_CURVE_EDITS_PER_TRANSACTION {
+                return Err(SketchValidationError::ResourceLimit {
+                    resource: "curve_edits",
+                    requested: segment_count,
+                    limit: MAX_CURVE_EDITS_PER_TRANSACTION,
+                });
+            }
+            let (sin, cos) = angle.sin_cos();
+            let mut next_index = 0_usize;
+            for outline in &outlines.loops {
+                let mut bindings = Vec::with_capacity(outline.points.len());
+                for point in &outline.points {
+                    let placed = SketchPoint2::new(
+                        origin.u + point.u * cos - point.v * sin,
+                        origin.v + point.u * sin + point.v * cos,
+                    );
+                    bindings.push(builder.add_derived_point(
+                        PointOutputRole::Vertex(index_u16(next_index)?),
+                        placed,
+                    )?);
+                    next_index += 1;
+                }
+                let first_segment = next_index - bindings.len();
+                for (offset, binding) in bindings.iter().enumerate() {
+                    let end = bindings[(offset + 1) % bindings.len()];
+                    builder.add_line(
+                        CurveOutputRole::Segment(index_u16(first_segment + offset)?),
+                        entity_role,
+                        *binding,
+                        end,
+                    )?;
+                }
+            }
+        }
         SketchRecipe::TwoPointRectangle {
             first_corner,
             width,

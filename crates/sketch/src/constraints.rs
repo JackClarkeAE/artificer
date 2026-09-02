@@ -63,6 +63,22 @@ pub enum SketchConstraintKind {
         second: SketchPointId,
         third: SketchPointId,
     },
+    /// The line through `start` and `end` touches the circle about `center`
+    /// of the given radius. The radius is a literal because a circle's is.
+    LineTangentToCircle {
+        start: SketchPointId,
+        end: SketchPointId,
+        center: SketchPointId,
+        radius: f64,
+    },
+    /// The line through `start` and `end` touches the circle about `center`
+    /// that passes through `rim`, which is how an arc carries its radius.
+    LineTangentToArc {
+        start: SketchPointId,
+        end: SketchPointId,
+        center: SketchPointId,
+        rim: SketchPointId,
+    },
 }
 
 impl SketchConstraintKind {
@@ -79,6 +95,15 @@ impl SketchConstraintKind {
                 second,
                 third,
             } => vec![first, second, third],
+            Self::LineTangentToCircle {
+                start, end, center, ..
+            } => vec![start, end, center],
+            Self::LineTangentToArc {
+                start,
+                end,
+                center,
+                rim,
+            } => vec![start, end, center, rim],
             Self::Parallel {
                 first_start,
                 first_end,
@@ -119,7 +144,9 @@ impl SketchConstraintKind {
             | Self::Perpendicular { .. }
             | Self::EqualLength { .. }
             | Self::Tangent { .. }
-            | Self::Collinear { .. } => 1,
+            | Self::Collinear { .. }
+            | Self::LineTangentToCircle { .. }
+            | Self::LineTangentToArc { .. } => 1,
         }
     }
 }
@@ -200,6 +227,12 @@ pub(crate) fn validate_constraint(kind: &SketchConstraintKind) -> Result<(), Con
             Err(ConstraintError::NonFiniteValue)
         }
         SketchConstraintKind::Distance { distance, .. } if *distance <= 0.0 => {
+            Err(ConstraintError::NonPositiveDistance)
+        }
+        SketchConstraintKind::LineTangentToCircle { radius, .. } if !radius.is_finite() => {
+            Err(ConstraintError::NonFiniteValue)
+        }
+        SketchConstraintKind::LineTangentToCircle { radius, .. } if *radius <= 0.0 => {
             Err(ConstraintError::NonPositiveDistance)
         }
         _ => Ok(()),
@@ -528,11 +561,90 @@ fn project(
             let b = point(positions, second);
             let ac = c - a;
             let len_sq = ac.length_squared();
+            // The point goes to the infinite line, not the span between the
+            // other two: collinear lines lie end to end, not on top of each
+            // other, and clamping used to drag the second line onto the
+            // first.
             if len_sq > 1.0e-14 && !pinned.contains_key(&second) {
-                let t = ((b - a).dot(ac) / len_sq).clamp(0.0, 1.0);
+                let t = (b - a).dot(ac) / len_sq;
                 positions.insert(second, a + ac * t);
             }
         }
+        SketchConstraintKind::LineTangentToCircle {
+            start,
+            end,
+            center,
+            radius,
+        } => project_line_tangent(positions, pinned, start, end, center, radius),
+        SketchConstraintKind::LineTangentToArc {
+            start,
+            end,
+            center,
+            rim,
+        } => {
+            let radius = point(positions, center).distance(point(positions, rim));
+            project_line_tangent(positions, pinned, start, end, center, radius);
+        }
+    }
+}
+
+/// The signed distance from `center` to the line through `a` and `b`, and
+/// the unit normal it is measured along.
+fn line_offset(
+    a: SketchPoint2,
+    b: SketchPoint2,
+    center: SketchPoint2,
+) -> Option<(f64, (f64, f64))> {
+    let direction = b - a;
+    let length = direction.length();
+    if length <= 1.0e-14 {
+        return None;
+    }
+    let normal = (-direction.v / length, direction.u / length);
+    let offset = (center - a).u * normal.0 + (center - a).v * normal.1;
+    Some((offset, normal))
+}
+
+/// Slides the line, or failing that the centre, along the line's normal
+/// until the centre sits one radius away from it. The circle stays on the
+/// side it is already on, so a line tangent to a circle never flips through
+/// it to the other side.
+fn project_line_tangent(
+    positions: &mut BTreeMap<SketchPointId, SketchPoint2>,
+    pinned: &BTreeMap<SketchPointId, SketchPoint2>,
+    start: SketchPointId,
+    end: SketchPointId,
+    center: SketchPointId,
+    radius: f64,
+) {
+    let a = point(positions, start);
+    let b = point(positions, end);
+    let c = point(positions, center);
+    let Some((offset, normal)) = line_offset(a, b, c) else {
+        return;
+    };
+    let target = if offset < 0.0 { -radius } else { radius };
+    let delta = target - offset;
+    let line_movable = movable(pinned, start) || movable(pinned, end);
+    let center_movable = movable(pinned, center);
+    let (line_share, center_share) = match (line_movable, center_movable) {
+        (true, true) => (0.5, 0.5),
+        (true, false) => (1.0, 0.0),
+        (false, true) => (0.0, 1.0),
+        (false, false) => return,
+    };
+    // Moving the line away from the centre by `delta` lowers the offset.
+    let shift = |p: SketchPoint2, amount: f64| {
+        SketchPoint2::new(p.u + normal.0 * amount, p.v + normal.1 * amount)
+    };
+    if movable(pinned, start) {
+        positions.insert(start, shift(a, -delta * line_share));
+    }
+    if movable(pinned, end) {
+        positions.insert(end, shift(b, -delta * line_share));
+    }
+    if center_movable {
+        positions.insert(center, shift(c, delta * center_share));
     }
 }
 
@@ -605,6 +717,31 @@ fn residual(positions: &BTreeMap<SketchPointId, SketchPoint2>, kind: &SketchCons
             let ab = b - a;
             let ac = c - a;
             ab.cross(ac).abs() / (ac.length()).max(1.0e-14)
+        }
+        SketchConstraintKind::LineTangentToCircle {
+            start,
+            end,
+            center,
+            radius,
+        } => line_offset(
+            point(positions, start),
+            point(positions, end),
+            point(positions, center),
+        )
+        .map_or(radius, |(offset, _)| (offset.abs() - radius).abs()),
+        SketchConstraintKind::LineTangentToArc {
+            start,
+            end,
+            center,
+            rim,
+        } => {
+            let radius = point(positions, center).distance(point(positions, rim));
+            line_offset(
+                point(positions, start),
+                point(positions, end),
+                point(positions, center),
+            )
+            .map_or(radius, |(offset, _)| (offset.abs() - radius).abs())
         }
     }
 }
@@ -684,6 +821,79 @@ mod tests {
         assert!((first.v - second.v).abs() < 1.0e-9);
         assert!((first.distance(second) - 5.0).abs() < 1.0e-9);
         assert!(definition.validate(PrecisionPolicy::default()).is_ok());
+    }
+
+    #[test]
+    fn a_line_slides_until_it_touches_the_circle_it_is_made_tangent_to() {
+        let mut definition = rectangle();
+        let ids = definition
+            .active_points()
+            .map(|point| point.id)
+            .collect::<Vec<_>>();
+        // The rectangle's first side runs along v = 0; a circle of radius 2
+        // centred a little above it, at the fixed origin, wants that side
+        // two units away.
+        definition
+            .add_constraint(
+                SketchConstraintKind::Fixed {
+                    point: ids[0],
+                    position: SketchPoint2::new(0.0, 0.0),
+                },
+                PrecisionPolicy::default(),
+            )
+            .expect("fix the corner");
+        let others = ids
+            .iter()
+            .copied()
+            .filter(|id| *id != ids[0])
+            .collect::<Vec<_>>();
+        definition
+            .add_constraint(
+                SketchConstraintKind::LineTangentToCircle {
+                    start: others[0],
+                    end: others[1],
+                    center: ids[0],
+                    radius: 2.0,
+                },
+                PrecisionPolicy::default(),
+            )
+            .expect("tangent line");
+        let solution = definition
+            .solve_constraints(PrecisionPolicy::default())
+            .expect("solve");
+        let a = solution.positions[&others[0]];
+        let b = solution.positions[&others[1]];
+        let c = solution.positions[&ids[0]];
+        let (offset, _) = line_offset(a, b, c).expect("the side keeps its length");
+        assert!((offset.abs() - 2.0).abs() < 1.0e-9, "offset {offset}");
+        assert!(solution.maximum_residual <= 1.0e-9);
+    }
+
+    #[test]
+    fn collinear_moves_a_point_onto_the_infinite_line_not_the_span() {
+        let mut positions = BTreeMap::new();
+        let ids = (1..=3)
+            .map(|index| SketchPointId::new(index).expect("id"))
+            .collect::<Vec<_>>();
+        positions.insert(ids[0], SketchPoint2::new(0.0, 0.0));
+        positions.insert(ids[1], SketchPoint2::new(1.0, 0.0));
+        positions.insert(ids[2], SketchPoint2::new(5.0, 1.0));
+        let record = SketchConstraintRecord {
+            id: SketchConstraintId::new(1).expect("id"),
+            kind: SketchConstraintKind::Collinear {
+                first: ids[0],
+                second: ids[2],
+                third: ids[1],
+            },
+            enabled: true,
+        };
+        let solved = solve(&positions, [record].into_iter(), 1.0e-9).expect("solve");
+        let moved = solved.positions[&ids[2]];
+        assert!((moved.v).abs() < 1.0e-9);
+        assert!(
+            (moved.u - 5.0).abs() < 1.0e-9,
+            "the point stays beyond the span: {moved:?}"
+        );
     }
 
     #[test]

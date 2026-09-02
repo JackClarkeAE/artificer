@@ -15,6 +15,7 @@ mod command_icons;
 pub mod commands;
 mod development_log;
 pub mod document_replay;
+pub mod documents;
 mod export;
 pub mod feature_editor;
 pub mod library_catalog;
@@ -94,9 +95,9 @@ use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
     DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
     SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
-    SketchContextFitKey, SketchContextTriangle, SketchCurveDirection, SketchDimensionKind,
-    SketchEditError, SketchEntity, SketchEntityId, SketchGeometry, SketchPlane, SketchPoint,
-    SketchView, SketchViewportContext,
+    SketchContextFitKey, SketchContextLayer, SketchContextTriangle, SketchCurveDirection,
+    SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId, SketchGeometry,
+    SketchPlane, SketchPoint, SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
@@ -192,7 +193,7 @@ pub struct DocumentSettings {
     pub length_unit: DisplayLengthUnit,
     /// Retained so older workspace files keep parsing and older builds keep
     /// reading newer files; the navigation profile itself is a user
-    /// preference now (see [`UserPreferencesFile`]), not document state.
+    /// preference now (see `UserPreferencesFile`), not document state.
     #[serde(default, with = "legacy_navigation")]
     pub navigation: navigation::NavigationPreset,
 }
@@ -475,6 +476,7 @@ enum PendingOperation {
         cancel_mode: WorkbenchMode,
         finish_sketch_on_commit: bool,
         distance: f64,
+        draft_degrees: f64,
         frame: PlanarFrame3,
         target_face: Option<EntityRef>,
         support_digest: Option<SemanticDigest>,
@@ -495,6 +497,7 @@ struct AsyncFeaturePreviewIntent {
     profile: PlanarProfile2,
     target_face: Option<EntityRef>,
     distance: f64,
+    draft_degrees: f64,
     mode: ExtrusionMode,
 }
 
@@ -1761,24 +1764,69 @@ struct PendingFaceSketch {
 }
 
 impl FaceSketchDisplayContext {
-    fn update_filtered_geometry(&mut self, enabled: bool, max_depth: f64) {
-        if !enabled {
-            self.triangles.clear();
-            self.edges.clear();
-        } else {
-            self.triangles = self
+    /// Selects what the sketch canvas shows behind the sketch.
+    ///
+    /// The body on and above the sketch surface is always shown — that is
+    /// what the user is drawing on. `project_below` additionally reveals the
+    /// geometry hidden under the surface, down to `max_depth`, as an x-ray
+    /// layer: deeper faces are darker, so a pocket floor and a bore wall read
+    /// at different depths at a glance.
+    fn update_filtered_geometry(&mut self, project_below: bool, max_depth: f64) {
+        // Depth is signed along the outward face normal: zero on the face,
+        // positive for material raised from it, negative below it.
+        const SURFACE_TOLERANCE: f64 = 1.0e-4;
+        let depth_shade = |depth: f64| -> f32 {
+            if max_depth <= SURFACE_TOLERANCE {
+                return 0.0;
+            }
+            (1.0 - 0.7 * (-depth / max_depth).clamp(0.0, 1.0)) as f32
+        };
+        let mut triangles = Vec::new();
+        let mut edges = Vec::new();
+        if project_below {
+            let mut below = self
                 .raw_triangles
                 .iter()
-                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
-                .map(|(_, tri)| *tri)
-                .collect();
-            self.edges = self
-                .raw_edges
-                .iter()
-                .filter(|(depth, _)| *depth <= max_depth + 1e-4)
-                .map(|(_, edge)| *edge)
-                .collect();
+                .filter(|(depth, _)| {
+                    *depth < -SURFACE_TOLERANCE && *depth >= -max_depth - SURFACE_TOLERANCE
+                })
+                .map(|(depth, triangle)| {
+                    (
+                        *depth,
+                        triangle
+                            .with_layer(SketchContextLayer::Below)
+                            .with_shade(triangle.shade * depth_shade(*depth)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            // Painter order: deepest first.
+            below.sort_by(|left, right| left.0.total_cmp(&right.0));
+            triangles.extend(below.into_iter().map(|(_, triangle)| triangle));
+            edges.extend(
+                self.raw_edges
+                    .iter()
+                    .filter(|(depth, _)| {
+                        *depth < -SURFACE_TOLERANCE && *depth >= -max_depth - SURFACE_TOLERANCE
+                    })
+                    .map(|(_, edge)| edge.with_layer(SketchContextLayer::Below)),
+            );
         }
+        let mut body = self
+            .raw_triangles
+            .iter()
+            .filter(|(depth, _)| *depth >= -SURFACE_TOLERANCE)
+            .map(|(depth, triangle)| (*depth, triangle.with_layer(SketchContextLayer::Body)))
+            .collect::<Vec<_>>();
+        body.sort_by(|left, right| left.0.total_cmp(&right.0));
+        triangles.extend(body.into_iter().map(|(_, triangle)| triangle));
+        edges.extend(
+            self.raw_edges
+                .iter()
+                .filter(|(depth, _)| *depth >= -SURFACE_TOLERANCE)
+                .map(|(_, edge)| edge.with_layer(SketchContextLayer::Body)),
+        );
+        self.triangles = triangles;
+        self.edges = edges;
     }
 
     fn viewport_context(&self) -> SketchViewportContext<'_> {
@@ -1805,6 +1853,12 @@ pub struct KernelLabApp {
     document: ModelDocument,
     document_path: PathBuf,
     document_path_text: String,
+    /// The name the document tab and header show: "Document 1" until the
+    /// shell names it otherwise.
+    document_title: String,
+    /// Requests this document makes of the shell that hosts it (a new tab,
+    /// closing its own), drained by the shell every frame.
+    shell_requests: Vec<documents::ShellRequest>,
     document_settings: DocumentSettings,
     construction_planes: Vec<ConstructionPlane>,
     next_construction_plane_id: u64,
@@ -1910,6 +1964,8 @@ pub struct KernelLabApp {
     sketch_last_error: Option<SketchEditError>,
     sketch_finish_issue: Option<CertifiedProfileStatus>,
     extrusion_distance: f64,
+    /// Draft angle for a new-body extrusion, in degrees; zero is straight.
+    extrusion_draft_degrees: f64,
     extrusion_mode: ExtrusionMode,
     /// When false, signed face distance retains the convenient Add/Cut
     /// inference. Clicking an operation in Properties turns this on so the
@@ -1953,6 +2009,8 @@ pub struct KernelLabApp {
     camera_before_plane_sketch: Option<ViewState>,
     /// Show the origin planes even once a sketch has retired them.
     show_origin_planes: bool,
+    /// The view-only cut through the model, for looking inside it.
+    section_analysis: SectionAnalysis,
     /// A plane sketch waiting for its camera flight to land. Opening the 2D
     /// canvas immediately would replace the very viewport the animation
     /// plays in, which reads as a snap even though the camera is flying.
@@ -2005,6 +2063,8 @@ impl Default for KernelLabApp {
             document: ModelDocument::default(),
             document_path,
             document_path_text,
+            document_title: "Document 1".to_owned(),
+            shell_requests: Vec::new(),
             document_settings: DocumentSettings::default(),
             construction_planes: Vec::new(),
             next_construction_plane_id: 1,
@@ -2070,7 +2130,7 @@ impl Default for KernelLabApp {
             selected_origin_plane: SketchPlane::XY,
             sketch_support: SketchSupport::default(),
             face_sketch_context: None,
-            project_3d_body_context: true,
+            project_3d_body_context: false,
             project_3d_body_depth: 50.0,
             sketches: Vec::new(),
             active_sketch_index: None,
@@ -2082,6 +2142,7 @@ impl Default for KernelLabApp {
             sketch_last_error: None,
             sketch_finish_issue: None,
             extrusion_distance: 4.0,
+            extrusion_draft_degrees: 0.0,
             extrusion_mode: ExtrusionMode::NewBody,
             extrusion_mode_explicit: false,
             extruded_sketch_revision: None,
@@ -2112,6 +2173,7 @@ impl Default for KernelLabApp {
             model_inspector_open: false,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
+            section_analysis: SectionAnalysis::default(),
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
             model_context_menu: None,
@@ -2135,21 +2197,7 @@ impl KernelLabApp {
     #[must_use]
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_style(&creation_context.egui_ctx);
-        let mut app = Self {
-            animate_face_camera_transitions: true,
-            feature_preview_scheduler: Some(JobScheduler::new(2)),
-            ..Self::default()
-        };
-        app.reset_to_blank_workspace();
-        app.theme_preferences_path = Some(theme_preferences_path());
-        app.load_theme_preferences(&creation_context.egui_ctx);
-        app.user_preferences_path = Some(user_preferences_path());
-        app.load_user_preferences();
-        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
-            app.document_status = Some(format!(
-                "Local Part Library is using its verified built-in fallback: {error}"
-            ));
-        }
+        let mut app = Self::new_document(&creation_context.egui_ctx);
         match DevelopmentRecorder::start_default() {
             Ok(recorder) => {
                 eprintln!(
@@ -2161,6 +2209,30 @@ impl KernelLabApp {
             Err(error) => {
                 eprintln!("Artificer could not start its local development log: {error}");
             }
+        }
+        app
+    }
+
+    /// A further document for the running application: a blank workspace
+    /// with the user's theme and preferences and its own Part Library
+    /// handle, but no development log of its own and no style installation,
+    /// both of which belong to the process rather than to a document.
+    #[must_use]
+    pub fn new_document(egui_ctx: &egui::Context) -> Self {
+        let mut app = Self {
+            animate_face_camera_transitions: true,
+            feature_preview_scheduler: Some(JobScheduler::new(2)),
+            ..Self::default()
+        };
+        app.reset_to_blank_workspace();
+        app.theme_preferences_path = Some(theme_preferences_path());
+        app.load_theme_preferences(egui_ctx);
+        app.user_preferences_path = Some(user_preferences_path());
+        app.load_user_preferences();
+        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
+            app.document_status = Some(format!(
+                "Local Part Library is using its verified built-in fallback: {error}"
+            ));
         }
         app
     }
@@ -2386,6 +2458,28 @@ impl KernelLabApp {
 
     pub fn native_document_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&self.document).map_err(|error| error.to_string())
+    }
+
+    /// The name shown on this document's tab and in its header.
+    #[must_use]
+    pub fn document_title(&self) -> &str {
+        &self.document_title
+    }
+
+    pub fn set_document_title(&mut self, title: impl Into<String>) {
+        self.document_title = title.into();
+    }
+
+    /// Asks the hosting shell for something a single document cannot do
+    /// for itself. Without a shell the request is simply dropped when
+    /// nobody drains it.
+    pub fn request_from_shell(&mut self, request: documents::ShellRequest) {
+        self.shell_requests.push(request);
+    }
+
+    /// Drains the requests made since the last frame.
+    pub fn take_shell_requests(&mut self) -> Vec<documents::ShellRequest> {
+        std::mem::take(&mut self.shell_requests)
     }
 
     #[must_use]
@@ -2961,6 +3055,22 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_pending_entity_count(&self) -> usize {
         self.sketch.pending_entity_count()
+    }
+
+    /// The label of the sketch edit awaiting confirmation, if there is one.
+    #[must_use]
+    pub fn sketch_pending_label(&self) -> Option<&'static str> {
+        self.sketch.pending().map(|pending| pending.label())
+    }
+
+    /// Every committed sketch entity's presented geometry, in canvas order.
+    #[must_use]
+    pub fn sketch_entity_geometries(&self) -> Vec<SketchGeometry> {
+        self.sketch
+            .entities()
+            .iter()
+            .map(|entity| entity.geometry)
+            .collect()
     }
 
     /// The single line of prose the sketch canvas is showing for the active
@@ -5518,6 +5628,7 @@ impl KernelLabApp {
                 "Plane preview",
             ));
         }
+        planes.extend(self.section_plane_overlay());
         // A genuinely blank document still presents its three usable origin
         // planes instead of replacing them with an arbitrary starter solid.
         if self.origin_reference_planes_visible() {
@@ -5871,6 +5982,27 @@ impl KernelLabApp {
                 ReplayAction::SketchRegionExtrusion(
                     SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
                         .map_err(|error| format!("invalid sketch-region extrusion: {error}"))?,
+                )
+            }
+            KernelCommand::LoftPlanarProfileOffset {
+                profile,
+                distance,
+                offset,
+                ..
+            } => {
+                let profile = as_drawn(profile, None);
+                let selected_regions = authoring_region_signatures_for_profile(authoring, &profile)
+                    .ok_or_else(|| {
+                        "the drafted extrusion profile has no stable sketch-region selection"
+                            .to_owned()
+                    })?;
+                let draft_degrees = (offset / distance).atan().to_degrees();
+                ReplayAction::SketchRegionExtrusion(
+                    SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
+                        .and_then(|recipe| recipe.with_draft(draft_degrees))
+                        .map_err(|error| {
+                            format!("invalid drafted sketch-region extrusion: {error}")
+                        })?,
                 )
             }
             KernelCommand::ExtrudeFaceProfile {
@@ -6340,7 +6472,7 @@ impl KernelLabApp {
             .bodies
             .last()
             .and_then(|body| self.committed_world_pivot_for_body(body));
-        self.frame_visible_document();
+        self.reveal_visible_document();
         self.feature_preview.append(FeaturePreviewKind::Component);
         self.last_attempt = Attempt::Accepted {
             operation: "Library component committed",
@@ -7484,6 +7616,11 @@ impl KernelLabApp {
             cancel_mode,
             finish_sketch_on_commit,
             distance: self.extrusion_distance,
+            draft_degrees: if target_face.is_none() {
+                self.extrusion_draft_degrees
+            } else {
+                0.0
+            },
             frame: self.sketch_support.frame(),
             target_face,
             support_digest: self.sketch_support.support_digest(),
@@ -7537,11 +7674,17 @@ impl KernelLabApp {
         match self.pending_operation.as_mut() {
             Some(PendingOperation::ExtrudeSketch {
                 distance,
+                draft_degrees,
                 mode,
                 target_face,
                 ..
             }) => {
                 *distance = self.extrusion_distance;
+                *draft_degrees = if target_face.is_none() {
+                    self.extrusion_draft_degrees
+                } else {
+                    0.0
+                };
                 *mode = if target_face.is_some() {
                     self.extrusion_mode
                 } else {
@@ -7594,6 +7737,7 @@ impl KernelLabApp {
             frame,
             target_face,
             distance,
+            draft_degrees,
             mode,
             ..
         } = self.pending_operation?
@@ -7605,6 +7749,7 @@ impl KernelLabApp {
             self.sketch_planar_profile_payload()?,
             target_face,
             distance,
+            draft_degrees,
             mode,
         )
     }
@@ -7673,6 +7818,7 @@ impl KernelLabApp {
             frame,
             target_face,
             distance,
+            draft_degrees,
             mode,
             ..
         }) = self.pending_operation
@@ -7695,6 +7841,7 @@ impl KernelLabApp {
             profile,
             target_face,
             distance,
+            draft_degrees,
             mode,
         };
 
@@ -8402,6 +8549,7 @@ impl KernelLabApp {
             cancel_mode: _,
             finish_sketch_on_commit,
             distance,
+            draft_degrees,
             frame,
             target_face,
             support_digest,
@@ -8539,9 +8687,14 @@ impl KernelLabApp {
                 .expect("a face-supported extrusion has a displayed body"),
             None => &empty_input,
         };
-        let Some(command) =
-            build_planar_profile_extrusion_command(frame, profile, target_face, distance, mode)
-        else {
+        let Some(command) = build_planar_profile_extrusion_command(
+            frame,
+            profile,
+            target_face,
+            distance,
+            draft_degrees,
+            mode,
+        ) else {
             self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                 KernelErrorCode::InvalidInput,
                 base_snapshot,
@@ -8707,7 +8860,7 @@ impl KernelLabApp {
                     ExtrusionMode::Add | ExtrusionMode::Cut => self.sync_active_body_record(),
                 }
                 if mode == ExtrusionMode::NewBody {
-                    self.frame_visible_document();
+                    self.reveal_visible_document();
                 }
                 let active_body = self.active_body_id();
                 if let Some(index) = self.active_sketch_index
@@ -10138,12 +10291,91 @@ impl KernelLabApp {
         context.request_repaint();
     }
 
+    /// Hands the section plane to the camera state the renderer reads.
+    fn sync_section_plane(&mut self) {
+        self.view.section_cut_plane = self.section_analysis.cut_plane();
+    }
+
+    /// The section plane as the user has set it.
+    #[must_use]
+    pub const fn section_analysis(&self) -> SectionAnalysis {
+        self.section_analysis
+    }
+
+    /// Sets the section plane, as the ribbon's panel does.
+    pub fn set_section_analysis(&mut self, section: SectionAnalysis) {
+        self.section_analysis = section;
+        self.sync_section_plane();
+    }
+
+    /// The card that shows where the section plane lies: the plane, sized
+    /// to what it cuts through, labelled so it is not mistaken for a datum.
+    fn section_plane_overlay(&self) -> Option<viewport::ModelSketchOverlay> {
+        if !self.section_analysis.active {
+            return None;
+        }
+        let frame = self.section_analysis.frame();
+        // Sized to the bodies it cuts; the datum planes are only a fallback
+        // for a document with nothing solid in it yet.
+        let bounds = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .filter_map(|body| self.committed_world_bounds_for_body(body))
+            .reduce(union_aabb)
+            .or_else(|| self.visible_document_bounds())
+            .unwrap_or_else(|| {
+                Aabb3::new(
+                    Point3::new(-25.0, -25.0, -25.0),
+                    Point3::new(25.0, 25.0, 25.0),
+                )
+            });
+        let extent = |axis: Vector3| {
+            let span = |min: f64, max: f64, component: f64| {
+                let a = (min - 0.0) * component;
+                let b = (max - 0.0) * component;
+                a.abs().max(b.abs())
+            };
+            (span(bounds.min.x, bounds.max.x, axis.x)
+                + span(bounds.min.y, bounds.max.y, axis.y)
+                + span(bounds.min.z, bounds.max.z, axis.z))
+            .max(5.0)
+                * 1.1
+        };
+        Some(reference_plane_overlay(
+            frame,
+            extent(frame.u),
+            extent(frame.v),
+            true,
+            None,
+            "Section",
+        ))
+    }
+
     fn reset_view(&mut self, context: &egui::Context) {
         self.view.reset_orientation();
         context.request_repaint();
     }
 
     fn frame_visible_document(&mut self) {
+        if let Some(bounds) = self.visible_document_bounds() {
+            self.view.frame(bounds);
+        }
+    }
+
+    /// Brings the document into view without moving the camera closer.
+    ///
+    /// Committing a feature used to reframe the camera on the result, which
+    /// zoomed in on the new body and left the user zooming straight back
+    /// out. The view they had is kept, and grows only if the new geometry
+    /// falls outside it.
+    fn reveal_visible_document(&mut self) {
+        if let Some(bounds) = self.visible_document_bounds() {
+            self.view.widen_to_include(bounds);
+        }
+    }
+
+    fn visible_document_bounds(&self) -> Option<Aabb3> {
         let active = self.active_body_id();
         let bounds = self
             .bodies
@@ -10165,12 +10397,9 @@ impl KernelLabApp {
         // 50 mm datum against the old one-unit camera radius. With the planes
         // retired and no solid yet, a committed sketch is what there is to
         // frame.
-        let bounds = bounds
+        bounds
             .or_else(|| self.visible_reference_plane_bounds())
-            .or_else(|| viewport::sketch_overlay_bounds(&self.visible_sketch_overlays()));
-        if let Some(bounds) = bounds {
-            self.view.frame(bounds);
-        }
+            .or_else(|| viewport::sketch_overlay_bounds(&self.visible_sketch_overlays()))
     }
 
     fn frame_visible_body(&mut self, context: &egui::Context) {
@@ -10481,6 +10710,19 @@ impl KernelLabApp {
         let response = ui
             .menu_button("File", |ui| {
                 ui.set_min_width(190.0);
+                // A new document opens in its own tab beside this one; the
+                // shell that hosts the tabs answers the request.
+                let new_document = ui
+                    .button("New document")
+                    .on_hover_text("Open a blank document in a new tab");
+                new_document.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New document")
+                });
+                if new_document.clicked() {
+                    self.request_from_shell(documents::ShellRequest::NewDocument);
+                    ui.close();
+                }
+                ui.separator();
                 let path = self.document_path.clone();
                 let save = ui
                     .add_enabled(!operation_pending, egui::Button::new("Save"))
@@ -10581,7 +10823,7 @@ impl KernelLabApp {
             ui.separator();
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Document 1")
+                RichText::new(self.document_title.clone())
                     .font(FontId::proportional(14.0))
                     .color(theme::text())
                     .strong(),
@@ -11643,6 +11885,8 @@ impl KernelLabApp {
                                 "context_selected_boundary",
                                 &mut sketch.context_selected_boundary,
                             ),
+                            ("context_below_face", &mut sketch.context_below_face),
+                            ("context_below_edge", &mut sketch.context_below_edge),
                         ],
                     );
                     section(
@@ -12453,9 +12697,10 @@ impl KernelLabApp {
                     let unit = match input.kind {
                         ToolInputKind::Length | ToolInputKind::SignedLength => "mm",
                         ToolInputKind::Angle => "°",
-                        ToolInputKind::Integer | ToolInputKind::Choice | ToolInputKind::Boolean => {
-                            ""
-                        }
+                        ToolInputKind::Integer
+                        | ToolInputKind::Choice
+                        | ToolInputKind::Boolean
+                        | ToolInputKind::Text => "",
                     };
                     if !unit.is_empty() {
                         ui.label(RichText::new(unit).small().color(theme::muted()));
@@ -13821,6 +14066,23 @@ impl KernelLabApp {
                         .suffix(" mm"),
                 )
                 .changed();
+            if !face_supported {
+                // Draft is a new-body option: the walls lean by this angle,
+                // built as an exact loft to the profile's offset section.
+                intent_changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut self.extrusion_draft_degrees)
+                            .speed(0.25)
+                            .range(-60.0..=60.0)
+                            .max_decimals(2)
+                            .prefix("Draft ")
+                            .suffix("°"),
+                    )
+                    .on_hover_text(
+                        "Draft angle. Positive leans the walls outward, negative inward. Straight edges become planes and tangent arcs become cones; an arc meeting a corner cannot draft.",
+                    )
+                    .changed();
+            }
             // The same field, written as arithmetic over document variables:
             // `depth`, `plate_width / 2`. Evaluated on Enter into the drag
             // value above, so what commits is always a plain number.
@@ -17250,6 +17512,7 @@ fn build_async_feature_preview(
         intent.profile.clone(),
         intent.target_face,
         intent.distance,
+        intent.draft_degrees,
         intent.mode,
     )?;
     let precision = input.precision_policy().unwrap_or_default();
@@ -18041,6 +18304,7 @@ fn build_planar_profile_extrusion_command(
     profile: PlanarProfile2,
     target_face: Option<EntityRef>,
     distance: f64,
+    draft_degrees: f64,
     mode: ExtrusionMode,
 ) -> Option<KernelCommand> {
     let operation = mode.feature_operation();
@@ -18063,6 +18327,16 @@ fn build_planar_profile_extrusion_command(
             distance,
             operation,
         }),
+        // A drafted new body is a loft to the profile's offset section: the
+        // same command replay issues from the sketch-region recipe.
+        (None, None) if draft_degrees != 0.0 && draft_degrees.is_finite() => {
+            Some(KernelCommand::LoftPlanarProfileOffset {
+                frame,
+                profile,
+                distance,
+                offset: distance * draft_degrees.to_radians().tan(),
+            })
+        }
         (None, None) => Some(KernelCommand::ExtrudePlanarProfile {
             frame,
             profile,
@@ -18675,6 +18949,29 @@ fn project_face_sketch_context(
     support: &PlanarFaceSupport,
 ) -> Option<FaceSketchDisplayContext> {
     let projection = FaceSketchProjection::from_frame(support.frame)?;
+    // The sketch looks at its face from outside the body. The frame's `u × v`
+    // is the face's own normal, but nothing above guarantees it points out of
+    // the material, so let the face's tessellation say: its triangles wind
+    // with the outward normal, and if they project clockwise here, the frame
+    // looks into the body and every depth flips sign.
+    let mut face_winding = 0.0_f64;
+    for triangle in scene
+        .triangles
+        .iter()
+        .filter(|triangle| triangle.source_face == support.face)
+    {
+        let Some(projected) = triangle
+            .vertices
+            .map(|point| projection.project(point))
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let vertices = [projected[0].0, projected[1].0, projected[2].0];
+        face_winding += sketch_triangle_signed_area(vertices);
+    }
+    let outward = if face_winding < 0.0 { -1.0 } else { 1.0 };
     let projected_triangles = scene
         .triangles
         .iter()
@@ -18690,32 +18987,51 @@ fn project_face_sketch_context(
                 .collect::<Vec<_>>()
                 .try_into()
                 .ok()?;
-            let signed_area = sketch_triangle_signed_area(vertices);
+            let signed_area = sketch_triangle_signed_area(vertices) * outward;
             if !signed_area.is_finite() || signed_area <= 0.0 {
                 return None;
             }
-            let depth = projected.iter().map(|(_, depth)| depth).sum::<f64>() / 3.0;
             let vertex_depths: [f64; 3] = projected
                 .iter()
                 .map(|(_, depth)| *depth)
                 .collect::<Vec<_>>()
                 .try_into()
                 .ok()?;
-            Some((depth, vertex_depths, SketchContextTriangle::new(vertices)))
+            let depth = vertex_depths.iter().sum::<f64>() / 3.0 * outward;
+            // Shade from the true 3D attitude of the facet: a face parallel
+            // to the sketch plane is brightest, one sloping away is darker.
+            // Walls at right angles have no projected area and never arrive.
+            let [a, b, c] = triangle.vertices;
+            let facet_normal = normalized_vector(cross_vector(
+                Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+            ));
+            let attitude = facet_normal
+                .map(|normal| dot_vector(normal, projection.normal).abs())
+                .unwrap_or(1.0);
+            let shade = (0.55 + 0.45 * attitude) as f32;
+            Some((
+                depth,
+                vertex_depths,
+                SketchContextTriangle::new(vertices).with_shade(shade),
+            ))
         })
         .collect::<Vec<_>>();
     let raw_triangles: Vec<(f64, SketchContextTriangle)> = projected_triangles
         .iter()
-        .map(|(depth, _, triangle)| (depth.abs(), *triangle))
+        .map(|(depth, _, triangle)| (*depth, *triangle))
         .collect();
 
+    // Creases only: a bore's facet seams and a fillet's tangent rails are not
+    // lines the user should see through the face.
     let raw_edges: Vec<(f64, SketchContextEdge)> = scene
         .edges
         .iter()
+        .filter(|edge| !edge.is_smooth && !edge.is_tangent)
         .filter_map(|edge| {
             let endpoints = edge.endpoints.map(|point| projection.project(point));
             let endpoints = [endpoints[0]?, endpoints[1]?];
-            let edge_depth = (endpoints[0].1.abs() + endpoints[1].1.abs()) * 0.5;
+            let edge_depth = (endpoints[0].1 + endpoints[1].1) * 0.5 * outward;
             projected_triangles
                 .iter()
                 .any(|(_, depths, triangle)| {
@@ -18997,6 +19313,76 @@ fn validate_construction_planes(planes: &[ConstructionPlane]) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// A section analysis plane: a cut through the displayed model that shows
+/// its inside, without changing the document.
+///
+/// The plane lies parallel to one origin plane, `offset` millimetres along
+/// that plane's normal. The side the normal points to is kept unless the
+/// plane is flipped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionAnalysis {
+    pub active: bool,
+    pub plane: SketchPlane,
+    pub offset: f64,
+    pub flipped: bool,
+}
+
+impl Default for SectionAnalysis {
+    fn default() -> Self {
+        Self {
+            active: false,
+            plane: SketchPlane::XY,
+            offset: 0.0,
+            flipped: false,
+        }
+    }
+}
+
+impl SectionAnalysis {
+    /// The plane's frame: origin on the plane, axes along the origin plane's.
+    #[must_use]
+    fn frame(self) -> PlanarFrame3 {
+        let base = sketch_plane_frame(self.plane);
+        let normal = self.unit_normal();
+        PlanarFrame3::new(
+            Point3::new(
+                normal.x * self.offset,
+                normal.y * self.offset,
+                normal.z * self.offset,
+            ),
+            base.u,
+            base.v,
+        )
+    }
+
+    /// The normal of the kept side, before flipping: the origin plane's own.
+    fn unit_normal(self) -> Vector3 {
+        let base = sketch_plane_frame(self.plane);
+        Vector3::new(
+            base.u.y * base.v.z - base.u.z * base.v.y,
+            base.u.z * base.v.x - base.u.x * base.v.z,
+            base.u.x * base.v.y - base.u.y * base.v.x,
+        )
+    }
+
+    /// The renderer's clipping plane, or `None` while the section is off.
+    #[must_use]
+    pub fn cut_plane(self) -> Option<artificer_ui_core::presentation::SectionCutPlane> {
+        if !self.active {
+            return None;
+        }
+        let sign = if self.flipped { -1.0 } else { 1.0 };
+        let normal = self.unit_normal();
+        let normal = Vector3::new(normal.x * sign, normal.y * sign, normal.z * sign);
+        // Kept where `normal · p + offset >= 0`; the plane itself sits
+        // `self.offset` along the unflipped normal.
+        Some(artificer_ui_core::presentation::SectionCutPlane::new(
+            normal,
+            -sign * self.offset,
+        ))
+    }
 }
 
 const fn origin_plane_label(plane: SketchPlane) -> &'static str {
@@ -21076,6 +21462,7 @@ mod extrusion_workbench_tests {
             cancel_mode,
             finish_sketch_on_commit,
             distance: 0.0,
+            draft_degrees: 0.0,
             frame,
             target_face,
             support_digest,
@@ -23868,5 +24255,246 @@ mod auto_commit_delete {
         assert!(app.sketch.selected().is_some());
         assert!(app.sketch.stage_delete_selected().is_ok());
         assert!(app.sketch.has_pending_edit());
+    }
+}
+
+#[cfg(test)]
+mod face_sketch_context_layers {
+    use super::*;
+
+    fn context() -> FaceSketchDisplayContext {
+        let triangle = |offset: f64| {
+            SketchContextTriangle::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+                SketchPoint::new(offset, 1.0),
+            ])
+        };
+        let edge = |offset: f64| {
+            SketchContextEdge::new([
+                SketchPoint::new(offset, 0.0),
+                SketchPoint::new(offset + 1.0, 0.0),
+            ])
+        };
+        FaceSketchDisplayContext {
+            fit_key: SketchContextFitKey::new([0; 32], 1),
+            axis_labels: ["U", "V"],
+            // A raised boss, the face itself, a shallow pocket floor, and a
+            // deep bore floor.
+            raw_triangles: vec![
+                (5.0, triangle(0.0)),
+                (0.0, triangle(10.0)),
+                (-4.0, triangle(20.0)),
+                (-40.0, triangle(30.0)),
+            ],
+            raw_edges: vec![(5.0, edge(0.0)), (0.0, edge(10.0)), (-4.0, edge(20.0))],
+            triangles: Vec::new(),
+            edges: Vec::new(),
+            boundary: Vec::new(),
+            inner_boundaries: Vec::new(),
+            snap_curves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_body_on_and_above_the_surface_is_always_shown_nearest_last() {
+        let mut context = context();
+        context.update_filtered_geometry(false, 50.0);
+        assert_eq!(context.triangles.len(), 2, "nothing below the face");
+        assert!(
+            context
+                .triangles
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        // Painter order: the face first, the raised boss over it.
+        assert_eq!(context.triangles[0].vertices[0].u, 10.0);
+        assert_eq!(context.triangles[1].vertices[0].u, 0.0);
+        assert_eq!(context.edges.len(), 2);
+    }
+
+    #[test]
+    fn projecting_below_adds_an_xray_layer_under_the_body_within_the_depth() {
+        let mut context = context();
+        context.update_filtered_geometry(true, 10.0);
+        let below = context
+            .triangles
+            .iter()
+            .filter(|triangle| triangle.layer == SketchContextLayer::Below)
+            .collect::<Vec<_>>();
+        assert_eq!(below.len(), 1, "the 40 mm bore floor is beyond the depth");
+        assert_eq!(below[0].vertices[0].u, 20.0);
+        assert!(below[0].shade < 1.0, "a face below the surface is darker");
+        // The x-ray precedes the body in painter order.
+        assert_eq!(context.triangles[0].layer, SketchContextLayer::Below);
+        assert!(
+            context.triangles[1..]
+                .iter()
+                .all(|triangle| triangle.layer == SketchContextLayer::Body)
+        );
+        assert_eq!(
+            context
+                .edges
+                .iter()
+                .filter(|edge| edge.layer == SketchContextLayer::Below)
+                .count(),
+            1
+        );
+
+        context.update_filtered_geometry(true, 50.0);
+        assert_eq!(context.triangles.len(), 4);
+        let deep = context.triangles[0];
+        let shallow = context.triangles[1];
+        assert_eq!(deep.vertices[0].u, 30.0, "deepest paints first");
+        assert!(deep.shade < shallow.shade, "deeper is darker");
+    }
+}
+
+#[cfg(test)]
+mod drafted_extrusion_command {
+    use super::*;
+
+    fn square_profile() -> (PlanarFrame3, PlanarProfile2) {
+        (
+            PlanarFrame3::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+            PlanarProfile2::from_polygon(&[
+                ProtocolPoint2::new(0.0, 0.0),
+                ProtocolPoint2::new(10.0, 0.0),
+                ProtocolPoint2::new(10.0, 10.0),
+                ProtocolPoint2::new(0.0, 10.0),
+            ]),
+        )
+    }
+
+    #[test]
+    fn a_draft_angle_turns_a_new_body_extrusion_into_an_offset_loft() {
+        let (frame, profile) = square_profile();
+        let straight = build_planar_profile_extrusion_command(
+            frame,
+            profile.clone(),
+            None,
+            8.0,
+            0.0,
+            ExtrusionMode::NewBody,
+        );
+        assert!(matches!(
+            straight,
+            Some(KernelCommand::ExtrudePlanarProfile { distance, .. }) if distance == 8.0
+        ));
+        let drafted = build_planar_profile_extrusion_command(
+            frame,
+            profile,
+            None,
+            -8.0,
+            5.0,
+            ExtrusionMode::NewBody,
+        );
+        let Some(KernelCommand::LoftPlanarProfileOffset {
+            distance, offset, ..
+        }) = drafted
+        else {
+            panic!("a drafted new body lofts")
+        };
+        assert_eq!(distance, 8.0, "the sign moves into the frame");
+        assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
+    }
+}
+
+#[cfg(test)]
+mod section_analysis_and_commit_camera {
+    use super::*;
+
+    #[test]
+    fn the_section_plane_keeps_the_side_its_normal_points_to_until_flipped() {
+        let mut section = SectionAnalysis::default();
+        assert!(section.cut_plane().is_none(), "off by default");
+        section.active = true;
+        section.plane = SketchPlane::XY;
+        section.offset = 3.0;
+        let plane = section.cut_plane().expect("active");
+        assert!(
+            plane.distance_to_point(Point3::new(0.0, 0.0, 5.0)) > 0.0,
+            "above is kept"
+        );
+        assert!(
+            plane.distance_to_point(Point3::new(0.0, 0.0, 1.0)) < 0.0,
+            "below is cut"
+        );
+        assert!(plane.distance_to_point(Point3::new(7.0, -2.0, 3.0)).abs() < 1.0e-12);
+        section.flipped = true;
+        let flipped = section.cut_plane().expect("active");
+        assert!(flipped.distance_to_point(Point3::new(0.0, 0.0, 5.0)) < 0.0);
+        assert!(flipped.distance_to_point(Point3::new(0.0, 0.0, 1.0)) > 0.0);
+        assert!(flipped.distance_to_point(Point3::new(7.0, -2.0, 3.0)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn toggling_the_section_hands_the_plane_to_the_camera_and_draws_its_card() {
+        let mut app = KernelLabApp::default();
+        assert!(app.view.section_cut_plane.is_none());
+        app.section_analysis.plane = SketchPlane::YZ;
+        app.section_analysis.active = true;
+        app.sync_section_plane();
+        let plane = app.view.section_cut_plane.expect("the camera clips");
+        assert!(plane.active);
+        assert!((plane.normal.x - 1.0).abs() < 1.0e-12);
+        assert!(
+            app.visible_reference_plane_overlays()
+                .iter()
+                .any(|overlay| overlay.segment_count() == 4),
+            "the section plane shows as a card"
+        );
+        app.section_analysis.active = false;
+        app.sync_section_plane();
+        assert!(app.view.section_cut_plane.is_none());
+    }
+
+    #[test]
+    fn committing_an_extrusion_never_brings_the_camera_closer() {
+        for (radius, may_grow) in [(0.5, false), (40.0, true)] {
+            let mut app = KernelLabApp {
+                workbench_mode: WorkbenchMode::Sketch,
+                ..Default::default()
+            };
+            assert!(app.sketch.set_tool(crate::sketch::SketchTool::Circle));
+            let entity = app
+                .sketch
+                .stage_geometry(SketchGeometry::circle(
+                    SketchPoint::new(0.0, 0.0),
+                    SketchPoint::new(radius, 0.0),
+                ))
+                .expect("circle stages");
+            app.commit_sketch_stroke(entity);
+            let _ = app
+                .sketch
+                .select_region_at_point(SketchPoint::new(0.0, 0.0), false);
+            assert!(app.stage_sketch_extrusion());
+            if !may_grow {
+                // A view already wide enough for the body.
+                app.view.frame(Aabb3::new(
+                    Point3::new(-100.0, -100.0, -100.0),
+                    Point3::new(100.0, 100.0, 100.0),
+                ));
+            }
+            let before = app.view.fit_radius();
+            let target = app.view.target();
+            assert!(app.confirm_pending_operation());
+            assert_eq!(app.last_error_code(), None);
+            let after = app.view.fit_radius();
+            assert!(
+                after >= before - 1.0e-9,
+                "commit zoomed in: {before} -> {after}"
+            );
+            if may_grow {
+                assert!(after > before, "a body outside the view widens it");
+            } else {
+                assert_eq!(after, before, "a body inside the view leaves it alone");
+                assert_eq!(app.view.target(), target);
+            }
+        }
     }
 }

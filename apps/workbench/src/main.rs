@@ -1,4 +1,4 @@
-use artificer_workbench::KernelLabApp;
+use artificer_workbench::documents::WorkbenchShell;
 
 fn main() -> eframe::Result<()> {
     // First, before the window, the logger, or anything that touches a file.
@@ -25,6 +25,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Artificer · Workbench",
         options,
-        Box::new(|creation_context| Ok(Box::new(KernelLabApp::new(creation_context)))),
+        Box::new(|creation_context| Ok(Box::new(WorkbenchShell::new(creation_context)))),
     )
 }
