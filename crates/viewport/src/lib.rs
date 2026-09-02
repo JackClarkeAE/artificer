@@ -1557,12 +1557,7 @@ fn show_document_impl(
     // whole frame: it neither paints, nor occludes, nor takes a pick. Facets
     // the plane passes through are cut at it, and the cuts are the chords
     // the caps are built from.
-    let mut section_cut_chords: Vec<[Point3; 2]> = Vec::new();
     if let Some(plane) = view.section_cut_plane.filter(|plane| plane.active) {
-        // The cap loops need the whole cut, and projection has already
-        // culled every facet turned away from the camera, so the chords come
-        // from the bodies' own facets rather than from the clip below.
-        section_cut_chords = section_cut_chords_of(bodies, plane);
         let mut kept = Vec::with_capacity(triangles.len());
         let mut front_chords = Vec::new();
         for triangle in &triangles {
@@ -1574,63 +1569,77 @@ fn show_document_impl(
     // discarded side they cover the material behind the plane, so every line
     // under them is hidden; from the kept side the body is in front of them
     // and they are neither painted nor occluding.
-    let section_caps = view
+    // Caps are built per body, in that body's own model space, and carried
+    // to the screen through the same presentation its facets take, so a
+    // placed or dragged body keeps its caps on its cut.
+    let section_caps: Vec<(usize, Vec<[Point3; 3]>)> = view
         .section_cut_plane
         .filter(|plane| plane.active && plane.distance_to_point(view.eye_position()) < 0.0)
         .map(|plane| {
             let normal = Vector3::new(plane.normal.x, plane.normal.y, plane.normal.z);
-            section_cap_regions(&section_cut_chords, normal)
+            bodies
                 .iter()
-                .filter_map(|region| triangulate_preview_region(region, normal))
-                .flatten()
-                .collect::<Vec<[Point3; 3]>>()
+                .enumerate()
+                .map(|(index, body)| {
+                    let chords = section_cut_chords_of(std::slice::from_ref(body), plane);
+                    let caps = section_cap_regions(&chords, normal)
+                        .iter()
+                        .filter_map(|region| triangulate_preview_region(region, normal))
+                        .flatten()
+                        .collect::<Vec<[Point3; 3]>>();
+                    (index, caps)
+                })
+                .filter(|(_, caps)| !caps.is_empty())
+                .collect()
         })
         .unwrap_or_default();
+    let project_cap = |index: usize, point: Point3| {
+        InstancePresentation::for_body(
+            &bodies[index],
+            active_body,
+            *active_display_transform,
+            animation_phase,
+        )
+        .project_point(point, *view)
+    };
     let occluders_with_caps;
     let occluders: &[ProjectedTriangle] = if section_caps.is_empty() {
         &triangles
     } else {
-        let cap_body = bodies
-            .first()
-            .map_or(BodyInstanceKey::new(0), |body| body.key);
-        let cap_source = bodies.first().map_or(
-            EntityRef {
-                snapshot: artificer_protocol::SnapshotId::new([0; 16]),
-                entity: artificer_protocol::EntityId(u64::MAX),
-                kind: artificer_protocol::EntityKind::Face,
-            },
-            |body| EntityRef {
+        let mut occluders = triangles.clone();
+        for (index, caps) in &section_caps {
+            let body = &bodies[*index];
+            let cap_source = EntityRef {
                 snapshot: body.scene.snapshot,
                 entity: artificer_protocol::EntityId(u64::MAX),
                 kind: artificer_protocol::EntityKind::Face,
-            },
-        );
-        let mut occluders = triangles.clone();
-        occluders.extend(section_caps.iter().map(|cap| {
-            let camera = cap.map(|point| view.project(point));
-            let points = camera.map(|point| projection.camera_point(point));
-            let vertex_depths = camera.map(|point| point.depth);
-            ProjectedTriangle {
-                points,
-                screen_bounds: points_bounds(&points),
-                model_vertices: *cap,
-                model_edges: [
-                    ModelEdgeKey::new([cap[0], cap[1]]),
-                    ModelEdgeKey::new([cap[1], cap[2]]),
-                    ModelEdgeKey::new([cap[2], cap[0]]),
-                ],
-                vertex_depths,
-                maximum_depth: vertex_depths
-                    .iter()
-                    .copied()
-                    .fold(f64::NEG_INFINITY, f64::max),
-                depth: vertex_depths.iter().sum::<f64>() / 3.0,
-                body: cap_body,
-                source: cap_source,
-                role: FaceRole::FeatureEnd,
-                lighting: [VertexLighting::default(); 3],
-            }
-        }));
+            };
+            occluders.extend(caps.iter().map(|cap| {
+                let camera = cap.map(|point| project_cap(*index, point));
+                let points = camera.map(|point| projection.camera_point(point));
+                let vertex_depths = camera.map(|point| point.depth);
+                ProjectedTriangle {
+                    points,
+                    screen_bounds: points_bounds(&points),
+                    model_vertices: *cap,
+                    model_edges: [
+                        ModelEdgeKey::new([cap[0], cap[1]]),
+                        ModelEdgeKey::new([cap[1], cap[2]]),
+                        ModelEdgeKey::new([cap[2], cap[0]]),
+                    ],
+                    vertex_depths,
+                    maximum_depth: vertex_depths
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max),
+                    depth: vertex_depths.iter().sum::<f64>() / 3.0,
+                    body: body.key,
+                    source: cap_source,
+                    role: FaceRole::FeatureEnd,
+                    lighting: [VertexLighting::default(); 3],
+                }
+            }));
+        }
         occluders_with_caps = occluders;
         &occluders_with_caps
     };
@@ -1858,10 +1867,28 @@ fn show_document_impl(
     };
     let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
-    let section_cut_segments = section_cut_chords
-        .iter()
-        .map(|chord| chord.map(|point| projection.camera_point(view.project(point))))
-        .collect::<Vec<[Pos2; 2]>>();
+    // The cut outline, per body through that body's presentation, like the
+    // caps. The chords come from every facet of the body, front or back:
+    // projection has already culled the facets turned away from the camera,
+    // and a loop that misses the back of the part never closes.
+    let section_cut_segments = view
+        .section_cut_plane
+        .filter(|plane| plane.active)
+        .map(|plane| {
+            bodies
+                .iter()
+                .enumerate()
+                .flat_map(|(index, body)| {
+                    section_cut_chords_of(std::slice::from_ref(body), plane)
+                        .into_iter()
+                        .map(move |chord| (index, chord))
+                })
+                .map(|(index, chord)| {
+                    chord.map(|point| projection.camera_point(project_cap(index, point)))
+                })
+                .collect::<Vec<[Pos2; 2]>>()
+        })
+        .unwrap_or_default();
 
     if display_mode.shows_triangles() {
         for triangle in &triangles {
@@ -1975,15 +2002,17 @@ fn show_document_impl(
     // from the kept side the body itself is in front of the cap.
     if !section_caps.is_empty() {
         let mut mesh = Mesh::default();
-        for triangle in &section_caps {
-            let first = mesh.vertices.len() as u32;
-            for point in triangle {
-                mesh.colored_vertex(
-                    projection.camera_point(view.project(*point)),
-                    SECTION_CAP_FILL,
-                );
+        for (index, caps) in &section_caps {
+            for triangle in caps {
+                let first = mesh.vertices.len() as u32;
+                for point in triangle {
+                    mesh.colored_vertex(
+                        projection.camera_point(project_cap(*index, *point)),
+                        SECTION_CAP_FILL,
+                    );
+                }
+                mesh.add_triangle(first, first + 1, first + 2);
             }
-            mesh.add_triangle(first, first + 1, first + 2);
         }
         painter.add(Shape::mesh(mesh));
     }
@@ -3194,7 +3223,7 @@ fn paint_edges(
         .filter(|selection| selection.body == body)
         .map(|selection| logical_edge_group(scene, selection.edge))
         .unwrap_or_default();
-    let mut groups = BTreeMap::<(EntityRef, bool, bool, bool), Vec<[Pos2; 2]>>::new();
+    let mut groups = BTreeMap::<(EntityRef, bool, bool, bool, bool), Vec<[Pos2; 2]>>::new();
     for edge in edge_frame.by_body.get(&body).into_iter().flatten() {
         let identity = DocumentEdgeSelection {
             body,
@@ -3204,10 +3233,15 @@ fn paint_edges(
         let selected =
             measured || Some(identity) == selected_edge || selected_edges.contains(&identity);
         let hovered = hovered_group.contains(&edge.source);
-        // Smooth subdivisions never paint; a tangent rail paints only where
-        // it is the body's outline against the background. Both surface the
-        // moment the user hovers or selects them.
-        if (edge.smooth || (edge.tangent && !edge.outline)) && !selected && !hovered {
+        // Smooth subdivisions never paint. A tangent rail, where a fillet
+        // meets the faces it blends, is drawn faintly: it is not a crease,
+        // but it is where the blend starts and ends, which a drawing shows.
+        // Hover and selection give it the full weight.
+        if edge.smooth && !selected && !hovered {
+            continue;
+        }
+        let faint = edge.tangent && !edge.outline && !selected && !hovered;
+        if faint && !visible_pass {
             continue;
         }
         if edge.visible != visible_pass {
@@ -3218,7 +3252,7 @@ fn paint_edges(
             continue;
         }
         let segments = groups
-            .entry((edge.source, selected, hovered, edge.outline))
+            .entry((edge.source, selected, hovered, edge.outline, faint))
             .or_default();
         if visible_pass {
             for [start, end] in &edge.visible_intervals {
@@ -3249,9 +3283,12 @@ fn paint_edges(
             }
         }
     }
-    for ((_source, selected, hovered, outline), segments) in groups {
-        let (stroke, halo) =
+    for ((_source, selected, hovered, outline, faint), segments) in groups {
+        let (mut stroke, halo) =
             edge_presentation_strokes(selected, hovered, display_mode, visible_pass, outline);
+        if faint {
+            stroke = Stroke::new(stroke.width * 0.7, stroke.color.gamma_multiply(0.42));
+        }
         for chain in joined_segment_chains(segments) {
             if let Some(halo) = halo {
                 painter.add(Shape::line(chain.clone(), halo));

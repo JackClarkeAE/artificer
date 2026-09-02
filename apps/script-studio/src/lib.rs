@@ -337,14 +337,17 @@ fn name_faces(
         if !seen.insert(entity.entity.0) {
             continue;
         }
+        let description = describe_face(scene, entity);
         faces.push(FaceName {
             entity,
             script_name: script.get(&entity.entity.0).cloned(),
-            history_name: history
-                .get(&entity.entity.0)
-                .cloned()
-                .unwrap_or_else(|| format!("face {}", entity.entity.0)),
-            description: describe_face(scene, entity),
+            history_name: history.get(&entity.entity.0).cloned().unwrap_or_else(|| {
+                // No step claims this face by role: say what it is and
+                // where, which is what a person needs to pick it out.
+                let kind = description.split(", centre").next().unwrap_or("face");
+                format!("{kind} face {}", entity.entity.0)
+            }),
+            description,
         });
     }
     // Script names first, then history names, each in name order.
@@ -850,6 +853,11 @@ impl ScriptStudio {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The camera, for tests and for hosts that place the view.
+    pub fn view_mut(&mut self) -> &mut ViewState {
+        &mut self.view
     }
 
     #[must_use]
@@ -1798,7 +1806,10 @@ impl ScriptStudio {
         let bodies: Vec<DocumentBodyInstance<'_>> = scene
             .map(|scene| vec![DocumentBodyInstance::new(BODY, scene, bounds, pivot)])
             .unwrap_or_default();
-        let time = ui.input(|input| input.time);
+        // The phase drives the workbench's joint-motion animation, which
+        // spins the active body about its pivot; a script's body stands
+        // still.
+        let animation_phase = 0.0;
         self.view.section_cut_plane = self.section.cut_plane();
         let output = show_document_with_feature_drag(
             ui,
@@ -1816,7 +1827,7 @@ impl ScriptStudio {
             ActiveTool::Select,
             &mut self.transform,
             &mut self.view,
-            time,
+            animation_phase,
             None,
             &[],
             &[],
