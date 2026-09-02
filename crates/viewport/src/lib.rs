@@ -670,6 +670,167 @@ fn rotate_point_by_unit_quaternion(point: Point3, rotation: RotationQuaternion) 
     )
 }
 
+/// Magenta for a collision: no gap reading can take this colour, so
+/// "these parts pass through one another" never reads as "these parts are
+/// close".
+pub const HEAT_COLLISION: Color32 = Color32::from_rgb(226, 84, 214);
+/// Red for a gap smaller than the fit allows.
+pub const HEAT_TOO_CLOSE: Color32 = Color32::from_rgb(228, 74, 62);
+/// Green for a gap the fit is happy with.
+pub const HEAT_IN_TOLERANCE: Color32 = Color32::from_rgb(64, 190, 116);
+/// Blue for a gap wider than the fit needs.
+pub const HEAT_LOOSE: Color32 = Color32::from_rgb(66, 142, 236);
+
+/// How a clearance reading becomes a colour.
+///
+/// Both forms agree on the one reading that is not a gap at all: a negative
+/// value means the two bodies occupy the same space, and it is painted in a
+/// colour no gap can take.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeatPalette {
+    /// A continuous ramp from the tightest reading worth colouring to the
+    /// loosest. Readings outside the span clamp to its ends.
+    Gradient { near: f32, far: f32 },
+    /// A pass/fail window: below `minimum` is too close, inside is right,
+    /// above `maximum` is looser than the fit needs. An infinite `maximum`
+    /// makes the window an ordinary "must clear by" check with no upper
+    /// complaint.
+    Window { minimum: f32, maximum: f32 },
+}
+
+/// One entry of the legend a palette prints beside the model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeatBand {
+    pub color: Color32,
+    pub label: String,
+}
+
+impl HeatPalette {
+    /// The colour one reading takes, in millimetres.
+    ///
+    /// A reading that is not a number is left to the body's own colour by
+    /// returning `None`; an infinite one means nothing was near enough to
+    /// measure against, which is the loosest answer there is.
+    #[must_use]
+    pub fn color(self, value: f32) -> Option<Color32> {
+        if value.is_nan() {
+            return None;
+        }
+        if value < 0.0 {
+            return Some(HEAT_COLLISION);
+        }
+        Some(match self {
+            Self::Window { minimum, maximum } => {
+                if value < minimum {
+                    HEAT_TOO_CLOSE
+                } else if value <= maximum {
+                    HEAT_IN_TOLERANCE
+                } else {
+                    HEAT_LOOSE
+                }
+            }
+            Self::Gradient { near, far } => {
+                if !value.is_finite() {
+                    HEAT_LOOSE
+                } else {
+                    let span = far - near;
+                    let position = if span > 0.0 {
+                        ((value - near) / span).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    if position < 0.5 {
+                        mix(HEAT_TOO_CLOSE, HEAT_IN_TOLERANCE, position * 2.0)
+                    } else {
+                        mix(HEAT_IN_TOLERANCE, HEAT_LOOSE, (position - 0.5) * 2.0)
+                    }
+                }
+            }
+        })
+    }
+
+    /// The legend this palette prints, tightest reading first.
+    #[must_use]
+    pub fn legend(self) -> Vec<HeatBand> {
+        let band = |color: Color32, label: String| HeatBand { color, label };
+        let mut bands = vec![band(HEAT_COLLISION, "Collision".to_owned())];
+        match self {
+            Self::Window { minimum, maximum } => {
+                bands.push(band(
+                    HEAT_TOO_CLOSE,
+                    format!("under {}", millimetres(minimum)),
+                ));
+                bands.push(band(
+                    HEAT_IN_TOLERANCE,
+                    if maximum.is_finite() {
+                        format!("{} to {}", millimetres(minimum), millimetres(maximum))
+                    } else {
+                        format!("{} and over", millimetres(minimum))
+                    },
+                ));
+                if maximum.is_finite() {
+                    bands.push(band(HEAT_LOOSE, format!("over {}", millimetres(maximum))));
+                }
+            }
+            Self::Gradient { near, far } => {
+                bands.push(band(HEAT_TOO_CLOSE, millimetres(near)));
+                bands.push(band(
+                    HEAT_IN_TOLERANCE,
+                    millimetres(f32::midpoint(near, far)),
+                ));
+                bands.push(band(HEAT_LOOSE, millimetres(far)));
+            }
+        }
+        bands
+    }
+}
+
+/// A length written the way the rest of the workbench writes one.
+fn millimetres(value: f32) -> String {
+    if !value.is_finite() {
+        return "∞".to_owned();
+    }
+    let text = if value.abs() >= 100.0 {
+        format!("{value:.0}")
+    } else if value.abs() >= 1.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.3}")
+    };
+    format!("{} mm", text.trim_end_matches('0').trim_end_matches('.'))
+}
+
+/// A scalar measured over one body's display facets, and the palette that
+/// turns it into colour.
+///
+/// The readings are per facet corner rather than per facet, so the
+/// rasteriser interpolates them across the triangle. A tessellated cylinder
+/// then shows the clearance over its wall instead of showing its own
+/// tessellation.
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceField<'a> {
+    /// One reading per facet corner, in scene order: facet `i` takes
+    /// `values[3 * i..3 * i + 3]`. A slice shorter than the scene leaves the
+    /// remaining facets in the body's own colour.
+    pub values: &'a [f32],
+    pub palette: HeatPalette,
+    /// Changes whenever the readings do. The GPU buffer cache keys on this
+    /// rather than hashing a megabyte of vertices every frame.
+    pub epoch: u64,
+}
+
+impl SurfaceField<'_> {
+    /// The colour one facet corner takes, or `None` where the field does not
+    /// reach.
+    #[must_use]
+    pub fn color(&self, facet: usize, corner: usize) -> Option<Color32> {
+        self.values
+            .get(facet * 3 + corner)
+            .copied()
+            .and_then(|value| self.palette.color(value))
+    }
+}
+
 /// One visible body supplied to the document viewport.
 #[derive(Clone, Copy, Debug)]
 pub struct DocumentBodyInstance<'a> {
@@ -678,6 +839,9 @@ pub struct DocumentBodyInstance<'a> {
     /// `None` keeps the neutral steel the workbench uses for unassigned
     /// bodies, so an unset material is visibly unset.
     pub tint: Option<Color32>,
+    /// A measurement painted over the body in place of its material, when
+    /// an analysis has one to show.
+    pub field: Option<SurfaceField<'a>>,
     pub scene: &'a DebugScene,
     pub bounds: Option<Aabb3>,
     pub pivot: Point3,
@@ -701,11 +865,19 @@ impl<'a> DocumentBodyInstance<'a> {
         Self {
             key,
             tint: None,
+            field: None,
             scene,
             bounds,
             pivot,
             base_transform: RigidOccurrenceTransform::identity(),
         }
+    }
+
+    /// Returns the same occurrence painted by an analysis reading.
+    #[must_use]
+    pub const fn with_field(mut self, field: Option<SurfaceField<'a>>) -> Self {
+        self.field = field;
+        self
     }
 
     /// Returns the same occurrence at a committed rigid placement.
@@ -876,6 +1048,10 @@ struct ProjectedTriangle {
     source: EntityRef,
     role: FaceRole,
     lighting: [VertexLighting; 3],
+    /// The analysis reading at each corner, or `NaN` where the body carries
+    /// no field. Interpolating it across the facet is what makes a heat map
+    /// show the measurement rather than the tessellation.
+    heat: [f32; 3],
 }
 
 /// One vertex's evaluated light rig. `level` is the combined intensity and
@@ -1637,6 +1813,9 @@ fn show_document_impl(
                     source: cap_source,
                     role: FaceRole::FeatureEnd,
                     lighting: [VertexLighting::default(); 3],
+                    // A cut cap is material the section plane exposed, not a
+                    // surface any clearance was measured over.
+                    heat: [f32::NAN; 3],
                 }
             }));
         }
@@ -1865,6 +2044,13 @@ fn show_document_impl(
             .find(|body| body.key == key)
             .and_then(|body| body.tint)
     };
+    let palette_of = |key: BodyInstanceKey| {
+        bodies
+            .iter()
+            .find(|body| body.key == key)
+            .and_then(|body| body.field)
+            .map(|field| field.palette)
+    };
     let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
     // The cut outline, per body through that body's presentation, like the
@@ -1911,6 +2097,22 @@ fn show_document_impl(
             } else {
                 [face_color(triangle.role); 3]
             };
+            // An analysis reading replaces the material it is measured over,
+            // corner by corner, so the gradient across a facet is the
+            // measurement's and not the tessellation's. The light rig still
+            // shades it, which is what keeps the part readable as a shape
+            // while it is showing a number.
+            if let Some(palette) = palette_of(triangle.body) {
+                for (corner, vertex) in fill.iter_mut().enumerate() {
+                    if let Some(reading) = palette.color(triangle.heat[corner]) {
+                        *vertex = if display_mode.is_shaded() {
+                            shaded_material_color(reading, triangle.lighting[corner])
+                        } else {
+                            reading
+                        };
+                    }
+                }
+            }
             let identity = DocumentFaceSelection {
                 body: triangle.body,
                 face: triangle.source,
@@ -1961,16 +2163,28 @@ fn show_document_impl(
         if view.fill_backend == artificer_ui_core::presentation::FillBackend::GpuOnly {
             let gpu_bodies = bodies
                 .iter()
-                .map(|b| {
-                    let tint_rgba = b.tint.map(|c| {
-                        [
-                            f32::from(c.r()) / 255.0,
-                            f32::from(c.g()) / 255.0,
-                            f32::from(c.b()) / 255.0,
-                            f32::from(c.a()) / 255.0,
-                        ]
-                    });
-                    (b.key.get(), b.scene.clone(), tint_rgba)
+                .map(|b| crate::gpu::GpuBody {
+                    key: b.key.get(),
+                    revision: body_revision(b),
+                    scene: b.scene.clone(),
+                    tint: b.tint.map(linear_rgba),
+                    colors: b.field.map(|field| {
+                        // Every sample is a finished colour: where the field
+                        // has no reading the body keeps the colour it would
+                        // have had, so a partial field is a partial overlay
+                        // rather than a hole in the part.
+                        let base = b.tint.map_or(crate::gpu::NEUTRAL_BODY_COLOR, linear_rgba);
+                        (0..b.scene.triangles.len() * 3)
+                            .map(|sample| {
+                                field
+                                    .values
+                                    .get(sample)
+                                    .copied()
+                                    .and_then(|value| field.palette.color(value))
+                                    .map_or(base, linear_rgba)
+                            })
+                            .collect()
+                    }),
                 })
                 .collect::<Vec<_>>();
             let aspect_ratio = canvas.rect.width() / canvas.rect.height().max(1.0);
@@ -2276,6 +2490,12 @@ fn show_document_impl(
     }
     paint_axes(&painter, canvas.rect, *view);
     paint_tool_hint(&painter, canvas.rect, active_tool);
+    // A body painted by a measurement is unreadable without the scale it was
+    // painted to, so the legend is part of the overlay rather than something
+    // the host has to remember to print beside it.
+    if let Some(palette) = bodies.iter().find_map(|body| body.field.map(|f| f.palette)) {
+        paint_heat_legend(&painter, canvas.rect, palette);
+    }
     // A secondary click is a menu gesture, never a camera gesture: egui only
     // reports `clicked_by` once it has ruled out a drag, so the right-drag
     // orbit binding keeps working untouched. The pick is re-run from the
@@ -2579,23 +2799,36 @@ fn project_document_triangles(
                     animation_phase,
                 ),
                 body.scene,
+                body.field,
             )
         })
         .collect::<Vec<_>>();
     let triangle_work = presentations
         .iter()
-        .flat_map(|(body, presentation, scene)| {
+        .flat_map(|(body, presentation, scene, field)| {
             scene
                 .triangles
                 .iter()
-                .map(move |triangle| (*body, *presentation, triangle))
+                .enumerate()
+                .map(move |(facet, triangle)| {
+                    let heat = field.map_or([f32::NAN; 3], |field| {
+                        [0, 1, 2].map(|corner| {
+                            field
+                                .values
+                                .get(facet * 3 + corner)
+                                .copied()
+                                .unwrap_or(f32::NAN)
+                        })
+                    });
+                    (*body, *presentation, triangle, heat)
+                })
         })
         .collect::<Vec<_>>();
     let mut triangles = ComputePool::global()
         .map(
             "viewport.project.triangles",
             &triangle_work,
-            |_, (body, presentation, triangle)| {
+            |_, (body, presentation, triangle, heat)| {
                 let camera = triangle
                     .vertices
                     .map(|point| presentation.project_point(point, view));
@@ -2623,6 +2856,7 @@ fn project_document_triangles(
                     lighting: triangle
                         .normals
                         .map(|normal| vertex_lighting(presentation.present_normal(normal), view)),
+                    heat: *heat,
                 })
             },
         )
@@ -5010,6 +5244,7 @@ struct SectionVertex {
     model: Point3,
     depth: f64,
     lighting: VertexLighting,
+    heat: f32,
     /// Which of the facet's three edges this corner lies on, so a cut piece's
     /// edges keep the identity of the model edge they are part of.
     on_edges: [bool; 3],
@@ -5029,6 +5264,7 @@ fn section_lerp(a: SectionVertex, b: SectionVertex, t: f64) -> SectionVertex {
             level: a.lighting.level + (b.lighting.level - a.lighting.level) * f,
             sky: a.lighting.sky + (b.lighting.sky - a.lighting.sky) * f,
         },
+        heat: a.heat + (b.heat - a.heat) * f,
         on_edges: [
             a.on_edges[0] && b.on_edges[0],
             a.on_edges[1] && b.on_edges[1],
@@ -5118,6 +5354,7 @@ fn section_clip_triangle(
         model: triangle.model_vertices[index],
         depth: triangle.vertex_depths[index],
         lighting: triangle.lighting[index],
+        heat: triangle.heat[index],
         // Edge `i` runs from corner `i` to corner `i + 1`.
         on_edges: [
             index == 0 || index == 1,
@@ -5176,6 +5413,7 @@ fn section_clip_triangle(
             source: triangle.source,
             role: triangle.role,
             lighting: corners.map(|vertex| vertex.lighting),
+            heat: corners.map(|vertex| vertex.heat),
         });
     }
 }
@@ -6505,6 +6743,64 @@ fn projected_triad_axes(view: ViewState) -> [CameraProjection; 3] {
     .map(|axis| view.project_direction(axis))
 }
 
+/// The key to a heat map: one swatch per band, with the reading it stands
+/// for, in the corner the axis triad leaves free.
+fn paint_heat_legend(painter: &egui::Painter, rect: Rect, palette: HeatPalette) {
+    let bands = palette.legend();
+    if bands.is_empty() {
+        return;
+    }
+    let font = FontId::monospace(10.0);
+    let row = 15.0;
+    let swatch = 10.0;
+    let padding = egui::vec2(8.0, 6.0);
+    let width = bands
+        .iter()
+        .map(|band| {
+            painter
+                .layout_no_wrap(band.label.clone(), font.clone(), Color32::WHITE)
+                .rect
+                .width()
+        })
+        .fold(0.0_f32, f32::max)
+        + swatch
+        + 8.0;
+    let size = egui::vec2(
+        width + padding.x * 2.0,
+        bands.len() as f32 * row + padding.y * 2.0,
+    );
+    let panel = Rect::from_min_size(rect.right_bottom() - size - egui::vec2(14.0, 14.0), size);
+    painter.rect_filled(
+        panel,
+        3.0,
+        Color32::from_rgba_unmultiplied(250, 251, 252, 232),
+    );
+    painter.rect_stroke(
+        panel,
+        3.0,
+        Stroke::new(1.0, Color32::from_gray(196)),
+        egui::StrokeKind::Inside,
+    );
+    for (index, band) in bands.iter().enumerate() {
+        let top = panel.min.y + padding.y + index as f32 * row;
+        painter.rect_filled(
+            Rect::from_min_size(
+                egui::pos2(panel.min.x + padding.x, top + (row - swatch) / 2.0),
+                egui::vec2(swatch, swatch),
+            ),
+            1.0,
+            band.color,
+        );
+        painter.text(
+            egui::pos2(panel.min.x + padding.x + swatch + 8.0, top + row / 2.0),
+            Align2::LEFT_CENTER,
+            &band.label,
+            font.clone(),
+            Color32::from_rgb(58, 66, 76),
+        );
+    }
+}
+
 fn paint_tool_hint(painter: &egui::Painter, rect: Rect, tool: ActiveTool) {
     let instruction = match tool {
         ActiveTool::Select => {
@@ -6746,6 +7042,48 @@ fn vertex_lighting(normal: [f64; 3], view: ViewState) -> VertexLighting {
         level: level.clamp(0.0, 1.0) as f32,
         sky: sky as f32,
     }
+}
+
+/// A colour as the GPU pipeline takes it.
+fn linear_rgba(color: Color32) -> [f32; 4] {
+    [
+        f32::from(color.r()) / 255.0,
+        f32::from(color.g()) / 255.0,
+        f32::from(color.b()) / 255.0,
+        f32::from(color.a()) / 255.0,
+    ]
+}
+
+/// What the GPU buffer cache keys one body's upload on.
+///
+/// The snapshot identifies the geometry, the facet count the detail it was
+/// tessellated to, and the tint and field epoch the colours painted over it.
+/// A body whose revision has not moved is the body already uploaded, and one
+/// whose revision has is re-uploaded rather than drawn as it used to be.
+fn body_revision(body: &DocumentBodyInstance<'_>) -> u64 {
+    // FNV-1a: a few bytes of identity, not a megabyte of vertices.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut fold = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    fold(body.scene.snapshot.as_bytes());
+    fold(&(body.scene.triangles.len() as u64).to_le_bytes());
+    fold(&body.tint.map_or([0; 4], |tint| tint.to_array()));
+    if let Some(field) = body.field {
+        fold(&field.epoch.to_le_bytes());
+        fold(&(field.values.len() as u64).to_le_bytes());
+        let (kind, low, high) = match field.palette {
+            HeatPalette::Gradient { near, far } => (1_u8, near, far),
+            HeatPalette::Window { minimum, maximum } => (2, minimum, maximum),
+        };
+        fold(&[kind]);
+        fold(&low.to_bits().to_le_bytes());
+        fold(&high.to_bits().to_le_bytes());
+    }
+    hash
 }
 
 fn mix(left: Color32, right: Color32, amount: f32) -> Color32 {
@@ -7087,6 +7425,7 @@ mod tests {
                 level: 1.0,
                 sky: 1.0,
             }; 3],
+            heat: [f32::NAN; 3],
         };
         for display_mode in [ModelDisplayMode::Diagnostic, ModelDisplayMode::ShadedEdges] {
             let intervals = painted_visible_edge_intervals(
@@ -7153,6 +7492,7 @@ mod tests {
                 level: 1.0,
                 sky: 1.0,
             }; 3],
+            heat: [f32::NAN; 3],
         };
 
         let expected = vec![[0.0, 1.0]];
@@ -7939,6 +8279,145 @@ mod tests {
         }
         assert!(average < budget, "average {average:?}; p95 {p95:?}");
         assert!(p95 < p95_budget, "p95 {p95:?}; average {average:?}");
+    }
+
+    #[test]
+    fn a_palette_keeps_a_collision_apart_from_every_gap() {
+        let window = HeatPalette::Window {
+            minimum: 0.10,
+            maximum: 0.20,
+        };
+        assert_eq!(window.color(-0.01), Some(HEAT_COLLISION));
+        assert_eq!(window.color(0.05), Some(HEAT_TOO_CLOSE));
+        assert_eq!(window.color(0.10), Some(HEAT_IN_TOLERANCE));
+        assert_eq!(window.color(0.20), Some(HEAT_IN_TOLERANCE));
+        assert_eq!(window.color(0.21), Some(HEAT_LOOSE));
+        assert_eq!(
+            window.color(f32::NAN),
+            None,
+            "an unmeasured facet keeps its own colour"
+        );
+
+        // An open-ended window has nothing to call too loose, so it prints
+        // three bands rather than four.
+        let open = HeatPalette::Window {
+            minimum: 0.10,
+            maximum: f32::INFINITY,
+        };
+        assert_eq!(open.color(50.0), Some(HEAT_IN_TOLERANCE));
+        assert_eq!(open.legend().len(), 3);
+        assert_eq!(open.legend()[2].label, "0.1 mm and over");
+
+        // The ramp runs red through green to blue, and a collision is still
+        // the colour no gap can take.
+        let ramp = HeatPalette::Gradient {
+            near: 0.0,
+            far: 2.0,
+        };
+        assert_eq!(ramp.color(-1.0), Some(HEAT_COLLISION));
+        assert_eq!(ramp.color(0.0), Some(HEAT_TOO_CLOSE));
+        assert_eq!(ramp.color(1.0), Some(HEAT_IN_TOLERANCE));
+        assert_eq!(ramp.color(2.0), Some(HEAT_LOOSE));
+        assert_eq!(
+            ramp.color(f32::INFINITY),
+            Some(HEAT_LOOSE),
+            "nothing to measure against is the loosest reading there is"
+        );
+        let midway = ramp.color(0.5).expect("a reading");
+        assert!(
+            midway != HEAT_TOO_CLOSE && midway != HEAT_IN_TOLERANCE,
+            "the ramp interpolates rather than stepping: {midway:?}"
+        );
+        assert_eq!(ramp.legend().len(), 4);
+    }
+
+    #[test]
+    fn a_body_upload_is_keyed_on_everything_that_changes_its_pixels() {
+        let (scene, bounds, pivot) = cuboid_scene_fixture();
+        let key = BodyInstanceKey::new(3);
+        let plain = DocumentBodyInstance::new(key, &scene, Some(bounds), pivot);
+        let baseline = body_revision(&plain);
+
+        assert_eq!(
+            baseline,
+            body_revision(&DocumentBodyInstance::new(key, &scene, Some(bounds), pivot)),
+            "the same body twice is the same upload"
+        );
+        assert_ne!(
+            baseline,
+            body_revision(&plain.with_tint(Some(Color32::RED))),
+            "a material change repaints"
+        );
+
+        let readings = vec![1.0_f32; scene.triangles.len() * 3];
+        let field = |epoch: u64, palette: HeatPalette| SurfaceField {
+            values: &readings,
+            palette,
+            epoch,
+        };
+        let ramp = HeatPalette::Gradient {
+            near: 0.0,
+            far: 1.0,
+        };
+        let painted = plain.with_field(Some(field(1, ramp)));
+        assert_ne!(baseline, body_revision(&painted), "a heat map repaints");
+        assert_ne!(
+            body_revision(&painted),
+            body_revision(&plain.with_field(Some(field(2, ramp)))),
+            "a new study repaints"
+        );
+        assert_ne!(
+            body_revision(&painted),
+            body_revision(&plain.with_field(Some(field(
+                1,
+                HeatPalette::Window {
+                    minimum: 0.1,
+                    maximum: 0.2,
+                },
+            )))),
+            "the same readings under a different scale repaint"
+        );
+    }
+
+    #[test]
+    fn the_gpu_upload_takes_its_colour_per_corner_and_falls_back_to_the_material() {
+        let (scene, _, _) = cuboid_scene_fixture();
+        let corners = scene.triangles.len() * 3;
+        let mut colors = vec![[0.0, 1.0, 0.0, 1.0]; corners];
+        colors[0] = [1.0, 0.0, 0.0, 1.0];
+
+        let body = crate::gpu::GpuBody {
+            key: 1,
+            revision: 1,
+            scene: scene.clone(),
+            tint: Some([0.2, 0.2, 0.2, 1.0]),
+            colors: Some(colors),
+        };
+        let vertices = crate::gpu::body_vertices(&body);
+        assert_eq!(vertices.len(), corners);
+        assert_eq!(vertices[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(vertices[1].color, [0.0, 1.0, 0.0, 1.0]);
+
+        // A field that does not reach every corner leaves the rest on the
+        // body's own colour rather than blanking them.
+        let short = crate::gpu::GpuBody {
+            colors: Some(vec![[1.0, 0.0, 0.0, 1.0]]),
+            ..body.clone()
+        };
+        let vertices = crate::gpu::body_vertices(&short);
+        assert_eq!(vertices[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(vertices[1].color, [0.2, 0.2, 0.2, 1.0]);
+
+        // And an unassigned body is the neutral steel, not black.
+        let bare = crate::gpu::GpuBody {
+            tint: None,
+            colors: None,
+            ..body
+        };
+        assert_eq!(
+            crate::gpu::body_vertices(&bare)[0].color,
+            crate::gpu::NEUTRAL_BODY_COLOR
+        );
     }
 
     fn cuboid_scene_fixture() -> (DebugScene, Aabb3, Point3) {
@@ -9975,6 +10454,7 @@ mod tests {
                             },
                             role: FaceRole::PositiveX,
                             lighting: [VertexLighting::default(); 3],
+                            heat: [f32::NAN; 3],
                         };
                         let late_depth = late.depths.iter().sum::<f64>() / 3.0;
                         // A quarter-millimetre allowance keeps shared

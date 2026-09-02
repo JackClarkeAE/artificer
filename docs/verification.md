@@ -374,6 +374,41 @@ rather than only when the surfaces do; such a pair keeps a positive
 distance, the gap to the wall around it, with the state saying it is
 inside.
 
+### The heat map
+
+The pair table says which pairs fail. The heat map says where on the
+parts they fail, and it is the same measurement read at a different
+resolution: for every corner of every display facet, the signed clearance
+to the nearest of the other bodies.
+
+```rust
+use artificer_kernel::api::analysis::clearance_fields;
+let fields = clearance_fields(&subjects, &CancellationToken::new());
+```
+
+Positive is a gap; negative is penetration, and its magnitude is how far
+inside the nearest other body that corner sits. A body with nothing to
+measure against reads infinite rather than zero.
+
+Two things about the sampling are worth stating plainly. Readings are
+taken at facet corners rather than facet centres, so the renderer
+interpolates the measurement across each facet and a tessellated cylinder
+shows the clearance over its wall rather than showing its own
+tessellation. And corners alone would miss a collision that falls wholly
+inside a facet — a pin driven through the middle of a disc has every
+corner of that disc out on its rim — so each facet's centre is read too,
+and a facet whose centre is inside another body is painted as a collision
+throughout. That over-states a collision by at most one facet and never
+hides one, which is the direction a fit check has to err in.
+
+The workbench paints the readings over the bodies through the viewport's
+per-vertex colour channel, on both the software and the GPU fill paths,
+with a legend naming the bands. A collision takes a colour no gap can
+take, so "these parts pass through one another" never reads as "these
+parts are close". The readings are bound to the tessellation they were
+measured on: a body rebuilt by an edit simply has no reading until the
+study is run again.
+
 ## 9. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the

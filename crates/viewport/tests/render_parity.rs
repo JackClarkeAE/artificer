@@ -9,8 +9,8 @@ use artificer_ui_core::presentation::{
     ActiveTool, DisplayTransform, ProjectionMode, SectionCutPlane, ViewState,
 };
 use artificer_viewport::{
-    BodyInstanceKey, DocumentBodyInstance, FeaturePreviewDragState, ModelDisplayMode,
-    show_document_with_feature_drag,
+    BodyInstanceKey, DocumentBodyInstance, FeaturePreviewDragState, HeatPalette, ModelDisplayMode,
+    SurfaceField, show_document_with_feature_drag,
 };
 use egui_kittest::Harness;
 
@@ -248,5 +248,78 @@ fn test_gpu_fill_backend_rendering() {
             });
 
         harness.step();
+    }
+}
+
+#[test]
+fn a_heat_map_repaints_on_both_backends_as_its_readings_change() {
+    // The GPU path caches one vertex buffer per body. A heat map changes the
+    // colours every study, so a cache that never noticed would keep drawing
+    // the first reading; one that never evicted would leak a buffer a frame.
+    let (scene, bounds, pivot) = cuboid_fixture();
+    let body_key = BodyInstanceKey::new(1);
+    let corners = scene.triangles.len() * 3;
+
+    for backend in [
+        artificer_ui_core::presentation::FillBackend::GpuOnly,
+        artificer_ui_core::presentation::FillBackend::CpuOnly,
+    ] {
+        let mut view = ViewState::default();
+        view.fill_backend = backend;
+        view.frame(bounds);
+        let mut display_transform = DisplayTransform::default();
+        let mut drag_state = FeaturePreviewDragState::default();
+        let mut edge_frame_memo = None;
+
+        for epoch in 1..=3_u64 {
+            // Every pass paints a different reading over the same facets.
+            let readings = (0..corners)
+                .map(|corner| (corner as f32).mul_add(0.01, epoch as f32 * 0.1) - 0.5)
+                .collect::<Vec<f32>>();
+            let mut harness = Harness::builder()
+                .with_size([800.0, 600.0])
+                .wgpu()
+                .build_ui(|ui| {
+                    let body = DocumentBodyInstance::new(body_key, &scene, Some(bounds), pivot)
+                        .with_field(Some(SurfaceField {
+                            values: &readings,
+                            palette: HeatPalette::Window {
+                                minimum: 0.1,
+                                maximum: 0.4,
+                            },
+                            epoch,
+                        }));
+
+                    let _ = show_document_with_feature_drag(
+                        ui,
+                        &[body],
+                        Some(bounds),
+                        true,
+                        ModelDisplayMode::ShadedEdges,
+                        None,
+                        None,
+                        None,
+                        &[],
+                        &[],
+                        &[],
+                        Some(body_key),
+                        ActiveTool::Select,
+                        &mut display_transform,
+                        &mut view,
+                        0.0,
+                        None,
+                        &[],
+                        &[],
+                        &[],
+                        None,
+                        None,
+                        &mut drag_state,
+                        &mut edge_frame_memo,
+                        artificer_ui_core::navigation::NavigationPreset::Artificer.bindings(),
+                    );
+                });
+
+            harness.step();
+        }
     }
 }

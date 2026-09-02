@@ -109,6 +109,10 @@ impl GpuVertex {
     };
 }
 
+/// The neutral steel an unassigned body takes, matching the CPU path's own
+/// unassigned shade.
+pub const NEUTRAL_BODY_COLOR: [f32; 4] = [0.78, 0.82, 0.88, 1.0];
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GpuViewportUniforms {
@@ -118,61 +122,121 @@ pub struct GpuViewportUniforms {
     pub flags: [u32; 4],
 }
 
+/// One body's uploaded facets, and the revision of the body they stand for.
 pub struct BodyMeshGpuBuffer {
-    pub vertex_buffer: &'static wgpu::Buffer,
+    pub vertex_buffer: wgpu::Buffer,
     pub vertex_count: u32,
+    /// What the buffer holds. A body whose revision has moved on is
+    /// re-uploaded over this entry rather than drawn stale.
+    revision: u64,
 }
 
+/// One vertex buffer per body, replaced when that body changes and dropped
+/// when it leaves the frame.
+///
+/// Both halves matter. Keying on the body alone drew the geometry a body
+/// used to have after every edit; keeping the entries forever leaked a
+/// buffer per body per colour, which a per-frame heat map turns into a
+/// buffer per frame.
 #[derive(Default)]
 pub struct BodyMeshCache {
     buffers: HashMap<u64, BodyMeshGpuBuffer>,
+}
+
+/// One body as the callback carries it to the GPU.
+#[derive(Clone)]
+pub struct GpuBody {
+    pub key: u64,
+    /// Changes whenever the body's facets or colours do.
+    pub revision: u64,
+    pub scene: DebugScene,
+    pub tint: Option<[f32; 4]>,
+    /// One colour per facet corner in scene order, taking the place of the
+    /// tint wherever it reaches. This is the analysis heat map.
+    pub colors: Option<Vec<[f32; 4]>>,
+}
+
+/// One body's facets as the vertex buffer holds them.
+///
+/// The per-corner colours take precedence where they reach, the tint stands
+/// in where they do not, and an unassigned body falls back to the same
+/// neutral steel the software renderer paints it.
+#[must_use]
+pub fn body_vertices(body: &GpuBody) -> Vec<GpuVertex> {
+    let default_color = body.tint.unwrap_or(NEUTRAL_BODY_COLOR);
+    let mut vertices = Vec::with_capacity(body.scene.triangles.len() * 3);
+    for (facet, triangle) in body.scene.triangles.iter().enumerate() {
+        let normals = triangle.normals;
+        for (corner, &point) in triangle.vertices.iter().enumerate() {
+            let normal = normals[corner];
+            let color = body
+                .colors
+                .as_ref()
+                .and_then(|colors| colors.get(facet * 3 + corner))
+                .copied()
+                .unwrap_or(default_color);
+            vertices.push(GpuVertex {
+                position: [point.x as f32, point.y as f32, point.z as f32],
+                _pad0: 0.0,
+                normal: [normal.x as f32, normal.y as f32, normal.z as f32],
+                _pad1: 0.0,
+                color,
+            });
+        }
+    }
+    vertices
 }
 
 impl BodyMeshCache {
     pub fn get_or_upload(
         &mut self,
         device: &wgpu::Device,
-        key: u64,
-        scene: &DebugScene,
-        tint: Option<[f32; 4]>,
+        body: &GpuBody,
     ) -> Option<&BodyMeshGpuBuffer> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.buffers.entry(key) {
-            let mut vertices = Vec::with_capacity(scene.triangles.len() * 3);
-            let default_color = tint.unwrap_or([0.78, 0.82, 0.88, 1.0]);
-
-            for triangle in &scene.triangles {
-                let normals = triangle.normals;
-                for (index, &point) in triangle.vertices.iter().enumerate() {
-                    let normal = normals[index];
-                    vertices.push(GpuVertex {
-                        position: [point.x as f32, point.y as f32, point.z as f32],
-                        _pad0: 0.0,
-                        normal: [normal.x as f32, normal.y as f32, normal.z as f32],
-                        _pad1: 0.0,
-                        color: default_color,
-                    });
-                }
-            }
-
+        let stale = self
+            .buffers
+            .get(&body.key)
+            .is_none_or(|held| held.revision != body.revision);
+        if stale {
+            let vertices = body_vertices(body);
             if vertices.is_empty() {
+                self.buffers.remove(&body.key);
                 return None;
             }
 
-            let vertex_buffer = Box::leak(Box::new(device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("artificer.viewport.body_mesh"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                },
-            )));
-
-            e.insert(BodyMeshGpuBuffer {
-                vertex_buffer,
-                vertex_count: vertices.len() as u32,
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("artificer.viewport.body_mesh"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
             });
+
+            self.buffers.insert(
+                body.key,
+                BodyMeshGpuBuffer {
+                    vertex_buffer,
+                    vertex_count: vertices.len() as u32,
+                    revision: body.revision,
+                },
+            );
         }
 
-        self.buffers.get(&key)
+        self.buffers.get(&body.key)
+    }
+
+    /// Drops every body the frame no longer draws.
+    pub fn retain_live(&mut self, live: &[GpuBody]) {
+        self.buffers
+            .retain(|key, _| live.iter().any(|body| body.key == *key));
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
     }
 
     pub fn clear(&mut self) {
@@ -181,23 +245,21 @@ impl BodyMeshCache {
 }
 
 pub struct GpuViewportPipeline {
-    shader: &'static wgpu::ShaderModule,
-    pipeline_layout: &'static wgpu::PipelineLayout,
-    pipelines: HashMap<wgpu::TextureFormat, &'static wgpu::RenderPipeline>,
-    uniform_buffer: &'static wgpu::Buffer,
-    bind_group: &'static wgpu::BindGroup,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
+    pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
     mesh_cache: BodyMeshCache,
     active_format: wgpu::TextureFormat,
 }
 
 impl GpuViewportPipeline {
     pub fn new(device: &wgpu::Device, initial_format: wgpu::TextureFormat) -> Self {
-        let shader = Box::leak(Box::new(device.create_shader_module(
-            wgpu::ShaderModuleDescriptor {
-                label: Some("artificer.viewport.shader"),
-                source: wgpu::ShaderSource::Wgsl(WGSL_SHADER.into()),
-            },
-        )));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("artificer.viewport.shader"),
+            source: wgpu::ShaderSource::Wgsl(WGSL_SHADER.into()),
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("artificer.viewport.bind_group_layout"),
@@ -213,31 +275,27 @@ impl GpuViewportPipeline {
             }],
         });
 
-        let uniform_buffer = Box::leak(Box::new(device.create_buffer(&wgpu::BufferDescriptor {
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("artificer.viewport.uniform_buffer"),
             size: std::mem::size_of::<GpuViewportUniforms>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        })));
+        });
 
-        let bind_group = Box::leak(Box::new(device.create_bind_group(
-            &wgpu::BindGroupDescriptor {
-                label: Some("artificer.viewport.bind_group"),
-                layout: &bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                }],
-            },
-        )));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("artificer.viewport.bind_group"),
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
 
-        let pipeline_layout = Box::leak(Box::new(device.create_pipeline_layout(
-            &wgpu::PipelineLayoutDescriptor {
-                label: Some("artificer.viewport.pipeline_layout"),
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            },
-        )));
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("artificer.viewport.pipeline_layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
 
         let mut slf = Self {
             shader,
@@ -261,53 +319,46 @@ impl GpuViewportPipeline {
         slf
     }
 
-    pub fn ensure_pipeline(
-        &mut self,
-        device: &wgpu::Device,
-        format: wgpu::TextureFormat,
-    ) -> &'static wgpu::RenderPipeline {
-        if let Some(&pipeline) = self.pipelines.get(&format) {
-            return pipeline;
+    pub fn ensure_pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
+        if self.pipelines.contains_key(&format) {
+            return;
         }
 
-        let pipeline = Box::leak(Box::new(device.create_render_pipeline(
-            &wgpu::RenderPipelineDescriptor {
-                label: Some("artificer.viewport.render_pipeline"),
-                layout: Some(self.pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: self.shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[GpuVertex::LAYOUT],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: self.shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: None,
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("artificer.viewport.render_pipeline"),
+            layout: Some(&self.pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &self.shader,
+                entry_point: Some("vs_main"),
+                buffers: &[GpuVertex::LAYOUT],
+                compilation_options: Default::default(),
             },
-        )));
+            fragment: Some(wgpu::FragmentState {
+                module: &self.shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
 
         self.pipelines.insert(format, pipeline);
-        pipeline
     }
 
     pub fn mesh_cache_mut(&mut self) -> &mut BodyMeshCache {
@@ -345,7 +396,7 @@ impl GpuViewportPipeline {
             ],
         };
 
-        queue.write_buffer(self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
 }
 
@@ -354,17 +405,12 @@ pub struct ViewportGpuCallback {
     pub aspect_ratio: f32,
     pub is_shaded: bool,
     pub target_format: wgpu::TextureFormat,
-    pub bodies: Vec<(u64, DebugScene, Option<[f32; 4]>)>,
+    pub bodies: Vec<GpuBody>,
 }
 
 impl ViewportGpuCallback {
     #[must_use]
-    pub fn new(
-        view: ViewState,
-        aspect_ratio: f32,
-        is_shaded: bool,
-        bodies: Vec<(u64, DebugScene, Option<[f32; 4]>)>,
-    ) -> Self {
+    pub fn new(view: ViewState, aspect_ratio: f32, is_shaded: bool, bodies: Vec<GpuBody>) -> Self {
         Self {
             view,
             aspect_ratio,
@@ -392,11 +438,12 @@ impl egui_wgpu::CallbackTrait for ViewportGpuCallback {
         pipeline.ensure_pipeline(device, self.target_format);
         pipeline.prepare(queue, self.view, self.aspect_ratio, self.is_shaded);
 
-        for (key, scene, tint) in &self.bodies {
-            pipeline
-                .mesh_cache_mut()
-                .get_or_upload(device, *key, scene, *tint);
+        for body in &self.bodies {
+            pipeline.mesh_cache_mut().get_or_upload(device, body);
         }
+        // A body hidden, deleted or moved to another document keeps no
+        // buffer: the cache holds exactly what the frame draws.
+        pipeline.mesh_cache_mut().retain_live(&self.bodies);
 
         Vec::new()
     }
@@ -412,13 +459,12 @@ impl egui_wgpu::CallbackTrait for ViewportGpuCallback {
                 .pipelines
                 .get(&pipeline.active_format)
                 .or_else(|| pipeline.pipelines.get(&wgpu::TextureFormat::Rgba8Unorm))
-                .copied()
-                .unwrap_or(pipeline.pipeline_for_fallback());
+                .unwrap_or_else(|| pipeline.pipeline_for_fallback());
 
-            for (key, _, _) in &self.bodies {
-                if let Some(buffer) = pipeline.mesh_cache.buffers.get(key) {
+            for body in &self.bodies {
+                if let Some(buffer) = pipeline.mesh_cache.buffers.get(&body.key) {
                     render_pass.set_pipeline(active_pipe);
-                    render_pass.set_bind_group(0, pipeline.bind_group, &[]);
+                    render_pass.set_bind_group(0, &pipeline.bind_group, &[]);
                     render_pass.set_vertex_buffer(0, buffer.vertex_buffer.slice(..));
                     render_pass.draw(0..buffer.vertex_count, 0..1);
                 }
@@ -428,11 +474,10 @@ impl egui_wgpu::CallbackTrait for ViewportGpuCallback {
 }
 
 impl GpuViewportPipeline {
-    fn pipeline_for_fallback(&self) -> &'static wgpu::RenderPipeline {
+    fn pipeline_for_fallback(&self) -> &wgpu::RenderPipeline {
         self.pipelines
             .values()
             .next()
-            .copied()
             .expect("GpuViewportPipeline must have at least one pipeline")
     }
 }

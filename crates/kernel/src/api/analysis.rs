@@ -21,7 +21,7 @@ use artificer_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::api::interference::{ClearanceState, FacetIndex, Placement, clearance};
+use crate::api::interference::{ClearanceState, FacetIndex, Placement, clearance, clearance_field};
 use crate::{CancellationToken, NativeKernel, Snapshot};
 
 /// The shape of the document this module publishes. A reader that
@@ -188,6 +188,39 @@ pub fn interference_study(
         tier,
         elapsed_ms: started.elapsed().as_millis() as u64,
     }
+}
+
+/// The heat map of a whole study: for each subject, the signed clearance
+/// from every corner of its display facets to the nearest of the others, in
+/// scene order.
+///
+/// One index per subject is built and shared by every subject that reads it,
+/// so `n` bodies cost `n` builds rather than `n(n - 1)`. A cancelled study
+/// leaves the fields it had not reached empty rather than partly filled: a
+/// half-measured body would paint as clear where nothing had looked yet.
+#[must_use]
+pub fn clearance_fields(subjects: &[Subject], cancellation: &CancellationToken) -> Vec<Vec<f64>> {
+    let indices = subjects
+        .iter()
+        .map(|subject| FacetIndex::build(&subject.snapshot, subject.placement))
+        .collect::<Vec<_>>();
+    subjects
+        .iter()
+        .enumerate()
+        .map(|(current, subject)| {
+            if cancellation.is_cancelled() {
+                return Vec::new();
+            }
+            let others = indices
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != current)
+                .map(|(_, index)| index)
+                .collect::<Vec<_>>();
+            let scene = NativeKernel::debug_scene(&subject.snapshot);
+            clearance_field(&scene, subject.placement, &others)
+        })
+        .collect()
 }
 
 fn count(pairs: &[PairReport], state: ClearanceState) -> usize {

@@ -1752,6 +1752,88 @@ struct WorkbenchBody {
     material: Option<String>,
 }
 
+/// The clearance measured over every visible body, ready to paint.
+///
+/// One reading per facet corner, in the scene order the viewport walks, so
+/// the renderer interpolates the measurement across each facet instead of
+/// showing the tessellation it was measured on.
+#[derive(Clone, Debug)]
+struct ClearanceHeatMap {
+    fields: Vec<(BodyId, Vec<f32>)>,
+    palette: viewport::HeatPalette,
+    /// Changes with every study, so the viewport's uploaded colours are
+    /// replaced rather than kept.
+    epoch: u64,
+    visible: bool,
+}
+
+impl ClearanceHeatMap {
+    /// The field for one body, when it is showing and still describes the
+    /// facets it is about to be painted over.
+    ///
+    /// The length check is what keeps an edit from painting last study's
+    /// readings onto this body's new facets: a field is bound to the
+    /// tessellation it was measured on, and a body that has been rebuilt
+    /// simply has no reading yet.
+    fn field_for(&self, body: BodyId, samples: usize) -> Option<viewport::SurfaceField<'_>> {
+        if !self.visible {
+            return None;
+        }
+        self.fields
+            .iter()
+            .find(|(held, values)| *held == body && values.len() == samples)
+            .map(|(_, values)| viewport::SurfaceField {
+                values,
+                palette: self.palette,
+                epoch: self.epoch,
+            })
+    }
+}
+
+/// Builds the heat map a study leaves behind.
+///
+/// The ramp spans zero to the ninetieth percentile of the readings rather
+/// than to the largest of them: one body parked far across the workspace
+/// would otherwise stretch the scale until every real fit read as tight.
+fn heat_map_from(
+    bodies: &[BodyId],
+    fields: Vec<Vec<f64>>,
+    previous: Option<&ClearanceHeatMap>,
+) -> Option<ClearanceHeatMap> {
+    let fields = bodies
+        .iter()
+        .copied()
+        .zip(fields)
+        .map(|(body, values)| {
+            let values = values.into_iter().map(|value| value as f32).collect();
+            (body, values)
+        })
+        .collect::<Vec<(BodyId, Vec<f32>)>>();
+    if fields.iter().all(|(_, values)| values.is_empty()) {
+        return None;
+    }
+    let mut readings = fields
+        .iter()
+        .flat_map(|(_, values)| values.iter().copied())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<f32>>();
+    let far = if readings.is_empty() {
+        1.0
+    } else {
+        let index = (readings.len() * 9 / 10).min(readings.len() - 1);
+        let (_, value, _) = readings.select_nth_unstable_by(index, f32::total_cmp);
+        value.max(1.0e-3)
+    };
+    Some(ClearanceHeatMap {
+        fields,
+        palette: viewport::HeatPalette::Gradient { near: 0.0, far },
+        epoch: previous.map_or(1, |held| held.epoch + 1),
+        // A study is asked for; its picture arrives with it. What the user
+        // then chooses to do with the toggle survives the next study.
+        visible: previous.is_none_or(|held| held.visible),
+    })
+}
+
 #[derive(Clone, Debug)]
 struct WorkbenchSketch {
     id: Option<SketchId>,
@@ -2058,6 +2140,10 @@ pub struct KernelLabApp {
     /// it. A study is a reading, not a feature: it never enters the
     /// history and never touches a snapshot.
     interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
+    /// The clearance heat map from that study, painted over the bodies it
+    /// was measured on. Kept beside the report rather than inside it: the
+    /// report is a published document, and this is a picture of it.
+    heat_map: Option<ClearanceHeatMap>,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
@@ -2226,6 +2312,7 @@ impl Default for KernelLabApp {
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
             interference: None,
+            heat_map: None,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
             section_analysis: SectionAnalysis::default(),
@@ -9551,9 +9638,15 @@ impl KernelLabApp {
     /// document, so it needs no confirmation gate and leaves no feature
     /// behind.
     pub fn run_interference_study(&mut self) {
-        use artificer_kernel::api::analysis::{Subject, interference_study};
+        use artificer_kernel::api::analysis::{Subject, clearance_fields, interference_study};
         use artificer_kernel::api::interference::Placement;
 
+        let visible = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
         let subjects = self
             .bodies
             .iter()
@@ -9575,13 +9668,13 @@ impl KernelLabApp {
             self.document_status =
                 Some("Interference needs two visible bodies to compare".to_owned());
             self.interference = None;
+            self.heat_map = None;
             return;
         }
-        let report = interference_study(
-            &subjects,
-            self.document_precision(),
-            &CancellationToken::new(),
-        );
+        let cancellation = CancellationToken::new();
+        let report = interference_study(&subjects, self.document_precision(), &cancellation);
+        let fields = clearance_fields(&subjects, &cancellation);
+        self.heat_map = heat_map_from(&visible, fields, self.heat_map.as_ref());
         self.document_status = Some(match (report.interfering, report.touching) {
             (0, 0) => format!(
                 "No interference across {} pairs{}",
@@ -9740,12 +9833,31 @@ impl KernelLabApp {
         }
 
         ui.add_space(6.0);
+        // The table says which pairs fail; the heat map says where on the
+        // parts they fail. Both come from the same study, so the toggle sits
+        // with the table rather than in a menu somewhere else.
+        if let Some(heat_map) = self.heat_map.as_mut() {
+            let mut visible = heat_map.visible;
+            if ui
+                .checkbox(&mut visible, "Heat map")
+                .on_hover_text(
+                    "Paint every body by how close it comes to the others. \
+                     Magenta is a collision, red is tight, blue is clear.",
+                )
+                .changed()
+            {
+                heat_map.visible = visible;
+            }
+        }
+
+        ui.add_space(4.0);
         if ui
             .button("Dismiss")
             .on_hover_text("Clear the study. Nothing in the document changes either way.")
             .clicked()
         {
             self.interference = None;
+            self.heat_map = None;
         }
     }
 
@@ -15820,6 +15932,11 @@ impl KernelLabApp {
             egui::vec2((available.x - 14.0).max(1.0), (available.y - 14.0).max(1.0));
         self.last_model_viewport_size = Some(viewport_size);
         self.refresh_display_detail_buckets(viewport_size);
+        // The body instances borrow the heat map's readings for as long as
+        // the viewport is drawing them, and the viewport also writes the
+        // camera back. Lifting the readings out of the document for the
+        // duration is what lets both be true at once.
+        let heat_map = self.heat_map.take();
 
         let frame_output = Frame::new()
             .fill(theme::viewport_bottom())
@@ -15879,6 +15996,9 @@ impl KernelLabApp {
                                         .map(|found| found.colour)
                                 },
                             )
+                            .with_field(heat_map.as_ref().and_then(|heat_map| {
+                                heat_map.field_for(body.id, scene.triangles.len() * 3)
+                            }))
                             .with_base_transform(self.occurrence_transform_for_body(body.id)),
                         )
                     })
@@ -16104,6 +16224,7 @@ impl KernelLabApp {
                     }
                 }
             });
+        self.heat_map = heat_map;
         self.model_canvas_overlay(ui, frame_output.response.rect.shrink(7.0));
         self.sync_transform_preview();
     }
@@ -23610,6 +23731,66 @@ mod extrusion_workbench_tests {
             "{:?}",
             app.document_status
         );
+    }
+
+    #[test]
+    fn a_study_leaves_a_heat_map_bound_to_the_facets_it_was_measured_on() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+
+        app.run_interference_study();
+        let heat_map = app.heat_map.as_ref().expect("a heat map");
+        assert!(heat_map.visible, "the picture arrives with the study");
+        assert_eq!(heat_map.fields.len(), app.bodies.len());
+        for body in &app.bodies {
+            let samples = body.body.scene.triangles.len() * 3;
+            let field = heat_map
+                .field_for(body.id, samples)
+                .expect("a field for every visible body");
+            assert_eq!(field.values.len(), samples);
+            assert!(
+                field.values.iter().all(|value| !value.is_nan()),
+                "every corner was measured"
+            );
+            // A field is bound to the tessellation it was measured on: ask
+            // for a different one and there is no reading.
+            assert!(heat_map.field_for(body.id, samples + 3).is_none());
+        }
+
+        // The ramp is derived from the readings, so it spans a real gap.
+        match heat_map.palette {
+            viewport::HeatPalette::Gradient { near, far } => {
+                assert_eq!(near, 0.0);
+                assert!(far > 0.0 && far.is_finite(), "ramp to {far}");
+            }
+            other => panic!("a study opens on the measured ramp, not {other:?}"),
+        }
+
+        // Turning it off keeps the study and stops the painting; a second
+        // study respects that choice and moves the epoch on.
+        let first_epoch = heat_map.epoch;
+        app.heat_map.as_mut().expect("a heat map").visible = false;
+        app.run_interference_study();
+        let heat_map = app.heat_map.as_ref().expect("a heat map");
+        assert!(!heat_map.visible, "the toggle survives the next study");
+        assert!(heat_map.epoch > first_epoch, "a new study is a new upload");
+        assert!(
+            heat_map
+                .field_for(
+                    app.bodies[0].id,
+                    app.bodies[0].body.scene.triangles.len() * 3
+                )
+                .is_none(),
+            "a hidden heat map paints nothing"
+        );
+
+        // Dismissing the study takes the picture with it.
+        app.interference = None;
+        app.heat_map = None;
+        app.run_interference_study();
+        assert!(app.heat_map.is_some(), "a fresh study builds a fresh map");
     }
 
     #[test]

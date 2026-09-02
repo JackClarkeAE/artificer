@@ -214,3 +214,69 @@ fn an_empty_body_is_never_close_to_anything() {
     assert_eq!(report.state, ClearanceState::Clear);
     assert!(report.distance.is_infinite());
 }
+
+#[test]
+fn a_clearance_field_reads_at_every_corner_and_signs_penetration() {
+    // Two cubes 5 mm apart on x. The near wall of the left one reads 5;
+    // its far wall reads 15, the whole span of the right cube away.
+    let left = cuboid([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+    let right = index(&cuboid([15.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+    let scene = artificer_kernel::NativeKernel::debug_scene(&left);
+    let field = artificer_kernel::api::interference::clearance_field(
+        &scene,
+        Placement::IDENTITY,
+        &[&right],
+    );
+
+    assert_eq!(
+        field.len(),
+        scene.triangles.len() * 3,
+        "one reading per facet corner"
+    );
+    let nearest = field.iter().copied().fold(f64::INFINITY, f64::min);
+    let farthest = field.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert!((nearest - 5.0).abs() <= 1.0e-9, "nearest {nearest}");
+    assert!((farthest - 15.0).abs() <= 1.0e-9, "farthest {farthest}");
+    assert!(field.iter().all(|value| *value > 0.0), "nothing overlaps");
+
+    // Driven 3 mm into a cube that swallows it in y and z, the corners
+    // inside read negative, and the deepest is the 3 mm of travel.
+    let driven = index(&cuboid([7.0, -5.0, -5.0], [10.0, 20.0, 20.0]));
+    let field = artificer_kernel::api::interference::clearance_field(
+        &scene,
+        Placement::IDENTITY,
+        &[&driven],
+    );
+    let deepest = field.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!((deepest + 3.0).abs() <= 1.0e-9, "deepest {deepest}");
+    assert!(
+        field.iter().any(|value| *value > 0.0),
+        "the far side of the cube is still clear of it"
+    );
+}
+
+#[test]
+fn a_clearance_field_takes_the_nearest_of_several_bodies_and_is_infinite_alone() {
+    let subject = cuboid([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+    let scene = artificer_kernel::NativeKernel::debug_scene(&subject);
+    let far = index(&cuboid([40.0, 0.0, 0.0], [10.0, 10.0, 10.0]));
+    let near = index(&cuboid([-4.0, 0.0, 0.0], [2.0, 10.0, 10.0]));
+
+    let alone =
+        artificer_kernel::api::interference::clearance_field(&scene, Placement::IDENTITY, &[]);
+    assert!(
+        alone.iter().all(|value| value.is_infinite()),
+        "nothing to measure against is not a clearance of zero"
+    );
+
+    let both = artificer_kernel::api::interference::clearance_field(
+        &scene,
+        Placement::IDENTITY,
+        &[&far, &near],
+    );
+    let nearest = both.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        (nearest - 2.0).abs() <= 1.0e-9,
+        "the near body wins: {nearest}"
+    );
+}

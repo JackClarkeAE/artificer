@@ -5,7 +5,7 @@ use std::f64::consts::PI;
 
 use artificer_kernel::CancellationToken;
 use artificer_kernel::api::analysis::{
-    ANALYSIS_SCHEMA_VERSION, Subject, interference_study, study_session_steps,
+    ANALYSIS_SCHEMA_VERSION, Subject, clearance_fields, interference_study, study_session_steps,
 };
 use artificer_kernel::api::interference::{ClearanceState, Placement};
 use artificer_kernel::api::session::Session;
@@ -185,4 +185,53 @@ fn a_study_needs_two_bodies_and_names_a_step_it_cannot_find() {
     )
     .expect_err("an unknown step");
     assert!(error.message.contains("nowhere"), "{}", error.message);
+}
+
+#[test]
+fn a_study_paints_each_subject_by_its_clearance_to_the_others() {
+    let session = session(STACK);
+    let subject = |label: &str| {
+        let id = session.step_snapshots.get(label).expect("a step");
+        Subject::new(
+            label,
+            session.snapshot_cache.get(id).expect("a snapshot").clone(),
+        )
+    };
+    let subjects = vec![subject("plate"), subject("post"), subject("pin")];
+    let fields = clearance_fields(&subjects, &CancellationToken::default());
+
+    assert_eq!(fields.len(), 3, "one field per subject");
+    for (subject, field) in subjects.iter().zip(&fields) {
+        let scene = artificer_kernel::NativeKernel::debug_scene(&subject.snapshot);
+        assert_eq!(
+            field.len(),
+            scene.triangles.len() * 3,
+            "{} reads at every facet corner",
+            subject.name
+        );
+    }
+
+    // The post stands 2 mm clear of the plate, so nothing on it is nearer
+    // than that except where the pin is driven through it.
+    let post = &fields[1];
+    assert!(
+        post.iter().any(|value| *value < 0.0),
+        "the pin passes through the post"
+    );
+    let clear = post
+        .iter()
+        .copied()
+        .filter(|value| *value > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    assert!(clear <= 2.0 + 1.0e-6, "nearest clear reading {clear}");
+
+    // A cancelled study leaves the fields it never reached empty rather
+    // than reporting an unmeasured body as clear.
+    let cancelled = CancellationToken::default();
+    cancelled.cancel();
+    assert!(
+        clearance_fields(&subjects, &cancelled)
+            .iter()
+            .all(Vec::is_empty)
+    );
 }

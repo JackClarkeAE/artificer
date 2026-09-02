@@ -466,6 +466,71 @@ pub fn clearance(a: &FacetIndex, b: &FacetIndex, precision: PrecisionPolicy) -> 
     }
 }
 
+/// The signed clearance from every vertex of a scene's facets to the
+/// nearest of the other bodies, in scene order: three values per facet, one
+/// per corner.
+///
+/// Positive is a gap. Negative is penetration, and its magnitude is how far
+/// inside the nearest other body that corner sits, which is what tells a
+/// collision from a tight fit. A vertex with no other body to measure
+/// against reads infinite.
+///
+/// Sampling at corners rather than at facet centres is what lets a renderer
+/// interpolate the reading across a facet: a tessellated cylinder then
+/// shows the clearance rather than its own tessellation.
+///
+/// Corners alone would miss a collision that falls wholly inside a facet — a
+/// pin driven through the middle of a disc has every corner of that disc on
+/// its rim, outside the pin. So each facet's centre is read too, and a
+/// facet whose centre is inside another body is painted as collision
+/// throughout. That over-states a collision by at most one facet and never
+/// hides one, which is the direction a fit check has to err in.
+#[must_use]
+pub fn clearance_field(
+    scene: &DebugScene,
+    placement: Placement,
+    others: &[&FacetIndex],
+) -> Vec<f64> {
+    let mut values = Vec::with_capacity(scene.triangles.len() * 3);
+    for triangle in &scene.triangles {
+        let placed = triangle.vertices.map(|point| placement.apply(point));
+        let mut corners = placed.map(|point| signed_clearance(point, others));
+        let centre = signed_clearance(facet_centre(&placed), others);
+        if centre < 0.0 {
+            for corner in &mut corners {
+                *corner = corner.min(centre);
+            }
+        }
+        values.extend_from_slice(&corners);
+    }
+    values
+}
+
+/// The nearest signed clearance from one point to a set of bodies.
+fn signed_clearance(point: Point3, others: &[&FacetIndex]) -> f64 {
+    let mut best = f64::INFINITY;
+    for other in others {
+        let Some(bounds) = other.bounds() else {
+            continue;
+        };
+        // The surface distance is a descent that prunes; containment is a
+        // ray cast that does not, so it is asked only of the points whose
+        // answer could be yes at all. It cannot be skipped on the running
+        // minimum: a point deep inside one body reads a large distance and
+        // still belongs below a small gap to another.
+        let distance = other.distance_to_surface(point);
+        let signed = if inside_bounds(point, bounds) && other.contains(point) {
+            -distance
+        } else {
+            distance
+        };
+        if signed < best {
+            best = signed;
+        }
+    }
+    best
+}
+
 /// Whether any vertex of `inner`'s facets lies inside `outer`.
 ///
 /// One vertex is enough: a solid that merely touches another has its whole
