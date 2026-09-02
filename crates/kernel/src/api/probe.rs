@@ -14,6 +14,7 @@ use artificer_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::api::debug::{ApiError, ApiErrorCode};
+use crate::api::interference::{FacetIndex, Placement, clearance};
 use crate::api::query::MeasureTarget;
 use crate::api::selectors::{EntitySelector, point_triangle_distance_sq, resolve_selector};
 use crate::api::session::Session;
@@ -55,6 +56,11 @@ pub enum ProbeRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step: Option<String>,
     },
+    /// The closest approach of the bodies two steps left behind, with
+    /// where it is and whether they are apart, touching, or inside one
+    /// another. No Boolean runs, so this answers for bodies the Boolean
+    /// engine would refuse.
+    Clearance { a: String, b: String },
     /// The thinnest wall of a body: the shortest inward ray from any facet
     /// centre to the far side. Read off display facets.
     MinWall {
@@ -152,6 +158,7 @@ pub fn probe(session: &Session, request: &ProbeRequest) -> Result<ProbeResult, A
         }
         ProbeRequest::Distance { from, to } => distance(session, from, to),
         ProbeRequest::IntersectionVolume { a, b } => intersection_volume(session, a, b),
+        ProbeRequest::Clearance { a, b } => clearance_between(session, a, b),
         ProbeRequest::Contains { point, step } => {
             let (snapshot, tier) = body(session, step.as_deref())?;
             let scene = NativeKernel::debug_scene(snapshot);
@@ -195,6 +202,40 @@ pub fn probe(session: &Session, request: &ProbeRequest) -> Result<ProbeResult, A
             })
         }
     }
+}
+
+/// The closest approach of two committed bodies.
+fn clearance_between(session: &Session, a: &str, b: &str) -> Result<ProbeResult, ApiError> {
+    let (first, _) = body(session, Some(a))?;
+    let (second, _) = body(session, Some(b))?;
+    let precision = first.precision_policy().unwrap_or_default();
+    let left = FacetIndex::build(first, Placement::IDENTITY);
+    let right = FacetIndex::build(second, Placement::IDENTITY);
+    let report = clearance(&left, &right, precision);
+    Ok(ProbeResult {
+        probe: "clearance".to_owned(),
+        value: report.distance,
+        unit: "mm".to_owned(),
+        tier: report.tier,
+        method: if report.bound > 0.0 {
+            format!(
+                "closest approach of display facets, within {} mm of the true surfaces",
+                report.bound
+            )
+        } else {
+            "closest approach of exact planar geometry".to_owned()
+        },
+        detail: format!(
+            "\"{a}\" and \"{b}\" are {}; closest at ({:.4}, {:.4}, {:.4}) and ({:.4}, {:.4}, {:.4})",
+            report.state.as_str(),
+            report.witness_a.x,
+            report.witness_a.y,
+            report.witness_a.z,
+            report.witness_b.x,
+            report.witness_b.y,
+            report.witness_b.z
+        ),
+    })
 }
 
 fn tier_detail(tier: Tier) -> String {

@@ -92,6 +92,23 @@ fn restore_all_shell_regions(harness: &mut Harness<'static, KernelLabApp>) {
 }
 
 #[test]
+fn the_features_group_offers_shell_and_the_hole_ring_by_their_ribbon_names() {
+    // Both commands were added to a group whose buttons are narrow, so the
+    // visible label has to be one that fits rather than one that truncates.
+    let mut harness = harness();
+    harness.run();
+    for label in ["Shell", "Hole ring"] {
+        assert!(
+            harness
+                .get_by_role_and_label(Role::Button, label)
+                .rect()
+                .is_positive(),
+            "{label} must be on the Features group"
+        );
+    }
+}
+
+#[test]
 fn document_properties_popout_changes_units_and_exposes_real_file_actions() {
     let mut harness = harness();
     harness.run();

@@ -10,6 +10,7 @@ pub mod debug;
 pub mod decompile;
 pub mod diff;
 pub mod export;
+pub mod interference;
 pub mod journal;
 pub mod probe;
 pub mod query;

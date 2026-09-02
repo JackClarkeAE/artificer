@@ -139,6 +139,7 @@ that step left behind; without one it reads the current body.
 
 | Probe | Answer | Tier |
 | --- | --- | --- |
+| `clearance` `{a, b}` | The closest approach of two bodies, mm, with where it is and whether they are apart, touching or inside one another. | Exact between planar bodies; otherwise facet-derived, with the chord bound named in `method`. |
 | `volume` `{step?}` | Exact volume, mm³. | Exact unless the body is faceted. |
 | `surface_area` `{step?}` | Exact surface area, mm². | As above. |
 | `area` `{face}` | Exact area of one face, mm². | As above. |

@@ -878,7 +878,7 @@ impl SolidFeaturePreset {
             Self::Rib => "Add rib",
             Self::Mirror => "Mirror body",
             Self::LinearPattern => "Linear body pattern",
-            Self::HolePattern => "Hole pattern",
+            Self::HolePattern => "Hole ring",
             Self::Shell => "Shell body",
             Self::Chamfer => "Chamfer edge",
             Self::Fillet => "Fillet edge",
@@ -9593,6 +9593,142 @@ impl KernelLabApp {
         true
     }
 
+    /// The staged Boolean's operands, as the card shows them.
+    ///
+    /// Everything here is also reachable by clicking bodies in the viewport;
+    /// this is the surface that says what those clicks did, and the only one
+    /// that can name a target without making it active first.
+    fn boolean_operand_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(PendingOperation::BooleanBodies {
+            target, operation, ..
+        }) = self.pending_operation
+        else {
+            return;
+        };
+        let bodies = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| (body.id, body.ordinal))
+            .collect::<Vec<_>>();
+        let name = |ordinal: u32| format!("Body {ordinal}");
+        let target_name = bodies
+            .iter()
+            .find(|(id, _)| *id == target)
+            .map_or_else(|| "Body".to_owned(), |(_, ordinal)| name(*ordinal));
+
+        status_line(
+            ui,
+            match operation {
+                BooleanOperation::Union => "Join",
+                BooleanOperation::Difference => "Cut",
+                BooleanOperation::Intersection => "Intersect",
+            },
+            theme::accent(),
+        );
+        ui.add_space(4.0);
+
+        // The target survives the operation, so it is named first and on its
+        // own: every other body in the list is something being spent.
+        ui.label(RichText::new("Target · kept").small().color(theme::muted()));
+        let mut chosen_target = None;
+        egui::ComboBox::from_id_salt("boolean_target_picker")
+            .selected_text(target_name)
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                for (id, ordinal) in &bodies {
+                    if ui.selectable_label(*id == target, name(*ordinal)).clicked() {
+                        chosen_target = Some(*id);
+                    }
+                }
+            });
+        if let Some(chosen) = chosen_target {
+            self.set_boolean_target(chosen);
+        }
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(if self.boolean_keep_tools() {
+                "Tools · kept"
+            } else {
+                "Tools · consumed"
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        let mut toggled = None;
+        for (id, ordinal) in &bodies {
+            if *id == target {
+                continue;
+            }
+            let mut held = self.boolean_tools.contains(id);
+            if ui.checkbox(&mut held, name(*ordinal)).changed() {
+                toggled = Some(*id);
+            }
+        }
+        if let Some(body) = toggled {
+            self.toggle_boolean_tool(body);
+        }
+        if bodies.len() < 2 {
+            ui.label(
+                RichText::new("No other visible body to combine with.")
+                    .small()
+                    .color(theme::muted()),
+            );
+        }
+
+        ui.add_space(6.0);
+        let mut keep = self.boolean_keep_tools();
+        if ui
+            .checkbox(&mut keep, "Keep tool bodies after the operation")
+            .changed()
+        {
+            self.set_boolean_keep_tools(keep);
+        }
+
+        // The kernel refuses by name. Repeating that reason where the operands
+        // are picked is what turns a refusal into something the user can act
+        // on, rather than a sentence that scrolled past in the status line.
+        if let Attempt::Rejected { operation, error } = &self.last_attempt
+            && *operation == "Body Boolean"
+        {
+            ui.add_space(6.0);
+            let reason = error
+                .diagnostics
+                .first()
+                .map_or_else(|| error.message.clone(), |first| first.message.clone());
+            ui.label(RichText::new(reason).small().color(theme::bad()));
+        }
+    }
+
+    /// Whether the staged Boolean keeps its tool bodies.
+    fn boolean_keep_tools(&self) -> bool {
+        matches!(
+            self.pending_operation,
+            Some(PendingOperation::BooleanBodies {
+                keep_tools: true,
+                ..
+            })
+        )
+    }
+
+    /// Names a different body as the staged Boolean's target.
+    ///
+    /// A body cannot be both operands, so naming one that is already a tool
+    /// drops it from the tool set rather than refusing the pick.
+    fn set_boolean_target(&mut self, body: BodyId) {
+        let Some(PendingOperation::BooleanBodies { target, .. }) = self.pending_operation.as_mut()
+        else {
+            return;
+        };
+        if *target == body {
+            return;
+        }
+        *target = body;
+        self.boolean_tools.retain(|held| *held != body);
+        self.document_status = Some(self.boolean_operand_summary());
+    }
+
     fn set_boolean_keep_tools(&mut self, keep: bool) {
         if let Some(PendingOperation::BooleanBodies { keep_tools, .. }) =
             self.pending_operation.as_mut()
@@ -14011,6 +14147,22 @@ impl KernelLabApp {
                         theme::property_row(ui, "Type", kind);
                         theme::property_row_colored(ui, "Entity", &format!("#{id}"), theme::accent())
                             .on_hover_text(detail);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                // A Boolean's operands used to be nowhere but the status line:
+                // the card asked for a confirmation without showing what was
+                // about to be combined. Naming them here is what makes the
+                // gate answerable.
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(
+                        self.pending_operation,
+                        Some(PendingOperation::BooleanBodies { .. })
+                    )
+                {
+                    card(ui, "boolean_operands", "OPERANDS", &mut |ui| {
+                        self.boolean_operand_controls(ui);
                     });
                     ui.add_space(5.0);
                 }
@@ -23247,6 +23399,49 @@ mod extrusion_workbench_tests {
             let volume = app.displayed_measures().unwrap().volume;
             assert_eq!(volume > 24.0, adds_material, "{preset:?}: {volume}");
         }
+    }
+
+    #[test]
+    fn the_boolean_card_names_both_operands_and_keeps_tools_on_request() {
+        let mut app = KernelLabApp::default();
+        // Two bodies: the bootstrap cuboid and a second one from a revolve.
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2, "two bodies to combine");
+        let target = app.active_body_id().expect("an active body");
+        let other = app
+            .bodies
+            .iter()
+            .map(|body| body.id)
+            .find(|id| *id != target)
+            .expect("a second body");
+
+        app.stage_body_boolean(BooleanOperation::Union);
+        // Staging names no tool on purpose, so the gate cannot fire yet.
+        assert!(app.boolean_tools.is_empty());
+        assert!(!app.boolean_keep_tools());
+
+        // The panel can name a target that is not the active body, and doing
+        // so cannot leave the same body on both sides.
+        app.toggle_boolean_tool(other);
+        assert_eq!(app.boolean_tools, vec![other]);
+        app.set_boolean_target(other);
+        assert!(
+            app.boolean_tools.is_empty(),
+            "the new target drops out of the tool set"
+        );
+        app.set_boolean_target(target);
+        app.toggle_boolean_tool(other);
+
+        app.set_boolean_keep_tools(true);
+        assert!(app.boolean_keep_tools());
+        let before = app.bodies.len();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(
+            app.bodies.len(),
+            before,
+            "a kept tool stays in the document"
+        );
     }
 
     #[test]
