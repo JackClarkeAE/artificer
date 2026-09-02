@@ -28,8 +28,10 @@ let hub = revolve(sketch: section, axis: [0, 0, 1], angle: 360, label: "hub");
 drill(face: faces(">Z"), center: [0, 0], diameter: bore_diameter, depth: hub_height, label: "bore");
 
 // Four bolt holes on the flange, on a pitch circle between hub and rim.
+// The flange top is found by a point on it between two of the holes, so
+// the selector keeps finding the flange after the first hole is cut.
 let pitch = (hub_radius + flange_radius) / 2;
-let flange_top = nearest(point: [pitch, 0, flange_thickness], kind: "face");
+let flange_top = nearest(point: [pitch * cos(45), pitch * sin(45), flange_thickness], kind: "face");
 drill(face: flange_top, center: [pitch * cos(0), pitch * sin(0)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_0");
 drill(face: flange_top, center: [pitch * cos(90), pitch * sin(90)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_1");
 drill(face: flange_top, center: [pitch * cos(180), pitch * sin(180)], diameter: bolt_diameter, depth: flange_thickness, label: "bolt_2");

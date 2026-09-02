@@ -949,3 +949,51 @@ fn edge_selectors_never_answer_with_faces() {
     let error = compile_script(script, &BTreeMap::new()).expect_err("planar is not an edge rule");
     assert!(error.message().contains("Unknown edge selector"), "{error}");
 }
+
+#[test]
+fn a_direction_selector_prefers_the_face_farthest_along_it() {
+    // A boss on a plate: two faces look up, and ">Z" means the higher one.
+    let script = r#"
+        let plate = box(size: [40, 40, 10], label: "plate");
+        let boss_profile = sketch(on: faces(">Z"), label: "boss_profile", entities: [
+            rect(width: 16, height: 16),
+        ]);
+        extrude(sketch: boss_profile, distance: 12, operation: "add", label: "boss");
+    "#;
+    let commands = compile_script(script, &BTreeMap::new()).expect("compile");
+    let mut session = Session::new();
+    for command in commands {
+        session
+            .execute(command, &CancellationToken::default())
+            .expect("execute");
+    }
+    let top = EntitySelector::ByGeometry {
+        selector: GeometricSelector::FaceByNormal {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            match_kind: NormalMatch::Closest,
+        },
+    };
+    let boss_top = EntitySelector::ByGeometry {
+        selector: GeometricSelector::NearestTo {
+            point: Point3::new(20.0, 20.0, 22.0),
+            kind: artificer_protocol::EntityKind::Face,
+        },
+    };
+    let bottom = EntitySelector::ByGeometry {
+        selector: GeometricSelector::FaceByNormal {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            match_kind: NormalMatch::Farthest,
+        },
+    };
+    let plate_bottom = EntitySelector::ByGeometry {
+        selector: GeometricSelector::NearestTo {
+            point: Point3::new(20.0, 20.0, 0.0),
+            kind: artificer_protocol::EntityKind::Face,
+        },
+    };
+    let query = session.query();
+    let resolve =
+        |selector: &EntitySelector| query.entity_info(selector).expect("resolve").entity_ref;
+    assert_eq!(resolve(&top), resolve(&boss_top), "the boss top is the top");
+    assert_eq!(resolve(&bottom), resolve(&plate_bottom));
+}

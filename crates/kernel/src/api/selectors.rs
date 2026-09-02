@@ -591,13 +591,34 @@ fn resolve_geometric_selector(
                 ));
             }
 
+            // Where a face's triangles sit along the direction, for breaking
+            // ties between faces that point the same way: a stepped part has
+            // several faces looking up, and ">Z" means the top one.
+            let mut face_reach: BTreeMap<EntityId, f64> = BTreeMap::new();
+            for tri in &scene.triangles {
+                let reach = tri
+                    .vertices
+                    .iter()
+                    .map(|vertex| {
+                        vertex.x * target_dir.x + vertex.y * target_dir.y + vertex.z * target_dir.z
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let entry = face_reach
+                    .entry(tri.source_face.entity)
+                    .or_insert(f64::NEG_INFINITY);
+                *entry = entry.max(reach);
+            }
+
             let mut best_face = None;
+            // Closest, Farthest and Parallel score higher for a better face;
+            // Perpendicular scores the alignment it wants to minimise.
             let mut best_score = match match_kind {
-                NormalMatch::Closest => f64::NEG_INFINITY,
-                NormalMatch::Farthest => f64::INFINITY,
+                NormalMatch::Closest | NormalMatch::Farthest => f64::NEG_INFINITY,
                 NormalMatch::Parallel => -1.0,
                 NormalMatch::Perpendicular => f64::INFINITY,
             };
+            let mut best_reach = f64::NEG_INFINITY;
+            const TIE: f64 = 1.0e-9;
 
             for (face_id, (sum_n, count)) in face_normals {
                 let count_f = count as f64;
@@ -616,15 +637,28 @@ fn resolve_geometric_selector(
                     NormalMatch::Parallel => dot.abs(),
                     NormalMatch::Perpendicular => dot.abs(),
                 };
-
-                let is_better = match match_kind {
-                    NormalMatch::Closest | NormalMatch::Parallel => score > best_score,
-                    NormalMatch::Farthest => score < best_score,
-                    NormalMatch::Perpendicular => score < best_score,
+                // Closest wants the face farthest along the direction among
+                // equals; Farthest wants the one farthest against it.
+                let reach = face_reach
+                    .get(&face_id)
+                    .copied()
+                    .unwrap_or(f64::NEG_INFINITY);
+                let reach = match match_kind {
+                    NormalMatch::Farthest => -reach,
+                    _ => reach,
                 };
 
-                if is_better {
+                let is_tie = (score - best_score).abs() <= TIE;
+                let is_better = match match_kind {
+                    NormalMatch::Closest | NormalMatch::Farthest | NormalMatch::Parallel => {
+                        score > best_score + TIE
+                    }
+                    NormalMatch::Perpendicular => score < best_score - TIE,
+                };
+
+                if is_better || (is_tie && reach > best_reach) {
                     best_score = score;
+                    best_reach = reach;
                     best_face = Some(face_id);
                 }
             }
