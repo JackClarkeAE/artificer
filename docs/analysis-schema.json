@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artificer.dev/schemas/interference-report-1.json",
+  "title": "Artificer interference report",
+  "description": "The machine-readable answer to whether an assembly fits: every unordered pair of the named bodies, how close they come, where, and whether they are apart, touching or inside one another. Measured over a bounding-volume hierarchy of each body's facets rather than through a Boolean, so it answers for pairs the Boolean engine refuses; the overlap volume, which does need one, is present only where the engine could supply it. Produced by the JSON-RPC method `analysis.interference` and by `api::analysis::interference_study`. schema_version 1.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kernel_version": {
+      "type": "string"
+    },
+    "subjects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The bodies compared, in the order they were given. Pairs are reported in that order."
+    },
+    "pairs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pair"
+      }
+    },
+    "interfering": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "touching": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "clear": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tightest": {
+      "$ref": "#/$defs/tightest"
+    },
+    "tier": {
+      "$ref": "#/$defs/tier"
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "kernel_version",
+    "subjects",
+    "pairs",
+    "interfering",
+    "touching",
+    "clear",
+    "tier",
+    "elapsed_ms"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "tier": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "approximate"
+      ],
+      "description": "exact: both bodies are planar throughout, so their facets are their surfaces and the distance is the true one. approximate: at least one surface is curved and its facets are chords of it, so the measured gap is never smaller than the true gap and never larger than it by more than `bound`."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "touching",
+        "interfering"
+      ],
+      "description": "clear: the bodies are apart by `distance`. touching: their surfaces meet without either reaching inside the other. interfering: one body reaches inside the other, which for a body wholly contained still leaves a positive `distance` to the wall around it."
+    },
+    "point": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false
+    },
+    "pair": {
+      "type": "object",
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "distance": {
+          "type": "number",
+          "description": "The closest approach of the two surfaces, in millimetres."
+        },
+        "witness_a": {
+          "$ref": "#/$defs/point"
+        },
+        "witness_b": {
+          "$ref": "#/$defs/point"
+        },
+        "tier": {
+          "$ref": "#/$defs/tier"
+        },
+        "bound": {
+          "type": "number",
+          "minimum": 0,
+          "description": "How far below `distance` the true clearance may sit, in millimetres: one chord budget per curved body. Absent when the pair is exact."
+        },
+        "overlap_volume": {
+          "type": "number",
+          "minimum": 0,
+          "description": "The volume the two bodies share, in cubic millimetres. Present only for an interfering pair whose operands the Boolean engine can carry."
+        },
+        "overlap_unavailable": {
+          "type": "string",
+          "description": "The Boolean engine's refusal code, when a pair interferes but its overlap volume could not be computed. The clearance beside it still stands."
+        }
+      },
+      "required": [
+        "a",
+        "b",
+        "state",
+        "distance",
+        "witness_a",
+        "witness_b",
+        "tier"
+      ],
+      "additionalProperties": false
+    },
+    "tightest": {
+      "type": "object",
+      "description": "The closest that any pair which is not in contact comes. Absent when no pair is clear.",
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "distance": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "a",
+        "b",
+        "distance"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -320,6 +320,31 @@ impl SharedSession {
                 }
             }
             "report" => respond(id, &session.report()),
+            "analysis.interference" => {
+                #[derive(serde::Deserialize)]
+                struct Subjects {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                }
+                let request: Subjects = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid interference study: {error}"),
+                        );
+                    }
+                };
+                match crate::api::analysis::study_session_steps(
+                    &session,
+                    &request.subjects,
+                    &CancellationToken::default(),
+                ) {
+                    Ok(report) => respond(id, &report),
+                    Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
+                }
+            }
             "probe" => {
                 let request: ProbeRequest = match serde_json::from_value(params) {
                     Ok(request) => request,

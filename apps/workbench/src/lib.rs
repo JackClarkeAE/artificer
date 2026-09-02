@@ -1661,6 +1661,10 @@ enum ControlsScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextualSubject {
     PendingOperation,
+    /// A finished interference study. It is a reading rather than an
+    /// operation, so it has no gate; it stays until it is dismissed or the
+    /// bodies move under it.
+    Interference,
     Component,
     Measurement,
     Selection,
@@ -1679,6 +1683,7 @@ impl ContextualSubject {
     const fn title(self) -> &'static str {
         match self {
             Self::PendingOperation => "OPERATION",
+            Self::Interference => "INTERFERENCE",
             Self::Component => "COMPONENT",
             Self::Measurement => "MEASURE",
             Self::Selection => "SELECTION",
@@ -2049,6 +2054,10 @@ pub struct KernelLabApp {
     /// the other; both now open closed, with facts arriving as a contextual
     /// card over the canvas.
     model_inspector_open: bool,
+    /// The last interference study, kept until the document changes under
+    /// it. A study is a reading, not a feature: it never enters the
+    /// history and never touches a snapshot.
+    interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
@@ -2216,6 +2225,7 @@ impl Default for KernelLabApp {
             edge_finish_distance_text: "0.400".to_owned(),
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
+            interference: None,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
             section_analysis: SectionAnalysis::default(),
@@ -9535,6 +9545,72 @@ impl KernelLabApp {
         ));
     }
 
+    /// Measures every pair of visible bodies at the poses they occupy.
+    ///
+    /// Nothing is staged and nothing is committed: a study reads the
+    /// document, so it needs no confirmation gate and leaves no feature
+    /// behind.
+    pub fn run_interference_study(&mut self) {
+        use artificer_kernel::api::analysis::{Subject, interference_study};
+        use artificer_kernel::api::interference::Placement;
+
+        let subjects = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| {
+                let occurrence = self.occurrence_transform_for_body(body.id);
+                let rotation = occurrence.rotation();
+                let translation = occurrence.translation();
+                let placement = Placement::from_quaternion(
+                    [rotation.w, rotation.x, rotation.y, rotation.z],
+                    [translation.x, translation.y, translation.z],
+                )
+                .unwrap_or(Placement::IDENTITY);
+                Subject::new(format!("Body {}", body.ordinal), body.body.snapshot.clone())
+                    .at(placement)
+            })
+            .collect::<Vec<_>>();
+        if subjects.len() < 2 {
+            self.document_status =
+                Some("Interference needs two visible bodies to compare".to_owned());
+            self.interference = None;
+            return;
+        }
+        let report = interference_study(
+            &subjects,
+            self.document_precision(),
+            &CancellationToken::new(),
+        );
+        self.document_status = Some(match (report.interfering, report.touching) {
+            (0, 0) => format!(
+                "No interference across {} pairs{}",
+                report.pairs.len(),
+                report.tightest.as_ref().map_or(String::new(), |tightest| {
+                    format!("; tightest {:.3} mm", tightest.distance)
+                })
+            ),
+            (0, touching) => format!("{touching} pairs touch; none overlap"),
+            (interfering, _) => format!("{interfering} pairs interfere"),
+        });
+        self.interference = Some(report);
+    }
+
+    /// The precision the document's bodies were built under.
+    fn document_precision(&self) -> artificer_protocol::PrecisionPolicy {
+        self.bodies
+            .first()
+            .and_then(|body| body.body.snapshot.precision_policy())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn interference_report(
+        &self,
+    ) -> Option<&artificer_kernel::api::analysis::InterferenceReport> {
+        self.interference.as_ref()
+    }
+
     fn stage_body_boolean(&mut self, operation: BooleanOperation) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
@@ -9591,6 +9667,86 @@ impl KernelLabApp {
         }
         self.document_status = Some(self.boolean_operand_summary());
         true
+    }
+
+    /// The last interference study, pair by pair.
+    ///
+    /// The rows are ordered worst first: what overlaps, then what touches,
+    /// then the tightest gap. A study that has to be scrolled to find the
+    /// failure in is a study that failed to say anything.
+    fn interference_card(&mut self, ui: &mut egui::Ui) {
+        use artificer_kernel::api::interference::ClearanceState;
+
+        let Some(report) = self.interference.clone() else {
+            return;
+        };
+        let (colour, headline) = match (report.interfering, report.touching) {
+            (0, 0) => (theme::good(), "Clear".to_owned()),
+            (0, touching) => (theme::accent(), format!("{touching} touching")),
+            (interfering, _) => (theme::bad(), format!("{interfering} interfering")),
+        };
+        status_line(ui, &headline, colour);
+        ui.label(
+            RichText::new(format!(
+                "{} pairs · {}",
+                report.pairs.len(),
+                if report.tier == artificer_protocol::Tier::Exact {
+                    "exact".to_owned()
+                } else {
+                    "within the chord budget".to_owned()
+                }
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+        ui.add_space(6.0);
+
+        let mut pairs = report.pairs.clone();
+        pairs.sort_by(|left, right| {
+            let rank = |state: ClearanceState| match state {
+                ClearanceState::Interfering => 0,
+                ClearanceState::Touching => 1,
+                ClearanceState::Clear => 2,
+            };
+            rank(left.state)
+                .cmp(&rank(right.state))
+                .then(left.distance.total_cmp(&right.distance))
+        });
+        for pair in &pairs {
+            let (colour, reading) = match pair.state {
+                ClearanceState::Interfering => (
+                    theme::bad(),
+                    pair.overlap_volume.map_or_else(
+                        || {
+                            pair.overlap_unavailable.clone().map_or_else(
+                                || "overlaps".to_owned(),
+                                |code| format!("overlaps · {code}"),
+                            )
+                        },
+                        |volume| format!("overlaps {volume:.3} mm³"),
+                    ),
+                ),
+                ClearanceState::Touching => (theme::accent(), "touching".to_owned()),
+                ClearanceState::Clear => (theme::muted(), format!("{:.3} mm apart", pair.distance)),
+            };
+            ui.horizontal_top(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.0, colour);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} ↔ {}", pair.a, pair.b)).strong());
+                    ui.label(RichText::new(reading).small().color(theme::muted()));
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        if ui
+            .button("Dismiss")
+            .on_hover_text("Clear the study. Nothing in the document changes either way.")
+            .clicked()
+        {
+            self.interference = None;
+        }
     }
 
     /// The staged Boolean's operands, as the card shows them.
@@ -12514,6 +12670,9 @@ impl KernelLabApp {
         if self.pending_operation.is_some() {
             return Some(ContextualSubject::PendingOperation);
         }
+        if self.interference.is_some() {
+            return Some(ContextualSubject::Interference);
+        }
         // A ready sketch, or a selected face that can be pushed and pulled, is
         // a feature waiting to happen. Its controls used to live in a separate
         // floating window in this same slot, which the card then covered.
@@ -14147,6 +14306,13 @@ impl KernelLabApp {
                         theme::property_row(ui, "Type", kind);
                         theme::property_row_colored(ui, "Entity", &format!("#{id}"), theme::accent())
                             .on_hover_text(detail);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::Interference) && self.interference.is_some() {
+                    card(ui, "interference_study", "INTERFERENCE", &mut |ui| {
+                        self.interference_card(ui);
                     });
                     ui.add_space(5.0);
                 }
@@ -23399,6 +23565,51 @@ mod extrusion_workbench_tests {
             let volume = app.displayed_measures().unwrap().volume;
             assert_eq!(volume > 24.0, adds_material, "{preset:?}: {volume}");
         }
+    }
+
+    #[test]
+    fn an_interference_study_measures_every_visible_pair_without_touching_the_document() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+        let before = app.document.features().len();
+        let digests = app
+            .bodies
+            .iter()
+            .map(|body| body.body.snapshot.semantic_digest())
+            .collect::<Vec<_>>();
+
+        app.run_interference_study();
+        let report = app.interference_report().expect("a study").clone();
+        assert_eq!(report.pairs.len(), 1, "two bodies make one pair");
+        assert_eq!(report.subjects.len(), 2);
+        assert_eq!(
+            report.interfering + report.touching + report.clear,
+            report.pairs.len()
+        );
+
+        // A study is a reading: no feature, no new snapshot, nothing moved.
+        assert_eq!(app.document.features().len(), before);
+        assert_eq!(
+            app.bodies
+                .iter()
+                .map(|body| body.body.snapshot.semantic_digest())
+                .collect::<Vec<_>>(),
+            digests
+        );
+
+        // One body is not a comparison.
+        app.bodies[1].visible = false;
+        app.run_interference_study();
+        assert!(app.interference_report().is_none());
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("two visible bodies")),
+            "{:?}",
+            app.document_status
+        );
     }
 
     #[test]

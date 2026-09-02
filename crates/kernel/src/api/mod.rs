@@ -5,6 +5,7 @@
 //! `artificer_kernel` has the whole surface, and the server binary in
 //! `apps/api-server` is a thin command-line front for it.
 
+pub mod analysis;
 pub mod commands;
 pub mod debug;
 pub mod decompile;

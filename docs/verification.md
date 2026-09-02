@@ -324,10 +324,62 @@ says the wall at an open cap could not be taken away, because that case
 alone rests on the Boolean engine's analytic domain; it carries the
 engine's own diagnostic underneath, and the same body shells closed.
 
-## 8. Not in this release
+## 8. Interference studies
+
+An interference study is the machine-readable answer to whether an
+assembly fits. It names its subjects, measures every unordered pair, and
+publishes a versioned document with its own schema in
+[`docs/analysis-schema.json`](analysis-schema.json), guarded by the same
+kind of test the session report has: every study the kernel can produce
+validates against it.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"analysis.interference","params":{"subjects":["plate","post","pin"]}}
+```
+
+```rust
+use artificer_kernel::api::analysis::{interference_study, Subject};
+let report = interference_study(&subjects, precision, &CancellationToken::new());
+```
+
+Each pair says whether the bodies are `clear`, `touching` or
+`interfering`, how close their surfaces come, and where: a witness point
+on each body. A pair that interferes also carries the volume the two
+share, when the Boolean engine can carry those operands; when it cannot,
+the pair keeps its measured clearance and records the engine's refusal
+code, because "they overlap and this is how much" and "they overlap and
+the engine could not say how much" are different answers.
+
+No Boolean runs to find the interference itself. The work is a descent
+through a bounding-volume hierarchy of each body's facets, so a study
+answers for pairs the Boolean engine refuses outright — two parts sharing
+a face plane, or meeting in a curve outside the line and circle
+vocabulary — and a pair of parts with several thousand facets each is
+measured in milliseconds rather than by comparing every facet against
+every other.
+
+The tier means what it means everywhere else. Between bodies whose faces
+are all planar, the facets are the surfaces and the distance is exact.
+Where a surface is curved, its facets are chords of it: the measured gap
+is never smaller than the true gap and never larger than it by more than
+the `bound` the pair publishes, which is one chord budget per curved
+body. A study is `approximate` if any pair in it was.
+
+Two distinctions the geometry has to get right. Touching is not
+interfering: a point on a shared boundary is inside neither body, which
+ray parity alone cannot decide, so the distance to the surface is
+measured first. And a body wholly inside another never brings their
+surfaces close at all, so containment is tested whenever the bounds meet
+rather than only when the surfaces do; such a pair keeps a positive
+distance, the gap to the wall around it, with the state saying it is
+inside.
+
+## 9. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
-measures are volume, surface area, centroid and bounds. Shell covers
+measures are volume, surface area, centroid and bounds. An interference
+study is static: it measures the poses the bodies are in, and nothing
+sweeps them through a motion yet. Shell covers
 prisms and solids of revolution; a blended or domed body is refused
 rather than approximated, and opening the cap of a cone waits on the
 Boolean engine. Probes read the

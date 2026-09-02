@@ -81,6 +81,63 @@ impl Placement {
         })
     }
 
+    /// The same rigid motion as a protocol similarity, for the commands
+    /// that take one. A rotation matrix goes back to a quaternion by
+    /// Shepperd's method: the largest of the four components is recovered
+    /// from the trace first, so the division is never by a small number.
+    #[must_use]
+    pub fn to_similarity(self) -> Option<artificer_protocol::SimilarityTransform3> {
+        let m = self.columns;
+        // `m[column][row]`, so the trace is the three diagonal entries.
+        let (m00, m11, m22) = (m[0][0], m[1][1], m[2][2]);
+        let trace = m00 + m11 + m22;
+        let (w, x, y, z) = if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            (
+                0.25 * s,
+                (m[1][2] - m[2][1]) / s,
+                (m[2][0] - m[0][2]) / s,
+                (m[0][1] - m[1][0]) / s,
+            )
+        } else if m00 > m11 && m00 > m22 {
+            let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+            (
+                (m[1][2] - m[2][1]) / s,
+                0.25 * s,
+                (m[1][0] + m[0][1]) / s,
+                (m[2][0] + m[0][2]) / s,
+            )
+        } else if m11 > m22 {
+            let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+            (
+                (m[2][0] - m[0][2]) / s,
+                (m[1][0] + m[0][1]) / s,
+                0.25 * s,
+                (m[2][1] + m[1][2]) / s,
+            )
+        } else {
+            let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+            (
+                (m[0][1] - m[1][0]) / s,
+                (m[2][0] + m[0][2]) / s,
+                (m[2][1] + m[1][2]) / s,
+                0.25 * s,
+            )
+        };
+        let quaternion = artificer_protocol::RotationQuaternion::new(w, x, y, z);
+        quaternion
+            .is_finite()
+            .then_some(artificer_protocol::SimilarityTransform3 {
+                translation: artificer_protocol::Vector3::new(
+                    self.translation[0],
+                    self.translation[1],
+                    self.translation[2],
+                ),
+                rotation: quaternion,
+                uniform_scale: 1.0,
+            })
+    }
+
     fn apply(self, point: Point3) -> Point3 {
         let [cx, cy, cz] = self.columns;
         Point3::new(

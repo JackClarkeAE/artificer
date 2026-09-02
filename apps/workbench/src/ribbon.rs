@@ -707,6 +707,13 @@ impl KernelLabApp {
             ModelCommand::HolePattern => {
                 self.preset_feature_availability(SolidFeaturePreset::HolePattern)
             }
+            ModelCommand::Interference => {
+                if self.bodies.iter().filter(|body| body.visible).count() < 2 {
+                    CommandAvailability::disabled("Show two bodies to compare first.")
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
             ModelCommand::Shell => self.preset_feature_availability(SolidFeaturePreset::Shell),
             ModelCommand::Chamfer => self.preset_feature_availability(SolidFeaturePreset::Chamfer),
             ModelCommand::Fillet => self.preset_feature_availability(SolidFeaturePreset::Fillet),
@@ -981,6 +988,7 @@ impl KernelLabApp {
             ModelCommand::Mirror => self.stage_preset_feature(SolidFeaturePreset::Mirror),
             ModelCommand::Pattern => self.stage_preset_feature(SolidFeaturePreset::LinearPattern),
             ModelCommand::HolePattern => self.stage_preset_feature(SolidFeaturePreset::HolePattern),
+            ModelCommand::Interference => self.run_interference_study(),
             ModelCommand::Shell => self.stage_preset_feature(SolidFeaturePreset::Shell),
             ModelCommand::Chamfer => self.stage_preset_feature(SolidFeaturePreset::Chamfer),
             ModelCommand::Fillet => self.stage_preset_feature(SolidFeaturePreset::Fillet),

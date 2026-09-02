@@ -558,6 +558,37 @@ fn reports_conform_to_the_published_schema() {
     }
 }
 
+#[test]
+fn interference_studies_conform_to_the_published_schema() {
+    // The analysis document is a second published shape, and it earns the
+    // same guard: every study the kernel can produce validates, including
+    // the ones whose overlap volume the Boolean engine refuses to supply.
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/analysis-schema.json")).unwrap();
+    for source in [
+        "let plate = box(origin: [-20, -20, 0], size: [40, 40, 10], label: \"plate\");\nlet post = cylinder(center: [0, 0, 12], radius: 5, height: 20, label: \"post\");\nlet pin = cylinder(center: [0, 0, 5], radius: 3, height: 20, label: \"pin\");\n",
+        "let a = box(size: [10, 10, 10], label: \"a\");\nlet b = box(origin: [30, 0, 0], size: [10, 10, 10], label: \"b\");\n",
+        "let a = box(size: [20, 20, 20], label: \"a\");\nlet b = box(origin: [10, 0, 0], size: [20, 20, 20], label: \"b\");\n",
+        "let a = box(size: [20, 20, 20], label: \"a\");\nlet b = box(origin: [20, 0, 0], size: [20, 20, 20], label: \"b\");\n",
+    ] {
+        let mut session = Session::new();
+        let outcome = session.run_script(source, &BTreeMap::new(), &CancellationToken::default());
+        assert!(outcome.succeeded(), "{:?}", outcome.failure);
+        let subjects: Vec<String> = session.step_order.clone();
+        let study = artificer_kernel::api::analysis::study_session_steps(
+            &session,
+            &subjects,
+            &CancellationToken::default(),
+        )
+        .expect("a study");
+        let document = serde_json::to_value(study).unwrap();
+        let mut path = Vec::new();
+        let mut problems = Vec::new();
+        check(&schema, &schema, &document, &mut path, &mut problems);
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
+}
+
 /// A small validator for the subset of JSON Schema the report schema uses:
 /// types, required and closed property sets, enums and consts, `$ref` into
 /// `$defs`, `items`, `oneOf`, and `allOf`.
