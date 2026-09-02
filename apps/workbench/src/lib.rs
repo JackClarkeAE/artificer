@@ -2009,6 +2009,8 @@ pub struct KernelLabApp {
     camera_before_plane_sketch: Option<ViewState>,
     /// Show the origin planes even once a sketch has retired them.
     show_origin_planes: bool,
+    /// The view-only cut through the model, for looking inside it.
+    section_analysis: SectionAnalysis,
     /// A plane sketch waiting for its camera flight to land. Opening the 2D
     /// canvas immediately would replace the very viewport the animation
     /// plays in, which reads as a snap even though the camera is flying.
@@ -2171,6 +2173,7 @@ impl Default for KernelLabApp {
             model_inspector_open: false,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
+            section_analysis: SectionAnalysis::default(),
             pending_plane_sketch: None,
             sketch_orbit_peek: false,
             model_context_menu: None,
@@ -3052,6 +3055,22 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_pending_entity_count(&self) -> usize {
         self.sketch.pending_entity_count()
+    }
+
+    /// The label of the sketch edit awaiting confirmation, if there is one.
+    #[must_use]
+    pub fn sketch_pending_label(&self) -> Option<&'static str> {
+        self.sketch.pending().map(|pending| pending.label())
+    }
+
+    /// Every committed sketch entity's presented geometry, in canvas order.
+    #[must_use]
+    pub fn sketch_entity_geometries(&self) -> Vec<SketchGeometry> {
+        self.sketch
+            .entities()
+            .iter()
+            .map(|entity| entity.geometry)
+            .collect()
     }
 
     /// The single line of prose the sketch canvas is showing for the active
@@ -5609,6 +5628,7 @@ impl KernelLabApp {
                 "Plane preview",
             ));
         }
+        planes.extend(self.section_plane_overlay());
         // A genuinely blank document still presents its three usable origin
         // planes instead of replacing them with an arbitrary starter solid.
         if self.origin_reference_planes_visible() {
@@ -6452,7 +6472,7 @@ impl KernelLabApp {
             .bodies
             .last()
             .and_then(|body| self.committed_world_pivot_for_body(body));
-        self.frame_visible_document();
+        self.reveal_visible_document();
         self.feature_preview.append(FeaturePreviewKind::Component);
         self.last_attempt = Attempt::Accepted {
             operation: "Library component committed",
@@ -8840,7 +8860,7 @@ impl KernelLabApp {
                     ExtrusionMode::Add | ExtrusionMode::Cut => self.sync_active_body_record(),
                 }
                 if mode == ExtrusionMode::NewBody {
-                    self.frame_visible_document();
+                    self.reveal_visible_document();
                 }
                 let active_body = self.active_body_id();
                 if let Some(index) = self.active_sketch_index
@@ -10271,12 +10291,91 @@ impl KernelLabApp {
         context.request_repaint();
     }
 
+    /// Hands the section plane to the camera state the renderer reads.
+    fn sync_section_plane(&mut self) {
+        self.view.section_cut_plane = self.section_analysis.cut_plane();
+    }
+
+    /// The section plane as the user has set it.
+    #[must_use]
+    pub const fn section_analysis(&self) -> SectionAnalysis {
+        self.section_analysis
+    }
+
+    /// Sets the section plane, as the ribbon's panel does.
+    pub fn set_section_analysis(&mut self, section: SectionAnalysis) {
+        self.section_analysis = section;
+        self.sync_section_plane();
+    }
+
+    /// The card that shows where the section plane lies: the plane, sized
+    /// to what it cuts through, labelled so it is not mistaken for a datum.
+    fn section_plane_overlay(&self) -> Option<viewport::ModelSketchOverlay> {
+        if !self.section_analysis.active {
+            return None;
+        }
+        let frame = self.section_analysis.frame();
+        // Sized to the bodies it cuts; the datum planes are only a fallback
+        // for a document with nothing solid in it yet.
+        let bounds = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .filter_map(|body| self.committed_world_bounds_for_body(body))
+            .reduce(union_aabb)
+            .or_else(|| self.visible_document_bounds())
+            .unwrap_or_else(|| {
+                Aabb3::new(
+                    Point3::new(-25.0, -25.0, -25.0),
+                    Point3::new(25.0, 25.0, 25.0),
+                )
+            });
+        let extent = |axis: Vector3| {
+            let span = |min: f64, max: f64, component: f64| {
+                let a = (min - 0.0) * component;
+                let b = (max - 0.0) * component;
+                a.abs().max(b.abs())
+            };
+            (span(bounds.min.x, bounds.max.x, axis.x)
+                + span(bounds.min.y, bounds.max.y, axis.y)
+                + span(bounds.min.z, bounds.max.z, axis.z))
+            .max(5.0)
+                * 1.1
+        };
+        Some(reference_plane_overlay(
+            frame,
+            extent(frame.u),
+            extent(frame.v),
+            true,
+            None,
+            "Section",
+        ))
+    }
+
     fn reset_view(&mut self, context: &egui::Context) {
         self.view.reset_orientation();
         context.request_repaint();
     }
 
     fn frame_visible_document(&mut self) {
+        if let Some(bounds) = self.visible_document_bounds() {
+            self.view.frame(bounds);
+        }
+    }
+
+    /// Brings the document into view without moving the camera closer.
+    ///
+    /// Committing a feature used to reframe the camera on the result, which
+    /// zoomed in on the new body and left the user zooming straight back
+    /// out. The view they had is kept, and grows only if the new geometry
+    /// falls outside it.
+    fn reveal_visible_document(&mut self) {
+        if let Some(bounds) = self.visible_document_bounds() {
+            self.view.widen_to_include(bounds);
+        }
+    }
+
+    fn visible_document_bounds(&self) -> Option<Aabb3> {
         let active = self.active_body_id();
         let bounds = self
             .bodies
@@ -10298,12 +10397,9 @@ impl KernelLabApp {
         // 50 mm datum against the old one-unit camera radius. With the planes
         // retired and no solid yet, a committed sketch is what there is to
         // frame.
-        let bounds = bounds
+        bounds
             .or_else(|| self.visible_reference_plane_bounds())
-            .or_else(|| viewport::sketch_overlay_bounds(&self.visible_sketch_overlays()));
-        if let Some(bounds) = bounds {
-            self.view.frame(bounds);
-        }
+            .or_else(|| viewport::sketch_overlay_bounds(&self.visible_sketch_overlays()))
     }
 
     fn frame_visible_body(&mut self, context: &egui::Context) {
@@ -19219,6 +19315,76 @@ fn validate_construction_planes(planes: &[ConstructionPlane]) -> Result<(), Stri
     Ok(())
 }
 
+/// A section analysis plane: a cut through the displayed model that shows
+/// its inside, without changing the document.
+///
+/// The plane lies parallel to one origin plane, `offset` millimetres along
+/// that plane's normal. The side the normal points to is kept unless the
+/// plane is flipped.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SectionAnalysis {
+    pub active: bool,
+    pub plane: SketchPlane,
+    pub offset: f64,
+    pub flipped: bool,
+}
+
+impl Default for SectionAnalysis {
+    fn default() -> Self {
+        Self {
+            active: false,
+            plane: SketchPlane::XY,
+            offset: 0.0,
+            flipped: false,
+        }
+    }
+}
+
+impl SectionAnalysis {
+    /// The plane's frame: origin on the plane, axes along the origin plane's.
+    #[must_use]
+    fn frame(self) -> PlanarFrame3 {
+        let base = sketch_plane_frame(self.plane);
+        let normal = self.unit_normal();
+        PlanarFrame3::new(
+            Point3::new(
+                normal.x * self.offset,
+                normal.y * self.offset,
+                normal.z * self.offset,
+            ),
+            base.u,
+            base.v,
+        )
+    }
+
+    /// The normal of the kept side, before flipping: the origin plane's own.
+    fn unit_normal(self) -> Vector3 {
+        let base = sketch_plane_frame(self.plane);
+        Vector3::new(
+            base.u.y * base.v.z - base.u.z * base.v.y,
+            base.u.z * base.v.x - base.u.x * base.v.z,
+            base.u.x * base.v.y - base.u.y * base.v.x,
+        )
+    }
+
+    /// The renderer's clipping plane, or `None` while the section is off.
+    #[must_use]
+    pub fn cut_plane(self) -> Option<artificer_ui_core::presentation::SectionCutPlane> {
+        if !self.active {
+            return None;
+        }
+        let sign = if self.flipped { -1.0 } else { 1.0 };
+        let normal = self.unit_normal();
+        let normal = Vector3::new(normal.x * sign, normal.y * sign, normal.z * sign);
+        // Kept where `normal · p + offset >= 0`; the plane itself sits
+        // `self.offset` along the unflipped normal.
+        Some(artificer_ui_core::presentation::SectionCutPlane::new(
+            normal,
+            -sign * self.offset,
+        ))
+    }
+}
+
 const fn origin_plane_label(plane: SketchPlane) -> &'static str {
     match plane {
         SketchPlane::XY => "XY Plane",
@@ -24235,5 +24401,100 @@ mod drafted_extrusion_command {
         };
         assert_eq!(distance, 8.0, "the sign moves into the frame");
         assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
+    }
+}
+
+#[cfg(test)]
+mod section_analysis_and_commit_camera {
+    use super::*;
+
+    #[test]
+    fn the_section_plane_keeps_the_side_its_normal_points_to_until_flipped() {
+        let mut section = SectionAnalysis::default();
+        assert!(section.cut_plane().is_none(), "off by default");
+        section.active = true;
+        section.plane = SketchPlane::XY;
+        section.offset = 3.0;
+        let plane = section.cut_plane().expect("active");
+        assert!(
+            plane.distance_to_point(Point3::new(0.0, 0.0, 5.0)) > 0.0,
+            "above is kept"
+        );
+        assert!(
+            plane.distance_to_point(Point3::new(0.0, 0.0, 1.0)) < 0.0,
+            "below is cut"
+        );
+        assert!(plane.distance_to_point(Point3::new(7.0, -2.0, 3.0)).abs() < 1.0e-12);
+        section.flipped = true;
+        let flipped = section.cut_plane().expect("active");
+        assert!(flipped.distance_to_point(Point3::new(0.0, 0.0, 5.0)) < 0.0);
+        assert!(flipped.distance_to_point(Point3::new(0.0, 0.0, 1.0)) > 0.0);
+        assert!(flipped.distance_to_point(Point3::new(7.0, -2.0, 3.0)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn toggling_the_section_hands_the_plane_to_the_camera_and_draws_its_card() {
+        let mut app = KernelLabApp::default();
+        assert!(app.view.section_cut_plane.is_none());
+        app.section_analysis.plane = SketchPlane::YZ;
+        app.section_analysis.active = true;
+        app.sync_section_plane();
+        let plane = app.view.section_cut_plane.expect("the camera clips");
+        assert!(plane.active);
+        assert!((plane.normal.x - 1.0).abs() < 1.0e-12);
+        assert!(
+            app.visible_reference_plane_overlays()
+                .iter()
+                .any(|overlay| overlay.segment_count() == 4),
+            "the section plane shows as a card"
+        );
+        app.section_analysis.active = false;
+        app.sync_section_plane();
+        assert!(app.view.section_cut_plane.is_none());
+    }
+
+    #[test]
+    fn committing_an_extrusion_never_brings_the_camera_closer() {
+        for (radius, may_grow) in [(0.5, false), (40.0, true)] {
+            let mut app = KernelLabApp {
+                workbench_mode: WorkbenchMode::Sketch,
+                ..Default::default()
+            };
+            assert!(app.sketch.set_tool(crate::sketch::SketchTool::Circle));
+            let entity = app
+                .sketch
+                .stage_geometry(SketchGeometry::circle(
+                    SketchPoint::new(0.0, 0.0),
+                    SketchPoint::new(radius, 0.0),
+                ))
+                .expect("circle stages");
+            app.commit_sketch_stroke(entity);
+            let _ = app
+                .sketch
+                .select_region_at_point(SketchPoint::new(0.0, 0.0), false);
+            assert!(app.stage_sketch_extrusion());
+            if !may_grow {
+                // A view already wide enough for the body.
+                app.view.frame(Aabb3::new(
+                    Point3::new(-100.0, -100.0, -100.0),
+                    Point3::new(100.0, 100.0, 100.0),
+                ));
+            }
+            let before = app.view.fit_radius();
+            let target = app.view.target();
+            assert!(app.confirm_pending_operation());
+            assert_eq!(app.last_error_code(), None);
+            let after = app.view.fit_radius();
+            assert!(
+                after >= before - 1.0e-9,
+                "commit zoomed in: {before} -> {after}"
+            );
+            if may_grow {
+                assert!(after > before, "a body outside the view widens it");
+            } else {
+                assert_eq!(after, before, "a body inside the view leaves it alone");
+                assert_eq!(app.view.target(), target);
+            }
+        }
     }
 }

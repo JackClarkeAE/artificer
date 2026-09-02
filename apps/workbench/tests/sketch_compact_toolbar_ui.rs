@@ -1,6 +1,6 @@
 use artificer_sketch_ui::sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
-    ROW_GAP,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
+    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
 };
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
 use egui::accesskit::Role;
@@ -154,8 +154,8 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
     enter_xy_sketch(&mut harness);
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
-    // Creation on the first row, modify and constrain on the second. The
-    // relation family (ADR 0026, F1) fills the grid to a full seven by two.
+    // Six columns of drawing tools in two rows; the constraints stand in
+    // their own column beyond a divider, Relation above Dimension.
     let rows = [
         [
             "Select sketch geometry",
@@ -164,18 +164,35 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             "Two-point rectangle",
             "Centre-point circle",
             "Centre-start-end arc",
-            "Outer-diameter polygon",
         ],
         [
+            "Outer-diameter polygon",
             "Two-point centre-to-centre slot",
             "Trim curve span",
             "2D fillet",
             "Equal-distance chamfer",
             "Rectangular sketch pattern",
-            "Horizontal relation",
-            "Sketch dimension",
         ],
     ];
+    for (row_index, label) in ["Horizontal relation", "Sketch dimension"]
+        .into_iter()
+        .enumerate()
+    {
+        let row_first = harness
+            .get_by_role_and_label(Role::Button, rows[row_index][0])
+            .rect();
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        assert_eq!(rect.center().y, row_first.center().y, "{label} row drifted");
+        assert_eq!(
+            rect.left(),
+            row_first.left()
+                + 6.0 * PRIMARY_CELL_WIDTH
+                + 5.0 * FAMILY_GAP
+                + CONSTRAINT_DIVIDER_WIDTH,
+            "{label} sits beyond the divider"
+        );
+        assert!(rect.max.x <= 1040.0, "{label} is clipped: {rect:?}");
+    }
     for (row_index, row) in rows.into_iter().enumerate() {
         let first = harness.get_by_role_and_label(Role::Button, row[0]).rect();
         for (column, label) in row.into_iter().enumerate() {

@@ -28,7 +28,7 @@ pub const PRIMARY_CELL_SIZE: f32 = 33.0;
 /// reads as a mistake. Sized so the longest label — `Rectangle`, which measures
 /// 51 px at [`TextStyle::Small`] — clears the chooser column with room to spare.
 /// At 88 px it did not, and ran into the chevron.
-pub const PRIMARY_CELL_WIDTH: f32 = 98.0;
+pub const PRIMARY_CELL_WIDTH: f32 = 97.0;
 /// Left column of a tile, holding the icon.
 pub const TILE_ICON_COLUMN: f32 = 26.0;
 /// Side length of the icon painted inside that column.
@@ -59,8 +59,15 @@ pub const ROW_GAP: f32 = 2.0;
 pub const TOOLBAR_TOP_PADDING: f32 = 4.0;
 /// Reserved clearance below the second row before the ribbon divider.
 pub const TOOLBAR_BOTTOM_PADDING: f32 = 4.0;
-/// Width of the uniform seven-column toolbar grid.
-pub const SKETCH_TOOLBAR_WIDTH: f32 = PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 6.0;
+/// Width of the strip that parts the drawing tools from the constraints: a
+/// hairline with breathing room either side. It replaces one family gap, and
+/// the tile is a pixel narrower than it was, so the whole grid is exactly as
+/// wide as the old seven-column one and still fits the minimum window.
+pub const CONSTRAINT_DIVIDER_WIDTH: f32 = 9.0;
+/// Width of the toolbar: six columns of drawing tools, the divider, and the
+/// constraint column.
+pub const SKETCH_TOOLBAR_WIDTH: f32 =
+    PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH;
 /// Height required by the padded two-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 =
     PRIMARY_CELL_SIZE * 2.0 + ROW_GAP + TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING;
@@ -75,6 +82,8 @@ const _: () = {
     // The grid must fill the ribbon's content height exactly: short leaves the
     // caption floating, tall clips the bottom row.
     assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
+    // The 1040 px minimum window has exactly this much room for the grid.
+    assert!(SKETCH_TOOLBAR_WIDTH == 698.0);
 };
 
 /// Left column of a variant-menu row, holding the icon.
@@ -1961,6 +1970,7 @@ impl Default for SketchToolbarOutput {
     }
 }
 
+/// The drawing tools: what puts geometry on the canvas and what reshapes it.
 const FIRST_ROW: &[ToolFamily] = &[
     ToolFamily::Select,
     ToolFamily::Point,
@@ -1968,17 +1978,18 @@ const FIRST_ROW: &[ToolFamily] = &[
     ToolFamily::Rectangle,
     ToolFamily::Circle,
     ToolFamily::Arc,
-    ToolFamily::Polygon,
 ];
 const SECOND_ROW: &[ToolFamily] = &[
+    ToolFamily::Polygon,
     ToolFamily::Slot,
     ToolFamily::Trim,
     ToolFamily::Fillet,
     ToolFamily::Chamfer,
     ToolFamily::Pattern,
-    ToolFamily::Relation,
-    ToolFamily::Dimension,
 ];
+/// The constraints: what tells the solver how the geometry has to behave.
+/// They stand apart from the drawing tools, behind a divider, one per row.
+const CONSTRAINT_COLUMN: &[ToolFamily] = &[ToolFamily::Relation, ToolFamily::Dimension];
 
 /// Paint the compact two-row sketch tool grid and return an exact chosen tool.
 ///
@@ -2002,27 +2013,52 @@ pub fn render_sketch_toolbar(
         |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(TOOLBAR_TOP_PADDING);
-            render_toolbar_row(
-                ui,
-                FIRST_ROW,
-                &mut state.preferences,
-                active,
-                gate,
-                capabilities,
-                &mut output,
-                &mut escaped_anchor,
-            );
-            ui.add_space(ROW_GAP);
-            render_toolbar_row(
-                ui,
-                SECOND_ROW,
-                &mut state.preferences,
-                active,
-                gate,
-                capabilities,
-                &mut output,
-                &mut escaped_anchor,
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    render_toolbar_row(
+                        ui,
+                        FIRST_ROW,
+                        &mut state.preferences,
+                        active,
+                        gate,
+                        capabilities,
+                        &mut output,
+                        &mut escaped_anchor,
+                    );
+                    ui.add_space(ROW_GAP);
+                    render_toolbar_row(
+                        ui,
+                        SECOND_ROW,
+                        &mut state.preferences,
+                        active,
+                        gate,
+                        capabilities,
+                        &mut output,
+                        &mut escaped_anchor,
+                    );
+                });
+                render_constraint_divider(ui);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (index, family) in CONSTRAINT_COLUMN.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(ROW_GAP);
+                        }
+                        render_toolbar_row(
+                            ui,
+                            std::slice::from_ref(family),
+                            &mut state.preferences,
+                            active,
+                            gate,
+                            capabilities,
+                            &mut output,
+                            &mut escaped_anchor,
+                        );
+                    }
+                });
+            });
             ui.add_space(TOOLBAR_BOTTOM_PADDING);
         },
     );
@@ -2039,6 +2075,21 @@ pub fn render_sketch_toolbar(
     }
 
     output
+}
+
+/// The hairline between the drawing tools and the constraints. It spans both
+/// rows, so the two constraint tiles read as one column set apart from the
+/// grid rather than as the tail of the second row.
+fn render_constraint_divider(ui: &mut Ui) {
+    let (_, rect) = ui.allocate_space(vec2(
+        CONSTRAINT_DIVIDER_WIDTH,
+        PRIMARY_CELL_SIZE * 2.0 + ROW_GAP,
+    ));
+    let x = rect.center().x.round() + 0.5;
+    ui.painter().line_segment(
+        [pos2(x, rect.top() + 3.0), pos2(x, rect.bottom() - 3.0)],
+        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2920,10 +2971,14 @@ mod tests {
         let row_width = |row: &[ToolFamily]| {
             PRIMARY_CELL_WIDTH * row.len() as f32 + FAMILY_GAP * row.len().saturating_sub(1) as f32
         };
-        assert_eq!(FIRST_ROW.len(), 7);
-        assert_eq!(SECOND_ROW.len(), 7);
-        assert!(row_width(FIRST_ROW) <= SKETCH_TOOLBAR_WIDTH);
-        assert_eq!(row_width(SECOND_ROW), SKETCH_TOOLBAR_WIDTH);
+        assert_eq!(FIRST_ROW.len(), 6);
+        assert_eq!(SECOND_ROW.len(), 6);
+        assert_eq!(CONSTRAINT_COLUMN.len(), 2);
+        assert_eq!(
+            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + PRIMARY_CELL_WIDTH,
+            SKETCH_TOOLBAR_WIDTH
+        );
+        assert_eq!(row_width(FIRST_ROW), row_width(SECOND_ROW));
         assert!((28.0..=36.0).contains(&PRIMARY_CELL_SIZE));
         // Two rows fill the ribbon's content box exactly, which is what puts
         // the group caption on its bottom edge rather than above a gap.
@@ -2934,6 +2989,7 @@ mod tests {
         let mut all = FIRST_ROW
             .iter()
             .chain(SECOND_ROW)
+            .chain(CONSTRAINT_COLUMN)
             .copied()
             .collect::<Vec<_>>();
         all.sort_unstable();

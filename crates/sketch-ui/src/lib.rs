@@ -8590,7 +8590,80 @@ impl SketchCanvasState {
                     },
                 }])
             }
+            (ToolVariant::CollinearRelation, [first, second]) => {
+                let ((first_start, first_end), (second_start, second_end)) =
+                    pair_lines(*first, *second)?;
+                // Both ends of the second line onto the first line's carrier:
+                // that is two equations, the same count as making the lines
+                // parallel and then sharing a point.
+                Ok(vec![
+                    CoreConstraintKind::Collinear {
+                        first: first_start,
+                        second: second_start,
+                        third: first_end,
+                    },
+                    CoreConstraintKind::Collinear {
+                        first: first_start,
+                        second: second_end,
+                        third: first_end,
+                    },
+                ])
+            }
+            (ToolVariant::TangentRelation, [first, second]) => {
+                let (line, round) = match (first, second) {
+                    (RelationOperand::Curve(first), RelationOperand::Curve(second)) => {
+                        if self.relation_line_points(*first).is_ok() {
+                            (*first, *second)
+                        } else {
+                            (*second, *first)
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "This relation applies to a line and a circle or arc.".to_owned()
+                        );
+                    }
+                };
+                let (start, end) = self.relation_line_points(line).map_err(|_| {
+                    "This relation applies to a line and a circle or arc.".to_owned()
+                })?;
+                Ok(vec![match self.relation_round_carrier(round)? {
+                    RoundCarrier::Circle { center, radius } => {
+                        CoreConstraintKind::LineTangentToCircle {
+                            start,
+                            end,
+                            center,
+                            radius,
+                        }
+                    }
+                    RoundCarrier::Arc { center, rim } => CoreConstraintKind::LineTangentToArc {
+                        start,
+                        end,
+                        center,
+                        rim,
+                    },
+                }])
+            }
             _ => Err("This relation needs different operands.".to_owned()),
+        }
+    }
+
+    /// The centre and radius of a circular operand, as the solver holds them.
+    fn relation_round_carrier(&self, entity: CoreEntityId) -> Result<RoundCarrier, String> {
+        let record = self
+            .authoring
+            .entity(entity)
+            .ok_or_else(|| "That curve is no longer part of the sketch.".to_owned())?;
+        match record.geometry {
+            CoreCurve2::Circle { center, radius, .. } => {
+                Ok(RoundCarrier::Circle { center, radius })
+            }
+            CoreCurve2::CircularArc { center, start, .. } => {
+                Ok(RoundCarrier::Arc { center, rim: start })
+            }
+            CoreCurve2::Line { .. } | CoreCurve2::Bspline { .. } => {
+                Err("This relation applies to a line and a circle or arc.".to_owned())
+            }
         }
     }
 
@@ -9146,7 +9219,9 @@ impl SketchCanvasState {
             | ToolVariant::DistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
-            | ToolVariant::EqualLengthRelation => self.append_relation_operand(point, pick_radius),
+            | ToolVariant::EqualLengthRelation
+            | ToolVariant::TangentRelation
+            | ToolVariant::CollinearRelation => self.append_relation_operand(point, pick_radius),
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern => {
                 if self.modifier_sources.is_empty() {
                     let picked = self.exact_curve_hit(point, pick_radius)?;
@@ -9182,6 +9257,19 @@ enum RelationOperand {
     Curve(CoreEntityId),
 }
 
+/// A circular operand's centre and the way it carries its radius.
+#[derive(Clone, Copy, Debug)]
+enum RoundCarrier {
+    Circle {
+        center: CorePointId,
+        radius: f64,
+    },
+    Arc {
+        center: CorePointId,
+        rim: CorePointId,
+    },
+}
+
 /// How many operands a relation needs before it can be staged.
 const fn relation_arity(variant: ToolVariant) -> Option<usize> {
     match variant {
@@ -9191,7 +9279,9 @@ const fn relation_arity(variant: ToolVariant) -> Option<usize> {
         | ToolVariant::DistanceRelation
         | ToolVariant::ParallelRelation
         | ToolVariant::PerpendicularRelation
-        | ToolVariant::EqualLengthRelation => Some(2),
+        | ToolVariant::EqualLengthRelation
+        | ToolVariant::TangentRelation
+        | ToolVariant::CollinearRelation => Some(2),
         _ => None,
     }
 }
@@ -9207,6 +9297,8 @@ const fn relation_label(variant: ToolVariant) -> &'static str {
         ToolVariant::ParallelRelation => "Parallel relation",
         ToolVariant::PerpendicularRelation => "Perpendicular relation",
         ToolVariant::EqualLengthRelation => "Equal-length relation",
+        ToolVariant::TangentRelation => "Tangent relation",
+        ToolVariant::CollinearRelation => "Collinear relation",
         _ => "Sketch relation",
     }
 }
@@ -10567,10 +10659,15 @@ pub fn show_with_context(
                 | ToolVariant::TwoDistanceChamfer
                 | ToolVariant::RectangularPattern
                 | ToolVariant::CircularPattern
-        ) {
+        ) || relation_arity(state.exact_tool).is_some()
+        {
             // Span and corner modifiers retain the actual model-space pick.
             // Snapping to a junction would erase the finite carrier branch the
-            // user intended to keep. Pattern centres remain snap-aware.
+            // user intended to keep. Pattern centres remain snap-aware. A
+            // relation picks what is under the pointer, endpoint first, so it
+            // takes the raw point too: a click with a relation tool used to
+            // fall through to plain selection here, which is why relations
+            // never staged from the canvas.
             let raw_point = state.view.screen_to_sketch(response.rect, position);
             let point = if matches!(
                 state.exact_tool,
@@ -10578,7 +10675,8 @@ pub fn show_with_context(
                     | ToolVariant::Fillet
                     | ToolVariant::Chamfer
                     | ToolVariant::TwoDistanceChamfer
-            ) {
+            ) || relation_arity(state.exact_tool).is_some()
+            {
                 raw_point
             } else {
                 state.snap_point(response.rect, position).point
@@ -16871,6 +16969,90 @@ mod tests {
         );
         assert!(state.pending().is_none());
         assert_eq!(state.authoring, authoring_before);
+    }
+
+    #[test]
+    fn a_tangent_relation_slides_a_line_onto_a_circle() {
+        let mut state = SketchCanvasState::default();
+        let line = commit_test_line(&mut state, (-4.0, 3.0), (4.0, 3.0));
+        let circle = commit_test_circle(&mut state, (0.0, 0.0), 2.0);
+        assert!(state.set_exact_tool(ToolVariant::TangentRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(1.0, 3.0), 0.2)
+                .is_none(),
+            "one operand is not yet a relation"
+        );
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(0.0, 2.0), 0.2)
+            .expect("a line and a circle complete a tangent relation");
+        assert_eq!(state.relation_diagnostic(), None);
+        assert_eq!(state.commit_pending(), Ok(subject));
+        let SketchGeometry::Segment { start, end } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == line)
+            .expect("the line survives")
+            .geometry
+        else {
+            panic!("a line should present as a segment");
+        };
+        let SketchGeometry::Circle { center, rim } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == circle)
+            .expect("the circle survives")
+            .geometry
+        else {
+            panic!("a circle should present as a circle");
+        };
+        // Both are free to move, so they meet half way: the line comes down
+        // and the circle comes up until the centre is one radius from the
+        // line. The presented circle follows its solved centre.
+        let radius = center.distance_squared(rim).sqrt();
+        let offset = (center.v - start.v).abs();
+        assert!((end.v - start.v).abs() <= 1.0e-9, "{start:?} {end:?}");
+        assert!(
+            (offset - radius).abs() <= 1.0e-9,
+            "the line should touch the circle: centre {center:?}, radius {radius}, line at v = {}",
+            start.v
+        );
+        assert!(start.v < 3.0 && center.v > 0.0);
+    }
+
+    #[test]
+    fn a_collinear_relation_lays_a_line_along_another_without_collapsing_it() {
+        let mut state = SketchCanvasState::default();
+        commit_test_line(&mut state, (0.0, 0.0), (4.0, 0.0));
+        let second = commit_test_line(&mut state, (6.0, 1.0), (10.0, 1.5));
+        assert!(state.set_exact_tool(ToolVariant::CollinearRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(2.0, 0.0), 0.2)
+                .is_none()
+        );
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(8.0, 1.25), 0.2)
+            .expect("two lines complete a collinear relation");
+        assert_eq!(state.relation_diagnostic(), None);
+        assert_eq!(state.commit_pending(), Ok(subject));
+        let SketchGeometry::Segment { start, end } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == second)
+            .expect("the second line survives")
+            .geometry
+        else {
+            panic!("a line should present as a segment");
+        };
+        assert!(
+            start.v.abs() <= 1.0e-9 && end.v.abs() <= 1.0e-9,
+            "{start:?} {end:?}"
+        );
+        assert!(
+            start.u > 4.0 && end.u > start.u,
+            "the line stays beyond the first, end to end: {start:?} {end:?}"
+        );
     }
 
     #[test]

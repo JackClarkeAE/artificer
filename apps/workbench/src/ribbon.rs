@@ -28,7 +28,10 @@ use crate::sketch_toolbar::{
 use crate::theme::{self, ribbon_group};
 use artificer_model::QuantityKind;
 
-use crate::{KernelLabApp, SolidFeaturePreset, WorkbenchMode, shell_button_activated, viewport};
+use crate::{
+    KernelLabApp, SketchPlane, SolidFeaturePreset, WorkbenchMode, origin_plane_label,
+    shell_button_activated, viewport,
+};
 
 /// Whether a command can run right now, and in plain words why not when it
 /// cannot. A disabled control that cannot say why is a dead end.
@@ -207,6 +210,9 @@ impl KernelLabApp {
                 }
                 if group == RibbonGroupId::SketchView {
                     self.sketch_projected_context_panel(ui);
+                }
+                if group == RibbonGroupId::Analyse {
+                    self.section_analysis_panel(ui);
                 }
             });
         }
@@ -493,6 +499,55 @@ impl KernelLabApp {
         }
     }
 
+    /// The controls of the section plane, beside its command: which origin
+    /// plane it lies on, how far along that plane's normal, and which side
+    /// is kept.
+    fn section_analysis_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.section_analysis.active {
+            return;
+        }
+        let mut section = self.section_analysis;
+        ui.vertical(|ui| {
+            ui.label(RichText::new("Section Plane").small().color(theme::muted()));
+            ui.horizontal(|ui| {
+                for plane in SketchPlane::ALL {
+                    let label = origin_plane_label(plane)
+                        .trim_end_matches(" Plane")
+                        .to_owned();
+                    if ui
+                        .selectable_label(section.plane == plane, label)
+                        .on_hover_text(format!("Cut parallel to the {}", origin_plane_label(plane)))
+                        .clicked()
+                    {
+                        section.plane = plane;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let mut offset = section.offset;
+                if ui
+                    .add(egui::DragValue::new(&mut offset).speed(0.5).suffix(" mm"))
+                    .on_hover_text("Where the cut lies along the plane's normal.")
+                    .changed()
+                    && offset.is_finite()
+                {
+                    section.offset = offset;
+                }
+                if ui
+                    .button("Flip")
+                    .on_hover_text("Keep the other side of the plane instead.")
+                    .clicked()
+                {
+                    section.flipped = !section.flipped;
+                }
+            });
+        });
+        if section != self.section_analysis {
+            self.section_analysis = section;
+            self.sync_section_plane();
+        }
+    }
+
     pub(crate) fn activate_sketch_tool_variant(&mut self, variant: ToolVariant) {
         if self.sketch.set_exact_tool(variant) {
             self.active_sketch_tool = variant;
@@ -557,6 +612,7 @@ impl KernelLabApp {
             // command raises and focuses it, so it is never "on".
             ModelCommand::ShowHistory => self.shell.visibility().feature_timeline,
             ModelCommand::ToggleOriginPlanes => self.show_origin_planes,
+            ModelCommand::ToggleSection => self.section_analysis.active,
             ModelCommand::ToggleTheme => theme::active_theme() == theme::WorkbenchTheme::Dark,
             ModelCommand::ThemeLight => theme::active_theme() == theme::WorkbenchTheme::Light,
             ModelCommand::ThemeDark => theme::active_theme() == theme::WorkbenchTheme::Dark,
@@ -757,6 +813,7 @@ impl KernelLabApp {
             | ModelCommand::ShowBrowser
             | ModelCommand::ShowHistory
             | ModelCommand::ToggleOriginPlanes
+            | ModelCommand::ToggleSection
             | ModelCommand::ToggleTheme
             | ModelCommand::ThemeLight
             | ModelCommand::ThemeDark
@@ -958,6 +1015,10 @@ impl KernelLabApp {
             }
             ModelCommand::ToggleOriginPlanes => {
                 self.show_origin_planes = !self.show_origin_planes;
+            }
+            ModelCommand::ToggleSection => {
+                self.section_analysis.active = !self.section_analysis.active;
+                self.sync_section_plane();
             }
             ModelCommand::FrameSketch => self.frame_active_sketch(),
             ModelCommand::ToggleSnap => {

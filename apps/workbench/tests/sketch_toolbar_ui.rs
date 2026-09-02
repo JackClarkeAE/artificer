@@ -9,10 +9,11 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
-    ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate,
-    SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN,
-    TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant, render_sketch_toolbar,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
+    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH,
+    SketchOperationGate, SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState,
+    TILE_ICON_COLUMN, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
+    render_sketch_toolbar,
 };
 
 struct ToolbarHarness {
@@ -146,8 +147,8 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING
     );
 
-    // Creation on the first row, modify and constrain on the second: the
-    // relation family (ADR 0026, F1) completes a full seven-by-two grid.
+    // Six columns of drawing tools in two rows, then the divider, then the
+    // constraint column: Relation above Dimension.
     let rows = [
         [
             ToolFamily::Select,
@@ -156,18 +157,35 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
             ToolFamily::Rectangle,
             ToolFamily::Circle,
             ToolFamily::Arc,
-            ToolFamily::Polygon,
         ],
         [
+            ToolFamily::Polygon,
             ToolFamily::Slot,
             ToolFamily::Trim,
             ToolFamily::Fillet,
             ToolFamily::Chamfer,
             ToolFamily::Pattern,
-            ToolFamily::Relation,
-            ToolFamily::Dimension,
         ],
     ];
+    for (row_index, constraint) in [ToolFamily::Relation, ToolFamily::Dimension]
+        .into_iter()
+        .enumerate()
+    {
+        let row_first = output.controls[rows[row_index][0] as usize]
+            .expect("row control")
+            .primary;
+        let layout = output.controls[constraint as usize].expect("constraint layout");
+        assert_eq!(layout.primary.center().y, row_first.center().y);
+        assert_eq!(
+            layout.primary.left(),
+            row_first.left()
+                + 6.0 * PRIMARY_CELL_WIDTH
+                + 5.0 * FAMILY_GAP
+                + CONSTRAINT_DIVIDER_WIDTH,
+            "{constraint:?} sits beyond the divider"
+        );
+        assert_eq!(layout.primary.right(), bounds.right());
+    }
     for (row_index, row) in rows.into_iter().enumerate() {
         let first = output.controls[row[0] as usize]
             .expect("first row control")

@@ -831,11 +831,14 @@ fn workbench_two_visible_bodies_snapshot() {
     assert_eq!(harness.state().body_count(), 2);
     assert!(harness.state().body_visible(0));
     assert!(harness.state().body_visible(1));
+    // Committing never zooms in; the frame only grows to keep both bodies
+    // inside it, so the sphere round their union lies within the view.
     let (document_center, document_radius) = harness.state().view_frame();
-    assert!((document_center.x - 2.5).abs() <= 1.0e-12);
-    assert!((document_center.y - 0.75).abs() <= 1.0e-12);
-    assert!((document_center.z - 1.0).abs() <= 1.0e-12);
-    assert!((document_radius - 8.8125_f64.sqrt()).abs() <= 1.0e-12);
+    let separation = ((document_center.x - 2.5).powi(2)
+        + (document_center.y - 0.75).powi(2)
+        + (document_center.z - 1.0).powi(2))
+    .sqrt();
+    assert!(separation + 8.8125_f64.sqrt() <= document_radius + 1.0e-9);
     click_button(&mut harness, "Browser");
     assert!(
         harness
