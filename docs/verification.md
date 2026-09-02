@@ -517,15 +517,62 @@ hands back. The turntable that spun the active body on the spot is what a
 document with no joints still gets, because on such a document there is no
 mechanism to animate.
 
-## 10. Not in this release
+## 10. Sweeping a mechanism
+
+A static study answers whether an assembly fits *where it is*. A mechanism
+asks the harder question: does it fit anywhere it can go. A sweep is the
+answer — the assembly stepped through its travel, every pair measured at
+every step, stopping the moment two parts share space. It publishes its
+own document, with its own schema in
+[`docs/sweep-schema.json`](sweep-schema.json) and the same conformance
+guard the others have.
+
+```rust
+use artificer_kernel::api::sweep::{interference_sweep, SweepStep};
+let sweep = interference_sweep(&subjects, &steps, precision, profile, &token, &mut progress);
+```
+
+A step is where every body sits at one position of the mechanism. The
+kernel does not know what a joint is: the caller solves the mechanism and
+hands over the placements, which keeps the kernel free of the document's
+assembly vocabulary and lets a sweep run over poses from a solver, a
+recording or a file alike. The driver values ride along uninterpreted, so
+the report can name the position a collision was found at.
+
+Two things come back. The report is the document: every pair at the step
+it came closest, the first collision if there was one, and the verdict a
+clearance profile gives — judged at each pair's tightest step, which is
+the step a fit is decided on. The fields are the picture: the worst
+reading each facet corner saw *anywhere* in the motion. Worst rather than
+last, so the heat map of a travel shows the tightest the mechanism ever
+got at each point on each part rather than wherever it happened to stop.
+
+The sweep stops at the first collision on purpose. Past that point the
+parts have already passed through one another, so nothing beyond is a pose
+the real thing reaches; `steps_measured` against `steps_offered` is how
+much of the travel was actually answered for. A cancelled sweep says so
+and keeps what it measured — the positions it never reached are not
+cleared, only unmeasured, and `clears()` is false either way.
+
+The cost is one facet hierarchy per subject per step, which is why the
+hierarchy of a body that does not move between steps is kept rather than
+rebuilt: the frame a mechanism turns against is most of an assembly, and
+that is the difference between one build per subject and one per subject
+per step. The workbench runs the sweep on the compute pool with progress
+and cancellation, over the same travel the play button shows — the sweep
+reads the same swing function the animation does, so it measures the
+motion that was watched rather than a second one that resembles it.
+
+## 11. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
-measures are volume, surface area, centroid and bounds. An interference
-study is static: it measures the poses the bodies are in, and driving a
-mechanism through its travel while it measures is the next slice. Joints
-are fixed and revolute; sliding, cylindrical and ball joints are not in
-the vocabulary yet, and a mechanism whose loop closes is refused rather
-than solved. Shell covers
+measures are volume, surface area, centroid and bounds. Joints are fixed
+and revolute; sliding, cylindrical and ball joints are not in the
+vocabulary yet, and a mechanism whose loop closes is refused rather than
+solved. A sweep walks one path through the configuration space — every
+joint driven together, the path the animation plays — so a mechanism with
+more than one degree of freedom is checked along that path and not over
+the whole space it can occupy. Shell covers
 prisms and solids of revolution; a blended or domed body is refused
 rather than approximated, and opening the cap of a cone waits on the
 Boolean engine. Probes read the

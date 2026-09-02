@@ -601,6 +601,94 @@ fn interference_studies_conform_to_the_published_schema() {
     }
 }
 
+#[test]
+fn interference_sweeps_conform_to_the_published_schema() {
+    use artificer_kernel::api::analysis::{BUILT_IN_PROFILES, Subject};
+    use artificer_kernel::api::interference::Placement;
+    use artificer_kernel::api::sweep::{SweepStep, interference_sweep};
+
+    // A third published shape, and the same guard: a sweep that clears, one
+    // that collides and stops, and one that was cancelled all validate,
+    // judged and unjudged.
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../docs/sweep-schema.json")).unwrap();
+    let mut session = Session::new();
+    let outcome = session.run_script(
+        "let post = box(origin: [-3, 12, -10], size: [6, 8, 20], label: \"post\");
+let arm = box(origin: [0, -2, -2], size: [20, 4, 4], label: \"arm\");
+",
+        &BTreeMap::new(),
+        &CancellationToken::default(),
+    );
+    assert!(outcome.succeeded(), "{:?}", outcome.failure);
+    let subjects = ["post", "arm"]
+        .into_iter()
+        .map(|label| {
+            let id = session.step_snapshots.get(label).expect("a step");
+            Subject::new(
+                label,
+                session.snapshot_cache.get(id).expect("a snapshot").clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let swing = |radians: f64| {
+        let half = radians / 2.0;
+        SweepStep::new(
+            vec![radians],
+            vec![
+                Placement::IDENTITY,
+                Placement::from_quaternion([half.cos(), 0.0, 0.0, half.sin()], [0.0, 0.0, 0.0])
+                    .expect("a unit quaternion"),
+            ],
+        )
+    };
+
+    for travel in [1.0, std::f64::consts::FRAC_PI_2] {
+        let steps = (0..20)
+            .map(|step| swing(travel * f64::from(step) / 19.0))
+            .collect::<Vec<_>>();
+        let profiles = std::iter::once(None).chain(
+            BUILT_IN_PROFILES
+                .iter()
+                .map(|profile| Some(profile.profile())),
+        );
+        for profile in profiles {
+            let cancellation = CancellationToken::default();
+            let sweep = interference_sweep(
+                &subjects,
+                &steps,
+                artificer_protocol::PrecisionPolicy::default(),
+                profile.as_ref(),
+                &cancellation,
+                &mut |_, _| {},
+            );
+            let document = serde_json::to_value(sweep.report).unwrap();
+            let mut path = Vec::new();
+            let mut problems = Vec::new();
+            check(&schema, &schema, &document, &mut path, &mut problems);
+            assert!(problems.is_empty(), "{problems:#?}");
+        }
+    }
+
+    // And a cancelled one, which carries the flag the others omit.
+    let cancellation = CancellationToken::default();
+    cancellation.cancel();
+    let sweep = interference_sweep(
+        &subjects,
+        &[swing(0.0)],
+        artificer_protocol::PrecisionPolicy::default(),
+        None,
+        &cancellation,
+        &mut |_, _| {},
+    );
+    assert!(sweep.report.cancelled);
+    let document = serde_json::to_value(sweep.report).unwrap();
+    let mut path = Vec::new();
+    let mut problems = Vec::new();
+    check(&schema, &schema, &document, &mut path, &mut problems);
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
 /// A small validator for the subset of JSON Schema the report schema uses:
 /// types, required and closed property sets, enums and consts, `$ref` into
 /// `$defs`, `items`, `oneOf`, and `allOf`.

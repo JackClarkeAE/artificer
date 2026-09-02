@@ -287,3 +287,69 @@ fn a_revolute_joint_poses_its_component_and_stands_the_turntable_down() {
     // And the animation now belongs to the mechanism.
     assert!(harness.state().animation_drives_joints());
 }
+
+#[test]
+fn a_sweep_measures_the_travel_the_animation_plays() {
+    let mut harness = two_component_assembly();
+
+    // Without a joint there is no motion to sweep, and the workbench says
+    // so rather than sweeping one pose and calling it a travel.
+    harness.state_mut().run_interference_sweep();
+    assert!(harness.state().sweep_report().is_none());
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("joint")),
+        "{:?}",
+        harness.state().document_status_text()
+    );
+
+    click_scrolled_button(&mut harness, "Add revolute joint");
+    click_button(&mut harness, "Confirm operation");
+    assert!(harness.state().animation_drives_joints());
+
+    harness.state_mut().run_interference_sweep();
+    // The sweep runs off the UI thread, so the frames keep coming while it
+    // works — which is the point of running it there.
+    for _ in 0..600 {
+        harness.run();
+        if !harness.state().sweep_is_running() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!harness.state().sweep_is_running(), "the sweep finished");
+    let report = harness
+        .state()
+        .sweep_report()
+        .unwrap_or_else(|| panic!("a sweep: {:?}", harness.state().document_status_text()))
+        .clone();
+    assert!(
+        report.subjects.len() >= 2,
+        "every visible body takes part: {:?}",
+        report.subjects
+    );
+    assert!(report.steps_offered > 1, "a travel, not a pose");
+    assert!(!report.cancelled);
+    assert!(report.steps_measured > 0);
+    // Either the mechanism cleared its whole travel, or it stopped where
+    // it did not; both are answers, and neither is silence.
+    if let Some(collision) = report.collision.as_ref() {
+        assert_eq!(report.steps_measured, collision.step + 1);
+    } else {
+        assert_eq!(report.steps_measured, report.steps_offered);
+    }
+
+    // The sweep leaves the picture of the whole motion behind, bound to
+    // the facets it was measured on.
+    let heat_map = harness.state().heat_map_sample_counts();
+    assert_eq!(
+        heat_map.len(),
+        report.subjects.len(),
+        "one field per swept body"
+    );
+    for (body, samples) in heat_map {
+        assert!(samples > 0, "body {body} has no readings");
+    }
+}

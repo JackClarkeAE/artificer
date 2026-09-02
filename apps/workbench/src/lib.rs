@@ -105,6 +105,7 @@ use crate::sketch_toolbar::{
 };
 use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
 use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
+use artificer_kernel::api::sweep::{Sweep, SweepReport, SweepStep, interference_sweep};
 use artificer_model::JointId;
 use artificer_model::kinematics::{self, JointDriver, Kinematics};
 
@@ -1755,6 +1756,27 @@ struct WorkbenchBody {
     material: Option<String>,
 }
 
+/// How many positions of the mechanism a sweep measures.
+///
+/// The sweep walks the same travel the animation plays, so this is the
+/// resolution at which "it looked fine when I watched it" becomes a
+/// measurement. Sixty-four steps put a quarter-turn hinge under a degree
+/// and a half per step, which is finer than a collision that matters is
+/// narrow.
+const SWEEP_STEPS: usize = 64;
+
+/// A sweep running off the UI thread.
+struct AsyncSweep {
+    job: JobHandle<Sweep>,
+    cancellation: CancellationToken,
+    /// The step the worker has reached, so the status line can count.
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+    /// The bodies the fields belong to, in subject order.
+    bodies: Vec<BodyId>,
+    started: Instant,
+}
+
 /// One joint the user can pose, as the controls need it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DrivableJoint {
@@ -1800,6 +1822,60 @@ impl ClearanceHeatMap {
                 palette: self.palette,
                 epoch: self.epoch,
             })
+    }
+}
+
+/// Where one joint sits at a phase of the motion.
+///
+/// A joint with limits swings between them and back — a triangle wave, so
+/// a hinge sweeps its travel instead of jumping back at the end of the
+/// turn. One without turns continuously, because that is what an unlimited
+/// revolute joint does. The animation and the sweep both read this, so the
+/// measurement is of the motion that was watched rather than of a second
+/// motion that resembles it.
+fn swept_angle(phase: f64, limits: Option<(f64, f64)>) -> f64 {
+    match limits {
+        None => phase,
+        Some((min, max)) => {
+            let sweep = (phase / std::f64::consts::PI).rem_euclid(2.0);
+            let fraction = if sweep <= 1.0 { sweep } else { 2.0 - sweep };
+            min + (max - min) * fraction
+        }
+    }
+}
+
+/// The one line a sweep leaves in the status bar.
+fn sweep_status(report: &SweepReport) -> String {
+    if let Some(collision) = report.collision.as_ref() {
+        return format!(
+            "Collision at step {} of {}: {} ↔ {}",
+            collision.step + 1,
+            report.steps_offered,
+            collision.a,
+            collision.b
+        );
+    }
+    if report.cancelled {
+        return format!(
+            "Sweep stopped after {} of {} positions; the rest is unmeasured",
+            report.steps_measured, report.steps_offered
+        );
+    }
+    let travel = format!("{} positions", report.steps_measured);
+    match (report.profile.as_ref(), report.failing) {
+        (Some(profile), 0) => format!("{}: the motion clears over {travel}", profile.name),
+        (Some(profile), failing) => {
+            format!("{}: {failing} pairs too close over {travel}", profile.name)
+        }
+        (None, _) => report.tightest().map_or_else(
+            || format!("No contact over {travel}"),
+            |tightest| {
+                format!(
+                    "Clear over {travel}; closest {:.3} mm between {} and {}",
+                    tightest.distance, tightest.a, tightest.b
+                )
+            },
+        ),
     }
 }
 
@@ -2215,6 +2291,12 @@ pub struct KernelLabApp {
     /// it. A study is a reading, not a feature: it never enters the
     /// history and never touches a snapshot.
     interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
+    /// The last sweep of the mechanism through its travel, kept beside the
+    /// static study rather than replacing it: one answers for the pose the
+    /// assembly is in, the other for every pose it can reach.
+    sweep: Option<SweepReport>,
+    /// A sweep running off the UI thread.
+    async_sweep: Option<AsyncSweep>,
     /// The angle each revolute joint is held at, in radians. A joint with
     /// no entry rests at zero, which is the pose the document assembled.
     joint_drivers: BTreeMap<JointId, f64>,
@@ -2398,6 +2480,8 @@ impl Default for KernelLabApp {
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
             interference: None,
+            sweep: None,
+            async_sweep: None,
             joint_drivers: BTreeMap::new(),
             kinematics: Kinematics::default(),
             clearance_profile: None,
@@ -9835,6 +9919,220 @@ impl KernelLabApp {
         self.clearance_profile.as_ref()
     }
 
+    /// Measures the mechanism through the travel the animation plays.
+    ///
+    /// A static study answers for the pose the assembly is in. This
+    /// answers the harder question a mechanism asks — whether it clears
+    /// itself *anywhere it can go* — by stepping the joints through the
+    /// same sweep the play button shows and measuring every step. It stops
+    /// at the first collision, because past that point the parts have
+    /// already passed through one another and nothing beyond is a pose the
+    /// real thing reaches.
+    pub fn run_interference_sweep(&mut self) {
+        use artificer_kernel::api::analysis::Subject;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        if self.async_sweep.is_some() {
+            return;
+        }
+        let joints = self.drivable_joints();
+        if joints.is_empty() {
+            self.document_status =
+                Some("A sweep needs a joint to drive; this document has none".to_owned());
+            return;
+        }
+        let bodies = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
+        if bodies.len() < 2 {
+            self.document_status = Some("A sweep needs two visible bodies to compare".to_owned());
+            return;
+        }
+        let subjects = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| Subject::new(format!("Body {}", body.ordinal), body.body.snapshot.clone()))
+            .collect::<Vec<_>>();
+        let Some(steps) = self.sweep_steps(&joints, &bodies) else {
+            self.document_status =
+                Some("The mechanism could not be posed through its travel".to_owned());
+            return;
+        };
+
+        let total = steps.len();
+        let precision = self.document_precision();
+        let profile = self.clearance_profile.clone();
+        let cancellation = CancellationToken::new();
+        let job_cancellation = cancellation.clone();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::clone(&progress);
+        let Some(scheduler) = self.feature_preview_scheduler.as_ref() else {
+            // No scheduler is the deterministic-test configuration, where
+            // running it here is what a caller wants anyway.
+            let sweep = interference_sweep(
+                &subjects,
+                &steps,
+                precision,
+                profile.as_ref(),
+                &cancellation,
+                &mut |_, _| {},
+            );
+            self.apply_sweep(sweep, &bodies);
+            return;
+        };
+        let job = scheduler.submit(JobPriority::Commit, None, move |_| {
+            interference_sweep(
+                &subjects,
+                &steps,
+                precision,
+                profile.as_ref(),
+                &job_cancellation,
+                &mut |step, _| {
+                    reported.store(step, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+        });
+        self.async_sweep = Some(AsyncSweep {
+            job,
+            cancellation,
+            progress,
+            total,
+            bodies,
+            started: Instant::now(),
+        });
+        self.document_status = Some(format!("Sweeping {total} positions…"));
+    }
+
+    /// The positions a sweep measures: the animation's own travel, solved.
+    ///
+    /// Every step comes from the same `animated_joint_angle` the play
+    /// button uses, so a sweep measures exactly the motion the user
+    /// watched rather than a second motion that only resembles it.
+    fn sweep_steps(&self, joints: &[DrivableJoint], bodies: &[BodyId]) -> Option<Vec<SweepStep>> {
+        use artificer_kernel::api::interference::Placement;
+
+        let mut steps = Vec::with_capacity(SWEEP_STEPS);
+        for step in 0..SWEEP_STEPS {
+            let phase = std::f64::consts::TAU * step as f64 / SWEEP_STEPS as f64;
+            let mut drivers = Vec::with_capacity(joints.len());
+            let mut values = Vec::with_capacity(joints.len());
+            for joint in joints {
+                let angle = swept_angle(phase, joint.limits);
+                drivers.push(angle);
+                values.push(JointDriver::new(joint.id, angle));
+            }
+            let posed = kinematics::solve(&self.document, &values).ok()?;
+            let mut placements = Vec::with_capacity(bodies.len());
+            for body in bodies {
+                // A body that is not a component occurrence is not in the
+                // assembly graph, so nothing drives it: it stands still
+                // through the whole travel, which is exactly what the
+                // frame of a mechanism does.
+                let Some(component) = self.component_for_body(*body) else {
+                    placements.push(Placement::IDENTITY);
+                    continue;
+                };
+                let pose = posed.pose(component.id).unwrap_or(component.pose);
+                placements.push(Placement::from_quaternion(
+                    [
+                        pose.rotation.w(),
+                        pose.rotation.x(),
+                        pose.rotation.y(),
+                        pose.rotation.z(),
+                    ],
+                    [
+                        pose.translation.x(),
+                        pose.translation.y(),
+                        pose.translation.z(),
+                    ],
+                )?);
+            }
+            steps.push(SweepStep::new(drivers, placements));
+        }
+        Some(steps)
+    }
+
+    /// Takes a finished sweep: its report, and the picture of the whole
+    /// travel that goes with it.
+    fn apply_sweep(&mut self, sweep: Sweep, bodies: &[BodyId]) {
+        self.heat_map = heat_map_from(
+            bodies,
+            sweep.fields,
+            self.clearance_profile.as_ref(),
+            self.heat_map.as_ref(),
+        );
+        self.document_status = Some(sweep_status(&sweep.report));
+        self.sweep = Some(sweep.report);
+    }
+
+    /// Collects a running sweep once its worker is done.
+    fn poll_async_sweep(&mut self, context: &egui::Context) {
+        let Some(running) = self.async_sweep.as_ref() else {
+            return;
+        };
+        let Some(finished) = running.job.try_take() else {
+            let reached = running
+                .progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(running.total);
+            self.document_status = Some(format!(
+                "Sweeping {reached} of {} positions…",
+                running.total
+            ));
+            context.request_repaint();
+            return;
+        };
+        let running = self.async_sweep.take().expect("a finished sweep is staged");
+        match finished {
+            Ok(sweep) => {
+                let bodies = running.bodies.clone();
+                self.apply_sweep(sweep, &bodies);
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Sweep failed: {error:?}"));
+            }
+        }
+        let _ = running.started;
+        context.request_repaint();
+    }
+
+    /// Stops a running sweep. What it measured before the stop is kept and
+    /// says so; what it never reached, it never claims.
+    pub fn cancel_interference_sweep(&mut self) {
+        if let Some(running) = self.async_sweep.as_ref() {
+            running.cancellation.cancel();
+        }
+    }
+
+    #[must_use]
+    pub fn sweep_report(&self) -> Option<&SweepReport> {
+        self.sweep.as_ref()
+    }
+
+    #[must_use]
+    pub fn sweep_is_running(&self) -> bool {
+        self.async_sweep.is_some()
+    }
+
+    /// How many readings the heat map holds for each body, so a caller can
+    /// see that a study or a sweep left a picture without reaching into
+    /// the readings themselves.
+    #[must_use]
+    pub fn heat_map_sample_counts(&self) -> Vec<(u64, usize)> {
+        self.heat_map.as_ref().map_or_else(Vec::new, |heat_map| {
+            heat_map
+                .fields
+                .iter()
+                .map(|(body, values)| (body.get(), values.len()))
+                .collect()
+        })
+    }
+
     /// The precision the document's bodies were built under.
     fn document_precision(&self) -> artificer_protocol::PrecisionPolicy {
         self.bodies
@@ -10009,6 +10307,7 @@ impl KernelLabApp {
             );
         }
         ui.add_space(6.0);
+        self.sweep_controls(ui);
 
         let mut pairs = report.pairs.clone();
         pairs.sort_by(|left, right| {
@@ -10084,6 +10383,107 @@ impl KernelLabApp {
         {
             self.interference = None;
             self.heat_map = None;
+        }
+    }
+
+    /// The sweep: the same fit question asked of the whole motion rather
+    /// than of the pose the assembly happens to be in.
+    ///
+    /// It lives under the study because it answers with the same numbers
+    /// against the same profile. What it adds is the travel.
+    fn sweep_controls(&mut self, ui: &mut egui::Ui) {
+        if !self.animation_drives_joints() {
+            return;
+        }
+        ui.separator();
+        if let Some(running) = self.async_sweep.as_ref() {
+            let reached = running
+                .progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(running.total);
+            ui.add(
+                egui::ProgressBar::new(reached as f32 / running.total.max(1) as f32)
+                    .text(format!("Sweeping {reached} / {}", running.total)),
+            );
+            if ui
+                .button("Stop sweep")
+                .on_hover_text(
+                    "Keep what has been measured. The rest of the travel stays unmeasured, \
+                     and the report says so.",
+                )
+                .clicked()
+            {
+                self.cancel_interference_sweep();
+            }
+            return;
+        }
+        if ui
+            .button("Sweep the motion")
+            .on_hover_text(
+                "Drive every joint through its travel and measure each position, \
+                 stopping at the first collision. The heat map then shows the tightest \
+                 the mechanism ever gets at each point, not just where it is now.",
+            )
+            .clicked()
+        {
+            self.run_interference_sweep();
+        }
+        let Some(sweep) = self.sweep.as_ref() else {
+            return;
+        };
+        let (colour, headline) = match (sweep.collision.as_ref(), sweep.failing) {
+            (Some(collision), _) => (
+                theme::bad(),
+                format!(
+                    "Collision at step {} of {}: {} ↔ {}",
+                    collision.step + 1,
+                    sweep.steps_offered,
+                    collision.a,
+                    collision.b
+                ),
+            ),
+            (None, 0) if sweep.cancelled => (
+                theme::accent(),
+                format!(
+                    "Stopped after {} of {} positions",
+                    sweep.steps_measured, sweep.steps_offered
+                ),
+            ),
+            (None, 0) => (
+                theme::good(),
+                format!("The motion clears over {} positions", sweep.steps_measured),
+            ),
+            (None, failing) => (
+                theme::bad(),
+                format!("{failing} pairs too close over the motion"),
+            ),
+        };
+        ui.add_space(4.0);
+        status_line(ui, &headline, colour);
+        if let Some(tightest) = sweep.tightest() {
+            ui.label(
+                RichText::new(format!(
+                    "Closest {:.3} mm between {} and {}, at {:.1}°",
+                    tightest.distance,
+                    tightest.a,
+                    tightest.b,
+                    tightest
+                        .drivers
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0)
+                        .to_degrees()
+                ))
+                .small()
+                .color(theme::muted()),
+            );
+        }
+        if sweep.cancelled {
+            ui.label(
+                RichText::new("The positions it never reached are not cleared, only unmeasured.")
+                    .small()
+                    .color(theme::muted()),
+            );
         }
     }
 
@@ -11101,18 +11501,7 @@ impl KernelLabApp {
         if !self.animation_holds_joints() {
             return self.joint_angle(joint);
         }
-        let phase = self.motion.phase;
-        match limits {
-            None => phase,
-            Some((min, max)) => {
-                // A triangle wave over the phase: out to one stop, back to
-                // the other, so a hinge sweeps its travel instead of
-                // jumping back at the end of the turn.
-                let sweep = (phase / std::f64::consts::PI).rem_euclid(2.0);
-                let fraction = if sweep <= 1.0 { sweep } else { 2.0 - sweep };
-                min + (max - min) * fraction
-            }
-        }
+        swept_angle(self.motion.phase, limits)
     }
 
     /// Whether the animation drives a mechanism rather than spinning the
@@ -17340,6 +17729,7 @@ impl eframe::App for KernelLabApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.updates.poll(context);
         self.poll_async_sketch_extrusion_commit(context);
+        self.poll_async_sweep(context);
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }

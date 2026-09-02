@@ -2038,18 +2038,19 @@ fn show_document_impl(
     let cut_preview_faces = feature_preview
         .and_then(FeaturePreview::candidate)
         .map(|candidate| &candidate.changed_faces);
-    let tint_of = |key: BodyInstanceKey| {
-        bodies
+    // The colour a body paints its facets in, resolved once for the whole
+    // body rather than searched per triangle: the fill loop runs over every
+    // facet on screen, and a scan of the body list inside it is a scan per
+    // facet for an answer that cannot change within one.
+    let body_colours = bodies
+        .iter()
+        .map(|body| (body.key, body.tint, body.field.map(|field| field.palette)))
+        .collect::<Vec<_>>();
+    let colours_of = |key: BodyInstanceKey| {
+        body_colours
             .iter()
-            .find(|body| body.key == key)
-            .and_then(|body| body.tint)
-    };
-    let palette_of = |key: BodyInstanceKey| {
-        bodies
-            .iter()
-            .find(|body| body.key == key)
-            .and_then(|body| body.field)
-            .map(|field| field.palette)
+            .find(|(held, _, _)| *held == key)
+            .map_or((None, None), |(_, tint, palette)| (*tint, *palette))
     };
     let visible_rect = canvas.rect.expand(24.0);
     let mut pieces = Vec::with_capacity(triangles.len());
@@ -2082,11 +2083,12 @@ fn show_document_impl(
                 continue;
             }
 
+            let (tint, palette) = colours_of(triangle.body);
             // One colour per vertex, so the mesh rasteriser interpolates the exact
             // carrier shading across the facet. A cylinder's wall is the same
             // triangle count it always was and no longer bands.
             let mut fill = if display_mode.is_shaded() {
-                tint_of(triangle.body).map_or_else(
+                tint.map_or_else(
                     || triangle.lighting.map(shaded_face_color),
                     |tint| {
                         triangle
@@ -2102,7 +2104,7 @@ fn show_document_impl(
             // measurement's and not the tessellation's. The light rig still
             // shades it, which is what keeps the part readable as a shape
             // while it is showing a number.
-            if let Some(palette) = palette_of(triangle.body) {
+            if let Some(palette) = palette {
                 for (corner, vertex) in fill.iter_mut().enumerate() {
                     if let Some(reading) = palette.color(triangle.heat[corner]) {
                         *vertex = if display_mode.is_shaded() {

@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://artificer.dev/schemas/interference-sweep-1.json",
+  "title": "Artificer interference sweep",
+  "description": "The machine-readable answer to whether a mechanism clears itself through its travel, rather than in one pose: the assembly stepped through a motion, every pair measured at every step, stopping at the first step where two bodies share space. A step is where every body sits at one position of the mechanism; the kernel does not interpret the driver values it is given, so a sweep runs over poses from a joint solver, a recording or a file alike. Produced by `api::sweep::interference_sweep`. schema_version 1.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kernel_version": {
+      "type": "string"
+    },
+    "subjects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The bodies swept, in the order they were given. Every step's placements are in this order."
+    },
+    "steps_offered": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many positions the caller supplied."
+    },
+    "steps_measured": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many were measured. Fewer than were offered when a collision stopped the sweep or it was cancelled, and the difference is the part of the travel nothing is known about."
+    },
+    "collision": {
+      "$ref": "#/$defs/collision"
+    },
+    "pairs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pair"
+      },
+      "description": "Every unordered pair, at the step it came closest, worst first."
+    },
+    "profile": {
+      "$ref": "#/$defs/profile"
+    },
+    "failing": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many pairs the profile calls too close at their tightest step. Absent, or zero, when the sweep passes or was never judged."
+    },
+    "tier": {
+      "$ref": "#/$defs/tier"
+    },
+    "cancelled": {
+      "type": "boolean",
+      "description": "Whether the sweep stopped because it was cancelled. A cancelled sweep proves nothing about the steps it never reached."
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "kernel_version",
+    "subjects",
+    "steps_offered",
+    "steps_measured",
+    "pairs",
+    "tier",
+    "elapsed_ms"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "tier": {
+      "type": "string",
+      "enum": [
+        "exact",
+        "approximate"
+      ],
+      "description": "exact: every body swept is planar throughout, so its facets are its surfaces. approximate: at least one surface is curved and its facets are chords of it, so a measured gap is never smaller than the true gap and never larger than it by more than the pair's `bound`."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "clear",
+        "touching",
+        "interfering"
+      ]
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "pass",
+        "too_close",
+        "loose"
+      ]
+    },
+    "point": {
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "z": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "additionalProperties": false
+    },
+    "drivers": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "description": "The joint coordinates that put the mechanism in this position, as the caller supplied them."
+    },
+    "pair": {
+      "type": "object",
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "distance": {
+          "type": "number",
+          "description": "The closest the two bodies ever came, in millimetres."
+        },
+        "step": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The step that reading was taken at."
+        },
+        "drivers": {
+          "$ref": "#/$defs/drivers"
+        },
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "witness_a": {
+          "$ref": "#/$defs/point"
+        },
+        "witness_b": {
+          "$ref": "#/$defs/point"
+        },
+        "tier": {
+          "$ref": "#/$defs/tier"
+        },
+        "bound": {
+          "type": "number",
+          "minimum": 0
+        },
+        "verdict": {
+          "$ref": "#/$defs/verdict"
+        }
+      },
+      "required": [
+        "a",
+        "b",
+        "distance",
+        "step",
+        "drivers",
+        "state",
+        "witness_a",
+        "witness_b",
+        "tier"
+      ],
+      "additionalProperties": false
+    },
+    "collision": {
+      "type": "object",
+      "description": "Where the sweep first found two bodies sharing space, which is also where it stopped. Absent when the mechanism cleared itself through every step measured.",
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "drivers": {
+          "$ref": "#/$defs/drivers"
+        },
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "witness_a": {
+          "$ref": "#/$defs/point"
+        },
+        "witness_b": {
+          "$ref": "#/$defs/point"
+        }
+      },
+      "required": [
+        "step",
+        "drivers",
+        "a",
+        "b",
+        "witness_a",
+        "witness_b"
+      ],
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "object",
+      "description": "The fit the sweep was judged against. Absent when it only measured.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "minimum": {
+          "type": "number"
+        },
+        "maximum": {
+          "type": "number"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "minimum",
+        "note"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

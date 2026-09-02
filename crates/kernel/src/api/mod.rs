@@ -21,6 +21,7 @@ pub mod selectors;
 pub mod server;
 pub mod session;
 pub mod snapshot;
+pub mod sweep;
 
 pub use crate::CancellationToken;
 pub use commands::*;
