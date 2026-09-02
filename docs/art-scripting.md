@@ -344,7 +344,12 @@ reaches the last instance. The pattern step also stands in for a probe or
 selector that names it.
 
 Without `step:`, `pattern(direction:, spacing:, count:)` copies the whole
-current body along a row on the faceted tier, as before.
+current body along a row. Each copy is the body under a rigid
+translation, so it is exact for any body, blends and curved faces
+included. Copies that clear one another become separate solids of one
+body; copies that overlap are joined through the Boolean ladder, and
+where that refuses, so does the pattern. Stepping a prism along one of
+its own axes overlaps on a shared face plane, which the ladder refuses.
 
 ### `shell`
 
@@ -367,17 +372,34 @@ faces the pocket goes through. Closed, the body keeps a void one wall in
 from every face, so the report shows two shells. A hole through the open
 face keeps a wall around it. Every case is exact and reads back: a shelled
 `60 × 40 × 25` box open at the top has volume
-`60·40·25 − 54·34·22`, and `probe.min_wall` reads the wall. Rungs are
-`shell/open-prism` and `shell/closed-prism`.
+`60·40·25 − 54·34·22`, and `probe.min_wall` reads the wall.
 
-The domain is the prism about the open face: that face and the one
-opposite it are parallel planes and every other face is a plane or a
-cylinder along their normal, with an outline of lines and arcs. A box is a
-prism along each axis, so it opens on any face; an extrusion or a cylinder
-opens on its caps; a slot with round ends offsets its arcs exactly. A
-blended body, a revolved section other than a cylinder, or a wall thicker
-than half the narrowest neck of the outline is refused by name
-(`SHELL_DOMAIN_UNSUPPORTED`, `SHELL_WALL_INVALID`, `SHELL_SELF_INTERSECTS`).
+There are two readings of a body, tried in that order.
+
+**The prism**, rungs `shell/open-prism` and `shell/closed-prism`: the open
+face and the one opposite it are parallel planes, and every other face is a
+plane or a cylinder along their normal, with an outline of lines and arcs.
+A box is a prism along each axis, so it opens on any face; an extrusion or
+a cylinder opens on its caps; a slot with round ends offsets its arcs
+exactly, and so do the cylinders of a filleted vertical edge.
+
+**The solid of revolution**, rungs `shell/open-revolve` and
+`shell/closed-revolve`: a coaxial body whose section closes through its
+axis or on itself. The offset happens in the section, which carries the
+whole boundary, so a two-diameter turned hub, a tapered post and a tube
+all hollow to one wall measured square to the surface. Every open face
+must then be a cap square to the axis.
+
+Refusals are by name. A wall that leaves no floor or no core, or one
+thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
+`SHELL_SELF_INTERSECTS`. A body neither reading owns is
+`SHELL_DOMAIN_UNSUPPORTED`. A blend or a dome across the wall is
+`SHELL_BLEND_UNSUPPORTED`: the inner surface would be the offset of a
+torus or a sphere with the material on the far side of the tube, which
+this release's carriers do not express, so shell first and blend after.
+Opening a cap takes the wall away through the Boolean engine, so a body
+whose surfaces that engine does not carry yet — a cone, today — is
+`SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the same body shells closed.
 
 ### `union`, `difference`, `intersection`
 

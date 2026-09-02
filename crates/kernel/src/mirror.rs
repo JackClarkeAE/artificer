@@ -119,78 +119,94 @@ pub(crate) fn mirror_topology(
                 }
             }
         };
-        let planar = matches!(output.faces[face_index].value.surface, Surface::Plane(_));
-        let loops: Vec<_> = output.faces[face_index].value.loops().collect();
-        for loop_key in loops {
-            let loop_record = &mut output.loops[loop_key.0];
-            loop_record.value.coedges.reverse();
-            for coedge_key in loop_record.value.coedges.clone() {
-                let coedge = &mut output.coedges[coedge_key.0].value;
-                coedge.orientation = coedge.orientation.reversed();
-                let range = coedge.parameter_range;
-                let map_vector = |vector: Vector2| {
-                    let mapped = mirror(Point2::new(vector.x, vector.y));
-                    Vector2::new(mapped.x, mapped.y)
-                };
-                match coedge.pcurve {
-                    Curve2::Line { .. } => {
-                        let start = mirror(coedge.pcurve.evaluate(range.start));
-                        let end = mirror(coedge.pcurve.evaluate(range.end));
-                        let (pcurve, parameter_range) = Curve2::line_segment([end, start]);
-                        coedge.pcurve = pcurve;
-                        coedge.parameter_range = parameter_range;
-                    }
-                    Curve2::Circle {
-                        center,
-                        u,
-                        v,
+        reverse_face_loops(&mut output, face_index, mirror)?;
+    }
+    Ok(output)
+}
+
+/// Reverses every loop of one face and carries its curves-on-surface
+/// through `mirror`, the in-plane map the carrier's own reversal implies.
+///
+/// A face is reversed by flipping its carrier's parameterisation and then
+/// walking its loops the other way, so the two halves belong together: the
+/// mirror of a body and the void of a shell both need exactly this, and
+/// both call it here.
+pub(crate) fn reverse_face_loops(
+    topology: &mut Topology,
+    face_index: usize,
+    mirror: fn(Point2) -> Point2,
+) -> Result<(), MirrorError> {
+    let planar = matches!(topology.faces[face_index].value.surface, Surface::Plane(_));
+    let loops: Vec<_> = topology.faces[face_index].value.loops().collect();
+    for loop_key in loops {
+        let loop_record = &mut topology.loops[loop_key.0];
+        loop_record.value.coedges.reverse();
+        for coedge_key in loop_record.value.coedges.clone() {
+            let coedge = &mut topology.coedges[coedge_key.0].value;
+            coedge.orientation = coedge.orientation.reversed();
+            let range = coedge.parameter_range;
+            let map_vector = |vector: Vector2| {
+                let mapped = mirror(Point2::new(vector.x, vector.y));
+                Vector2::new(mapped.x, mapped.y)
+            };
+            match coedge.pcurve {
+                Curve2::Line { .. } => {
+                    let start = mirror(coedge.pcurve.evaluate(range.start));
+                    let end = mirror(coedge.pcurve.evaluate(range.end));
+                    let (pcurve, parameter_range) = Curve2::line_segment([end, start]);
+                    coedge.pcurve = pcurve;
+                    coedge.parameter_range = parameter_range;
+                }
+                Curve2::Circle {
+                    center,
+                    u,
+                    v,
+                    radius,
+                } => {
+                    coedge.pcurve = Curve2::Circle {
+                        center: mirror(center),
+                        u: map_vector(u),
+                        v: map_vector(v),
                         radius,
-                    } => {
-                        coedge.pcurve = Curve2::Circle {
-                            center: mirror(center),
-                            u: map_vector(u),
-                            v: map_vector(v),
-                            radius,
-                        };
-                        coedge.parameter_range = ParameterRange::new(range.end, range.start);
-                    }
-                    Curve2::Ellipse {
-                        center,
-                        u,
-                        v,
+                    };
+                    coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                }
+                Curve2::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                } => {
+                    coedge.pcurve = Curve2::Ellipse {
+                        center: mirror(center),
+                        u: map_vector(u),
+                        v: map_vector(v),
                         major_radius,
                         minor_radius,
-                    } => {
-                        coedge.pcurve = Curve2::Ellipse {
-                            center: mirror(center),
-                            u: map_vector(u),
-                            v: map_vector(v),
-                            major_radius,
-                            minor_radius,
-                        };
-                        coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                    };
+                    coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                }
+                Curve2::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                } => {
+                    if planar {
+                        return Err(MirrorError::UnsupportedPcurve);
                     }
-                    Curve2::Harmonic {
+                    // The azimuth mirror negates the parameter:
+                    // `cos(-t - p) = cos(t + p)`, and the reversed walk runs
+                    // from `-end` to `-start`.
+                    coedge.pcurve = Curve2::Harmonic {
                         mean,
                         amplitude,
-                        phase,
-                    } => {
-                        if planar {
-                            return Err(MirrorError::UnsupportedPcurve);
-                        }
-                        // The azimuth mirror negates the parameter:
-                        // `cos(−θ − φ) = cos(θ + φ)`, and the reversed walk
-                        // runs from `−end` to `−start`.
-                        coedge.pcurve = Curve2::Harmonic {
-                            mean,
-                            amplitude,
-                            phase: -phase,
-                        };
-                        coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
-                    }
+                        phase: -phase,
+                    };
+                    coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
                 }
             }
         }
     }
-    Ok(output)
+    Ok(())
 }

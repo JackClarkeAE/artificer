@@ -75,8 +75,9 @@ are stable, slash-separated paths:
 | `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
-| `pattern/faceted` | A whole-body linear pattern, which is faceted in this release. |
-| `shell/open-prism`, `shell/closed-prism` | A shell: the open face's inward offset cut as a pocket, or a core one wall in from every face taken away by the Boolean ladder. |
+| `pattern/exact-instances`, `pattern/boolean` | A whole-body pattern: copies that clear one another placed as solids of one body, or copies that overlap joined through the Boolean ladder. |
+| `shell/open-prism`, `shell/closed-prism` | A shell of a prism: the open face's inward offset cut as a pocket, or a core one wall in from every face enclosed as a void. |
+| `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section. |
 | `transform/similarity` | A rigid transform. |
 
 A rung ending in `/faceted` is the approximate tier; the step also carries
@@ -269,34 +270,65 @@ holes is the plate less six holes in closed form, the replay is
 digest-stable across sessions and journal replays, and a rim fillet on
 any instance certifies through the ordinary blend ladder. A placement
 that would carry an instance off its face is refused by instance number,
-and a refused or failed pattern leaves nothing behind. The face the
+and a refused or failed pattern leaves nothing behind.
+
+A whole-body pattern (`pattern` without `step:`) is exact too. Each copy
+is the body under a rigid translation, so a cylinder patterns as
+cylinders and a blend as blends: the report shows two caps and two half
+walls per copy of a cylinder, never a facet. Copies that clear one
+another along the pattern direction become solids of one body
+(`pattern/exact-instances`), and the volume is the body's times the
+count. Copies that overlap are merged material and go through the
+Boolean ladder (`pattern/boolean`); where that ladder refuses, so does
+the pattern, rather than falling to a tessellation. Stepping a prism
+along one of its own axes leaves the other face planes shared between
+the copies, which is that refusal. The face the
 feature was built on is followed by history through every later step, so
 a boss the feature itself added does not capture a `faces(">Z")`
 selector.
 
 ### Shell
 
-`shell` (`shell_snapshot` on the kernel wire) hollows a prismatic body to
-one uniform wall, open at one face, at two opposite faces, or closed. It
+`shell` (`shell_snapshot` on the kernel wire) hollows a body to one
+uniform wall, open at one face, at two opposite faces, or closed. It
 composes constructions the kernel already certifies: the mitred loop
-offset the rim blends use, the exact face cut, the prism constructor and
-the Boolean engine. The answers are closed-form and the tests hold the
+offset the rim blends use, the exact face cut, the prism and revolve
+constructors, and the Boolean engine.
+
+The body is read as a prism about the open face first, and as a coaxial
+solid of revolution second, so a two-diameter turned hub or a tapered
+post hollows in its own section with the wall measured square to the
+surface. A closed shell needs no Boolean at all: the core is the body's
+own boundary offset inward, which an offset that does not self-intersect
+places inside the material by construction, so the core is enclosed
+directly as a void and the ordinary solid validator certifies the
+result. The answers are closed-form and the tests hold the
 kernel to them: a `b × d × h` box open at the top has volume
 `bdh − (b−2w)(d−2w)(h−w)`, a cylinder open at the top is the annular cup
 `πr²h − π(r−w)²(h−w)`, a closed box keeps a void `(b−2w)(d−2w)(h−2w)`
 and reports two shells, a hole through the open face keeps a wall around
 it, and `probe.min_wall` reads the wall back to `1e-9` on planar walls
 (to the facet chord on curved ones). A wall that leaves no floor or no
-core, a body that is not a prism about the open face, two open faces
-that are not opposite, or a wall thicker than half the narrowest neck are
-refused by name: `SHELL_WALL_INVALID`, `SHELL_DOMAIN_UNSUPPORTED`,
+core, a body neither reading owns, two open faces that are not opposite,
+or a wall thicker than half the narrowest neck are refused by name:
+`SHELL_WALL_INVALID`, `SHELL_DOMAIN_UNSUPPORTED`,
 `SHELL_OPEN_FACES_UNSUPPORTED`, `SHELL_SELF_INTERSECTS`.
+
+Two refusals mark where the release stops. `SHELL_BLEND_UNSUPPORTED`
+says the wall would run under a blend or a dome: its inner surface is the
+offset of a torus or a sphere, and the material would lie on the far side
+of the tube from where those carriers put it, which is a property of the
+surface vocabulary rather than of the offset. `SHELL_OPEN_REVOLVE_UNSUPPORTED`
+says the wall at an open cap could not be taken away, because that case
+alone rests on the Boolean engine's analytic domain; it carries the
+engine's own diagnostic underneath, and the same body shells closed.
 
 ## 8. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Shell covers
-prisms: a revolved body other than a cylinder, or a blended one, is
-refused rather than approximated. Probes read the
+prisms and solids of revolution; a blended or domed body is refused
+rather than approximated, and opening the cap of a cone waits on the
+Boolean engine. Probes read the
 current session only; comparing two reports is a job for the caller until
 the semantic diff lands.

@@ -291,7 +291,11 @@ fn refusal(script: &str) -> (ApiErrorCode, String) {
     let mut session = Session::new();
     let outcome = session.run_script(script, &BTreeMap::new(), &CancellationToken::default());
     let failure = outcome.failure.expect("the shell should be refused");
-    assert_eq!(failure.label, "shelled");
+    assert!(
+        failure.label == "shelled" || failure.label == "hollow" || failure.label == "cup",
+        "{}",
+        failure.label
+    );
     let codes = failure
         .diagnostics
         .iter()
@@ -351,4 +355,164 @@ fn shells_refuse_walls_that_leave_nothing_and_bodies_that_are_not_prisms() {
         box_script()
     ));
     assert!(codes.contains("SHELL_OPEN_FACES_UNSUPPORTED"), "{codes}");
+}
+
+// ---------------------------------------------------------------------------
+// Solids of revolution
+// ---------------------------------------------------------------------------
+
+/// A two-diameter turned hub: a 30 mm flange 10 mm thick under a 12 mm
+/// boss 30 mm tall. No face of it is a prism about any other, so the
+/// prism reading refuses and the section reading owns it.
+fn stepped_hub() -> String {
+    "let section = sketch(on: \"XZ\", label: \"section\", entities: [
+    line(start: [0, 0], end: [30, 0]),
+    line(start: [30, 0], end: [30, 10]),
+    line(start: [30, 10], end: [12, 10]),
+    line(start: [12, 10], end: [12, 40]),
+    line(start: [12, 40], end: [0, 40]),
+    line(start: [0, 40], end: [0, 0]),
+]);
+let hub = revolve(sketch: section, axis: [0, 0, 1], label: \"hub\");
+"
+    .to_owned()
+}
+
+#[test]
+fn a_stepped_hub_shells_closed_through_its_section() {
+    let session = run(&format!(
+        "{}shell(wall: 3, label: \"hollow\");\n",
+        stepped_hub()
+    ));
+    // The core is the section offset 3 mm inward: a 27 mm disc from z = 3
+    // to 7 under a 9 mm post to z = 37.
+    let core = PI * (27.0 * 27.0 * 4.0 + 9.0 * 9.0 * 30.0);
+    let body = PI * (30.0 * 30.0 * 10.0 + 12.0 * 12.0 * 30.0);
+    assert_close(session.snapshot.measures().volume, body - core, "volume");
+    assert_eq!(
+        session.snapshot.counts().shells,
+        2,
+        "an outer shell and a void"
+    );
+    assert_eq!(rung_of(&session, "hollow"), "shell/closed-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+    let surfaces = session.report().body.expect("body").surfaces;
+    assert_eq!(surfaces.planes + surfaces.cylinders, surfaces.total());
+    // Between two facetted bores the probe reads short by their chords.
+    let wall = min_wall(&session);
+    assert!((wall - 3.0).abs() <= 1.0e-2, "thinnest wall {wall}");
+}
+
+#[test]
+fn a_stepped_hub_opens_at_its_top_cap() {
+    let session = run(&format!(
+        "{}shell(open: faces(\">Z\"), wall: 3, label: \"cup\");\n",
+        stepped_hub()
+    ));
+    // The same core, less the wall it would have left over the boss: the
+    // bore runs right out through the top.
+    let removed = PI * (27.0 * 27.0 * 4.0 + 9.0 * 9.0 * 33.0);
+    let body = PI * (30.0 * 30.0 * 10.0 + 12.0 * 12.0 * 30.0);
+    assert_close(session.snapshot.measures().volume, body - removed, "volume");
+    assert_eq!(session.snapshot.counts().shells, 1, "the cup is open");
+    assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn a_tapered_post_shells_closed_with_conical_walls() {
+    let script = "let s = sketch(on: \"XZ\", label: \"s\", entities: [
+    line(start: [0, 0], end: [20, 0]),
+    line(start: [20, 0], end: [12, 30]),
+    line(start: [12, 30], end: [0, 30]),
+    line(start: [0, 30], end: [0, 0]),
+]);
+let post = revolve(sketch: s, axis: [0, 0, 1], label: \"post\");
+shell(wall: 2, label: \"hollow\");
+";
+    let session = run(script);
+    // The wall is measured square to the slant, so the core's radius line
+    // is the post's shifted by one wall along its own normal.
+    let (wall, slope): (f64, f64) = (2.0, 8.0 / 30.0);
+    let inset = wall * (1.0 + slope * slope).sqrt();
+    let radius = |z: f64| 20.0 - inset - slope * z;
+    let (lower, upper) = (radius(wall), radius(30.0 - wall));
+    let core = PI * (30.0 - 2.0 * wall) / 3.0 * (lower * lower + lower * upper + upper * upper);
+    let body = PI * 30.0 / 3.0 * (400.0 + 20.0 * 12.0 + 144.0);
+    assert_close(session.snapshot.measures().volume, body - core, "volume");
+    assert_eq!(session.snapshot.counts().shells, 2);
+    let surfaces = session.report().body.expect("body").surfaces;
+    assert_eq!(surfaces.cones, 4, "two cone halves outside and two in");
+    assert_eq!(rung_of(&session, "hollow"), "shell/closed-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn a_revolved_shell_replays_to_the_same_digest() {
+    let script = format!("{}shell(wall: 3, label: \"hollow\");\n", stepped_hub());
+    let first = run(&script);
+    assert_eq!(
+        run(&script).snapshot.semantic_digest(),
+        first.snapshot.semantic_digest()
+    );
+    let journal = first.export_journal().unwrap();
+    assert_eq!(
+        Session::from_journal(&journal)
+            .unwrap()
+            .snapshot
+            .semantic_digest(),
+        first.snapshot.semantic_digest()
+    );
+    let decompiled = first.to_art(&DecompileOptions::default()).unwrap();
+    assert_eq!(
+        run(&decompiled).snapshot.semantic_digest(),
+        first.snapshot.semantic_digest(),
+        "{decompiled}"
+    );
+}
+
+#[test]
+fn a_blend_or_a_dome_is_refused_by_name() {
+    // The wall's inner surface would be the offset of a torus, with the
+    // material on the far side of the tube from where this kernel's
+    // carriers put it.
+    let (_, codes) = refusal(
+        "let c = cylinder(radius: 20, height: 30, label: \"c\");
+fillet(edges: [nearest(point: [20, 0, 30], kind: \"edge\"), nearest(point: [-20, 0, 30], kind: \"edge\")], radius: 5, label: \"rim\");
+shell(wall: 3, label: \"shelled\");
+",
+    );
+    assert!(codes.contains("SHELL_BLEND_UNSUPPORTED"), "{codes}");
+
+    // The same for a dome, whose inner surface would be a sphere.
+    let (_, codes) = refusal(
+        "let c = cylinder(radius: 5, height: 10, label: \"c\");
+fillet(edges: [nearest(point: [5, 0, 10], kind: \"edge\"), nearest(point: [-5, 0, 10], kind: \"edge\")], radius: 5, label: \"dome\");
+shell(wall: 1, label: \"shelled\");
+",
+    );
+    assert!(codes.contains("SHELL_BLEND_UNSUPPORTED"), "{codes}");
+}
+
+#[test]
+fn opening_a_cap_the_boolean_cannot_carry_names_the_shell_first() {
+    // A cone's wall is taken away through the Boolean engine, which does
+    // not reconstruct cones yet. The refusal leads with the shell's own
+    // account and keeps the engine's underneath.
+    let (_, codes) = refusal(
+        "let s = sketch(on: \"XZ\", label: \"s\", entities: [
+    line(start: [0, 0], end: [20, 0]),
+    line(start: [20, 0], end: [12, 30]),
+    line(start: [12, 30], end: [0, 30]),
+    line(start: [0, 30], end: [0, 0]),
+]);
+let post = revolve(sketch: s, axis: [0, 0, 1], label: \"post\");
+shell(open: faces(\">Z\"), wall: 2, label: \"shelled\");
+",
+    );
+    assert!(
+        codes.starts_with("SHELL_OPEN_REVOLVE_UNSUPPORTED"),
+        "{codes}"
+    );
+    assert!(codes.contains("BOOLEAN_"), "{codes}");
 }

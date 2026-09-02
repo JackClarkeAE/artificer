@@ -796,6 +796,11 @@ impl PendingOperation {
     }
 }
 
+/// How many holes a staged hole pattern cuts. The ring is a feature
+/// pattern like any other: one circle repeated at rigid placements in its
+/// own face, carried by a single profile so the cut stays one exact step.
+const HOLE_PATTERN_COUNT: u32 = 6;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SolidFeaturePreset {
     Revolve,
@@ -803,6 +808,8 @@ enum SolidFeaturePreset {
     Rib,
     Mirror,
     LinearPattern,
+    HolePattern,
+    Shell,
     Chamfer,
     Fillet,
 }
@@ -871,6 +878,8 @@ impl SolidFeaturePreset {
             Self::Rib => "Add rib",
             Self::Mirror => "Mirror body",
             Self::LinearPattern => "Linear body pattern",
+            Self::HolePattern => "Hole pattern",
+            Self::Shell => "Shell body",
             Self::Chamfer => "Chamfer edge",
             Self::Fillet => "Fillet edge",
         }
@@ -883,6 +892,10 @@ impl SolidFeaturePreset {
             Self::Rib => "Add a straight rectangular rib to the selected planar face",
             Self::Mirror => "Mirror the browser-selected bodies across the selected plane",
             Self::LinearPattern => "Create three separated +X copies as one multi-solid body group",
+            Self::HolePattern => {
+                "Cut a ring of six holes on the selected face, evenly spaced about its centre"
+            }
+            Self::Shell => "Hollow the active body to one uniform wall, open at the selected face",
             Self::Chamfer => {
                 "Finish one or more compatible cuboid edges with exact planar chamfers"
             }
@@ -9862,16 +9875,17 @@ impl KernelLabApp {
         };
         let body = self.bodies[index].id;
         let base_snapshot = self.bodies[index].body.snapshot.id();
-        let (target_face, frame) =
-            if matches!(preset, SolidFeaturePreset::Hole | SolidFeaturePreset::Rib) {
-                let Some(face) = self.selected_face else {
-                    self.document_status = Some("Select a planar face for Hole or Rib".to_owned());
-                    return;
-                };
-                let support = match NativeKernel::planar_face_support(
-                    &self.bodies[index].body.snapshot,
-                    face,
-                ) {
+        let (target_face, frame) = if matches!(
+            preset,
+            SolidFeaturePreset::Hole | SolidFeaturePreset::Rib | SolidFeaturePreset::HolePattern
+        ) {
+            let Some(face) = self.selected_face else {
+                self.document_status =
+                    Some("Select a planar face for Hole, Rib or Hole pattern".to_owned());
+                return;
+            };
+            let support =
+                match NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face) {
                     Ok(support) => support,
                     Err(error) => {
                         self.document_status =
@@ -9879,51 +9893,60 @@ impl KernelLabApp {
                         return;
                     }
                 };
-                (Some(face), Some(support.frame))
-            } else if matches!(
-                preset,
-                SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
-            ) {
-                self.apply_tangent_edge_chain();
-                let selected = self
-                    .selected_edges
-                    .iter()
-                    .copied()
-                    .filter(|selection| selection.body.get() == body.get())
-                    .collect::<Vec<_>>();
-                if selected.is_empty() || selected.len() != self.selected_edges.len() {
-                    self.document_status =
-                        Some("Select one or more edges on the active body".to_owned());
-                    return;
-                }
-                let support = self.edge_finish_selection_support();
-                self.document_status = Some(if support.can_commit() {
-                    "Edge-finish preview staged · confirm with Enter or the green tick".to_owned()
-                } else {
-                    format!("Preview staged · {}", support.detail())
-                });
-                // A fresh staging is a fresh attempt: the editor shows the last
-                // refusal for this preset, and it must not inherit one from
-                // an earlier, cancelled staging.
-                if matches!(
-                    &self.last_attempt,
-                    Attempt::Rejected { operation, .. } if *operation == preset.label()
-                ) {
-                    self.last_attempt = Attempt::NotRun;
-                }
-                (Some(selected[0].edge), None)
-            } else if preset == SolidFeaturePreset::Mirror {
-                let (plane_frame, plane_name) = self.browser_mirror_plane();
-                let target_count = self.browser_selected_body_indices().len().max(1);
-                self.document_status = Some(if target_count > 1 {
-                    format!("Mirror staged across {plane_name} for {target_count} bodies")
-                } else {
-                    format!("Mirror staged across {plane_name}")
-                });
-                (None, Some(plane_frame))
+            (Some(face), Some(support.frame))
+        } else if matches!(
+            preset,
+            SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
+        ) {
+            self.apply_tangent_edge_chain();
+            let selected = self
+                .selected_edges
+                .iter()
+                .copied()
+                .filter(|selection| selection.body.get() == body.get())
+                .collect::<Vec<_>>();
+            if selected.is_empty() || selected.len() != self.selected_edges.len() {
+                self.document_status =
+                    Some("Select one or more edges on the active body".to_owned());
+                return;
+            }
+            let support = self.edge_finish_selection_support();
+            self.document_status = Some(if support.can_commit() {
+                "Edge-finish preview staged · confirm with Enter or the green tick".to_owned()
             } else {
-                (None, None)
-            };
+                format!("Preview staged · {}", support.detail())
+            });
+            // A fresh staging is a fresh attempt: the editor shows the last
+            // refusal for this preset, and it must not inherit one from
+            // an earlier, cancelled staging.
+            if matches!(
+                &self.last_attempt,
+                Attempt::Rejected { operation, .. } if *operation == preset.label()
+            ) {
+                self.last_attempt = Attempt::NotRun;
+            }
+            (Some(selected[0].edge), None)
+        } else if preset == SolidFeaturePreset::Shell {
+            // The selected face is the one the shell opens. With none
+            // selected the body hollows closed, around a void.
+            self.document_status = Some(if self.selected_face.is_some() {
+                "Shell staged, open at the selected face".to_owned()
+            } else {
+                "Shell staged closed · select a face first to open one".to_owned()
+            });
+            (self.selected_face, None)
+        } else if preset == SolidFeaturePreset::Mirror {
+            let (plane_frame, plane_name) = self.browser_mirror_plane();
+            let target_count = self.browser_selected_body_indices().len().max(1);
+            self.document_status = Some(if target_count > 1 {
+                format!("Mirror staged across {plane_name} for {target_count} bodies")
+            } else {
+                format!("Mirror staged across {plane_name}")
+            });
+            (None, Some(plane_frame))
+        } else {
+            (None, None)
+        };
         self.pending_operation = Some(PendingOperation::PresetFeature {
             preset,
             base_snapshot,
@@ -10080,6 +10103,54 @@ impl KernelLabApp {
                 diameter: 1.0,
                 depth: 1_000.0,
             },
+            SolidFeaturePreset::HolePattern => {
+                // Every instance is the same circle at a placement of its
+                // own, and one profile carries them all, so the ring is a
+                // single exact face cut rather than six cuts in a row.
+                let target_face = target_face.expect("staged hole pattern face");
+                let frame = frame.expect("staged hole pattern frame");
+                let reach = NativeKernel::planar_face_support(&input, target_face)
+                    .ok()
+                    .and_then(|support| {
+                        support
+                            .boundary
+                            .iter()
+                            .map(|point| point.x.abs().min(point.y.abs()))
+                            .fold(None, |smallest: Option<f64>, value| {
+                                Some(smallest.map_or(value, |current| current.min(value)))
+                            })
+                    })
+                    .filter(|reach| reach.is_finite() && *reach > 0.0)
+                    .unwrap_or(1.0);
+                let pitch = reach * 0.55;
+                let radius = (pitch * 0.4).min(0.5);
+                let regions = (0..HOLE_PATTERN_COUNT)
+                    .map(|instance| {
+                        let angle = std::f64::consts::TAU * f64::from(instance)
+                            / f64::from(HOLE_PATTERN_COUNT);
+                        PlanarRegion2 {
+                            outer: PlanarLoop2 {
+                                curves: vec![PlanarCurve2::Circle {
+                                    center: ProtocolPoint2::new(
+                                        pitch * angle.cos(),
+                                        pitch * angle.sin(),
+                                    ),
+                                    radius,
+                                    direction: ArcDirection::CounterClockwise,
+                                }],
+                            },
+                            holes: Vec::new(),
+                        }
+                    })
+                    .collect();
+                KernelCommand::ExtrudeFacePlanarProfile {
+                    target_face,
+                    frame,
+                    profile: PlanarProfile2 { regions },
+                    distance: 1_000.0,
+                    operation: FaceExtrusionOperation::Cut,
+                }
+            }
             SolidFeaturePreset::Rib => KernelCommand::AddRib {
                 target_face: target_face.expect("staged rib face"),
                 frame: frame.expect("staged rib frame"),
@@ -10095,6 +10166,20 @@ impl KernelLabApp {
                 KernelCommand::MirrorSnapshot {
                     plane_origin,
                     plane_normal,
+                }
+            }
+            SolidFeaturePreset::Shell => {
+                // A tenth of the body's smallest side leaves a wall that
+                // fits whatever was staged, and the editor tunes it.
+                let wall = input.measures().bounds.map_or(1.0, |bounds| {
+                    let smallest = (bounds.max.x - bounds.min.x)
+                        .min(bounds.max.y - bounds.min.y)
+                        .min(bounds.max.z - bounds.min.z);
+                    (smallest * 0.1).max(1.0e-3)
+                });
+                KernelCommand::ShellSnapshot {
+                    open_faces: target_face.into_iter().collect(),
+                    wall,
                 }
             }
             SolidFeaturePreset::LinearPattern => {
@@ -10169,6 +10254,7 @@ impl KernelLabApp {
             SolidFeaturePreset::Revolve => FeatureKind::BaseBody,
             SolidFeaturePreset::Hole => FeatureKind::Cut,
             SolidFeaturePreset::Rib => FeatureKind::Add,
+            SolidFeaturePreset::HolePattern | SolidFeaturePreset::Shell => FeatureKind::Cut,
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
             | SolidFeaturePreset::Chamfer
@@ -10248,7 +10334,9 @@ impl KernelLabApp {
                 existing.body = displayed.clone();
                 existing.last_feature = appended.feature;
                 existing.kind = match preset {
-                    SolidFeaturePreset::Hole => ModelBodyKind::CutPocket,
+                    SolidFeaturePreset::Hole | SolidFeaturePreset::HolePattern => {
+                        ModelBodyKind::CutPocket
+                    }
                     SolidFeaturePreset::Rib => ModelBodyKind::AddedBoss,
                     _ => ModelBodyKind::Boolean,
                 };
@@ -23159,6 +23247,89 @@ mod extrusion_workbench_tests {
             let volume = app.displayed_measures().unwrap().volume;
             assert_eq!(volume > 24.0, adds_material, "{preset:?}: {volume}");
         }
+    }
+
+    #[test]
+    fn the_ribbon_shells_the_active_body_open_at_the_selected_face() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::Shell);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let after = app.displayed_measures().unwrap();
+        assert!(
+            after.volume < before - 1.0e-9,
+            "a shell removes material: {before} then {} ({:?})",
+            after.volume,
+            app.document_status
+        );
+        let feature = app.selected_history_feature.expect("the shell is selected");
+        let scalars = app.selected_feature_scalars();
+        assert_eq!(
+            scalars.iter().map(|s| s.label).collect::<Vec<_>>(),
+            vec!["Wall"]
+        );
+
+        // The wall is parametric: a thicker one leaves more material.
+        let thicker = scalars[0].value * 1.5;
+        assert!(
+            app.edit_feature_scalar(feature, 0, thicker),
+            "{:?}",
+            app.document_status
+        );
+        assert!(
+            app.displayed_measures().unwrap().volume > after.volume + 1.0e-9,
+            "a thicker wall leaves more behind"
+        );
+    }
+
+    #[test]
+    fn the_ribbon_shells_a_body_closed_when_no_face_is_selected() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = None;
+        app.stage_preset_feature(SolidFeaturePreset::Shell);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let displayed = app.displayed.as_ref().expect("a body");
+        assert_eq!(
+            displayed.snapshot.counts().shells,
+            2,
+            "a closed shell keeps a void"
+        );
+        assert!(app.displayed_measures().unwrap().volume < before - 1.0e-9);
+    }
+
+    #[test]
+    fn the_ribbon_cuts_a_ring_of_holes_on_the_selected_face() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::HolePattern);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let displayed = app.displayed.as_ref().expect("a body");
+        let counts = displayed.snapshot.counts();
+        assert_eq!(counts.solids, 1);
+        assert!(
+            app.displayed_measures().unwrap().volume < before - 1.0e-9,
+            "six holes remove material"
+        );
+        // Every instance is exact: the cut names the prism rung, not the
+        // faceted one, and carries no approximation warning.
+        let rung = displayed.report.rung.as_deref().unwrap_or_default();
+        assert!(!rung.ends_with("/faceted"), "{rung}");
+        assert!(
+            displayed.report.warnings.is_empty(),
+            "{:?}",
+            displayed.report.warnings
+        );
     }
 
     #[test]

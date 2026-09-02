@@ -23,6 +23,7 @@ mod analytic_boolean;
 mod loft;
 mod loop_offset;
 mod mirror;
+mod pattern;
 mod planar_profile;
 mod prism_boolean;
 mod prism_edge_finish;
@@ -1245,11 +1246,10 @@ impl NativeKernel {
                 (topology, HistoryMode::OneToOne)
             }
             KernelCommand::ShellSnapshot { open_faces, wall } => {
-                // A shell is a composition of certified constructions: the
-                // open cap's inward offset cut as a pocket, or a core built
-                // from that offset and taken away by the Boolean ladder.
-                // The inner operation's outcome is the shell's, under the
-                // shell's own rung.
+                // A shell is a composition of certified constructions. The
+                // wall comes from the mitred loop offset the rim blends
+                // use; what the offset returns is either a pocket to cut
+                // into the open face, or a core to enclose as a void.
                 let plan = shell::plan_shell(
                     input.id,
                     &input.topology,
@@ -1260,7 +1260,18 @@ impl NativeKernel {
                 .map_err(|reason| {
                     simple_invalid_input(input.id, reason.code(), reason.message())
                 })?;
-                let mut outcome = match plan {
+                let core_from_empty = |command: KernelCommand| -> Result<Snapshot, KernelError> {
+                    let empty = Self::empty();
+                    let request = ExecuteRequest {
+                        protocol_version: CURRENT_PROTOCOL_VERSION,
+                        request_id: artificer_protocol::RequestId::new("shell::core"),
+                        expected_snapshot: empty.id(),
+                        precision: request.precision,
+                        command,
+                    };
+                    Self::execute(&empty, &request, cancellation).map(|outcome| outcome.snapshot)
+                };
+                match plan {
                     shell::ShellPlan::Pocket {
                         target_face,
                         frame,
@@ -1280,51 +1291,117 @@ impl NativeKernel {
                                 operation: FaceExtrusionOperation::Cut,
                             },
                         };
-                        Self::execute(input, &pocket, cancellation)?
+                        let mut outcome = Self::execute(input, &pocket, cancellation)?;
+                        let faceted = outcome
+                            .report
+                            .rung
+                            .as_deref()
+                            .is_some_and(|rung| rung.ends_with("/faceted"));
+                        outcome.report.rung = Some(
+                            if faceted {
+                                "shell/faceted"
+                            } else {
+                                "shell/open-prism"
+                            }
+                            .to_owned(),
+                        );
+                        return Ok(outcome);
                     }
                     shell::ShellPlan::Hollow {
                         frame,
                         profile,
                         distance,
                     } => {
-                        let empty = Self::empty();
-                        let core = ExecuteRequest {
+                        let core = core_from_empty(KernelCommand::ExtrudePlanarProfile {
+                            frame,
+                            profile,
+                            distance,
+                        })?;
+                        let topology =
+                            shell::hollow(&input.topology, &core.topology).ok_or_else(|| {
+                                simple_invalid_input(
+                                    input.id,
+                                    "SHELL_CORE_UNSUPPORTED",
+                                    "The shell core is not a single closed solid to enclose.",
+                                )
+                            })?;
+                        rung = "shell/closed-prism";
+                        (topology, HistoryMode::Generated)
+                    }
+                    shell::ShellPlan::Revolved {
+                        frame,
+                        profile,
+                        axis,
+                        angle,
+                        open: false,
+                    } => {
+                        let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
+                            frame,
+                            profile,
+                            axis,
+                            angle,
+                        })?;
+                        let topology =
+                            shell::hollow(&input.topology, &core.topology).ok_or_else(|| {
+                                simple_invalid_input(
+                                    input.id,
+                                    "SHELL_CORE_UNSUPPORTED",
+                                    "The shell core is not a single closed solid to enclose.",
+                                )
+                            })?;
+                        rung = "shell/closed-revolve";
+                        (topology, HistoryMode::Generated)
+                    }
+                    shell::ShellPlan::Revolved {
+                        frame,
+                        profile,
+                        axis,
+                        angle,
+                        open: true,
+                    } => {
+                        // An open cap's core reaches past the body, so the
+                        // wall there is taken away rather than enclosed.
+                        let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
+                            frame,
+                            profile,
+                            axis,
+                            angle,
+                        })?;
+                        let opened = BooleanRequest {
                             protocol_version: CURRENT_PROTOCOL_VERSION,
-                            request_id: artificer_protocol::RequestId::new("shell::core"),
-                            expected_snapshot: empty.id(),
-                            precision: request.precision,
-                            command: KernelCommand::ExtrudePlanarProfile {
-                                frame,
-                                profile,
-                                distance,
-                            },
-                        };
-                        let core = Self::execute(&empty, &core, cancellation)?;
-                        let hollow = BooleanRequest {
-                            protocol_version: CURRENT_PROTOCOL_VERSION,
-                            request_id: artificer_protocol::RequestId::new("shell::hollow"),
+                            request_id: artificer_protocol::RequestId::new("shell::open"),
                             expected_target_snapshot: input.id,
-                            expected_tool_snapshot: core.snapshot.id(),
+                            expected_tool_snapshot: core.id(),
                             precision: request.precision,
                             operation: BooleanOperation::Difference,
                         };
-                        Self::execute_boolean(input, &core.snapshot, &hollow, cancellation)?
+                        let mut outcome = Self::execute_boolean(
+                            input, &core, &opened, cancellation,
+                        )
+                        .map_err(|inner| {
+                            // The wall at an open cap is taken away rather
+                            // than enclosed, so this case rests on the
+                            // Boolean's analytic domain. Say that in the
+                            // shell's own words, keeping what the engine
+                            // reported underneath.
+                            let mut diagnostics = vec![simple_diagnostic(
+                                "SHELL_OPEN_REVOLVE_UNSUPPORTED",
+                                KernelStage::Construction,
+                                "Opening a revolved body's cap takes the wall away through the Boolean engine, which does not carry this body's surfaces yet. A closed shell of the same body needs no Boolean.",
+                            )];
+                            diagnostics.extend(inner.diagnostics.iter().cloned());
+                            error(
+                                inner.code,
+                                inner.stage,
+                                input.id,
+                                "the wall at the open cap could not be taken away",
+                                diagnostics,
+                            )
+                        })?;
+                        outcome.report.rung = Some("shell/open-revolve".to_owned());
+                        return Ok(outcome);
                     }
-                };
-                let faceted = outcome
-                    .report
-                    .rung
-                    .as_deref()
-                    .is_some_and(|rung| rung.ends_with("/faceted"));
-                outcome.report.rung = Some(
-                    match (open_faces.is_empty(), faceted) {
-                        (_, true) => "shell/faceted",
-                        (true, false) => "shell/closed-prism",
-                        (false, false) => "shell/open-prism",
-                    }
-                    .to_owned(),
-                );
-                return Ok(outcome);
+                }
             }
             KernelCommand::LinearPatternSnapshot {
                 direction,
@@ -1333,38 +1410,90 @@ impl NativeKernel {
             } => {
                 validate_transform_source(input)?;
                 let direction = Vector3::new(direction.x, direction.y, direction.z);
+                let length = direction.length();
                 if *count < 2
                     || *count > 128
+                    || !spacing.is_finite()
                     || *spacing <= request.precision.min_feature_size
-                    || direction.length() <= request.precision.angular_agreement_radians
-                    || input
-                        .topology
-                        .faces
-                        .iter()
-                        .any(|face| !matches!(face.value.surface, Surface::Plane(_)))
+                    || !length.is_finite()
+                    || length <= request.precision.angular_agreement_radians
                 {
                     return Err(simple_invalid_input(
                         input.id,
                         "LINEAR_PATTERN_DOMAIN_UNSUPPORTED",
-                        "Pattern requires 2..=128 separated copies of an all-planar body.",
+                        "A pattern places 2 to 128 copies along a direction, spaced by more than the minimum feature size.",
                     ));
                 }
-                let topology = faceted_boolean::linear_pattern_scene(
-                    &Self::authoritative_scene(input),
-                    direction,
+                let unit = direction / length;
+                let step = unit * *spacing;
+                // Copies that clear one another are the body itself under a
+                // rigid translation, placed side by side as solids of one
+                // topology: exact, with no classification to do. Copies that
+                // touch or overlap are merged material, which the Boolean
+                // ladder owns.
+                if pattern::instances_clear_one_another(
+                    input.measures.bounds,
+                    unit,
                     *spacing,
-                    *count,
-                    request.precision,
-                )
-                .ok_or_else(|| {
-                    simple_invalid_input(
-                        input.id,
-                        "LINEAR_PATTERN_FAILED",
-                        "Pattern produced no solid.",
-                    )
-                })?;
-                rung = "pattern/faceted";
-                (topology, HistoryMode::RegularizedFaceFeature)
+                    request.precision.linear_agreement,
+                ) {
+                    let mut topology = input.topology.clone();
+                    for instance in 1..*count {
+                        check_cancelled(input.id, cancellation, KernelStage::Construction)?;
+                        let moved = transform::transform_topology(
+                            &input.topology,
+                            Similarity::translating(step * f64::from(instance)),
+                        );
+                        topology = pattern::merge_disjoint(&topology, &moved);
+                    }
+                    rung = "pattern/exact-instances";
+                    (topology, HistoryMode::Generated)
+                } else {
+                    let mut accumulated = input.clone();
+                    let mut report = None;
+                    for instance in 1..*count {
+                        check_cancelled(input.id, cancellation, KernelStage::Construction)?;
+                        let placement = ExecuteRequest {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            request_id: artificer_protocol::RequestId::new("pattern::instance"),
+                            expected_snapshot: input.id,
+                            precision: request.precision,
+                            command: KernelCommand::TransformSnapshot {
+                                transform: artificer_protocol::SimilarityTransform3 {
+                                    translation: protocol_vector(step * f64::from(instance)),
+                                    rotation: artificer_protocol::RotationQuaternion::IDENTITY,
+                                    uniform_scale: 1.0,
+                                },
+                            },
+                        };
+                        let moved = Self::execute(input, &placement, cancellation)?;
+                        let join = BooleanRequest {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            request_id: artificer_protocol::RequestId::new("pattern::join"),
+                            expected_target_snapshot: accumulated.id(),
+                            expected_tool_snapshot: moved.snapshot.id(),
+                            precision: request.precision,
+                            operation: BooleanOperation::Union,
+                        };
+                        let joined = Self::execute_boolean(
+                            &accumulated,
+                            &moved.snapshot,
+                            &join,
+                            cancellation,
+                        )?;
+                        accumulated = joined.snapshot;
+                        report = Some(joined.report);
+                    }
+                    let mut report = report.expect("a pattern places at least one further copy");
+                    // The chain's last union reports against the copy before
+                    // it; the pattern as a whole ran on the input.
+                    report.input_snapshot = input.id;
+                    report.rung = Some("pattern/boolean".to_owned());
+                    return Ok(ExecutionOutcome {
+                        snapshot: accumulated,
+                        report,
+                    });
+                }
             }
             KernelCommand::FinishEdge {
                 target_edge,

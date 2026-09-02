@@ -49,6 +49,15 @@ impl Similarity {
         })
     }
 
+    /// The exact isometry a pattern places an instance by.
+    pub(crate) const fn translating(offset: Vector3) -> Self {
+        Self {
+            translation: offset,
+            rotation: Rotation::IDENTITY,
+            scale: 1.0,
+        }
+    }
+
     pub(crate) const fn scale(self) -> f64 {
         self.scale
     }
@@ -235,6 +244,13 @@ struct Rotation {
 }
 
 impl Rotation {
+    const IDENTITY: Self = Self {
+        w: 1.0,
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+
     /// Normalizes without overflowing by first scaling by the largest
     /// component, then selects one of the equivalent `q`/`-q` forms.
     fn normalize(quaternion: RotationQuaternion) -> Option<Self> {

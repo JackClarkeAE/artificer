@@ -585,3 +585,158 @@ fn a_pattern_on_a_face_feature_matches_the_same_holes_drilled_by_hand() {
     assert_eq!(patterned.snapshot.counts(), by_hand.snapshot.counts());
     assert_eq!(patterned.report().tier, Tier::Exact);
 }
+
+// ---------------------------------------------------------------------------
+// Whole-body patterns
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_whole_body_pattern_places_exact_copies_side_by_side() {
+    // A cylinder: the faceted tier could never have carried this, and the
+    // copies stay cylinders.
+    let (r, h) = (8.0, 30.0);
+    let script = format!(
+        "let post = cylinder(radius: {r}, height: {h}, label: \"post\");\npattern(direction: [1, 0, 0], spacing: 25, count: 4, label: \"row\");\n"
+    );
+    let session = run(&script);
+    assert_close(
+        session.snapshot.measures().volume,
+        4.0 * PI * r * r * h,
+        "volume",
+    );
+    assert_eq!(session.snapshot.counts().solids, 4);
+    let report = session.report();
+    assert_eq!(report.tier, Tier::Exact);
+    assert_eq!(
+        report
+            .steps
+            .iter()
+            .find(|step| step.label == "row")
+            .and_then(|step| step.rung.as_deref()),
+        Some("pattern/exact-instances")
+    );
+    let body = report.body.expect("body");
+    assert_eq!(body.surfaces.planes, 8, "two caps per copy");
+    assert_eq!(body.surfaces.cylinders, 8, "two half walls per copy");
+    // The copies are where the spacing put them.
+    for instance in 0..4 {
+        let centre = 25.0 * f64::from(instance);
+        assert!(contains(&session, centre, 0.0, h / 2.0), "copy {instance}");
+        assert!(!contains(&session, centre + 12.5, 0.0, h / 2.0));
+    }
+}
+
+#[test]
+fn a_blended_body_patterns_with_its_blends() {
+    let script = "\
+let block = box(size: [20, 20, 10], label: \"block\");
+fillet(edges: [nearest(point: [20, 10, 10], kind: \"edge\")], radius: 2, label: \"round\");
+pattern(direction: [0, 1, 0], spacing: 30, count: 3, label: \"row\");
+";
+    let session = run(script);
+    let one = 20.0 * 20.0 * 10.0 - (4.0 - PI) * 20.0;
+    assert_close(session.snapshot.measures().volume, 3.0 * one, "volume");
+    assert_eq!(session.snapshot.counts().solids, 3);
+    let body = session.report().body.expect("body");
+    assert_eq!(body.surfaces.cylinders, 3, "one blend band per copy");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn overlapping_copies_join_through_the_boolean_ladder() {
+    // A step with a component along every axis: the copies overlap without
+    // sharing a face plane, so the union is an ordinary Boolean.
+    let side = 20.0;
+    let spacing = 20.0;
+    let script = format!(
+        "let block = box(size: [{side}, {side}, {side}], label: \"block\");\npattern(direction: [1, 1, 1], spacing: {spacing}, count: 2, label: \"row\");\n"
+    );
+    let session = run(&script);
+    let step = spacing / 3.0_f64.sqrt();
+    let shared = (side - step).powi(3);
+    assert_close(
+        session.snapshot.measures().volume,
+        2.0 * side.powi(3) - shared,
+        "the union of two overlapping copies",
+    );
+    assert_eq!(session.snapshot.counts().solids, 1);
+    let report = session.report();
+    assert_eq!(report.tier, Tier::Exact);
+    assert_eq!(
+        report
+            .steps
+            .iter()
+            .find(|step| step.label == "row")
+            .and_then(|step| step.rung.as_deref()),
+        Some("pattern/boolean")
+    );
+}
+
+#[test]
+fn copies_that_overlap_on_a_shared_face_plane_are_refused_by_the_ladder() {
+    // Stepping a box along one axis leaves the other four face planes
+    // shared between the copies, which is the Boolean engine's tangency
+    // limit rather than a pattern of its own. It refuses instead of
+    // falling to a tessellation.
+    let mut session = run("let block = box(size: [60, 40, 25], label: \"block\");\n");
+    let error = session
+        .execute(
+            ApiCommand::LinearPattern {
+                label: "row".to_owned(),
+                direction: Vector3::new(1.0, 0.0, 0.0),
+                spacing: 30.0,
+                count: 2,
+            },
+            &CancellationToken::default(),
+        )
+        .expect_err("coincident geometry");
+    assert!(
+        error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "BOOLEAN_CONTACT_UNSUPPORTED"),
+        "{error:?}"
+    );
+    assert_eq!(session.snapshot.measures().volume, 60.0 * 40.0 * 25.0);
+}
+
+#[test]
+fn whole_body_patterns_replay_to_the_same_digest_and_refuse_bad_input() {
+    let script = "\
+let block = box(size: [10, 10, 10], label: \"block\");
+pattern(direction: [1, 0, 0], spacing: 20, count: 3, label: \"row\");
+";
+    let first = run(script);
+    assert_eq!(
+        run(script).snapshot.semantic_digest(),
+        first.snapshot.semantic_digest()
+    );
+    let journal = first.export_journal().unwrap();
+    assert_eq!(
+        Session::from_journal(&journal)
+            .unwrap()
+            .snapshot
+            .semantic_digest(),
+        first.snapshot.semantic_digest()
+    );
+
+    let mut session = run("let block = box(size: [10, 10, 10], label: \"block\");\n");
+    for (direction, spacing, count) in [
+        (Vector3::new(1.0, 0.0, 0.0), 20.0, 1),
+        (Vector3::new(0.0, 0.0, 0.0), 20.0, 3),
+        (Vector3::new(1.0, 0.0, 0.0), 0.0, 3),
+    ] {
+        let error = session
+            .execute(
+                ApiCommand::LinearPattern {
+                    label: "row".to_owned(),
+                    direction,
+                    spacing,
+                    count,
+                },
+                &CancellationToken::default(),
+            )
+            .expect_err("refused");
+        assert_eq!(error.code, ApiErrorCode::KernelError, "{error:?}");
+    }
+}
