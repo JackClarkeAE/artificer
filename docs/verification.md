@@ -563,7 +563,41 @@ and cancellation, over the same travel the play button shows — the sweep
 reads the same swing function the animation does, so it measures the
 motion that was watched rather than a second one that resembles it.
 
-## 11. Not in this release
+## 11. Where the Boolean engine stops: coincident carriers
+
+The analytic engine classifies each operand's faces against the other
+solid: it cuts each face by the other solid's section on that face's
+carrier, then keeps the pieces the operation calls for. That works when
+the two boundaries meet *transversely* — crossing, not lying on one
+another. Two faces that share a carrier surface break it, and the engine
+refuses by name (`BOOLEAN_CONTACT_UNSUPPORTED`) rather than guessing.
+
+The refusal is not squeamishness about a hard case; it is that the section
+is the wrong object there. Take two 20 mm cubes overlapping along x, both
+resting on the plane z = 0. Their bottom faces are coplanar and point the
+same way. The section the tool's *other* faces cut on the target's bottom
+face bounds the region the tool would occupy if it passed through that
+plane — but it only rests on it, so a two-dimensional difference against
+that section removes a strip that is on the union's own boundary. The
+answer is wrong, and it is wrong quietly.
+
+Getting it right means classifying a face against the other solid as one
+of four things — inside, outside, on the boundary facing the same way, on
+the boundary facing the opposite way — and choosing per operation:
+
+| | co-oriented | anti-oriented |
+| --- | --- | --- |
+| Union | keep the shared region once | drop it from both |
+| Intersection | keep it once | drop it from both |
+| Difference | drop it from both | keep it on the target |
+
+That is a different classification core, not an addition to this one, so
+it is not in this release. Everything downstream is already built to live
+without it: an interference study needs no Boolean at all, and reports the
+clearance of pairs the engine refuses while naming the refusal in place of
+the overlap volume it could not compute.
+
+## 12. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Joints are fixed
@@ -575,6 +609,7 @@ more than one degree of freedom is checked along that path and not over
 the whole space it can occupy. Shell covers
 prisms and solids of revolution; a blended or domed body is refused
 rather than approximated, and opening the cap of a cone waits on the
-Boolean engine. Probes read the
+Boolean engine, whose coincident-carrier limit section 11 sets out.
+Probes read the
 current session only; comparing two reports is a job for the caller until
 the semantic diff lands.
