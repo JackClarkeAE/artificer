@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::commands::ApiCommand;
 use crate::api::debug::{ApiError, ApiErrorCode, CommandResult};
-use crate::api::scripting::{ScriptError, compile_program};
+use crate::api::scripting::{ModuleResolver, NoModules, ScriptError, compile_program_with};
 use crate::api::selectors::{EntitySelector, resolve_selector};
 use crate::api::session::Session;
 use crate::{CancellationToken, EdgeDescription, FaceDescription, NativeKernel, SurfaceCounts};
@@ -341,8 +341,20 @@ impl Session {
         overrides: &BTreeMap<String, f64>,
         token: &CancellationToken,
     ) -> ScriptOutcome {
+        self.run_script_with(source, overrides, &NoModules, token)
+    }
+
+    /// [`Self::run_script`] with the modules the script's `use` lines name
+    /// loaded through `modules`.
+    pub fn run_script_with(
+        &mut self,
+        source: &str,
+        overrides: &BTreeMap<String, f64>,
+        modules: &dyn ModuleResolver,
+        token: &CancellationToken,
+    ) -> ScriptOutcome {
         let started = Instant::now();
-        let program = match compile_program(source, overrides) {
+        let program = match compile_program_with(source, overrides, modules) {
             Ok(program) => program,
             Err(error) => {
                 return ScriptOutcome {
@@ -581,13 +593,23 @@ impl Session {
         names
     }
 
+    /// Resolves a selector to an entity of the current body. A history
+    /// selector whose entity the faceted tier rebuilt without carrying its
+    /// identity forward names nothing now, and is reported as nothing.
     fn resolve(&self, selector: &EntitySelector) -> Result<EntityRef, ApiError> {
-        resolve_selector(
+        let entity = resolve_selector(
             selector,
             &self.snapshot,
             &self.step_order,
             &self.step_reports,
-        )
+        )?;
+        if entity.snapshot != self.snapshot.id() {
+            return Err(ApiError::new(
+                ApiErrorCode::SelectorNotFound,
+                "The entity is not part of the current body",
+            ));
+        }
+        Ok(entity)
     }
 
     fn named(&self, name: String, source: NameSource, entity: EntityRef) -> NamedEntity {
@@ -611,13 +633,18 @@ impl Session {
 }
 
 /// The one-based line on which a step with `label` is declared: the first
-/// line carrying `label: "<label>"`.
+/// line carrying `label: "<label>"`. A label scoped to a function call
+/// (`call/step`) is looked up by its last segment, the label the function
+/// body wrote.
 #[must_use]
 pub fn line_of_label(source: &str, label: &str) -> Option<usize> {
-    let needle = format!("label: \"{label}\"");
-    let compact = format!("label:\"{label}\"");
-    source
-        .lines()
-        .position(|line| line.contains(&needle) || line.contains(&compact))
-        .map(|index| index + 1)
+    let find = |label: &str| {
+        let needle = format!("label: \"{label}\"");
+        let compact = format!("label:\"{label}\"");
+        source
+            .lines()
+            .position(|line| line.contains(&needle) || line.contains(&compact))
+            .map(|index| index + 1)
+    };
+    find(label).or_else(|| label.rsplit('/').next().and_then(find))
 }

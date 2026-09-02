@@ -745,6 +745,7 @@ fn the_shipped_examples_compile_and_run() {
         "examples/three_holes_and_cut.art",
         "examples/flanged_hub.art",
         "examples/filleted_flange.art",
+        "examples/standoff_plate.art",
     ] {
         let source = std::fs::read_to_string(example).expect(example);
         let commands = artificer_kernel::api::scripting::compile_script(&source, &BTreeMap::new())

@@ -32,6 +32,7 @@ Work on the next release is about verification-driven CAD: letting a program, no
 - **The session report.** `artificer-api report part.art` (or `run --json`) prints a versioned JSON document: every step with the strategy **rung** that certified it (`face-feature/exact-prism`, `edge-finish/rim-blend`, `boolean/analytic`, ...) and whether it was exact or fell to the faceted tier, the body's exact volume, area and centroid, every face and edge described from its analytic carrier, the names the script gave, and the failing step with its diagnostic codes and script line when a run stops short. The shape is published as a JSON Schema in [`docs/report-schema.json`](docs/report-schema.json) and a test keeps its list of diagnostic codes equal to what the kernel source emits. The JSON-RPC methods `script.report`, `report` and `query.describe` give the same over the wire.
 - **Probes that change nothing.** `probe` answers volume, surface area, face area, edge length, minimum distance, the overlap volume of two bodies, point containment and thinnest wall, each with a tier and the method behind it, and leaves the session's digest untouched. The reference is [`docs/verification.md`](docs/verification.md).
 - **Every step result** now carries its rung, tier and construction warnings, and Script Studio prints them in the console.
+- **`.art` 0.3: functions, modules and typed parameters.** `fn standoff(on: face, at: [f64; 2], height: f64, label: str) -> body { ... return boss with faces { top: boss.top }; }` packages steps that recur, with labels scoped to the call so a loop of calls stays unique without string arithmetic, and exported faces that keep resolving after later steps. `use "lib/standoffs.art";` shares functions and constants between scripts. `param wall: f64 [mm] in 1.2..4.0 = 2.0 "wall thickness";` carries a unit, a range and a description, and `artificer-api params part.art --json` (or JSON-RPC `script.params`) lists them without running the script. Unbound names, arity and type mismatches, recursion and import cycles refuse with a line and column.
 
 ## What is new in 0.96
 
@@ -158,6 +159,9 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `mirror(origin:, normal:)`, `pattern(direction:, spacing:, count:)` | Whole-body operations. |
 | `union(target:, tool:)`, `difference(target:, tool:)`, `intersection(target:, tool:)` | Booleans between two steps. |
 | `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
+| `fn name(a: f64, on: face, label: str) -> body { ... return step with faces { top: ... }; }` | Functions with typed arguments, call-scoped labels and exported faces. |
+| `use "lib/parts.art";` | Modules of functions and constants. |
+| `param wall: f64 [mm] in 1..4 = 2 "wall";` | Parameters with a unit, a range and a description. |
 | `sqrt abs floor ceil round min max clamp pow hypot sin cos tan asin acos atan atan2`, `pi` | Arithmetic. |
 
 Errors name their line and column, so an editor can point at them. `artificer-api report part.art` prints the machine-readable session report instead of prose, with every step's rung and tier, the body's exact measures and every face described. Open the same file in **Artificer Script Studio** to edit it live against the kernel's viewport, with the `param` lines as a customizer. The complete language reference, with every function, argument, selector and method, is [`docs/art-scripting.md`](docs/art-scripting.md); it is written to be handed to an AI agent as-is.

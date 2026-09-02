@@ -438,7 +438,12 @@ fn resolve_history_selector(
             .iter()
             .filter(|record| {
                 record.role.as_ref().is_some_and(|r| {
-                    r.name == role && ordinal.is_none_or(|ord| r.ordinal == Some(ord))
+                    // A role is matched whole, or by its trailing segments:
+                    // `end_face` finds `face_extrude.boss.end_face`, so a
+                    // function need not know the label its step ends up
+                    // under.
+                    (r.name == role || r.name.ends_with(&format!(".{role}")))
+                        && ordinal.is_none_or(|ord| r.ordinal == Some(ord))
                 })
             })
             .flat_map(|record| record.outputs.iter().copied())

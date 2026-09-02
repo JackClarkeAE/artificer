@@ -152,14 +152,22 @@ If the Boolean engine cannot carry a pair of bodies, `intersection_volume`
 fails with the engine's own diagnostics (`BOOLEAN_SURFACE_PAIR_UNSUPPORTED`,
 `BOOLEAN_CONTACT_UNSUPPORTED`) rather than guessing.
 
-## 3. Per-step results
+## 3. Parameters without running
+
+`artificer-api params part.art --json` and the JSON-RPC method
+`script.params` list every `param` with its type, unit, range, default and
+description, without executing the script; the report's `parameters` field
+shows the values a run actually used, so the two round-trip through
+`--param` overrides. See section 17 of the scripting reference.
+
+## 4. Per-step results
 
 Every `CommandResult` from `Session::execute`, and every entry `script.run`
 returns over JSON-RPC, now carries `rung`, `tier` and `warnings` alongside
 the validation diagnostics, so a caller that drives the kernel one step at
 a time sees the same certification the report summarises.
 
-## 4. Not in this release
+## 5. Not in this release
 
 The report does not yet carry an inertia tensor or principal axes; the
 measures are volume, surface area, centroid and bounds. Probes read the

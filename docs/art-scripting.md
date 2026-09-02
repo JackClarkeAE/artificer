@@ -1,8 +1,10 @@
-# The `.art` scripting language, version 0.2
+# The `.art` scripting language, version 0.3
 
 A reference for people and for AI agents writing Artificer scripts. Everything
-here is what the kernel implements today (Artificer 0.96, `.art` 0.2); nothing
-is aspirational. Where a feature has a limit, the limit is stated.
+here is what the kernel implements today (Artificer 0.97, `.art` 0.3); nothing
+is aspirational. Where a feature has a limit, the limit is stated. Version 0.3
+adds functions, modules, typed parameters with units, ranges and descriptions,
+array indexing, and parameter introspection; sections 14 to 17 cover them.
 
 A `.art` script is a list of steps. Each step names a kernel command, and the
 kernel executes the steps in order against one session. The same script
@@ -92,9 +94,11 @@ the CLI prints them; the JSON-RPC server returns them as the error object.
 | Value | Written as | Notes |
 |---|---|---|
 | Number | `12`, `-0.5`, `width * 2` | 64-bit float. |
+| Boolean | `true`, `false` | The value of a `bool` parameter. |
 | String | `"XY"`, `"top_face"` | Used for plane names, roles, selectors, operations, labels. |
-| Array | `[1, 2, 3]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. |
+| Array | `[1, 2, 3]`, `corners[i]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. `a[i]` reads element `i`, counting from 0. |
 | Step | `let b = box(...)` | The bound name of an executed step; passed to Booleans and used for methods. |
+| Body | `let s = standoff(...)` | What a function returns: a step plus the faces it exports, read as `s.top` (section 14). |
 | Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)` | Only valid inside `sketch(entities: [...])`. |
 | Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")` | Names a face or edge of the current body, resolved when the step runs. |
 
@@ -579,9 +583,161 @@ For an agent, the rules that make this reliable:
 - Test with `cargo run -p artificer-api-server -- run part.art`; the output
   names the failing step and why.
 
-## 13. Not in 0.2
+## 13. Not in 0.3
 
 Partial revolves, sweeps and lofts between arbitrary sections, shells,
 concave fillets between a boss and its plate, text as sketch geometry from a
 script, threads, and assemblies. The workbench has several of these; the
-scripting surface follows the kernel API as it grows.
+scripting surface follows the kernel API as it grows. Functions cannot
+recurse, and a module's functions share one flat namespace with the script's.
+
+---
+
+## 14. Functions
+
+A function packages steps that recur: a standoff, a bolt pattern, a slot.
+It takes typed values, faces and bodies, builds geometry, and returns a
+body with the faces it wants callers to use.
+
+```art
+fn standoff(on: face, at: [f64; 2], height: f64, hole: f64, label: str) -> body {
+    let boss = cylinder_on(on: on, at: at, diameter: hole * 2.5, height: height, label: "boss");
+    drill(face: boss.top, center: [0, 0], diameter: hole, depth: height, label: "hole");
+    return boss with faces { top: boss.top };
+}
+
+let plate = box(size: [80, 60, 5], label: "plate");
+let s1 = standoff(on: plate.face("top_face"), at: [30, 20], height: 10, hole: 3, label: "s1");
+drill(face: s1.top, center: [0, 0], diameter: 1, depth: 2, label: "pilot");
+```
+
+**Declaring.** `fn name(param: type, param: type = default, ...) -> type { ... }`
+at the top level of the script or a module, before or after its first use.
+Parameter types are `f64` (also `float`, `number`), `int`, `str`, `bool`,
+`face`, `edge`, `body`, `any`, and arrays `[type; N]` or `[type]`. A parameter
+without a type accepts anything. A default is an expression evaluated when
+the argument is omitted. The return type is checked when declared. A
+function cannot be named after a builtin (`box`, `drill`, `sin`, ...).
+
+**Calling.** Arguments are given by name, `f(a: 1, b: 2)`, or in
+declaration order, `f(1, 2)`, or mixed with positional ones first. An
+unknown name, a missing argument without a default, an argument given twice,
+or a value of the wrong type is an error naming the function, the argument
+and the value. Recursion, direct or through another function, is refused
+with the chain named.
+
+**Scope.** A function body sees its own parameters and the script's
+top-level names as they were before the call: `param`s, `let` constants,
+module constants. It does not see the caller's locals. `let` inside a
+function is local to that call.
+
+**Labels are scoped to the call.** Every step a function builds gets its
+label prefixed with the call's `label` argument and a slash, so the first
+call above builds `s1/boss/profile`, `s1/boss` and `s1/hole`, and a loop of
+calls needs no string arithmetic to stay unique. The step that carries the
+call's own label (the `extrude(... label: label)` inside `cylinder_on`) *is*
+the call's step, `s1/boss`, not `s1/boss/boss`. A function without a `label`
+parameter, or called without one, scopes by its name and call count:
+`block_1/`, `block_2/`. Nested calls nest their prefixes.
+
+**Returning.** `return value;` ends the call with a value; a body without a
+`return` returns nothing. `return step with faces { name: selector, ... };`
+returns a **body**: the step plus the named selectors. Callers read an
+exported face as `body.name` or `body.face("name")`; a name the body does
+not export falls through to the step's history role, so `body.face("end_face")`
+still works. Because exported faces are selectors, usually history
+selectors, they keep resolving after later steps drill or fillet the body.
+
+**Names in the report.** A top-level `let s = f(...)` that receives a body
+records each exported face as `s.name` in the program's names, so Script
+Studio and the session report list `s1.top` beside the script's other
+names.
+
+**Roles inside a function.** The kernel names an added extrusion's cap
+`face_extrude.<label>.end_face`, and inside a function the label is not
+known until the call. History selectors therefore match a role by its
+trailing segments: `p.face("end_face")` finds `face_extrude.s1/boss.end_face`.
+
+---
+
+## 15. Modules
+
+A module is a `.art` file of functions and constants that other scripts
+import:
+
+```art
+// lib/standoffs.art
+param wall: f64 [mm] = 3 "boss wall thickness";
+let clearance = 0.2;
+
+fn standoff(on: face, at: [f64; 2], height: f64, hole: f64, label: str) -> body { ... }
+```
+
+```art
+use "lib/standoffs.art";
+let plate = box(size: [80, 60, 5], label: "plate");
+standoff(on: plate.face("top_face"), at: [30, 20], height: 10, hole: 3 + clearance, label: "s1");
+```
+
+- `use "path";` sits at the top level. It declares the module's functions
+  and brings its `param`s and `let` constants into scope; a module's
+  `param` takes a `--param` override like the script's own.
+- A module builds nothing: a step at its top level is an error. Geometry
+  belongs in its functions.
+- Modules can `use` other modules. A module is loaded once however many
+  times it is named; a cycle (`a.art -> b.art -> a.art`) is refused with the
+  chain.
+- Where a path is looked up is the host's decision. The command-line runner
+  and Script Studio look beside the importing file, then beside the script,
+  then along `--module-path` directories. The JSON-RPC server takes the
+  sources inline: `script.run` and `script.report` accept a `modules` object
+  mapping each path a `use` writes to its source. A host that loads no
+  modules says so.
+- Functions and constants share one namespace across the script and every
+  module it imports; defining the same function twice is an error naming
+  the module that already has it.
+
+---
+
+## 16. Parameters in full
+
+```art
+param wall: f64 [mm] in 1.2..4.0 = 2.0 "external wall thickness";
+param count: int in 1..12 = 4 "bolt holes";
+param countersunk: bool = false;
+param finish: str = "anodised";
+```
+
+`param name[: type] [[unit]] [in low..high] = default ["description"];`
+
+- **Types:** `f64` (the default), `int` (a whole number), `bool`, `str`.
+- **Unit:** any word in brackets; the kernel does not convert, the word is
+  carried through to the listing for a customizer to show.
+- **Range:** inclusive, checked against the default and against any
+  override; a value outside it is an error naming the range.
+- **Description:** a string after the default, for the listing.
+- **Overrides:** `--param name=value` on the command line, `params` over
+  JSON-RPC, the customizer in Script Studio. A number overrides an `f64`;
+  a whole number an `int`; `0`/`1` or `false`/`true` a `bool`. A `str` is
+  set in the script, not by override.
+
+---
+
+## 17. Introspection
+
+The parameters of a script are listed without running it:
+
+```sh
+cargo run --release -p artificer-api-server -- params part.art
+cargo run --release -p artificer-api-server -- params part.art --json
+```
+
+```json
+[{"name":"wall","param_type":"f64","default":2.0,"default_text":"2","unit":"mm","min":1.2,"max":4.0,"description":"external wall thickness","line":1}]
+```
+
+The JSON-RPC method `script.params` takes `{"source": "..."}` and returns
+the same list; in Rust it is `script_parameters(source)`. Defaults that
+depend on earlier parameters are evaluated in order. The session report's
+`parameters` field then shows the value every parameter took in a run, so
+a run can be reproduced from its report.

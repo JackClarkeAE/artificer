@@ -17,7 +17,7 @@ use crate::api::debug::ApiError;
 use crate::api::export::{export_obj, export_stl_ascii};
 use crate::api::probe::{ProbeRequest, probe};
 use crate::api::query::MeasureTarget;
-use crate::api::scripting::compile_script;
+use crate::api::scripting::{InlineModules, compile_program_with, script_parameters};
 use crate::api::selectors::EntitySelector;
 use crate::api::session::Session;
 use crate::api::snapshot::SnapshotOptions;
@@ -114,6 +114,18 @@ impl Default for SharedSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The parameters of `script.run` and `script.report`: the script, its
+/// parameter overrides, and the sources of the modules its `use` lines
+/// name, keyed by the path each `use` writes.
+#[derive(Deserialize)]
+struct ScriptParams {
+    source: String,
+    #[serde(default)]
+    params: BTreeMap<String, f64>,
+    #[serde(default)]
+    modules: BTreeMap<String, String>,
 }
 
 /// What one line of input asked for.
@@ -323,12 +335,6 @@ impl SharedSession {
                 }
             }
             "script.report" => {
-                #[derive(Deserialize)]
-                struct ScriptParams {
-                    source: String,
-                    #[serde(default)]
-                    params: BTreeMap<String, f64>,
-                }
                 let script: ScriptParams = match serde_json::from_value(params) {
                     Ok(script) => script,
                     Err(error) => {
@@ -342,8 +348,30 @@ impl SharedSession {
                 // A failed step is part of the report, not a transport
                 // error: the caller reads `status`, `failure`, and every
                 // step that did commit.
-                let outcome = session.run_script(&script.source, &script.params, &token);
+                let modules = InlineModules::new(script.modules);
+                let outcome =
+                    session.run_script_with(&script.source, &script.params, &modules, &token);
                 respond(id, &session.report_with(outcome.failure))
+            }
+            "script.params" => {
+                #[derive(Deserialize)]
+                struct SourceParams {
+                    source: String,
+                }
+                let script: SourceParams = match serde_json::from_value(params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid script params: {error}"),
+                        );
+                    }
+                };
+                match script_parameters(&script.source) {
+                    Ok(parameters) => respond(id, &parameters),
+                    Err(error) => JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                }
             }
             "snapshot" => {
                 // Absent params mean the default isometric SVG; present but
@@ -380,12 +408,6 @@ impl SharedSession {
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
             "script.run" => {
-                #[derive(Deserialize)]
-                struct ScriptParams {
-                    source: String,
-                    #[serde(default)]
-                    params: BTreeMap<String, f64>,
-                }
                 let script: ScriptParams = match serde_json::from_value(params) {
                     Ok(script) => script,
                     Err(error) => {
@@ -396,12 +418,15 @@ impl SharedSession {
                         );
                     }
                 };
-                let commands = match compile_script(&script.source, &script.params) {
-                    Ok(commands) => commands,
+                let modules = InlineModules::new(script.modules);
+                let program = match compile_program_with(&script.source, &script.params, &modules) {
+                    Ok(program) => program,
                     Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
                 };
+                session.parameters = program.parameters;
+                session.names = program.names;
                 let mut results = Vec::new();
-                for command in commands {
+                for command in program.commands {
                     match session.execute(command, &token) {
                         Ok(result) => results.push(result),
                         Err(error) => return JsonRpcResponse::api_error(id, &error),

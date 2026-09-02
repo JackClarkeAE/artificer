@@ -20,7 +20,8 @@ use artificer_kernel::api::commands::ApiCommand;
 use artificer_kernel::api::debug::ApiError;
 use artificer_kernel::api::export::{export_obj, export_stl_binary};
 use artificer_kernel::api::scripting::{
-    ScriptError, ScriptParameter, compile_program, script_parameters,
+    FileModules, ModuleResolver, NoModules, ScriptError, ScriptParameter, compile_program_with,
+    script_parameters,
 };
 use artificer_kernel::api::selectors::EntitySelector;
 use artificer_kernel::api::session::Session;
@@ -54,6 +55,10 @@ pub const EXAMPLES: &[(&str, &str)] = &[
     (
         "Filleted flange",
         include_str!("../../../crates/kernel/examples/filleted_flange.art"),
+    ),
+    (
+        "Standoff plate (functions)",
+        include_str!("../../../crates/kernel/examples/standoff_plate.art"),
     ),
     (
         "Bearing mount",
@@ -187,13 +192,26 @@ pub fn run_script(
     overrides: &BTreeMap<String, f64>,
     token: &CancellationToken,
 ) -> RunOutcome {
-    run_script_generation(0, source, overrides, token)
+    run_script_generation(0, source, overrides, None, token)
+}
+
+/// [`run_script`] for a script saved at `path`, whose `use` lines resolve
+/// beside it.
+#[must_use]
+pub fn run_script_at(
+    source: &str,
+    overrides: &BTreeMap<String, f64>,
+    path: Option<&Path>,
+    token: &CancellationToken,
+) -> RunOutcome {
+    run_script_generation(0, source, overrides, path, token)
 }
 
 fn run_script_generation(
     generation: u64,
     source: &str,
     overrides: &BTreeMap<String, f64>,
+    path: Option<&Path>,
     token: &CancellationToken,
 ) -> RunOutcome {
     let started = Instant::now();
@@ -208,7 +226,13 @@ fn run_script_generation(
         cancelled: false,
     };
 
-    let program = match compile_program(source, overrides) {
+    // A saved script's modules live beside it; an unsaved one has nowhere
+    // to look, and a `use` says so.
+    let modules: Box<dyn ModuleResolver> = match path {
+        Some(path) => Box::new(FileModules::beside(path)),
+        None => Box::new(NoModules),
+    };
+    let program = match compile_program_with(source, overrides, modules.as_ref()) {
         Ok(program) => program,
         Err(error) => {
             outcome.error = Some(RunError::from_script(&error));
@@ -951,12 +975,19 @@ impl ScriptStudio {
         let worker_token = token.clone();
         let source = self.source.clone();
         let overrides = self.overrides();
+        let path = self.path.clone();
         let sender = self.sender.clone();
         let repaint = ctx.clone();
         std::thread::Builder::new()
             .name(format!("art-run-{generation}"))
             .spawn(move || {
-                let outcome = run_script_generation(generation, &source, &overrides, &worker_token);
+                let outcome = run_script_generation(
+                    generation,
+                    &source,
+                    &overrides,
+                    path.as_deref(),
+                    &worker_token,
+                );
                 // The receiver is gone only when the window has closed.
                 let _ = sender.send(outcome);
                 repaint.request_repaint();
@@ -1620,17 +1651,37 @@ impl ScriptStudio {
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
                         for row in &mut self.customizer {
-                            ui.label(RichText::new(&row.parameter.name).color(theme::text()))
-                                .on_hover_text(format!("Declared on line {}", row.parameter.line));
-                            match row.parameter.default {
+                            let parameter = &row.parameter;
+                            let mut hover = format!("Declared on line {}", parameter.line);
+                            if let Some(description) = &parameter.description {
+                                hover = format!("{description}\n{hover}");
+                            }
+                            let title = match &parameter.unit {
+                                Some(unit) => format!("{} [{unit}]", parameter.name),
+                                None => parameter.name.clone(),
+                            };
+                            ui.label(RichText::new(title).color(theme::text()))
+                                .on_hover_text(hover);
+                            match parameter.default {
                                 Some(default) => {
                                     let mut value = row.value.unwrap_or(default);
                                     let step = (default.abs() * 0.01).max(0.1);
-                                    let drag = ui.add(
-                                        egui::DragValue::new(&mut value)
-                                            .speed(step)
-                                            .max_decimals(4),
-                                    );
+                                    let mut drag_value = egui::DragValue::new(&mut value)
+                                        .speed(step)
+                                        .max_decimals(4);
+                                    // A declared range bounds the drag; an
+                                    // int or bool parameter moves in whole
+                                    // steps.
+                                    if let (Some(min), Some(max)) = (parameter.min, parameter.max) {
+                                        drag_value = drag_value.range(min..=max);
+                                    }
+                                    if parameter.param_type == "int" {
+                                        drag_value = drag_value.speed(1.0).max_decimals(0);
+                                    } else if parameter.param_type == "bool" {
+                                        drag_value =
+                                            drag_value.speed(1.0).max_decimals(0).range(0.0..=1.0);
+                                    }
+                                    let drag = ui.add(drag_value);
                                     drag.widget_info(|| {
                                         egui::WidgetInfo::labeled(
                                             egui::WidgetType::DragValue,
