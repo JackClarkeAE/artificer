@@ -33,7 +33,19 @@ pub enum SketchSnapKey {
         entity: SketchEntityId,
         index: u8,
     },
+    /// The nearest point along a curve's interior. Lowest priority and a
+    /// tighter capture radius, so a stroke that ends visually "on" an edge
+    /// lands exactly on it and forms a real T-junction instead of a dangling
+    /// bridge a hair inside the cell.
+    OnCurve {
+        entity: SketchEntityId,
+    },
 }
+
+/// Fraction of the snap radius within which a curve interior captures the
+/// pointer. Tighter than a named point so tracing beside an edge never pulls
+/// free placement onto it; the same ratio the support-edge snap uses.
+pub const ON_CURVE_RADIUS_RATIO: f64 = 0.6;
 
 impl SketchSnapKey {
     const fn priority(&self) -> u8 {
@@ -43,6 +55,7 @@ impl SketchSnapKey {
             Self::Center { .. } => 2,
             Self::Midpoint { .. } => 3,
             Self::Quadrant { .. } => 4,
+            Self::OnCurve { .. } => 5,
         }
     }
 }
@@ -241,6 +254,17 @@ pub fn query_snap_candidates(
                     );
                 }
             }
+        }
+        let parameter = curve.closest_parameter(pointer);
+        if let Ok(on_curve) = curve.evaluate(parameter) {
+            let on_curve_radius = radius * ON_CURVE_RADIUS_RATIO;
+            push_candidate(
+                &mut candidates,
+                SketchSnapKey::OnCurve { entity: entity.id },
+                on_curve,
+                pointer,
+                on_curve_radius * on_curve_radius,
+            );
         }
     }
 

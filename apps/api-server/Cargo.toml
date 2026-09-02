@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-artificer-api = { path = "../../crates/api" }
+artificer-kernel = { path = "../../crates/kernel" }
 artificer-protocol = { path = "../../crates/protocol" }
 serde.workspace = true
 serde_json.workspace = true

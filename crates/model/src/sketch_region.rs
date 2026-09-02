@@ -161,7 +161,23 @@ pub struct SketchRegionExtrusion {
     pub regions: Vec<RegionSignature>,
     pub target: SketchRegionExtrusionTarget,
     pub distance: f64,
+    /// Draft angle in degrees: the walls lean outward by this much per unit
+    /// of height when positive, inward when negative. Zero is a straight
+    /// extrusion. A drafted new body replays as a loft to the profile's
+    /// offset section, which is exact for straight edges and tangent arcs.
+    /// Face features do not draft.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub draft_degrees: f64,
 }
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// The largest draft the recipe accepts, in degrees. Beyond it the offset
+/// section outruns any plausible profile; the kernel would refuse the
+/// collapse anyway, but a typo should fail at the recipe.
+pub const MAX_DRAFT_DEGREES: f64 = 75.0;
 
 impl SketchRegionExtrusion {
     /// Creates a standalone extrusion recipe with a canonical region set.
@@ -208,9 +224,24 @@ impl SketchRegionExtrusion {
             regions,
             target,
             distance,
+            draft_degrees: 0.0,
         };
         recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Sets the draft angle of a new-body extrusion. Face features cannot
+    /// draft, and a draft outside `±MAX_DRAFT_DEGREES` is refused.
+    pub fn with_draft(mut self, draft_degrees: f64) -> Result<Self, SketchRegionRecipeError> {
+        self.draft_degrees = draft_degrees;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether replay lofts this extrusion to an offset section.
+    #[must_use]
+    pub fn is_drafted(&self) -> bool {
+        self.draft_degrees != 0.0
     }
 
     /// Validates only persisted recipe structure. Geometry is deliberately
@@ -242,7 +273,13 @@ impl SketchRegionExtrusion {
         if !self.distance.is_finite() || self.distance == 0.0 {
             return Err(SketchRegionRecipeError::InvalidDistance);
         }
+        if !self.draft_degrees.is_finite() || self.draft_degrees.abs() > MAX_DRAFT_DEGREES {
+            return Err(SketchRegionRecipeError::InvalidDraft);
+        }
         if let SketchRegionExtrusionTarget::PlanarFace { face, .. } = &self.target {
+            if self.draft_degrees != 0.0 {
+                return Err(SketchRegionRecipeError::InvalidDraft);
+            }
             validate_face_reference(face, 0)?;
         }
         Ok(())
@@ -329,6 +366,12 @@ impl SketchRegionExtrusion {
         };
         let distance = self.distance.abs();
         let command = match operation {
+            None if self.is_drafted() => KernelCommand::LoftPlanarProfileOffset {
+                frame,
+                profile,
+                distance,
+                offset: distance * self.draft_degrees.to_radians().tan(),
+            },
             None => KernelCommand::ExtrudePlanarProfile {
                 frame,
                 profile,
@@ -380,6 +423,10 @@ pub enum SketchRegionRecipeError {
     NonCanonicalSelection,
     #[error("sketch-region extrusion distance must be finite and non-zero")]
     InvalidDistance,
+    #[error(
+        "a draft angle must be finite, within ±{MAX_DRAFT_DEGREES} degrees, and zero for a face feature"
+    )]
+    InvalidDraft,
     #[error("a face sketch-region feature requires a valid persistent face target")]
     InvalidFaceTarget,
     #[error("persistent face lineage exceeds the depth limit of {limit}")]
@@ -767,5 +814,142 @@ mod tests {
                 signature: missing_signature,
             }) if missing_sketch == sketch && missing_signature == signature
         ));
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+    use crate::{
+        FeatureDraft, FeatureKind, ModelDocument, OutputDraft, SketchPayload, SketchSupportRecipe,
+        SnapshotAssociation,
+    };
+    use artificer_protocol::{
+        PlanarFrame3, Point3, PrecisionPolicy, SemanticDigest, SnapshotId, Vector3,
+    };
+    use artificer_sketch::{
+        ArrangementLimits, ConfirmationSource, PointInput, SignedLength, SketchDefinition,
+        SketchPoint2, SketchRecipe, SketchValue, build_arrangement, compile_selected_profile,
+    };
+
+    fn document_with_square() -> (ModelDocument, SketchId, RegionSignature) {
+        let mut definition = SketchDefinition::new();
+        let transaction = definition
+            .stage(
+                SketchRecipe::TwoPointRectangle {
+                    first_corner: PointInput::Position(SketchPoint2::new(0.0, 0.0)),
+                    width: SketchValue::Literal(SignedLength::new(4.0).unwrap()),
+                    height: SketchValue::Literal(SignedLength::new(4.0).unwrap()),
+                },
+                "Square",
+            )
+            .unwrap();
+        definition
+            .commit(transaction, ConfirmationSource::GreenTick)
+            .unwrap();
+        let precision = PrecisionPolicy::default();
+        let arrangement = build_arrangement(
+            &definition.arrangement_inputs().unwrap(),
+            &precision,
+            ArrangementLimits::default(),
+        );
+        let regions = vec![arrangement.cells[0].signature.clone()];
+        let profile = compile_selected_profile(&arrangement, &regions, &precision)
+            .unwrap()
+            .profile;
+        let payload = SketchPayload::from_authoring(
+            PlanarFrame3::new(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ),
+            definition,
+            Some(profile),
+            SketchSupportRecipe::Origin,
+        )
+        .unwrap();
+        let mut document = ModelDocument::default();
+        let appended = document
+            .append_feature(
+                FeatureDraft::new(FeatureKind::Sketch, "Sketch", ReplayAction::Marker)
+                    .with_sketch_payload(payload)
+                    .with_output(OutputDraft::CreateSketch {
+                        label: "Sketch 1".into(),
+                        geometry_revision: 1,
+                    })
+                    .with_commit(SnapshotAssociation::new(
+                        SnapshotId::ZERO,
+                        SnapshotId::ZERO,
+                        SemanticDigest::new([0; 32]),
+                    )),
+            )
+            .unwrap();
+        (document, appended.created_sketches[0], regions[0].clone())
+    }
+
+    #[test]
+    fn a_drafted_new_body_replays_as_a_loft_to_the_offset_section() {
+        let (document, sketch, signature) = document_with_square();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], 5.0)
+            .unwrap()
+            .with_draft(10.0)
+            .unwrap();
+        assert!(recipe.is_drafted());
+        let ReplayAction::Kernel(KernelCommand::LoftPlanarProfileOffset {
+            distance, offset, ..
+        }) = recipe
+            .resolve(&document, PrecisionPolicy::default())
+            .unwrap()
+        else {
+            panic!("a drafted recipe lofts")
+        };
+        assert_eq!(distance, 5.0);
+        assert!((offset - 5.0 * 10.0_f64.to_radians().tan()).abs() < 1.0e-12);
+
+        // The persisted form omits a zero draft and reads old recipes as
+        // straight extrusions.
+        let straight =
+            SketchRegionExtrusion::new_body(sketch, recipe.regions.clone(), 5.0).unwrap();
+        let json = serde_json::to_string(&straight).unwrap();
+        assert!(!json.contains("draft_degrees"));
+        let parsed: SketchRegionExtrusion = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, straight);
+        let json = serde_json::to_string(&recipe).unwrap();
+        assert!(json.contains("draft_degrees"));
+        assert_eq!(
+            serde_json::from_str::<SketchRegionExtrusion>(&json).unwrap(),
+            recipe
+        );
+    }
+
+    #[test]
+    fn drafts_are_bounded_and_refused_on_face_features() {
+        let (_, sketch, signature) = document_with_square();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 5.0).unwrap();
+        assert_eq!(
+            recipe.clone().with_draft(80.0).unwrap_err(),
+            SketchRegionRecipeError::InvalidDraft
+        );
+        assert_eq!(
+            recipe.with_draft(f64::NAN).unwrap_err(),
+            SketchRegionRecipeError::InvalidDraft
+        );
+        let face = PersistentRef::new(
+            crate::FeatureId::from_allocated(1),
+            artificer_protocol::OperationRole::new("base.entity", None),
+            EntityKind::Face,
+        );
+        let on_face = SketchRegionExtrusion::on_face(
+            sketch,
+            vec![signature],
+            face,
+            FaceExtrusionOperation::Add,
+            5.0,
+        )
+        .unwrap();
+        assert_eq!(
+            on_face.with_draft(5.0).unwrap_err(),
+            SketchRegionRecipeError::InvalidDraft
+        );
     }
 }

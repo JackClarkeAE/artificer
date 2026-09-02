@@ -11,3 +11,4 @@ target/
 # not part of the project.
 *.stl
 *.zip
+target-check/

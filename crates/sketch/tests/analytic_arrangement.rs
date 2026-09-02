@@ -1,7 +1,8 @@
 use artificer_protocol::{ArcDirection, PlanarCurve2, Point2, PrecisionPolicy};
 use artificer_sketch::{
     ArrangementDiagnostic, ArrangementInputCurve, ArrangementLimits, CurveDirection,
-    SketchEntityId, SketchPoint2, SketchPointId, build_arrangement, compile_selected_profile,
+    ProfileCompileError, SketchEntityId, SketchPoint2, SketchPointId, build_arrangement,
+    compile_selected_profile,
 };
 
 fn eid(raw: u64) -> SketchEntityId {
@@ -253,18 +254,122 @@ fn attached_dangling_geometry_is_not_exported_as_part_of_the_cell() {
 }
 
 #[test]
-fn point_kissing_loops_are_rejected_without_suppressing_an_unrelated_cell() {
+fn point_kissing_loops_each_remain_selectable_but_refuse_a_pinched_union() {
     let precision = PrecisionPolicy::default();
     let mut curves = rectangle(1, 1, (0.0, 0.0), (2.0, 2.0));
     curves.extend(rectangle(10, 10, (2.0, 2.0), (4.0, 4.0)));
     curves.extend(rectangle(20, 20, (8.0, 0.0), (10.0, 2.0)));
     let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
-    assert_eq!(arrangement.cells.len(), 1, "{:?}", arrangement.diagnostics);
+    assert_eq!(arrangement.cells.len(), 3, "{:?}", arrangement.diagnostics);
     assert!(
-        arrangement
+        !arrangement
             .diagnostics
             .iter()
             .any(|diagnostic| matches!(diagnostic, ArrangementDiagnostic::KissingJunction { .. }))
+    );
+    let lower = arrangement
+        .cell_at_point(SketchPoint2::new(1.0, 1.0), &precision)
+        .expect("lower kissing square");
+    let upper = arrangement
+        .cell_at_point(SketchPoint2::new(3.0, 3.0), &precision)
+        .expect("upper kissing square");
+    assert!(
+        compile_selected_profile(
+            &arrangement,
+            std::slice::from_ref(&lower.signature),
+            &precision
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        compile_selected_profile(
+            &arrangement,
+            &[lower.signature.clone(), upper.signature.clone()],
+            &precision
+        ),
+        Err(ProfileCompileError::PinchedBoundary)
+    ));
+}
+
+#[test]
+fn a_polygon_inscribed_in_a_circle_splits_it_into_selectable_segments() {
+    let precision = PrecisionPolicy::default();
+    // A diamond whose vertices sit exactly on the rim: every vertex is a
+    // four-departure junction carrying authored endpoints.
+    let vertices = [
+        SketchPoint2::new(2.0, 0.0),
+        SketchPoint2::new(0.0, 2.0),
+        SketchPoint2::new(-2.0, 0.0),
+        SketchPoint2::new(0.0, -2.0),
+    ];
+    let mut curves: Vec<_> = (0..4)
+        .map(|index| {
+            ArrangementInputCurve::line(
+                eid(1 + index as u64),
+                pid(1 + index as u64),
+                pid(1 + ((index + 1) % 4) as u64),
+                vertices[index],
+                vertices[(index + 1) % 4],
+            )
+        })
+        .collect();
+    curves.push(ArrangementInputCurve::circle(
+        eid(10),
+        SketchPoint2::new(0.0, 0.0),
+        2.0,
+        CurveDirection::CounterClockwise,
+    ));
+    let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
+    assert_eq!(arrangement.cells.len(), 5, "{:?}", arrangement.diagnostics);
+    assert!(
+        arrangement.diagnostics.is_empty(),
+        "{:?}",
+        arrangement.diagnostics
+    );
+    let inner = arrangement
+        .cell_at_point(SketchPoint2::new(0.0, 0.0), &precision)
+        .expect("the inscribed diamond");
+    let segment = arrangement
+        // Inside the rim (radius 1.8) but beyond the diamond edge u + v = 2.
+        .cell_at_point(SketchPoint2::new(1.27, 1.27), &precision)
+        .expect("one circular segment");
+    assert_ne!(inner.signature, segment.signature);
+    let compiled = compile_selected_profile(
+        &arrangement,
+        std::slice::from_ref(&segment.signature),
+        &precision,
+    )
+    .unwrap();
+    assert_eq!(compiled.profile.regions.len(), 1);
+    assert_eq!(compiled.profile.regions[0].outer.curves.len(), 2);
+}
+
+#[test]
+fn spokes_from_a_shared_centre_divide_a_square_into_quadrants() {
+    let precision = PrecisionPolicy::default();
+    let mut curves = rectangle(1, 1, (0.0, 0.0), (4.0, 4.0));
+    let centre = SketchPoint2::new(2.0, 2.0);
+    let rim = [
+        SketchPoint2::new(2.0, 0.0),
+        SketchPoint2::new(4.0, 2.0),
+        SketchPoint2::new(2.0, 4.0),
+        SketchPoint2::new(0.0, 2.0),
+    ];
+    for (index, end) in rim.into_iter().enumerate() {
+        curves.push(ArrangementInputCurve::line(
+            eid(10 + index as u64),
+            pid(10),
+            pid(11 + index as u64),
+            centre,
+            end,
+        ));
+    }
+    let arrangement = build_arrangement(&curves, &precision, ArrangementLimits::default());
+    assert_eq!(arrangement.cells.len(), 4, "{:?}", arrangement.diagnostics);
+    assert!(
+        arrangement.diagnostics.is_empty(),
+        "{:?}",
+        arrangement.diagnostics
     );
 }
 

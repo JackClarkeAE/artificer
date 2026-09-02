@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Artificer Script Studio</string>
+    <key>CFBundleExecutable</key>
+    <string>ArtificerScriptStudio</string>
+    <key>CFBundleIconFile</key>
+    <string>artificer</string>
+    <key>CFBundleIdentifier</key>
+    <string>org.artificer.script-studio</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Artificer Script Studio</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <!-- Both version keys are rewritten from the crate version by
+         scripts/build-standalone.sh; the values here are only what an
+         unbuilt template carries. -->
+    <key>CFBundleShortVersionString</key>
+    <string>0.6.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Artificer Script</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>art</string>
+            </array>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+        </dict>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+</dict>
+</plist>

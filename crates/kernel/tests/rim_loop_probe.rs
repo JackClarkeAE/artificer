@@ -196,8 +196,10 @@ fn a_hexagon_rim_chamfers_with_six_slants() {
 }
 
 #[test]
-fn a_reflex_profile_corner_rejects_the_rim_loop() {
-    // L-profile: the vertex at (6,4) is concave.
+fn a_reflex_profile_corner_chamfers_along_a_straight_mitre() {
+    // L-profile: the vertex at (6,4) is concave. Two slant planes meet
+    // there in a straight line, so the chamfer stays exact: the spine is
+    // the inward offset with that corner extended rather than trimmed.
     let corners = [
         (0.0, 0.0),
         (10.0, 0.0),
@@ -207,10 +209,21 @@ fn a_reflex_profile_corner_rejects_the_rim_loop() {
         (0.0, 9.0),
     ];
     let base = extrude(&corners, "rim-reflex-base");
-    let refused = finish(&base, rim_loop(&base), 1.0, "rim-reflex");
-    assert!(
-        refused.is_err(),
-        "a concave profile corner must reject a rim-loop finish"
+    let distance = 1.0;
+    let chamfered = finish(&base, rim_loop(&base), distance, "rim-reflex")
+        .expect("a concave profile corner mitres a rim-loop chamfer");
+    // Two caps, six walls, six slants; every face planar.
+    assert_eq!(chamfered.counts().faces, 14);
+    assert!(NativeKernel::debug_scene(&chamfered).carriers.is_empty());
+    // The inward offset shortens the perimeter by 2t at each of the five
+    // convex corners and lengthens it by 2t at the reflex one, so
+    // P(t) = P − 8t and the removed volume is P·d²/2 − 4·d³/3.
+    let perimeter = 10.0 + 4.0 + 4.0 + 5.0 + 6.0 + 9.0;
+    let removed = perimeter * distance * distance / 2.0 - 4.0 * distance.powi(3) / 3.0;
+    assert_close(
+        chamfered.measures().volume,
+        polygon_area(&corners) * HEIGHT - removed,
+        "reflex rim chamfer volume",
     );
 }
 

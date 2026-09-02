@@ -281,6 +281,7 @@ fn offset_loci(segment: Segment, radius: f64, precision: PrecisionPolicy) -> Vec
             });
             loci
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Vec::new(),
     }
 }
 
@@ -571,6 +572,7 @@ fn start_tangent(segment: Segment) -> Result<Vector2, CornerBlendError> {
                 .ok_or(CornerBlendError::NoCorner)?;
             Ok(radial.perpendicular().scaled(sweep.signum()))
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(CornerBlendError::NoCorner),
     }
 }
 
@@ -588,6 +590,7 @@ fn carrier_tangent_at(segment: Segment, point: Point2) -> Result<Vector2, Corner
                 .ok_or(CornerBlendError::NoCorner)?;
             Ok(radial.perpendicular().scaled(sweep.signum()))
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(CornerBlendError::NoCorner),
     }
 }
 
@@ -604,6 +607,7 @@ fn end_tangent(segment: Segment) -> Result<Vector2, CornerBlendError> {
                 .ok_or(CornerBlendError::NoCorner)?;
             Ok(radial.perpendicular().scaled(sweep.signum()))
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(CornerBlendError::NoCorner),
     }
 }
 
@@ -615,6 +619,7 @@ pub(crate) fn segment_length(segment: Segment) -> f64 {
     match segment {
         Segment::Line { start, end } => between(start, end).length(),
         Segment::Arc { radius, sweep, .. } => radius * sweep.abs(),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.length(),
     }
 }
 
@@ -649,6 +654,9 @@ fn point_at_arc_length_from_end(
                 radius.mul_add(angle.sin(), center.y),
             )
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            return Err(CornerBlendError::NoCorner);
+        }
     })
 }
 
@@ -682,6 +690,9 @@ fn point_at_arc_length_from_start(
                 radius.mul_add(angle.cos(), center.x),
                 radius.mul_add(angle.sin(), center.y),
             )
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            return Err(CornerBlendError::NoCorner);
         }
     })
 }
@@ -725,6 +736,7 @@ fn arc_length_from_start(
                 .contains(&progress)
                 .then(|| progress * radius * sweep.abs())
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
     }
 }
 
@@ -751,6 +763,7 @@ fn tangency_foot(segment: Segment, center: Point2) -> Option<Point2> {
             let radial = between(arc_center, center).normalized()?;
             Some(offset(arc_center, radial.scaled(radius)))
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
     }
 }
 
@@ -781,6 +794,9 @@ pub(crate) fn retarget_end(segment: Segment, point: Point2) -> Result<Segment, C
                 sweep: new_sweep,
             }
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            return Err(CornerBlendError::NoCorner);
+        }
     })
 }
 
@@ -810,6 +826,9 @@ pub(crate) fn retarget_start(segment: Segment, point: Point2) -> Result<Segment,
                 start_angle,
                 sweep: new_sweep,
             }
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            return Err(CornerBlendError::NoCorner);
         }
     })
 }
@@ -863,6 +882,9 @@ mod tests {
                 assert!((sweep.abs() - std::f64::consts::FRAC_PI_2).abs() < 1.0e-12);
             }
             Segment::Line { .. } => panic!("a fillet connector is an arc"),
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                panic!("a fillet connector is an arc")
+            }
         }
     }
 
@@ -961,6 +983,9 @@ mod tests {
                 assert!((center.x.hypot(center.y) - (radius - fillet)).abs() < 1.0e-12);
             }
             Segment::Line { .. } => panic!("a fillet connector is an arc"),
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                panic!("a fillet connector is an arc")
+            }
         }
     }
 }

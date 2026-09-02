@@ -380,6 +380,17 @@ pub enum SketchRecipe {
         weights: Option<Vec<f64>>,
         closed: bool,
     },
+    /// One line of text set in the bundled typeface, laid out from `anchor`
+    /// along the direction `angle` with its baseline through the anchor.
+    /// Every glyph contour becomes a closed loop of exact lines (see
+    /// [`crate::text`]), so letters extrude like any other profile.
+    Text {
+        anchor: PointInput,
+        content: String,
+        /// Height of a capital letter.
+        height: SketchValue<Length>,
+        angle: SketchValue<Angle>,
+    },
 }
 
 impl SketchRecipe {
@@ -401,6 +412,7 @@ impl SketchRecipe {
                 | Self::FilletWithHints { .. }
                 | Self::Chamfer { .. }
                 | Self::Trim { .. }
+                | Self::Text { .. }
         )
     }
 
@@ -466,6 +478,7 @@ impl SketchRecipe {
                 push(second_cap_center);
             }
             Self::CircularPattern { center, .. } => push(center),
+            Self::Text { anchor, .. } => push(anchor),
             Self::FitPointSpline { fit_points, .. } => {
                 for pt in fit_points {
                     push(pt);

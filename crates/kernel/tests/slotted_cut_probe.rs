@@ -166,17 +166,15 @@ fn a_cut_crossing_an_interior_slot_removes_the_far_side_too() {
          (the truncated bug would publish {truncated})"
     );
 
-    // This body is all planes, but it was rebuilt by the faceted fallback,
-    // and an approximation must say so.
+    // This body is all planes, and the general analytic engine now carries
+    // it exactly: the cut is a certified difference, not a faceted rebuild,
+    // so it carries no approximation caveat.
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION"),
-        "the crossing-void fallback must carry its caveat: {:?}",
+        outcome.report.warnings.is_empty(),
+        "an all-plane crossing cut is exact: {:?}",
         outcome.report.warnings
     );
+    assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
 }
 
 /// The canonicalized overtravel contract survives: past the last face there

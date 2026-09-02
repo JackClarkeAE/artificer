@@ -1,18 +1,29 @@
 //! Recursive-descent parser for the .art language.
 
-use crate::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
-use crate::scripting::lexer::{SpannedToken, Token};
+use crate::api::scripting::ast::{AstNode, BinaryOperator, Expression, UnaryOperator};
+use crate::api::scripting::lexer::{SpannedToken, Token};
 
 pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
+
+/// The deepest expression nesting the parser follows. A script is a few
+/// hundred lines of feature calls, never a deeply nested term; the limit
+/// exists so that a hostile `((((...` over the wire is an error rather than
+/// a stack overflow that takes the whole server with it.
+pub const MAX_EXPRESSION_DEPTH: usize = 64;
 
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<SpannedToken>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -65,6 +76,7 @@ impl Parser {
         match self.peek() {
             Token::Param => self.parse_param_decl(),
             Token::Let => self.parse_let_binding(),
+            Token::For => self.parse_for_loop(),
             _ => {
                 let expr = self.parse_expression()?;
                 if self.peek() == &Token::Semi {
@@ -76,6 +88,7 @@ impl Parser {
     }
 
     fn parse_param_decl(&mut self) -> Result<AstNode, String> {
+        let (decl_line, _) = self.current_span();
         self.advance(); // 'param'
         let (line, col) = self.current_span();
         let name = match self.advance() {
@@ -106,6 +119,45 @@ impl Parser {
             name,
             param_type,
             default_value,
+            line: decl_line,
+        })
+    }
+
+    fn parse_for_loop(&mut self) -> Result<AstNode, String> {
+        let (line, col) = self.current_span();
+        self.advance(); // 'for'
+        let (name_line, name_col) = self.current_span();
+        let variable = match self.advance() {
+            Token::Ident(s) => s,
+            other => {
+                return Err(format!(
+                    "Expected a loop variable at {name_line}:{name_col}, got {other:?}"
+                ));
+            }
+        };
+        self.expect(Token::In)?;
+        let start = self.parse_expression()?;
+        self.expect(Token::DotDot)?;
+        let end = self.parse_expression()?;
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        while self.peek() != &Token::RBrace {
+            if self.peek() == &Token::Eof {
+                let (eof_line, eof_col) = self.current_span();
+                return Err(format!(
+                    "The loop starting at {line}:{col} has no closing brace at {eof_line}:{eof_col}"
+                ));
+            }
+            body.push(self.parse_statement()?);
+        }
+        self.expect(Token::RBrace)?;
+        Ok(AstNode::For {
+            variable,
+            start,
+            end,
+            body,
+            line,
+            col,
         })
     }
 
@@ -131,7 +183,16 @@ impl Parser {
     }
 
     pub fn parse_expression(&mut self) -> Result<Expression, String> {
-        self.parse_add_sub()
+        if self.depth >= MAX_EXPRESSION_DEPTH {
+            let (line, col) = self.current_span();
+            return Err(format!(
+                "Expression nested deeper than {MAX_EXPRESSION_DEPTH} levels at {line}:{col}"
+            ));
+        }
+        self.depth += 1;
+        let result = self.parse_add_sub();
+        self.depth -= 1;
+        result
     }
 
     fn parse_add_sub(&mut self) -> Result<Expression, String> {
@@ -205,6 +266,8 @@ impl Parser {
                     method,
                     named_args,
                     positional_args,
+                    line,
+                    col,
                 };
             } else {
                 break;
@@ -228,6 +291,7 @@ impl Parser {
             }
             Token::Ident(name) => {
                 let name = name.clone();
+                let (line, col) = self.current_span();
                 self.advance();
                 if self.peek() == &Token::LParen {
                     let (named_args, positional_args) = self.parse_arguments()?;
@@ -235,6 +299,8 @@ impl Parser {
                         name,
                         named_args,
                         positional_args,
+                        line,
+                        col,
                     })
                 } else {
                     Ok(Expression::Identifier(name))

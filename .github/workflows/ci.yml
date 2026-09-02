@@ -104,13 +104,19 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
       - name: Kernel and geometry tests
-        run: cargo test --workspace --exclude artificer-workbench
-      - name: Release executable
-        run: cargo build --release --package artificer-workbench --bin artificer-workbench
+        # Script Studio's UI suite drives a wgpu harness the way the
+        # workbench suites do, so it stays with them on the Linux runner.
+        run: cargo test --workspace --exclude artificer-workbench --exclude artificer-script-studio
+      - name: Release executables
+        run: |
+          cargo build --release --package artificer-workbench --bin artificer-workbench
+          cargo build --release --package artificer-script-studio --bin artificer-script-studio
       - uses: actions/upload-artifact@v4
         with:
           name: artificer-windows-x86_64
-          path: target/release/artificer-workbench.exe
+          path: |
+            target/release/artificer-workbench.exe
+            target/release/artificer-script-studio.exe
           if-no-files-found: error
 
   focused-ui-pixels:
@@ -303,11 +309,13 @@ jobs:
           mkdir -p dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/release/artificer-workbench.exe dist/Artificer.exe
+            cp target/release/artificer-script-studio.exe dist/ArtificerScriptStudio.exe
             cp README.md dist/
             (cd dist && 7z a -tzip "../$name.zip" . >/dev/null)
             asset="$name.zip"
           else
             cp target/release/artificer-workbench dist/Artificer
+            cp target/release/artificer-script-studio dist/ArtificerScriptStudio
             cp README.md dist/
             tar -czf "$name.tar.gz" -C dist .
             asset="$name.tar.gz"
@@ -336,7 +344,7 @@ jobs:
           name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
           release_dir="artifacts/standalone/release"
           cp README.md "$release_dir/"
-          (cd "$release_dir" && zip -qry "$GITHUB_WORKSPACE/$name.zip" Artificer.app README.md)
+          (cd "$release_dir" && zip -qry "$GITHUB_WORKSPACE/$name.zip" Artificer.app "Artificer Script Studio.app" README.md)
           gh release upload "$GITHUB_REF_NAME" "$name.zip" --clobber
           echo "asset=$name.zip" >> "$GITHUB_ENV"
 

@@ -288,6 +288,18 @@ fn dense_face_sketch_body_context_generation_fits_60hz_budget() {
         .expect("generated face sketch should cache its committed-body projection");
     assert!(triangles >= 2);
     assert_eq!(
+        edges, 12,
+        "by default the sketch shows only the body on and above its face"
+    );
+    // Projecting the geometry below the surface reveals the lower steps of
+    // the chain, still without the 20 rear/hidden source edges.
+    harness.state_mut().set_project_3d_body_context(true);
+    harness.step();
+    let (_, edges) = harness
+        .state()
+        .face_sketch_context_counts()
+        .expect("generated face sketch should cache its committed-body projection");
+    assert_eq!(
         edges, 28,
         "the face-normal sketch context must omit the 20 rear/hidden source edges"
     );

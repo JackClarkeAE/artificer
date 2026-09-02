@@ -382,7 +382,7 @@ pub(crate) fn ray_face_crossings(
 ) -> Option<usize> {
     let loops: Vec<Vec<Segment>> = face
         .loops()
-        .map(|loop_key| crate::analytic_extrusion::topology_loop_segments(topology, loop_key))
+        .map(|loop_key| crate::analytic_extrusion::topology_loop_chords(topology, loop_key))
         .collect::<Option<Vec<_>>>()?;
     let guard = 1.0e-9;
     match face.surface {
@@ -530,6 +530,12 @@ fn segment_distance(segment: Segment, point: Point2) -> f64 {
                 to_start.min(to_end)
             }
         }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } => (0..=64)
+            .map(|step| {
+                let sample = segment.point_at(f64::from(step) / 64.0);
+                (point.x - sample.x).hypot(point.y - sample.y)
+            })
+            .fold(f64::INFINITY, f64::min),
     }
 }
 
@@ -551,6 +557,7 @@ fn segment_midpoint(segment: Segment) -> Point2 {
                 radius.mul_add(angle.sin(), center.y),
             )
         }
+        _ => segment.point_at(0.5),
     }
 }
 
@@ -616,6 +623,57 @@ fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, Paramete
                 None
             }
         }
+        (
+            Surface::Plane(plane),
+            Segment::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start_angle,
+                sweep,
+                ..
+            },
+        ) => Some((
+            Curve3::Ellipse {
+                center: plane.evaluate(center),
+                u: plane.u * u.x + plane.v * u.y,
+                v: plane.u * -u.y + plane.v * u.x,
+                major_radius: major,
+                minor_radius: minor,
+            },
+            ParameterRange::new(start_angle, start_angle + sweep),
+        )),
+        (
+            Surface::Cylinder(cylinder),
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end,
+            },
+        ) => {
+            // The trace of a plane section: an ellipse in space whose angle
+            // is the azimuth past the crest.
+            let section = crate::analytic_boolean::CylinderSectionHarmonic {
+                cylinder,
+                mean,
+                amplitude,
+                phase,
+            };
+            let (center, u, v, major_radius, minor_radius) = section.ellipse()?;
+            Some((
+                Curve3::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                },
+                ParameterRange::new(section.angle_at(start.x), section.angle_at(end.x)),
+            ))
+        }
         _ => None,
     }
 }
@@ -638,6 +696,38 @@ fn segment_pcurve(segment: Segment) -> (Curve2, ParameterRange) {
                 radius,
             },
             ParameterRange::new(start_angle, start_angle + sweep),
+        ),
+        Segment::Ellipse {
+            center,
+            u,
+            major,
+            minor,
+            start_angle,
+            sweep,
+            ..
+        } => (
+            Curve2::Ellipse {
+                center,
+                u: crate::topology::Vector2::new(u.x, u.y),
+                v: crate::topology::Vector2::new(-u.y, u.x),
+                major_radius: major,
+                minor_radius: minor,
+            },
+            ParameterRange::new(start_angle, start_angle + sweep),
+        ),
+        Segment::Harmonic {
+            mean,
+            amplitude,
+            phase,
+            start,
+            end,
+        } => (
+            Curve2::Harmonic {
+                mean,
+                amplitude,
+                phase,
+            },
+            ParameterRange::new(start.x, end.x),
         ),
     }
 }

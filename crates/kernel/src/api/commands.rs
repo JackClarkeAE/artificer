@@ -3,7 +3,11 @@
 use artificer_protocol::{Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
-use crate::selectors::EntitySelector;
+use crate::api::selectors::EntitySelector;
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
 
 /// A reference to a prior operation's step.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -116,6 +120,11 @@ pub enum ApiCommand {
         regions: Vec<u32>,
         distance: f64,
         operation: ExtrudeOp,
+        /// Draft angle in degrees for a new body: positive leans the walls
+        /// outward, negative inward. Replays as an exact loft to the
+        /// profile's offset section. Add and cut extrusions do not draft.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        draft_degrees: f64,
     },
     Revolve {
         label: String,

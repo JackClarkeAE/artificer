@@ -4,6 +4,11 @@
 pub enum Token {
     Param,
     Let,
+    For,
+    In,
+    LBrace,
+    RBrace,
+    DotDot,
     Ident(String),
     Number(f64),
     StringLit(String),
@@ -88,6 +93,8 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
             let token = match s.as_str() {
                 "param" => Token::Param,
                 "let" => Token::Let,
+                "for" => Token::For,
+                "in" => Token::In,
                 _ => Token::Ident(s),
             };
             tokens.push(SpannedToken {
@@ -106,7 +113,9 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
                     s.push(c);
                     chars.next();
                     col += 1;
-                } else if c == '.' && !has_dot {
+                } else if c == '.' && !has_dot && chars.clone().nth(1) != Some('.') {
+                    // A lone `.` continues the number; `..` after a number
+                    // is the range of a `for` loop and ends it.
                     s.push(c);
                     has_dot = true;
                     chars.next();
@@ -160,7 +169,21 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
         chars.next();
         col += 1;
 
+        // `..` is one token: the range of a `for` loop.
+        if ch == '.' && chars.peek() == Some(&'.') {
+            chars.next();
+            col += 1;
+            tokens.push(SpannedToken {
+                token: Token::DotDot,
+                line,
+                col: start_col,
+            });
+            continue;
+        }
+
         let token = match ch {
+            '{' => Token::LBrace,
+            '}' => Token::RBrace,
             '(' => Token::LParen,
             ')' => Token::RParen,
             '[' => Token::LBracket,

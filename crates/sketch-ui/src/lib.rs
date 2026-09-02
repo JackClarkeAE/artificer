@@ -246,25 +246,72 @@ impl SketchPoint {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SketchContextTriangle {
     pub vertices: [SketchPoint; 3],
+    /// Brightness of the face relative to the palette's context colour, in
+    /// `0.0..=1.0`. Faces parallel to the sketch plane are brightest; a face
+    /// that slopes away from it, or lies deep below it, is darker.
+    pub shade: f32,
+    pub layer: SketchContextLayer,
 }
 
 impl SketchContextTriangle {
     #[must_use]
     pub const fn new(vertices: [SketchPoint; 3]) -> Self {
-        Self { vertices }
+        Self {
+            vertices,
+            shade: 1.0,
+            layer: SketchContextLayer::Body,
+        }
     }
+
+    #[must_use]
+    pub const fn with_shade(mut self, shade: f32) -> Self {
+        self.shade = shade;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_layer(mut self, layer: SketchContextLayer) -> Self {
+        self.layer = layer;
+        self
+    }
+}
+
+/// Where a projected body element sits relative to the sketch surface.
+///
+/// The body itself is always drawn when sketching on a face. Geometry below
+/// the surface is hidden by the face in a true view and only appears when
+/// the user asks to project it, so it is painted as an x-ray in its own
+/// colour and never mistaken for the visible body.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SketchContextLayer {
+    /// On or above the sketch surface: the host face and anything raised
+    /// from it.
+    #[default]
+    Body,
+    /// Below the sketch surface: pockets, bores, and walls under the face.
+    Below,
 }
 
 /// One body edge already projected into the active sketch's `(u, v)` frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SketchContextEdge {
     pub endpoints: [SketchPoint; 2],
+    pub layer: SketchContextLayer,
 }
 
 impl SketchContextEdge {
     #[must_use]
     pub const fn new(endpoints: [SketchPoint; 2]) -> Self {
-        Self { endpoints }
+        Self {
+            endpoints,
+            layer: SketchContextLayer::Body,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_layer(mut self, layer: SketchContextLayer) -> Self {
+        self.layer = layer;
+        self
     }
 }
 
@@ -1394,13 +1441,31 @@ impl RetainedRecipeParameter {
         }
     }
 
+    /// A free-text parameter: the characters a text recipe sets.
+    fn text(stable_key: &'static str, label: &'static str, content: &str) -> Self {
+        Self {
+            stable_key,
+            label,
+            text: content.to_owned(),
+            unit: "",
+            value: None,
+            domain: ToolNumberDomain::Text,
+            read_only_reason: None,
+            error: None,
+        }
+    }
+
+    const fn is_text(&self) -> bool {
+        matches!(self.domain, ToolNumberDomain::Text)
+    }
+
     fn view(&self) -> SelectedRecipeParameter {
         SelectedRecipeParameter {
             stable_key: self.stable_key,
             label: self.label,
             text: self.text.clone(),
             unit: self.unit,
-            editable: self.value.is_some(),
+            editable: self.value.is_some() || self.is_text(),
             read_only_reason: self.read_only_reason,
             error: self.error,
         }
@@ -1423,7 +1488,12 @@ enum ToolNumberDomain {
     Finite,
     NonZero,
     NonZeroLength,
-    Integer { minimum: u16, maximum: u16 },
+    Integer {
+        minimum: u16,
+        maximum: u16,
+    },
+    /// Not a number at all: free text, kept verbatim.
+    Text,
 }
 
 #[derive(Clone, Debug)]
@@ -1482,7 +1552,20 @@ impl RetainedToolNumber {
 struct ActiveToolInputs {
     numbers: BTreeMap<(ToolVariant, &'static str), RetainedToolNumber>,
     flags: BTreeMap<(ToolVariant, &'static str), bool>,
+    texts: BTreeMap<(ToolVariant, &'static str), String>,
 }
+
+/// Default free-text value of a tool field, when the field is text rather
+/// than a number or a flag.
+fn tool_text_default(variant: ToolVariant, stable_key: &'static str) -> Option<&'static str> {
+    match (variant, stable_key) {
+        (ToolVariant::Text, "content") => Some(DEFAULT_TEXT_CONTENT),
+        _ => None,
+    }
+}
+
+const DEFAULT_TEXT_CONTENT: &str = "TEXT";
+const DEFAULT_TEXT_HEIGHT: f64 = 10.0;
 
 fn format_tool_number(value: f64) -> String {
     if value.fract().abs() <= f64::EPSILON {
@@ -1531,7 +1614,8 @@ fn validate_tool_number(text: &str, domain: ToolNumberDomain) -> Result<f64, Too
         | ToolNumberDomain::Finite
         | ToolNumberDomain::NonZero
         | ToolNumberDomain::NonZeroLength
-        | ToolNumberDomain::Integer { .. } => Ok(value),
+        | ToolNumberDomain::Integer { .. }
+        | ToolNumberDomain::Text => Ok(value),
     }
 }
 
@@ -1550,6 +1634,8 @@ fn tool_number_spec(
                 maximum: CORE_MAX_POLYGON_SIDES,
             },
         )),
+        (ToolVariant::Text, "height") => Some((DEFAULT_TEXT_HEIGHT, positive)),
+        (ToolVariant::Text, "angle") => Some((0.0, finite)),
         (ToolVariant::Fillet, "radius") => Some((DEFAULT_FILLET_RADIUS, positive)),
         (ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer, "distance_1") => {
             Some((DEFAULT_CHAMFER_DISTANCE, positive))
@@ -1777,6 +1863,20 @@ fn selected_recipe_editor_for(
             ],
             BOUND_REFERENCE_NOTE,
         ),
+        CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } => (
+            "Text",
+            vec![
+                RetainedRecipeParameter::text("content", "Text", content),
+                literal_length_parameter("height", "Height", height),
+                literal_angle_parameter("angle", "Angle", angle),
+            ],
+            "The baseline anchor stays fixed; edit the text, its capital height, or its angle.",
+        ),
         CoreRecipe::TwoPointSlot { width, .. } => (
             "Two-point slot",
             vec![literal_length_parameter("width", "Width", width)],
@@ -1925,6 +2025,61 @@ fn recipe_parameter_value(editor: &SelectedRecipeEditor, key: &'static str) -> O
         .iter()
         .find(|parameter| parameter.stable_key == key)
         .and_then(|parameter| parameter.value)
+}
+
+fn recipe_parameter_text(editor: &SelectedRecipeEditor, key: &'static str) -> Option<String> {
+    editor
+        .parameters
+        .iter()
+        .find(|parameter| {
+            parameter.stable_key == key && matches!(parameter.domain, ToolNumberDomain::Text)
+        })
+        .map(|parameter| parameter.text.clone())
+}
+
+/// The recipe a text click stages: one line of `content` at capital height
+/// `height`, its baseline through `anchor` at `angle` radians from `+u`.
+fn text_recipe(anchor: SketchPoint, content: &str, height: f64, angle: f64) -> Option<CoreRecipe> {
+    if content.chars().all(char::is_whitespace) {
+        return None;
+    }
+    Some(CoreRecipe::Text {
+        anchor: core_point_input(anchor),
+        content: content.to_owned(),
+        height: CoreValue::Literal(CoreLength::new(height).ok()?),
+        angle: CoreValue::Literal(CoreAngle::radians(angle).ok()?),
+    })
+}
+
+/// The outline segments of `content` placed at `anchor`, for the live
+/// preview under the pointer before the anchor click. An unsettable text
+/// (empty, or a glyph the typeface lacks) previews nothing rather than
+/// something misleading.
+fn text_preview_geometries(
+    anchor: SketchPoint,
+    content: &str,
+    height: f64,
+    angle: f64,
+) -> Vec<SketchGeometry> {
+    let Ok(outlines) = artificer_sketch::text::text_outlines(content, height) else {
+        return Vec::new();
+    };
+    let (sin, cos) = angle.sin_cos();
+    let place = |point: artificer_sketch::SketchPoint2| {
+        SketchPoint::new(
+            anchor.u + point.u * cos - point.v * sin,
+            anchor.v + point.u * sin + point.v * cos,
+        )
+    };
+    let mut geometries = Vec::new();
+    for outline in &outlines.loops {
+        for index in 0..outline.points.len() {
+            let start = place(outline.points[index]);
+            let end = place(outline.points[(index + 1) % outline.points.len()]);
+            geometries.push(SketchGeometry::segment(start, end));
+        }
+    }
+    geometries
 }
 
 fn replace_literal_length(
@@ -2161,6 +2316,18 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
             replace_literal_length(outer_diameter, driven)?;
             replace_literal_angle(rotation, recipe_parameter_value(editor, "rotation"))?;
         }
+        CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } => {
+            if let Some(text) = recipe_parameter_text(editor, "content") {
+                *content = text;
+            }
+            replace_literal_length(height, recipe_parameter_value(editor, "height"))?;
+            replace_literal_angle(angle, recipe_parameter_value(editor, "angle"))?;
+        }
         CoreRecipe::TwoPointSlot { width, .. } => {
             replace_literal_length(width, recipe_parameter_value(editor, "width"))?;
         }
@@ -2284,6 +2451,9 @@ fn translate_core_recipe(recipe: &mut CoreRecipe, delta_u: f64, delta_v: f64) {
         CoreRecipe::InnerDiameterPolygon { center, .. }
         | CoreRecipe::OuterDiameterPolygon { center, .. } => {
             translate_core_point_input(center, delta_u, delta_v);
+        }
+        CoreRecipe::Text { anchor, .. } => {
+            translate_core_point_input(anchor, delta_u, delta_v);
         }
         CoreRecipe::TwoPointSlot {
             first_cap_center,
@@ -4060,6 +4230,12 @@ fn exact_creation_preview_geometries(state: &SketchCanvasState) -> Option<Vec<Sk
             let reference = state.polygon_reference_from_inputs(center, pointer);
             regular_polygon_preview(state.exact_tool, center, reference, state.polygon_sides)
         }
+        ToolVariant::Text => {
+            let content = state.active_tool_text("content")?;
+            let height = state.active_tool_number("height")?;
+            let angle = state.active_tool_number("angle")?.to_radians();
+            Some(text_preview_geometries(pointer, &content, height, angle))
+        }
         ToolVariant::TwoPointSlot | ToolVariant::CentreToOuterPointSlot => {
             let axis_start = state.creation_anchor?;
             let axis_end = state.slot_axis_from_inputs(axis_start, state.arc_start?);
@@ -4594,6 +4770,8 @@ pub enum SnapKind {
     Center(SketchEntityId),
     Midpoint(SketchEntityId),
     Quadrant(SketchEntityId, u8),
+    /// Nearest point along an authored curve's interior.
+    OnCurve(SketchEntityId),
     SupportEndpoint,
     SupportCenter,
     SupportMidpoint,
@@ -4612,6 +4790,7 @@ impl SnapKind {
             Self::Center(_) => "Snap: centre",
             Self::Midpoint(_) => "Snap: midpoint",
             Self::Quadrant(_, _) => "Snap: quadrant",
+            Self::OnCurve(_) => "Snap: on curve",
             Self::SupportEndpoint => "Snap: edge vertex",
             Self::SupportCenter => "Snap: edge centre",
             Self::SupportMidpoint => "Snap: edge midpoint",
@@ -5178,6 +5357,9 @@ impl SketchCanvasState {
     /// using their in-canvas dimensional editor.
     #[must_use]
     pub fn active_tool_input_text(&self, stable_key: &'static str) -> Option<String> {
+        if let Some(text) = self.active_tool_text(stable_key) {
+            return Some(text);
+        }
         let (default, _) = tool_number_spec(self.exact_tool, stable_key)?;
         Some(
             self.tool_inputs
@@ -5187,12 +5369,31 @@ impl SketchCanvasState {
         )
     }
 
+    /// The value of one free-text tool field, when the active tool has one.
+    #[must_use]
+    pub fn active_tool_text(&self, stable_key: &'static str) -> Option<String> {
+        let default = tool_text_default(self.exact_tool, stable_key)?;
+        Some(
+            self.tool_inputs
+                .texts
+                .get(&(self.exact_tool, stable_key))
+                .cloned()
+                .unwrap_or_else(|| default.to_owned()),
+        )
+    }
+
     /// Applies one typed edit while retaining the previous valid preview
     /// value. Returns false only when the field does not belong to this tool
     /// or while an immutable operation is awaiting confirmation.
     pub fn set_active_tool_input_text(&mut self, stable_key: &'static str, text: String) -> bool {
         if self.pending.is_some() {
             return false;
+        }
+        if tool_text_default(self.exact_tool, stable_key).is_some() {
+            self.tool_inputs
+                .texts
+                .insert((self.exact_tool, stable_key), text);
+            return true;
         }
         let Some((default, domain)) = tool_number_spec(self.exact_tool, stable_key) else {
             return false;
@@ -5225,7 +5426,8 @@ impl SketchCanvasState {
             .numbers
             .get_mut(&(self.exact_tool, stable_key))
         else {
-            return tool_number_spec(self.exact_tool, stable_key).is_some();
+            return tool_number_spec(self.exact_tool, stable_key).is_some()
+                || tool_text_default(self.exact_tool, stable_key).is_some();
         };
         input.restore_last_valid();
         true
@@ -5400,6 +5602,7 @@ impl SketchCanvasState {
             ToolVariant::CentreStartEndArc | ToolVariant::ThreePointArc => SketchTool::Arc,
             ToolVariant::InnerDiameterPolygon
             | ToolVariant::OuterDiameterPolygon
+            | ToolVariant::Text
             | ToolVariant::TwoPointSlot
             | ToolVariant::CentreToOuterPointSlot => SketchTool::Point,
         };
@@ -5914,7 +6117,10 @@ impl SketchCanvasState {
                 .parameters
                 .iter_mut()
                 .find(|parameter| parameter.stable_key == stable_key)?;
-            let old_value = parameter.value?;
+            if !parameter.is_text() {
+                parameter.value?;
+            }
+            let old_value = parameter.value;
             parameter.text = text;
             parameter.error = None;
             (
@@ -5925,7 +6131,11 @@ impl SketchCanvasState {
             )
         };
 
-        let parsed = {
+        // Free text is kept as typed; the recipe replay below decides
+        // whether it can be set.
+        let parsed = if matches!(domain, ToolNumberDomain::Text) {
+            None
+        } else {
             let named_values = &self.named_values;
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
@@ -5943,7 +6153,7 @@ impl SketchCanvasState {
             match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
-                    value
+                    Some(value)
                 }
                 Err(error) => {
                     parameter.error = Some(RecipeParameterError::Numeric(error));
@@ -5969,8 +6179,8 @@ impl SketchCanvasState {
                 .parameters
                 .iter_mut()
                 .find(|parameter| parameter.stable_key == stable_key)?;
-            debug_assert_eq!(parameter.value, Some(parsed));
-            parameter.value = Some(old_value);
+            debug_assert_eq!(parameter.value, parsed);
+            parameter.value = old_value;
             parameter.error = Some(RecipeParameterError::ReplayRejected);
             return self.pending.as_ref().map(|pending| pending.subject);
         };
@@ -7404,6 +7614,7 @@ impl SketchCanvasState {
                 CoreSnapKey::Quadrant { entity: id, index } => {
                     SnapKind::Quadrant(entity(id), index)
                 }
+                CoreSnapKey::OnCurve { entity: id } => SnapKind::OnCurve(entity(id)),
             };
             return SnapResult {
                 point: SketchPoint::new(candidate.point.u, candidate.point.v),
@@ -7559,6 +7770,16 @@ impl SketchCanvasState {
             | ToolVariant::FitPointSpline
             | ToolVariant::ControlVertexSpline => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
+            ToolVariant::Text => {
+                if self.active_tool_parameter_issue().is_some() {
+                    return None;
+                }
+                let content = self.active_tool_text("content")?;
+                let height = self.active_tool_number("height")?;
+                let angle = self.active_tool_number("angle")?.to_radians();
+                let recipe = text_recipe(point, &content, height, angle)?;
+                self.stage_recipe(recipe, "Add sketch text").ok()
+            }
             ToolVariant::SingleLine => {
                 if let Some(start) = self.creation_anchor.take() {
                     self.update_dimension_pointer(point);
@@ -8369,7 +8590,80 @@ impl SketchCanvasState {
                     },
                 }])
             }
+            (ToolVariant::CollinearRelation, [first, second]) => {
+                let ((first_start, first_end), (second_start, second_end)) =
+                    pair_lines(*first, *second)?;
+                // Both ends of the second line onto the first line's carrier:
+                // that is two equations, the same count as making the lines
+                // parallel and then sharing a point.
+                Ok(vec![
+                    CoreConstraintKind::Collinear {
+                        first: first_start,
+                        second: second_start,
+                        third: first_end,
+                    },
+                    CoreConstraintKind::Collinear {
+                        first: first_start,
+                        second: second_end,
+                        third: first_end,
+                    },
+                ])
+            }
+            (ToolVariant::TangentRelation, [first, second]) => {
+                let (line, round) = match (first, second) {
+                    (RelationOperand::Curve(first), RelationOperand::Curve(second)) => {
+                        if self.relation_line_points(*first).is_ok() {
+                            (*first, *second)
+                        } else {
+                            (*second, *first)
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "This relation applies to a line and a circle or arc.".to_owned()
+                        );
+                    }
+                };
+                let (start, end) = self.relation_line_points(line).map_err(|_| {
+                    "This relation applies to a line and a circle or arc.".to_owned()
+                })?;
+                Ok(vec![match self.relation_round_carrier(round)? {
+                    RoundCarrier::Circle { center, radius } => {
+                        CoreConstraintKind::LineTangentToCircle {
+                            start,
+                            end,
+                            center,
+                            radius,
+                        }
+                    }
+                    RoundCarrier::Arc { center, rim } => CoreConstraintKind::LineTangentToArc {
+                        start,
+                        end,
+                        center,
+                        rim,
+                    },
+                }])
+            }
             _ => Err("This relation needs different operands.".to_owned()),
+        }
+    }
+
+    /// The centre and radius of a circular operand, as the solver holds them.
+    fn relation_round_carrier(&self, entity: CoreEntityId) -> Result<RoundCarrier, String> {
+        let record = self
+            .authoring
+            .entity(entity)
+            .ok_or_else(|| "That curve is no longer part of the sketch.".to_owned())?;
+        match record.geometry {
+            CoreCurve2::Circle { center, radius, .. } => {
+                Ok(RoundCarrier::Circle { center, radius })
+            }
+            CoreCurve2::CircularArc { center, start, .. } => {
+                Ok(RoundCarrier::Arc { center, rim: start })
+            }
+            CoreCurve2::Line { .. } | CoreCurve2::Bspline { .. } => {
+                Err("This relation applies to a line and a circle or arc.".to_owned())
+            }
         }
     }
 
@@ -8925,7 +9219,9 @@ impl SketchCanvasState {
             | ToolVariant::DistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
-            | ToolVariant::EqualLengthRelation => self.append_relation_operand(point, pick_radius),
+            | ToolVariant::EqualLengthRelation
+            | ToolVariant::TangentRelation
+            | ToolVariant::CollinearRelation => self.append_relation_operand(point, pick_radius),
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern => {
                 if self.modifier_sources.is_empty() {
                     let picked = self.exact_curve_hit(point, pick_radius)?;
@@ -8961,6 +9257,19 @@ enum RelationOperand {
     Curve(CoreEntityId),
 }
 
+/// A circular operand's centre and the way it carries its radius.
+#[derive(Clone, Copy, Debug)]
+enum RoundCarrier {
+    Circle {
+        center: CorePointId,
+        radius: f64,
+    },
+    Arc {
+        center: CorePointId,
+        rim: CorePointId,
+    },
+}
+
 /// How many operands a relation needs before it can be staged.
 const fn relation_arity(variant: ToolVariant) -> Option<usize> {
     match variant {
@@ -8970,7 +9279,9 @@ const fn relation_arity(variant: ToolVariant) -> Option<usize> {
         | ToolVariant::DistanceRelation
         | ToolVariant::ParallelRelation
         | ToolVariant::PerpendicularRelation
-        | ToolVariant::EqualLengthRelation => Some(2),
+        | ToolVariant::EqualLengthRelation
+        | ToolVariant::TangentRelation
+        | ToolVariant::CollinearRelation => Some(2),
         _ => None,
     }
 }
@@ -8986,6 +9297,8 @@ const fn relation_label(variant: ToolVariant) -> &'static str {
         ToolVariant::ParallelRelation => "Parallel relation",
         ToolVariant::PerpendicularRelation => "Perpendicular relation",
         ToolVariant::EqualLengthRelation => "Equal-length relation",
+        ToolVariant::TangentRelation => "Tangent relation",
+        ToolVariant::CollinearRelation => "Collinear relation",
         _ => "Sketch relation",
     }
 }
@@ -10346,10 +10659,15 @@ pub fn show_with_context(
                 | ToolVariant::TwoDistanceChamfer
                 | ToolVariant::RectangularPattern
                 | ToolVariant::CircularPattern
-        ) {
+        ) || relation_arity(state.exact_tool).is_some()
+        {
             // Span and corner modifiers retain the actual model-space pick.
             // Snapping to a junction would erase the finite carrier branch the
-            // user intended to keep. Pattern centres remain snap-aware.
+            // user intended to keep. Pattern centres remain snap-aware. A
+            // relation picks what is under the pointer, endpoint first, so it
+            // takes the raw point too: a click with a relation tool used to
+            // fall through to plain selection here, which is why relations
+            // never staged from the canvas.
             let raw_point = state.view.screen_to_sketch(response.rect, position);
             let point = if matches!(
                 state.exact_tool,
@@ -10357,7 +10675,8 @@ pub fn show_with_context(
                     | ToolVariant::Fillet
                     | ToolVariant::Chamfer
                     | ToolVariant::TwoDistanceChamfer
-            ) {
+            ) || relation_arity(state.exact_tool).is_some()
+            {
                 raw_point
             } else {
                 state.snap_point(response.rect, position).point
@@ -10667,12 +10986,15 @@ fn paint_viewport_context(
     view: SketchView,
     context: &SketchViewportContext<'_>,
 ) {
+    // The x-ray of what lies below the surface goes down first, so the body
+    // that is really there paints over it wherever the two overlap.
     let mesh = projected_context_mesh(rect, view, context.triangles);
     if !mesh.indices.is_empty() {
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    let edge_stroke = Stroke::new(1.0, sketch_colours().context_edge);
+    let body_stroke = Stroke::new(1.0, sketch_colours().context_edge);
+    let below_stroke = Stroke::new(1.2, sketch_colours().context_below_edge);
     for edge in context.edges {
         let [first, second] = edge.endpoints;
         if !first.is_finite() || !second.is_finite() {
@@ -10682,8 +11004,17 @@ fn paint_viewport_context(
             view.sketch_to_screen(rect, first),
             view.sketch_to_screen(rect, second),
         ];
-        if screen_points_are_finite(&points) {
-            painter.line_segment(points, edge_stroke);
+        if !screen_points_are_finite(&points) {
+            continue;
+        }
+        match edge.layer {
+            SketchContextLayer::Body => {
+                painter.line_segment(points, body_stroke);
+            }
+            SketchContextLayer::Below => {
+                // Hidden-line convention: what is under the surface dashes.
+                painter.add(egui::Shape::dashed_line(&points, below_stroke, 6.0, 4.0));
+            }
         }
     }
 
@@ -10732,10 +11063,21 @@ fn projected_context_mesh(
     view: SketchView,
     triangles: &[SketchContextTriangle],
 ) -> egui::Mesh {
+    let colours = sketch_colours();
     let mut mesh = egui::Mesh::default();
     mesh.reserve_vertices(triangles.len() * 3);
     mesh.reserve_triangles(triangles.len());
-    for triangle in triangles {
+    // Below-surface faces first, then the body, so painter order inside each
+    // layer (far to near) is preserved and the body always wins overlaps.
+    let layered = triangles
+        .iter()
+        .filter(|triangle| triangle.layer == SketchContextLayer::Below)
+        .chain(
+            triangles
+                .iter()
+                .filter(|triangle| triangle.layer == SketchContextLayer::Body),
+        );
+    for triangle in layered {
         if triangle.vertices.iter().any(|point| !point.is_finite()) {
             continue;
         }
@@ -10745,13 +11087,40 @@ fn projected_context_mesh(
         if !screen_points_are_finite(&points) {
             continue;
         }
+        let base = match triangle.layer {
+            SketchContextLayer::Body => colours.context_face,
+            SketchContextLayer::Below => colours.context_below_face,
+        };
+        let colour = shaded_context_colour(base, triangle.shade, colours.background);
         let first = mesh.vertices.len() as u32;
         for point in points {
-            mesh.colored_vertex(point, sketch_colours().context_face);
+            mesh.colored_vertex(point, colour);
         }
         mesh.add_triangle(first, first + 1, first + 2);
     }
     mesh
+}
+
+/// Darkens or lightens a context colour toward the canvas ground by the
+/// triangle's shade, so a sloping or deep face reads as one even when it is
+/// the same carrier as its neighbour. Alpha is kept: the x-ray stays an
+/// x-ray.
+fn shaded_context_colour(base: Color32, shade: f32, ground: Color32) -> Color32 {
+    let shade = shade.clamp(0.0, 1.0);
+    // Shade 1.0 is the palette colour; shade 0.0 is one third of the way to
+    // the ground, which is visibly darker (or lighter, on a dark theme)
+    // without dissolving the face into the background.
+    let weight = 0.35 * (1.0 - shade);
+    let mix = |from: u8, to: u8| -> u8 {
+        let value = f32::from(from) + (f32::from(to) - f32::from(from)) * weight;
+        value.round().clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgba_unmultiplied(
+        mix(base.r(), ground.r()),
+        mix(base.g(), ground.g()),
+        mix(base.b(), ground.b()),
+        base.a(),
+    )
 }
 
 fn screen_points_are_finite(points: &[Pos2]) -> bool {
@@ -11707,7 +12076,7 @@ fn paint_snap_marker(painter: &egui::Painter, rect: Rect, state: &SketchCanvasSt
         SnapKind::Quadrant(_, _) | SnapKind::SupportQuadrant => {
             painter.circle_stroke(position, 4.5, stroke);
         }
-        SnapKind::SupportEdge => {
+        SnapKind::OnCurve(_) | SnapKind::SupportEdge => {
             // The hourglass reads as "somewhere along this edge" rather than
             // naming a distinguished point, matching the usual nearest glyph.
             for [first, second] in [
@@ -13896,6 +14265,42 @@ mod tests {
         assert_point_near(quadrant.point, SketchPoint::new(3.0, -1.0));
     }
 
+    #[test]
+    fn a_stroke_ending_beside_an_edge_snaps_onto_the_edge_itself() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-2.0, -2.0),
+                SketchPoint::new(2.0, 2.0),
+            ))
+            .expect("rectangle should stage");
+        state.commit_pending().expect("rectangle should commit");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0));
+
+        // A hair inside the top edge, far from every named point: the
+        // pointer lands exactly on the edge so the line forms a T-junction.
+        let near_edge = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(0.3, 1.98)),
+        );
+        assert!(matches!(near_edge.kind, SnapKind::OnCurve(_)));
+        // The pointer round-trips through screen space in single precision,
+        // so only the coordinate the snap decides is exact.
+        assert!((near_edge.point.v - 2.0).abs() <= EPSILON);
+        assert!((near_edge.point.u - 0.3).abs() <= 1.0e-4);
+
+        // Well clear of the edge the grid still wins.
+        let clear = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(0.3, 1.0)),
+        );
+        assert_eq!(clear.kind, SnapKind::Grid);
+    }
+
     /// A unit circle's support curve, split into two half turns the way a
     /// drilled hole's loop arrives from the kernel.
     fn support_hole(center: SketchPoint, radius: f64) -> Vec<SketchContextCurve> {
@@ -14506,6 +14911,72 @@ mod tests {
             assert_eq!(state.authoring().active_entities().count(), 8);
             assert!(state.certified_sketch_profile().is_some());
         }
+    }
+
+    #[test]
+    fn the_text_tool_stages_glyph_outlines_from_one_anchor_click() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::Text));
+        assert_eq!(state.gesture_progress().required_points, 1);
+        assert_eq!(
+            state.active_tool_input_text("content").as_deref(),
+            Some(DEFAULT_TEXT_CONTENT)
+        );
+        assert!(state.set_active_tool_input_text("content", "O".to_owned()));
+        assert!(state.set_active_tool_input_text("height", "12".to_owned()));
+        assert!(state.set_active_tool_input_text("angle", "90".to_owned()));
+        assert!(state.active_tool_input_error("height").is_none());
+
+        let id = state
+            .handle_creation_click(SketchPoint::new(5.0, 5.0))
+            .expect("the anchor click stages the text");
+        let CoreRecipe::Text {
+            content,
+            height,
+            angle,
+            ..
+        } = pending_recipe(&state)
+        else {
+            panic!("the text tool stages the text recipe")
+        };
+        assert_eq!(content, "O");
+        assert!((literal_length(*height) - 12.0).abs() <= EPSILON);
+        assert!((literal_angle(*angle) - std::f64::consts::FRAC_PI_2).abs() <= EPSILON);
+        let entities = state.pending().expect("pending text").entities().len();
+        assert!(
+            entities >= 16,
+            "an O is two loops of chords, got {entities}"
+        );
+
+        assert_eq!(state.commit_pending(), Ok(id));
+        assert_eq!(state.authoring().active_operations().count(), 1);
+        assert_eq!(state.authoring().active_entities().count(), entities);
+        assert!(
+            state.certified_sketch_profile().is_some(),
+            "the letter's stroke is a closed profile"
+        );
+
+        // The committed text is one operation whose text can be retyped:
+        // selecting any of its chords exposes the whole recipe.
+        let chord = state.entities().first().expect("committed chord").id;
+        state.set_selected(None);
+        assert!(state.set_selected(Some(chord)));
+        let view = state
+            .selected_recipe_editor()
+            .expect("a selected text exposes its recipe");
+        assert_eq!(view.title, "Text");
+        let content = view
+            .parameters
+            .iter()
+            .find(|parameter| parameter.stable_key == "content")
+            .expect("content parameter");
+        assert_eq!(content.text, "O");
+        assert!(content.editable);
+        assert!(
+            view.parameters
+                .iter()
+                .any(|parameter| parameter.stable_key == "height")
+        );
     }
 
     #[test]
@@ -16498,6 +16969,90 @@ mod tests {
         );
         assert!(state.pending().is_none());
         assert_eq!(state.authoring, authoring_before);
+    }
+
+    #[test]
+    fn a_tangent_relation_slides_a_line_onto_a_circle() {
+        let mut state = SketchCanvasState::default();
+        let line = commit_test_line(&mut state, (-4.0, 3.0), (4.0, 3.0));
+        let circle = commit_test_circle(&mut state, (0.0, 0.0), 2.0);
+        assert!(state.set_exact_tool(ToolVariant::TangentRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(1.0, 3.0), 0.2)
+                .is_none(),
+            "one operand is not yet a relation"
+        );
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(0.0, 2.0), 0.2)
+            .expect("a line and a circle complete a tangent relation");
+        assert_eq!(state.relation_diagnostic(), None);
+        assert_eq!(state.commit_pending(), Ok(subject));
+        let SketchGeometry::Segment { start, end } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == line)
+            .expect("the line survives")
+            .geometry
+        else {
+            panic!("a line should present as a segment");
+        };
+        let SketchGeometry::Circle { center, rim } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == circle)
+            .expect("the circle survives")
+            .geometry
+        else {
+            panic!("a circle should present as a circle");
+        };
+        // Both are free to move, so they meet half way: the line comes down
+        // and the circle comes up until the centre is one radius from the
+        // line. The presented circle follows its solved centre.
+        let radius = center.distance_squared(rim).sqrt();
+        let offset = (center.v - start.v).abs();
+        assert!((end.v - start.v).abs() <= 1.0e-9, "{start:?} {end:?}");
+        assert!(
+            (offset - radius).abs() <= 1.0e-9,
+            "the line should touch the circle: centre {center:?}, radius {radius}, line at v = {}",
+            start.v
+        );
+        assert!(start.v < 3.0 && center.v > 0.0);
+    }
+
+    #[test]
+    fn a_collinear_relation_lays_a_line_along_another_without_collapsing_it() {
+        let mut state = SketchCanvasState::default();
+        commit_test_line(&mut state, (0.0, 0.0), (4.0, 0.0));
+        let second = commit_test_line(&mut state, (6.0, 1.0), (10.0, 1.5));
+        assert!(state.set_exact_tool(ToolVariant::CollinearRelation));
+        assert!(
+            state
+                .handle_modifier_click(SketchPoint::new(2.0, 0.0), 0.2)
+                .is_none()
+        );
+        let subject = state
+            .handle_modifier_click(SketchPoint::new(8.0, 1.25), 0.2)
+            .expect("two lines complete a collinear relation");
+        assert_eq!(state.relation_diagnostic(), None);
+        assert_eq!(state.commit_pending(), Ok(subject));
+        let SketchGeometry::Segment { start, end } = state
+            .entities
+            .iter()
+            .find(|entity| entity.id == second)
+            .expect("the second line survives")
+            .geometry
+        else {
+            panic!("a line should present as a segment");
+        };
+        assert!(
+            start.v.abs() <= 1.0e-9 && end.v.abs() <= 1.0e-9,
+            "{start:?} {end:?}"
+        );
+        assert!(
+            start.u > 4.0 && end.u > start.u,
+            "the line stays beyond the first, end to end: {start:?} {end:?}"
+        );
     }
 
     #[test]

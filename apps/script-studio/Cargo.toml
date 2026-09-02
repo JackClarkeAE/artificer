@@ -1,0 +1,21 @@
+[package]
+name = "artificer-script-studio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "A live .art script visualiser on the Artificer kernel"
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+artificer-kernel = { path = "../../crates/kernel" }
+artificer-protocol = { path = "../../crates/protocol" }
+artificer-ui-core = { path = "../../crates/ui-core" }
+artificer-viewport = { path = "../../crates/viewport" }
+
+[dev-dependencies]
+egui_kittest.workspace = true
+
+[lints]
+workspace = true

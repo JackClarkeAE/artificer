@@ -484,6 +484,60 @@ impl ViewState {
         }
     }
 
+    /// Makes sure `bounds` is on screen without ever moving closer.
+    ///
+    /// A feature that has just been committed is what the user is looking
+    /// at, and they have usually already set the view they want for it.
+    /// Reframing on every commit threw that view away and zoomed the camera
+    /// in on the body. This keeps the camera where it is when the new
+    /// geometry already fits, and only when it spills out of the framed
+    /// sphere does the frame grow to take it in.
+    pub fn widen_to_include(&mut self, bounds: Aabb3) {
+        let radius = bounds_radius(bounds);
+        if !bounds.is_finite()
+            || !bounds.is_ordered()
+            || !radius.is_finite()
+            || radius <= f64::EPSILON
+        {
+            return;
+        }
+        let centre = bounds_center(bounds);
+        let framed_radius = self.fit_radius / bounded_zoom(self.zoom);
+        let separation = ((centre.x - self.target.x).powi(2)
+            + (centre.y - self.target.y).powi(2)
+            + (centre.z - self.target.z).powi(2))
+        .sqrt();
+        if separation + radius <= framed_radius * 1.0001 {
+            return;
+        }
+        // The smallest sphere holding both the framed one and the new one,
+        // so the old view stays inside the new one rather than being swapped
+        // for it, and grows by no more than it has to.
+        let (target, fit_radius) = if separation <= f64::EPSILON {
+            (self.target, framed_radius.max(radius))
+        } else if framed_radius >= separation + radius {
+            (self.target, framed_radius)
+        } else {
+            let grown = (framed_radius + separation + radius) * 0.5;
+            let shift = (grown - framed_radius) / separation;
+            (
+                Point3::new(
+                    self.target.x + (centre.x - self.target.x) * shift,
+                    self.target.y + (centre.y - self.target.y) * shift,
+                    self.target.z + (centre.z - self.target.z) * shift,
+                ),
+                grown,
+            )
+        };
+        if !target.is_finite() || !fit_radius.is_finite() || fit_radius <= f64::EPSILON {
+            return;
+        }
+        self.zoom = 1.0;
+        self.target = target;
+        self.fit_radius = fit_radius;
+        self.focus_pivot = false;
+    }
+
     pub const fn target(self) -> Point3 {
         self.target
     }
@@ -1341,6 +1395,38 @@ fn rotate_z(point: [f64; 3], angle: f64) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widening_never_moves_the_camera_closer() {
+        let mut view = ViewState::default();
+        view.frame(Aabb3::new(
+            Point3::new(-25.0, -25.0, -25.0),
+            Point3::new(25.0, 25.0, 25.0),
+        ));
+        let framed = view.fit_radius();
+        let target = view.target();
+        // A body well inside the frame changes nothing.
+        view.widen_to_include(Aabb3::new(
+            Point3::new(-2.0, -2.0, 0.0),
+            Point3::new(2.0, 2.0, 3.0),
+        ));
+        assert_eq!(view.fit_radius(), framed);
+        assert_eq!(view.target(), target);
+        // One that spills out of it grows the frame, and only as far as it
+        // has to: the old sphere stays inside the new one.
+        view.widen_to_include(Aabb3::new(
+            Point3::new(40.0, -5.0, -5.0),
+            Point3::new(60.0, 5.0, 5.0),
+        ));
+        assert!(view.fit_radius() > framed);
+        let moved = view.target();
+        let separation = ((moved.x - target.x).powi(2)
+            + (moved.y - target.y).powi(2)
+            + (moved.z - target.z).powi(2))
+        .sqrt();
+        assert!(separation + framed <= view.fit_radius() + 1.0e-9);
+        assert!(view.fit_radius() < framed * 2.0);
+    }
     use std::f64::consts::FRAC_PI_2;
     use std::time::{Duration, Instant};
 

@@ -1,0 +1,46 @@
+// filleted_flange.art — every edge of a flanged hub rounded.
+//
+// The same hub as flanged_hub.art, with the bore drawn into the revolved
+// section so the body has no cut features at all, and then every rim
+// filleted: the flange's top and bottom rims, the hub's top rim and the
+// bore's rim. Each blend is an exact torus band. A round rim is two
+// half-circle edges, so each fillet names both by a point on each.
+//
+// Bolt holes are left out on purpose: in this release a rim next to a
+// drilled hole has no exact blend, and a hole drilled after a blend falls to
+// the faceted tier. flanged_hub.art shows the order that keeps both exact.
+
+param hub_radius: f64 = 20.0;
+param hub_height: f64 = 40.0;
+param flange_radius: f64 = 45.0;
+param flange_thickness: f64 = 8.0;
+param bore_radius: f64 = 6.0;
+param rim_fillet: f64 = 2.0;
+param bore_fillet: f64 = 1.0;
+
+// The (r, z) section, with the bore as the inner wall along the axis side.
+let section = sketch(on: "XZ", label: "section", entities: [
+    line(start: [bore_radius, 0], end: [flange_radius, 0]),
+    line(start: [flange_radius, 0], end: [flange_radius, flange_thickness]),
+    line(start: [flange_radius, flange_thickness], end: [hub_radius, flange_thickness]),
+    line(start: [hub_radius, flange_thickness], end: [hub_radius, hub_height]),
+    line(start: [hub_radius, hub_height], end: [bore_radius, hub_height]),
+    line(start: [bore_radius, hub_height], end: [bore_radius, 0]),
+]);
+let hub = revolve(sketch: section, axis: [0, 0, 1], label: "hub");
+
+// The flange: its outer rim, top and bottom.
+fillet(edges: [nearest(point: [0, flange_radius, flange_thickness], kind: "edge"),
+               nearest(point: [0, -flange_radius, flange_thickness], kind: "edge")],
+       radius: rim_fillet, label: "flange_top_rim");
+fillet(edges: [nearest(point: [0, flange_radius, 0], kind: "edge"),
+               nearest(point: [0, -flange_radius, 0], kind: "edge")],
+       radius: rim_fillet, label: "flange_bottom_rim");
+
+// The hub's top rim and the bore's rim.
+fillet(edges: [nearest(point: [0, hub_radius, hub_height], kind: "edge"),
+               nearest(point: [0, -hub_radius, hub_height], kind: "edge")],
+       radius: rim_fillet, label: "hub_rim");
+fillet(edges: [nearest(point: [0, bore_radius, hub_height], kind: "edge"),
+               nearest(point: [0, -bore_radius, hub_height], kind: "edge")],
+       radius: bore_fillet, label: "bore_rim");

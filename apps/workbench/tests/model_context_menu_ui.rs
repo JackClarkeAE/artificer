@@ -113,6 +113,10 @@ fn create_extruded_body(harness: &mut Harness<'static, KernelLabApp>) {
     click_button(harness, "Extrude");
     click_button(harness, "Confirm operation");
     assert!(harness.state().displayed_snapshot_id().is_some());
+    // Committing keeps the camera where the sketch left it, which frames
+    // the whole datum plane; the picks below want the body filling the view.
+    press_key(harness, egui::Key::F);
+    harness.run();
 }
 
 #[test]

@@ -49,12 +49,9 @@ impl PrismProfile {
         self.height
     }
 
-    pub(crate) fn outer(&self) -> &[Segment] {
-        &self.outer
-    }
-
-    pub(crate) fn holes(&self) -> &[Vec<Segment>] {
-        &self.holes
+    /// Every loop in profile order: the outer boundary, then each hole.
+    pub(crate) fn loops(&self) -> impl Iterator<Item = &[Segment]> {
+        std::iter::once(self.outer.as_slice()).chain(self.holes.iter().map(Vec::as_slice))
     }
 
     /// The same solid seen from the other end: the frame sits on the far cap
@@ -105,6 +102,9 @@ fn mirror_loop(source: &[Segment]) -> Vec<Segment> {
                 start_angle: -(start_angle + sweep),
                 sweep,
             },
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                unreachable!("planar profiles carry lines and arcs only")
+            }
         })
         .collect()
 }
@@ -174,8 +174,12 @@ pub(crate) fn extract_prism(
     if topology.solids.len() != 1 {
         return Err(PrismEdgeFinishError::DomainUnsupported);
     }
-    let top_index = single_face_with_role(topology, FaceRole::ExtrusionTop)?;
-    let bottom_index = single_face_with_role(topology, FaceRole::ExtrusionBottom)?;
+    // A primitive cuboid names its caps by world axis rather than by
+    // extrusion role; it is the same prism, so its `+Z` face is the top cap.
+    let top_index = single_face_with_role(topology, FaceRole::ExtrusionTop)
+        .or_else(|_| single_face_with_role(topology, FaceRole::PositiveZ))?;
+    let bottom_index = single_face_with_role(topology, FaceRole::ExtrusionBottom)
+        .or_else(|_| single_face_with_role(topology, FaceRole::NegativeZ))?;
     let top = &topology.faces[top_index].value;
     let bottom = &topology.faces[bottom_index].value;
     let top_plane = top
@@ -536,6 +540,9 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                             ArcDirection::Clockwise
                         },
                     },
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                        unreachable!("planar profiles carry lines and arcs only")
+                    }
                 }
             })
             .collect(),

@@ -28,7 +28,7 @@ pub const PRIMARY_CELL_SIZE: f32 = 33.0;
 /// reads as a mistake. Sized so the longest label — `Rectangle`, which measures
 /// 51 px at [`TextStyle::Small`] — clears the chooser column with room to spare.
 /// At 88 px it did not, and ran into the chevron.
-pub const PRIMARY_CELL_WIDTH: f32 = 98.0;
+pub const PRIMARY_CELL_WIDTH: f32 = 97.0;
 /// Left column of a tile, holding the icon.
 pub const TILE_ICON_COLUMN: f32 = 26.0;
 /// Side length of the icon painted inside that column.
@@ -59,8 +59,15 @@ pub const ROW_GAP: f32 = 2.0;
 pub const TOOLBAR_TOP_PADDING: f32 = 4.0;
 /// Reserved clearance below the second row before the ribbon divider.
 pub const TOOLBAR_BOTTOM_PADDING: f32 = 4.0;
-/// Width of the uniform seven-column toolbar grid.
-pub const SKETCH_TOOLBAR_WIDTH: f32 = PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 6.0;
+/// Width of the strip that parts the drawing tools from the constraints: a
+/// hairline with breathing room either side. It replaces one family gap, and
+/// the tile is a pixel narrower than it was, so the whole grid is exactly as
+/// wide as the old seven-column one and still fits the minimum window.
+pub const CONSTRAINT_DIVIDER_WIDTH: f32 = 9.0;
+/// Width of the toolbar: six columns of drawing tools, the divider, and the
+/// constraint column.
+pub const SKETCH_TOOLBAR_WIDTH: f32 =
+    PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH;
 /// Height required by the padded two-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 =
     PRIMARY_CELL_SIZE * 2.0 + ROW_GAP + TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING;
@@ -75,6 +82,8 @@ const _: () = {
     // The grid must fill the ribbon's content height exactly: short leaves the
     // caption floating, tall clips the bottom row.
     assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
+    // The 1040 px minimum window has exactly this much room for the grid.
+    assert!(SKETCH_TOOLBAR_WIDTH == 698.0);
 };
 
 /// Left column of a variant-menu row, holding the icon.
@@ -166,6 +175,7 @@ pub enum ToolVariant {
     ThreePointArc,
     InnerDiameterPolygon,
     OuterDiameterPolygon,
+    Text,
     TwoPointSlot,
     CentreToOuterPointSlot,
     Trim,
@@ -188,7 +198,7 @@ pub enum ToolVariant {
 }
 
 impl ToolVariant {
-    pub const COUNT: usize = 34;
+    pub const COUNT: usize = 35;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
@@ -205,6 +215,7 @@ impl ToolVariant {
         Self::ThreePointArc,
         Self::InnerDiameterPolygon,
         Self::OuterDiameterPolygon,
+        Self::Text,
         Self::TwoPointSlot,
         Self::CentreToOuterPointSlot,
         Self::Trim,
@@ -229,6 +240,19 @@ impl ToolVariant {
     #[must_use]
     pub fn descriptor(self) -> &'static ToolDescriptor {
         &TOOL_DESCRIPTORS[self as usize]
+    }
+
+    /// The label on the family tile while this variant is its current
+    /// choice. Families of one kind of shape keep their own name; a variant
+    /// that is a different thing altogether, like text under the closed-
+    /// shapes tile, names itself so the tile never lies about what a click
+    /// will draw.
+    #[must_use]
+    pub fn tile_label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            _ => self.family().descriptor().tile_label,
+        }
     }
 
     #[must_use]
@@ -262,6 +286,8 @@ pub enum ToolInputKind {
     Integer,
     Choice,
     Boolean,
+    /// Free text, such as the characters a text tool sets.
+    Text,
 }
 
 /// One deterministic field in a tool's Tab order.
@@ -344,6 +370,7 @@ pub enum ToolIcon {
     ThreePointArc,
     InnerPolygon,
     OuterPolygon,
+    Text,
     TwoPointSlot,
     CentreSlot,
     Trim,
@@ -461,6 +488,7 @@ const ARC_VARIANTS: &[ToolVariant] = &[ToolVariant::CentreStartEndArc, ToolVaria
 const POLYGON_VARIANTS: &[ToolVariant] = &[
     ToolVariant::InnerDiameterPolygon,
     ToolVariant::OuterDiameterPolygon,
+    ToolVariant::Text,
 ];
 const SLOT_VARIANTS: &[ToolVariant] = &[
     ToolVariant::TwoPointSlot,
@@ -691,6 +719,10 @@ const OUTER_POLYGON_PHASES: &[PointAcquisitionPhase] = &[
     phase("centre", "Click the polygon centre."),
     phase("vertex", "Click one outer polygon vertex."),
 ];
+const TEXT_PHASES: &[PointAcquisitionPhase] = &[phase(
+    "anchor",
+    "Click where the text baseline starts; the palette sets the text, height, and angle.",
+)];
 const TWO_POINT_SLOT_PHASES: &[PointAcquisitionPhase] = &[
     phase("cap_start", "Click the first cap centre."),
     phase("cap_end", "Click the second cap centre."),
@@ -819,6 +851,26 @@ const INNER_POLYGON_INPUTS: &[ToolInputField] = &[
         "Rotation",
         ToolInputKind::Angle,
         "finite directed angle",
+    ),
+];
+const TEXT_INPUTS: &[ToolInputField] = &[
+    input(
+        "content",
+        "Text",
+        ToolInputKind::Text,
+        "one line of characters the bundled typeface can set",
+    ),
+    input(
+        "height",
+        "Height",
+        ToolInputKind::Length,
+        "positive finite capital-letter height",
+    ),
+    input(
+        "angle",
+        "Angle",
+        ToolInputKind::Angle,
+        "finite baseline direction",
     ),
 ];
 const OUTER_POLYGON_INPUTS: &[ToolInputField] = &[
@@ -1279,6 +1331,26 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         ToolOutputRole::ProfileGeometry,
         CapabilityRequirement::EditableSketch,
         "Polygon creation requires an editable sketch.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::Text,
+        "sketch.text",
+        ToolFamily::Polygon,
+        "Sketch text",
+        "Set a line of text as exact outline loops.",
+        "Click where the baseline starts. Every letter becomes closed loops of exact lines that extrude like any profile; Tab edits the text, its capital height, and the baseline angle.",
+        "Click where the text baseline starts.",
+        "Choose polygon type; current default: Text.",
+        None,
+        ToolIcon::Text,
+        ToolCursor::Crosshair,
+        TEXT_PHASES,
+        TEXT_INPUTS,
+        SelectionRequirement::None,
+        ToolOutputRole::ProfileGeometry,
+        CapabilityRequirement::EditableSketch,
+        "Text creation requires an editable sketch.",
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
@@ -1898,6 +1970,7 @@ impl Default for SketchToolbarOutput {
     }
 }
 
+/// The drawing tools: what puts geometry on the canvas and what reshapes it.
 const FIRST_ROW: &[ToolFamily] = &[
     ToolFamily::Select,
     ToolFamily::Point,
@@ -1905,17 +1978,18 @@ const FIRST_ROW: &[ToolFamily] = &[
     ToolFamily::Rectangle,
     ToolFamily::Circle,
     ToolFamily::Arc,
-    ToolFamily::Polygon,
 ];
 const SECOND_ROW: &[ToolFamily] = &[
+    ToolFamily::Polygon,
     ToolFamily::Slot,
     ToolFamily::Trim,
     ToolFamily::Fillet,
     ToolFamily::Chamfer,
     ToolFamily::Pattern,
-    ToolFamily::Relation,
-    ToolFamily::Dimension,
 ];
+/// The constraints: what tells the solver how the geometry has to behave.
+/// They stand apart from the drawing tools, behind a divider, one per row.
+const CONSTRAINT_COLUMN: &[ToolFamily] = &[ToolFamily::Relation, ToolFamily::Dimension];
 
 /// Paint the compact two-row sketch tool grid and return an exact chosen tool.
 ///
@@ -1939,27 +2013,52 @@ pub fn render_sketch_toolbar(
         |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(TOOLBAR_TOP_PADDING);
-            render_toolbar_row(
-                ui,
-                FIRST_ROW,
-                &mut state.preferences,
-                active,
-                gate,
-                capabilities,
-                &mut output,
-                &mut escaped_anchor,
-            );
-            ui.add_space(ROW_GAP);
-            render_toolbar_row(
-                ui,
-                SECOND_ROW,
-                &mut state.preferences,
-                active,
-                gate,
-                capabilities,
-                &mut output,
-                &mut escaped_anchor,
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    render_toolbar_row(
+                        ui,
+                        FIRST_ROW,
+                        &mut state.preferences,
+                        active,
+                        gate,
+                        capabilities,
+                        &mut output,
+                        &mut escaped_anchor,
+                    );
+                    ui.add_space(ROW_GAP);
+                    render_toolbar_row(
+                        ui,
+                        SECOND_ROW,
+                        &mut state.preferences,
+                        active,
+                        gate,
+                        capabilities,
+                        &mut output,
+                        &mut escaped_anchor,
+                    );
+                });
+                render_constraint_divider(ui);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (index, family) in CONSTRAINT_COLUMN.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(ROW_GAP);
+                        }
+                        render_toolbar_row(
+                            ui,
+                            std::slice::from_ref(family),
+                            &mut state.preferences,
+                            active,
+                            gate,
+                            capabilities,
+                            &mut output,
+                            &mut escaped_anchor,
+                        );
+                    }
+                });
+            });
             ui.add_space(TOOLBAR_BOTTOM_PADDING);
         },
     );
@@ -1976,6 +2075,21 @@ pub fn render_sketch_toolbar(
     }
 
     output
+}
+
+/// The hairline between the drawing tools and the constraints. It spans both
+/// rows, so the two constraint tiles read as one column set apart from the
+/// grid rather than as the tail of the second row.
+fn render_constraint_divider(ui: &mut Ui) {
+    let (_, rect) = ui.allocate_space(vec2(
+        CONSTRAINT_DIVIDER_WIDTH,
+        PRIMARY_CELL_SIZE * 2.0 + ROW_GAP,
+    ));
+    let x = rect.center().x.round() + 0.5;
+    ui.painter().line_segment(
+        [pos2(x, rect.top() + 3.0), pos2(x, rect.bottom() - 3.0)],
+        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2068,7 +2182,7 @@ fn render_family(
         ui,
         primary_rect,
         current.descriptor(),
-        family.descriptor().tile_label,
+        current.tile_label(),
         active == current,
         primary_reason,
     );
@@ -2588,6 +2702,13 @@ impl<'a> IconPainter<'a> {
                 self.polygon((0.50, 0.50), 0.38, 6, 0.0);
                 self.line((0.50, 0.50), (0.83, 0.50));
             }
+            ToolIcon::Text => {
+                // A capital A with its crossbar and a baseline: lettering.
+                self.line((0.22, 0.76), (0.50, 0.16));
+                self.line((0.50, 0.16), (0.78, 0.76));
+                self.line((0.33, 0.55), (0.67, 0.55));
+                self.line((0.14, 0.86), (0.86, 0.86));
+            }
             ToolIcon::TwoPointSlot => {
                 self.line((0.28, 0.25), (0.72, 0.25));
                 self.line((0.28, 0.75), (0.72, 0.75));
@@ -2850,10 +2971,14 @@ mod tests {
         let row_width = |row: &[ToolFamily]| {
             PRIMARY_CELL_WIDTH * row.len() as f32 + FAMILY_GAP * row.len().saturating_sub(1) as f32
         };
-        assert_eq!(FIRST_ROW.len(), 7);
-        assert_eq!(SECOND_ROW.len(), 7);
-        assert!(row_width(FIRST_ROW) <= SKETCH_TOOLBAR_WIDTH);
-        assert_eq!(row_width(SECOND_ROW), SKETCH_TOOLBAR_WIDTH);
+        assert_eq!(FIRST_ROW.len(), 6);
+        assert_eq!(SECOND_ROW.len(), 6);
+        assert_eq!(CONSTRAINT_COLUMN.len(), 2);
+        assert_eq!(
+            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + PRIMARY_CELL_WIDTH,
+            SKETCH_TOOLBAR_WIDTH
+        );
+        assert_eq!(row_width(FIRST_ROW), row_width(SECOND_ROW));
         assert!((28.0..=36.0).contains(&PRIMARY_CELL_SIZE));
         // Two rows fill the ribbon's content box exactly, which is what puts
         // the group caption on its bottom edge rather than above a gap.
@@ -2864,6 +2989,7 @@ mod tests {
         let mut all = FIRST_ROW
             .iter()
             .chain(SECOND_ROW)
+            .chain(CONSTRAINT_COLUMN)
             .copied()
             .collect::<Vec<_>>();
         all.sort_unstable();

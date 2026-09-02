@@ -1,19 +1,27 @@
-use artificer_kernel::{CancellationToken, FaceRole, NativeKernel};
+//! A round cut through the side of a three-hole block that crosses two of
+//! the holes perpendicularly and misses the third.
+//!
+//! The crossings meet in quartic curves, outside the line-and-circle
+//! vocabulary, so the faceted tier answers and must say so; the cut still
+//! owes a valid closed solid whose volume lies between the holed block and
+//! the block minus the whole cutter.
+
+use std::f64::consts::PI;
+
+use artificer_kernel::{CancellationToken, NativeKernel};
 use artificer_protocol::{
     ArcDirection, CURRENT_PROTOCOL_VERSION, ExecuteRequest, FaceExtrusionOperation, KernelCommand,
     PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3,
-    PrecisionPolicy, RequestId, Vector3,
+    PrecisionPolicy, RequestId, ValidationProfile, Vector3,
 };
 
 #[test]
-fn test_crossing_cut_on_body_with_three_holes() {
+fn a_side_cut_crossing_two_of_three_holes_closes_and_says_it_is_faceted() {
     let frame = PlanarFrame3::new(
         Point3::new(0.0, 0.0, 0.0),
         Vector3::new(1.0, 0.0, 0.0),
         Vector3::new(0.0, 1.0, 0.0),
     );
-
-    // Outer rectangle: 100 x 100
     let outer_curves = vec![
         PlanarCurve2::Line {
             start: Point2::new(0.0, 0.0),
@@ -32,41 +40,37 @@ fn test_crossing_cut_on_body_with_three_holes() {
             end: Point2::new(0.0, 0.0),
         },
     ];
-
-    // Three circular holes
-    let hole1 = vec![PlanarCurve2::Circle {
-        center: Point2::new(25.0, 25.0),
-        radius: 8.0,
-        direction: ArcDirection::CounterClockwise,
-    }];
-    let hole2 = vec![PlanarCurve2::Circle {
-        center: Point2::new(75.0, 25.0),
-        radius: 8.0,
-        direction: ArcDirection::CounterClockwise,
-    }];
-    let hole3 = vec![PlanarCurve2::Circle {
-        center: Point2::new(50.0, 75.0),
-        radius: 8.0,
-        direction: ArcDirection::CounterClockwise,
-    }];
-
+    // The cutter runs along +y from the y = 0 face, centred at x = 50 with
+    // radius 10, to a depth of 30: it crosses the two holes at y = 15 and
+    // misses the one at y = 75.
+    let hole = |x: f64, y: f64| {
+        vec![PlanarCurve2::Circle {
+            center: Point2::new(x, y),
+            radius: 8.0,
+            direction: ArcDirection::CounterClockwise,
+        }]
+    };
     let profile = PlanarProfile2 {
         regions: vec![PlanarRegion2 {
             outer: PlanarLoop2 {
                 curves: outer_curves,
             },
             holes: vec![
-                PlanarLoop2 { curves: hole1 },
-                PlanarLoop2 { curves: hole2 },
-                PlanarLoop2 { curves: hole3 },
+                PlanarLoop2 {
+                    curves: hole(40.0, 15.0),
+                },
+                PlanarLoop2 {
+                    curves: hole(62.0, 15.0),
+                },
+                PlanarLoop2 {
+                    curves: hole(50.0, 75.0),
+                },
             ],
         }],
     };
-
-    // Step 1: Extrude base block with 3 holes
-    let req1 = ExecuteRequest {
+    let extrude = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("step1-extrude"),
+        request_id: RequestId::new("three-holes-extrude"),
         expected_snapshot: NativeKernel::empty().id(),
         precision: PrecisionPolicy::default(),
         command: KernelCommand::ExtrudePlanarProfile {
@@ -75,74 +79,77 @@ fn test_crossing_cut_on_body_with_three_holes() {
             distance: 40.0,
         },
     };
-
-    let outcome1 = NativeKernel::execute(&NativeKernel::empty(), &req1, &CancellationToken::new())
-        .expect("step 1 should succeed");
-
-    println!("Base snapshot counts: {}", outcome1.snapshot.counts());
-    let scene1 = NativeKernel::debug_scene(&outcome1.snapshot);
-    let cap_triangles = scene1
-        .triangles
-        .iter()
-        .filter(|t| t.role == FaceRole::ExtrusionTop || t.role == FaceRole::ExtrusionBottom)
-        .count();
-    println!("Base cap triangles: {}", cap_triangles);
+    let base = NativeKernel::execute(&NativeKernel::empty(), &extrude, &CancellationToken::new())
+        .expect("three holes extrude")
+        .snapshot;
+    let expected_base = 100.0 * 100.0 * 40.0 - 3.0 * PI * 64.0 * 40.0;
+    let base_volume = base.measures().volume;
     assert!(
-        cap_triangles > 0,
-        "Cap faces must be triangulated in debug scene"
+        ((base_volume - expected_base) / expected_base).abs() < 1.0e-9,
+        "base volume {base_volume} should be {expected_base}"
     );
 
-    // Find a side face (e.g. at Y=0)
-    let side_face_ref = scene1
+    let side_face = NativeKernel::debug_scene(&base)
         .triangles
         .iter()
-        .find(|t| {
-            let [a, b, c] = t.vertices;
-            let avg_y = (a.y + b.y + c.y) / 3.0;
-            avg_y.abs() < 1e-4
+        .find(|triangle| {
+            let [a, b, c] = triangle.vertices;
+            ((a.y + b.y + c.y) / 3.0).abs() < 1.0e-6
         })
-        .map(|t| t.source_face)
-        .expect("must have a Y=0 side face");
-
-    // Step 2: Cut a cylindrical pocket through the side face
-    let cut_frame = PlanarFrame3::new(
-        Point3::new(50.0, 0.0, 20.0),
-        Vector3::new(1.0, 0.0, 0.0),
-        Vector3::new(0.0, 0.0, 1.0),
-    );
-
-    let cut_circle = vec![PlanarCurve2::Circle {
-        center: Point2::new(0.0, 0.0),
-        radius: 10.0,
-        direction: ArcDirection::CounterClockwise,
-    }];
-
-    let cut_profile = PlanarProfile2 {
-        regions: vec![PlanarRegion2 {
-            outer: PlanarLoop2 { curves: cut_circle },
-            holes: vec![],
-        }],
-    };
-
-    let req2 = ExecuteRequest {
+        .map(|triangle| triangle.source_face)
+        .expect("the y = 0 side face");
+    let cut = ExecuteRequest {
         protocol_version: CURRENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("step2-cut"),
-        expected_snapshot: outcome1.snapshot.id(),
+        request_id: RequestId::new("three-holes-cut"),
+        expected_snapshot: base.id(),
         precision: PrecisionPolicy::default(),
         command: KernelCommand::ExtrudeFacePlanarProfile {
-            target_face: side_face_ref,
-            frame: cut_frame,
-            profile: cut_profile,
+            target_face: side_face,
+            frame: PlanarFrame3::new(
+                Point3::new(50.0, 0.0, 20.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+            ),
+            profile: PlanarProfile2 {
+                regions: vec![PlanarRegion2 {
+                    outer: PlanarLoop2 {
+                        curves: vec![PlanarCurve2::Circle {
+                            center: Point2::new(0.0, 0.0),
+                            radius: 10.0,
+                            direction: ArcDirection::CounterClockwise,
+                        }],
+                    },
+                    holes: vec![],
+                }],
+            },
             distance: 30.0,
             operation: FaceExtrusionOperation::Cut,
         },
     };
+    let outcome = NativeKernel::execute(&base, &cut, &CancellationToken::new())
+        .expect("the crossing cut closes");
 
-    let outcome2 = NativeKernel::execute(&outcome1.snapshot, &req2, &CancellationToken::new())
-        .expect("step 2 cut must succeed without validation errors");
-
-    println!("After cut counts: {}", outcome2.snapshot.counts());
-    let scene2 = NativeKernel::debug_scene(&outcome2.snapshot);
-    println!("Scene triangles after cut: {}", scene2.triangles.len());
-    assert!(!scene2.triangles.is_empty());
+    assert!(
+        outcome
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION"),
+        "a crossing cut is a labelled approximation: {:?}",
+        outcome.report.warnings
+    );
+    let validation = NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid);
+    assert!(validation.valid, "{:?}", validation.diagnostics);
+    let after = outcome.snapshot.measures().volume;
+    let cutter = PI * 100.0 * 30.0;
+    assert!(
+        after < base_volume && after > base_volume - cutter,
+        "volume {after} must lie between {base_volume} and {}",
+        base_volume - cutter
+    );
+    assert!(
+        !NativeKernel::debug_scene(&outcome.snapshot)
+            .triangles
+            .is_empty()
+    );
 }
