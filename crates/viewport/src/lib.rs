@@ -1709,6 +1709,60 @@ fn show_document_impl(
         view.set_target(bounds_center(bounds));
     }
 
+    // Which gizmo axis the move drag is constrained to. Picked once, when
+    // the drag starts, and held for its whole length: an axis that could be
+    // lost mid-drag because the arrow swung out from under the pointer
+    // would be a handle that lets go while it is being pulled.
+    let gizmo_memory = egui::Id::new("viewport.move_gizmo.axis").with(canvas.id);
+    let gizmo_handles = active_body
+        .and_then(|key| bodies.iter().find(|body| body.key == key))
+        .map(|active| {
+            let active_bounds = active
+                .bounds
+                .or_else(|| scene_bounds(active.scene))
+                .unwrap_or(bounds);
+            tool_gizmo_handles(
+                projection,
+                active_bounds,
+                *view,
+                InstancePresentation::for_body(
+                    active,
+                    active_body,
+                    *active_display_transform,
+                    animation_phase,
+                ),
+            )
+        });
+    if canvas.drag_stopped() {
+        ui.data_mut(|data| data.remove::<usize>(gizmo_memory));
+    }
+    if active_tool == ActiveTool::Move
+        && !feature_interaction.consumes_primary
+        && canvas.drag_started_by(PointerButton::Primary)
+    {
+        let picked = canvas
+            .interact_pointer_pos()
+            .zip(gizmo_handles)
+            .and_then(|(pointer, handles)| grab_gizmo_axis(pointer, handles));
+        ui.data_mut(|data| {
+            if let Some((axis, _)) = picked {
+                data.insert_temp(gizmo_memory, axis);
+            } else {
+                data.remove::<usize>(gizmo_memory);
+            }
+        });
+    }
+    let grabbed_axis_index = (active_tool == ActiveTool::Move)
+        .then(|| ui.data(|data| data.get_temp::<usize>(gizmo_memory)))
+        .flatten();
+    let grabbed_axis = grabbed_axis_index
+        .zip(gizmo_handles)
+        .map(|(axis, handles)| GrabbedAxis {
+            direction: handles.directions[axis],
+            screen: handles.endpoints[axis] - handles.origin,
+            length: handles.length,
+        });
+
     handle_canvas_input(
         ui,
         &canvas,
@@ -1719,6 +1773,7 @@ fn show_document_impl(
         feature_interaction.consumes_primary,
         navigation,
         navigation_action,
+        grabbed_axis,
     );
 
     let mut triangles = project_document_triangles(
@@ -2488,6 +2543,7 @@ fn show_document_impl(
                 *active_display_transform,
                 animation_phase,
             ),
+            grabbed_axis_index,
         );
     }
     paint_axes(&painter, canvas.rect, *view);
@@ -2694,6 +2750,60 @@ fn navigation_gesture_state(
     })
 }
 
+/// One gizmo axis being dragged: the world direction it moves along, and
+/// the screen vector its whole length projects to.
+#[derive(Clone, Copy, Debug)]
+struct GrabbedAxis {
+    direction: Vector3,
+    screen: egui::Vec2,
+    length: f64,
+}
+
+impl GrabbedAxis {
+    /// How far along the axis a pointer delta carries, by reading the
+    /// delta's component along the axis as it appears on screen.
+    fn travel_from(self, delta: egui::Vec2) -> Option<(Vector3, f64)> {
+        let squared = self.screen.length_sq();
+        if squared <= 1.0 {
+            // Edge-on: the arrow has no screen length to read a drag
+            // against, and dividing by it would send the body away.
+            return None;
+        }
+        let along = f64::from(delta.x * self.screen.x + delta.y * self.screen.y);
+        Some((self.direction, self.length * along / f64::from(squared)))
+    }
+}
+
+/// The gizmo axis nearest the pointer, when one is close enough to grab.
+fn grab_gizmo_axis(pointer: Pos2, handles: GizmoHandles) -> Option<(usize, GrabbedAxis)> {
+    const GRAB_RADIUS: f32 = 9.0;
+    let mut best: Option<(usize, f32)> = None;
+    for (axis, endpoint) in handles.endpoints.into_iter().enumerate() {
+        let along = endpoint - handles.origin;
+        if along.length() <= 1.0 {
+            continue;
+        }
+        // Distance from the pointer to the drawn segment.
+        let offset = pointer - handles.origin;
+        let travel =
+            ((offset.x * along.x + offset.y * along.y) / along.length_sq()).clamp(0.0, 1.0);
+        let distance = (offset - along * travel).length();
+        if distance <= GRAB_RADIUS && best.is_none_or(|(_, held)| distance < held) {
+            best = Some((axis, distance));
+        }
+    }
+    best.map(|(axis, _)| {
+        (
+            axis,
+            GrabbedAxis {
+                direction: handles.directions[axis],
+                screen: handles.endpoints[axis] - handles.origin,
+                length: handles.length,
+            },
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_canvas_input(
     ui: &Ui,
@@ -2705,6 +2815,7 @@ fn handle_canvas_input(
     suppress_primary: bool,
     bindings: artificer_ui_core::navigation::Bindings,
     action: Option<NavigationAction>,
+    grabbed_axis: Option<GrabbedAxis>,
 ) {
     let mut changed = false;
     let delta = canvas.drag_delta();
@@ -2730,11 +2841,26 @@ fn handle_canvas_input(
                 changed = true;
             }
             ActiveTool::Move => {
-                let denominator = (projection.points_per_unit * view.zoom).max(1.0e-9);
-                display_transform.translate_by(view.world_delta_from_screen(
-                    f64::from(delta.x) / denominator,
-                    f64::from(delta.y) / denominator,
-                ));
+                // An axis under the pointer when the drag began constrains
+                // it: the pointer's travel is read along that arrow alone,
+                // so a move along X stays a move along X however the camera
+                // is turned. With no axis grabbed the drag is free in the
+                // camera plane, which is what it always was.
+                if let Some((direction, travel)) =
+                    grabbed_axis.and_then(|axis| axis.travel_from(delta))
+                {
+                    display_transform.translate_by([
+                        direction.x * travel,
+                        direction.y * travel,
+                        direction.z * travel,
+                    ]);
+                } else {
+                    let denominator = (projection.points_per_unit * view.zoom).max(1.0e-9);
+                    display_transform.translate_by(view.world_delta_from_screen(
+                        f64::from(delta.x) / denominator,
+                        f64::from(delta.y) / denominator,
+                    ));
+                }
                 changed = true;
             }
             ActiveTool::Rotate => {
@@ -6635,6 +6761,65 @@ fn paint_preview_arrow(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The tool gizmo's three handles: where each is on screen, how far along
+/// the axis that is in the model, and which way the world moves when it is
+/// dragged.
+///
+/// One computation, used to draw the handles and to pick them, so what the
+/// pointer grabs is always the arrow the eye sees.
+#[derive(Clone, Copy)]
+struct GizmoHandles {
+    origin: Pos2,
+    endpoints: [Pos2; 3],
+    /// The world direction each drawn arrow runs along, and the model
+    /// distance its full length stands for.
+    directions: [Vector3; 3],
+    length: f64,
+}
+
+fn tool_gizmo_handles(
+    projection: Projection,
+    bounds: Aabb3,
+    view: ViewState,
+    presentation: InstancePresentation,
+) -> GizmoHandles {
+    let diagonal = ((bounds.max.x - bounds.min.x).powi(2)
+        + (bounds.max.y - bounds.min.y).powi(2)
+        + (bounds.max.z - bounds.min.z).powi(2))
+    .sqrt();
+    let length = diagonal * 0.22 / presentation.active_transform.scale.max(0.01);
+    let local_pivot = presentation.local_pivot;
+    let axes = [
+        Vector3::new(1.0, 0.0, 0.0),
+        Vector3::new(0.0, 1.0, 0.0),
+        Vector3::new(0.0, 0.0, 1.0),
+    ];
+    GizmoHandles {
+        origin: projection.instance_point(local_pivot, view, presentation),
+        endpoints: axes.map(|axis| {
+            projection.instance_point(
+                Point3::new(
+                    axis.x.mul_add(length, local_pivot.x),
+                    axis.y.mul_add(length, local_pivot.y),
+                    axis.z.mul_add(length, local_pivot.z),
+                ),
+                view,
+                presentation,
+            )
+        }),
+        // The arrow is drawn through the body's presentation, so the world
+        // direction it stands for is that same presentation applied to the
+        // axis: a placed or turned occurrence drags along the arrow the
+        // user is looking at, not along the world axis it started as.
+        directions: axes.map(|axis| {
+            let placed = presentation.present_normal(axis);
+            Vector3::new(placed[0], placed[1], placed[2])
+        }),
+        length,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_active_tool_gizmo(
     painter: &egui::Painter,
     rect: Rect,
@@ -6643,6 +6828,7 @@ fn paint_active_tool_gizmo(
     bounds: Aabb3,
     view: ViewState,
     presentation: InstancePresentation,
+    grabbed: Option<usize>,
 ) {
     if matches!(active_tool, ActiveTool::Select | ActiveTool::Orbit) {
         if active_tool == ActiveTool::Orbit {
@@ -6655,28 +6841,42 @@ fn paint_active_tool_gizmo(
         return;
     }
 
-    let diagonal = ((bounds.max.x - bounds.min.x).powi(2)
-        + (bounds.max.y - bounds.min.y).powi(2)
-        + (bounds.max.z - bounds.min.z).powi(2))
-    .sqrt();
-    let length = diagonal * 0.22 / presentation.active_transform.scale.max(0.01);
-    let local_pivot = presentation.local_pivot;
-    let origin = projection.instance_point(local_pivot, view, presentation);
-    let endpoints = [
-        Point3::new(local_pivot.x + length, local_pivot.y, local_pivot.z),
-        Point3::new(local_pivot.x, local_pivot.y + length, local_pivot.z),
-        Point3::new(local_pivot.x, local_pivot.y, local_pivot.z + length),
-    ]
-    .map(|point| projection.instance_point(point, view, presentation));
+    let handles = tool_gizmo_handles(projection, bounds, view, presentation);
+    let origin = handles.origin;
+    let endpoints = handles.endpoints;
 
     if active_tool == ActiveTool::Rotate {
         painter.circle_stroke(origin, 34.0, Stroke::new(2.0, HOVERED.gamma_multiply(0.72)));
     }
-    for (endpoint, color) in endpoints.into_iter().zip([AXIS_X, AXIS_Y, AXIS_Z]) {
-        painter.line_segment([origin, endpoint], Stroke::new(2.2, color));
+    for (axis, (endpoint, color)) in endpoints
+        .into_iter()
+        .zip([AXIS_X, AXIS_Y, AXIS_Z])
+        .enumerate()
+    {
+        // The axis being dragged is the only one that matters, so the other
+        // two step back rather than competing with it for attention.
+        let (color, weight) = match grabbed {
+            Some(held) if held == axis => (color, 3.4),
+            Some(_) => (color.gamma_multiply(0.3), 1.6),
+            None => (color, 2.2),
+        };
+        painter.line_segment([origin, endpoint], Stroke::new(weight, color));
         match active_tool {
             ActiveTool::Move => {
-                painter.circle_filled(endpoint, 4.0, color);
+                // An arrowhead, so the handle reads as something to pull.
+                let along = endpoint - origin;
+                if along.length() > 12.0 {
+                    let unit = along.normalized();
+                    let side = egui::vec2(-unit.y, unit.x);
+                    let base = endpoint - unit * 9.0;
+                    painter.add(Shape::convex_polygon(
+                        vec![endpoint, base + side * 3.6, base - side * 3.6],
+                        color,
+                        Stroke::NONE,
+                    ));
+                } else {
+                    painter.circle_filled(endpoint, 4.0, color);
+                }
             }
             ActiveTool::Scale => {
                 painter.rect_filled(
@@ -6810,7 +7010,9 @@ fn paint_tool_hint(painter: &egui::Painter, rect: Rect, tool: ActiveTool) {
         }
         ActiveTool::Measure => "Click face for area or edge(s) for length/distance · RMB orbit",
         ActiveTool::Orbit => "Drag to orbit · wheel zoom",
-        ActiveTool::Move => "Drag to move · wheel zoom · RMB orbit",
+        ActiveTool::Move => {
+            "Drag an arrow to move along it, or anywhere else to move freely · RMB orbit"
+        }
         ActiveTool::Rotate => "Drag to rotate · wheel zoom · RMB orbit",
         ActiveTool::Scale => "Drag vertically to scale · wheel zoom · RMB orbit",
     };
@@ -6835,7 +7037,7 @@ const fn accessible_tool_description(tool: ActiveTool) -> &'static str {
             "Interactive model viewport. Orbit is active. Drag to orbit or use the mouse wheel to zoom."
         }
         ActiveTool::Move => {
-            "Interactive model viewport. Move is active. Drag in the screen plane to move, use the mouse wheel to zoom, or right-drag to orbit."
+            "Interactive model viewport. Move is active. Drag one of the three axis arrows to move along that axis alone, drag anywhere else to move in the screen plane, use the mouse wheel to zoom, or right-drag to orbit."
         }
         ActiveTool::Rotate => {
             "Interactive model viewport. Rotate is active. Drag to rotate, use the mouse wheel to zoom, or right-drag to orbit."
@@ -8419,6 +8621,83 @@ mod tests {
         assert_eq!(
             crate::gpu::body_vertices(&bare)[0].color,
             crate::gpu::NEUTRAL_BODY_COLOR
+        );
+    }
+
+    #[test]
+    fn a_grabbed_gizmo_axis_reads_a_drag_along_itself_and_nowhere_else() {
+        // An axis whose arrow runs to the right on screen: dragging right
+        // moves along it, dragging up the screen moves it not at all, and
+        // dragging back the other way reverses it.
+        let axis = GrabbedAxis {
+            direction: Vector3::new(1.0, 0.0, 0.0),
+            screen: egui::vec2(80.0, 0.0),
+            length: 20.0,
+        };
+        let (_, forward) = axis
+            .travel_from(egui::vec2(40.0, 0.0))
+            .expect("an arrow with screen length reads a drag");
+        assert!((forward - 10.0).abs() <= 1.0e-9, "{forward}");
+        let (_, across) = axis.travel_from(egui::vec2(0.0, 40.0)).expect("a reading");
+        assert!(
+            across.abs() <= 1.0e-9,
+            "a drag across the axis moves nothing: {across}"
+        );
+        let (_, back) = axis.travel_from(egui::vec2(-40.0, 0.0)).expect("a reading");
+        assert!((back + 10.0).abs() <= 1.0e-9, "{back}");
+
+        // An axis pointing at the camera has no screen length to read a
+        // drag against, so it declines rather than dividing by nothing.
+        let edge_on = GrabbedAxis {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            screen: egui::vec2(0.2, 0.1),
+            length: 20.0,
+        };
+        assert!(edge_on.travel_from(egui::vec2(50.0, 50.0)).is_none());
+    }
+
+    #[test]
+    fn the_move_gizmo_offers_three_handles_and_picks_the_one_under_the_pointer() {
+        let (scene, bounds, pivot) = cuboid_scene_fixture();
+        let key = BodyInstanceKey::new(1);
+        let body = DocumentBodyInstance::new(key, &scene, Some(bounds), pivot);
+        let mut view = ViewState::default();
+        view.frame(bounds);
+        let projection = Projection {
+            screen_center: Pos2::new(400.0, 300.0),
+            points_per_unit: 12.0,
+        };
+        let handles = tool_gizmo_handles(
+            projection,
+            bounds,
+            view,
+            InstancePresentation::for_body(&body, Some(key), DisplayTransform::default(), 0.0),
+        );
+
+        assert!(handles.length > 0.0, "the arrows have a model length");
+        // Three handles, and each drags along the axis it was built from.
+        for (axis, expected) in handles.directions.into_iter().zip([
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ]) {
+            assert!(
+                (axis.x - expected.x).abs() <= 1.0e-9
+                    && (axis.y - expected.y).abs() <= 1.0e-9
+                    && (axis.z - expected.z).abs() <= 1.0e-9,
+                "an unplaced body's handles are the world axes: {axis:?}"
+            );
+        }
+
+        // The pointer on an arrow grabs that arrow; well away from all
+        // three it grabs none, which is what leaves the free drag alone.
+        for (axis, endpoint) in handles.endpoints.into_iter().enumerate() {
+            let grabbed = grab_gizmo_axis(endpoint, handles).expect("an arrow under the pointer");
+            assert_eq!(grabbed.0, axis, "the nearest arrow is the one grabbed");
+        }
+        assert!(
+            grab_gizmo_axis(handles.origin + egui::vec2(400.0, 400.0), handles).is_none(),
+            "nothing is grabbed away from the gizmo"
         );
     }
 
