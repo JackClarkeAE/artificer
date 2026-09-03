@@ -49,6 +49,18 @@ pub enum PointOutputRole {
         fragment: u16,
         point: u8,
     },
+    /// One point of the curve offset from source `source` in an
+    /// [`SketchRecipe::Offset`](crate::SketchRecipe::Offset) chain, in the
+    /// analytic curve's own centre/start/end order.
+    OffsetPoint {
+        source: u16,
+        point: u8,
+    },
+    /// One point of the round join filling the corner after source `corner`.
+    OffsetJoinPoint {
+        corner: u16,
+        point: u8,
+    },
     Tangency(u8),
     FilletCenter,
     /// The selected source-carrier intersection retained as an endpoint when
@@ -76,6 +88,16 @@ pub enum CurveOutputRole {
     /// span under the persisted pick point.
     TrimFragment(u16),
     TrimmedSource(u8),
+    /// The curve offset from the source at this index in the chain. Keyed on
+    /// the source rather than on its position in the result, so it keeps its
+    /// identity when a distance edit changes how many joins there are.
+    OffsetCurve {
+        source: u16,
+    },
+    /// The round join filling the corner that follows this source.
+    OffsetJoin {
+        corner: u16,
+    },
     CornerConnector,
 }
 

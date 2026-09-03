@@ -571,6 +571,31 @@ pub fn evaluate_recipe(
                 }
             }
         }
+        SketchRecipe::Offset {
+            sources,
+            closed,
+            distance,
+        } => {
+            let chain = crate::chain::SketchChain {
+                members: sources.clone(),
+                closed: *closed,
+            };
+            let geometry = crate::chain::chain_geometry(definition, &chain)
+                .map_err(|reason| SketchValidationError::ChainRefused { reason })?;
+            let distance = resolve_signed(*distance, inputs)?;
+            let offset = crate::offset::offset_chain(&geometry, distance, &precision)
+                .map_err(|reason| SketchValidationError::OffsetRefused { reason })?;
+            if offset.len() > MAX_ACTIVE_SKETCH_CURVES {
+                return Err(SketchValidationError::ResourceLimit {
+                    resource: "offset_curves",
+                    requested: offset.len(),
+                    limit: MAX_ACTIVE_SKETCH_CURVES,
+                });
+            }
+            for produced in offset {
+                builder.add_offset_curve(produced.origin, entity_role, produced.curve)?;
+            }
+        }
         SketchRecipe::CircularPattern {
             sources,
             center,
@@ -1170,6 +1195,69 @@ impl<'a> EvaluationBuilder<'a> {
             endpoints[0],
         )?;
         Ok(())
+    }
+
+    /// One curve of an offset chain, keyed on where it came from rather than on
+    /// where it landed in the result: a distance edit changes how many joins
+    /// there are, and a curve whose identity moved with the join count would
+    /// take every dimension that referenced it with it.
+    fn add_offset_curve(
+        &mut self,
+        origin: crate::offset::OffsetOrigin,
+        entity_role: SketchEntityRole,
+        curve: EvaluatedCurve2,
+    ) -> Result<(), SketchValidationError> {
+        let (role, point) = match origin {
+            crate::offset::OffsetOrigin::Source(source) => {
+                let source = index_u16(source)?;
+                (
+                    CurveOutputRole::OffsetCurve { source },
+                    Box::new(move |slot| PointOutputRole::OffsetPoint {
+                        source,
+                        point: slot,
+                    }) as Box<dyn Fn(u8) -> PointOutputRole>,
+                )
+            }
+            crate::offset::OffsetOrigin::Join(corner) => {
+                let corner = index_u16(corner)?;
+                (
+                    CurveOutputRole::OffsetJoin { corner },
+                    Box::new(move |slot| PointOutputRole::OffsetJoinPoint {
+                        corner,
+                        point: slot,
+                    }) as Box<dyn Fn(u8) -> PointOutputRole>,
+                )
+            }
+        };
+        match curve {
+            EvaluatedCurve2::Line { start, end } => {
+                let start = self.add_derived_point(point(0), start)?;
+                let end = self.add_derived_point(point(1), end)?;
+                self.add_line(role, entity_role, start, end)
+            }
+            EvaluatedCurve2::CircularArc {
+                center,
+                start,
+                end,
+                direction,
+            } => {
+                let center = self.add_derived_point(point(0), center)?;
+                let start = self.add_derived_point(point(1), start)?;
+                let end = self.add_derived_point(point(2), end)?;
+                self.add_arc(role, entity_role, center, start, end, direction)
+            }
+            EvaluatedCurve2::Circle {
+                center,
+                radius,
+                direction,
+            } => {
+                let center = self.add_derived_point(point(0), center)?;
+                self.add_circle(role, entity_role, center, radius, direction)
+            }
+            // An offset never produces one: `offset_chain` refuses a spline
+            // source before any geometry is built.
+            EvaluatedCurve2::Bspline { .. } => Err(SketchValidationError::NonFiniteValue),
+        }
     }
 
     fn add_pattern_curve(

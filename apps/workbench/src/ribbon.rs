@@ -406,17 +406,7 @@ impl KernelLabApp {
     }
 
     fn sketch_tool_grid(&mut self, ui: &mut egui::Ui) {
-        let mut capabilities = SketchToolCapabilities::default();
-        // Offset has its tile, its icon and its place in the grid, and no
-        // engine behind it yet: the chain walk, the offset curves and the
-        // associative recipe are specified in
-        // `docs/architecture/geometry-kernel/sketch-offset-plan.md`. Saying so
-        // on the control is better than a tile that lights up and does
-        // nothing when clicked.
-        capabilities.disable_with_reason(
-            ToolVariant::Offset,
-            "Offset is not built yet. It will copy a connected chain of curves to either side at a set distance.",
-        );
+        let capabilities = SketchToolCapabilities::default();
         let gate = if self.pending_operation.is_some() || self.sketch.has_pending_edit() {
             SketchOperationGate::AwaitingConfirmation
         } else {

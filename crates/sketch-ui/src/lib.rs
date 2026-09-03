@@ -32,16 +32,17 @@ use artificer_sketch::{
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
     ProfileCompileError as CoreProfileCompileError, RegionSignature as CoreRegionSignature,
     RetirementPolicy as CoreRetirementPolicy, SignedLength as CoreSignedLength,
-    SketchArrangement as CoreSketchArrangement, SketchConstraintId as CoreConstraintId,
-    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
-    SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
-    SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
-    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
-    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    SketchArrangement as CoreSketchArrangement, SketchChain as CoreSketchChain,
+    SketchConstraintId as CoreConstraintId, SketchConstraintKind as CoreConstraintKind,
+    SketchCurve2 as CoreCurve2, SketchDefinition as CoreSketchDefinition,
+    SketchEntityId as CoreEntityId, SketchEntityRole as CoreEntityRole,
+    SketchOperationId as CoreOperationId, SketchOutputRef as CoreOutputRef,
+    SketchPoint2 as CorePoint2, SketchPointId as CorePointId, SketchRecipe as CoreRecipe,
+    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
-    SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
-    compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
-    select_trim_span,
+    SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement, chain_geometry,
+    compile_selected_profile, connected_chain, hit_test_curves, intersect_curves,
+    query_snap_candidates, select_trim_span,
 };
 use artificer_ui_core::drag_handle::{DragHandlePhase, DragHandleState, PointerSample};
 
@@ -86,6 +87,7 @@ const DEFAULT_RECTANGULAR_PATTERN_ROWS: u16 = 2;
 const DEFAULT_CIRCULAR_PATTERN_COUNT: u16 = 4;
 const DEFAULT_TOOL_LENGTH: f64 = 5.0;
 const DEFAULT_FILLET_RADIUS: f64 = 1.0;
+const DEFAULT_OFFSET_DISTANCE: f64 = 1.0;
 const DEFAULT_CHAMFER_DISTANCE: f64 = 1.0;
 const DEFAULT_POLYGON_DIAMETER: f64 = 10.0;
 const DEFAULT_SLOT_LENGTH: f64 = 10.0;
@@ -1637,6 +1639,9 @@ fn tool_number_spec(
         (ToolVariant::Text, "height") => Some((DEFAULT_TEXT_HEIGHT, positive)),
         (ToolVariant::Text, "angle") => Some((0.0, finite)),
         (ToolVariant::Fillet, "radius") => Some((DEFAULT_FILLET_RADIUS, positive)),
+        // Signed: the sign is which side of the chain the copy lands on, which
+        // is a thing to type as much as a thing to point at.
+        (ToolVariant::Offset, "distance") => Some((DEFAULT_OFFSET_DISTANCE, non_zero)),
         (ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer, "distance_1") => {
             Some((DEFAULT_CHAMFER_DISTANCE, positive))
         }
@@ -1691,6 +1696,9 @@ fn tool_number_spec(
 
 fn tool_flag_default(variant: ToolVariant, stable_key: &'static str) -> Option<bool> {
     match (variant, stable_key) {
+        // On by default, as it is in the reference: a click on one wall of an
+        // outline almost always means the outline.
+        (ToolVariant::Offset, "chain_selection") => Some(true),
         (ToolVariant::RectangularPattern, "second_direction") => Some(false),
         (ToolVariant::CircularPattern, "full_circle" | "rotate_instances") => Some(true),
         _ => None,
@@ -1918,6 +1926,13 @@ fn selected_recipe_editor_for(
                 literal_angle_parameter("direction", "Direction", direction),
             ],
             "Source curve IDs are retained; count changes preserve every matching semantic output ID.",
+        ),
+        CoreRecipe::Offset { distance, .. } => (
+            "Offset",
+            vec![literal_signed_length_parameter(
+                "distance", "Distance", distance, false,
+            )],
+            "The chain and the side it was taken on are retained; only the distance is edited here.",
         ),
         CoreRecipe::CircularPattern {
             count, total_angle, ..
@@ -2369,6 +2384,9 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         } => {
             replace_literal_integer(count, recipe_parameter_value(editor, "count"));
             replace_literal_angle(total_angle, recipe_parameter_value(editor, "total_angle"))?;
+        }
+        CoreRecipe::Offset { distance, .. } => {
+            replace_literal_signed_length(distance, recipe_parameter_value(editor, "distance"))?;
         }
         CoreRecipe::Fillet { radius, .. } | CoreRecipe::FilletWithHints { radius, .. } => {
             replace_literal_length(radius, recipe_parameter_value(editor, "radius"))?;
@@ -9591,6 +9609,122 @@ impl SketchCanvasState {
         Some(subject)
     }
 
+    /// Offsets the chain under the pointer, on the side the click fell.
+    ///
+    /// One click does the whole thing: the chain is what the curve is joined
+    /// to, the side is which way the click sits from it, and the magnitude is
+    /// the palette's `distance`, which `Tab` retypes and which the recipe then
+    /// keeps. That is the smallest gesture that is still the tool — the live
+    /// drag handle is the next stage, not a different command.
+    fn stage_offset(
+        &mut self,
+        point: SketchPoint,
+        pick_radius: f64,
+    ) -> Result<SketchEntityId, SketchEditError> {
+        if self.active_tool_parameter_issue().is_some() {
+            return Err(SketchEditError::AuthoringRejected);
+        }
+        let picked = self
+            .exact_curve_hit(point, pick_radius)
+            .ok_or(SketchEditError::AuthoringRejected)?;
+        let magnitude = self
+            .active_tool_number("distance")
+            .ok_or(SketchEditError::AuthoringRejected)?;
+        let chain = self
+            .offset_chain_for(picked)
+            .ok_or(SketchEditError::AuthoringRejected)?;
+        let side = self.offset_side(&chain, picked, point).unwrap_or(1.0);
+        let distance = CoreSignedLength::new(magnitude.abs() * side)
+            .map_err(|_| SketchEditError::AuthoringRejected)?;
+        let recipe = CoreRecipe::Offset {
+            sources: chain.members,
+            closed: chain.closed,
+            distance: CoreValue::Literal(distance),
+        };
+        let transaction = self
+            .authoring
+            .stage(recipe, "Offset sketch geometry")
+            .map_err(|_| SketchEditError::AuthoringRejected)?;
+        self.stage_core_transaction(transaction, "Offset sketch geometry")
+    }
+
+    /// The chain a click on `picked` means: the whole connected run when chain
+    /// selection is on, that one curve when it is off.
+    fn offset_chain_for(&self, picked: CoreEntityId) -> Option<CoreSketchChain> {
+        let precision = PrecisionPolicy::default();
+        let chain = connected_chain(&self.authoring, picked, &precision).ok()?;
+        if self.active_tool_flag("chain_selection").unwrap_or(true) {
+            return Some(chain);
+        }
+        Some(CoreSketchChain {
+            members: chain
+                .members
+                .into_iter()
+                .filter(|member| member.entity == picked)
+                .collect(),
+            closed: false,
+        })
+    }
+
+    /// Which side of the chain the pointer is on, as +1 (left of travel) or -1.
+    ///
+    /// Read from the curve the click actually landed on, oriented the way the
+    /// chain walks it. A click exactly on the curve has no side, and the caller
+    /// keeps the sign it already had.
+    fn offset_side(
+        &self,
+        chain: &CoreSketchChain,
+        picked: CoreEntityId,
+        point: SketchPoint,
+    ) -> Option<f64> {
+        let index = chain
+            .members
+            .iter()
+            .position(|member| member.entity == picked)?;
+        let geometry = chain_geometry(&self.authoring, chain).ok()?;
+        let subject = core_point(point);
+        let slack = PrecisionPolicy::default().min_feature_size;
+        match geometry.curves.get(index)? {
+            CoreEvaluatedCurve2::Line { start, end } => {
+                let offset = signed_offset_from_line(*start, *end, subject)?;
+                (offset.abs() > slack).then(|| if offset > 0.0 { 1.0 } else { -1.0 })
+            }
+            // The left of a counter-clockwise arc is its inside, so a click
+            // outside one asks for the larger radius and a click inside for the
+            // smaller. A chord would answer for a semicircle and lie for
+            // anything longer.
+            CoreEvaluatedCurve2::CircularArc {
+                center,
+                start,
+                direction,
+                ..
+            } => {
+                let radius = (*start - *center).length();
+                let reach = (subject - *center).length();
+                let inward = match direction {
+                    CoreCurveDirection::CounterClockwise => 1.0,
+                    CoreCurveDirection::Clockwise => -1.0,
+                };
+                ((reach - radius).abs() > slack)
+                    .then(|| if reach > radius { -inward } else { inward })
+            }
+            CoreEvaluatedCurve2::Circle {
+                center,
+                radius,
+                direction,
+            } => {
+                let reach = (subject - *center).length();
+                let inward = match direction {
+                    CoreCurveDirection::CounterClockwise => 1.0,
+                    CoreCurveDirection::Clockwise => -1.0,
+                };
+                ((reach - radius).abs() > slack)
+                    .then(|| if reach > *radius { -inward } else { inward })
+            }
+            CoreEvaluatedCurve2::Bspline { .. } => None,
+        }
+    }
+
     fn stage_rectangular_pattern(
         &mut self,
         direction_point: SketchPoint,
@@ -9768,6 +9902,7 @@ impl SketchCanvasState {
             | ToolVariant::EqualLengthRelation
             | ToolVariant::TangentRelation
             | ToolVariant::CollinearRelation => self.append_relation_operand(point, pick_radius),
+            ToolVariant::Offset => self.stage_offset(point, pick_radius).ok(),
             ToolVariant::RectangularPattern | ToolVariant::CircularPattern => {
                 if self.modifier_sources.is_empty() {
                     let picked = self.exact_curve_hit(point, pick_radius)?;
@@ -11369,6 +11504,7 @@ pub fn show_with_context(
                 | ToolVariant::Fillet
                 | ToolVariant::Chamfer
                 | ToolVariant::TwoDistanceChamfer
+                | ToolVariant::Offset
                 | ToolVariant::RectangularPattern
                 | ToolVariant::CircularPattern
         ) || relation_arity(state.exact_tool).is_some()
@@ -11382,12 +11518,16 @@ pub fn show_with_context(
             // fall through to plain selection here, which is why relations
             // never staged from the canvas.
             let raw_point = state.view.screen_to_sketch(response.rect, position);
+            // Offset takes the raw point too, and for a reason of its own:
+            // which side of the chain the click fell on is the whole of the
+            // direction, and a snap onto the curve has no side.
             let point = if matches!(
                 state.exact_tool,
                 ToolVariant::Trim
                     | ToolVariant::Fillet
                     | ToolVariant::Chamfer
                     | ToolVariant::TwoDistanceChamfer
+                    | ToolVariant::Offset
             ) || relation_arity(state.exact_tool).is_some()
                 || dimensioning
             {

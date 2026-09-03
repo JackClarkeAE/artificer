@@ -22,7 +22,13 @@ use crate::ids::SketchEntityId;
 use crate::offset::OffsetChain;
 
 /// One curve of a chain, and which way the walk crosses it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// This is also what [`crate::SketchRecipe::Offset`] persists: an offset
+/// depends on the direction the chain is walked in, so the order and the
+/// reversal flags are intent, not a cache.
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct ChainMember {
     pub entity: SketchEntityId,
     /// True when the walk crosses the curve against its own direction, so its

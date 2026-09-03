@@ -368,6 +368,19 @@ pub enum SketchRecipe {
         limits: Vec<SketchEntityId>,
         pick: SketchPoint2,
     },
+    /// A second chain holding `distance` from the first, on the side the sign
+    /// chooses. Associative like the patterns: the sources are read as
+    /// evaluated curves on every replay, so moving one moves the offset with
+    /// it.
+    ///
+    /// `sources` is the chain in traversal order, with the reversal flags that
+    /// make it read head to tail. Both are intent: which way round the chain is
+    /// walked is what decides which side "left of travel" names.
+    Offset {
+        sources: Vec<crate::chain::ChainMember>,
+        closed: bool,
+        distance: SketchValue<SignedLength>,
+    },
     FitPointSpline {
         fit_points: Vec<PointInput>,
         degree: usize,
@@ -412,6 +425,7 @@ impl SketchRecipe {
                 | Self::FilletWithHints { .. }
                 | Self::Chamfer { .. }
                 | Self::Trim { .. }
+                | Self::Offset { .. }
                 | Self::Text { .. }
         )
     }
@@ -493,7 +507,8 @@ impl SketchRecipe {
             | Self::Fillet { .. }
             | Self::FilletWithHints { .. }
             | Self::Chamfer { .. }
-            | Self::Trim { .. } => {}
+            | Self::Trim { .. }
+            | Self::Offset { .. } => {}
         }
         references
     }
@@ -517,6 +532,7 @@ impl SketchRecipe {
                 entities.extend(limits.iter().copied());
                 entities
             }
+            Self::Offset { sources, .. } => sources.iter().map(|member| member.entity).collect(),
             _ => Vec::new(),
         };
         entities.sort_unstable();

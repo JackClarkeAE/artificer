@@ -1,6 +1,6 @@
 # Sketch offset implementation plan
 
-Status: proposed; the registry entry, tile, icon and shortcut ship, the engine does not
+Status: stages 1-4 implemented; self-intersection pruning and projected body edges remain proposed
 Last reviewed: 2026-09-03
 Programme position: the first sketch modifier that reads a whole connected chain rather than one curve or one corner
 
@@ -10,11 +10,13 @@ It is the tool that turns a drawn outline into a wall, a gasket, a clearance,
 or a toolpath allowance without redrawing it, and it is the last of the
 common sketch modifiers Artificer does not have.
 
-This document is the specification. It records what the reference
-implementation does and why, what Artificer's existing machinery already
-supplies, the exact geometry the first pass will and will not attempt, and the
-staged work with its tests. Nothing here is implemented yet apart from the
-control surface described under *What already ships*.
+This document is the specification, and the record of how much of it is built.
+It states what the reference implementation does and why, what Artificer's
+existing machinery already supplied, the exact geometry the first pass attempts
+and refuses, and the staged work with its tests. Stages 1 to 4 have landed:
+Offset draws, follows its sources, and refuses by name. Stages 5 and 6 —
+self-intersection pruning, and offsetting an edge of a body through a
+projection — have not.
 
 ## What the reference does
 
@@ -78,21 +80,18 @@ sharpens. The same staged shape appears in the polyline-offset literature
 ([Liu et al., *An offset algorithm for polyline
 curves*](https://www.sciencedirect.com/science/article/abs/pii/S0166361506001060)).
 
-## What already ships
+## What ships
 
-`crates/sketch-ui/src/sketch_toolbar.rs` carries the whole control surface:
-`ToolFamily::Offset`, `ToolVariant::Offset`, `ToolIcon::Offset`, the `O`
-shortcut, two acquisition phases (`chain`, `distance`), two inputs (a signed
-`distance` and a boolean `chain_selection`),
-`SelectionRequirement::ConnectedCurveChain`,
-`CapabilityRequirement::OffsetChain`, `ToolOutputRole::GeneratedGeometry` and
-`CommitContract::StageThenUniversalTickOrEnter`. The tile sits at the end of
-the drawing block's last row, beside Trim, Fillet and Chamfer
-([ADR 0030](../adr/0030-ribbon-tabs-are-views.md)).
+| Piece | Where |
+|---|---|
+| The control surface: family, variant, icon, the `O` shortcut, the two phases, the signed `distance` and the `chain_selection` switch | `crates/sketch-ui/src/sketch_toolbar.rs` |
+| The offset geometry and its refusals | `crates/sketch/src/offset.rs` |
+| The chain walk | `crates/sketch/src/chain.rs` |
+| The associative recipe, its output roles, its evaluation | `SketchRecipe::Offset`, `CurveOutputRole::OffsetCurve`/`OffsetJoin`, `crates/sketch/src/primitives.rs` |
+| The canvas gesture and the typed distance | `SketchCanvasState::stage_offset` in `crates/sketch-ui/src/lib.rs` |
 
-`apps/workbench/src/ribbon.rs` disables it with a reason that says the engine
-is not built. Every stage below ends with that reason narrowing or going away;
-the tile is enabled by stage 3.
+The tile sits at the end of the drawing block's last row, beside Trim, Fillet
+and Chamfer ([ADR 0030](../adr/0030-ribbon-tabs-are-views.md)), and is live.
 
 ## What the existing machinery already supplies
 
@@ -213,32 +212,36 @@ that already exists, so what a click will take is visible before the click.
 
 ```rust
 Offset {
-    sources: Vec<SketchEntityId>,
+    /// The chain in traversal order, with the reversal flags that make it read
+    /// head to tail. Both are intent: which way round the chain is walked is
+    /// what decides which side "left of travel" names.
+    sources: Vec<ChainMember>,
+    closed: bool,
     distance: SketchValue<SignedLength>,
-    /// Round-join arcs at convex corners are curves of this recipe too, so a
-    /// replay that produced a different corner count is a mismatch, not a
-    /// silent difference.
-    joins: OffsetJoinStyle,
 }
 ```
 
-It is a modifier over `sources`, exactly as the pattern recipes are: it reads
-their evaluated curves, never their recipes, so it respects the recipe boundary
-of [ADR 0026](../adr/0026-second-expansion-programme.md) and works over
+It reads its sources as evaluated curves, never as recipes, exactly as the
+pattern recipes do — so it respects the recipe boundary of
+[ADR 0026](../adr/0026-second-expansion-programme.md) and works over
 recipe-owned shapes (a rectangle's side, a polygon's edge) without touching the
-owning recipe.
+owning recipe. It is not a modifier: it retires nothing, and stages through the
+ordinary creation path.
 
 Associativity falls out of that for free and is the point: the source moves,
-the recipe re-evaluates, the offset moves with it. Re-authoring the distance
-goes through `stage_constraint_value`'s sibling path for modifier inputs, so a
-typed distance edits the existing operation rather than adding another one.
+the recipe re-evaluates, the offset moves with it. An edit that breaks the
+chain the offset was taken from refuses the whole transaction rather than
+offsetting a gap. Re-authoring the distance goes through the selected-recipe
+editor, which replaces the operation in place, so a typed distance edits the
+offset that exists rather than adding another one.
 
 Identity: `CurveOutputRole::OffsetCurve { source: u16 }` for a curve derived
 from the *n*th source, and `CurveOutputRole::OffsetJoin { corner: u16 }` for an
-inserted round join, with the matching `PointOutputRole` variants. Both are
-new, both are keyed on the position in the canonicalised source list, and both
-survive a distance edit — which is what lets a dimension or a downstream
-feature reference an offset curve and keep referencing it.
+inserted round join, with matching `PointOutputRole` variants. Both are keyed
+on where a curve came from rather than where it landed in the result: a
+distance edit changes how many joins there are, and a curve whose identity
+moved with the join count would take every dimension that referenced it with
+it.
 
 Persistence: a new `SketchRecipe` variant is additive under the existing
 `#[serde(tag = "kind")]`, so documents written before it still load, and it
@@ -301,30 +304,36 @@ is what Trim and Fillet already do for their own refusals.
 
 ## Stages
 
-Each stage is independently shippable, ends green, and narrows the tile's
-disabled reason.
+Each stage is independently shippable and ends green.
 
-**Stage 1 — offset geometry, headless.** `crates/sketch/src/offset.rs`: per-curve
-offset for line, arc and circle; the three join kinds; the corner intersections;
-the named refusals. Pure functions over `EvaluatedCurve2`, tested against
-hand-computed geometry: a square offsets to a square with four round corners
-at `+d` and a smaller square at `−d`; a rounded rectangle keeps its tangent
-joins and gains no corner arcs; an arc's offset shares its centre exactly; a
-circle offset inward by its radius is refused rather than collapsed.
+**Stage 1 — offset geometry, headless. Done.** `crates/sketch/src/offset.rs`:
+per-curve offset for line, arc and circle; the three join kinds; the corner
+meetings; the named refusals. Pure functions over `EvaluatedCurve2`, tested
+against hand-computed geometry — a square outward into four sides and four
+round corners, the same square inward into a smaller sharp one, a filleted
+outline whose tangent corner stays tangent, a step that survives on the inside
+and one that does not, the chain walked the other way, and the four refusals.
 
-**Stage 2 — the chain walk.** Chain extraction over the arrangement, with the
-determinism, T-junction and single-curve properties above as tests. No UI.
+**Stage 2 — the chain walk. Done.** `crates/sketch/src/chain.rs`, with the
+determinism, T-junction and construction-geometry properties as tests in
+`crates/sketch/tests/connected_chains.rs`. No UI.
 
-**Stage 3 — the recipe.** `SketchRecipe::Offset`, its evaluation through
-`RecipeBuilder`, the new output roles, the persistence round trip above, and a
-test that moves a source and re-evaluates the offset with it. The tile is
-enabled at the end of this stage, driven from the ribbon with a typed distance
-and no canvas interaction.
+**Stage 3 — the recipe. Done.** `SketchRecipe::Offset`, its evaluation through
+the recipe builder, `CurveOutputRole::OffsetCurve`/`OffsetJoin` and their point
+roles, the persistence round trip, and tests in
+`crates/sketch/tests/core_offsets.rs` that edit the distance, move a source and
+watch the offset follow, and refuse an edit that breaks the chain the offset
+was taken from.
 
-**Stage 4 — the interaction.** Hover highlight, live drag, the typed field, the
-`chain_selection` switch, staging behind the gate, and a workbench UI suite
-that offsets a drawn rectangle outward, checks the four round corners, edits
-the distance, and undoes it. One snapshot.
+**Stage 4 — the gesture. Done, in its first form.** One click: the chain is
+what the picked curve is joined to, the side is which side of it the click
+fell, and the magnitude is the palette's `distance`, which `Tab` retypes. The
+result commits on acceptance like every other sketch stroke
+([ADR 0027](../adr/0027-sketch-edits-commit-on-acceptance.md)).
+`apps/workbench/tests/sketch_offset_ui.rs` offsets a drawn rectangle outward
+and inward from the canvas and drives the typed distance. The hover highlight
+that shows the chain before the click, and the live drag that sets the distance
+by pointing, are the part of this stage still to come.
 
 **Stage 5 — self-intersection pruning.** The slice-and-discard pass, replacing
 stage 1's conservative whole-chain refusal for the cases it can resolve. Tested
@@ -333,16 +342,17 @@ approach each other.
 
 **Stage 6 — projection.** `SketchRecipe::ProjectedEdge`, `SupportCurveKey`, the
 Project command, and an end-to-end test that projects a body edge and offsets
-the projected chain.
+the projected chain. Until this lands, Offset acts on sketch geometry only —
+which is exactly where the reference stands before Project.
 
 ## Deferred
 
 - Splines. An exact offset of a B-spline is not a B-spline; when Artificer
   offsets one it will be by an approximation the precision policy governs and
   the document records, not by silence.
-- Mitre and chamfer join styles. `OffsetJoinStyle` exists in the recipe from
-  stage 3 so adding one later does not change the persisted shape, but round is
-  the only style the first pass emits.
+- Mitre and chamfer join styles. Round is the only style the first pass emits;
+  adding another means a field on the recipe and a migration, which is a
+  smaller price than a join style nobody asked for yet.
 - Variable-distance and two-sided offset.
 - Offsetting a whole profile region as a region, rather than as the chain of
   its boundary.
