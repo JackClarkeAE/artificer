@@ -155,9 +155,25 @@ both offsets' ends, and a concave one's routinely lies past a short neighbour's.
 Line/line is a closed-form intersection; line/arc and arc/arc are the circle
 forms in the same module.
 
-This is what makes the offset *topology-matched to its parent*: four lines in,
-four lines out, so a rectangle offsets to a rectangle and the result can be
-dimensioned, constrained and offset again. It is `OFFSETGAPTYPE 0` in AutoCAD
+This is what makes the offset *topology-matched to its parent*: one curve out
+for each curve in, so a rectangle offsets to a rectangle and the result can be
+dimensioned, constrained and offset again. Every curve of the source is carried
+across, and the corner rules are what carry the rest:
+
+- a **filleted** corner is two tangent corners around an arc, so the fillet
+  offsets to a concentric arc — same centre, radius grown or shrunk by the
+  distance — and its neighbours meet it exactly where they always did;
+- a **chamfered** corner is two ordinary corners around a short line, so the
+  chamfer offsets parallel to itself at exactly the distance, and its
+  neighbours extend to meet it — a chamfer offset outward comes out longer,
+  because the corner has to go somewhere;
+- an **arc meeting a line at an angle** extends the line onto the offset arc's
+  own circle, at the intersection beside the corner rather than the one on the
+  far side of the bulge.
+
+None of those is a special case in the code. They are the same three corner
+rules applied to what the chain happens to hold, and each has a test that says
+so. It is `OFFSETGAPTYPE 0` in AutoCAD
 and what SolidWorks' Offset Entities does; Fusion's rounding is the outlier
 among CAD sketch offsets, and following it here would have meant every
 rectangle acquiring four fillets nobody drew.

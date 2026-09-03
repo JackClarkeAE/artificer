@@ -813,10 +813,12 @@ mod tests {
         assert_eq!(extent(&reversed), (low, high));
     }
 
+    /// A filleted corner: line, tangent arc, line. The arc is geometry like
+    /// any other — it offsets to a concentric arc, its neighbours meet it
+    /// where they always did, and nothing is inserted or dropped.
     #[test]
-    fn a_tangent_join_inserts_nothing_and_still_meets_exactly() {
-        // A line running into a quarter arc it is tangent to, then out again:
-        // one rounded corner of a filleted outline.
+    fn a_filleted_corner_keeps_its_fillet_at_the_offset_radius() {
+        // A 2 mm fillet between a run along v = 0 and a rise along u = 10.
         let chain = OffsetChain::new(
             vec![
                 line((0.0, 0.0), (8.0, 0.0)),
@@ -830,18 +832,162 @@ mod tests {
             ],
             false,
         );
-        let offset =
-            offset_chain(&chain, -1.0, &PrecisionPolicy::default()).expect("a tangent chain");
-        assert_eq!(offset.len(), 3, "a tangent corner needs no join");
+        let precision = PrecisionPolicy::default();
+        // Outward of a counter-clockwise arc is the larger radius; inward the
+        // smaller. Either way the centre does not move and the count does not
+        // change.
+        for (distance, expected) in [(-1.0, 3.0), (1.0, 1.0)] {
+            let offset = offset_chain(&chain, distance, &precision).expect("a filleted corner");
+            assert_eq!(
+                offset.len(),
+                3,
+                "a tangent corner needs no curve of its own"
+            );
+            assert_watertight(&offset, false);
+            assert_eq!(
+                offset.iter().map(|entry| entry.origin).collect::<Vec<_>>(),
+                vec![
+                    OffsetOrigin::Source(0),
+                    OffsetOrigin::Source(1),
+                    OffsetOrigin::Source(2)
+                ],
+                "one offset curve for each source curve, in order"
+            );
+
+            let EvaluatedCurve2::CircularArc { center, start, .. } = &offset[1].curve else {
+                panic!("the fillet stays an arc");
+            };
+            assert!(close_to(*center, point(8.0, 2.0)));
+            assert!(((*start - *center).length() - expected).abs() < 1.0e-12);
+            // And it still meets its neighbours tangentially, which is what
+            // makes the result a filleted outline rather than three curves that
+            // happen to touch.
+            assert!(close_to(expect_line(&offset[0].curve).1, *start));
+        }
+    }
+
+    /// A chamfered corner: line, chamfer, line. Two ordinary corners, so the
+    /// chamfer offsets parallel to itself and its neighbours extend to meet it
+    /// — the chamfer is kept, and it is longer than the one it came from
+    /// because that is where the corner went.
+    #[test]
+    fn a_chamfered_corner_keeps_its_chamfer_and_grows_it_outward() {
+        // A 2 mm equal chamfer across the same corner at (10, 0).
+        let chain = OffsetChain::new(
+            vec![
+                line((0.0, 0.0), (8.0, 0.0)),
+                line((8.0, 0.0), (10.0, 2.0)),
+                line((10.0, 2.0), (10.0, 10.0)),
+            ],
+            false,
+        );
+        let offset = offset_chain(&chain, -1.0, &PrecisionPolicy::default())
+            .expect("a chamfered corner offsets");
+        assert_eq!(offset.len(), 3, "three lines in, three lines out");
         assert_watertight(&offset, false);
 
-        let EvaluatedCurve2::CircularArc { center, start, .. } = &offset[1].curve else {
-            panic!("the arc stays an arc");
+        // The chamfer's offset runs parallel to it, exactly 1 mm out along its
+        // own normal, and meets its neighbours' offsets where the carriers
+        // cross: at v = -1 on one side and u = 11 on the other.
+        let (chamfer_start, chamfer_end) = expect_line(&offset[1].curve);
+        let direction = (chamfer_end - chamfer_start)
+            .normalized()
+            .expect("direction");
+        assert!(close_to(
+            point(direction.u, direction.v),
+            point(0.5_f64.sqrt(), 0.5_f64.sqrt())
+        ));
+        let root = 2.0_f64.sqrt();
+        assert!(close_to(chamfer_start, point(7.0 + root, -1.0)));
+        assert!(close_to(chamfer_end, point(11.0, 3.0 - root)));
+        // Every point of it is the offset distance from the chamfer it came
+        // from, which is what "the chamfer is kept" has to mean.
+        for sample in [chamfer_start, chamfer_end] {
+            let along = (point(10.0, 2.0) - point(8.0, 0.0))
+                .normalized()
+                .expect("chamfer direction");
+            assert!(((sample - point(8.0, 0.0)).dot(along.left_normal()) + 1.0).abs() < 1.0e-12);
+        }
+        assert!(
+            (chamfer_end - chamfer_start).length() > (point(10.0, 2.0) - point(8.0, 0.0)).length(),
+            "an outward offset lengthens the chamfer; the corner has to go somewhere"
+        );
+
+        // Its neighbours extended to meet it, rather than stopping where the
+        // source curves' own offsets ended.
+        assert!(close_to(expect_line(&offset[0].curve).1, chamfer_start));
+        assert!(close_to(expect_line(&offset[2].curve).0, chamfer_end));
+    }
+
+    /// An arc that meets its neighbours at an angle rather than tangentially:
+    /// the lines have to extend onto the offset arc's own circle, and the
+    /// meeting has to be the branch nearest the corner rather than the one on
+    /// the far side of it.
+    #[test]
+    fn a_line_extends_onto_an_arc_it_meets_at_an_angle() {
+        // A semicircular bulge on the right, entered and left by sloped lines
+        // so neither corner is tangent.
+        let (centre, radius) = (point(10.0, 3.0), 3.0);
+        let chain = OffsetChain::new(
+            vec![
+                line((0.0, -3.0), (10.0, 0.0)),
+                EvaluatedCurve2::CircularArc {
+                    center: centre,
+                    start: point(10.0, 0.0),
+                    end: point(10.0, 6.0),
+                    direction: CurveDirection::CounterClockwise,
+                },
+                line((10.0, 6.0), (0.0, 9.0)),
+            ],
+            false,
+        );
+        let offset =
+            offset_chain(&chain, 1.0, &PrecisionPolicy::default()).expect("an angled arc corner");
+        assert_eq!(offset.len(), 3, "three curves in, three curves out");
+        assert_watertight(&offset, false);
+        assert!(
+            offset
+                .iter()
+                .all(|entry| matches!(entry.origin, OffsetOrigin::Source(_))),
+            "both corners were reached by extending"
+        );
+
+        // Left of a counter-clockwise arc is its inside, so the bulge shrinks
+        // by the offset distance about the same centre.
+        let EvaluatedCurve2::CircularArc {
+            center: offset_centre,
+            start,
+            ..
+        } = &offset[1].curve
+        else {
+            panic!("the bulge stays an arc");
         };
-        // Outward of a counter-clockwise arc is the larger radius, about the
-        // same centre.
-        assert!(close_to(*center, point(8.0, 2.0)));
-        assert!(((*start - *center).length() - 3.0).abs() < 1.0e-12);
+        assert!(close_to(*offset_centre, centre));
+        assert!(((*start - centre).length() - (radius - 1.0)).abs() < 1.0e-12);
+
+        // Each line extended until it reached that circle, and each is still
+        // exactly one millimetre to the left of the line it came from.
+        for (index, (source_start, source_end)) in [
+            (point(0.0, -3.0), point(10.0, 0.0)),
+            (point(10.0, 6.0), point(0.0, 9.0)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (start, end) = expect_line(&offset[index * 2].curve);
+            let meeting = if index == 0 { end } else { start };
+            assert!(
+                ((meeting - centre).length() - (radius - 1.0)).abs() < 1.0e-9,
+                "the line has to reach the offset arc's circle, not stop short of it"
+            );
+            // The near branch, not the one on the far side of the bulge.
+            assert!(
+                (meeting - point(10.0, if index == 0 { 0.0 } else { 6.0 })).length() < 2.0,
+                "the meeting is the branch beside the corner it came from"
+            );
+            let along = (source_end - source_start).normalized().expect("direction");
+            assert!(((start - source_start).dot(along.left_normal()) - 1.0).abs() < 1.0e-12);
+        }
     }
 
     #[test]
