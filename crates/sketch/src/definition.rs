@@ -543,14 +543,46 @@ impl SketchDefinition {
         &self,
         entity: SketchEntityId,
     ) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
+        let solved = self
+            .solve_constraints(PrecisionPolicy::default())
+            .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
+        self.evaluated_curve_from(entity, &solved)
+    }
+
+    /// Every active curve of the sketch, in stable entity order, from one
+    /// constraint solve.
+    ///
+    /// [`Self::evaluated_curve`] solves the whole constraint system to answer
+    /// for one curve, which is the right shape for a single query and the wrong
+    /// one for a walk over the sketch: this exists so a caller that wants many
+    /// curves pays for the solve once.
+    pub fn evaluated_curves(
+        &self,
+    ) -> Result<Vec<(SketchEntityId, crate::EvaluatedCurve2)>, SketchValidationError> {
+        let solved = self
+            .solve_constraints(PrecisionPolicy::default())
+            .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
+        let mut entities = self
+            .active_entities()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        entities.sort_unstable();
+        entities
+            .into_iter()
+            .map(|entity| Ok((entity, self.evaluated_curve_from(entity, &solved)?)))
+            .collect()
+    }
+
+    fn evaluated_curve_from(
+        &self,
+        entity: SketchEntityId,
+        solved: &ConstraintSolution,
+    ) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
         let record = self
             .entities
             .get(&entity)
             .filter(|record| record.active)
             .ok_or(SketchValidationError::MissingEntity { entity })?;
-        let solved = self
-            .solve_constraints(PrecisionPolicy::default())
-            .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
         let point = |id: SketchPointId| {
             solved
                 .positions
@@ -1160,6 +1192,15 @@ pub enum SketchValidationError {
     UnsupportedPatternSource {
         entity: SketchEntityId,
     },
+    /// The offset could not be produced. The reason names the curve or the
+    /// corner, because "the offset failed" is not something a user can act on.
+    OffsetRefused {
+        reason: crate::offset::OffsetError,
+    },
+    /// A chain could not be walked from the picked curve.
+    ChainRefused {
+        reason: crate::chain::ChainError,
+    },
     InvalidCornerSelection,
     CornerDistanceTooLarge,
     FilletHintOffSource {
@@ -1287,6 +1328,8 @@ impl fmt::Display for SketchValidationError {
                     "entity {entity} cannot be used by this sketch edit"
                 )
             }
+            Self::OffsetRefused { reason } => write!(formatter, "offset refused: {reason}"),
+            Self::ChainRefused { reason } => write!(formatter, "chain refused: {reason}"),
             Self::InvalidCornerSelection => formatter
                 .write_str("fillet and chamfer require two distinct, connected line segments"),
             Self::CornerDistanceTooLarge => formatter.write_str(

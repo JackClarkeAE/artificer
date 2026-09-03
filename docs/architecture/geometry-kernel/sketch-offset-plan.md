@@ -104,7 +104,7 @@ what makes it a bounded piece of work rather than a new subsystem.
 | A recipe that reads other entities' evaluated curves | `SketchRecipe::RectangularPattern` and `pattern_sources` in `crates/sketch/src/primitives.rs` |
 | Stable identity for many generated curves from many sources | `CurveOutputRole::PatternCurve { instance, source }` and `PointOutputRole::PatternPoint` |
 | Emitting a transformed copy of any evaluated curve | `RecipeBuilder::add_pattern_curve`, which already switches over `Line`, `CircularArc`, `Circle` and `Bspline` |
-| Connectivity between curves | `build_arrangement` in `crates/sketch/src/arrangement.rs`: junctions, half-edges and `ArrangementLoop` |
+| Connectivity between curves | `build_arrangement` in `crates/sketch/src/arrangement.rs` for regions; `crates/sketch/src/chain.rs` for the entity-level walk a recipe can name |
 | Adjacent-span reasoning under a pick | `crates/sketch/src/trim.rs` (`TrimJunction`, `select_trim_span`) |
 | Picking a curve under the pointer | `queries::hit_test_curves` |
 | A live drag handle with a typed alternative | the rectangular-pattern direction manipulator, and the dimension-label drag |
@@ -183,11 +183,14 @@ Refusals, all named, all with the shape the rest of the crate uses:
 ## Chain selection
 
 The chain is the transitive closure of *shares an endpoint within
-`linear_agreement`* over the active, non-reference curves of the sketch,
-starting from the curve under the pointer. It is computed from the arrangement
-rather than by a bespoke walk: `build_arrangement` already produces the
-junctions and half-edges, and its `ArrangementLoop` is exactly "all connected
-lines within a certain loop" when the chain closes.
+`linear_agreement`* over the active profile curves of the sketch, starting from
+the curve under the pointer.
+
+It is a walk over whole entities, not over the arrangement. `build_arrangement`
+knows more about connectivity than anything else in the crate, but what it
+produces are fragments split at every crossing, and a fragment has no entity
+identity for a recipe to store. The chain has to name the curves the sketch
+actually holds, so `crates/sketch/src/chain.rs` walks those directly.
 
 Three properties matter and are each a test:
 
