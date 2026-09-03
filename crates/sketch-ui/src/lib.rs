@@ -5038,14 +5038,6 @@ pub struct SketchCanvasState {
     /// canvas so a row in the list can be found in the drawing. Presentation
     /// only: set each frame by whoever draws the list, never persisted.
     relation_highlight: Vec<SketchPoint>,
-    /// Where each dimension's value has been dragged to, as an offset in
-    /// sketch units from where the geometry would otherwise put it.
-    ///
-    /// Sketch units rather than screen points so a placed dimension keeps its
-    /// place under pan and zoom. This is the sketch session's, not the
-    /// document's: a dimension reopened later starts from its computed
-    /// position again.
-    dimension_placements: BTreeMap<CoreConstraintId, (f64, f64)>,
     /// The drag in progress on a dimension's value, and where inside the chip
     /// it was grabbed, so the label does not jump to the pointer.
     dimension_drag: DragHandleState,
@@ -5124,7 +5116,6 @@ impl Default for SketchCanvasState {
             dimension_operands: Vec::new(),
             relation_diagnostic: None,
             relation_highlight: Vec::new(),
-            dimension_placements: BTreeMap::new(),
             dimension_drag: DragHandleState::default(),
             dimension_drag_target: None,
             modifier_picks: BTreeMap::new(),
@@ -8772,13 +8763,14 @@ impl SketchCanvasState {
     ) -> Option<SketchPoint> {
         let (from, to) = self.constraint_leader(kind)?;
         let placed = self
-            .dimension_placements
+            .authoring
+            .constraints()
             .get(&id)
-            .copied()
-            .unwrap_or((0.0, 0.0));
+            .and_then(|record| record.label_offset)
+            .unwrap_or(CorePoint2::new(0.0, 0.0));
         Some(SketchPoint::new(
-            (from.u + to.u) * 0.5 + placed.0,
-            (from.v + to.v) * 0.5 + placed.1,
+            (from.u + to.u) * 0.5 + placed.u,
+            (from.v + to.v) * 0.5 + placed.v,
         ))
     }
 
@@ -8882,26 +8874,12 @@ impl SketchCanvasState {
             return false;
         };
         let pointer = self.view.screen_to_sketch(rect, position);
-        let placement = (
+        let placement = CorePoint2::new(
             pointer.u - grab.0 - (from.u + to.u) * 0.5,
             pointer.v - grab.1 - (from.v + to.v) * 0.5,
         );
-        if self.dimension_placements.get(&id) == Some(&placement) {
-            return false;
-        }
-        self.dimension_placements.insert(id, placement);
-        true
-    }
-
-    /// Forgets placements for relations the sketch no longer holds, so a
-    /// released dimension does not leave its label's position behind.
-    fn prune_dimension_placements(&mut self) {
-        if self.dimension_placements.is_empty() {
-            return;
-        }
-        let held = self.authoring.constraints();
-        self.dimension_placements
-            .retain(|id, _| held.contains_key(id));
+        self.authoring
+            .set_constraint_label_offset(id, Some(placement))
     }
 
     /// Where a dimension's leader runs: from the thing it is measured from to
@@ -11148,7 +11126,6 @@ fn handle_dimension_drag_input(
     canvas: &Response,
     state: &mut SketchCanvasState,
 ) -> DimensionDragInteraction {
-    state.prune_dimension_placements();
     if state.pending.is_some() {
         state.dimension_drag.cancel();
         state.dimension_drag_target = None;

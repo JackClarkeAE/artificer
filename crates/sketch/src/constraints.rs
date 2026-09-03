@@ -205,6 +205,17 @@ pub struct SketchConstraintRecord {
     pub kind: SketchConstraintKind,
     #[serde(default = "constraint_enabled")]
     pub enabled: bool,
+    /// Where the drawing puts this dimension's value, as an offset in sketch
+    /// units from the middle of what it measures.
+    ///
+    /// An offset rather than a position, so a label keeps its place beside the
+    /// geometry when the dimension is retyped and the geometry moves. It is
+    /// part of the drawing and travels with it: a dimension dragged clear of a
+    /// crowded corner should still be clear when the sketch is opened
+    /// tomorrow. Absent means the computed position, which is where every
+    /// dimension starts and where those authored before this field stay.
+    #[serde(default)]
+    pub label_offset: Option<SketchPoint2>,
 }
 
 const fn constraint_enabled() -> bool {
@@ -1182,6 +1193,7 @@ mod tests {
                 third: ids[1],
             },
             enabled: true,
+            label_offset: None,
         };
         let solved = solve(
             &positions,

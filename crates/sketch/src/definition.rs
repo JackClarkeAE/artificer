@@ -387,6 +387,7 @@ impl SketchDefinition {
                 id,
                 kind,
                 enabled: true,
+                label_offset: None,
             },
         );
         if let Err(error) = self.solve_constraints(precision) {
@@ -432,6 +433,36 @@ impl SketchDefinition {
             .checked_next()
             .ok_or(ConstraintError::IdSpaceExhausted)?;
         Ok(())
+    }
+
+    /// Moves where a dimension's value is drawn, as an offset in sketch units
+    /// from the middle of what it measures.
+    ///
+    /// Deliberately outside the transaction machinery, and deliberately not a
+    /// new revision. Dragging a label changes the drawing, not the geometry:
+    /// advancing the revision here would mark every feature built on this
+    /// sketch stale, so tidying an annotation would ask for a rebuild. The
+    /// offset still travels with the document, because where a dimension sits
+    /// is part of the drawing.
+    ///
+    /// Answers whether anything changed. A non-finite offset is refused rather
+    /// than stored, so a label can never be moved somewhere unpaintable.
+    pub fn set_constraint_label_offset(
+        &mut self,
+        id: SketchConstraintId,
+        offset: Option<SketchPoint2>,
+    ) -> bool {
+        if offset.is_some_and(|offset| !offset.is_finite()) {
+            return false;
+        }
+        let Some(record) = self.constraints.get_mut(&id) else {
+            return false;
+        };
+        if record.label_offset == offset {
+            return false;
+        }
+        record.label_offset = offset;
+        true
     }
 
     pub fn remove_constraint(&mut self, id: SketchConstraintId) -> bool {

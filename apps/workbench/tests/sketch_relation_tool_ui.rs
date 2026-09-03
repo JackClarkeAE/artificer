@@ -568,3 +568,76 @@ fn a_dimension_label_is_dragged_clear_of_the_geometry_it_measures() {
         "the grab must not read as the first pick of another dimension"
     );
 }
+
+/// Where a dimension's value was dragged to is part of the drawing, so it is
+/// in the document: a sketch saved, reopened in a fresh process and edited
+/// again shows its labels where they were left.
+#[test]
+fn a_dragged_dimension_label_survives_a_save_and_reopen() {
+    let mut source = harness();
+    enter_xy_sketch(&mut source);
+    draw_line(
+        &mut source,
+        SketchPoint::new(-3.0, 0.0),
+        SketchPoint::new(3.0, 0.0),
+    );
+    draw_line(
+        &mut source,
+        SketchPoint::new(-3.0, 2.0),
+        SketchPoint::new(3.0, 2.0),
+    );
+    click_button(&mut source, "Sketch dimension");
+    click_sketch_point(&mut source, SketchPoint::new(-3.0, 0.0));
+    click_sketch_point(&mut source, SketchPoint::new(-3.0, 2.0));
+    confirm_if_staged(&mut source);
+    assert_eq!(source.state().sketch_constraint_count(), 1);
+
+    let placed = *source
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("the dimension has a label");
+    let viewport = source.get_by_label("Sketch viewport").rect();
+    let grab = source
+        .state()
+        .sketch_point_screen_position(viewport, placed);
+    let release = source
+        .state()
+        .sketch_point_screen_position(viewport, SketchPoint::new(-5.5, 1.0));
+    drag_between(&mut source, grab, release);
+    let moved = *source
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("the label is still there");
+    assert!((moved.u - (-5.5)).abs() <= 0.05, "dragged: {moved:?}");
+
+    click_button(&mut source, "Finish sketch");
+    assert_eq!(source.state().workbench_mode(), WorkbenchMode::Model);
+    let saved = source.state().native_document_json().expect("save");
+
+    let mut restored = harness();
+    restored.run();
+    restored
+        .state_mut()
+        .load_native_document_json(&saved)
+        .expect("the sketch should hydrate in a fresh process");
+    restored.run();
+    click_button(&mut restored, "Sketch 1 feature");
+    assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Sketch);
+
+    assert_eq!(
+        restored.state().sketch_constraint_count(),
+        1,
+        "the dimension came back"
+    );
+    let reopened = *restored
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("and so did its label");
+    assert!(
+        (reopened.u - moved.u).abs() <= 1.0e-6 && (reopened.v - moved.v).abs() <= 1.0e-6,
+        "the label should reopen where it was left: {reopened:?} against {moved:?}"
+    );
+}

@@ -541,3 +541,70 @@ fn a_circle_is_placed_in_a_rectangle_by_dimensions_from_two_edges() {
     assert_eq!(solved(&sketch, bottom_right), SketchPoint2::new(40.0, 0.0));
     assert_eq!(solved(&sketch, top_left), SketchPoint2::new(0.0, 20.0));
 }
+
+/// Where a dimension's value sits is part of the drawing, so it travels with
+/// the document — and it is not a change to the geometry, so it does not
+/// advance the revision and cannot make a feature built on this sketch stale.
+#[test]
+fn a_dimension_label_offset_persists_without_advancing_the_revision() {
+    let mut sketch = SketchDefinition::new();
+    let (start, _) = commit_line(&mut sketch, (0.0, 0.0), (10.0, 0.0));
+    let (other, _) = commit_line(&mut sketch, (0.0, 4.0), (10.0, 4.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Distance {
+                first: start,
+                second: other,
+                distance: 4.0,
+            },
+            "Distance",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the dimension");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the dimension");
+    let id = *sketch.constraints().keys().next().expect("one dimension");
+    let revision = sketch.revision();
+
+    let offset = SketchPoint2::new(-3.0, 1.5);
+    assert!(sketch.set_constraint_label_offset(id, Some(offset)));
+    assert_eq!(sketch.constraints()[&id].label_offset, Some(offset));
+    assert_eq!(
+        sketch.revision(),
+        revision,
+        "moving a label is not a change to the geometry"
+    );
+    assert!(
+        !sketch.set_constraint_label_offset(id, Some(offset)),
+        "putting a label where it already is changes nothing"
+    );
+    assert!(
+        !sketch.set_constraint_label_offset(id, Some(SketchPoint2::new(f64::NAN, 0.0))),
+        "a label cannot be moved somewhere unpaintable"
+    );
+    assert_eq!(sketch.constraints()[&id].label_offset, Some(offset));
+
+    // It survives the trip through the document.
+    let json = serde_json::to_string(&sketch).expect("serialize");
+    let decoded: SketchDefinition = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(decoded.constraints()[&id].label_offset, Some(offset));
+
+    // And retyping the dimension keeps the label where it was put.
+    let retyped = sketch
+        .stage_constraint_value(id, 6.0, "Sketch dimension", PrecisionPolicy::default())
+        .expect("stage the new value");
+    sketch
+        .commit(retyped, ConfirmationSource::GreenTick)
+        .expect("commit the new value");
+    assert_eq!(sketch.constraints()[&id].label_offset, Some(offset));
+    assert_eq!(sketch.constraints()[&id].kind.value(), Some(6.0));
+
+    // A sketch written before labels could be moved reads back with none.
+    let legacy = json.replace(
+        r#""label_offset":{"u":-3.0,"v":1.5}"#,
+        r#""label_offset":null"#,
+    );
+    let decoded: SketchDefinition = serde_json::from_str(&legacy).expect("deserialize");
+    assert_eq!(decoded.constraints()[&id].label_offset, None);
+}

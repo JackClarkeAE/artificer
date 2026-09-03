@@ -2206,6 +2206,15 @@ fn render_constraint_block(
                         reason,
                         TileIdentity::Constraint(*variant),
                     );
+                    // The same cell boundary a drawing family draws. Both
+                    // blocks are one set of controls, and a tile without the
+                    // outline reads as a label rather than a button.
+                    paint_family_cell_boundary(
+                        ui,
+                        cell_rect,
+                        active == *variant,
+                        response.hovered(),
+                    );
                     if response.clicked() {
                         preferences.remember(*variant);
                         output.chosen = Some(*variant);
