@@ -1,6 +1,7 @@
 use artificer_sketch_ui::sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
-    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_COLUMNS,
+    CONSTRAINT_DIVIDER_WIDTH, CONSTRAINT_TOOLS, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
+    ROW_GAP,
 };
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
 use egui::accesskit::Role;
@@ -155,7 +156,7 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
     // Six columns of drawing tools in two rows; the constraints stand in
-    // their own column beyond a divider, Relation above Dimension.
+    // their own block beyond a divider, one cell each.
     let rows = [
         [
             "Select sketch geometry",
@@ -174,10 +175,12 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             "Rectangular sketch pattern",
         ],
     ];
-    for (row_index, label) in ["Horizontal relation", "Sketch dimension"]
-        .into_iter()
-        .enumerate()
-    {
+    // Every constraint has a cell beyond the divider — all eleven of them on
+    // screen at once, and every one inside the minimum window.
+    for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
+        let label = variant.descriptor().accessible_name;
+        let row_index = index / CONSTRAINT_COLUMNS;
+        let column = index % CONSTRAINT_COLUMNS;
         let row_first = harness
             .get_by_role_and_label(Role::Button, rows[row_index][0])
             .rect();
@@ -188,7 +191,8 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             row_first.left()
                 + 6.0 * PRIMARY_CELL_WIDTH
                 + 5.0 * FAMILY_GAP
-                + CONSTRAINT_DIVIDER_WIDTH,
+                + CONSTRAINT_DIVIDER_WIDTH
+                + column as f32 * (CONSTRAINT_CELL_WIDTH + FAMILY_GAP),
             "{label} sits beyond the divider"
         );
         assert!(rect.max.x <= 1040.0, "{label} is clipped: {rect:?}");

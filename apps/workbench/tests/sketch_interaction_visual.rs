@@ -365,3 +365,32 @@ fn dimension_tool_armed_on_a_rectangle_snapshot() {
     harness.get_by_role_and_label(Role::TextInput, "Rectangle width");
     settle_snapshot(&mut harness, "workbench_dimension_tool_armed_1040");
 }
+
+/// The constraint block and the panel it raises, which is what the sketch
+/// workspace had no answer for: eleven relations on the ribbon, the armed one
+/// lit, and a panel naming it, saying what to pick, and listing what the
+/// sketch already holds.
+#[test]
+fn armed_relation_panel_and_held_relations_snapshot() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Single line");
+    commit_line(
+        &mut harness,
+        SketchPoint::new(-4.0, -1.0),
+        SketchPoint::new(2.0, 1.5),
+    );
+    press_key(&mut harness, egui::Key::Escape);
+
+    // Level the line, then arm a second relation so the panel shows both the
+    // armed tool and the relation the sketch is now holding.
+    click_button(&mut harness, "Horizontal relation");
+    click_sketch_point(&mut harness, SketchPoint::new(-1.0, 0.25));
+    if harness.state().sketch_pending_label().is_some() {
+        click_button(&mut harness, "Confirm operation");
+    }
+    assert_eq!(harness.state().sketch_constraint_count(), 1);
+
+    click_button(&mut harness, "Perpendicular relation");
+    settle_snapshot(&mut harness, "workbench_relation_panel_1040");
+}

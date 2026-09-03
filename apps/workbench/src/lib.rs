@@ -72,8 +72,8 @@ use artificer_protocol::{
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
     CurveIntersections, EvaluatedCurve2 as AuthoringCurve2, ProfileCompileError, RegionSignature,
-    SketchArrangement, SketchDefinition, SketchPoint2 as AuthoringPoint2, build_arrangement,
-    compile_selected_profile, intersect_curves,
+    SketchArrangement, SketchConstraintId, SketchDefinition, SketchPoint2 as AuthoringPoint2,
+    build_arrangement, compile_selected_profile, intersect_curves,
 };
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Frame, Margin, RichText, Stroke};
@@ -94,14 +94,14 @@ use crate::shell::{WorkbenchShellState, WorkbenchShellVisibility};
 use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
     DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
-    SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
-    SketchContextFitKey, SketchContextLayer, SketchContextTriangle, SketchCurveDirection,
-    SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId, SketchGeometry,
-    SketchPlane, SketchPoint, SketchView, SketchViewportContext,
+    SelectedRecipeParameter, SketchCanvasState, SketchConstraintSummary, SketchContextCurve,
+    SketchContextEdge, SketchContextFitKey, SketchContextLayer, SketchContextTriangle,
+    SketchCurveDirection, SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId,
+    SketchGeometry, SketchPlane, SketchPoint, SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
-    CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
-    paint_tool_icon,
+    CommitContract, SelectionRequirement, SketchToolbarState, ToolFamily, ToolInputKind,
+    ToolVariant, paint_tool_icon,
 };
 use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
 use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
@@ -3392,6 +3392,24 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_dimension_error(&self) -> Option<DimensionInputError> {
         self.sketch.dimension_error()
+    }
+
+    /// How many relations the sketch is holding.
+    #[must_use]
+    pub fn sketch_constraint_count(&self) -> usize {
+        self.sketch.constraint_count()
+    }
+
+    /// How many operands the armed relation has collected so far.
+    #[must_use]
+    pub fn sketch_relation_operand_count(&self) -> usize {
+        self.sketch.relation_operand_count()
+    }
+
+    /// Why the last relation pick went nowhere, if it did.
+    #[must_use]
+    pub fn sketch_relation_diagnostic(&self) -> Option<&str> {
+        self.sketch.relation_diagnostic()
     }
 
     #[must_use]
@@ -13900,6 +13918,7 @@ impl KernelLabApp {
     /// not need it.
     fn sketch_parameter_panel(&mut self, ui: &mut egui::Ui) {
         if self.workbench_mode != WorkbenchMode::Sketch {
+            self.sketch.set_relation_highlight(&[]);
             return;
         }
         let parameters = self.orphaned_sketch_parameters();
@@ -13923,9 +13942,25 @@ impl KernelLabApp {
         let shows_tool = !inspecting
             && !descriptor.inputs.is_empty()
             && !Self::tool_inputs_are_dimension_boxes(self.active_sketch_tool);
-        if !shows_selected && !shows_tool {
+        // A relation has no fields of its own, which is precisely why it needs
+        // this panel: what it is waiting to be picked, and what it refused,
+        // are the only feedback a relation gives. Held relations join it while
+        // the user is inspecting, so a sketch that will not move can be asked
+        // why.
+        let arming_relation = self.active_sketch_tool.family() == ToolFamily::Relation;
+        let shows_relations = arming_relation || (inspecting && self.sketch.constraint_count() > 0);
+        if !shows_selected && !shows_tool && !shows_relations {
+            self.sketch.set_relation_highlight(&[]);
             return;
         }
+        // Only summarized when the panel will show them: this runs every frame
+        // the sketch is open.
+        let relations = if shows_relations {
+            self.sketch.constraint_summaries()
+        } else {
+            Vec::new()
+        };
+        let mut remove = None;
         egui::Panel::right("sketch_parameter_panel")
             .exact_size(232.0)
             .resizable(false)
@@ -13945,7 +13980,7 @@ impl KernelLabApp {
                     );
                     ui.add_space(3.0);
                     self.sketch_recipe_parameter_fields(ui, &parameters);
-                } else {
+                } else if shows_tool {
                     ui.label(
                         RichText::new(descriptor.accessible_name)
                             .color(theme::accent())
@@ -13953,7 +13988,141 @@ impl KernelLabApp {
                     );
                     self.sketch_active_tool_inputs(ui, descriptor);
                 }
+                if shows_relations {
+                    if shows_selected || shows_tool {
+                        ui.add_space(9.0);
+                        ui.separator();
+                    }
+                    remove = self.sketch_relation_panel(ui, arming_relation, &relations);
+                }
             });
+        if let Some(id) = remove
+            && let Some(subject) = self.sketch.stage_constraint_removal(id)
+        {
+            self.commit_sketch_stroke(subject);
+        }
+    }
+
+    /// The relation section of the sketch panel: what the armed relation wants
+    /// next, what it last refused, and every relation the sketch holds.
+    ///
+    /// Returns the relation the user asked to remove, if any; the removal is
+    /// staged by the caller, outside the panel's borrow.
+    fn sketch_relation_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        arming_relation: bool,
+        relations: &[SketchConstraintSummary],
+    ) -> Option<SketchConstraintId> {
+        let descriptor = self.active_sketch_tool.descriptor();
+        if arming_relation {
+            ui.label(RichText::new("RELATION").small().color(theme::muted()));
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(descriptor.accessible_name)
+                    .color(theme::accent())
+                    .strong(),
+            );
+            ui.add(
+                egui::Label::new(
+                    RichText::new(descriptor.short_tooltip)
+                        .small()
+                        .color(theme::muted()),
+                )
+                .wrap(),
+            );
+            if let Some(step) = self.sketch.relation_step() {
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(RichText::new(step).small().color(
+                        if self.sketch.relation_operand_count() > 0 {
+                            theme::good()
+                        } else {
+                            theme::text()
+                        },
+                    ))
+                    .wrap(),
+                );
+            }
+            if let Some(diagnostic) = self.sketch.relation_diagnostic() {
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(RichText::new(diagnostic).small().color(theme::bad())).wrap(),
+                );
+            }
+            ui.add_space(7.0);
+        }
+
+        ui.label(
+            RichText::new(format!("RELATIONS HELD · {}", relations.len()))
+                .small()
+                .color(theme::muted()),
+        );
+        ui.add_space(3.0);
+        if relations.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("None yet. Pick a relation, then click the geometry it holds.")
+                        .small()
+                        .color(theme::muted()),
+                )
+                .wrap(),
+            );
+            self.sketch.set_relation_highlight(&[]);
+            return None;
+        }
+
+        // A release is a staged model edit like any other, so it waits behind
+        // whatever is already at the gate rather than failing at the click.
+        let staging_blocked = self.pending_operation.is_some() || self.sketch.has_pending_edit();
+        let mut remove = None;
+        let mut highlight: &[SketchPoint] = &[];
+        for (index, relation) in relations.iter().enumerate() {
+            let row = ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(160.0);
+                    ui.label(RichText::new(relation.label).color(theme::text()));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&relation.detail).small().color(theme::muted()),
+                        )
+                        .wrap(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let name = format!("Remove relation {}", index + 1);
+                    let response =
+                        ui.add_enabled(!staging_blocked, egui::Button::new("×").small());
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            !staging_blocked,
+                            name.clone(),
+                        )
+                    });
+                    let response = if staging_blocked {
+                        response.on_disabled_hover_text(
+                            crate::sketch_toolbar::PENDING_CONFIRMATION_DISABLED_REASON,
+                        )
+                    } else {
+                        response.on_hover_text(format!(
+                            "Release the {} relation. The geometry it holds returns to the shape it was drawn with.",
+                            relation.label
+                        ))
+                    };
+                    if response.clicked() {
+                        remove = Some(relation.id);
+                    }
+                });
+            });
+            // Ringing the points it holds is what turns a word in a list into
+            // something findable in the drawing.
+            if row.response.contains_pointer() {
+                highlight = &relation.points;
+            }
+        }
+        self.sketch.set_relation_highlight(highlight);
+        remove
     }
 
     /// The active sketch tool's own input fields.

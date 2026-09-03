@@ -10,7 +10,7 @@ use std::array;
 use std::f32::consts::{PI, TAU};
 
 use egui::{
-    Align, Align2, Button, Color32, Direction, Key, Layout, Modifiers, Painter, Pos2, Rect,
+    Align, Align2, Button, Color32, Direction, FontId, Key, Layout, Modifiers, Painter, Pos2, Rect,
     Response, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, WidgetInfo, WidgetType, pos2,
     vec2,
 };
@@ -26,15 +26,23 @@ pub const PRIMARY_CELL_SIZE: f32 = 33.0;
 ///
 /// Uniform rather than fitted per label, because a ribbon row of ragged tiles
 /// reads as a mistake. Sized so the longest label — `Rectangle`, which measures
-/// 51 px at [`TextStyle::Small`] — clears the chooser column with room to spare.
-/// At 88 px it did not, and ran into the chevron.
-pub const PRIMARY_CELL_WIDTH: f32 = 97.0;
+/// 46 px at [`TILE_LABEL_TEXT_SIZE`] — clears the chooser column with room to
+/// spare. The tile shrank from 97 px when the label did: the width the smaller
+/// text gave back is what pays for the constraint block beyond the divider.
+pub const PRIMARY_CELL_WIDTH: f32 = 87.0;
 /// Left column of a tile, holding the icon.
-pub const TILE_ICON_COLUMN: f32 = 26.0;
+pub const TILE_ICON_COLUMN: f32 = 24.0;
 /// Side length of the icon painted inside that column.
-pub const TILE_ICON_SIZE: f32 = 22.0;
+pub const TILE_ICON_SIZE: f32 = 20.0;
 /// Gap between the icon column and the start of the label.
 pub const TILE_LABEL_GAP: f32 = 2.0;
+/// Size of the text drawn on a family tile.
+///
+/// A point under `TextStyle::Small`, which is 11 px here. The tile label is a
+/// caption on a control the icon has already named, not body text, and the
+/// point it gives back per tile is what lets six drawing families and every
+/// constraint share one ribbon row at the minimum window width.
+pub const TILE_LABEL_TEXT_SIZE: f32 = 10.0;
 /// Side length of the separately focusable chooser contained by a family tile.
 ///
 /// A full-height column at the tile's right edge. It used to be a 12 px square
@@ -42,10 +50,10 @@ pub const TILE_LABEL_GAP: f32 = 2.0;
 /// chooser and the glyph collide.
 pub const CHEVRON_CELL_WIDTH: f32 = 13.0;
 // The label has to clear the chooser column: `Rectangle` is the longest at
-// 51 px, and at the old 88 px tile it ran into the chevron. A tile geometry
+// 46 px, and at the old 88 px tile it ran into the chevron. A tile geometry
 // that breaks this does not compile.
 const _: () =
-    assert!(PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH >= 56.0);
+    assert!(PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH >= 47.0);
 /// Inset that keeps the chooser visibly inside its family tile.
 pub const CHEVRON_CELL_INSET: f32 = 1.0;
 /// Horizontal space between tool families: the same 2 px that separates the
@@ -61,13 +69,27 @@ pub const TOOLBAR_TOP_PADDING: f32 = 4.0;
 pub const TOOLBAR_BOTTOM_PADDING: f32 = 4.0;
 /// Width of the strip that parts the drawing tools from the constraints: a
 /// hairline with breathing room either side. It replaces one family gap, and
-/// the tile is a pixel narrower than it was, so the whole grid is exactly as
-/// wide as the old seven-column one and still fits the minimum window.
+/// says in the layout what the grouping means — what puts geometry on the
+/// canvas to the left of it, what tells the solver how that geometry has to
+/// behave to the right.
 pub const CONSTRAINT_DIVIDER_WIDTH: f32 = 9.0;
+/// Width of one constraint cell.
+///
+/// Square-ish and icon-only, because there are eleven of them and a labelled
+/// tile each would take three ribbons. The name is on the tooltip and in the
+/// accessible name, which is where a control this dense keeps it.
+pub const CONSTRAINT_CELL_WIDTH: f32 = 24.0;
+/// Side length of the glyph painted in a constraint cell.
+pub const CONSTRAINT_ICON_SIZE: f32 = 18.0;
+/// Constraint cells per row, over the same two rows the drawing tools use.
+pub const CONSTRAINT_COLUMNS: usize = 6;
+/// Width of the whole constraint block beyond the divider.
+pub const CONSTRAINT_BLOCK_WIDTH: f32 = CONSTRAINT_CELL_WIDTH * CONSTRAINT_COLUMNS as f32
+    + FAMILY_GAP * (CONSTRAINT_COLUMNS as f32 - 1.0);
 /// Width of the toolbar: six columns of drawing tools, the divider, and the
-/// constraint column.
+/// constraint block.
 pub const SKETCH_TOOLBAR_WIDTH: f32 =
-    PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH;
+    PRIMARY_CELL_WIDTH * 6.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_BLOCK_WIDTH;
 /// Height required by the padded two-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 =
     PRIMARY_CELL_SIZE * 2.0 + ROW_GAP + TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING;
@@ -82,8 +104,10 @@ const _: () = {
     // The grid must fill the ribbon's content height exactly: short leaves the
     // caption floating, tall clips the bottom row.
     assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
-    // The 1040 px minimum window has exactly this much room for the grid.
-    assert!(SKETCH_TOOLBAR_WIDTH == 698.0);
+    // The 1040 px minimum window has this much room for the grid, and no more.
+    assert!(SKETCH_TOOLBAR_WIDTH <= 698.0);
+    // Every constraint has a cell of its own; none may fall off the block.
+    assert!(CONSTRAINT_TOOLS.len() <= CONSTRAINT_COLUMNS * 2);
 };
 
 /// Left column of a variant-menu row, holding the icon.
@@ -1951,7 +1975,12 @@ pub struct SketchToolbarOutput {
     /// Tight union of persistent toolbar controls; popup menus are excluded.
     pub bounds: Option<Rect>,
     /// Per-family geometry, indexed by [`ToolFamily`] discriminant.
+    ///
+    /// A constraint family has no tile of its own any more, so its entry is the
+    /// union of the cells its variants occupy in the constraint block.
     pub controls: [Option<ToolControlLayout>; ToolFamily::COUNT],
+    /// Per-constraint geometry, indexed as in [`CONSTRAINT_TOOLS`].
+    pub constraints: [Option<Rect>; CONSTRAINT_TOOLS.len()],
     /// True while any family chooser is open after this frame.
     pub menu_open: bool,
     /// True when this module consumed Escape to close a chooser.
@@ -1964,6 +1993,7 @@ impl Default for SketchToolbarOutput {
             chosen: None,
             bounds: None,
             controls: array::from_fn(|_| None),
+            constraints: array::from_fn(|_| None),
             menu_open: false,
             escape_consumed: false,
         }
@@ -1988,8 +2018,29 @@ const SECOND_ROW: &[ToolFamily] = &[
     ToolFamily::Pattern,
 ];
 /// The constraints: what tells the solver how the geometry has to behave.
-/// They stand apart from the drawing tools, behind a divider, one per row.
-const CONSTRAINT_COLUMN: &[ToolFamily] = &[ToolFamily::Relation, ToolFamily::Dimension];
+///
+/// They stand apart from the drawing tools, beyond a divider, and every one of
+/// them is its own button. A relation the user cannot see is a relation they do
+/// not know they have: nine of these used to live inside one tile's dropdown,
+/// under the name of whichever was picked last, which is why the sketch read as
+/// having no constraints at all.
+///
+/// Two rows of [`CONSTRAINT_COLUMNS`], in the order a drawer reaches for them:
+/// the axis relations first, then the pairwise ones, then the two that hold a
+/// measurement.
+pub const CONSTRAINT_TOOLS: &[ToolVariant] = &[
+    ToolVariant::HorizontalRelation,
+    ToolVariant::VerticalRelation,
+    ToolVariant::CoincidentRelation,
+    ToolVariant::CollinearRelation,
+    ToolVariant::ParallelRelation,
+    ToolVariant::PerpendicularRelation,
+    ToolVariant::TangentRelation,
+    ToolVariant::EqualLengthRelation,
+    ToolVariant::DistanceRelation,
+    ToolVariant::FixedRelation,
+    ToolVariant::Dimension,
+];
 
 /// Paint the compact two-row sketch tool grid and return an exact chosen tool.
 ///
@@ -2040,24 +2091,14 @@ pub fn render_sketch_toolbar(
                     );
                 });
                 render_constraint_divider(ui);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (index, family) in CONSTRAINT_COLUMN.iter().enumerate() {
-                        if index > 0 {
-                            ui.add_space(ROW_GAP);
-                        }
-                        render_toolbar_row(
-                            ui,
-                            std::slice::from_ref(family),
-                            &mut state.preferences,
-                            active,
-                            gate,
-                            capabilities,
-                            &mut output,
-                            &mut escaped_anchor,
-                        );
-                    }
-                });
+                render_constraint_block(
+                    ui,
+                    &mut state.preferences,
+                    active,
+                    gate,
+                    capabilities,
+                    &mut output,
+                );
             });
             ui.add_space(TOOLBAR_BOTTOM_PADDING);
         },
@@ -2077,9 +2118,73 @@ pub fn render_sketch_toolbar(
     output
 }
 
+/// Every constraint as its own cell, in two rows beyond the divider.
+///
+/// No chooser and no last-used memory in the cells themselves: the point of
+/// the block is that the whole set is on screen at once. Picking one still
+/// records it as the family's last-used variant, so the keyboard shortcut
+/// re-arms whichever relation the user reached for most recently.
+fn render_constraint_block(
+    ui: &mut Ui,
+    preferences: &mut SketchToolPreferences,
+    active: ToolVariant,
+    gate: SketchOperationGate,
+    capabilities: &SketchToolCapabilities,
+    output: &mut SketchToolbarOutput,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for (row_index, row) in CONSTRAINT_TOOLS.chunks(CONSTRAINT_COLUMNS).enumerate() {
+            if row_index > 0 {
+                ui.add_space(ROW_GAP);
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = FAMILY_GAP;
+                for (column, variant) in row.iter().enumerate() {
+                    let index = row_index * CONSTRAINT_COLUMNS + column;
+                    let (_, cell_rect) =
+                        ui.allocate_space(vec2(CONSTRAINT_CELL_WIDTH, PRIMARY_CELL_SIZE));
+                    let reason = gate
+                        .disabled_reason()
+                        .or_else(|| capabilities.disabled_reason(*variant));
+                    let response = constraint_button(
+                        ui,
+                        cell_rect,
+                        variant.descriptor(),
+                        active == *variant,
+                        reason,
+                    );
+                    if response.clicked() {
+                        preferences.remember(*variant);
+                        output.chosen = Some(*variant);
+                    }
+                    output.constraints[index] = Some(response.rect);
+                    // A constraint family owns no tile, so its layout is the
+                    // union of the cells its variants sit in.
+                    let family = variant.family() as usize;
+                    output.controls[family] = Some(match output.controls[family] {
+                        Some(layout) => ToolControlLayout {
+                            primary: layout.primary.union(response.rect),
+                            chooser: None,
+                        },
+                        None => ToolControlLayout {
+                            primary: response.rect,
+                            chooser: None,
+                        },
+                    });
+                    output.bounds = Some(match output.bounds {
+                        Some(bounds) => bounds.union(response.rect),
+                        None => response.rect,
+                    });
+                }
+            });
+        }
+    });
+}
+
 /// The hairline between the drawing tools and the constraints. It spans both
-/// rows, so the two constraint tiles read as one column set apart from the
-/// grid rather than as the tail of the second row.
+/// rows, so the constraint cells read as one block set apart from the grid
+/// rather than as the tail of the second row.
 fn render_constraint_divider(ui: &mut Ui) {
     let (_, rect) = ui.allocate_space(vec2(
         CONSTRAINT_DIVIDER_WIDTH,
@@ -2323,7 +2428,80 @@ fn icon_button(
         ),
         Align2::LEFT_CENTER,
         label,
-        TextStyle::Small.resolve(ui.style()),
+        FontId::proportional(TILE_LABEL_TEXT_SIZE),
+        icon_color,
+    );
+    if selected {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            3.0,
+            Stroke::new(1.4, ui.visuals().selection.stroke.color),
+            StrokeKind::Inside,
+        );
+    }
+    if let Some(reason) = disabled_reason {
+        response = response.on_disabled_hover_text(reason);
+    } else {
+        response = response.on_hover_ui(|tooltip| descriptor_tooltip(tooltip, descriptor));
+    }
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::Button,
+            enabled,
+            selected,
+            descriptor.accessible_name,
+        )
+    });
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_label(descriptor.accessible_name);
+        node.set_description(descriptor.extended_tooltip);
+    });
+    response
+}
+
+/// One constraint cell: the icon alone, named for the pointer and for
+/// AccessKit.
+///
+/// The same selected/disabled treatment as a family tile, so an armed relation
+/// reads as armed. It is keyed on the variant rather than the family, because
+/// eleven of these share two families between them.
+fn constraint_button(
+    ui: &mut Ui,
+    rect: Rect,
+    descriptor: &'static ToolDescriptor,
+    selected: bool,
+    disabled_reason: Option<&str>,
+) -> Response {
+    let enabled = disabled_reason.is_none();
+    let button = Button::new(())
+        .min_size(rect.size())
+        .selected(selected)
+        .corner_radius(4.0);
+    let mut button_ui = ui.new_child(
+        UiBuilder::new()
+            .id_salt(("sketch_constraint", descriptor.variant))
+            .max_rect(rect)
+            .layout(Layout::centered_and_justified(Direction::TopDown)),
+    );
+    if !enabled {
+        button_ui.disable();
+    }
+    let mut response = button_ui.add_sized(rect.size(), button);
+    let icon_color = if enabled {
+        ui.style()
+            .interact_selectable(&response, selected)
+            .fg_stroke
+            .color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    paint_tool_icon(
+        ui.painter(),
+        Rect::from_center_size(
+            response.rect.center(),
+            vec2(CONSTRAINT_ICON_SIZE, CONSTRAINT_ICON_SIZE),
+        ),
+        descriptor.icon,
         icon_color,
     );
     if selected {
@@ -2973,9 +3151,8 @@ mod tests {
         };
         assert_eq!(FIRST_ROW.len(), 6);
         assert_eq!(SECOND_ROW.len(), 6);
-        assert_eq!(CONSTRAINT_COLUMN.len(), 2);
         assert_eq!(
-            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + PRIMARY_CELL_WIDTH,
+            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_BLOCK_WIDTH,
             SKETCH_TOOLBAR_WIDTH
         );
         assert_eq!(row_width(FIRST_ROW), row_width(SECOND_ROW));
@@ -2986,13 +3163,36 @@ mod tests {
         // The label-clears-the-chooser bound is a compile-time assertion
         // beside the constants; a geometry that breaks it does not build.
 
+        // Every family is drawn, and every family is drawn once: the drawing
+        // families as tiles, the constraint families as their variants' cells.
         let mut all = FIRST_ROW
             .iter()
             .chain(SECOND_ROW)
-            .chain(CONSTRAINT_COLUMN)
             .copied()
+            .chain(CONSTRAINT_TOOLS.iter().map(|variant| variant.family()))
             .collect::<Vec<_>>();
         all.sort_unstable();
+        all.dedup();
         assert_eq!(all, ToolFamily::ALL);
+    }
+
+    /// The block is the whole of both constraint families and nothing else:
+    /// a relation missing from it is a relation the user cannot reach.
+    #[test]
+    fn every_constraint_variant_has_a_cell_of_its_own() {
+        let mut listed = CONSTRAINT_TOOLS.to_vec();
+        listed.sort_unstable();
+        listed.dedup();
+        assert_eq!(listed.len(), CONSTRAINT_TOOLS.len(), "a cell is repeated");
+
+        let mut expected = ToolFamily::Relation
+            .variants()
+            .iter()
+            .chain(ToolFamily::Dimension.variants())
+            .copied()
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
+        assert!(CONSTRAINT_TOOLS.len() <= CONSTRAINT_COLUMNS * 2);
     }
 }

@@ -9,10 +9,11 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
-    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH,
-    SketchOperationGate, SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState,
-    TILE_ICON_COLUMN, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_COLUMNS,
+    CONSTRAINT_DIVIDER_WIDTH, CONSTRAINT_TOOLS, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
+    ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate,
+    SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN,
+    TILE_LABEL_GAP, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
     render_sketch_toolbar,
 };
 
@@ -76,7 +77,7 @@ impl ToolbarHarness {
 }
 
 #[test]
-fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_choosers() {
+fn compact_toolbar_is_six_drawing_columns_and_a_constraint_block_beyond_the_divider() {
     let mut fixture = ToolbarHarness::new();
     fixture.run();
 
@@ -87,10 +88,17 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Sketch point",
         "Trim curve span",
         "2D fillet",
-        "Sketch dimension",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert_eq!(node.rect().width(), PRIMARY_CELL_WIDTH, "{label}");
+        assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
+    }
+    // Every constraint is a cell of its own beyond the divider, icon-only and
+    // uniform: none of them is a tile, and none of them is behind a chooser.
+    for variant in CONSTRAINT_TOOLS {
+        let label = variant.descriptor().accessible_name;
+        let node = fixture.harness.get_by_role_and_label(Role::Button, label);
+        assert_eq!(node.rect().width(), CONSTRAINT_CELL_WIDTH, "{label}");
         assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
     }
     for label in [
@@ -102,7 +110,6 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Two-point centre-to-centre slot",
         "Equal-distance chamfer",
         "Rectangular sketch pattern",
-        "Horizontal relation",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert_eq!(
@@ -122,7 +129,6 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Choose slot type; current default: Two-point centre-to-centre slot.",
         "Choose chamfer type; current default: Equal-distance chamfer.",
         "Choose pattern type; current default: Rectangular sketch pattern.",
-        "Choose relation; current default: Horizontal.",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert!(node.rect().width() < PRIMARY_CELL_WIDTH, "{label}");
@@ -148,7 +154,7 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
     );
 
     // Six columns of drawing tools in two rows, then the divider, then the
-    // constraint column: Relation above Dimension.
+    // constraint block: two rows of cells, one per constraint.
     let rows = [
         [
             ToolFamily::Select,
@@ -167,25 +173,47 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
             ToolFamily::Pattern,
         ],
     ];
-    for (row_index, constraint) in [ToolFamily::Relation, ToolFamily::Dimension]
-        .into_iter()
-        .enumerate()
-    {
+    // The constraint block: two rows of cells beyond the divider, aligned with
+    // the drawing rows they sit beside.
+    let block_left = output.controls[ToolFamily::Select as usize]
+        .expect("select layout")
+        .primary
+        .left()
+        + 6.0 * PRIMARY_CELL_WIDTH
+        + 5.0 * FAMILY_GAP
+        + CONSTRAINT_DIVIDER_WIDTH;
+    for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
+        let row_index = index / CONSTRAINT_COLUMNS;
+        let column = index % CONSTRAINT_COLUMNS;
         let row_first = output.controls[rows[row_index][0] as usize]
             .expect("row control")
             .primary;
-        let layout = output.controls[constraint as usize].expect("constraint layout");
-        assert_eq!(layout.primary.center().y, row_first.center().y);
+        let cell = output.constraints[index].expect("constraint cell");
         assert_eq!(
-            layout.primary.left(),
-            row_first.left()
-                + 6.0 * PRIMARY_CELL_WIDTH
-                + 5.0 * FAMILY_GAP
-                + CONSTRAINT_DIVIDER_WIDTH,
-            "{constraint:?} sits beyond the divider"
+            cell.size(),
+            egui::vec2(CONSTRAINT_CELL_WIDTH, PRIMARY_CELL_SIZE),
+            "{variant:?} must be a whole cell"
         );
-        assert_eq!(layout.primary.right(), bounds.right());
+        assert_eq!(
+            cell.center().y,
+            row_first.center().y,
+            "{variant:?} row drifted"
+        );
+        assert_eq!(
+            cell.left(),
+            block_left + column as f32 * (CONSTRAINT_CELL_WIDTH + FAMILY_GAP),
+            "{variant:?} column drifted"
+        );
+        assert!(cell.right() <= bounds.right());
     }
+    // The full row reaches the toolbar's trailing edge: the block is as wide
+    // as the width the narrower tiles gave back, not a stub of it.
+    assert_eq!(
+        output.constraints[CONSTRAINT_COLUMNS - 1]
+            .expect("last cell of the first constraint row")
+            .right(),
+        bounds.right()
+    );
     for (row_index, row) in rows.into_iter().enumerate() {
         let first = output.controls[row[0] as usize]
             .expect("first row control")
@@ -364,4 +392,47 @@ fn pending_confirmation_disables_both_halves_of_every_selector() {
             .accesskit_node()
             .is_disabled()
     );
+}
+
+/// The tile geometry leaves the label a fixed column, and the label has to fit
+/// it: the constants can only assert the arithmetic, not what the text
+/// actually measures. This is the measurement, at the size the tile draws.
+#[test]
+fn every_tile_label_fits_the_column_the_tile_geometry_leaves_it() {
+    let measured: Rc<RefCell<Vec<(&'static str, f32)>>> = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&measured);
+    let mut harness = Harness::builder()
+        .with_size([1040.0, 700.0])
+        .with_pixels_per_point(1.0)
+        .with_theme(egui::Theme::Dark)
+        .build_ui(move |ui| {
+            let mut sink = sink.borrow_mut();
+            sink.clear();
+            for family in ToolFamily::ALL {
+                for variant in family.variants() {
+                    let label = variant.tile_label();
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            label.to_owned(),
+                            egui::FontId::proportional(sketch_toolbar::TILE_LABEL_TEXT_SIZE),
+                            egui::Color32::WHITE,
+                        )
+                        .rect
+                        .width();
+                    sink.push((label, width));
+                }
+            }
+        });
+    harness.run();
+
+    // A split tile stops short of the chooser column; an unsplit one does not,
+    // so the tighter of the two is the bound every label must clear.
+    let room = PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH;
+    for (label, width) in measured.borrow().iter() {
+        assert!(
+            *width <= room,
+            "{label} measures {width} pt and the tile leaves {room} pt"
+        );
+    }
 }

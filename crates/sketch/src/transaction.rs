@@ -4,10 +4,10 @@ use std::fmt;
 use artificer_protocol::PrecisionPolicy;
 
 use crate::{
-    CurveProvenance, OutputRole, PrimitiveEvaluation, SketchConstraintKind, SketchDefinition,
-    SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId, SketchOutputOwner,
-    SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision,
-    SketchValidationError, evaluate_recipe, instantiate_curve,
+    CurveProvenance, OutputRole, PrimitiveEvaluation, SketchConstraintId, SketchConstraintKind,
+    SketchDefinition, SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId,
+    SketchOutputOwner, SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord,
+    SketchRecipe, SketchRevision, SketchValidationError, evaluate_recipe, instantiate_curve,
 };
 
 /// Visible confirmation path used to publish an atomic sketch edit.
@@ -351,6 +351,70 @@ impl SketchDefinition {
         }
         // Each `add_constraint` advances the revision; the batch publishes one
         // successor however many equations it carries.
+        candidate.set_revision(next_revision(self.revision())?);
+        candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
+        Ok(SketchTransaction {
+            expected_revision: self.revision(),
+            label,
+            candidate,
+            impact,
+            inputs: SketchInputValues::default(),
+            precision,
+        })
+    }
+
+    /// Stages the removal of one held relation as an atomic transaction.
+    ///
+    /// Dropping an equation cannot conflict — the system it leaves is a subset
+    /// of one that already solved — but it does free points the solver was
+    /// holding, so it goes through the same candidate/impact/confirm path as
+    /// adding one rather than mutating the live definition.
+    ///
+    /// A relation is a projection over the recipes, applied at evaluation
+    /// time, not an edit written back into them: the impact of releasing one
+    /// is therefore every point that returns to what its recipe says, and the
+    /// geometry visibly goes back to the shape it was drawn with.
+    pub fn stage_constraint_removal(
+        &self,
+        id: SketchConstraintId,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let label = checked_label(label)?;
+        if !self.constraints.contains_key(&id) {
+            return Err(SketchTransactionError::NoChange);
+        }
+        let before = self
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let mut candidate = self.clone();
+        if !candidate.remove_constraint(id) {
+            return Err(SketchTransactionError::NoChange);
+        }
+        let after = candidate
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+
+        let mut impact = SketchImpactReport {
+            profile_changed: true,
+            ..SketchImpactReport::default()
+        };
+        for (point, position) in &after.positions {
+            let moved = before
+                .positions
+                .get(point)
+                .is_none_or(|previous| !positions_agree(*previous, *position, precision));
+            if moved {
+                impact.changed_points.insert(*point);
+                for (entity, record) in candidate.entities() {
+                    if record.active && record.geometry.referenced_points().contains(point) {
+                        impact.changed_entities.insert(*entity);
+                    }
+                }
+            }
+        }
+        // `remove_constraint` advances the revision itself; pin it to the one
+        // successor this transaction publishes, as the adding path does.
         candidate.set_revision(next_revision(self.revision())?);
         candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
         Ok(SketchTransaction {

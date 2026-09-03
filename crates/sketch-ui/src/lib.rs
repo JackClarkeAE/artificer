@@ -32,12 +32,12 @@ use artificer_sketch::{
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
     ProfileCompileError as CoreProfileCompileError, RegionSignature as CoreRegionSignature,
     RetirementPolicy as CoreRetirementPolicy, SignedLength as CoreSignedLength,
-    SketchArrangement as CoreSketchArrangement, SketchConstraintKind as CoreConstraintKind,
-    SketchCurve2 as CoreCurve2, SketchDefinition as CoreSketchDefinition,
-    SketchEntityId as CoreEntityId, SketchEntityRole as CoreEntityRole,
-    SketchOperationId as CoreOperationId, SketchOutputRef as CoreOutputRef,
-    SketchPoint2 as CorePoint2, SketchPointId as CorePointId, SketchRecipe as CoreRecipe,
-    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    SketchArrangement as CoreSketchArrangement, SketchConstraintId as CoreConstraintId,
+    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
+    SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
+    SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
+    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
+    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
     SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
@@ -5030,6 +5030,10 @@ pub struct SketchCanvasState {
     /// Why the last relation was refused, in the solver's own words. Cleared
     /// when a relation succeeds or the tool changes.
     relation_diagnostic: Option<String>,
+    /// The points of the relation the panel's pointer is over, ringed on the
+    /// canvas so a row in the list can be found in the drawing. Presentation
+    /// only: set each frame by whoever draws the list, never persisted.
+    relation_highlight: Vec<SketchPoint>,
     /// Exact model-space picks keyed by the carrier selected for a corner tool.
     modifier_picks: BTreeMap<CoreEntityId, SketchPoint>,
     hovered: Option<SketchEntityId>,
@@ -5102,6 +5106,7 @@ impl Default for SketchCanvasState {
             modifier_sources: Vec::new(),
             relation_operands: Vec::new(),
             relation_diagnostic: None,
+            relation_highlight: Vec::new(),
             modifier_picks: BTreeMap::new(),
             hovered: None,
             trim_hover_fragment: None,
@@ -5611,6 +5616,12 @@ impl SketchCanvasState {
             self.tool = tool;
             self.modifier_sources.clear();
             self.modifier_picks.clear();
+            // An operand was picked for the relation that was armed when it
+            // was clicked. Carrying it into the next relation would complete
+            // that one from a pick the user made for something else, and
+            // carrying the refusal would explain a pick two tools ago.
+            self.clear_relation_acquisition();
+            self.relation_diagnostic = None;
             self.trim_hover_fragment = None;
             self.pattern_manipulator = None;
             self.dimension_pick = None;
@@ -8379,8 +8390,6 @@ impl SketchCanvasState {
             })
     }
 
-    /// How many operands the active relation still wants, if a relation tool
-    /// owns the pointer.
     /// The sketch's single centreline, as the axis a revolve can turn about
     /// (ADR 0026, F3).
     ///
@@ -8410,10 +8419,128 @@ impl SketchCanvasState {
         self.relation_operands.len()
     }
 
+    /// How many operands the active relation wants, if a relation tool owns
+    /// the pointer.
+    ///
+    /// Horizontal and vertical take either one line or two endpoints, so the
+    /// answer depends on what has been picked already: nothing yet means one
+    /// pick may be enough, a lone point means a second is needed.
+    #[must_use]
+    pub fn relation_operands_required(&self) -> Option<usize> {
+        let arity = relation_arity(self.exact_tool)?;
+        Some(match (self.exact_tool, self.relation_operands.as_slice()) {
+            (
+                ToolVariant::HorizontalRelation | ToolVariant::VerticalRelation,
+                [RelationOperand::Point(_)],
+            ) => 2,
+            _ => arity,
+        })
+    }
+
+    /// What the armed relation is waiting for, in one line, or nothing when no
+    /// relation is armed.
+    ///
+    /// The step is what the panel says while a pick is half-made; the
+    /// descriptor's own prompt covers the first pick.
+    #[must_use]
+    pub fn relation_step(&self) -> Option<String> {
+        let required = self.relation_operands_required()?;
+        let picked = self.relation_operands.len();
+        Some(if picked == 0 {
+            self.exact_tool.descriptor().prompt.to_owned()
+        } else {
+            format!("Picked {picked} of {required} · click the next one")
+        })
+    }
+
     /// The last refusal, in the solver's own words.
     #[must_use]
     pub fn relation_diagnostic(&self) -> Option<&str> {
         self.relation_diagnostic.as_deref()
+    }
+
+    /// Rings these points on the canvas until told otherwise.
+    ///
+    /// Set from the relation list each frame: an empty slice is how the
+    /// highlight goes away, so nothing has to remember to clear it.
+    pub fn set_relation_highlight(&mut self, points: &[SketchPoint]) {
+        if self.relation_highlight != points {
+            self.relation_highlight.clear();
+            self.relation_highlight.extend_from_slice(points);
+        }
+    }
+
+    /// How many relations the sketch is holding.
+    #[must_use]
+    pub fn constraint_count(&self) -> usize {
+        self.authoring
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .count()
+    }
+
+    /// Every relation the sketch is holding, oldest first.
+    ///
+    /// This is what makes constraints a thing the user can see rather than
+    /// infer: a sketch that will not move the way they expect is a sketch with
+    /// a relation in it, and until now nothing on screen said so.
+    #[must_use]
+    pub fn constraint_summaries(&self) -> Vec<SketchConstraintSummary> {
+        self.authoring
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .map(|record| SketchConstraintSummary {
+                id: record.id,
+                label: constraint_kind_label(&record.kind),
+                detail: constraint_detail(&record.kind),
+                points: record
+                    .kind
+                    .referenced_points()
+                    .into_iter()
+                    .filter_map(|point| self.relation_point_position(point))
+                    .map(|position| SketchPoint::new(position.u, position.v))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Stages the removal of one relation behind the usual confirmation gate.
+    ///
+    /// Releasing an equation cannot conflict — what is left solved before — but
+    /// it frees the points the solver was holding, so it travels the same
+    /// staged path as making one: preview, tick, undo.
+    pub fn stage_constraint_removal(&mut self, id: CoreConstraintId) -> Option<SketchEntityId> {
+        let transaction = match self.authoring.stage_constraint_removal(
+            id,
+            "Remove relation",
+            PrecisionPolicy::default(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.relation_diagnostic = Some(error.to_string());
+                return None;
+            }
+        };
+        let subject = transaction
+            .impact()
+            .changed_entities
+            .iter()
+            .find_map(|entity| self.ui_by_core.get(entity).copied())
+            .or(self.selected)
+            .or_else(|| self.entities.first().map(|entity| entity.id))?;
+        match self.stage_core_relation(transaction, "Remove relation", subject) {
+            Ok(subject) => {
+                self.relation_diagnostic = None;
+                Some(subject)
+            }
+            Err(_) => {
+                self.relation_diagnostic =
+                    Some("The removal could not be staged for confirmation.".to_owned());
+                None
+            }
+        }
     }
 
     fn clear_relation_acquisition(&mut self) {
@@ -8676,7 +8803,15 @@ impl SketchCanvasState {
     ) -> Option<SketchEntityId> {
         let variant = self.exact_tool;
         let arity = relation_arity(variant)?;
-        let operand = self.relation_operand_hit(point, pick_radius)?;
+        let Some(operand) = self.relation_operand_hit(point, pick_radius) else {
+            // A relation tool owns the click, so a miss cannot fall through to
+            // selection and must say so itself. Silence here is what made the
+            // relation tools look inert: the pointer was simply not on
+            // anything a relation can name.
+            self.relation_diagnostic =
+                Some("Nothing to relate here. Click a line or one of its endpoints.".to_owned());
+            return None;
+        };
         if self.relation_operands.contains(&operand) {
             self.relation_diagnostic = Some("A relation needs two different operands.".to_owned());
             return None;
@@ -9283,6 +9418,63 @@ const fn relation_arity(variant: ToolVariant) -> Option<usize> {
         | ToolVariant::TangentRelation
         | ToolVariant::CollinearRelation => Some(2),
         _ => None,
+    }
+}
+
+/// One held relation, as the constraint panel lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SketchConstraintSummary {
+    pub id: CoreConstraintId,
+    /// What the relation holds, in one or two words.
+    pub label: &'static str,
+    /// What it holds it on, in the user's terms rather than point ids.
+    pub detail: String,
+    /// The constrained points, in sketch coordinates, for highlighting the
+    /// relation on the canvas.
+    pub points: Vec<SketchPoint>,
+}
+
+/// What one held relation holds, named the way the user picked it rather than
+/// by point identifier.
+fn constraint_detail(kind: &CoreConstraintKind) -> String {
+    let millimetres = |value: f64| format!("{value:.3} mm");
+    match kind {
+        CoreConstraintKind::Fixed { .. } => "pinned point".to_owned(),
+        CoreConstraintKind::Coincident { .. } => "two points held together".to_owned(),
+        CoreConstraintKind::Horizontal { .. } => "two points level".to_owned(),
+        CoreConstraintKind::Vertical { .. } => "two points plumb".to_owned(),
+        CoreConstraintKind::Distance { distance, .. } => millimetres(*distance),
+        CoreConstraintKind::Parallel { .. } => "two lines parallel".to_owned(),
+        CoreConstraintKind::Perpendicular { .. } => "two lines square".to_owned(),
+        CoreConstraintKind::EqualLength { .. } => "two lines the same length".to_owned(),
+        CoreConstraintKind::Tangent { .. } | CoreConstraintKind::LineTangentToArc { .. } => {
+            "line touching an arc".to_owned()
+        }
+        CoreConstraintKind::Collinear { .. } => "three points in line".to_owned(),
+        CoreConstraintKind::LineTangentToCircle { radius, .. } => {
+            format!("line touching a circle of radius {}", millimetres(*radius))
+        }
+    }
+}
+
+/// The name a held relation goes by in the panel.
+///
+/// Shorter than the tool that made it: the panel column is narrow and the row
+/// already says it is a relation.
+const fn constraint_kind_label(kind: &CoreConstraintKind) -> &'static str {
+    match kind {
+        CoreConstraintKind::Fixed { .. } => "Fixed",
+        CoreConstraintKind::Coincident { .. } => "Coincident",
+        CoreConstraintKind::Horizontal { .. } => "Horizontal",
+        CoreConstraintKind::Vertical { .. } => "Vertical",
+        CoreConstraintKind::Distance { .. } => "Distance",
+        CoreConstraintKind::Parallel { .. } => "Parallel",
+        CoreConstraintKind::Perpendicular { .. } => "Perpendicular",
+        CoreConstraintKind::EqualLength { .. } => "Equal length",
+        CoreConstraintKind::Tangent { .. }
+        | CoreConstraintKind::LineTangentToCircle { .. }
+        | CoreConstraintKind::LineTangentToArc { .. } => "Tangent",
+        CoreConstraintKind::Collinear { .. } => "Collinear",
     }
 }
 
@@ -10830,6 +11022,7 @@ pub fn show_with_context(
         state.selected,
     );
     paint_modifier_sources(&painter, response.rect, state);
+    paint_relation_highlight(&painter, response.rect, state);
     let semantic_selected = semantic_selection_targets(ui, response.rect, state);
     if let Some(selected) = semantic_selected {
         selection_changed |= state.set_selected(Some(selected));
@@ -11698,6 +11891,18 @@ fn paint_modifier_sources(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 Stroke::new(3.1, sketch_colours().selected),
             );
         }
+    }
+}
+
+/// Rings the points one listed relation holds.
+///
+/// A relation names points, and a list of words cannot say which ones. The
+/// panel row sets this while the pointer is over it, so "Coincident" in the
+/// list and the corner it holds are the same thing on screen.
+fn paint_relation_highlight(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
+    for point in &state.relation_highlight {
+        let centre = state.view.sketch_to_screen(rect, *point);
+        painter.circle_stroke(centre, 6.0, Stroke::new(1.6, sketch_colours().selected));
     }
 }
 

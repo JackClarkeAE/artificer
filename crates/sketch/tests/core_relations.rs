@@ -311,3 +311,125 @@ fn a_perpendicular_relation_squares_two_lines() {
         "the lines should be square, dot = {dot}"
     );
 }
+
+/// A relation can be released again, through the same staged path that made
+/// it. The equation goes; the geometry returns to what its recipe says,
+/// because a relation is a projection over the recipes rather than an edit
+/// written back into them.
+#[test]
+fn releasing_a_relation_stages_like_making_one_and_returns_the_geometry() {
+    let mut sketch = SketchDefinition::new();
+    let (start, end) = commit_line(&mut sketch, (0.0, 0.0), (10.0, 4.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Horizontal {
+                first: start,
+                second: end,
+            },
+            "Horizontal",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the relation");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the relation");
+    let id = *sketch.constraints().keys().next().expect("one relation");
+    let held = sketch.revision();
+    assert!((solved(&sketch, end).v - solved(&sketch, start).v).abs() <= 1.0e-9);
+
+    let removal = sketch
+        .stage_constraint_removal(id, "Remove relation", PrecisionPolicy::default())
+        .expect("releasing a relation should stage");
+    assert!(
+        !removal.impact().changed_points.is_empty(),
+        "releasing a relation that was holding the line must report the movement"
+    );
+    // Staging changes nothing: the live sketch still holds the relation.
+    assert_eq!(sketch.constraints().len(), 1);
+    assert_eq!(sketch.revision(), held);
+
+    sketch
+        .commit(removal, ConfirmationSource::GreenTick)
+        .expect("commit the release");
+    assert!(sketch.constraints().is_empty());
+    assert!(
+        (solved(&sketch, end).v - 4.0).abs() <= 1.0e-9,
+        "the released line returns to the shape it was drawn with"
+    );
+
+    // Undo puts a released relation back, the same way it takes a made one
+    // away: the journal is what a user reaches for after releasing the wrong
+    // one.
+    let mut journal = SketchUndoJournal::new(8);
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Horizontal {
+                first: start,
+                second: end,
+            },
+            "Horizontal",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the relation again");
+    journal
+        .confirm(
+            &mut sketch,
+            transaction,
+            ConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        )
+        .expect("confirm the relation through the journal");
+    let reinstated = *sketch.constraints().keys().next().expect("one relation");
+    let removal = sketch
+        .stage_constraint_removal(reinstated, "Remove relation", PrecisionPolicy::default())
+        .expect("stage the release");
+    journal
+        .confirm(
+            &mut sketch,
+            removal,
+            ConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        )
+        .expect("confirm the release through the journal");
+    assert!(sketch.constraints().is_empty());
+
+    assert!(journal.undo(&mut sketch), "the release must be undoable");
+    assert_eq!(sketch.constraints().len(), 1);
+    assert!(
+        (solved(&sketch, end).v - solved(&sketch, start).v).abs() <= 1.0e-9,
+        "undoing a release puts the line back under the relation"
+    );
+}
+
+/// Releasing a relation that is not there changes nothing, and says so rather
+/// than publishing an empty revision.
+#[test]
+fn releasing_an_absent_relation_is_refused_as_no_change() {
+    let mut sketch = SketchDefinition::new();
+    let (start, end) = commit_line(&mut sketch, (0.0, 0.0), (10.0, 4.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Horizontal {
+                first: start,
+                second: end,
+            },
+            "Horizontal",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the relation");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the relation");
+    let id = *sketch.constraints().keys().next().expect("one relation");
+    let removal = sketch
+        .stage_constraint_removal(id, "Remove relation", PrecisionPolicy::default())
+        .expect("stage the release");
+    sketch
+        .commit(removal, ConfirmationSource::GreenTick)
+        .expect("commit the release");
+
+    assert!(matches!(
+        sketch.stage_constraint_removal(id, "Remove relation", PrecisionPolicy::default()),
+        Err(SketchTransactionError::NoChange)
+    ));
+}
