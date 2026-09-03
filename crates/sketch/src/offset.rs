@@ -2,10 +2,16 @@
 //!
 //! One chain in, one chain out, at a signed distance measured to the left of
 //! travel. The work is entirely local to the chain: each curve gets its own
-//! exact offset, and each corner between two of them gets whichever join its
-//! turn direction calls for. Nothing here reads the sketch, the arrangement,
-//! or the document — the caller supplies the chain and this module answers
-//! with geometry or a named refusal.
+//! exact offset, and each corner between two of them is where those two exact
+//! offsets meet. Nothing here reads the sketch, the arrangement, or the
+//! document — the caller supplies the chain and this module answers with
+//! geometry or a named refusal.
+//!
+//! The result matches the topology of what it came from: four lines offset to
+//! four lines, so a rectangle offsets to a rectangle. That is what makes an
+//! offset something you can dimension, constrain and offset again, and it is
+//! what every offset in this module is derived from — the parent curves, and
+//! nothing added to them.
 //!
 //! The exact domain is lines, circular arcs and circles. A B-spline is refused
 //! by name rather than approximated: the offset of a degree-*n* B-spline is not
@@ -174,25 +180,36 @@ pub fn offset_chain(
                 let meeting = curve_end(&offsets[corner]);
                 set_curve_start(&mut offsets[next], meeting);
             }
-            CornerTurn::Convex { left } => {
+            // Both kinds of corner do the same thing: the two offsets meet
+            // where their carriers meet. A concave corner reaches that point by
+            // trimming and a convex one by extending, which is the difference
+            // between them and the whole of it.
+            turn @ (CornerTurn::Convex { .. } | CornerTurn::Concave) => {
                 let pivot = curve_end(&chain.curves[corner]);
-                let from = curve_end(&offsets[corner]);
-                let to = curve_start(&offsets[next]);
-                joins[corner] = round_join(pivot, from, to, left, precision);
-            }
-            CornerTurn::Concave => {
-                let pivot = curve_end(&chain.curves[corner]);
-                let meeting = nearest_carrier_meeting(&offsets[corner], &offsets[next], pivot)
-                    .ok_or(OffsetError::CornerCollapses { corner })?;
+                let Some(meeting) =
+                    nearest_carrier_meeting(&offsets[corner], &offsets[next], pivot)
+                else {
+                    // Carriers that never meet — two arcs whose offset circles
+                    // have separated, a line that misses one — leave a gap no
+                    // extension can close. At a convex corner the arc on the
+                    // source corner is the one curve that closes it and stays
+                    // exact; at a concave one the corner is simply gone.
+                    let CornerTurn::Convex { left } = turn else {
+                        return Err(OffsetError::CornerCollapses { corner });
+                    };
+                    let from = curve_end(&offsets[corner]);
+                    let to = curve_start(&offsets[next]);
+                    joins[corner] = round_join(pivot, from, to, left, precision);
+                    continue;
+                };
                 let (before_first, before_second) =
                     (offsets[corner].clone(), offsets[next].clone());
                 set_curve_end(&mut offsets[corner], meeting);
                 set_curve_start(&mut offsets[next], meeting);
-                // Trimming to the carriers can extend as well as shorten, which
-                // is what lets a corner meet past the end of a short offset.
-                // What it must never do is turn a curve round: that is a curve
-                // the distance has consumed, and pruning it away is the
-                // self-intersection pass this one deliberately does not attempt.
+                // Meeting at the carriers must never turn a curve round. That is
+                // a curve the distance has consumed, and removing it to rejoin
+                // its neighbours is the self-intersection pass this one
+                // deliberately does not attempt — so it refuses, and says where.
                 if !survives_trim(&before_first, &offsets[corner], precision)
                     || !survives_trim(&before_second, &offsets[next], precision)
                 {
@@ -338,12 +355,17 @@ fn radial(center: SketchPoint2, through: SketchPoint2, radius: f64) -> Option<Sk
 }
 
 /// What a corner does to the offset that turns it.
+///
+/// Which one it is decides whether the two offsets have to be extended or
+/// trimmed to reach the point where their carriers meet; it does not change
+/// that they meet there.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CornerTurn {
     /// The curves meet tangentially; so do their offsets.
     Tangent,
     /// The corner turns away from the offset side, opening a gap. `left` is
-    /// the handedness of the turn, which is the sense the join sweeps in.
+    /// the handedness of the turn, which is the sense a join arc would sweep
+    /// in on the corners where no extension can close the gap.
     Convex { left: bool },
     /// The corner turns towards the offset side, so the two offsets overlap.
     Concave,
@@ -472,12 +494,16 @@ fn survives_trim(
     }
 }
 
-/// The arc that fills a convex corner: centred on the source corner, at the
-/// offset radius, from one offset's end to the next's start.
+/// The arc that fills a convex corner whose carriers never meet: centred on the
+/// source corner, at the offset radius, from one offset's end to the next's
+/// start.
 ///
-/// A round join is what holds the offset at a constant distance around the
-/// corner. A mitre does not: as the corner sharpens, its spike runs away
-/// without bound and the result stops being an offset.
+/// This is the fallback, not the rule. Extending to the carriers is what keeps
+/// the offset's topology the same as its parent's — a rectangle offsets to a
+/// rectangle — and it is what a corner of two lines, or of a line and an arc
+/// that still reach each other, always gets. Two offset arcs whose circles have
+/// separated leave a gap no extension can close, and this arc is the only curve
+/// that closes it and stays exact.
 fn round_join(
     pivot: SketchPoint2,
     from: SketchPoint2,
@@ -500,14 +526,12 @@ fn round_join(
     })
 }
 
-/// Where two overlapping offsets' *carriers* meet, nearest the corner they came
-/// from.
+/// Where two offsets' *carriers* meet, nearest the corner they came from.
 ///
-/// Carriers, not the bounded curves: a concave corner's meeting point routinely
-/// lies past the end of one of the two offsets, and refusing there would refuse
-/// every corner whose neighbouring side is shorter than the offset distance.
-/// Whether the extension is legitimate is [`survives_trim`]'s question, not
-/// this one's.
+/// Carriers, not the bounded curves. A convex corner's meeting point always
+/// lies past both offsets' ends — that is what makes it convex — and a concave
+/// one's routinely lies past a short neighbour's. Whether reaching it is
+/// legitimate is [`survives_trim`]'s question, not this one's.
 fn nearest_carrier_meeting(
     first: &EvaluatedCurve2,
     second: &EvaluatedCurve2,
@@ -709,39 +733,32 @@ mod tests {
     }
 
     #[test]
-    fn a_square_offsets_outward_into_four_sides_and_four_round_corners() {
-        // Walked counter-clockwise, outward is to the right of travel.
+    fn a_square_offsets_outward_into_a_larger_square() {
+        // Walked counter-clockwise, outward is to the right of travel. Four
+        // lines in, four lines out: the offset keeps the topology of what it
+        // came from, which is what lets it be dimensioned and offset again.
         let offset = offset_chain(&square(), -2.0, &PrecisionPolicy::default())
             .expect("a square offsets outward");
-        assert_eq!(offset.len(), 8);
+        assert_eq!(offset.len(), 4);
         assert_watertight(&offset, true);
+        assert!(
+            offset
+                .iter()
+                .all(|entry| matches!(entry.origin, OffsetOrigin::Source(_))),
+            "no corner needs a curve of its own"
+        );
 
-        let (start, end) = expect_line(&offset[0].curve);
-        assert_eq!(offset[0].origin, OffsetOrigin::Source(0));
-        assert!(close_to(start, point(0.0, -2.0)) && close_to(end, point(10.0, -2.0)));
-
-        // Every corner is a quarter arc of radius 2 centred on the source
-        // corner it replaced, which is what holds the offset at a constant
-        // distance where a mitre would not.
-        assert_eq!(offset[1].origin, OffsetOrigin::Join(0));
-        let EvaluatedCurve2::CircularArc {
-            center,
-            start,
-            end,
-            direction,
-        } = &offset[1].curve
-        else {
-            panic!("a convex corner takes a round join");
-        };
-        assert!(close_to(*center, point(10.0, 0.0)));
-        assert!(close_to(*start, point(10.0, -2.0)));
-        assert!(close_to(*end, point(12.0, 0.0)));
-        assert_eq!(*direction, CurveDirection::CounterClockwise);
-
-        for entry in &offset {
-            if let EvaluatedCurve2::CircularArc { center, start, .. } = &entry.curve {
-                assert!(((*start - *center).length() - 2.0).abs() < 1.0e-12);
-            }
+        let corners = offset
+            .iter()
+            .map(|entry| expect_line(&entry.curve).0)
+            .collect::<Vec<_>>();
+        for (actual, expected) in corners.iter().zip([
+            point(-2.0, -2.0),
+            point(12.0, -2.0),
+            point(12.0, 12.0),
+            point(-2.0, 12.0),
+        ]) {
+            assert!(close_to(*actual, expected), "{actual:?} vs {expected:?}");
         }
     }
 
@@ -777,24 +794,23 @@ mod tests {
         let precision = PrecisionPolicy::default();
         let outward = offset_chain(&square(), -2.0, &precision).expect("outward");
         let reversed = offset_chain(&square().reversed(), 2.0, &precision).expect("reversed");
-        // The same eight curves, walked the other way: four sides at the same
-        // offsets and four round corners of the same radius.
-        assert_eq!(outward.len(), reversed.len());
-        let reversed_corner_radii = reversed
-            .iter()
-            .filter_map(|entry| match &entry.curve {
-                EvaluatedCurve2::CircularArc { center, start, .. } => {
-                    Some((*start - *center).length())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(reversed_corner_radii.len(), 4);
-        assert!(
-            reversed_corner_radii
+        // The same four lines, walked the other way: the same larger square,
+        // whichever direction the chain was taken in.
+        let extent = |offset: &[OffsetCurve]| {
+            offset
                 .iter()
-                .all(|radius| (radius - 2.0).abs() < 1.0e-12)
-        );
+                .flat_map(|entry| {
+                    let (start, end) = expect_line(&entry.curve);
+                    [start.u, end.u, start.v, end.v]
+                })
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+                    (low.min(value), high.max(value))
+                })
+        };
+        assert_eq!(outward.len(), reversed.len());
+        let (low, high) = extent(&outward);
+        assert!(close_to(point(low, high), point(-2.0, 12.0)));
+        assert_eq!(extent(&reversed), (low, high));
     }
 
     #[test]
@@ -891,10 +907,11 @@ mod tests {
     }
 
     /// A step tall enough to survive the offset, taken on the inside: the
-    /// first corner is concave and trims to a sharp meeting, the second is
-    /// convex and takes a round join. One chain, both kinds.
+    /// first corner is concave and trims to its meeting, the second is convex
+    /// and extends to its own. One chain, both directions, and no curve added
+    /// to either.
     #[test]
-    fn a_step_taken_on_the_inside_trims_one_corner_and_rounds_the_other() {
+    fn a_step_taken_on_the_inside_trims_one_corner_and_extends_the_other() {
         let chain = OffsetChain::new(
             vec![
                 line((0.0, 0.0), (10.0, 0.0)),
@@ -905,23 +922,17 @@ mod tests {
         );
         let offset =
             offset_chain(&chain, 2.0, &PrecisionPolicy::default()).expect("a 3 mm step survives 2");
-        assert_eq!(offset.len(), 4);
+        assert_eq!(offset.len(), 3);
         assert_watertight(&offset, false);
 
+        // The riser's offset was trimmed at one end and extended at the other,
+        // and still runs the way it was drawn.
         assert_eq!(expect_line(&offset[0].curve).1, point(8.0, 2.0));
         assert_eq!(
             expect_line(&offset[1].curve),
-            (point(8.0, 2.0), point(8.0, 3.0))
+            (point(8.0, 2.0), point(8.0, 5.0))
         );
-        assert_eq!(offset[2].origin, OffsetOrigin::Join(1));
-        let EvaluatedCurve2::CircularArc {
-            center, direction, ..
-        } = &offset[2].curve
-        else {
-            panic!("the outside of the step is a round join");
-        };
-        assert!(close_to(*center, point(10.0, 3.0)));
-        assert_eq!(*direction, CurveDirection::Clockwise);
+        assert_eq!(expect_line(&offset[2].curve).0, point(8.0, 5.0));
     }
 
     #[test]

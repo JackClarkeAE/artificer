@@ -82,7 +82,7 @@ fn curve(sketch: &SketchDefinition, entity: SketchEntityId) -> EvaluatedCurve2 {
 }
 
 #[test]
-fn offsetting_a_square_outward_publishes_its_four_sides_and_four_round_corners() {
+fn offsetting_a_square_outward_publishes_one_curve_for_each_of_its_sides() {
     let (mut sketch, _) = square();
     let seed = sides(&sketch)[0];
     // Walked counter-clockwise, outward is to the right of travel.
@@ -90,22 +90,23 @@ fn offsetting_a_square_outward_publishes_its_four_sides_and_four_round_corners()
     let operation = commit(&mut sketch, recipe, "offset");
 
     let curves = published(&sketch, operation);
-    assert_eq!(curves.len(), 8);
+    assert_eq!(curves.len(), 4, "four lines in, four lines out");
     for source in 0..4_u16 {
         assert!(
             curves
                 .iter()
                 .any(|(role, _)| *role == CurveOutputRole::OffsetCurve { source })
         );
-        assert!(
-            curves
-                .iter()
-                .any(|(role, _)| *role == CurveOutputRole::OffsetJoin { corner: source })
-        );
     }
+    assert!(
+        !curves
+            .iter()
+            .any(|(role, _)| matches!(role, CurveOutputRole::OffsetJoin { .. })),
+        "a corner of two lines meets where they meet; nothing is added"
+    );
 
-    // The bottom side moved 2 mm below the square it came from, and the corner
-    // that follows it is a quarter arc of radius 2.
+    // The bottom side moved 2 mm below the square it came from, and reaches
+    // the corners of the larger square rather than stopping under the old one.
     let (_, bottom) = curves
         .iter()
         .find(|(role, _)| *role == CurveOutputRole::OffsetCurve { source: 0 })
@@ -114,24 +115,8 @@ fn offsetting_a_square_outward_publishes_its_four_sides_and_four_round_corners()
     let EvaluatedCurve2::Line { start, end } = curve(&sketch, bottom) else {
         panic!("an offset line is a line");
     };
-    assert_eq!((start.u, start.v), (0.0, -2.0));
-    assert_eq!((end.u, end.v), (10.0, -2.0));
-
-    let (_, corner) = curves
-        .iter()
-        .find(|(role, _)| *role == CurveOutputRole::OffsetJoin { corner: 0 })
-        .copied()
-        .expect("the join after the first side");
-    let EvaluatedCurve2::CircularArc {
-        center,
-        start: arc_start,
-        ..
-    } = curve(&sketch, corner)
-    else {
-        panic!("a round join is an arc");
-    };
-    assert_eq!((center.u, center.v), (10.0, 0.0));
-    assert!(((arc_start - center).length() - 2.0).abs() < 1.0e-12);
+    assert_eq!((start.u, start.v), (-2.0, -2.0));
+    assert_eq!((end.u, end.v), (12.0, -2.0));
 }
 
 #[test]
@@ -176,7 +161,7 @@ fn editing_the_distance_keeps_every_curve_that_is_still_there() {
     let EvaluatedCurve2::Line { start, .. } = curve(&sketch, bottom) else {
         panic!("still a line");
     };
-    assert_eq!((start.u, start.v), (0.0, -5.0));
+    assert_eq!((start.u, start.v), (-5.0, -5.0));
 }
 
 #[test]

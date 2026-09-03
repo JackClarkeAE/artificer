@@ -136,9 +136,11 @@ fn one_click_offsets_the_whole_outline_to_the_side_it_was_clicked_from() {
     // A sketch stroke commits on acceptance (ADR 0027), and an offset is one.
     assert!(!harness.state().operation_confirmation_pending());
 
-    // Four sides and four round corners, beside the rectangle they came from.
-    assert_eq!(harness.state().sketch_entity_count(), 9);
-    assert_eq!(segments(&harness).len(), 4, "four sides, and four arcs");
+    // Four sides, beside the rectangle they came from. A rectangle offsets to
+    // a rectangle: every corner is where the two offset sides meet, so nothing
+    // is added to the topology of the parent.
+    assert_eq!(harness.state().sketch_entity_count(), 5);
+    assert_eq!(segments(&harness).len(), 4, "four sides and no corner arcs");
     let lowest = lowest_offset_edge(&harness);
     assert!(
         (lowest + 4.0).abs() < 1.0e-6,
@@ -225,7 +227,7 @@ fn an_offset_undoes_as_one_thing_and_can_itself_be_offset() {
     click_button(&mut harness, "Offset chain");
     let below = canvas_sketch_point(&harness, SketchPoint::new(0.0, -2.0)) + egui::vec2(0.0, 6.0);
     click_at(&mut harness, below);
-    assert_eq!(harness.state().sketch_entity_count(), before + 8);
+    assert_eq!(harness.state().sketch_entity_count(), before + 4);
 
     // The offset's own curves are profile geometry, so the chain walk finds
     // them and the tool works on its own output — the case that catches an
@@ -233,7 +235,7 @@ fn an_offset_undoes_as_one_thing_and_can_itself_be_offset() {
     // the dimension chips the last stroke's selection drew below.
     let above = canvas_sketch_point(&harness, SketchPoint::new(0.0, 3.0)) + egui::vec2(0.0, -6.0);
     click_at(&mut harness, above);
-    assert_eq!(harness.state().sketch_entity_count(), before + 16);
+    assert_eq!(harness.state().sketch_entity_count(), before + 8);
 
     // Each is one edit, undone whole. Escape first closes the live dimension
     // readout the stroke left open, which owns the keyboard while it is up.

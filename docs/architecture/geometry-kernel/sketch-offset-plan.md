@@ -73,10 +73,12 @@ offsets a polyline of lines and arcs in seven stages: generate raw offset
 segments; trim or join them into a raw offset polyline; for open or
 self-intersecting input, also compute the dual (opposite-sign) offset; find all
 self-intersections; slice at them; discard the slices that come closer to the
-source than the offset distance; stitch what remains. Convex corners are joined
-with a **round** arc join, which is what keeps the offset at a constant
-distance rather than pushing a mitre spike out to infinity as the corner
-sharpens. The same staged shape appears in the polyline-offset literature
+source than the offset distance; stitch what remains. It joins convex corners
+with a **round** arc, which keeps every point of the result at a constant
+distance — the right choice for a cutter path, which is what that library is
+for, and the wrong one for a sketch, where the offset of a rectangle has to
+stay a rectangle. The staged shape of the algorithm is what is borrowed here,
+not that choice. The same shape appears in the polyline-offset literature
 ([Liu et al., *An offset algorithm for polyline
 curves*](https://www.sciencedirect.com/science/article/abs/pii/S0166361506001060)).
 
@@ -133,25 +135,53 @@ defines the left normal:
 - **Circle**: the same, and it is a chain of one. A circle has no ends, so
   neither does its offset.
 
-Joins between consecutive offset curves:
+Corners between consecutive offset curves. **The rule is one rule: the two
+offsets meet where their carriers meet.** What differs between a convex and a
+concave corner is only whether reaching that point extends the curves or trims
+them.
 
-- **Tangent join** — the source curves meet tangentially (their directions
+- **Tangent corner** — the source curves meet tangentially (their directions
   agree at the shared endpoint within `angular_agreement_radians`). The two
-  offsets already meet exactly; nothing is inserted. This is the common case
-  for filleted outlines, and it is why a rectangle with rounded corners offsets
-  cleanly.
-- **Convex corner** (the corner turns away from the offset side) — insert a
-  **round join**: an arc centred on the shared source endpoint, radius `|d|`,
-  from the first offset's end to the second offset's start. This holds the
-  distance exactly at the corner, which a mitre does not, and it is what the
-  reference implementations do. It is emitted as a real `add_arc`, so the
-  result stays analytic.
-- **Concave corner** (the corner turns towards the offset side) — the two
-  offsets overlap. Extend/trim both to their intersection and drop the overlap.
-  For line/line this is a closed-form intersection; for line/arc and arc/arc it
-  is the existing analytic intersection machinery in
-  `crates/sketch/src/intersections.rs`. Where they do not intersect at all the
-  corner has collapsed, and that is a refusal.
+  offsets already meet exactly; nothing is done but snapping them watertight.
+  This is the common case for filleted outlines.
+- **Convex corner** (the corner turns away from the offset side) — the offsets
+  open a gap. Both **extend** along their own carriers to the meeting point
+  nearest the source corner.
+- **Concave corner** (the corner turns towards the offset side) — the offsets
+  overlap. Both **trim** back to the same meeting point.
+
+Carriers, not the bounded curves: a convex corner's meeting always lies past
+both offsets' ends, and a concave one's routinely lies past a short neighbour's.
+Line/line is a closed-form intersection; line/arc and arc/arc are the circle
+forms in the same module.
+
+This is what makes the offset *topology-matched to its parent*: four lines in,
+four lines out, so a rectangle offsets to a rectangle and the result can be
+dimensioned, constrained and offset again. It is `OFFSETGAPTYPE 0` in AutoCAD
+and what SolidWorks' Offset Entities does; Fusion's rounding is the outlier
+among CAD sketch offsets, and following it here would have meant every
+rectangle acquiring four fillets nobody drew.
+
+The cost, stated plainly: a convex corner's meeting point sits `|d| / sin(θ/2)`
+from the source corner, where θ is the interior angle — `d√2` at a right angle,
+and growing without bound as the corner sharpens. So the *corner point* is not
+on the constant-distance locus, even though every *curve* is exactly `d` from
+its own parent. There is no arbitrary mitre limit: the coordinate bounds
+`validate_position` already holds every derived point to, and the direction
+check below, are the guards, and a spike is the exact offset of what was drawn.
+
+Two corners cannot be reached by extending:
+
+- **Carriers that never meet** — two offset arcs whose circles have separated,
+  or a line that misses one. Only at a convex corner: there the arc centred on
+  the source corner at radius `|d|` is the one curve that closes the gap and
+  stays exact, and it is emitted as `OffsetJoin { corner }`. At a concave
+  corner it is a collapse, and refused.
+- **A curve the meeting turns round.** Extending or trimming must never reverse
+  a curve's direction or wrap an arc's sweep. That is a curve the distance has
+  consumed, and removing it and rejoining its neighbours is the
+  self-intersection pass below. Until that exists, it is a refusal naming the
+  corner.
 
 Global validity, after the per-curve and per-join pass:
 
@@ -163,10 +193,12 @@ Global validity, after the per-curve and per-join pass:
   survivors are stitched. This is the stage that makes a large inward offset of
   a narrow pocket return a shorter valid chain rather than a bow tie.
 - **Topology matching.** `isTopologyMatched` is the reference's answer to
-  re-offsetting an offset. The first pass takes the strict reading: if pruning
-  would change the chain's topology, the operation is refused with a reason
-  that says the distance is too large for the shape, rather than silently
-  producing something the user cannot re-offset. A later pass may relax this.
+  re-offsetting an offset, and it is unconditional here: corners meet at their
+  carriers, so the result always has one curve per source curve. Only a corner
+  whose carriers never meet adds one, and only where nothing else can close the
+  gap. If pruning would change that, the operation is refused with a reason
+  saying the distance is too large for the shape, rather than silently
+  producing something the user cannot re-offset.
 
 Refusals, all named, all with the shape the rest of the crate uses:
 
@@ -309,10 +341,10 @@ Each stage is independently shippable and ends green.
 **Stage 1 — offset geometry, headless. Done.** `crates/sketch/src/offset.rs`:
 per-curve offset for line, arc and circle; the three join kinds; the corner
 meetings; the named refusals. Pure functions over `EvaluatedCurve2`, tested
-against hand-computed geometry — a square outward into four sides and four
-round corners, the same square inward into a smaller sharp one, a filleted
-outline whose tangent corner stays tangent, a step that survives on the inside
-and one that does not, the chain walked the other way, and the four refusals.
+against hand-computed geometry — a square outward into a larger square and
+inward into a smaller one, a filleted outline whose tangent corner stays
+tangent, a step that trims one corner and extends the other, a step the
+distance eats, the chain walked the other way, and the four refusals.
 
 **Stage 2 — the chain walk. Done.** `crates/sketch/src/chain.rs`, with the
 determinism, T-junction and construction-geometry properties as tests in
@@ -353,9 +385,10 @@ which is exactly where the reference stands before Project.
 - Splines. An exact offset of a B-spline is not a B-spline; when Artificer
   offsets one it will be by an approximation the precision policy governs and
   the document records, not by silence.
-- Mitre and chamfer join styles. Round is the only style the first pass emits;
-  adding another means a field on the recipe and a migration, which is a
-  smaller price than a join style nobody asked for yet.
+- A choice of join style. Corners meet at their carriers, full stop; a round
+  join appears only where no extension can reach. Offering mitre/round/chamfer
+  as an option means a field on the recipe and a migration, which is a larger
+  price than one correct default.
 - Variable-distance and two-sided offset.
 - Offsetting a whole profile region as a region, rather than as the chain of
   its boundary.
