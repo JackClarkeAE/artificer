@@ -48,6 +48,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
     harness.key_down(key);
     harness.step();
@@ -106,11 +122,11 @@ fn commit_centered_rectangle(
 fn create_extruded_body(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     commit_centered_rectangle(harness, 4.0, 2.0);
     click_button(harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
-    click_button(harness, "Extrude");
+    click_extrude(harness);
     click_button(harness, "Confirm operation");
     assert!(harness.state().displayed_snapshot_id().is_some());
     // Committing keeps the camera where the sketch left it, which frames
@@ -239,7 +255,7 @@ fn a_staged_operation_owns_the_canvas_and_suppresses_the_menu() {
 
     // With a face selected, Extrude stages a push/pull on it.
     click_button(&mut harness, "Extrusion top face");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert!(harness.state().operation_confirmation_pending());
     right_click_button(&mut harness, "Extrusion top face");
     assert!(
@@ -320,7 +336,7 @@ fn ribbon_tab_snapshots() {
     harness.snapshot("workbench_ribbon_dark_theme_1280");
     click_button(&mut harness, "Switch theme");
 
-    click_button(&mut harness, "Model mode");
+    click_button(&mut harness, "Model ribbon tab");
     click_button(&mut harness, "Sketch on selected face");
     for _ in 0..120 {
         harness.step();

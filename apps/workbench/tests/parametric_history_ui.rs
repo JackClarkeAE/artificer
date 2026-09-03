@@ -51,6 +51,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn activate_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     {
         let node = harness.get_by_role_and_label(Role::Button, label);
@@ -248,7 +264,7 @@ fn prepare_finished_sketch(harness: &mut Harness<'static, KernelLabApp>, case: F
     match case {
         FeatureScenario::Extrude => {
             click_button(harness, "XY Plane");
-            click_button(harness, "Sketch mode");
+            click_button(harness, "Create sketch");
             assert!(!harness.state().sketch_is_face_supported());
         }
         FeatureScenario::Add | FeatureScenario::Cut => {
@@ -267,7 +283,7 @@ fn prepare_finished_sketch(harness: &mut Harness<'static, KernelLabApp>, case: F
 }
 
 fn commit_prepared_feature(harness: &mut Harness<'static, KernelLabApp>, case: FeatureScenario) {
-    click_button(harness, "Extrude");
+    click_extrude(harness);
     activate_button(harness, CONFIRM_OPERATION);
     assert_eq!(harness.state().last_error_code(), None);
     assert!(
@@ -279,7 +295,8 @@ fn commit_prepared_feature(harness: &mut Harness<'static, KernelLabApp>, case: F
     );
 }
 
-fn assert_extrude_enabled(harness: &Harness<'static, KernelLabApp>) {
+fn assert_extrude_enabled(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
     assert_eq!(
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
@@ -293,7 +310,8 @@ fn assert_extrude_enabled(harness: &Harness<'static, KernelLabApp>) {
     );
 }
 
-fn assert_extrude_disabled(harness: &Harness<'static, KernelLabApp>) {
+fn assert_extrude_disabled(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -455,6 +473,7 @@ fn rollback_marker_retains_future_timeline_and_restores_the_exact_branch_head() 
     assert!(harness.state().body_visible(0));
     assert!(harness.state().sketch_visible(0));
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    show_model_commands(&mut harness);
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -555,7 +574,7 @@ fn face_operation_override_preserves_direction_and_auto_restores_sign_inference(
 
     set_extrusion_distance(&mut harness, "-0.5");
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Cut);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert!(harness.state().operation_confirmation_pending());
     activate_button(&mut harness, CONFIRM_OPERATION);
 
@@ -650,10 +669,10 @@ fn identical_new_bodies_keep_independent_history_branches() {
     harness.run();
 
     click_button(&mut harness, "XY Plane");
-    click_button(&mut harness, "Sketch mode");
+    click_button(&mut harness, "Create sketch");
     commit_centered_rectangle_with_dimensions(&mut harness, 4.0, 2.0);
     finish_active_sketch(&mut harness);
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
     commit_prepared_feature(&mut harness, FeatureScenario::Extrude);
     let shared_snapshot = harness
         .state()
@@ -665,8 +684,8 @@ fn identical_new_bodies_keep_independent_history_branches() {
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     commit_centered_rectangle_with_dimensions(&mut harness, 4.0, 2.0);
     finish_active_sketch(&mut harness);
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     activate_button(&mut harness, CONFIRM_OPERATION);
 
     assert_eq!(harness.state().body_count(), 2);
@@ -698,7 +717,7 @@ fn identical_new_bodies_keep_independent_history_branches() {
     commit_centered_rectangle(&mut harness);
     finish_active_sketch(&mut harness);
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Add);
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
     commit_prepared_feature(&mut harness, FeatureScenario::Add);
     let modified_second_snapshot = harness
         .state()
@@ -753,8 +772,8 @@ fn undoing_add_suppression_restores_a_generated_face_that_can_be_sketch_extruded
     commit_centered_rectangle_with_dimensions(&mut harness, 0.5, 0.5);
     finish_active_sketch(&mut harness);
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Add);
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     activate_button(&mut harness, CONFIRM_OPERATION);
 
     assert_eq!(harness.state().last_error_code(), None);
@@ -787,7 +806,7 @@ fn undoing_extrusion_restores_its_sketch_then_undoing_sketch_removes_the_artifac
             .is_some(),
         "undoing the consumer must visibly restore its source sketch"
     );
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
 
     activate_button(&mut harness, "Undo history change");
     assert_eq!(harness.state().document_feature_count(), 2);
@@ -802,6 +821,7 @@ fn undoing_extrusion_restores_its_sketch_then_undoing_sketch_removes_the_artifac
     let runtime_sketch_count = harness.state().sketch_count();
     let overlay_count = harness.state().visible_model_sketch_overlay_count();
     let eligibility = harness.state().sketch_extrusion_eligibility();
+    show_model_commands(&mut harness);
     let extrude_disabled = harness
         .get_by_role_and_label(Role::Button, "Extrude")
         .accesskit_node()
@@ -830,12 +850,12 @@ fn undoing_extrusion_restores_its_sketch_then_undoing_sketch_removes_the_artifac
     assert_eq!(harness.state().sketch_count(), 1);
     assert_eq!(harness.state().sketch_entity_count(), 1);
     assert!(harness.state().sketch_visible(0));
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
 
     activate_button(&mut harness, "Redo history change");
     assert_eq!(harness.state().sketch_count(), 1);
     assert!(!harness.state().sketch_visible(0));
-    assert_extrude_disabled(&harness);
+    assert_extrude_disabled(&mut harness);
 }
 
 #[test]
@@ -843,7 +863,7 @@ fn suppressing_and_restoring_sketch_disables_and_reenables_extrude() {
     let mut harness = harness();
     prepare_finished_sketch(&mut harness, FeatureScenario::Extrude);
     let feature_count = harness.state().document_feature_count();
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
 
     activate_button(&mut harness, "Sketch 1 feature");
     activate_button(&mut harness, "Suppress selected feature");
@@ -853,12 +873,12 @@ fn suppressing_and_restoring_sketch_disables_and_reenables_extrude() {
         SketchExtrusionEligibility::InactiveHistorySketch
     );
     assert!(!harness.state().sketch_visible(0));
-    assert_extrude_disabled(&harness);
+    assert_extrude_disabled(&mut harness);
 
     activate_button(&mut harness, "Restore selected feature");
     assert_eq!(harness.state().document_feature_count(), feature_count);
     assert!(harness.state().sketch_visible(0));
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
 }
 
 #[test]

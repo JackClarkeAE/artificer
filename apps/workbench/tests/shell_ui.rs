@@ -21,6 +21,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     harness.run();
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     // `scroll_to_me` animates the scroll offset, and `run()` can return while
     // that animation is still in flight. A click aimed at a rect sampled from
@@ -308,7 +324,7 @@ fn feature_timeline_changes_only_after_committed_sketch_and_extrusion_edits() {
             .is_none()
     );
 
-    click_button(&mut harness, "Sketch mode");
+    click_button(&mut harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     press_key(&mut harness, egui::Key::R);
     assert_eq!(harness.state().sketch_tool_label(), "Rectangle");
@@ -370,7 +386,7 @@ fn feature_timeline_changes_only_after_committed_sketch_and_extrusion_edits() {
         initial_attempts
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude finished sketch")
@@ -394,7 +410,7 @@ fn feature_timeline_changes_only_after_committed_sketch_and_extrusion_edits() {
         initial_attempts
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().feature_timeline_entries(), sketch_timeline);
     press_key(&mut harness, egui::Key::Enter);
 

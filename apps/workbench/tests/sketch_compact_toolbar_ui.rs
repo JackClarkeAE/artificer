@@ -1,6 +1,6 @@
 use artificer_sketch_ui::sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_COLUMNS, CONSTRAINT_DIVIDER_WIDTH,
-    CONSTRAINT_TOOLS, DRAWING_BLOCK_WIDTH, DRAWING_COLUMNS, FAMILY_GAP, PRIMARY_CELL_SIZE,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_BLOCK_ORIGIN, CONSTRAINT_COLUMNS,
+    CONSTRAINT_TOOLS, DRAWING_COLUMNS, FAMILY_GAP, GENERATOR_BLOCK_ORIGIN, PRIMARY_CELL_SIZE,
     PRIMARY_CELL_WIDTH, ROW_GAP,
 };
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
@@ -62,7 +62,7 @@ fn replace_tool_input(harness: &mut Harness<'static, KernelLabApp>, label: &str,
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     // No palette to raise: the sketch workspace has none. The active tool is
     // the lit ribbon tile and the canvas instruction line.
@@ -155,8 +155,9 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
     enter_xy_sketch(&mut harness);
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
-    // Four columns of drawing tools over three rows; the constraints stand in
-    // their own block beyond a divider, a named tile each.
+    // Four columns of drawing tools over three rows; the generators stand in a
+    // divided column of their own, and the constraints in a third block beyond
+    // a second divider, a named tile each.
     let drawing = [
         "Select sketch geometry",
         "Sketch point",
@@ -169,14 +170,24 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
         "Trim curve span",
         "2D fillet",
         "Equal-distance chamfer",
-        "Rectangular sketch pattern",
+        "Offset chain",
     ];
     let origin = harness
         .get_by_role_and_label(Role::Button, drawing[0])
         .rect();
     let row_top = |row: usize| origin.top() + row as f32 * (PRIMARY_CELL_SIZE + ROW_GAP);
-    // Every constraint has a tile beyond the divider — all eleven of them on
-    // screen at once, and every one inside the minimum window.
+    // The generator block: Pattern, alone in its column between the dividers.
+    let pattern = harness
+        .get_by_role_and_label(Role::Button, "Rectangular sketch pattern")
+        .rect();
+    assert_eq!(pattern.top(), row_top(0), "Pattern row drifted");
+    assert_eq!(
+        pattern.left(),
+        origin.left() + GENERATOR_BLOCK_ORIGIN,
+        "Pattern must open the generator block, past the first divider"
+    );
+    // Every constraint has a tile beyond the second divider — all eleven of
+    // them on screen at once, and every one inside the minimum window.
     for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
         let label = variant.descriptor().accessible_name;
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
@@ -188,12 +199,11 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
         assert_eq!(
             rect.left(),
             origin.left()
-                + DRAWING_BLOCK_WIDTH
-                + CONSTRAINT_DIVIDER_WIDTH
+                + CONSTRAINT_BLOCK_ORIGIN
                 + (index % CONSTRAINT_COLUMNS) as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
             "{label} sits beyond the divider"
         );
-        // The same whole tile a drawing tool gets, so the two blocks read as
+        // The same whole tile a drawing tool gets, so the three blocks read as
         // one set of controls.
         assert!(
             (rect.width() - PRIMARY_CELL_WIDTH).abs() <= 0.1

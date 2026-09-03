@@ -32,12 +32,13 @@ pub const PRIMARY_CELL_SIZE: f32 = 24.0;
 /// Width of every tile: icon column, label, and — where a family has variants —
 /// the chooser.
 ///
-/// One width for drawing tools and constraints alike, because they are the same
-/// kind of control and a block of ragged tiles reads as a mistake. Sized so the
-/// longest label on either side clears its columns: `Rectangle` at 40 px plus
-/// the chooser, and `Perpendicular` at 56 px without one, both measured at
-/// [`TILE_LABEL_TEXT_SIZE`].
-pub const PRIMARY_CELL_WIDTH: f32 = 84.0;
+/// One width for drawing tools, generators and constraints alike, because they
+/// are the same kind of control and a block of ragged tiles reads as a mistake.
+/// Sized so the longest label on either side clears its columns: `Rectangle` at
+/// 40 px plus the chooser, and `Perpendicular` at 56 px without one, both
+/// measured at [`TILE_LABEL_TEXT_SIZE`]. Nine columns of 84 px did not fit the
+/// minimum window once the generators took a block of their own.
+pub const PRIMARY_CELL_WIDTH: f32 = 80.0;
 /// Left column of a tile, holding the icon.
 pub const TILE_ICON_COLUMN: f32 = 20.0;
 /// Side length of the icon painted inside that column.
@@ -90,31 +91,40 @@ pub const ROW_GAP: f32 = 2.0;
 pub const TOOLBAR_TOP_PADDING: f32 = 0.0;
 /// Padding below the last row of tiles, for the same reason.
 pub const TOOLBAR_BOTTOM_PADDING: f32 = 0.0;
-/// Width of the strip that parts the drawing tools from the constraints: a
-/// hairline with breathing room either side. It replaces one family gap, and
-/// says in the layout what the grouping means — what puts geometry on the
-/// canvas to the left of it, what tells the solver how that geometry has to
-/// behave to the right.
-pub const CONSTRAINT_DIVIDER_WIDTH: f32 = 9.0;
-/// Rows in both blocks. The grid is as tall as the ribbon allows and as
+/// Width of a strip that parts one block of tiles from the next: a hairline
+/// with breathing room either side. It replaces one family gap, and says in the
+/// layout what the grouping means — what puts geometry on the canvas, what
+/// copies geometry that is already there, and what tells the solver how all of
+/// it has to behave.
+pub const BLOCK_DIVIDER_WIDTH: f32 = 8.0;
+/// The divider before the constraints, under the name it has always had.
+pub const CONSTRAINT_DIVIDER_WIDTH: f32 = BLOCK_DIVIDER_WIDTH;
+/// Rows in every block. The grid is as tall as the ribbon allows and as
 /// narrow as that makes it.
 pub const TOOLBAR_ROWS: usize = 3;
 /// Drawing-tool columns: twelve families over three rows.
 pub const DRAWING_COLUMNS: usize = 4;
+/// Generator columns: one, holding what repeats geometry that already exists.
+pub const GENERATOR_COLUMNS: usize = 1;
 /// Constraint columns: eleven constraints over the same three rows.
 pub const CONSTRAINT_COLUMNS: usize = 4;
 /// Width of one block of tiles, in columns of [`PRIMARY_CELL_WIDTH`].
 const fn block_width(columns: usize) -> f32 {
     PRIMARY_CELL_WIDTH * columns as f32 + FAMILY_GAP * (columns as f32 - 1.0)
 }
-/// Width of the drawing block, this side of the divider.
+/// Width of the drawing block, this side of the first divider.
 pub const DRAWING_BLOCK_WIDTH: f32 = block_width(DRAWING_COLUMNS);
-/// Width of the constraint block, beyond it.
+/// Width of the generator block, between the two dividers.
+pub const GENERATOR_BLOCK_WIDTH: f32 = block_width(GENERATOR_COLUMNS);
+/// Width of the constraint block, beyond the second.
 pub const CONSTRAINT_BLOCK_WIDTH: f32 = block_width(CONSTRAINT_COLUMNS);
-/// Width of the toolbar: the drawing block, the divider, and the constraint
-/// block.
-pub const SKETCH_TOOLBAR_WIDTH: f32 =
-    DRAWING_BLOCK_WIDTH + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_BLOCK_WIDTH;
+/// Left edge of the generator block, measured from the toolbar's own.
+pub const GENERATOR_BLOCK_ORIGIN: f32 = DRAWING_BLOCK_WIDTH + BLOCK_DIVIDER_WIDTH;
+/// Left edge of the constraint block, measured from the same origin.
+pub const CONSTRAINT_BLOCK_ORIGIN: f32 =
+    GENERATOR_BLOCK_ORIGIN + GENERATOR_BLOCK_WIDTH + BLOCK_DIVIDER_WIDTH;
+/// Width of the toolbar: three blocks and the two dividers between them.
+pub const SKETCH_TOOLBAR_WIDTH: f32 = CONSTRAINT_BLOCK_ORIGIN + CONSTRAINT_BLOCK_WIDTH;
 /// Height required by the padded three-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 = PRIMARY_CELL_SIZE * TOOLBAR_ROWS as f32
     + ROW_GAP * (TOOLBAR_ROWS as f32 - 1.0)
@@ -134,9 +144,15 @@ const _: () = {
     // caption floating, tall clips the bottom row.
     assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
     // The 1040 px minimum window has this much room for the grid, and no more.
-    assert!(SKETCH_TOOLBAR_WIDTH <= 698.0);
+    // The extra over the two-block layout is what Extrude gave back by living
+    // on the Model tab alone, which a sketch can now reach without leaving.
+    assert!(SKETCH_TOOLBAR_WIDTH <= 764.0);
     // Every tool has a tile of its own; none may fall off its block.
-    assert!(ToolFamily::COUNT - CONSTRAINT_FAMILIES.len() <= DRAWING_COLUMNS * TOOLBAR_ROWS);
+    assert!(
+        ToolFamily::COUNT - CONSTRAINT_FAMILIES.len() - GENERATOR_FAMILIES.len()
+            <= DRAWING_COLUMNS * TOOLBAR_ROWS
+    );
+    assert!(GENERATOR_FAMILIES.len() <= GENERATOR_COLUMNS * TOOLBAR_ROWS);
     assert!(CONSTRAINT_TOOLS.len() <= CONSTRAINT_COLUMNS * TOOLBAR_ROWS);
 };
 
@@ -169,13 +185,14 @@ pub enum ToolFamily {
     Trim,
     Fillet,
     Chamfer,
+    Offset,
     Pattern,
     Relation,
     Dimension,
 }
 
 impl ToolFamily {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
@@ -188,6 +205,7 @@ impl ToolFamily {
         Self::Trim,
         Self::Fillet,
         Self::Chamfer,
+        Self::Offset,
         Self::Pattern,
         Self::Relation,
         Self::Dimension,
@@ -236,6 +254,7 @@ pub enum ToolVariant {
     Fillet,
     Chamfer,
     TwoDistanceChamfer,
+    Offset,
     RectangularPattern,
     CircularPattern,
     FixedRelation,
@@ -252,7 +271,7 @@ pub enum ToolVariant {
 }
 
 impl ToolVariant {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 36;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
@@ -276,6 +295,7 @@ impl ToolVariant {
         Self::Fillet,
         Self::Chamfer,
         Self::TwoDistanceChamfer,
+        Self::Offset,
         Self::RectangularPattern,
         Self::CircularPattern,
         Self::FixedRelation,
@@ -382,6 +402,9 @@ pub enum SelectionRequirement {
     OneOrMoreEditableEntities,
     TwoConnectedProfileCurves,
     TwoConnectedProfileLines,
+    /// Every curve reachable from the one under the pointer by shared
+    /// endpoints — the loop, where the chain closes.
+    ConnectedCurveChain,
     /// The operands a relation names: endpoints, whole curves, or a mix,
     /// picked in the canvas while the relation tool is active.
     RelationOperands,
@@ -404,6 +427,7 @@ pub enum CapabilityRequirement {
     TrimCandidate,
     FilletPair,
     ChamferLinePair,
+    OffsetChain,
     PatternSeedSelection,
     RelationOperands,
 }
@@ -444,6 +468,7 @@ pub enum ToolIcon {
     Trim,
     Fillet,
     Chamfer,
+    Offset,
     RectangularPattern,
     CircularPattern,
     FixedRelation,
@@ -536,6 +561,12 @@ const SHORTCUT_G: ToolShortcut = ToolShortcut {
     key: Key::G,
     label: "G",
 };
+/// The key Fusion binds Offset to, free here: the model workspace's O is
+/// Orbit, and single-letter shortcuts are read per workspace.
+const SHORTCUT_O: ToolShortcut = ToolShortcut {
+    key: Key::O,
+    label: "O",
+};
 
 const SELECT_VARIANTS: &[ToolVariant] = &[ToolVariant::Select];
 const POINT_VARIANTS: &[ToolVariant] = &[ToolVariant::Point];
@@ -565,6 +596,7 @@ const SLOT_VARIANTS: &[ToolVariant] = &[
 const TRIM_VARIANTS: &[ToolVariant] = &[ToolVariant::Trim];
 const FILLET_VARIANTS: &[ToolVariant] = &[ToolVariant::Fillet];
 const CHAMFER_VARIANTS: &[ToolVariant] = &[ToolVariant::Chamfer, ToolVariant::TwoDistanceChamfer];
+const OFFSET_VARIANTS: &[ToolVariant] = &[ToolVariant::Offset];
 const PATTERN_VARIANTS: &[ToolVariant] = &[
     ToolVariant::RectangularPattern,
     ToolVariant::CircularPattern,
@@ -682,6 +714,15 @@ const TOOL_FAMILIES: [ToolFamilyDescriptor; ToolFamily::COUNT] = [
         None,
         CHAMFER_VARIANTS,
         ToolVariant::Chamfer,
+    ),
+    family(
+        ToolFamily::Offset,
+        "offset",
+        "Offset",
+        "Offset",
+        Some(SHORTCUT_O),
+        OFFSET_VARIANTS,
+        ToolVariant::Offset,
     ),
     family(
         ToolFamily::Pattern,
@@ -812,6 +853,16 @@ const FILLET_PHASES: &[PointAcquisitionPhase] = &[
 const CHAMFER_PHASES: &[PointAcquisitionPhase] = &[
     phase("first_line", "Select the first connected profile line."),
     phase("second_line", "Select the second connected profile line."),
+];
+const OFFSET_PHASES: &[PointAcquisitionPhase] = &[
+    phase(
+        "chain",
+        "Hover a curve to highlight every curve connected to it, then click to take the chain.",
+    ),
+    phase(
+        "distance",
+        "Move to either side of the chain to set which way it offsets, then click; Tab types the distance.",
+    ),
 ];
 const RECTANGULAR_PATTERN_PHASES: &[PointAcquisitionPhase] = &[phase(
     "direction",
@@ -1025,6 +1076,20 @@ const TWO_DISTANCE_CHAMFER_INPUTS: &[ToolInputField] = &[
         "Second distance",
         ToolInputKind::Length,
         "positive setback on the second line",
+    ),
+];
+const OFFSET_INPUTS: &[ToolInputField] = &[
+    input(
+        "distance",
+        "Offset distance",
+        ToolInputKind::SignedLength,
+        "non-zero finite distance; the sign chooses the side",
+    ),
+    input(
+        "chain_selection",
+        "Chain selection",
+        ToolInputKind::Boolean,
+        "take the whole connected chain, or only the curve under the pointer",
     ),
 ];
 const RECTANGULAR_PATTERN_INPUTS: &[ToolInputField] = &[
@@ -1542,6 +1607,26 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
+        ToolVariant::Offset,
+        "sketch.modify.offset",
+        ToolFamily::Offset,
+        "Offset chain",
+        "Copy a connected chain of curves a set distance to one side.",
+        "Hover a curve and the whole connected chain highlights; click to take it, then drag to either side or Tab a signed distance. The copy is new sketch geometry that keeps its distance from the chain it came from.",
+        "Hover a curve to take its connected chain.",
+        "Offset has no variants.",
+        Some(SHORTCUT_O),
+        ToolIcon::Offset,
+        ToolCursor::PrecisionPick,
+        OFFSET_PHASES,
+        OFFSET_INPUTS,
+        SelectionRequirement::ConnectedCurveChain,
+        ToolOutputRole::GeneratedGeometry,
+        CapabilityRequirement::OffsetChain,
+        "Offset requires a connected chain of sketch curves, or a body edge projected into the sketch.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
         ToolVariant::RectangularPattern,
         "sketch.pattern.rectangular",
         ToolFamily::Pattern,
@@ -2048,7 +2133,10 @@ impl Default for SketchToolbarOutput {
 ///
 /// Three rows of [`DRAWING_COLUMNS`], reading in the order the work goes:
 /// picking and placing, then the closed shapes, then what reshapes what is
-/// already drawn.
+/// already drawn. Offset closes that last row, where Pattern used to: it
+/// reshapes an existing chain into another one beside it, which is the same
+/// kind of work as trimming, filleting and chamfering, and not the same kind
+/// as repeating a shape wholesale.
 pub const DRAWING_FAMILIES: &[ToolFamily] = &[
     ToolFamily::Select,
     ToolFamily::Point,
@@ -2061,8 +2149,15 @@ pub const DRAWING_FAMILIES: &[ToolFamily] = &[
     ToolFamily::Trim,
     ToolFamily::Fillet,
     ToolFamily::Chamfer,
-    ToolFamily::Pattern,
+    ToolFamily::Offset,
 ];
+/// The generators: what takes geometry that already exists and makes more of
+/// it, unchanged, somewhere else.
+///
+/// Its own divided column, because that is a different promise from every tile
+/// to its left. One family today, and room for the two that belong beside it —
+/// mirror and circular arrays are the same idea.
+pub const GENERATOR_FAMILIES: &[ToolFamily] = &[ToolFamily::Pattern];
 /// The families whose variants are drawn as constraint tiles instead.
 pub const CONSTRAINT_FAMILIES: &[ToolFamily] = &[ToolFamily::Relation, ToolFamily::Dimension];
 /// The constraints: what tells the solver how the geometry has to behave.
@@ -2121,25 +2216,30 @@ pub fn render_sketch_toolbar(
             ui.add_space(TOOLBAR_TOP_PADDING);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (index, row) in DRAWING_FAMILIES.chunks(DRAWING_COLUMNS).enumerate() {
-                        if index > 0 {
-                            ui.add_space(ROW_GAP);
-                        }
-                        render_toolbar_row(
-                            ui,
-                            row,
-                            &mut state.preferences,
-                            active,
-                            gate,
-                            capabilities,
-                            &mut output,
-                            &mut escaped_anchor,
-                        );
-                    }
-                });
-                render_constraint_divider(ui);
+                render_family_block(
+                    ui,
+                    DRAWING_FAMILIES,
+                    DRAWING_COLUMNS,
+                    &mut state.preferences,
+                    active,
+                    gate,
+                    capabilities,
+                    &mut output,
+                    &mut escaped_anchor,
+                );
+                render_block_divider(ui);
+                render_family_block(
+                    ui,
+                    GENERATOR_FAMILIES,
+                    GENERATOR_COLUMNS,
+                    &mut state.preferences,
+                    active,
+                    gate,
+                    capabilities,
+                    &mut output,
+                    &mut escaped_anchor,
+                );
+                render_block_divider(ui);
                 render_constraint_block(
                     ui,
                     &mut state.preferences,
@@ -2243,12 +2343,49 @@ fn render_constraint_block(
     });
 }
 
-/// The hairline between the drawing tools and the constraints. It spans every
-/// row, so the constraint tiles read as one block set apart from the grid
-/// rather than as the tail of each row.
-fn render_constraint_divider(ui: &mut Ui) {
+/// One block of family tiles, laid out in rows of `columns`.
+///
+/// A block shorter than its grid — the generators are one tile in a column of
+/// three — simply leaves the remaining cells unallocated, so the tiles it does
+/// have stay on the same rows as every other block's.
+#[allow(clippy::too_many_arguments)]
+fn render_family_block(
+    ui: &mut Ui,
+    families: &[ToolFamily],
+    columns: usize,
+    preferences: &mut SketchToolPreferences,
+    active: ToolVariant,
+    gate: SketchOperationGate,
+    capabilities: &SketchToolCapabilities,
+    output: &mut SketchToolbarOutput,
+    escaped_anchor: &mut Option<egui::Id>,
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for (index, row) in families.chunks(columns).enumerate() {
+            if index > 0 {
+                ui.add_space(ROW_GAP);
+            }
+            render_toolbar_row(
+                ui,
+                row,
+                preferences,
+                active,
+                gate,
+                capabilities,
+                output,
+                escaped_anchor,
+            );
+        }
+    });
+}
+
+/// The hairline between two blocks. It spans every row, so each block reads as
+/// one set of tiles set apart from its neighbours rather than as the tail of
+/// each row.
+fn render_block_divider(ui: &mut Ui) {
     let (_, rect) = ui.allocate_space(vec2(
-        CONSTRAINT_DIVIDER_WIDTH,
+        BLOCK_DIVIDER_WIDTH,
         PRIMARY_CELL_SIZE * TOOLBAR_ROWS as f32 + ROW_GAP * (TOOLBAR_ROWS as f32 - 1.0),
     ));
     let x = rect.center().x.round() + 0.5;
@@ -2933,6 +3070,16 @@ impl<'a> IconPainter<'a> {
                 self.dot((0.18, 0.49), 0.045);
                 self.dot((0.49, 0.18), 0.045);
             }
+            // An open corner and the same corner copied outside it: the shape
+            // the tool makes, at the distance it holds.
+            ToolIcon::Offset => {
+                self.line((0.20, 0.20), (0.20, 0.66));
+                self.line((0.20, 0.66), (0.66, 0.66));
+                self.line((0.38, 0.38), (0.38, 0.84));
+                self.line((0.38, 0.84), (0.84, 0.84));
+                self.line((0.20, 0.20), (0.38, 0.38));
+                self.line((0.66, 0.66), (0.84, 0.84));
+            }
             ToolIcon::RectangularPattern => {
                 for row in 0..2 {
                     for column in 0..3 {
@@ -3156,10 +3303,14 @@ mod tests {
     fn fixed_layout_is_three_rows_and_fits_the_supported_ribbon() {
         assert_eq!(DRAWING_FAMILIES.len(), DRAWING_COLUMNS * TOOLBAR_ROWS);
         assert_eq!(
-            DRAWING_BLOCK_WIDTH + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_BLOCK_WIDTH,
+            DRAWING_BLOCK_WIDTH
+                + BLOCK_DIVIDER_WIDTH
+                + GENERATOR_BLOCK_WIDTH
+                + BLOCK_DIVIDER_WIDTH
+                + CONSTRAINT_BLOCK_WIDTH,
             SKETCH_TOOLBAR_WIDTH
         );
-        // Both blocks are built from the same tile, which is what makes a
+        // All three blocks are built from the same tile, which is what makes a
         // constraint read as the same kind of control as a drawing tool.
         assert_eq!(
             DRAWING_BLOCK_WIDTH - CONSTRAINT_BLOCK_WIDTH,
@@ -3174,18 +3325,24 @@ mod tests {
         // beside the constants; a geometry that breaks one does not build.
 
         // Every family is drawn, and every family is drawn once: the drawing
-        // families as tiles, the constraint families as their variants' tiles.
+        // and generator families as tiles, the constraint families as their
+        // variants' tiles.
         let mut all = DRAWING_FAMILIES
             .iter()
+            .chain(GENERATOR_FAMILIES)
             .copied()
             .chain(CONSTRAINT_TOOLS.iter().map(|variant| variant.family()))
             .collect::<Vec<_>>();
         all.sort_unstable();
         all.dedup();
         assert_eq!(all, ToolFamily::ALL);
-        // The two lists partition the families: nothing drawn twice, nothing
+        // The three lists partition the families: nothing drawn twice, nothing
         // left to a block that does not know how to draw it.
         for family in DRAWING_FAMILIES {
+            assert!(!CONSTRAINT_FAMILIES.contains(family), "{family:?}");
+            assert!(!GENERATOR_FAMILIES.contains(family), "{family:?}");
+        }
+        for family in GENERATOR_FAMILIES {
             assert!(!CONSTRAINT_FAMILIES.contains(family), "{family:?}");
         }
     }

@@ -49,6 +49,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
     harness.key_down(key);
     harness.step();
@@ -107,7 +123,8 @@ fn finish_active_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
 }
 
-fn assert_extrude_enabled(harness: &Harness<'static, KernelLabApp>) {
+fn assert_extrude_enabled(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
     assert_eq!(
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
@@ -126,11 +143,11 @@ fn create_origin_extruded_body(harness: &mut Harness<'static, KernelLabApp>) -> 
     let initial_attempts = harness.state().transaction_attempt_count();
 
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     commit_centered_rectangle(harness, 4.0, 2.0);
     finish_active_sketch(harness);
     assert_extrude_enabled(harness);
-    click_button(harness, "Extrude");
+    click_extrude(harness);
     click_button(harness, CONFIRM_OPERATION);
     let snapshot = harness
         .state()
@@ -162,8 +179,8 @@ fn staged_face_extrusion_arrow_drags_through_the_complete_workbench() {
     create_origin_extruded_body(&mut harness);
     begin_top_face_sketch(&mut harness);
     finish_active_sketch(&mut harness);
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude finished sketch")
@@ -297,7 +314,7 @@ fn finished_face_sketch_stays_visible_until_hidden_or_extruded() {
     click_button(&mut harness, "Sketch on selected face");
     commit_centered_rectangle(&mut harness, 1.0, 1.0);
     finish_active_sketch(&mut harness);
-    assert_extrude_enabled(&harness);
+    assert_extrude_enabled(&mut harness);
 
     assert!(
         harness
@@ -320,8 +337,8 @@ fn finished_face_sketch_stays_visible_until_hidden_or_extruded() {
             .query_by_role_and_label(Role::Button, "Hide Sketch 1")
             .is_some()
     );
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     assert_ne!(harness.state().displayed_snapshot_id(), snapshot);
@@ -339,7 +356,7 @@ fn fresh_process_load_keeps_origin_sketch_visible_and_separately_extrudable() {
     let mut source = harness();
     source.run();
     click_button(&mut source, "XY Plane");
-    click_button(&mut source, "Sketch mode");
+    click_button(&mut source, "Create sketch");
     commit_centered_rectangle(&mut source, 4.0, 2.0);
     finish_active_sketch(&mut source);
     let saved = source.state().native_document_json().unwrap();
@@ -355,8 +372,8 @@ fn fresh_process_load_keeps_origin_sketch_visible_and_separately_extrudable() {
     assert_eq!(restored.state().native_document_json().unwrap(), saved);
     assert_eq!(restored.state().sketch_count(), 1);
     assert_eq!(restored.state().visible_model_sketch_overlay_count(), 1);
-    assert_extrude_enabled(&restored);
-    click_button(&mut restored, "Extrude");
+    assert_extrude_enabled(&mut restored);
+    click_extrude(&mut restored);
     click_button(&mut restored, CONFIRM_OPERATION);
 
     assert!((restored.state().displayed_measures().unwrap().volume - 32.0).abs() <= 1.0e-9);
@@ -390,8 +407,8 @@ fn fresh_process_load_resolves_face_support_and_extrudes_loaded_sketch() {
 
     assert!(restored.state().sketch_is_face_supported());
     assert_eq!(restored.state().visible_model_sketch_overlay_count(), 1);
-    assert_extrude_enabled(&restored);
-    click_button(&mut restored, "Extrude");
+    assert_extrude_enabled(&mut restored);
+    click_extrude(&mut restored);
     click_button(&mut restored, CONFIRM_OPERATION);
 
     assert!((restored.state().displayed_measures().unwrap().volume - 25.0).abs() <= 1.0e-9);
@@ -413,8 +430,8 @@ fn two_new_body_extrusions_coexist_and_have_independent_browser_visibility() {
     commit_rectangle(&mut harness, SketchPoint::new(4.0, 0.0), 2.0, 1.0);
     finish_active_sketch(&mut harness);
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::NewBody);
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     assert_ne!(
@@ -507,8 +524,8 @@ fn confirmed_active_sketch_on_origin_extruded_body_top_face_can_extrude_directly
     begin_top_face_sketch(&mut harness);
 
     assert!(!harness.state().sketch_finished());
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
@@ -538,8 +555,8 @@ fn finished_sketch_on_origin_extruded_body_top_face_can_extrude() {
     begin_top_face_sketch(&mut harness);
     finish_active_sketch(&mut harness);
 
-    assert_extrude_enabled(&harness);
-    click_button(&mut harness, "Extrude");
+    assert_extrude_enabled(&mut harness);
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude finished sketch")

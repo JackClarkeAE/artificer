@@ -14756,6 +14756,9 @@ impl KernelLabApp {
                         SelectionRequirement::TwoConnectedProfileLines => {
                             Some("Select two connected profile lines")
                         }
+                        SelectionRequirement::ConnectedCurveChain => {
+                            Some("Point to one curve of the chain to offset")
+                        }
                         SelectionRequirement::RelationOperands => {
                             Some("Pick the curves or endpoints to relate")
                         }

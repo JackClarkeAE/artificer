@@ -149,7 +149,7 @@ fn insert_library_component(harness: &mut Harness<'static, KernelLabApp>) {
 fn commit_rectangle_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     click_button(harness, "Two-point rectangle");
     for point in [SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)] {

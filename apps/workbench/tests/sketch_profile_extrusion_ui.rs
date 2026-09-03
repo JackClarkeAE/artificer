@@ -43,6 +43,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPoint) -> egui::Pos2 {
     harness
         .state()
@@ -106,7 +122,7 @@ fn set_extrusion_distance(harness: &mut Harness<'static, KernelLabApp>, value: &
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
 }
 
@@ -126,6 +142,7 @@ fn extrude_and_measure(harness: &mut Harness<'static, KernelLabApp>) -> f64 {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -133,7 +150,7 @@ fn extrude_and_measure(harness: &mut Harness<'static, KernelLabApp>) -> f64 {
             .is_disabled(),
         "every certified first-pass region must expose the same Extrude action"
     );
-    click_button(harness, "Extrude");
+    click_extrude(harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
@@ -228,7 +245,7 @@ fn analytic_slot_on_a_face_cuts_the_existing_solid() {
     );
 
     let original_snapshot = harness.state().displayed_snapshot_id();
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, "Cut");
     set_extrusion_distance(&mut harness, "-1");
     assert_eq!(harness.state().displayed_snapshot_id(), original_snapshot);
@@ -307,6 +324,7 @@ fn a_circle_resting_on_a_square_side_still_offers_the_disc_to_extrude() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::PinchedRegion
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -314,7 +332,7 @@ fn a_circle_resting_on_a_square_side_still_offers_the_disc_to_extrude() {
             .is_disabled(),
         "Extrude stays live so it can ask for the profile"
     );
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().pending_operation_label(), None);
     assert_eq!(harness.state().sketch_tool_label(), "Select");
 
@@ -440,7 +458,7 @@ fn a_region_picked_in_the_model_viewport_extrudes_that_region() {
     assert!(harness.state_mut().select_committed_sketch_region(0, ring));
     assert_eq!(harness.state().selected_sketch_region_count(), 1);
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(harness.state().last_error_code(), None);
     let volume = harness
@@ -566,7 +584,7 @@ fn the_pointer_picks_a_committed_sketch_region_in_the_model_viewport() {
         "clicking the disc in the model viewport must select the disc"
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(
         harness.state().last_error_code(),
@@ -620,7 +638,7 @@ fn picking_the_surround_of_a_committed_sketch_extrudes_it() {
             .select_committed_sketch_region(0, surround)
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(
         harness.state().last_error_code(),
@@ -654,7 +672,7 @@ fn a_negative_distance_builds_the_new_body_below_the_sketch_plane() {
     click_button(&mut harness, "Two-point rectangle");
     click_sketch_point(&mut harness, SketchPoint::new(-2.0, 1.0));
     click_sketch_point(&mut harness, SketchPoint::new(2.0, 3.0));
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     set_extrusion_distance(&mut harness, "-4");
     assert!((harness.state().extrusion_distance() + 4.0).abs() <= 1.0e-9);
     assert!(
@@ -716,7 +734,7 @@ fn a_minus_sign_still_chooses_cut_on_a_face() {
     click_sketch_point(&mut harness, SketchPoint::new(-0.4, -0.4));
     click_sketch_point(&mut harness, SketchPoint::new(0.4, 0.4));
     // The distance control belongs to the staged operation's panel.
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
 
     set_extrusion_distance(&mut harness, "-0.5");
     assert_eq!(harness.state().extrusion_mode(), ExtrusionMode::Cut);
@@ -757,8 +775,12 @@ fn a_second_sketch_is_its_own_feature_and_the_first_still_extrudes() {
     click_sketch_point(&mut harness, SketchPoint::new(-1.0, 1.0));
     click_button(&mut harness, "Finish sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
-    // Sketch 2: a 3 x 3 square right of the origin, its own feature.
-    enter_xy_sketch(&mut harness);
+    // Sketch 2: a 3 x 3 square right of the origin, its own feature. With the
+    // first sketch committed the Create command names itself "New sketch",
+    // which is the whole point of this test.
+    click_button(&mut harness, "XY Plane");
+    click_button(&mut harness, "New sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     click_button(&mut harness, "Two-point rectangle");
     click_sketch_point(&mut harness, SketchPoint::new(1.0, 1.0));
     click_sketch_point(&mut harness, SketchPoint::new(4.0, 4.0));
@@ -769,7 +791,7 @@ fn a_second_sketch_is_its_own_feature_and_the_first_still_extrudes() {
         "the second sketch must be its own history feature"
     );
     // Extrude sketch 2 (the active one) at the default 4 mm.
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(
         harness.state().last_error_code(),
@@ -798,7 +820,7 @@ fn a_second_sketch_is_its_own_feature_and_the_first_still_extrudes() {
             .select_committed_sketch_region(0, anchor),
         "sketch 1's region must be selectable after sketch 2 was consumed"
     );
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(
         harness.state().last_error_code(),
@@ -854,7 +876,7 @@ fn shift_select_multiple_sketch_regions_in_viewport() {
     assert_eq!(harness.state().selected_sketch_region_count(), 2);
 
     // Both regions should now extrude together (full rectangle without hole)
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_eq!(harness.state().last_error_code(), None);
     let volume = harness

@@ -838,7 +838,7 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
         );
     }
     // Leave the ribbon where the rest of this test expects to find it.
-    open_ribbon_tab(&mut harness, "Model mode");
+    open_ribbon_tab(&mut harness, "Model ribbon tab");
 
     let clean_viewport = harness.get_by_label("Model viewport").rect();
     assert!(
@@ -1336,7 +1336,7 @@ fn orbit_returns_a_face_focused_camera_to_the_visible_document_centre() {
     assert_ne!(harness.state().view_frame().0, document_centre);
 
     harness
-        .get_by_role_and_label(Role::Button, "Model mode")
+        .get_by_role_and_label(Role::Button, "Exit sketch")
         .click_accesskit();
     harness.run();
     middle_drag_viewport(

@@ -22,8 +22,13 @@ use crate::command_icons::CommandIcon;
 ///
 /// Tabs are the taxonomy level the workbench used to lack: with one row for
 /// every model command, the row had to eat itself — hence `Boolean...` and
-/// single-letter transform buttons. Model and Sketch follow the active
-/// workspace; View is available from both.
+/// single-letter transform buttons.
+///
+/// A tab decides what the ribbon shows and nothing else. Picking Model from
+/// inside a sketch used to leave the sketch, which made every model command
+/// unreachable without abandoning the drawing they were meant to act on —
+/// Extrude most of all. Entering and leaving the sketch workspace is what
+/// Create ▸ Sketch and Finish/Exit are for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RibbonTab {
     Model,
@@ -52,20 +57,24 @@ impl RibbonTab {
         }
     }
 
-    /// Whether picking the tab enters a workspace, or only changes what the
-    /// ribbon shows. The latter is reachable while an operation is pending.
-    pub const fn switches_workspace(self) -> bool {
-        matches!(self, Self::Model | Self::Sketch)
+    /// Whether the tab's commands act on an open sketch, and are therefore
+    /// only worth showing while one is open.
+    ///
+    /// The Sketch tab is contextual, the way a sketch tab is everywhere else:
+    /// drawing tools with no canvas under them are twelve controls that cannot
+    /// do anything.
+    pub const fn needs_a_sketch(self) -> bool {
+        matches!(self, Self::Sketch)
     }
 
-    /// Model and Sketch keep the names the workspace buttons they replaced
-    /// already had: it is the same control doing the same job, now drawn as a
-    /// tab, and renaming it would break every script and habit that names it.
-    /// View is a ribbon tab only, and says so.
+    /// Every tab names itself the same way, because every tab now does the same
+    /// thing: it chooses which commands the ribbon shows. Model and Sketch used
+    /// to be called "Model mode" and "Sketch mode" — they entered a workspace,
+    /// and the name said so. They no longer do.
     pub const fn accessible_name(self) -> &'static str {
         match self {
-            Self::Model => "Model mode",
-            Self::Sketch => "Sketch mode",
+            Self::Model => "Model ribbon tab",
+            Self::Sketch => "Sketch ribbon tab",
             Self::View => "View ribbon tab",
             Self::Parametric => "Parametric ribbon tab",
             Self::Theme => "Theme ribbon tab",
@@ -83,7 +92,6 @@ pub enum RibbonGroupId {
     Modify,
     SketchTools,
     Complete,
-    SketchSolid,
     SketchView,
     Select,
     Camera,
@@ -101,7 +109,7 @@ impl RibbonGroupId {
     pub const fn caption(self) -> &'static str {
         match self {
             Self::Create => "CREATE",
-            Self::Solid | Self::SketchSolid => "SOLID",
+            Self::Solid => "SOLID",
             Self::Features => "FEATURES",
             Self::Boolean => "BOOLEAN",
             Self::Modify => "MODIFY",
@@ -131,7 +139,6 @@ impl RibbonGroupId {
             Self::Modify => "group_modify",
             Self::SketchTools => "group_sketch_tools",
             Self::Complete => "group_complete",
-            Self::SketchSolid => "group_sketch_solid",
             Self::SketchView => "group_sketch_view",
             Self::Select => "group_select",
             Self::Camera => "group_camera",
@@ -557,18 +564,9 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         "Leave the sketch without publishing it to the model.",
         None,
     ),
-    command(
-        ModelCommand::Extrude,
-        "sketch.extrude",
-        RibbonTab::Sketch,
-        RibbonGroupId::SketchSolid,
-        CommandIcon::Extrude,
-        CommandSize::Large,
-        "Extrude",
-        "Extrude",
-        "Extrude the active sketch.",
-        None,
-    ),
+    // Extrude is not repeated here. It is one command with one name, and it
+    // belongs where every other solid feature lives; the Model tab is one click
+    // away from inside a sketch now that a tab no longer changes the workspace.
     command(
         ModelCommand::FrameSketch,
         "sketch.frame",

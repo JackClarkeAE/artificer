@@ -92,20 +92,28 @@ impl KernelLabApp {
 
     /// The tab strip, drawn in the header beside the document name.
     ///
-    /// Model and Sketch are the workspace: picking one enters it, which is what
-    /// the separate "Model mode / Sketch mode" pair used to do a row above. They
-    /// were always the same choice said twice, so there is now one control.
-    /// View is a ribbon tab only — it changes what is shown, never the
-    /// workspace — and is therefore reachable while an operation is pending.
+    /// A tab picks what the ribbon shows and never touches the workspace.
+    /// Model and Sketch used to enter theirs, which meant reaching a model
+    /// command from inside a sketch cost you the sketch: Extrude lives on the
+    /// Model tab alone, and pressing Model to get at it would have closed the
+    /// drawing it was about to consume. Create ▸ Sketch opens a sketch and
+    /// Finish/Exit leave it, so every tab is now free to be looked at from
+    /// either side — including while an operation is pending.
     pub(crate) fn ribbon_tab_strip(&mut self, ui: &mut egui::Ui) {
+        // A pick is scoped to the workspace it was made in: opening a sketch
+        // shows the sketch tools even if the last thing you did before closing
+        // the previous one was look at the Model tab.
+        if self
+            .ribbon_tab
+            .is_some_and(|(mode, _)| mode != self.workbench_mode)
+        {
+            self.ribbon_tab = None;
+        }
         let active = self.active_ribbon_tab();
-        let operation_pending = self.pending_operation.is_some();
         ui.spacing_mut().item_spacing.x = 1.0;
-        for tab in RibbonTab::ALL {
+        for tab in self.available_ribbon_tabs() {
             let selected = tab == active;
-            let enabled = !tab.switches_workspace() || !operation_pending;
-            let response = ui.add_enabled(
-                enabled,
+            let response = ui.add(
                 egui::Button::new(
                     RichText::new(tab.label())
                         .font(FontId::proportional(12.0))
@@ -122,7 +130,7 @@ impl KernelLabApp {
             response.widget_info(|| {
                 egui::WidgetInfo::selected(
                     egui::WidgetType::Button,
-                    enabled,
+                    true,
                     selected,
                     tab.accessible_name(),
                 )
@@ -136,26 +144,20 @@ impl KernelLabApp {
                     Stroke::new(2.0, theme::accent()),
                 );
             }
-            if !enabled {
-                response.on_disabled_hover_text(
-                    "Confirm or cancel the pending operation before changing workspaces.",
-                );
-            } else if response.clicked() {
-                match tab {
-                    RibbonTab::Model => {
-                        self.ribbon_tab = None;
-                        self.enter_model_mode();
-                    }
-                    RibbonTab::Sketch => {
-                        self.ribbon_tab = None;
-                        self.enter_sketch_mode();
-                    }
-                    RibbonTab::View | RibbonTab::Parametric | RibbonTab::Theme => {
-                        self.ribbon_tab = Some((self.workbench_mode, tab));
-                    }
-                }
+            if response.clicked() {
+                self.ribbon_tab = Some((self.workbench_mode, tab));
             }
         }
+    }
+
+    /// The tabs on offer. Sketch is contextual: its twelve drawing tools and
+    /// its Finish/Exit pair all act on an open sketch, and a tab full of
+    /// controls that cannot do anything is worse than no tab.
+    fn available_ribbon_tabs(&self) -> impl Iterator<Item = RibbonTab> + use<> {
+        let sketching = self.workbench_mode == WorkbenchMode::Sketch;
+        RibbonTab::ALL
+            .into_iter()
+            .filter(move |tab| sketching || !tab.needs_a_sketch())
     }
 
     /// The tab whose commands are showing. Following the workspace by default
@@ -237,10 +239,7 @@ impl KernelLabApp {
         let active = self.command_is_active(descriptor.command);
         // The groups that publish geometry carry the ribbon's only emphasis, so
         // "what do I press to make a solid" is answerable at a glance.
-        let primary = matches!(
-            group,
-            RibbonGroupId::Solid | RibbonGroupId::SketchSolid | RibbonGroupId::Complete
-        );
+        let primary = matches!(group, RibbonGroupId::Solid | RibbonGroupId::Complete);
         let (response, painter) = ui.allocate_painter(
             LARGE_BUTTON,
             if enabled {
@@ -407,7 +406,17 @@ impl KernelLabApp {
     }
 
     fn sketch_tool_grid(&mut self, ui: &mut egui::Ui) {
-        let capabilities = SketchToolCapabilities::default();
+        let mut capabilities = SketchToolCapabilities::default();
+        // Offset has its tile, its icon and its place in the grid, and no
+        // engine behind it yet: the chain walk, the offset curves and the
+        // associative recipe are specified in
+        // `docs/architecture/geometry-kernel/sketch-offset-plan.md`. Saying so
+        // on the control is better than a tile that lights up and does
+        // nothing when clicked.
+        capabilities.disable_with_reason(
+            ToolVariant::Offset,
+            "Offset is not built yet. It will copy a connected chain of curves to either side at a set distance.",
+        );
         let gate = if self.pending_operation.is_some() || self.sketch.has_pending_edit() {
             SketchOperationGate::AwaitingConfirmation
         } else {

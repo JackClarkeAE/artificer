@@ -127,7 +127,10 @@ fn a_sketch_dimension_accepts_a_variable_expression() {
     replace_text_input(&mut harness, "Variable name Length1", "depth");
 
     click_button(&mut harness, "XY Plane");
-    click_button(&mut harness, "Sketch mode");
+    // Creating the variable left the ribbon on its own tab; the sketch command
+    // lives on the Model one.
+    click_button(&mut harness, "Model ribbon tab");
+    click_button(&mut harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     click_button(&mut harness, "Two-point rectangle");
     for point in [SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)] {

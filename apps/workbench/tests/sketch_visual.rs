@@ -92,6 +92,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn press_enter(harness: &mut Harness<'static, KernelLabApp>) {
     harness.key_down(egui::Key::Enter);
     harness.step();
@@ -109,7 +125,7 @@ fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     // Let egui's deterministic panel transition reach its fixed workbench
     // geometry before measuring layout or pixels.
     for _ in 0..18 {
@@ -499,7 +515,7 @@ fn workbench_analytic_annulus_extrusion_preview_snapshot() {
         }
     ));
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
@@ -579,6 +595,7 @@ fn workbench_active_face_sketch_extrude_ready_snapshot() {
 
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     assert!(!harness.state().sketch_finished());
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -612,6 +629,7 @@ fn workbench_committed_face_sketch_overlay_snapshot() {
             .is_some(),
         "the committed sketch must remain visible and hideable in the Browser"
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -665,7 +683,7 @@ fn snapshot_selected_face_feature(case: FaceFeatureSnapshotCase<'_>) {
         .render()
         .expect("base body before face-feature preview should render");
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert!(harness.state().operation_confirmation_pending());
     assert_eq!(
         harness.state().pending_operation_label(),
@@ -761,7 +779,7 @@ fn workbench_selected_face_push_pull_preview_snapshot() {
     let mut harness = harness();
     harness.run();
     click_button(&mut harness, "Positive Z face");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     set_extrusion_distance(&mut harness, "-1");
 
     assert_eq!(
@@ -782,7 +800,7 @@ fn workbench_committed_xy_extrusion_snapshot() {
     let original_snapshot = harness.state().displayed_snapshot_id();
     finish_exact_rectangle(&mut harness);
     set_extrusion_distance(&mut harness, "3");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude finished sketch")
@@ -818,14 +836,14 @@ fn workbench_two_visible_bodies_snapshot() {
     enter_xy_sketch(&mut harness);
     finish_exact_rectangle(&mut harness);
     set_extrusion_distance(&mut harness, "2");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     click_button(&mut harness, "New sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
     finish_offset_rectangle(&mut harness, SketchPoint::new(3.0, -0.5), "2", "1");
     set_extrusion_distance(&mut harness, "1");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     assert_eq!(harness.state().body_count(), 2);
@@ -861,7 +879,7 @@ fn workbench_repeated_face_add_cut_add_committed_snapshot() {
     let mut harness = harness();
     enter_positive_z_face_sketch(&mut harness);
     finish_one_by_one_face_rectangle(&mut harness);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     select_latest_feature_end(&mut harness);
@@ -869,7 +887,7 @@ fn workbench_repeated_face_add_cut_add_committed_snapshot() {
     finish_centered_face_rectangle(&mut harness, "0.5", "0.5");
     click_button(&mut harness, "Cut");
     set_extrusion_distance(&mut harness, "-0.5");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     select_latest_feature_end(&mut harness);
@@ -877,7 +895,7 @@ fn workbench_repeated_face_add_cut_add_committed_snapshot() {
     click_button(&mut harness, "Snap");
     finish_centered_face_rectangle(&mut harness, "0.25", "0.25");
     set_extrusion_distance(&mut harness, "0.25");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     let counts = harness

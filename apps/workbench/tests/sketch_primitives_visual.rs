@@ -59,7 +59,7 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     for _ in 0..18 {
         harness.step();
     }

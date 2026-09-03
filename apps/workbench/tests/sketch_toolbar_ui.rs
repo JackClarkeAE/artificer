@@ -9,13 +9,13 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_COLUMNS, CONSTRAINT_DIVIDER_WIDTH,
-    CONSTRAINT_LABEL_ROOM, CONSTRAINT_TOOLS, DRAWING_BLOCK_WIDTH, DRAWING_COLUMNS,
-    DRAWING_FAMILIES, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
-    SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate, SketchToolCapabilities,
-    SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN, TILE_LABEL_ROOM,
-    TOOLBAR_BOTTOM_PADDING, TOOLBAR_ROWS, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
-    render_sketch_toolbar,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_BLOCK_ORIGIN, CONSTRAINT_COLUMNS,
+    CONSTRAINT_LABEL_ROOM, CONSTRAINT_TOOLS, DRAWING_COLUMNS, DRAWING_FAMILIES, FAMILY_GAP,
+    GENERATOR_BLOCK_ORIGIN, GENERATOR_COLUMNS, GENERATOR_FAMILIES, PRIMARY_CELL_SIZE,
+    PRIMARY_CELL_WIDTH, ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate,
+    SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN,
+    TILE_LABEL_ROOM, TOOLBAR_BOTTOM_PADDING, TOOLBAR_ROWS, TOOLBAR_TOP_PADDING, ToolFamily,
+    ToolVariant, render_sketch_toolbar,
 };
 
 struct ToolbarHarness {
@@ -78,7 +78,7 @@ impl ToolbarHarness {
 }
 
 #[test]
-fn compact_toolbar_is_two_blocks_of_named_tiles_either_side_of_the_divider() {
+fn compact_toolbar_is_three_blocks_of_named_tiles_parted_by_dividers() {
     let mut fixture = ToolbarHarness::new();
     fixture.run();
 
@@ -157,8 +157,9 @@ fn compact_toolbar_is_two_blocks_of_named_tiles_either_side_of_the_divider() {
         TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING
     );
 
-    // Four columns of drawing tools over three rows, then the divider, then
-    // four columns of constraints over the same three rows.
+    // Four columns of drawing tools over three rows, then a divider and the
+    // generators' single column, then a second divider and four columns of
+    // constraints over the same three rows.
     let origin = output.controls[DRAWING_FAMILIES[0] as usize]
         .expect("first tile")
         .primary;
@@ -194,7 +195,29 @@ fn compact_toolbar_is_two_blocks_of_named_tiles_either_side_of_the_divider() {
         }
     }
 
-    let block_left = origin.left() + DRAWING_BLOCK_WIDTH + CONSTRAINT_DIVIDER_WIDTH;
+    for (index, family) in GENERATOR_FAMILIES.iter().enumerate() {
+        let layout = output.controls[*family as usize].expect("generator layout");
+        assert_eq!(
+            layout.primary.size(),
+            egui::vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE),
+            "{family:?} must be a whole tile"
+        );
+        // The block is one column wide today, so the row is the index and the
+        // column arithmetic would be a modulo of one.
+        assert_eq!(GENERATOR_COLUMNS, 1);
+        assert_eq!(
+            layout.primary.top(),
+            row_top(index),
+            "{family:?} row drifted"
+        );
+        assert_eq!(
+            layout.primary.left(),
+            origin.left() + GENERATOR_BLOCK_ORIGIN,
+            "{family:?} column drifted"
+        );
+    }
+
+    let block_left = origin.left() + CONSTRAINT_BLOCK_ORIGIN;
     for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
         let tile = output.constraints[index].expect("constraint tile");
         assert_eq!(

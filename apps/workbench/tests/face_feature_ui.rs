@@ -50,6 +50,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn drag_at(harness: &mut Harness<'static, KernelLabApp>, start: egui::Pos2, end: egui::Pos2) {
     harness.hover_at(start);
     harness.step();
@@ -256,6 +272,7 @@ fn active_face_sketch_can_extrude_directly_with_lossless_cancel() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -264,7 +281,7 @@ fn active_face_sketch_can_extrude_directly_with_lossless_cancel() {
         "a certified active face profile should enable Extrude"
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(
         harness.state().pending_operation_label(),
@@ -286,7 +303,7 @@ fn active_face_sketch_can_extrude_directly_with_lossless_cancel() {
         original_attempts
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     assert!(harness.state().sketch_finished());
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
@@ -316,7 +333,7 @@ fn selected_face_add_and_cut_preview_then_publish_only_through_global_confirmati
         let original_attempts = harness.state().transaction_attempt_count();
         prepare_one_by_one_face_rectangle(&mut harness);
 
-        click_button(&mut harness, "Extrude");
+        click_extrude(&mut harness);
         assert!(harness.state().operation_confirmation_pending());
         assert_eq!(
             harness.state().pending_operation_label(),
@@ -350,7 +367,7 @@ fn selected_face_add_and_cut_preview_then_publish_only_through_global_confirmati
             original_attempts
         );
 
-        click_button(&mut harness, "Extrude");
+        click_extrude(&mut harness);
         click_button(&mut harness, mode.label_for_test());
         set_extrusion_distance(
             &mut harness,
@@ -429,7 +446,7 @@ fn selected_face_add_and_cut_preview_then_publish_only_through_global_confirmati
             committed_history
         );
 
-        click_button(&mut harness, "Model mode");
+        click_button(&mut harness, "Model ribbon tab");
         click_button(&mut harness, "Sketch on selected face");
         assert!(harness.state().sketch_is_face_supported());
         let browser_sketch = format!(
@@ -460,12 +477,13 @@ fn selected_face_extrudes_directly_and_signed_distance_switches_to_cut() {
     let attempts = harness.state().transaction_attempt_count();
 
     click_button(&mut harness, "Positive Z face");
+    show_model_commands(&mut harness);
     let extrude = harness.get_by_role_and_label(Role::Button, "Extrude");
     assert!(
         !extrude.accesskit_node().is_disabled(),
         "a supported selected face should enable direct Extrude without a surrogate sketch"
     );
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Push/pull selected face")
@@ -525,7 +543,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     // B-rep and transaction counter stay neutral when that intent is declined.
     click_button(&mut harness, "M  Move");
     assert_eq!(harness.state().active_tool_label(), "Move");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert!(harness.state().operation_confirmation_pending());
     assert_eq!(harness.state().active_tool_label(), "Select");
     assert!(!harness.state().transform_preview_pending());
@@ -544,7 +562,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     assert_eq!(harness.state().displayed_snapshot_id(), Some(base_snapshot));
     assert_eq!(harness.state().transaction_attempt_count(), base_attempts);
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     let add_snapshot = harness
         .state()
@@ -570,7 +588,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     finish_centered_face_rectangle(&mut harness, "0.5", "0.5");
     click_button(&mut harness, "Cut");
     set_extrusion_distance(&mut harness, "-0.5");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().displayed_snapshot_id(), Some(add_snapshot));
     click_button(&mut harness, CONFIRM_OPERATION);
     let cut_snapshot = harness
@@ -602,7 +620,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
         "the newest generated floor must remain a supported rectangular face"
     );
     set_extrusion_distance(&mut harness, "0.25");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().displayed_snapshot_id(), Some(cut_snapshot));
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_ne!(harness.state().displayed_snapshot_id(), Some(cut_snapshot));
@@ -680,7 +698,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
 fn generated_annular_shoulder_rejects_a_profile_drawn_inside_its_void() {
     let mut harness = harness();
     prepare_one_by_one_face_rectangle(&mut harness);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
     let committed = harness.state().displayed_snapshot_id();
     let attempts = harness.state().transaction_attempt_count();
@@ -705,6 +723,7 @@ fn generated_annular_shoulder_rejects_a_profile_drawn_inside_its_void() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::ProfileOutsideSupport
     );
+    show_model_commands(&mut harness);
     let extrude = harness.get_by_role_and_label(Role::Button, "Extrude");
     assert!(extrude.accesskit_node().is_disabled());
     extrude.click_accesskit();
@@ -756,6 +775,7 @@ fn rotated_face_support_commits_an_exact_add_through_the_unified_kernel() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     let extrude = harness.get_by_role_and_label(Role::Button, "Extrude");
     assert!(!extrude.accesskit_node().is_disabled());
     extrude.click_accesskit();

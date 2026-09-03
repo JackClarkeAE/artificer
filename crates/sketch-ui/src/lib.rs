@@ -5593,6 +5593,7 @@ impl SketchCanvasState {
             | ToolVariant::Fillet
             | ToolVariant::Chamfer
             | ToolVariant::TwoDistanceChamfer
+            | ToolVariant::Offset
             | ToolVariant::RectangularPattern
             | ToolVariant::CircularPattern
             | ToolVariant::FixedRelation
@@ -7778,6 +7779,7 @@ impl SketchCanvasState {
             | ToolVariant::Fillet
             | ToolVariant::Chamfer
             | ToolVariant::TwoDistanceChamfer
+            | ToolVariant::Offset
             | ToolVariant::RectangularPattern
             | ToolVariant::CircularPattern
             | ToolVariant::FixedRelation

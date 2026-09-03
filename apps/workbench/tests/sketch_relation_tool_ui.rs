@@ -59,7 +59,7 @@ fn click_sketch_point(harness: &mut Harness<'static, KernelLabApp>, point: Sketc
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
 }
 

@@ -43,6 +43,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPoint) -> egui::Pos2 {
     harness
         .state()
@@ -56,7 +72,7 @@ fn click_sketch_point(harness: &mut Harness<'static, KernelLabApp>, point: Sketc
 fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
     click_button(harness, "XY Plane");
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
 }
 
@@ -170,7 +186,7 @@ fn rectangle_recipe_edit_applies_on_accept_and_drives_exact_new_body_volume() {
     assert_eq!(editor.parameters[0].text, "3");
     assert_eq!(editor.parameters[1].text, "2");
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
@@ -528,7 +544,7 @@ fn edited_extruded_sketch_rebuilds_in_place_and_escape_stays_neutral() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     create_two_point_rectangle(&mut harness);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     confirm(&mut harness);
     let original_snapshot = harness.state().displayed_snapshot_id();
     let original_feature_count = harness.state().document_feature_count();

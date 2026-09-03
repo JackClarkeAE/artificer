@@ -78,6 +78,22 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+/// Extrude lives on the Model tab alone now, and a ribbon tab no longer
+/// changes the workspace: a sketch reaches the model commands without leaving.
+fn show_model_commands(harness: &mut Harness<'static, KernelLabApp>) {
+    if harness
+        .query_by_role_and_label(Role::Button, "Extrude")
+        .is_none()
+    {
+        click_button(harness, "Model ribbon tab");
+    }
+}
+
+fn click_extrude(harness: &mut Harness<'static, KernelLabApp>) {
+    show_model_commands(harness);
+    click_button(harness, "Extrude");
+}
+
 fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
     harness.key_down(key);
     harness.step();
@@ -87,7 +103,7 @@ fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
 
 fn enter_sketch(harness: &mut Harness<'static, KernelLabApp>, plane: &str) {
     click_button(harness, plane);
-    click_button(harness, "Sketch mode");
+    click_button(harness, "Create sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
 }
 
@@ -340,12 +356,12 @@ fn mode_roundtrip_cancels_incomplete_rectangle_and_arc_drafts() {
         assert!(harness.state().sketch_creation_draft_active());
         assert!(!harness.state().operation_confirmation_pending());
 
-        click_button(&mut harness, "Model mode");
+        click_button(&mut harness, "Exit sketch");
         assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
         assert!(!harness.state().sketch_creation_draft_active());
         assert_kernel_unchanged(&harness, snapshot, attempts);
 
-        click_button(&mut harness, "Sketch mode");
+        click_button(&mut harness, "Create sketch");
         assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
         assert!(!harness.state().sketch_creation_draft_active());
 
@@ -605,6 +621,81 @@ fn read_only_selected_dimensions_do_not_block_the_next_creation_click() {
     assert_eq!(harness.state().pending_operation_label(), None);
 }
 
+/// The point of moving Extrude to the Model tab: a ribbon tab chooses which
+/// commands are shown and nothing else, so a sketch can look at the model
+/// commands and come back without ever leaving the canvas.
+#[test]
+fn the_model_tab_is_readable_from_inside_a_sketch_without_leaving_it() {
+    let mut harness = harness([1280.0, 800.0]);
+    // With no sketch open the Sketch tab is not offered at all: twelve drawing
+    // tools with no canvas under them can do nothing.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Sketch ribbon tab")
+            .is_none()
+    );
+
+    enter_sketch(&mut harness, "XY Plane");
+    commit_exact_xy_rectangle(&mut harness);
+    let snapshot = harness.state().displayed_snapshot_id();
+    let attempts = harness.state().transaction_attempt_count();
+
+    // Extrude is not repeated on the Sketch tab any more.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Extrude")
+            .is_none()
+    );
+
+    click_button(&mut harness, "Model ribbon tab");
+    assert_eq!(
+        harness.state().workbench_mode(),
+        WorkbenchMode::Sketch,
+        "reading the model commands must not close the sketch"
+    );
+    harness.get_by_label("Sketch viewport");
+    assert_kernel_unchanged(&harness, snapshot, attempts);
+    assert!(
+        !harness
+            .get_by_role_and_label(Role::Button, "Extrude")
+            .accesskit_node()
+            .is_disabled(),
+        "the sketch drawn behind the Model tab is still what Extrude would consume"
+    );
+    // The sketch tools are the other tab's, and are gone while it shows.
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Two-point rectangle")
+            .is_none()
+    );
+
+    click_button(&mut harness, "Sketch ribbon tab");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    harness.get_by_role_and_label(Role::Button, "Two-point rectangle");
+    assert_kernel_unchanged(&harness, snapshot, attempts);
+
+    // Leaving and reopening the sketch shows its own tools again, whatever was
+    // last looked at: the pick is scoped to the workspace it was made in.
+    click_button(&mut harness, "Model ribbon tab");
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Exit sketch")
+            .is_none(),
+        "leaving the sketch is the Sketch tab's own command, not a side effect of a tab"
+    );
+    click_button(&mut harness, "Sketch ribbon tab");
+    click_button(&mut harness, "Exit sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Sketch ribbon tab")
+            .is_none()
+    );
+    click_button(&mut harness, "Edit sketch");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    harness.get_by_role_and_label(Role::Button, "Two-point rectangle");
+}
+
 #[test]
 fn active_closed_sketch_extrudes_directly_and_cancel_returns_to_sketch() {
     let mut harness = harness([1280.0, 800.0]);
@@ -618,6 +709,7 @@ fn active_closed_sketch_extrudes_directly_and_cancel_returns_to_sketch() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -626,7 +718,7 @@ fn active_closed_sketch_extrudes_directly_and_cancel_returns_to_sketch() {
         "a confirmed closed profile should enable Extrude without a separate Finish step"
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
     assert_eq!(
         harness.state().pending_operation_label(),
@@ -641,9 +733,9 @@ fn active_closed_sketch_extrudes_directly_and_cancel_returns_to_sketch() {
     assert!(!harness.state().operation_confirmation_pending());
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
 
-    click_button(&mut harness, "Model mode");
+    click_button(&mut harness, "Exit sketch");
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CANCEL_OPERATION);
     assert_eq!(
         harness.state().workbench_mode(),
@@ -653,6 +745,7 @@ fn active_closed_sketch_extrudes_directly_and_cancel_returns_to_sketch() {
     assert!(!harness.state().sketch_finished());
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
 
+    show_model_commands(&mut harness);
     harness
         .get_by_role_and_label(Role::Button, "Extrude")
         .focus();
@@ -743,7 +836,7 @@ fn crossing_cells_require_selection_and_extrude_the_exact_selected_union() {
     assert_eq!(harness.state().available_sketch_region_count(), 3);
 
     let attempts = harness.state().transaction_attempt_count();
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     let command = harness
         .state()
         .pending_sketch_extrusion_command()
@@ -768,6 +861,7 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
 
     assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -777,7 +871,7 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
     );
     click_button(&mut harness, "Collapse browser panel");
     assert!(!harness.state().shell_visibility().model_browser);
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().workbench_mode(),
         WorkbenchMode::Model,
@@ -813,7 +907,7 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
     assert!(!harness.state().operation_confirmation_pending());
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude finished sketch")
@@ -852,6 +946,7 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
             .query_by_label("Body 1 · native sketch extrusion")
             .is_some()
     );
+    show_model_commands(&mut harness);
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -922,6 +1017,7 @@ fn concave_finished_loop_extrudes_as_an_exact_native_linear_profile() {
         SketchExtrusionEligibility::Ready
     );
 
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -931,7 +1027,7 @@ fn concave_finished_loop_extrudes_as_an_exact_native_linear_profile() {
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
 
     set_extrusion_distance(&mut harness, "2");
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert!(harness.state().operation_confirmation_pending());
     assert_kernel_unchanged(&harness, original_snapshot, original_attempts);
     click_button(&mut harness, "Confirm operation");
@@ -990,6 +1086,7 @@ fn separately_drawn_reversed_square_is_visibly_certified_and_extrude_ready() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -1165,6 +1262,7 @@ fn connected_line_loop_extrudes_without_leaving_the_line_tool() {
         harness.state().sketch_profile_status(),
         CertifiedProfileStatus::Closed { .. }
     ));
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -1173,7 +1271,7 @@ fn connected_line_loop_extrudes_without_leaving_the_line_tool() {
         "the automatic next-line anchor must not masquerade as unfinished geometry"
     );
 
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
@@ -1217,6 +1315,7 @@ fn circles_and_nested_profile_holes_extrude_from_the_visible_ui() {
             CertifiedProfileStatus::ClosedAnalyticCircle
                 | CertifiedProfileStatus::ClosedRegions { analytic: true, .. }
         ));
+        show_model_commands(&mut harness);
         assert!(
             !harness
                 .get_by_role_and_label(Role::Button, "Extrude")
@@ -1225,7 +1324,7 @@ fn circles_and_nested_profile_holes_extrude_from_the_visible_ui() {
             "an exact circular profile must expose the same Extrude action as a polygon"
         );
 
-        click_button(&mut harness, "Extrude");
+        click_extrude(&mut harness);
         assert_kernel_unchanged(&harness, snapshot, attempts);
         click_button(&mut harness, CONFIRM_OPERATION);
 
@@ -1254,13 +1353,14 @@ fn a_visible_circle_on_a_face_commits_as_an_exact_boss() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
             .accesskit_node()
             .is_disabled()
     );
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     assert_eq!(harness.state().last_error_code(), None);
@@ -1314,7 +1414,7 @@ fn a_visible_line_and_semicircular_arc_extrude_as_one_exact_profile() {
         ),
         "unexpected line/arc profile status: {status:?}"
     );
-    click_button(&mut harness, "Extrude");
+    click_extrude(&mut harness);
     click_button(&mut harness, CONFIRM_OPERATION);
 
     assert_eq!(harness.state().last_error_code(), None);
@@ -1356,6 +1456,7 @@ fn finish_saves_an_open_line_but_keeps_extrude_unavailable() {
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -1414,6 +1515,7 @@ fn finish_saves_self_intersecting_authoring_and_exposes_the_selected_bounded_cel
         harness.state().sketch_extrusion_eligibility(),
         SketchExtrusionEligibility::Ready
     );
+    show_model_commands(&mut harness);
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -1486,7 +1588,10 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
         "Two-point rectangle",
         "Centre-point circle",
         "Centre-start-end arc",
-        "Extrude",
+        // The two tiles at the far end of the sketch grid: the last drawing
+        // column and the generator column beyond the divider.
+        "Offset chain",
+        "Rectangular sketch pattern",
         "Frame sketch",
     ] {
         let node = harness.get_by_role_and_label(Role::Button, label);
@@ -1505,6 +1610,7 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
             "{label} overlaps the sketch canvas below the command ribbon: {rect:?}"
         );
     }
+    show_model_commands(&mut harness);
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "Extrude")
@@ -1512,6 +1618,9 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
             .is_disabled(),
         "persistent Extrude stays visible but unavailable until a closed profile is confirmed"
     );
+    // Back to the sketch tools; looking at the model commands never left the
+    // sketch, which is what makes Extrude reachable from here at all.
+    click_button(&mut harness, "Sketch ribbon tab");
 
     let clean_canvas = harness.get_by_label("Sketch viewport").rect();
     choose_sketch_tool(&mut harness, "Sketch point");
