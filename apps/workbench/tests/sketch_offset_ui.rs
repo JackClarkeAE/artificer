@@ -43,6 +43,13 @@ fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
     click_at(harness, center);
 }
 
+fn press_key(harness: &mut Harness<'static, KernelLabApp>, key: egui::Key) {
+    harness.key_down(key);
+    harness.step();
+    harness.key_up(key);
+    harness.step();
+}
+
 fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPoint) -> egui::Pos2 {
     harness
         .state()
@@ -75,6 +82,29 @@ fn lowest_offset_edge(harness: &Harness<'static, KernelLabApp>) -> f64 {
     segments(harness)
         .iter()
         .flat_map(|(start, end)| [start.v, end.v])
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// How far down the whole drawing reaches, whatever kind of curve gets there.
+///
+/// Counting entities does not survive an undo: replaying a composite like a
+/// rectangle explodes it into the exact curves it was always made of, so the
+/// tally changes without the drawing changing. Where the geometry ends does
+/// not move for that reason.
+fn lowest_point(harness: &Harness<'static, KernelLabApp>) -> f64 {
+    harness
+        .state()
+        .sketch_entity_geometries()
+        .into_iter()
+        .flat_map(|geometry| match geometry {
+            SketchGeometry::Point(point) => vec![point.v],
+            SketchGeometry::Segment { start, end } => vec![start.v, end.v],
+            SketchGeometry::Rectangle { first, opposite } => vec![first.v, opposite.v],
+            SketchGeometry::Circle { center, rim } => {
+                vec![center.v - center.distance_squared(rim).sqrt()]
+            }
+            SketchGeometry::Arc { start, end, .. } => vec![start.v, end.v],
+        })
         .fold(f64::INFINITY, f64::min)
 }
 
@@ -179,6 +209,49 @@ fn a_click_on_empty_canvas_stages_nothing_at_all() {
         harness.state().active_sketch_tool_label(),
         "Offset chain",
         "a miss leaves the tool armed for the next try"
+    );
+}
+
+#[test]
+fn an_offset_undoes_as_one_thing_and_can_itself_be_offset() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    // Smaller than the shared fixture, so two offsets still fit the canvas.
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-3.0, -2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(3.0, 2.0));
+    let before = harness.state().sketch_entity_count();
+
+    click_button(&mut harness, "Offset chain");
+    let below = canvas_sketch_point(&harness, SketchPoint::new(0.0, -2.0)) + egui::vec2(0.0, 6.0);
+    click_at(&mut harness, below);
+    assert_eq!(harness.state().sketch_entity_count(), before + 8);
+
+    // The offset's own curves are profile geometry, so the chain walk finds
+    // them and the tool works on its own output — the case that catches an
+    // offset whose result cannot be offset again. Take its top edge, clear of
+    // the dimension chips the last stroke's selection drew below.
+    let above = canvas_sketch_point(&harness, SketchPoint::new(0.0, 3.0)) + egui::vec2(0.0, -6.0);
+    click_at(&mut harness, above);
+    assert_eq!(harness.state().sketch_entity_count(), before + 16);
+
+    // Each is one edit, undone whole. Escape first closes the live dimension
+    // readout the stroke left open, which owns the keyboard while it is up.
+    // Where the drawing ends is the measure, not how many entities it holds:
+    // an undo replays a composite rectangle as the four curves it always was.
+    assert!((lowest_point(&harness) + 4.0).abs() < 1.0e-6);
+    press_key(&mut harness, egui::Key::Escape);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    harness.run();
+    assert!(
+        (lowest_point(&harness) + 3.0).abs() < 1.0e-6,
+        "one undo takes back the second offset and nothing else"
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    harness.run();
+    assert!(
+        (lowest_point(&harness) + 2.0).abs() < 1.0e-6,
+        "the second takes back the first, leaving the rectangle"
     );
 }
 
