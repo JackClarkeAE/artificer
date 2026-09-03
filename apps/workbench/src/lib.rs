@@ -12204,6 +12204,36 @@ impl KernelLabApp {
                     "design-history preview",
                     operation_pending,
                 );
+                // The ribbon's own toggle. It used to be a lone chevron at the
+                // head of the tool row, ahead of Select, where it read as a
+                // tool and cost the row its width; here it sits with the other
+                // region toggles, which is what it is.
+                let expanded = self.shell.visibility().command_ribbon;
+                let response = ui.add(
+                    egui::Button::new(RichText::new("Ribbon").font(FontId::proportional(11.5)))
+                        .frame(false)
+                        .selected(expanded)
+                        .corner_radius(2)
+                        .min_size(egui::vec2(56.0, 26.0)),
+                );
+                // The name says what the click does, because that is what a
+                // screen reader announces and what a test drives.
+                let name = if expanded {
+                    "Collapse command ribbon"
+                } else {
+                    "Expand command ribbon"
+                };
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name)
+                });
+                if shell_button_activated(ui, &response, operation_pending) {
+                    self.shell.set_command_ribbon(!expanded);
+                }
+                response.on_hover_text(if expanded {
+                    "Hide the command ribbon"
+                } else {
+                    "Show the command ribbon"
+                });
             });
         });
     }

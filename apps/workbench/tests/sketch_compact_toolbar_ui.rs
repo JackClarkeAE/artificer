@@ -1,7 +1,7 @@
 use artificer_sketch_ui::sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_COLUMNS,
-    CONSTRAINT_DIVIDER_WIDTH, CONSTRAINT_TOOLS, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
-    ROW_GAP,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_COLUMNS, CONSTRAINT_DIVIDER_WIDTH,
+    CONSTRAINT_TOOLS, DRAWING_BLOCK_WIDTH, DRAWING_COLUMNS, FAMILY_GAP, PRIMARY_CELL_SIZE,
+    PRIMARY_CELL_WIDTH, ROW_GAP,
 };
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
 use egui::accesskit::Role;
@@ -155,85 +155,83 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
     enter_xy_sketch(&mut harness);
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
-    // Six columns of drawing tools in two rows; the constraints stand in
-    // their own block beyond a divider, one cell each.
-    let rows = [
-        [
-            "Select sketch geometry",
-            "Sketch point",
-            "Single line",
-            "Two-point rectangle",
-            "Centre-point circle",
-            "Centre-start-end arc",
-        ],
-        [
-            "Outer-diameter polygon",
-            "Two-point centre-to-centre slot",
-            "Trim curve span",
-            "2D fillet",
-            "Equal-distance chamfer",
-            "Rectangular sketch pattern",
-        ],
+    // Four columns of drawing tools over three rows; the constraints stand in
+    // their own block beyond a divider, a named tile each.
+    let drawing = [
+        "Select sketch geometry",
+        "Sketch point",
+        "Single line",
+        "Two-point rectangle",
+        "Centre-point circle",
+        "Centre-start-end arc",
+        "Outer-diameter polygon",
+        "Two-point centre-to-centre slot",
+        "Trim curve span",
+        "2D fillet",
+        "Equal-distance chamfer",
+        "Rectangular sketch pattern",
     ];
-    // Every constraint has a cell beyond the divider — all eleven of them on
+    let origin = harness
+        .get_by_role_and_label(Role::Button, drawing[0])
+        .rect();
+    let row_top = |row: usize| origin.top() + row as f32 * (PRIMARY_CELL_SIZE + ROW_GAP);
+    // Every constraint has a tile beyond the divider — all eleven of them on
     // screen at once, and every one inside the minimum window.
     for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
         let label = variant.descriptor().accessible_name;
-        let row_index = index / CONSTRAINT_COLUMNS;
-        let column = index % CONSTRAINT_COLUMNS;
-        let row_first = harness
-            .get_by_role_and_label(Role::Button, rows[row_index][0])
-            .rect();
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
-        assert_eq!(rect.center().y, row_first.center().y, "{label} row drifted");
+        assert_eq!(
+            rect.top(),
+            row_top(index / CONSTRAINT_COLUMNS),
+            "{label} row drifted"
+        );
         assert_eq!(
             rect.left(),
-            row_first.left()
-                + 6.0 * PRIMARY_CELL_WIDTH
-                + 5.0 * FAMILY_GAP
+            origin.left()
+                + DRAWING_BLOCK_WIDTH
                 + CONSTRAINT_DIVIDER_WIDTH
-                + column as f32 * (CONSTRAINT_CELL_WIDTH + FAMILY_GAP),
+                + (index % CONSTRAINT_COLUMNS) as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
             "{label} sits beyond the divider"
+        );
+        // The same whole tile a drawing tool gets, so the two blocks read as
+        // one set of controls.
+        assert!(
+            (rect.width() - PRIMARY_CELL_WIDTH).abs() <= 0.1
+                && (rect.height() - PRIMARY_CELL_SIZE).abs() <= 0.1,
+            "{label} must be a complete tile: {rect:?}"
         );
         assert!(rect.max.x <= 1040.0, "{label} is clipped: {rect:?}");
     }
-    for (row_index, row) in rows.into_iter().enumerate() {
-        let first = harness.get_by_role_and_label(Role::Button, row[0]).rect();
-        for (column, label) in row.into_iter().enumerate() {
-            let rect = harness.get_by_role_and_label(Role::Button, label).rect();
-            assert!(rect.is_positive(), "{label} must have a hit target");
-            // A family with variants yields the chooser column; one without owns
-            // the full tile. Both are complete — neither is squeezed by the
-            // ribbon running out of width, which is what this guards.
-            let split_width = PRIMARY_CELL_WIDTH - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET;
-            assert!(
-                ((rect.width() - PRIMARY_CELL_WIDTH).abs() <= 0.1
-                    || (rect.width() - split_width).abs() <= 0.1)
-                    && (rect.height() - PRIMARY_CELL_SIZE).abs() <= 0.1,
-                "{label} must remain a complete tile: {rect:?}"
-            );
-            assert_eq!(rect.center().y, first.center().y, "{label} row drifted");
-            assert_eq!(
-                rect.left(),
-                first.left() + column as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
-                "{label} column drifted"
-            );
-            assert!(
-                rect.min.x >= 0.0
-                    && rect.max.x <= 1040.0
-                    && rect.min.y >= 0.0
-                    && rect.max.y <= viewport_top - 4.0,
-                "{label} is clipped or lacks bottom ribbon padding: {rect:?}; viewport top {viewport_top}"
-            );
-        }
-        if row_index == 1 {
-            let first_row_y = harness
-                .get_by_role_and_label(Role::Button, rows[0][0])
-                .rect()
-                .center()
-                .y;
-            assert_eq!(first.center().y - first_row_y, PRIMARY_CELL_SIZE + ROW_GAP);
-        }
+    for (index, label) in drawing.into_iter().enumerate() {
+        let rect = harness.get_by_role_and_label(Role::Button, label).rect();
+        assert!(rect.is_positive(), "{label} must have a hit target");
+        // A family with variants yields the chooser column; one without owns
+        // the full tile. Both are complete — neither is squeezed by the
+        // ribbon running out of width, which is what this guards.
+        let split_width = PRIMARY_CELL_WIDTH - CHEVRON_CELL_WIDTH - CHEVRON_CELL_INSET;
+        assert!(
+            ((rect.width() - PRIMARY_CELL_WIDTH).abs() <= 0.1
+                || (rect.width() - split_width).abs() <= 0.1)
+                && (rect.height() - PRIMARY_CELL_SIZE).abs() <= 0.1,
+            "{label} must remain a complete tile: {rect:?}"
+        );
+        assert_eq!(
+            rect.top(),
+            row_top(index / DRAWING_COLUMNS),
+            "{label} row drifted"
+        );
+        assert_eq!(
+            rect.left(),
+            origin.left() + (index % DRAWING_COLUMNS) as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
+            "{label} column drifted"
+        );
+        assert!(
+            rect.min.x >= 0.0
+                && rect.max.x <= 1040.0
+                && rect.min.y >= 0.0
+                && rect.max.y <= viewport_top - 4.0,
+            "{label} is clipped or lacks bottom ribbon padding: {rect:?}; viewport top {viewport_top}"
+        );
     }
 
     for (primary_label, chooser_label) in [

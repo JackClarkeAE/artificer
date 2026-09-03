@@ -29,8 +29,7 @@ use crate::theme::{self, ribbon_group};
 use artificer_model::QuantityKind;
 
 use crate::{
-    KernelLabApp, SketchPlane, SolidFeaturePreset, WorkbenchMode, origin_plane_label,
-    shell_button_activated, viewport,
+    KernelLabApp, SketchPlane, SolidFeaturePreset, WorkbenchMode, origin_plane_label, viewport,
 };
 
 /// Whether a command can run right now, and in plain words why not when it
@@ -62,20 +61,11 @@ const SMALL_BUTTON: Vec2 = vec2(78.0, 24.0);
 
 impl KernelLabApp {
     pub(crate) fn command_ribbon(&mut self, ui: &mut egui::Ui) {
-        let operation_pending = self.operation_confirmation_pending();
         if !self.shell.visibility().command_ribbon {
             ui.horizontal_centered(|ui| {
-                let response = ui.add_sized([24.0, 22.0], egui::Button::new("+").frame(false));
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        true,
-                        "Expand command ribbon",
-                    )
-                });
-                if shell_button_activated(ui, &response, operation_pending) {
-                    self.shell.set_command_ribbon(true);
-                }
+                // Nothing to collapse or expand from here: the toggle lives in
+                // the header, beside the other region toggles, which is what
+                // took the lone chevron off the front of the tool row.
                 ui.label(
                     RichText::new(format!("{} workspace", self.workbench_mode.label()))
                         .color(theme::muted()),
@@ -96,15 +86,6 @@ impl KernelLabApp {
             // separator was 19 px of air per boundary, the single largest
             // consumer of width at the 1040 px minimum window.
             ui.spacing_mut().item_spacing.x = 2.0;
-            let response = ui
-                .add_sized([24.0, 22.0], egui::Button::new("−").frame(false))
-                .on_hover_text("Collapse command ribbon");
-            response.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Collapse command ribbon")
-            });
-            if shell_button_activated(ui, &response, operation_pending) {
-                self.shell.set_command_ribbon(false);
-            }
             self.ribbon_groups(ui);
         });
     }

@@ -9,11 +9,12 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_COLUMNS,
-    CONSTRAINT_DIVIDER_WIDTH, CONSTRAINT_TOOLS, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH,
-    ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate,
-    SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN,
-    TILE_LABEL_GAP, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_COLUMNS, CONSTRAINT_DIVIDER_WIDTH,
+    CONSTRAINT_LABEL_ROOM, CONSTRAINT_TOOLS, DRAWING_BLOCK_WIDTH, DRAWING_COLUMNS,
+    DRAWING_FAMILIES, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
+    SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH, SketchOperationGate, SketchToolCapabilities,
+    SketchToolbarOutput, SketchToolbarState, TILE_ICON_COLUMN, TILE_LABEL_ROOM,
+    TOOLBAR_BOTTOM_PADDING, TOOLBAR_ROWS, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
     render_sketch_toolbar,
 };
 
@@ -77,7 +78,7 @@ impl ToolbarHarness {
 }
 
 #[test]
-fn compact_toolbar_is_six_drawing_columns_and_a_constraint_block_beyond_the_divider() {
+fn compact_toolbar_is_two_blocks_of_named_tiles_either_side_of_the_divider() {
     let mut fixture = ToolbarHarness::new();
     fixture.run();
 
@@ -93,12 +94,12 @@ fn compact_toolbar_is_six_drawing_columns_and_a_constraint_block_beyond_the_divi
         assert_eq!(node.rect().width(), PRIMARY_CELL_WIDTH, "{label}");
         assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
     }
-    // Every constraint is a cell of its own beyond the divider, icon-only and
-    // uniform: none of them is a tile, and none of them is behind a chooser.
+    // A constraint gets the same tile as a drawing tool — the whole one,
+    // because it has no variants to choose between.
     for variant in CONSTRAINT_TOOLS {
         let label = variant.descriptor().accessible_name;
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
-        assert_eq!(node.rect().width(), CONSTRAINT_CELL_WIDTH, "{label}");
+        assert_eq!(node.rect().width(), PRIMARY_CELL_WIDTH, "{label}");
         assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
     }
     for label in [
@@ -147,110 +148,80 @@ fn compact_toolbar_is_six_drawing_columns_and_a_constraint_block_beyond_the_divi
     let output = output.as_ref().expect("toolbar output");
     let bounds = output.bounds.expect("toolbar bounds");
     assert_eq!(bounds.width(), SKETCH_TOOLBAR_WIDTH);
-    assert_eq!(bounds.height(), PRIMARY_CELL_SIZE * 2.0 + ROW_GAP);
+    assert_eq!(
+        bounds.height(),
+        PRIMARY_CELL_SIZE * TOOLBAR_ROWS as f32 + ROW_GAP * (TOOLBAR_ROWS as f32 - 1.0)
+    );
     assert_eq!(
         SKETCH_TOOLBAR_HEIGHT - bounds.height(),
         TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING
     );
 
-    // Six columns of drawing tools in two rows, then the divider, then the
-    // constraint block: two rows of cells, one per constraint.
-    let rows = [
-        [
-            ToolFamily::Select,
-            ToolFamily::Point,
-            ToolFamily::Line,
-            ToolFamily::Rectangle,
-            ToolFamily::Circle,
-            ToolFamily::Arc,
-        ],
-        [
-            ToolFamily::Polygon,
-            ToolFamily::Slot,
-            ToolFamily::Trim,
-            ToolFamily::Fillet,
-            ToolFamily::Chamfer,
-            ToolFamily::Pattern,
-        ],
-    ];
-    // The constraint block: two rows of cells beyond the divider, aligned with
-    // the drawing rows they sit beside.
-    let block_left = output.controls[ToolFamily::Select as usize]
-        .expect("select layout")
-        .primary
-        .left()
-        + 6.0 * PRIMARY_CELL_WIDTH
-        + 5.0 * FAMILY_GAP
-        + CONSTRAINT_DIVIDER_WIDTH;
-    for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
-        let row_index = index / CONSTRAINT_COLUMNS;
-        let column = index % CONSTRAINT_COLUMNS;
-        let row_first = output.controls[rows[row_index][0] as usize]
-            .expect("row control")
-            .primary;
-        let cell = output.constraints[index].expect("constraint cell");
+    // Four columns of drawing tools over three rows, then the divider, then
+    // four columns of constraints over the same three rows.
+    let origin = output.controls[DRAWING_FAMILIES[0] as usize]
+        .expect("first tile")
+        .primary;
+    let row_top = |row: usize| origin.top() + row as f32 * (PRIMARY_CELL_SIZE + ROW_GAP);
+    for (index, family) in DRAWING_FAMILIES.iter().enumerate() {
+        let layout = output.controls[*family as usize].expect("family layout");
         assert_eq!(
-            cell.size(),
-            egui::vec2(CONSTRAINT_CELL_WIDTH, PRIMARY_CELL_SIZE),
-            "{variant:?} must be a whole cell"
+            layout.primary.size(),
+            egui::vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE),
+            "{family:?} must be a whole tile"
         );
         assert_eq!(
-            cell.center().y,
-            row_first.center().y,
+            layout.primary.top(),
+            row_top(index / DRAWING_COLUMNS),
+            "{family:?} row drifted"
+        );
+        assert_eq!(
+            layout.primary.left(),
+            origin.left() + (index % DRAWING_COLUMNS) as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
+            "{family:?} column drifted"
+        );
+        if let Some(chooser) = layout.chooser {
+            assert!(layout.primary.contains_rect(chooser));
+            // The chooser is a column at the tile's trailing edge. Asserting
+            // where it *starts* is the point: it must clear the icon column
+            // and the label, because the two overlapping is the bug this
+            // layout replaced.
+            assert!(
+                chooser.left() >= layout.primary.left() + TILE_ICON_COLUMN,
+                "chooser for {family:?} overlaps the icon column"
+            );
+            assert!(chooser.right() <= layout.primary.right());
+        }
+    }
+
+    let block_left = origin.left() + DRAWING_BLOCK_WIDTH + CONSTRAINT_DIVIDER_WIDTH;
+    for (index, variant) in CONSTRAINT_TOOLS.iter().enumerate() {
+        let tile = output.constraints[index].expect("constraint tile");
+        assert_eq!(
+            tile.size(),
+            egui::vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE),
+            "{variant:?} must be a whole tile"
+        );
+        assert_eq!(
+            tile.top(),
+            row_top(index / CONSTRAINT_COLUMNS),
             "{variant:?} row drifted"
         );
         assert_eq!(
-            cell.left(),
-            block_left + column as f32 * (CONSTRAINT_CELL_WIDTH + FAMILY_GAP),
+            tile.left(),
+            block_left + (index % CONSTRAINT_COLUMNS) as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP),
             "{variant:?} column drifted"
         );
-        assert!(cell.right() <= bounds.right());
+        assert!(tile.right() <= bounds.right());
     }
-    // The full row reaches the toolbar's trailing edge: the block is as wide
-    // as the width the narrower tiles gave back, not a stub of it.
+    // A full constraint row reaches the toolbar's trailing edge: the block is
+    // as wide as the columns it claims, not a stub of them.
     assert_eq!(
         output.constraints[CONSTRAINT_COLUMNS - 1]
-            .expect("last cell of the first constraint row")
+            .expect("last tile of the first constraint row")
             .right(),
         bounds.right()
     );
-    for (row_index, row) in rows.into_iter().enumerate() {
-        let first = output.controls[row[0] as usize]
-            .expect("first row control")
-            .primary;
-        for (column, family) in row.into_iter().enumerate() {
-            let layout = output.controls[family as usize].expect("family layout");
-            assert_eq!(
-                layout.primary.size(),
-                egui::vec2(PRIMARY_CELL_WIDTH, PRIMARY_CELL_SIZE)
-            );
-            assert_eq!(layout.primary.center().y, first.center().y);
-            assert_eq!(
-                layout.primary.left(),
-                first.left() + column as f32 * (PRIMARY_CELL_WIDTH + FAMILY_GAP)
-            );
-            if let Some(chooser) = layout.chooser {
-                assert!(layout.primary.contains_rect(chooser));
-                // The chooser is a column at the tile's trailing edge. Asserting
-                // where it *starts* is the point: it must clear the icon column
-                // and the label, because the two overlapping is the bug this
-                // layout replaced.
-                assert!(
-                    chooser.left() >= layout.primary.left() + TILE_ICON_COLUMN,
-                    "chooser for {family:?} overlaps the icon column"
-                );
-                assert!(chooser.right() <= layout.primary.right());
-            }
-        }
-        if row_index == 1 {
-            let first_row_y = output.controls[ToolFamily::Select as usize]
-                .expect("select layout")
-                .primary
-                .center()
-                .y;
-            assert_eq!(first.center().y - first_row_y, PRIMARY_CELL_SIZE + ROW_GAP);
-        }
-    }
 }
 
 #[test]
@@ -399,7 +370,9 @@ fn pending_confirmation_disables_both_halves_of_every_selector() {
 /// actually measures. This is the measurement, at the size the tile draws.
 #[test]
 fn every_tile_label_fits_the_column_the_tile_geometry_leaves_it() {
-    let measured: Rc<RefCell<Vec<(&'static str, f32)>>> = Rc::new(RefCell::new(Vec::new()));
+    /// One label, what it measures, and the room its own tile leaves it.
+    type MeasuredLabel = (&'static str, f32, f32);
+    let measured: Rc<RefCell<Vec<MeasuredLabel>>> = Rc::new(RefCell::new(Vec::new()));
     let sink = Rc::clone(&measured);
     let mut harness = Harness::builder()
         .with_size([1040.0, 700.0])
@@ -420,19 +393,24 @@ fn every_tile_label_fits_the_column_the_tile_geometry_leaves_it() {
                         )
                         .rect
                         .width();
-                    sink.push((label, width));
+                    // A drawing family spends the chooser column and a
+                    // constraint does not, so each label is held to the room
+                    // its own tile actually leaves.
+                    let room = if CONSTRAINT_TOOLS.contains(variant) {
+                        CONSTRAINT_LABEL_ROOM
+                    } else {
+                        TILE_LABEL_ROOM
+                    };
+                    sink.push((label, width, room));
                 }
             }
         });
     harness.run();
 
-    // A split tile stops short of the chooser column; an unsplit one does not,
-    // so the tighter of the two is the bound every label must clear.
-    let room = PRIMARY_CELL_WIDTH - TILE_ICON_COLUMN - TILE_LABEL_GAP - CHEVRON_CELL_WIDTH;
-    for (label, width) in measured.borrow().iter() {
+    for (label, width, room) in measured.borrow().iter() {
         assert!(
-            *width <= room,
-            "{label} measures {width} pt and the tile leaves {room} pt"
+            width <= room,
+            "{label} measures {width} pt and its tile leaves {room} pt"
         );
     }
 }
