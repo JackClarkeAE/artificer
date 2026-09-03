@@ -433,3 +433,111 @@ fn releasing_an_absent_relation_is_refused_as_no_change() {
         Err(SketchTransactionError::NoChange)
     ));
 }
+
+/// A hole placed in a plate, which is the dimension a drawer actually reaches
+/// for: the circle's centre held a typed distance from two edges of the
+/// rectangle around it.
+///
+/// Both shapes are recipes, so both move as bodies: the circle translates to
+/// meet the dimension and stays a circle, and the rectangle stays a rectangle.
+#[test]
+fn a_circle_is_placed_in_a_rectangle_by_dimensions_from_two_edges() {
+    let mut sketch = SketchDefinition::new();
+    // A 40 x 20 plate with its lower-left corner at the origin.
+    let plate = sketch
+        .stage(
+            SketchRecipe::TwoPointRectangle {
+                first_corner: point(0.0, 0.0),
+                width: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::SignedLength::new(40.0).expect("width"),
+                ),
+                height: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::SignedLength::new(20.0).expect("height"),
+                ),
+            },
+            "Plate",
+        )
+        .expect("stage plate");
+    sketch
+        .commit(plate, ConfirmationSource::GreenTick)
+        .expect("commit plate");
+    let plate_points = sketch.points().keys().copied().collect::<Vec<_>>();
+    let corner_at = |sketch: &SketchDefinition, u: f64, v: f64| {
+        *sketch
+            .points()
+            .iter()
+            .find(|(_, record)| {
+                (record.evaluated_position.u - u).abs() < 1.0e-9
+                    && (record.evaluated_position.v - v).abs() < 1.0e-9
+            })
+            .expect("corner")
+            .0
+    };
+    let bottom_left = corner_at(&sketch, 0.0, 0.0);
+    let bottom_right = corner_at(&sketch, 40.0, 0.0);
+    let top_left = corner_at(&sketch, 0.0, 20.0);
+
+    // A circle somewhere in the middle, drawn by eye.
+    let hole = sketch
+        .stage(
+            SketchRecipe::CentrePointCircle {
+                center: point(17.0, 11.0),
+                radius: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::Length::new(3.0).expect("radius"),
+                ),
+                radial_angle: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::Angle::radians(0.0).expect("angle"),
+                ),
+            },
+            "Hole",
+        )
+        .expect("stage hole");
+    sketch
+        .commit(hole, ConfirmationSource::GreenTick)
+        .expect("commit hole");
+    let centre = *sketch
+        .points()
+        .keys()
+        .find(|id| !plate_points.contains(id))
+        .expect("the circle's centre is a point of its own");
+
+    // 12 from the left edge, 8 up from the bottom edge. The left edge runs
+    // from the bottom-left corner up; the bottom edge runs to the right.
+    for (kind, what) in [
+        (
+            SketchConstraintKind::PointToLineDistance {
+                point: centre,
+                line_start: bottom_left,
+                line_end: top_left,
+                distance: -12.0,
+            },
+            "12 from the left edge",
+        ),
+        (
+            SketchConstraintKind::PointToLineDistance {
+                point: centre,
+                line_start: bottom_left,
+                line_end: bottom_right,
+                distance: 8.0,
+            },
+            "8 up from the bottom edge",
+        ),
+    ] {
+        let transaction = sketch
+            .stage_constraint(kind, what, PrecisionPolicy::default())
+            .unwrap_or_else(|error| panic!("{what} should stage: {error}"));
+        sketch
+            .commit(transaction, ConfirmationSource::GreenTick)
+            .unwrap_or_else(|error| panic!("{what} should commit: {error}"));
+    }
+
+    let placed = solved(&sketch, centre);
+    assert!(
+        (placed.u - 12.0).abs() <= 1.0e-9 && (placed.v - 8.0).abs() <= 1.0e-9,
+        "the hole should sit where the two dimensions put it, got {placed:?}"
+    );
+    // The plate did not move, and it is still a plate.
+    assert_eq!(solved(&sketch, bottom_left), SketchPoint2::new(0.0, 0.0));
+    assert_eq!(solved(&sketch, bottom_right), SketchPoint2::new(40.0, 0.0));
+    assert_eq!(solved(&sketch, top_left), SketchPoint2::new(0.0, 20.0));
+}

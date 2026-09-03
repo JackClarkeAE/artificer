@@ -427,6 +427,64 @@ impl SketchDefinition {
         })
     }
 
+    /// Stages a new value for a dimension the sketch already holds.
+    ///
+    /// This is what makes a driving dimension a dimension rather than a
+    /// snapshot: the number is retyped, the solver moves the geometry to it,
+    /// and the whole thing lands behind one confirmation like every other
+    /// edit. A value the system cannot satisfy is refused with the old one
+    /// still in place.
+    pub fn stage_constraint_value(
+        &self,
+        id: SketchConstraintId,
+        value: f64,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let label = checked_label(label)?;
+        let before = self
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let mut candidate = self.clone();
+        candidate
+            .set_constraint_value(id, value, precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let after = candidate
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+
+        let mut impact = SketchImpactReport {
+            profile_changed: true,
+            ..SketchImpactReport::default()
+        };
+        for (point, position) in &after.positions {
+            let moved = before
+                .positions
+                .get(point)
+                .is_none_or(|previous| !positions_agree(*previous, *position, precision));
+            if moved {
+                impact.changed_points.insert(*point);
+                for (entity, record) in candidate.entities() {
+                    if record.active && record.geometry.referenced_points().contains(point) {
+                        impact.changed_entities.insert(*entity);
+                    }
+                }
+            }
+        }
+        // `set_constraint_value` advances the revision itself; pin it to the
+        // one successor this transaction publishes, as the other paths do.
+        candidate.set_revision(next_revision(self.revision())?);
+        candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
+        Ok(SketchTransaction {
+            expected_revision: self.revision(),
+            label,
+            candidate,
+            impact,
+            inputs: SketchInputValues::default(),
+            precision,
+        })
+    }
+
     /// Stages a branch-replacing edit. This is the explicit API used by
     /// modifier controllers; it rejects creation-only recipes while retaining
     /// the same atomic preview/confirm implementation as `stage`.

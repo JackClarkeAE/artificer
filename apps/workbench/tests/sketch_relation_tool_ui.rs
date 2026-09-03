@@ -366,3 +366,109 @@ fn a_relation_on_recipe_owned_geometry_says_what_to_pick_instead() {
     );
     assert_eq!(harness.state().sketch_constraint_count(), 0);
 }
+
+/// Types a new value into the nth listed relation's field.
+fn set_relation_value(harness: &mut Harness<'static, KernelLabApp>, row: usize, value: f64) {
+    let name = format!("Relation {row} value");
+    let field = harness.get_by_role_and_label(Role::TextInput, name.as_str());
+    field.click();
+    harness.run();
+    let field = harness.get_by_role_and_label(Role::TextInput, name.as_str());
+    field.type_text(&format!("{value}"));
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+}
+
+/// Returns the centre of the one circle in the sketch.
+fn circle_centre(harness: &Harness<'static, KernelLabApp>) -> SketchPoint {
+    harness
+        .state()
+        .sketch_entity_geometries()
+        .into_iter()
+        .find_map(|geometry| match geometry {
+            SketchGeometry::Circle { center, .. } => Some(center),
+            _ => None,
+        })
+        .expect("one circle")
+}
+
+/// The dimension a drawer actually reaches for: a hole placed in a plate by
+/// measuring from two of its edges, from the user's report — "someone might
+/// ensure a circle is centred but offset vertically in a rectangle by using a
+/// sketch dimension from the sides of the rectangle to the centre of the
+/// circle".
+///
+/// The rectangle is a recipe, so the solver moves it as a body: the circle
+/// travels to meet the dimension and the plate stays a plate.
+#[test]
+fn a_circle_is_placed_in_a_rectangle_by_dimensioning_from_its_edges() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, -3.0));
+    click_sketch_point(&mut harness, SketchPoint::new(4.0, 3.0));
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(1.5, 0.5));
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    let drawn = circle_centre(&harness);
+    assert!((drawn.u - 0.5).abs() <= 1.0e-6 && (drawn.v - 0.5).abs() <= 1.0e-6);
+
+    // Dimension: the circle's centre first, then the plate's left edge.
+    click_button(&mut harness, "Sketch dimension");
+    click_sketch_point(&mut harness, drawn);
+    assert_eq!(
+        harness.state().sketch_dimension_operand_count(),
+        1,
+        "the centre is the first operand: {:?}",
+        harness.state().sketch_relation_diagnostic()
+    );
+    // Mid-height of the left edge, clear of both corners.
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    confirm_if_staged(&mut harness);
+    assert_eq!(
+        harness.state().sketch_constraint_count(),
+        1,
+        "the dimension should be held: {:?}",
+        harness.state().sketch_relation_diagnostic()
+    );
+
+    // It arrives holding what the sketch already showed.
+    let held = harness
+        .state()
+        .sketch_constraint_values()
+        .first()
+        .copied()
+        .expect("the dimension holds a value");
+    assert!(
+        (held - 4.5).abs() <= 1.0e-6,
+        "the dimension measures the offset it was taken at, got {held}"
+    );
+
+    // Retyping it drives the circle, and leaves the plate alone.
+    let plate_before = segments(&harness);
+    click_button(&mut harness, "Select sketch geometry");
+    harness.run();
+    set_relation_value(&mut harness, 1, 2.0);
+    confirm_if_staged(&mut harness);
+
+    let placed = circle_centre(&harness);
+    assert!(
+        (placed.u - (-2.0)).abs() <= 1.0e-6,
+        "the hole should sit 2 from the left edge, got {placed:?}"
+    );
+    assert!(
+        (placed.v - 0.5).abs() <= 1.0e-6,
+        "and should not have drifted vertically: {placed:?}"
+    );
+    assert_eq!(
+        segments(&harness),
+        plate_before,
+        "the plate is the reference and does not move"
+    );
+}

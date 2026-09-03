@@ -367,6 +367,19 @@ impl SketchDefinition {
                 return Err(ConstraintError::InactivePoint(point));
             }
         }
+        // A relation over points one shape owns has nothing to solve: the
+        // solver may translate that shape but never pull it apart, and the
+        // shape's own dimensions are where its size is set. Refusing by name
+        // is what keeps a rectangle a rectangle.
+        let referenced = kind.referenced_points();
+        let groups = self.rigid_point_groups();
+        if referenced.len() > 1
+            && referenced
+                .iter()
+                .all(|point| groups.share_a_body(referenced[0], *point))
+        {
+            return Err(ConstraintError::WithinOneShape);
+        }
         let id = self.allocator.allocate_constraint()?;
         self.constraints.insert(
             id,
@@ -385,6 +398,40 @@ impl SketchDefinition {
             .checked_next()
             .ok_or(ConstraintError::IdSpaceExhausted)?;
         Ok(id)
+    }
+
+    /// Retypes the value a dimension holds, keeping its identity and its
+    /// operands.
+    ///
+    /// The new value is refused exactly as a new relation is: a system that
+    /// will not converge leaves the old value in place, so a typed number
+    /// either takes or is explained, never half-applies.
+    pub fn set_constraint_value(
+        &mut self,
+        id: SketchConstraintId,
+        value: f64,
+        precision: PrecisionPolicy,
+    ) -> Result<(), ConstraintError> {
+        let Some(record) = self.constraints.get(&id) else {
+            return Err(ConstraintError::MissingConstraint(id));
+        };
+        let Some(kind) = record.kind.with_value(value) else {
+            return Err(ConstraintError::NotADimension);
+        };
+        crate::validate_constraint(&kind)?;
+        let previous = std::mem::replace(
+            &mut self.constraints.get_mut(&id).expect("checked").kind,
+            kind,
+        );
+        if let Err(error) = self.solve_constraints(precision) {
+            self.constraints.get_mut(&id).expect("checked").kind = previous;
+            return Err(error);
+        }
+        self.revision = self
+            .revision
+            .checked_next()
+            .ok_or(ConstraintError::IdSpaceExhausted)?;
+        Ok(())
     }
 
     pub fn remove_constraint(&mut self, id: SketchConstraintId) -> bool {
@@ -406,8 +453,30 @@ impl SketchDefinition {
         crate::constraints::solve(
             &seeds,
             self.constraints.values().cloned(),
+            &self.rigid_point_groups(),
             precision.linear_agreement,
         )
+    }
+
+    /// Which points the solver must move together.
+    ///
+    /// One group per shape-owning operation: a rectangle's corners and centre
+    /// travel as a rectangle, a circle's centre and rim as a circle. A line's
+    /// endpoints stay independent, which is what lets a relation level one.
+    #[must_use]
+    pub fn rigid_point_groups(&self) -> crate::constraints::RigidPointGroups {
+        let mut groups = crate::constraints::RigidPointGroups::default();
+        for operation in self.active_operations() {
+            if !operation.recipe.owns_its_shape() {
+                continue;
+            }
+            groups.insert_group(
+                self.active_points()
+                    .filter(|record| record.owner.operation == operation.id)
+                    .map(|record| record.id),
+            );
+        }
+        groups
     }
 
     #[must_use]

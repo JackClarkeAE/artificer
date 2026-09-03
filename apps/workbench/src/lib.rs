@@ -1660,6 +1660,17 @@ enum ControlsScope {
     Contextual(ContextualSubject, f32),
 }
 
+/// What the relations list was asked to do to one of its rows.
+///
+/// Both are staged model edits, and both are decided while the panel holds the
+/// list, so they are answered rather than performed, and carried out by the
+/// caller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RelationPanelAction {
+    Release(SketchConstraintId),
+    Retype(SketchConstraintId, f64),
+}
+
 /// What the contextual card is describing, which decides both its title and
 /// which existing card body it renders.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3404,6 +3415,24 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_relation_operand_count(&self) -> usize {
         self.sketch.relation_operand_count()
+    }
+
+    /// How many operands the dimension tool is holding for a distance between
+    /// two things.
+    #[must_use]
+    pub fn sketch_dimension_operand_count(&self) -> usize {
+        self.sketch.dimension_operand_count()
+    }
+
+    /// The values the sketch's dimensions hold, in the order the panel lists
+    /// them.
+    #[must_use]
+    pub fn sketch_constraint_values(&self) -> Vec<f64> {
+        self.sketch
+            .constraint_summaries()
+            .into_iter()
+            .filter_map(|relation| relation.value)
+            .collect()
     }
 
     /// Why the last relation pick went nowhere, if it did.
@@ -13977,7 +14006,11 @@ impl KernelLabApp {
         // are the only feedback a relation gives. Held relations join it while
         // the user is inspecting, so a sketch that will not move can be asked
         // why.
-        let arming_relation = self.active_sketch_tool.family() == ToolFamily::Relation;
+        // A dimension halfway through its two picks needs the same panel a
+        // relation does: it has picked one thing and nothing else on screen
+        // says so.
+        let arming_relation = self.active_sketch_tool.family() == ToolFamily::Relation
+            || self.sketch.dimension_step().is_some();
         let shows_relations = arming_relation || (inspecting && self.sketch.constraint_count() > 0);
         if !shows_selected && !shows_tool && !shows_relations {
             self.sketch.set_relation_highlight(&[]);
@@ -14026,9 +14059,14 @@ impl KernelLabApp {
                     remove = self.sketch_relation_panel(ui, arming_relation, &relations);
                 }
             });
-        if let Some(id) = remove
-            && let Some(subject) = self.sketch.stage_constraint_removal(id)
-        {
+        let staged = match remove {
+            Some(RelationPanelAction::Release(id)) => self.sketch.stage_constraint_removal(id),
+            Some(RelationPanelAction::Retype(id, value)) => {
+                self.sketch.stage_constraint_value(id, value)
+            }
+            None => None,
+        };
+        if let Some(subject) = staged {
             self.commit_sketch_stroke(subject);
         }
     }
@@ -14036,17 +14074,22 @@ impl KernelLabApp {
     /// The relation section of the sketch panel: what the armed relation wants
     /// next, what it last refused, and every relation the sketch holds.
     ///
-    /// Returns the relation the user asked to remove, if any; the removal is
-    /// staged by the caller, outside the panel's borrow.
+    /// Returns what the user asked of a listed relation, if anything; the edit
+    /// is staged by the caller, outside the panel's borrow.
     fn sketch_relation_panel(
         &mut self,
         ui: &mut egui::Ui,
         arming_relation: bool,
         relations: &[SketchConstraintSummary],
-    ) -> Option<SketchConstraintId> {
+    ) -> Option<RelationPanelAction> {
         let descriptor = self.active_sketch_tool.descriptor();
         if arming_relation {
-            ui.label(RichText::new("RELATION").small().color(theme::muted()));
+            let heading = if self.active_sketch_tool == ToolVariant::Dimension {
+                "DIMENSION"
+            } else {
+                "RELATION"
+            };
+            ui.label(RichText::new(heading).small().color(theme::muted()));
             ui.add_space(3.0);
             ui.label(
                 RichText::new(descriptor.accessible_name)
@@ -14061,16 +14104,20 @@ impl KernelLabApp {
                 )
                 .wrap(),
             );
-            if let Some(step) = self.sketch.relation_step() {
+            let step = self
+                .sketch
+                .relation_step()
+                .or_else(|| self.sketch.dimension_step().map(str::to_owned));
+            if let Some(step) = step {
                 ui.add_space(3.0);
+                let picked =
+                    self.sketch.relation_operand_count() + self.sketch.dimension_operand_count();
                 ui.add(
-                    egui::Label::new(RichText::new(step).small().color(
-                        if self.sketch.relation_operand_count() > 0 {
-                            theme::good()
-                        } else {
-                            theme::text()
-                        },
-                    ))
+                    egui::Label::new(RichText::new(step).small().color(if picked > 0 {
+                        theme::good()
+                    } else {
+                        theme::text()
+                    }))
                     .wrap(),
                 );
             }
@@ -14106,12 +14153,36 @@ impl KernelLabApp {
         // whatever is already at the gate rather than failing at the click.
         let staging_blocked = self.pending_operation.is_some() || self.sketch.has_pending_edit();
         let mut remove = None;
+        let mut retype = None;
         let mut highlight: &[SketchPoint] = &[];
         for (index, relation) in relations.iter().enumerate() {
             let row = ui.horizontal(|ui| {
                 ui.vertical(|ui| {
                     ui.set_max_width(160.0);
                     ui.label(RichText::new(relation.label).color(theme::text()));
+                    // A dimension is the number, so the number is the control:
+                    // typing here drives the geometry rather than reporting it.
+                    if let Some(value) = relation.value {
+                        let mut edited = value;
+                        let field = ui.add_enabled(
+                            !staging_blocked,
+                            egui::DragValue::new(&mut edited)
+                                .speed(0.1)
+                                .range(0.001..=100_000.0)
+                                .suffix(" mm"),
+                        );
+                        let name = format!("Relation {} value", index + 1);
+                        field.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::TextEdit,
+                                !staging_blocked,
+                                name.clone(),
+                            )
+                        });
+                        if field.changed() && edited != value {
+                            retype = Some((relation.id, edited));
+                        }
+                    }
                     ui.add(
                         egui::Label::new(
                             RichText::new(&relation.detail).small().color(theme::muted()),
@@ -14152,7 +14223,11 @@ impl KernelLabApp {
             }
         }
         self.sketch.set_relation_highlight(highlight);
-        remove
+        match (remove, retype) {
+            (Some(id), _) => Some(RelationPanelAction::Release(id)),
+            (None, Some((id, value))) => Some(RelationPanelAction::Retype(id, value)),
+            (None, None) => None,
+        }
     }
 
     /// The active sketch tool's own input fields.

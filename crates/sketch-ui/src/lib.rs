@@ -5027,6 +5027,10 @@ pub struct SketchCanvasState {
     modifier_sources: Vec<CoreEntityId>,
     /// Operands picked so far for the active relation tool, in click order.
     relation_operands: Vec<RelationOperand>,
+    /// What the dimension tool has been pointed at so far, when it is taking a
+    /// distance between two things rather than editing one curve's own
+    /// dimensions. Empty is the ordinary per-curve behaviour.
+    dimension_operands: Vec<RelationOperand>,
     /// Why the last relation was refused, in the solver's own words. Cleared
     /// when a relation succeeds or the tool changes.
     relation_diagnostic: Option<String>,
@@ -5105,6 +5109,7 @@ impl Default for SketchCanvasState {
             selected_recipe_editor: None,
             modifier_sources: Vec::new(),
             relation_operands: Vec::new(),
+            dimension_operands: Vec::new(),
             relation_diagnostic: None,
             relation_highlight: Vec::new(),
             modifier_picks: BTreeMap::new(),
@@ -5621,6 +5626,7 @@ impl SketchCanvasState {
             // that one from a pick the user made for something else, and
             // carrying the refusal would explain a pick two tools ago.
             self.clear_relation_acquisition();
+            self.dimension_operands.clear();
             self.relation_diagnostic = None;
             self.trim_hover_fragment = None;
             self.pattern_manipulator = None;
@@ -8390,6 +8396,237 @@ impl SketchCanvasState {
             })
     }
 
+    /// Whether the dimension tool should take this click as an operand of a
+    /// distance between two things.
+    ///
+    /// The first pick decides: a click that lands on a point starts a distance
+    /// dimension, and a click on a curve keeps the tool's older behaviour of
+    /// arming that curve's own dimensions. Once a first operand is held every
+    /// click belongs to the distance, which is what lets the second one be an
+    /// edge.
+    #[must_use]
+    fn dimension_takes_the_click(&self, point: SketchPoint, radius: f64) -> bool {
+        self.exact_tool == ToolVariant::Dimension
+            && self.pending.is_none()
+            && (!self.dimension_operands.is_empty()
+                || self.exact_point_hit(point, radius).is_some())
+    }
+
+    /// How many operands the dimension tool is holding.
+    #[must_use]
+    pub fn dimension_operand_count(&self) -> usize {
+        self.dimension_operands.len()
+    }
+
+    /// What the dimension tool is waiting for, when it is measuring between
+    /// two things rather than editing one curve's own dimensions.
+    #[must_use]
+    pub fn dimension_step(&self) -> Option<&'static str> {
+        if self.exact_tool != ToolVariant::Dimension {
+            return None;
+        }
+        match self.dimension_operands.len() {
+            0 => None,
+            _ => Some("Picked one · click the point or edge to measure to"),
+        }
+    }
+
+    /// The two endpoints of a straight curve used as a dimension's reference.
+    ///
+    /// Unlike a relation operand this accepts a curve a recipe owns: a
+    /// rectangle's side is exactly what a drawer measures from, and the solver
+    /// moves that rectangle as a body, so using its edge as a reference cannot
+    /// deform it.
+    fn dimension_line_points(
+        &self,
+        entity: CoreEntityId,
+    ) -> Result<(CorePointId, CorePointId), String> {
+        let record = self
+            .authoring
+            .entity(entity)
+            .ok_or_else(|| "That curve is no longer part of the sketch.".to_owned())?;
+        match record.geometry {
+            CoreCurve2::Line { start, end } => Ok((start, end)),
+            CoreCurve2::CircularArc { .. }
+            | CoreCurve2::Circle { .. }
+            | CoreCurve2::Bspline { .. } => {
+                Err("A distance dimension measures from a straight edge or a point.".to_owned())
+            }
+        }
+    }
+
+    /// Accumulates one dimension operand and stages the dimension once it has
+    /// both.
+    fn append_dimension_operand(
+        &mut self,
+        point: SketchPoint,
+        pick_radius: f64,
+    ) -> Option<SketchEntityId> {
+        let Some(operand) = self.relation_operand_hit(point, pick_radius) else {
+            self.relation_diagnostic = Some(
+                "Nothing to measure here. Click a point, or an edge to measure from.".to_owned(),
+            );
+            return None;
+        };
+        if self.dimension_operands.contains(&operand) {
+            self.relation_diagnostic =
+                Some("A dimension needs two different things to measure between.".to_owned());
+            return None;
+        }
+        if let RelationOperand::Curve(curve) = operand {
+            self.select_core_entity_for_modifier(curve);
+        }
+        self.dimension_operands.push(operand);
+        if self.dimension_operands.len() < 2 {
+            self.relation_diagnostic = None;
+            return None;
+        }
+        let staged = self.stage_dimension();
+        self.dimension_operands.clear();
+        staged
+    }
+
+    /// Turns the two picked operands into the dimension they describe: the
+    /// separation of two points, or the perpendicular offset of a point from
+    /// an edge.
+    fn stage_dimension(&mut self) -> Option<SketchEntityId> {
+        let kind = match self.dimension_constraint() {
+            Ok(kind) => kind,
+            Err(reason) => {
+                self.relation_diagnostic = Some(reason);
+                return None;
+            }
+        };
+        let label = "Sketch dimension";
+        let transaction =
+            match self
+                .authoring
+                .stage_constraint(kind, label, PrecisionPolicy::default())
+            {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    self.relation_diagnostic = Some(error.to_string());
+                    return None;
+                }
+            };
+        let subject = self.relation_subject(&transaction)?;
+        match self.stage_core_relation(transaction, label, subject) {
+            Ok(subject) => {
+                self.relation_diagnostic = None;
+                Some(subject)
+            }
+            Err(_) => {
+                self.relation_diagnostic =
+                    Some("The dimension could not be staged for confirmation.".to_owned());
+                None
+            }
+        }
+    }
+
+    /// The dimension the picked pair describes, measured where it stands.
+    ///
+    /// The value is what the sketch already shows, which the user then retypes
+    /// to drive it: a dimension arrives holding the truth and becomes an
+    /// instruction the moment it is edited.
+    fn dimension_constraint(&self) -> Result<CoreConstraintKind, String> {
+        let (first, second) = match self.dimension_operands.as_slice() {
+            [first, second] => (*first, *second),
+            _ => return Err("A dimension needs two picks.".to_owned()),
+        };
+        let position = |point: CorePointId| {
+            self.relation_point_position(point)
+                .ok_or_else(|| "That point is no longer part of the sketch.".to_owned())
+        };
+        match (first, second) {
+            (RelationOperand::Point(first), RelationOperand::Point(second)) => {
+                let (from, to) = (position(first)?, position(second)?);
+                let distance = (to.u - from.u).hypot(to.v - from.v);
+                if distance <= PrecisionPolicy::default().min_feature_size {
+                    return Err("Those points are already in the same place.".to_owned());
+                }
+                Ok(CoreConstraintKind::Distance {
+                    first,
+                    second,
+                    distance,
+                })
+            }
+            // Either order of picks means the same dimension: the edge is the
+            // reference and the point is what it holds.
+            (RelationOperand::Curve(curve), RelationOperand::Point(subject))
+            | (RelationOperand::Point(subject), RelationOperand::Curve(curve)) => {
+                let (line_start, line_end) = self.dimension_line_points(curve)?;
+                let (a, b, c) = (position(line_start)?, position(line_end)?, position(subject)?);
+                let offset = signed_offset_from_line(a, b, c)
+                    .ok_or_else(|| "That edge is too short to measure from.".to_owned())?;
+                if offset.abs() <= PrecisionPolicy::default().min_feature_size {
+                    return Err("That point is already on the edge.".to_owned());
+                }
+                Ok(CoreConstraintKind::PointToLineDistance {
+                    point: subject,
+                    line_start,
+                    line_end,
+                    distance: offset,
+                })
+            }
+            (RelationOperand::Curve(_), RelationOperand::Curve(_)) => Err(
+                "A distance between two edges is not a dimension yet; measure from an edge to a point."
+                    .to_owned(),
+            ),
+        }
+    }
+
+    /// Stages a new value for a dimension the sketch already holds.
+    ///
+    /// The panel hands over a magnitude. An offset taken from the far side of
+    /// an edge is stored negative, and it keeps that side: retyping the number
+    /// changes how far, never which way.
+    pub fn stage_constraint_value(
+        &mut self,
+        id: CoreConstraintId,
+        value: f64,
+    ) -> Option<SketchEntityId> {
+        let held = self
+            .authoring
+            .constraints()
+            .get(&id)
+            .and_then(|record| record.kind.value());
+        let value = match held {
+            Some(held) if held < 0.0 => -value.abs(),
+            Some(_) => value.abs(),
+            None => value,
+        };
+        let transaction = match self.authoring.stage_constraint_value(
+            id,
+            value,
+            "Sketch dimension",
+            PrecisionPolicy::default(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.relation_diagnostic = Some(error.to_string());
+                return None;
+            }
+        };
+        let subject = transaction
+            .impact()
+            .changed_entities
+            .iter()
+            .find_map(|entity| self.ui_by_core.get(entity).copied())
+            .or(self.selected)
+            .or_else(|| self.entities.first().map(|entity| entity.id))?;
+        match self.stage_core_relation(transaction, "Sketch dimension", subject) {
+            Ok(subject) => {
+                self.relation_diagnostic = None;
+                Some(subject)
+            }
+            Err(_) => {
+                self.relation_diagnostic =
+                    Some("The dimension could not be staged for confirmation.".to_owned());
+                None
+            }
+        }
+    }
+
     /// The sketch's single centreline, as the axis a revolve can turn about
     /// (ADR 0026, F3).
     ///
@@ -8495,6 +8732,11 @@ impl SketchCanvasState {
                 id: record.id,
                 label: constraint_kind_label(&record.kind),
                 detail: constraint_detail(&record.kind),
+                // A point-to-line offset is signed by the side it was taken
+                // from; the panel shows and takes the magnitude, and the sign
+                // is restored when it is written back.
+                value: record.kind.value().map(f64::abs),
+                leader: self.constraint_leader(&record.kind),
                 points: record
                     .kind
                     .referenced_points()
@@ -8504,6 +8746,39 @@ impl SketchCanvasState {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Where a dimension's leader runs: from the thing it is measured from to
+    /// the thing it holds.
+    ///
+    /// For an offset that is the foot of the perpendicular on the reference
+    /// edge and the point itself, so the leader lies along the very distance
+    /// the number names.
+    fn constraint_leader(&self, kind: &CoreConstraintKind) -> Option<(SketchPoint, SketchPoint)> {
+        let at = |point: CorePointId| {
+            self.relation_point_position(point)
+                .map(|position| SketchPoint::new(position.u, position.v))
+        };
+        match *kind {
+            CoreConstraintKind::Distance { first, second, .. } => Some((at(first)?, at(second)?)),
+            CoreConstraintKind::PointToLineDistance {
+                point,
+                line_start,
+                line_end,
+                ..
+            } => {
+                let (a, b, subject) = (at(line_start)?, at(line_end)?, at(point)?);
+                let (du, dv) = (b.u - a.u, b.v - a.v);
+                let length_squared = du.mul_add(du, dv * dv);
+                if length_squared <= f64::EPSILON {
+                    return None;
+                }
+                let along = ((subject.u - a.u) * du + (subject.v - a.v) * dv) / length_squared;
+                let foot = SketchPoint::new(du.mul_add(along, a.u), dv.mul_add(along, a.v));
+                Some((foot, subject))
+            }
+            _ => None,
+        }
     }
 
     /// Stages the removal of one relation behind the usual confirmation gate.
@@ -9421,6 +9696,19 @@ const fn relation_arity(variant: ToolVariant) -> Option<usize> {
     }
 }
 
+/// The signed perpendicular offset of `subject` from the line through `a` and
+/// `b`, along that line's left normal, or nothing when the line is too short
+/// to name a direction.
+fn signed_offset_from_line(a: CorePoint2, b: CorePoint2, subject: CorePoint2) -> Option<f64> {
+    let (du, dv) = (b.u - a.u, b.v - a.v);
+    let length = du.hypot(dv);
+    if length <= PrecisionPolicy::default().min_feature_size {
+        return None;
+    }
+    let normal = (-dv / length, du / length);
+    Some((subject.u - a.u) * normal.0 + (subject.v - a.v) * normal.1)
+}
+
 /// One held relation, as the constraint panel lists it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SketchConstraintSummary {
@@ -9429,9 +9717,16 @@ pub struct SketchConstraintSummary {
     pub label: &'static str,
     /// What it holds it on, in the user's terms rather than point ids.
     pub detail: String,
+    /// The value it holds, for the relations that hold one. This is what makes
+    /// a dimension retypable: the number is the relation, not a caption on it.
+    pub value: Option<f64>,
     /// The constrained points, in sketch coordinates, for highlighting the
     /// relation on the canvas.
     pub points: Vec<SketchPoint>,
+    /// The two ends of the dimension's leader, for the relations that measure
+    /// something: from where it is measured to what it holds. A dimension the
+    /// drawing does not show is a dimension nobody can check.
+    pub leader: Option<(SketchPoint, SketchPoint)>,
 }
 
 /// What one held relation holds, named the way the user picked it rather than
@@ -9444,6 +9739,9 @@ fn constraint_detail(kind: &CoreConstraintKind) -> String {
         CoreConstraintKind::Horizontal { .. } => "two points level".to_owned(),
         CoreConstraintKind::Vertical { .. } => "two points plumb".to_owned(),
         CoreConstraintKind::Distance { distance, .. } => millimetres(*distance),
+        CoreConstraintKind::PointToLineDistance { distance, .. } => {
+            format!("{} from an edge", millimetres(distance.abs()))
+        }
         CoreConstraintKind::Parallel { .. } => "two lines parallel".to_owned(),
         CoreConstraintKind::Perpendicular { .. } => "two lines square".to_owned(),
         CoreConstraintKind::EqualLength { .. } => "two lines the same length".to_owned(),
@@ -9468,6 +9766,7 @@ const fn constraint_kind_label(kind: &CoreConstraintKind) -> &'static str {
         CoreConstraintKind::Horizontal { .. } => "Horizontal",
         CoreConstraintKind::Vertical { .. } => "Vertical",
         CoreConstraintKind::Distance { .. } => "Distance",
+        CoreConstraintKind::PointToLineDistance { .. } => "Offset",
         CoreConstraintKind::Parallel { .. } => "Parallel",
         CoreConstraintKind::Perpendicular { .. } => "Perpendicular",
         CoreConstraintKind::EqualLength { .. } => "Equal length",
@@ -10843,6 +11142,12 @@ pub fn show_with_context(
         && let Some(position) = response.interact_pointer_pos()
     {
         response.request_focus();
+        // A dimension between two things is decided before the click is
+        // routed, because the same tool still edits one curve's own
+        // dimensions when the click lands on a curve rather than a point.
+        let raw_pick = state.view.screen_to_sketch(response.rect, position);
+        let dimension_pick_radius = 8.0 / state.view.points_per_unit;
+        let dimensioning = state.dimension_takes_the_click(raw_pick, dimension_pick_radius);
         if matches!(
             state.exact_tool,
             ToolVariant::Trim
@@ -10852,6 +11157,7 @@ pub fn show_with_context(
                 | ToolVariant::RectangularPattern
                 | ToolVariant::CircularPattern
         ) || relation_arity(state.exact_tool).is_some()
+            || dimensioning
         {
             // Span and corner modifiers retain the actual model-space pick.
             // Snapping to a junction would erase the finite carrier branch the
@@ -10868,6 +11174,7 @@ pub fn show_with_context(
                     | ToolVariant::Chamfer
                     | ToolVariant::TwoDistanceChamfer
             ) || relation_arity(state.exact_tool).is_some()
+                || dimensioning
             {
                 raw_point
             } else {
@@ -10880,6 +11187,8 @@ pub fn show_with_context(
             ) && ui.input(|input| input.modifiers.shift);
             if additive_pattern_pick {
                 state.toggle_pattern_source(point, pick_radius);
+            } else if dimensioning {
+                pending_created = state.append_dimension_operand(point, pick_radius);
             } else {
                 pending_created = state.handle_modifier_click(point, pick_radius);
             }
@@ -11022,6 +11331,7 @@ pub fn show_with_context(
         state.selected,
     );
     paint_modifier_sources(&painter, response.rect, state);
+    paint_constraint_dimensions(&painter, response.rect, state);
     paint_relation_highlight(&painter, response.rect, state);
     let semantic_selected = semantic_selection_targets(ui, response.rect, state);
     if let Some(selected) = semantic_selected {
@@ -11891,6 +12201,55 @@ fn paint_modifier_sources(painter: &egui::Painter, rect: Rect, state: &SketchCan
                 Stroke::new(3.1, sketch_colours().selected),
             );
         }
+    }
+}
+
+/// Draws every dimension the sketch holds, on the geometry it holds.
+///
+/// A leader along the distance itself and the value at its middle: the same
+/// chip a recipe's own dimensions use, so a driving number reads the same
+/// whether it came from a curve's parameters or from a relation between two
+/// things.
+fn paint_constraint_dimensions(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
+    let colours = sketch_colours();
+    let stroke = Stroke::new(1.0, colours.dimension.gamma_multiply(0.45));
+    // Straight from the records rather than through the panel's summaries:
+    // this runs every frame, and the summaries build a sentence per relation.
+    for record in state.authoring.constraints().values() {
+        if !record.enabled {
+            continue;
+        }
+        let (Some((from, to)), Some(value)) =
+            (state.constraint_leader(&record.kind), record.kind.value())
+        else {
+            continue;
+        };
+        let value = value.abs();
+        let start = state.view.sketch_to_screen(rect, from);
+        let end = state.view.sketch_to_screen(rect, to);
+        painter.line_segment([start, end], stroke);
+        let text = format!("{value:.2} mm");
+        let centre = start + (end - start) * 0.5;
+        let galley = painter.layout_no_wrap(
+            text.clone(),
+            FontId::monospace(10.0),
+            colours.dimension.gamma_multiply(0.85),
+        );
+        let chip = Rect::from_center_size(centre, galley.rect.size() + egui::vec2(8.0, 4.0));
+        painter.rect(
+            chip,
+            4.0,
+            colours.dimension_background.gamma_multiply(0.85),
+            Stroke::new(1.0, colours.dimension.gamma_multiply(0.55)),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            centre,
+            Align2::CENTER_CENTER,
+            text,
+            FontId::monospace(10.0),
+            colours.dimension.gamma_multiply(0.85),
+        );
     }
 }
 

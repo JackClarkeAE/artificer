@@ -548,6 +548,29 @@ impl SketchRecipe {
                 | Self::Trim { .. }
         )
     }
+
+    /// Whether this recipe owns the shape of what it produces.
+    ///
+    /// A line is two endpoints, and a relation is free to move either one: that
+    /// is what levelling a line means. A rectangle is a rectangle — move one of
+    /// its corners on its own and it stops being one — so the solver moves the
+    /// points of a shape-owning recipe together, as one body, and refuses a
+    /// relation that would have to pull them apart.
+    ///
+    /// This is the recipe boundary of ADR 0026 stated over points. It already
+    /// applies to curves, where a relation naming a recipe-owned curve is
+    /// refused; without it over points a relation could quietly shear a
+    /// rectangle into a quadrilateral.
+    #[must_use]
+    pub const fn owns_its_shape(&self) -> bool {
+        !matches!(
+            self,
+            Self::Point { .. }
+                | Self::Line { .. }
+                | Self::CentreLine { .. }
+                | Self::Polyline { .. }
+        )
+    }
 }
 
 #[cfg(test)]

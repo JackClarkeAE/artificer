@@ -394,3 +394,31 @@ fn armed_relation_panel_and_held_relations_snapshot() {
     click_button(&mut harness, "Perpendicular relation");
     settle_snapshot(&mut harness, "workbench_relation_panel_1040");
 }
+
+/// A hole placed in a plate by dimensioning from an edge: the dimension the
+/// user asked for, with the panel showing what it holds and the value that
+/// drives it.
+#[test]
+fn a_dimension_from_an_edge_places_a_hole_snapshot() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, -3.0));
+    click_sketch_point(&mut harness, SketchPoint::new(4.0, 3.0));
+    press_key(&mut harness, egui::Key::Escape);
+
+    click_button(&mut harness, "Centre-point circle");
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(1.5, 0.5));
+    press_key(&mut harness, egui::Key::Escape);
+
+    click_button(&mut harness, "Sketch dimension");
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    if harness.state().sketch_pending_label().is_some() {
+        click_button(&mut harness, "Confirm operation");
+    }
+    assert_eq!(harness.state().sketch_constraint_count(), 1);
+    settle_snapshot(&mut harness, "workbench_edge_dimension_1040");
+}
