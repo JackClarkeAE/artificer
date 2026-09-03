@@ -238,10 +238,20 @@ survive a distance edit — which is what lets a dimension or a downstream
 feature reference an offset curve and keep referencing it.
 
 Persistence: a new `SketchRecipe` variant is additive under the existing
-`#[serde(tag = "kind")]`, so documents written before it still load. A document
-containing one cannot be read by an older build, which is the same one-way
-compatibility every recipe addition has had; it therefore lands with a document
-version bump to 7 and an entry in the migration table.
+`#[serde(tag = "kind")]`, so documents written before it still load, and it
+does **not** bump `CURRENT_DOCUMENT_VERSION`. The version constants in
+`crates/model/src/lib.rs` mark structural schema changes — portable sketch
+payloads at 4, the joint forest at 5, the editable sketch graph at 6 — and Trim,
+Text and both patterns all landed inside 6 without one. Bumping to 7 would
+stamp every save, including the overwhelming majority with no offset in them,
+and refuse them all on an older build for nothing.
+
+The cost of not bumping is that an older build meeting an unknown `kind` fails
+with a serde error rather than the version refusal it has a message for. If
+that is judged too sharp, the fix is a conditional stamp — write 7 only for a
+document that actually contains an offset recipe — not an unconditional bump.
+A round-trip test that a v6 document with an offset still loads, and a v6
+document without one is untouched, is the gate either way.
 
 Degrees of freedom: the offset distance is a real degree of freedom, and the
 constraint solver must know it. `rigid_point_groups` treats each offset
@@ -303,10 +313,10 @@ circle offset inward by its radius is refused rather than collapsed.
 determinism, T-junction and single-curve properties above as tests. No UI.
 
 **Stage 3 — the recipe.** `SketchRecipe::Offset`, its evaluation through
-`RecipeBuilder`, the new output roles, the document version bump and its
-migration test, and a round-trip test that moves a source and re-evaluates.
-The tile is enabled at the end of this stage, driven from the ribbon with a
-typed distance and no canvas interaction.
+`RecipeBuilder`, the new output roles, the persistence round trip above, and a
+test that moves a source and re-evaluates the offset with it. The tile is
+enabled at the end of this stage, driven from the ribbon with a typed distance
+and no canvas interaction.
 
 **Stage 4 — the interaction.** Hover highlight, live drag, the typed field, the
 `chain_selection` switch, staging behind the gate, and a workbench UI suite
