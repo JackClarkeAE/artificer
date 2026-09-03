@@ -38,8 +38,9 @@ by tests, and **proposed** is a plan not yet executed.
 | [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | — |
 | [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
-| [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
+| [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | 0030 (tabs no longer switch workspace) |
 | [0029](0029-velopack-installers-and-in-app-updates.md) | Velopack installers and in-app updates | Accepted and implemented | — |
+| [0030](0030-ribbon-tabs-are-views.md) | Ribbon tabs choose a view, and the sketch grid has three blocks | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

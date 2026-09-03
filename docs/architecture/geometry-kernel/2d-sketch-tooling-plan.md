@@ -59,7 +59,7 @@ The two-point slot uses two cap centres followed by a width point. The centre-to
 - Ellipses and elliptical arcs.
 - Bézier, B-spline, and NURBS sketch curves.
 - Conics, equations, text, and image tracing.
-- Offset, mirror, projected/intersection geometry, and silhouette tools.
+- Offset, mirror, projected/intersection geometry, and silhouette tools. Sketch offset and the projection it needs for body edges are now specified in [the sketch offset plan](sketch-offset-plan.md); its control surface ships and its engine does not.
 - Tangent-circle and additional arc/slot construction variants.
 - A complete geometric/dimensional constraint solver and degrees-of-freedom display.
 

@@ -1,6 +1,6 @@
 # The workbench command registry and contextual properties
 
-Status: Accepted and implemented
+Status: Accepted and implemented; the workspace-switching half of the tab strip is superseded by [ADR 0030](0030-ribbon-tabs-are-views.md)
 
 ## Context
 
@@ -51,11 +51,13 @@ on screen must not silently rename a control somebody has learned or scripted.
 ### Two taxonomy levels, and two button weights
 
 Tab → group → command. Tabs are the level the workbench previously lacked, and
-they are what stops the row eating itself. `Model` and `Sketch` are the
-workspace — picking one enters it, and they keep the accessible names the
+they are what stops the row eating itself. `Model` and `Sketch` were the
+workspace — picking one entered it, and they kept the accessible names the
 separate workspace buttons they replaced already had. `View` is a ribbon tab
 only: it changes what is shown, never the workspace, and so stays reachable
-while an operation is pending.
+while an operation is pending. [ADR 0030](0030-ribbon-tabs-are-views.md) makes
+every tab work the way `View` does here, for the reason this record's own rule
+predicts: one command cannot live on two tabs under one name, and Extrude did.
 
 Exactly two button weights: a large icon with the name underneath for primary
 commands, a small icon with the name beside it for secondary ones. One size for
