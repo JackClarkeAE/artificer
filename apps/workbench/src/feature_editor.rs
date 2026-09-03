@@ -73,6 +73,7 @@ pub fn editable_scalars(command: &KernelCommand) -> Vec<EditableScalar> {
             EditableScalar::length("Thickness", *thickness),
             EditableScalar::length("Height", *height),
         ],
+        KernelCommand::ShellSnapshot { wall, .. } => vec![EditableScalar::length("Wall", *wall)],
         KernelCommand::LinearPatternSnapshot { spacing, count, .. } => vec![
             EditableScalar::length("Spacing", *spacing),
             EditableScalar::count("Count", f64::from(*count)),
@@ -139,6 +140,7 @@ pub fn with_scalar(command: &KernelCommand, index: usize, value: f64) -> Option<
         (KernelCommand::DrillHole { depth, .. }, 1) => *depth = value,
         (KernelCommand::AddRib { thickness, .. }, 0) => *thickness = value,
         (KernelCommand::AddRib { height, .. }, 1) => *height = value,
+        (KernelCommand::ShellSnapshot { wall, .. }, 0) => *wall = value,
         (KernelCommand::LinearPatternSnapshot { spacing, .. }, 0) => *spacing = value,
         (KernelCommand::LinearPatternSnapshot { count, .. }, 1) => {
             // Already range-checked above, so the rounding cannot saturate.

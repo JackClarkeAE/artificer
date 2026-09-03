@@ -584,7 +584,17 @@ fn sweep_contacts_source(
                         (cylinder.origin - frame.origin).dot(frame.u),
                         (cylinder.origin - frame.origin).dot(frame.v),
                     );
-                    circle_boundary_contacts_profile(center, cylinder.radius, &projected, clearance)
+                    // A partial wall — the half-cylinder end of a slot —
+                    // reaches only over its own arc; testing the whole
+                    // carrier would find contact where the wall is not.
+                    let arc = cylinder_face_arc(topology, face, cylinder, frame);
+                    circle_boundary_contacts_profile(
+                        center,
+                        cylinder.radius,
+                        arc,
+                        &projected,
+                        clearance,
+                    )
                 }
             }
         })
@@ -684,12 +694,88 @@ fn material_domains_overlap(
     })
 }
 
+/// The arc a cylindrical face covers, in the sweep frame's plane: its
+/// angular extent from its own parameters, or `None` when the face wraps a
+/// full turn or its extent cannot be read.
+fn cylinder_face_arc(
+    topology: &Topology,
+    face: &crate::topology::Face,
+    cylinder: crate::topology::Cylinder,
+    frame: crate::analytic_extrusion::Frame,
+) -> Option<Segment> {
+    let (u_min, u_max, _, _) = crate::validator::pcurve_extent(topology, face)?;
+    let turn = u_max - u_min;
+    if !turn.is_finite() || turn <= 0.0 || turn >= std::f64::consts::TAU - 1.0e-9 {
+        return None;
+    }
+    let project = |u: f64| {
+        let point = cylinder.evaluate(Point2::new(u, 0.0));
+        Point2::new(
+            (point - frame.origin).dot(frame.u),
+            (point - frame.origin).dot(frame.v),
+        )
+    };
+    let center = Point2::new(
+        (cylinder.origin - frame.origin).dot(frame.u),
+        (cylinder.origin - frame.origin).dot(frame.v),
+    );
+    let start = project(u_min);
+    let end = project(u_max);
+    let middle = project(0.5 * (u_min + u_max));
+    let angle = |point: Point2| (point.y - center.y).atan2(point.x - center.x);
+    let start_angle = angle(start);
+    let mut sweep = (angle(end) - start_angle).rem_euclid(std::f64::consts::TAU);
+    // The middle sample says which way round the arc runs.
+    let to_middle = (angle(middle) - start_angle).rem_euclid(std::f64::consts::TAU);
+    if to_middle > sweep {
+        sweep -= std::f64::consts::TAU;
+    }
+    Some(Segment::Arc {
+        center,
+        start,
+        end,
+        radius: cylinder.radius,
+        start_angle,
+        sweep,
+    })
+}
+
 fn circle_boundary_contacts_profile(
     center: Point2,
     radius: f64,
+    arc: Option<Segment>,
     regions: &[ProjectedRegion],
     clearance: f64,
 ) -> bool {
+    if let Some(arc) = arc {
+        let touches = regions.iter().any(|region| {
+            region.loops.iter().any(|profile_loop| {
+                profile_loop
+                    .segments
+                    .iter()
+                    .any(|segment| segment_clearance(*segment, arc) <= clearance)
+            })
+        });
+        if touches {
+            return true;
+        }
+        // The wall stands inside the pocket's material: the sweep would
+        // cut through it.
+        let Segment::Arc {
+            start_angle, sweep, ..
+        } = arc
+        else {
+            return true;
+        };
+        let middle = start_angle + 0.5 * sweep;
+        return profile_material_at(
+            Point2::new(
+                center.x + radius * middle.cos(),
+                center.y + radius * middle.sin(),
+            ),
+            regions,
+        );
+    }
     let circle = Segment::Arc {
         center,
         start: Point2::new(center.x + radius, center.y),
@@ -1881,12 +1967,38 @@ mod tests {
         assert!(!circle_boundary_contacts_profile(
             Point2::new(0.0, 0.0),
             1.0,
+            None,
             &disk(Point2::new(0.0, -1.7763568394002505e-15), 0.5),
             clearance,
         ));
         assert!(circle_boundary_contacts_profile(
             Point2::new(0.0, 0.0),
             1.0,
+            None,
+            &disk(Point2::new(0.6, 0.0), 0.5),
+            clearance,
+        ));
+        // A half wall reaches only over its own arc: a profile inside the
+        // carrier but clear of the wall is no contact.
+        let right_half = Segment::Arc {
+            center: Point2::new(0.0, 0.0),
+            start: Point2::new(0.0, -1.0),
+            end: Point2::new(0.0, 1.0),
+            radius: 1.0,
+            start_angle: -std::f64::consts::FRAC_PI_2,
+            sweep: std::f64::consts::PI,
+        };
+        assert!(!circle_boundary_contacts_profile(
+            Point2::new(0.0, 0.0),
+            1.0,
+            Some(right_half),
+            &disk(Point2::new(-0.6, 0.0), 0.3),
+            clearance,
+        ));
+        assert!(circle_boundary_contacts_profile(
+            Point2::new(0.0, 0.0),
+            1.0,
+            Some(right_half),
             &disk(Point2::new(0.6, 0.0), 0.5),
             clearance,
         ));

@@ -1,8 +1,13 @@
-# The `.art` scripting language, version 0.2
+# The `.art` scripting language, version 0.3
 
 A reference for people and for AI agents writing Artificer scripts. Everything
-here is what the kernel implements today (Artificer 0.96, `.art` 0.2); nothing
-is aspirational. Where a feature has a limit, the limit is stated.
+here is what the kernel implements today (Artificer 0.97, `.art` 0.3); nothing
+is aspirational. Where a feature has a limit, the limit is stated. Version 0.3
+adds functions, modules, typed parameters with units, ranges and descriptions,
+array indexing, and parameter introspection; sections 14 to 17 cover them.
+Section 18 covers the analysis surface — clearance, interference, clearance
+profiles and sweeping a mechanism through its travel — which reads a
+session and changes nothing in it.
 
 A `.art` script is a list of steps. Each step names a kernel command, and the
 kernel executes the steps in order against one session. The same script
@@ -92,9 +97,11 @@ the CLI prints them; the JSON-RPC server returns them as the error object.
 | Value | Written as | Notes |
 |---|---|---|
 | Number | `12`, `-0.5`, `width * 2` | 64-bit float. |
+| Boolean | `true`, `false` | The value of a `bool` parameter. |
 | String | `"XY"`, `"top_face"` | Used for plane names, roles, selectors, operations, labels. |
-| Array | `[1, 2, 3]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. |
+| Array | `[1, 2, 3]`, `corners[i]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. `a[i]` reads element `i`, counting from 0. |
 | Step | `let b = box(...)` | The bound name of an executed step; passed to Booleans and used for methods. |
+| Body | `let s = standoff(...)` | What a function returns: a step plus the faces it exports, read as `s.top` (section 14). |
 | Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)` | Only valid inside `sketch(entities: [...])`. |
 | Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")` | Names a face or edge of the current body, resolved when the step runs. |
 
@@ -109,7 +116,8 @@ edits the current one:
   "new"`, and `revolve`. The result becomes the current body. Every earlier
   body stays in the session under its step label.
 - **Edit the current body**: `drill`, `push_pull`, `fillet`, `chamfer`,
-  `mirror`, `pattern`, and `extrude` with `operation: "add"` or `"cut"`.
+  `mirror`, `pattern`, `shell`, and `extrude` with `operation: "add"` or
+  `"cut"`.
 - **Combine two bodies**: `union`, `difference`, `intersection` take the
   bodies two earlier steps left behind, by label, and the result becomes the
   current body.
@@ -288,16 +296,113 @@ faces the blends do not touch. `crates/kernel/examples/filleted_flange.art`
 rounds every rim of a flanged hub; `flanged_hub.art` shows the order that
 keeps rim fillets and bolt holes on the same part exact.
 
-### `mirror` and `pattern`
+### `mirror`
 
 ```art
-mirror(origin: [0, 0, 0], normal: [1, 0, 0], label: "other_half");
-pattern(direction: [1, 0, 0], spacing: 25, count: 4, label: "row");
+mirror(origin: [0, 0, 0], normal: [1, 0, 0], label: "flipped");
 ```
 
-`mirror` reflects the current body across the plane and joins the two.
-`pattern` repeats the current body `count` times along `direction` with the
-given `spacing`; `count` includes the original.
+`mirror` reflects the current body across the plane through `origin` with
+the given `normal`. It is exact for any body: every carrier is reflected
+as itself, so planes stay planes and blends stay torus bands, and the
+mirrored body keeps its face, edge and vertex count, its volume and its
+surface area, with its centroid reflected through the plane. Later
+features build on the mirrored body as they would on the original. The
+rung is `mirror/exact`.
+
+### `pattern`
+
+A feature pattern repeats one earlier feature, a `drill` or an `extrude`
+with `operation: "add"` or `"cut"` drawn on a face, at rigid placements on
+the same face. Each instance is the same exact feature replayed, committed
+as a step of its own named `<label>/<n>`, so a pattern of exact features
+is exact and later blends on any instance certify through the same
+ladder as on the original.
+
+```art
+let hole = drill(face: faces(">Z"), center: [25, 0], diameter: 6, depth: 10, label: "hole");
+
+// Six holes on the 25 mm circle about the face's axis.
+pattern(step: hole, axis: [0, 0, 1], axis_origin: [0, 0, 10], count: 6, label: "bolts");
+
+// A row: four holes 20 mm apart along Y.
+pattern(step: hole, direction: [0, 1, 0], spacing: 20, count: 4, label: "row");
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `step` | yes | The feature to repeat: a `let` bound to a `drill` or `extrude` call, or its label as a string. |
+| `axis`, `axis_origin` | circular | The turning axis, which must be normal to the feature's face; `axis_origin` defaults to the world origin. |
+| `angle` | no | Degrees between instances in a circular pattern; a full turn shared equally when left out. |
+| `direction`, `spacing` | linear | The row's direction, which must lie in the feature's face, and the distance between instances. |
+| `count` | yes | Instances in total, the original included; 2 to 128. |
+
+The face the feature was built on is followed by history, so a boss the
+feature itself added does not capture a `faces(">Z")` selector. A
+placement that would carry an instance off that face is refused by
+instance number, and a pattern commits whole or not at all: one journal
+entry, one undo. The pattern step reports the rung `pattern/replay`; its
+instances carry the rungs that built them, and `pattern.face("role")`
+reaches the last instance. The pattern step also stands in for a probe or
+selector that names it.
+
+Without `step:`, `pattern(direction:, spacing:, count:)` copies the whole
+current body along a row. Each copy is the body under a rigid
+translation, so it is exact for any body, blends and curved faces
+included. Copies that clear one another become separate solids of one
+body; copies that overlap are joined through the Boolean ladder, and
+where that refuses, so does the pattern. Stepping a prism along one of
+its own axes overlaps on a shared face plane, which the ladder refuses.
+
+### `shell`
+
+```art
+let block = box(size: [60, 40, 25], label: "block");
+shell(open: faces(">Z"), wall: 3, label: "tray");          // open at the top
+shell(open: [faces(">Z"), faces("<Z")], wall: 3, label: "tube");
+shell(wall: 3, label: "hollow");                            // closed, with a void
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `open` | no | The face to open, or an array of two opposite faces. Left out, the body is hollowed closed. |
+| `wall` | yes | The wall thickness, the same everywhere. |
+
+`shell` hollows the current body to one uniform wall. Open at one face it
+cuts a pocket: the face's outline offset inward by the wall, mitred at
+sharp corners, to within one wall of the far face. Open at two opposite
+faces the pocket goes through. Closed, the body keeps a void one wall in
+from every face, so the report shows two shells. A hole through the open
+face keeps a wall around it. Every case is exact and reads back: a shelled
+`60 × 40 × 25` box open at the top has volume
+`60·40·25 − 54·34·22`, and `probe.min_wall` reads the wall.
+
+There are two readings of a body, tried in that order.
+
+**The prism**, rungs `shell/open-prism` and `shell/closed-prism`: the open
+face and the one opposite it are parallel planes, and every other face is a
+plane or a cylinder along their normal, with an outline of lines and arcs.
+A box is a prism along each axis, so it opens on any face; an extrusion or
+a cylinder opens on its caps; a slot with round ends offsets its arcs
+exactly, and so do the cylinders of a filleted vertical edge.
+
+**The solid of revolution**, rungs `shell/open-revolve` and
+`shell/closed-revolve`: a coaxial body whose section closes through its
+axis or on itself. The offset happens in the section, which carries the
+whole boundary, so a two-diameter turned hub, a tapered post and a tube
+all hollow to one wall measured square to the surface. Every open face
+must then be a cap square to the axis.
+
+Refusals are by name. A wall that leaves no floor or no core, or one
+thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
+`SHELL_SELF_INTERSECTS`. A body neither reading owns is
+`SHELL_DOMAIN_UNSUPPORTED`. A blend or a dome across the wall is
+`SHELL_BLEND_UNSUPPORTED`: the inner surface would be the offset of a
+torus or a sphere with the material on the far side of the tube, which
+this release's carriers do not express, so shell first and blend after.
+Opening a cap takes the wall away through the Boolean engine, so a body
+whose surfaces that engine does not carry yet — a cone, today — is
+`SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the same body shells closed.
 
 ### `union`, `difference`, `intersection`
 
@@ -341,6 +446,23 @@ On a stepped part, `faces(">Z")` is the top step, not the plate under it.
 |---|---|
 | `"|X"`, `"|Y"`, `"|Z"` | Every straight edge parallel to the axis (a set). |
 | `"longest"`, `"shortest"` | By length. |
+
+### Named forms: any direction, any extremum, the edge between two faces
+
+The string forms above cover the axes and the common extremes. The named
+forms reach every geometric selector the API has:
+
+```art
+faces(direction: [1, 0, 1], match: "closest")   // closest, farthest, parallel, perpendicular
+faces(metric: "area", extremum: "max")          // area or radius; max or min
+edges(direction: [0, 0, 1])                     // every edge parallel to a direction (a set)
+edges(metric: "length", extremum: "min")
+edge_between(a: faces(">Z"), b: faces(">X"))    // the edge two faces share
+```
+
+`faces("spherical")`, `faces("conical")` and `faces("toroidal")` join
+`planar` and `cylindrical`. The decompiler (see `docs/verification.md`)
+writes whichever form is shortest.
 
 ### By position: `nearest`
 
@@ -421,6 +543,17 @@ faces are facets rather than analytic surfaces.
 The kernel measures the final body's volume, surface area and centroid, and
 exports it as binary or ASCII STL and as OBJ. Script Studio shows the volume,
 area and size in its console.
+
+For a program rather than a person, ask for the **session report**: `run
+part.art --json` (or `report part.art`) prints a versioned JSON document
+with every step's rung and tier, the body's exact measures, every face and
+edge described, and the names the script gave, or the failing step with the
+kernel's diagnostic codes and the script line. The JSON-RPC methods
+`script.report`, `report`, `probe` and `query.describe` give the same over
+the wire, and probes answer volume, area, distance, overlap, containment
+and wall-thickness questions without changing the session. The reference is
+[`docs/verification.md`](verification.md); the schema is
+[`docs/report-schema.json`](report-schema.json).
 
 ---
 
@@ -568,9 +701,309 @@ For an agent, the rules that make this reliable:
 - Test with `cargo run -p artificer-api-server -- run part.art`; the output
   names the failing step and why.
 
-## 13. Not in 0.2
+## 13. Not in 0.3
 
-Partial revolves, sweeps and lofts between arbitrary sections, shells,
-concave fillets between a boss and its plate, text as sketch geometry from a
-script, threads, and assemblies. The workbench has several of these; the
-scripting surface follows the kernel API as it grows.
+Partial revolves, sweeps and lofts between arbitrary sections, concave
+fillets between a boss and its plate, text as sketch geometry from a
+script, and threads. A script builds parts; joints and occurrences belong
+to a document, so a mechanism is assembled in the workbench and analysed
+through section 18 rather than written here. `shell` covers prisms and
+solids of revolution — a blended or domed body is refused by name. The
+scripting surface follows the kernel API as it grows. Functions cannot
+recurse, and a module's functions share one flat namespace with the
+script's.
+
+---
+
+## 14. Functions
+
+A function packages steps that recur: a standoff, a bolt pattern, a slot.
+It takes typed values, faces and bodies, builds geometry, and returns a
+body with the faces it wants callers to use.
+
+```art
+fn standoff(on: face, at: [f64; 2], height: f64, hole: f64, label: str) -> body {
+    let boss = cylinder_on(on: on, at: at, diameter: hole * 2.5, height: height, label: "boss");
+    drill(face: boss.top, center: [0, 0], diameter: hole, depth: height, label: "hole");
+    return boss with faces { top: boss.top };
+}
+
+let plate = box(size: [80, 60, 5], label: "plate");
+let s1 = standoff(on: plate.face("top_face"), at: [30, 20], height: 10, hole: 3, label: "s1");
+drill(face: s1.top, center: [0, 0], diameter: 1, depth: 2, label: "pilot");
+```
+
+**Declaring.** `fn name(param: type, param: type = default, ...) -> type { ... }`
+at the top level of the script or a module, before or after its first use.
+Parameter types are `f64` (also `float`, `number`), `int`, `str`, `bool`,
+`face`, `edge`, `body`, `any`, and arrays `[type; N]` or `[type]`. A parameter
+without a type accepts anything. A default is an expression evaluated when
+the argument is omitted. The return type is checked when declared. A
+function cannot be named after a builtin (`box`, `drill`, `sin`, ...).
+
+**Calling.** Arguments are given by name, `f(a: 1, b: 2)`, or in
+declaration order, `f(1, 2)`, or mixed with positional ones first. An
+unknown name, a missing argument without a default, an argument given twice,
+or a value of the wrong type is an error naming the function, the argument
+and the value. Recursion, direct or through another function, is refused
+with the chain named.
+
+**Scope.** A function body sees its own parameters and the script's
+top-level names as they were before the call: `param`s, `let` constants,
+module constants. It does not see the caller's locals. `let` inside a
+function is local to that call.
+
+**Labels are scoped to the call.** Every step a function builds gets its
+label prefixed with the call's `label` argument and a slash, so the first
+call above builds `s1/boss/profile`, `s1/boss` and `s1/hole`, and a loop of
+calls needs no string arithmetic to stay unique. The step that carries the
+call's own label (the `extrude(... label: label)` inside `cylinder_on`) *is*
+the call's step, `s1/boss`, not `s1/boss/boss`. A function without a `label`
+parameter, or called without one, scopes by its name and call count:
+`block_1/`, `block_2/`. Nested calls nest their prefixes.
+
+**Returning.** `return value;` ends the call with a value; a body without a
+`return` returns nothing. `return step with faces { name: selector, ... };`
+returns a **body**: the step plus the named selectors. Callers read an
+exported face as `body.name` or `body.face("name")`; a name the body does
+not export falls through to the step's history role, so `body.face("end_face")`
+still works. Because exported faces are selectors, usually history
+selectors, they keep resolving after later steps drill or fillet the body.
+
+**Names in the report.** A top-level `let s = f(...)` that receives a body
+records each exported face as `s.name` in the program's names, so Script
+Studio and the session report list `s1.top` beside the script's other
+names.
+
+**Roles inside a function.** The kernel names an added extrusion's cap
+`face_extrude.<label>.end_face`, and inside a function the label is not
+known until the call. History selectors therefore match a role by its
+trailing segments: `p.face("end_face")` finds `face_extrude.s1/boss.end_face`.
+
+---
+
+## 15. Modules
+
+A module is a `.art` file of functions and constants that other scripts
+import:
+
+```art
+// lib/standoffs.art
+param wall: f64 [mm] = 3 "boss wall thickness";
+let clearance = 0.2;
+
+fn standoff(on: face, at: [f64; 2], height: f64, hole: f64, label: str) -> body { ... }
+```
+
+```art
+use "lib/standoffs.art";
+let plate = box(size: [80, 60, 5], label: "plate");
+standoff(on: plate.face("top_face"), at: [30, 20], height: 10, hole: 3 + clearance, label: "s1");
+```
+
+- `use "path";` sits at the top level. It declares the module's functions
+  and brings its `param`s and `let` constants into scope; a module's
+  `param` takes a `--param` override like the script's own.
+- A module builds nothing: a step at its top level is an error. Geometry
+  belongs in its functions.
+- Modules can `use` other modules. A module is loaded once however many
+  times it is named; a cycle (`a.art -> b.art -> a.art`) is refused with the
+  chain.
+- Where a path is looked up is the host's decision. The command-line runner
+  and Script Studio look beside the importing file, then beside the script,
+  then along `--module-path` directories. The JSON-RPC server takes the
+  sources inline: `script.run` and `script.report` accept a `modules` object
+  mapping each path a `use` writes to its source. A host that loads no
+  modules says so.
+- Functions and constants share one namespace across the script and every
+  module it imports; defining the same function twice is an error naming
+  the module that already has it.
+
+---
+
+## 16. Parameters in full
+
+```art
+param wall: f64 [mm] in 1.2..4.0 = 2.0 "external wall thickness";
+param count: int in 1..12 = 4 "bolt holes";
+param countersunk: bool = false;
+param finish: str = "anodised";
+```
+
+`param name[: type] [[unit]] [in low..high] = default ["description"];`
+
+- **Types:** `f64` (the default), `int` (a whole number), `bool`, `str`.
+- **Unit:** any word in brackets; the kernel does not convert, the word is
+  carried through to the listing for a customizer to show.
+- **Range:** inclusive, checked against the default and against any
+  override; a value outside it is an error naming the range.
+- **Description:** a string after the default, for the listing.
+- **Overrides:** `--param name=value` on the command line, `params` over
+  JSON-RPC, the customizer in Script Studio. A number overrides an `f64`;
+  a whole number an `int`; `0`/`1` or `false`/`true` a `bool`. A `str` is
+  set in the script, not by override.
+
+---
+
+## 17. Introspection
+
+The parameters of a script are listed without running it:
+
+```sh
+cargo run --release -p artificer-api-server -- params part.art
+cargo run --release -p artificer-api-server -- params part.art --json
+```
+
+```json
+[{"name":"wall","param_type":"f64","default":2.0,"default_text":"2","unit":"mm","min":1.2,"max":4.0,"description":"external wall thickness","line":1}]
+```
+
+The JSON-RPC method `script.params` takes `{"source": "..."}` and returns
+the same list; in Rust it is `script_parameters(source)`. Defaults that
+depend on earlier parameters are evaluated in order. The session report's
+`parameters` field then shows the value every parameter took in a run, so
+a run can be reproduced from its report.
+
+---
+
+## 18. Analysis: does it fit
+
+A script builds parts. Whether they go together is a different question,
+and the kernel answers it without a Boolean: the work is distance between
+each body's display facets, gathered into a hierarchy, so it answers for
+pairs the Boolean engine refuses outright.
+
+Everything here reads the session and changes nothing in it. No step is
+journaled, the current body does not move, and the semantic digest is the
+same afterwards.
+
+### One gap, quickly
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"probe","params":{"probe":"clearance","a":"hub","b":"shaft"}}
+```
+
+Answers with the closest approach of the two bodies in millimetres, its
+tier, and the method. Use this when the question is about one pair.
+
+### Every pair at once
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"analysis.interference","params":{"subjects":["plate","post","pin"]}}
+```
+
+```rust
+use artificer_kernel::api::analysis::{interference_study, Subject};
+let report = interference_study(&subjects, precision, &CancellationToken::new());
+```
+
+Every unordered pair, each saying whether the two are `clear`, `touching`
+or `interfering`, how close they come, and where — a witness point on each
+body. An interfering pair also carries the volume the two share when the
+Boolean engine can carry those operands; when it cannot, the pair keeps
+its measured clearance and records the engine's refusal code in
+`overlap_unavailable` instead. The document's shape is published in
+[`docs/analysis-schema.json`](analysis-schema.json).
+
+**What the numbers are worth.** Between bodies whose faces are all planar
+the facets are the surfaces and `tier` is `exact`. Where a surface is
+curved its facets are chords of it: the measured gap is never smaller than
+the true gap and never larger than it by more than the `bound` the pair
+publishes, which is one chord budget per curved body. Compare against
+`distance - bound` when the answer has to be conservative.
+
+### Judging it against a fit
+
+A measurement is not an answer. `0.42 mm` says nothing until a fit says
+what it wanted.
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"analysis.profiles"}
+{"jsonrpc":"2.0","id":4,"method":"analysis.interference",
+ "params":{"subjects":["hub","shaft"],"profile":"fdm-press"}}
+```
+
+`analysis.profiles` lists the catalogue, so an agent discovers the keys
+rather than guessing them:
+
+| Key | Window | For |
+| --- | --- | --- |
+| `machined-running` | 0.02–0.08 mm | A milled or turned part that has to turn or slide. |
+| `resin-fine` | 0.05–0.15 mm | Masked stereolithography. |
+| `fdm-press` | 0.10–0.20 mm | Pushed together and meant to stay. |
+| `fdm-sliding` | 0.30–0.50 mm | Has to move after assembly. |
+| `assembly` | 0 mm and over | No fit: parts must simply not share space. |
+
+Pass `fit` instead of `profile` to supply a window of your own:
+`{"key":"harness","name":"Cable route","minimum":5.0,"note":"..."}`, with
+`maximum` omitted for a fit with no upper complaint.
+
+Each pair then earns a `verdict`. `pass` is the gap that was asked for.
+`too_close` is nearer than allowed, or an overlap, and it is the only
+verdict that fails a study — `failing` counts them. `loose` is clear by
+more than the fit needed: not a failure, but a part meant to be held that
+is not. An unknown profile key is refused by name rather than ignored.
+
+### Where on the part
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"analysis.clearance_field","params":{"subjects":["hub","shaft"]}}
+```
+
+The signed clearance at every corner of every display facet: positive is a
+gap, negative is penetration and its magnitude is how far inside. Each
+subject's readings come with the count, the nearest and the farthest
+beside them, so a caller that wants only the worst number need not walk
+the array. This is what the workbench paints as a heat map.
+
+### Over a whole motion
+
+A mechanism asks the harder question: does it fit *anywhere it can go*.
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"analysis.sweep","params":{
+  "subjects":["frame","arm"],
+  "steps":[
+    {"drivers":[0.0], "placements":[{}, {"rotation":[1,0,0,0]}]},
+    {"drivers":[0.4], "placements":[{}, {"rotation":[0.980,0,0,0.199]}]}
+  ],
+  "profile":"fdm-sliding"}}
+```
+
+A step is where every body sits at one position, in subject order. A
+placement is a unit quaternion `[w, x, y, z]` and a translation, both
+optional — `{}` is a body that does not move, which is what the frame of a
+mechanism is. The `drivers` ride along uninterpreted so the report can name
+the position a collision was found at; the kernel does not know what a
+joint is, which is what lets a sweep run over poses from a solver, a
+recording or a file alike.
+
+The sweep stops at the first collision: past that the parts have already
+passed through one another, so nothing beyond is a pose the real thing
+reaches. Read `steps_measured` against `steps_offered` to see how much of
+the travel was answered for, and `cancelled` to know the rest is
+unmeasured rather than clear. Its schema is
+[`docs/sweep-schema.json`](sweep-schema.json).
+
+### What the workbench adds
+
+Two things a script has no vocabulary for. **Insert part** in the Model
+tab's Create group brings a catalogue part into the design that is open,
+as its own body and occurrence, which is how an assembly is built up. And
+a **revolute joint** on an occurrence gives it a coordinate: the joint
+solver poses every component from the drivers, carrying each child's whole
+subtree, and the sweep above measures exactly the travel the play button
+shows. Section 9 of [`docs/verification.md`](verification.md) has the
+solver's rules and what it refuses.
+
+### Reading it as an agent
+
+- Ask `analysis.profiles` before naming a fit, and pass the key rather
+  than reproducing the numbers.
+- Decide on `failing` and the per-pair `verdict` when a profile is in
+  play; on `state` and `distance` when one is not.
+- Treat `approximate` as a flag to act on: subtract `bound` from
+  `distance` before concluding a part fits.
+- A refusal is data. `overlap_unavailable` names why a volume is missing
+  and leaves the clearance beside it standing; a study never fails because
+  the Boolean engine did.

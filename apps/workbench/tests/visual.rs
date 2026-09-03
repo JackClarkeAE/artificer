@@ -402,7 +402,8 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         "Save document",
         "Open saved document",
         "Export as STL…",
-        "Export as STEP…",
+        "Export as STEP (exact B-rep)…",
+        "Export as STEP (faceted)…",
     ] {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must be reachable: {rect:?}");

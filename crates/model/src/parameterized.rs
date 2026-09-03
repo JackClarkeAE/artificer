@@ -373,6 +373,7 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         | KernelCommand::AddRib { .. }
         | KernelCommand::MirrorSnapshot { .. }
         | KernelCommand::LinearPatternSnapshot { .. }
+        | KernelCommand::ShellSnapshot { .. }
         | KernelCommand::FinishEdge { .. }
         | KernelCommand::FinishEdges { .. } => {
             return Err(ParameterizedKernelError::UnsupportedCommand);

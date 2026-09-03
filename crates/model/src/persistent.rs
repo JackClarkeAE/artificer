@@ -377,6 +377,9 @@ fn rebind_target_command(
                 | KernelCommand::PushPullFace { target_face, .. }
                 | KernelCommand::DrillHole { target_face, .. }
                 | KernelCommand::AddRib { target_face, .. } => *target_face = *resolved,
+                KernelCommand::ShellSnapshot { open_faces, .. } => {
+                    *open_faces = vec![*resolved];
+                }
                 KernelCommand::FinishEdge { target_edge, .. } => *target_edge = *resolved,
                 KernelCommand::FinishEdges { target_edges, .. } => *target_edges = vec![*resolved],
                 _ => unreachable!("the command variant was checked above"),
@@ -386,6 +389,9 @@ fn rebind_target_command(
         resolved => {
             if let KernelCommand::FinishEdges { target_edges, .. } = &mut command {
                 *target_edges = resolved.to_vec();
+                PersistentResolution::Resolved(command)
+            } else if let KernelCommand::ShellSnapshot { open_faces, .. } = &mut command {
+                *open_faces = resolved.to_vec();
                 PersistentResolution::Resolved(command)
             } else {
                 PersistentResolution::Missing(PersistentMissing {
@@ -410,13 +416,18 @@ pub fn rebind_extrude_face_profile(
     rebind_face_target_command(command, target, reports, current_snapshot)
 }
 
-const fn target_kind_for_command(command: &KernelCommand) -> Option<EntityKind> {
+fn target_kind_for_command(command: &KernelCommand) -> Option<EntityKind> {
     match command {
         KernelCommand::ExtrudeFaceProfile { .. }
         | KernelCommand::ExtrudeFacePlanarProfile { .. }
         | KernelCommand::PushPullFace { .. }
         | KernelCommand::DrillHole { .. }
         | KernelCommand::AddRib { .. } => Some(EntityKind::Face),
+        // A shell names the faces it opens, so those are targets that must
+        // survive a replay. A closed shell names none and is not targeted.
+        KernelCommand::ShellSnapshot { open_faces, .. } if !open_faces.is_empty() => {
+            Some(EntityKind::Face)
+        }
         KernelCommand::FinishEdge { .. } | KernelCommand::FinishEdges { .. } => {
             Some(EntityKind::Edge)
         }
@@ -623,6 +634,7 @@ mod tests {
                 diagnostics: Vec::new(),
             },
             warnings: Vec::new(),
+            rung: None,
         }
     }
 

@@ -221,3 +221,174 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
     assert_eq!(restored.state().component_poses(), poses);
     assert_eq!(restored.state().assembly_joint_summaries(), summaries);
 }
+
+#[test]
+fn a_revolute_joint_poses_its_component_and_stands_the_turntable_down() {
+    let mut harness = two_component_assembly();
+    // No mechanism yet: the animation is the turntable, and every
+    // component stands where the document assembled it.
+    assert!(!harness.state().animation_drives_joints());
+    assert_eq!(
+        harness.state().solved_component_poses(),
+        harness.state().component_poses()
+    );
+
+    click_scrolled_button(&mut harness, "Add revolute joint");
+    click_button(&mut harness, "Confirm operation");
+    assert_eq!(harness.state().assembly_joint_count(), 1);
+
+    let joints = harness.state().drivable_joints();
+    assert_eq!(joints.len(), 1, "one revolute joint to drive");
+    let hinge = joints[0].id;
+    assert!(
+        joints[0].limits.is_none(),
+        "the workbench's joint is unlimited, so its slider shows one turn"
+    );
+
+    // At rest the mechanism is the assembled document, exactly.
+    assert_eq!(harness.state().joint_angle(hinge), 0.0);
+    assert_eq!(
+        harness.state().solved_component_poses(),
+        harness.state().component_poses()
+    );
+
+    // Driving it moves the jointed component and nothing else. The joint
+    // sits on the component's own pivot, so a half turn carries it to the
+    // far side of that pivot.
+    let assembled = harness.state().component_poses();
+    let jointed = harness
+        .state()
+        .active_component_instance_id()
+        .expect("an active component");
+    harness
+        .state_mut()
+        .set_joint_angle(hinge, std::f64::consts::PI);
+    harness.run();
+
+    let posed = harness.state().solved_component_poses();
+    assert_eq!(
+        posed.len(),
+        assembled.len(),
+        "posing adds and removes no components"
+    );
+    for (solved, rest) in posed.iter().zip(&assembled) {
+        assert_eq!(solved.0, rest.0);
+        if solved.0 == jointed {
+            assert_ne!(solved.1, rest.1, "the jointed component moved");
+        } else {
+            assert_eq!(solved.1, rest.1, "an unjointed component did not");
+        }
+    }
+
+    // The document itself never moved: a joint coordinate is a pose, not
+    // an edit.
+    assert_eq!(harness.state().component_poses(), assembled);
+
+    // And the animation now belongs to the mechanism.
+    assert!(harness.state().animation_drives_joints());
+}
+
+#[test]
+fn a_sweep_measures_the_travel_the_animation_plays() {
+    let mut harness = two_component_assembly();
+
+    // Without a joint there is no motion to sweep, and the workbench says
+    // so rather than sweeping one pose and calling it a travel.
+    harness.state_mut().run_interference_sweep();
+    assert!(harness.state().sweep_report().is_none());
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("joint")),
+        "{:?}",
+        harness.state().document_status_text()
+    );
+
+    click_scrolled_button(&mut harness, "Add revolute joint");
+    click_button(&mut harness, "Confirm operation");
+    assert!(harness.state().animation_drives_joints());
+
+    harness.state_mut().run_interference_sweep();
+    // The sweep runs off the UI thread, so the frames keep coming while it
+    // works — which is the point of running it there.
+    for _ in 0..600 {
+        harness.run();
+        if !harness.state().sweep_is_running() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!harness.state().sweep_is_running(), "the sweep finished");
+    let report = harness
+        .state()
+        .sweep_report()
+        .unwrap_or_else(|| panic!("a sweep: {:?}", harness.state().document_status_text()))
+        .clone();
+    assert!(
+        report.subjects.len() >= 2,
+        "every visible body takes part: {:?}",
+        report.subjects
+    );
+    assert!(report.steps_offered > 1, "a travel, not a pose");
+    assert!(!report.cancelled);
+    assert!(report.steps_measured > 0);
+    // Either the mechanism cleared its whole travel, or it stopped where
+    // it did not; both are answers, and neither is silence.
+    if let Some(collision) = report.collision.as_ref() {
+        assert_eq!(report.steps_measured, collision.step + 1);
+    } else {
+        assert_eq!(report.steps_measured, report.steps_offered);
+    }
+
+    // The sweep leaves the picture of the whole motion behind, bound to
+    // the facets it was measured on.
+    let heat_map = harness.state().heat_map_sample_counts();
+    assert_eq!(
+        heat_map.len(),
+        report.subjects.len(),
+        "one field per swept body"
+    );
+    for (body, samples) in heat_map {
+        assert!(samples > 0, "body {body} has no readings");
+    }
+}
+
+#[test]
+fn a_part_can_be_inserted_into_the_open_design_from_the_ribbon() {
+    let mut harness = new_harness();
+    harness.run();
+    assert!(
+        !harness.state().part_library_open(),
+        "the library starts closed"
+    );
+
+    // The Model tab's Create group offers it, alongside the sketch and the
+    // construction plane, because inserting a part is making something in
+    // this design rather than a view of it.
+    click_button(&mut harness, "Insert a part into this design");
+    assert!(
+        harness.state().part_library_open(),
+        "the command opens the library"
+    );
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("insert into this design")),
+        "{:?}",
+        harness.state().document_status_text()
+    );
+
+    // And the part lands in the design that was already open, as a second
+    // occurrence beside the one there rather than a new document.
+    enter_length(&mut harness, "80");
+    insert_component(&mut harness);
+    let first = harness.state().component_poses().len();
+    assert_eq!(first, 1, "one occurrence so far");
+
+    insert_component(&mut harness);
+    let poses = harness.state().component_poses();
+    assert_eq!(poses.len(), 2, "the second part joins the same design");
+    assert_ne!(poses[0].0, poses[1].0, "distinct occurrences");
+}

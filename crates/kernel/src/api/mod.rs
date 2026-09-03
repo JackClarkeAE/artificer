@@ -5,23 +5,34 @@
 //! `artificer_kernel` has the whole surface, and the server binary in
 //! `apps/api-server` is a thin command-line front for it.
 
+pub mod analysis;
 pub mod commands;
 pub mod debug;
+pub mod decompile;
+pub mod diff;
 pub mod export;
+pub mod interference;
 pub mod journal;
+pub mod probe;
 pub mod query;
+pub mod report;
 pub mod scripting;
 pub mod selectors;
 pub mod server;
 pub mod session;
 pub mod snapshot;
+pub mod sweep;
 
 pub use crate::CancellationToken;
 pub use commands::*;
 pub use debug::*;
+pub use decompile::*;
+pub use diff::*;
 pub use export::*;
 pub use journal::*;
+pub use probe::*;
 pub use query::*;
+pub use report::*;
 pub use selectors::*;
 pub use server::*;
 pub use session::*;

@@ -76,6 +76,35 @@ impl RzSection {
     }
 }
 
+impl RzSection {
+    /// The point on the axis that section heights are measured from.
+    pub(crate) const fn center(&self) -> Point3 {
+        self.center
+    }
+
+    /// The unit axis the section turns about.
+    pub(crate) const fn axis(&self) -> Vector3 {
+        self.axis
+    }
+
+    /// The radial direction the section's `r` runs along.
+    pub(crate) const fn radial_u(&self) -> Vector3 {
+        self.radial_u
+    }
+
+    /// The section chain, in order.
+    pub(crate) fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// Whether the chain closes on itself clear of the axis. A chain that
+    /// does not closes through the axis instead, and its first and last
+    /// points both sit on it.
+    pub(crate) const fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
 /// Recovers the section of any coaxial revolved solid built from planes,
 /// cylinders, cones, and tori.
 pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBlendError> {

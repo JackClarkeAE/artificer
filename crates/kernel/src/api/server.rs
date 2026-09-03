@@ -14,9 +14,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::commands::ApiCommand;
 use crate::api::debug::ApiError;
-use crate::api::export::{export_obj, export_stl_ascii};
+use crate::api::decompile::DecompileOptions;
+use crate::api::diff::ScriptDiff;
+use crate::api::export::{export_obj, export_step, export_step_faceted, export_stl_ascii};
+use crate::api::probe::{ProbeRequest, probe};
 use crate::api::query::MeasureTarget;
-use crate::api::scripting::compile_script;
+use crate::api::scripting::{InlineModules, compile_program_with, script_parameters};
 use crate::api::selectors::EntitySelector;
 use crate::api::session::Session;
 use crate::api::snapshot::SnapshotOptions;
@@ -113,6 +116,18 @@ impl Default for SharedSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The parameters of `script.run` and `script.report`: the script, its
+/// parameter overrides, and the sources of the modules its `use` lines
+/// name, keyed by the path each `use` writes.
+#[derive(Deserialize)]
+struct ScriptParams {
+    source: String,
+    #[serde(default)]
+    params: BTreeMap<String, f64>,
+    #[serde(default)]
+    modules: BTreeMap<String, String>,
 }
 
 /// What one line of input asked for.
@@ -288,6 +303,284 @@ impl SharedSession {
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
             "query.features" => respond(id, &session.query().features()),
+            "query.describe" => {
+                let selector: EntitySelector = match serde_json::from_value(params) {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid selector: {error}"),
+                        );
+                    }
+                };
+                match session.query().describe(&selector) {
+                    Ok(description) => respond(id, &description),
+                    Err(error) => JsonRpcResponse::api_error(id, &error),
+                }
+            }
+            "report" => respond(id, &session.report()),
+            "analysis.interference" => {
+                #[derive(serde::Deserialize)]
+                struct Subjects {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                    /// A shipped profile by key, or a whole profile of the
+                    /// caller's own. Omitted, the study measures without
+                    /// judging.
+                    #[serde(default)]
+                    profile: Option<String>,
+                    #[serde(default)]
+                    fit: Option<crate::api::analysis::ClearanceProfile>,
+                }
+                let request: Subjects = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid interference study: {error}"),
+                        );
+                    }
+                };
+                let profile = match (&request.profile, request.fit.clone()) {
+                    (Some(key), _) => match crate::api::analysis::built_in_profile(key) {
+                        Some(profile) => Some(profile),
+                        None => {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                format!("No clearance profile named \"{key}\""),
+                            );
+                        }
+                    },
+                    (None, fit) => fit,
+                };
+                match crate::api::analysis::study_session_steps(
+                    &session,
+                    &request.subjects,
+                    &CancellationToken::default(),
+                ) {
+                    Ok(mut report) => {
+                        report.judge(profile);
+                        respond(id, &report)
+                    }
+                    Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
+                }
+            }
+            "analysis.profiles" => respond(
+                id,
+                &crate::api::analysis::BUILT_IN_PROFILES
+                    .iter()
+                    .map(|profile| profile.profile())
+                    .collect::<Vec<_>>(),
+            ),
+            "analysis.clearance_field" => {
+                #[derive(serde::Deserialize)]
+                struct Fields {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                }
+                let request: Fields = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid clearance field request: {error}"),
+                        );
+                    }
+                };
+                match crate::api::analysis::session_subjects(&session, &request.subjects) {
+                    Ok(subjects) => {
+                        let fields = crate::api::analysis::clearance_fields(
+                            &subjects,
+                            &CancellationToken::default(),
+                        );
+                        respond(
+                            id,
+                            &serde_json::json!({
+                                "subjects": request.subjects,
+                                "fields": fields
+                                    .iter()
+                                    .zip(&request.subjects)
+                                    .map(|(values, name)| {
+                                        serde_json::json!({
+                                            "subject": name,
+                                            "samples": values.len(),
+                                            "nearest": values
+                                                .iter()
+                                                .copied()
+                                                .fold(f64::INFINITY, f64::min),
+                                            "farthest": values
+                                                .iter()
+                                                .copied()
+                                                .filter(|value| value.is_finite())
+                                                .fold(f64::NEG_INFINITY, f64::max),
+                                            "values": values,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            }),
+                        )
+                    }
+                    Err(error) => JsonRpcResponse::err(id, INVALID_PARAMS, &error.message),
+                }
+            }
+            "analysis.sweep" => {
+                use crate::api::interference::Placement;
+                use crate::api::sweep::{SweepStep, interference_sweep};
+
+                #[derive(serde::Deserialize)]
+                struct WirePlacement {
+                    /// A unit quaternion `[w, x, y, z]`; the identity when
+                    /// omitted, which is what a body that does not move takes.
+                    #[serde(default = "identity_rotation")]
+                    rotation: [f64; 4],
+                    #[serde(default)]
+                    translation: [f64; 3],
+                }
+                #[derive(serde::Deserialize)]
+                struct WireStep {
+                    #[serde(default)]
+                    drivers: Vec<f64>,
+                    #[serde(default)]
+                    placements: Vec<WirePlacement>,
+                }
+                #[derive(serde::Deserialize)]
+                struct Request {
+                    #[serde(default)]
+                    subjects: Vec<String>,
+                    #[serde(default)]
+                    steps: Vec<WireStep>,
+                    #[serde(default)]
+                    profile: Option<String>,
+                    #[serde(default)]
+                    fit: Option<crate::api::analysis::ClearanceProfile>,
+                }
+                const fn identity_rotation() -> [f64; 4] {
+                    [1.0, 0.0, 0.0, 0.0]
+                }
+
+                let request: Request = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid sweep: {error}"),
+                        );
+                    }
+                };
+                let profile = match (&request.profile, request.fit.clone()) {
+                    (Some(key), _) => match crate::api::analysis::built_in_profile(key) {
+                        Some(profile) => Some(profile),
+                        None => {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                format!("No clearance profile named \"{key}\""),
+                            );
+                        }
+                    },
+                    (None, fit) => fit,
+                };
+                let subjects =
+                    match crate::api::analysis::session_subjects(&session, &request.subjects) {
+                        Ok(subjects) => subjects,
+                        Err(error) => {
+                            return JsonRpcResponse::err(id, INVALID_PARAMS, &error.message);
+                        }
+                    };
+                let mut steps = Vec::with_capacity(request.steps.len());
+                for step in request.steps {
+                    let mut placements = Vec::with_capacity(step.placements.len());
+                    for placement in step.placements {
+                        let Some(placed) =
+                            Placement::from_quaternion(placement.rotation, placement.translation)
+                        else {
+                            return JsonRpcResponse::err(
+                                id,
+                                INVALID_PARAMS,
+                                "A placement's rotation is not a usable quaternion",
+                            );
+                        };
+                        placements.push(placed);
+                    }
+                    steps.push(SweepStep::new(step.drivers, placements));
+                }
+                if steps.is_empty() {
+                    return JsonRpcResponse::err(
+                        id,
+                        INVALID_PARAMS,
+                        "A sweep needs at least one position of the mechanism",
+                    );
+                }
+                let sweep = interference_sweep(
+                    &subjects,
+                    &steps,
+                    session.precision,
+                    profile.as_ref(),
+                    &CancellationToken::default(),
+                    &mut |_, _| {},
+                );
+                respond(id, &sweep.report)
+            }
+            "probe" => {
+                let request: ProbeRequest = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid probe: {error}"),
+                        );
+                    }
+                };
+                match probe(&session, &request) {
+                    Ok(result) => respond(id, &result),
+                    Err(error) => JsonRpcResponse::api_error(id, &error),
+                }
+            }
+            "script.report" => {
+                let script: ScriptParams = match serde_json::from_value(params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid script params: {error}"),
+                        );
+                    }
+                };
+                // A failed step is part of the report, not a transport
+                // error: the caller reads `status`, `failure`, and every
+                // step that did commit.
+                let modules = InlineModules::new(script.modules);
+                let outcome =
+                    session.run_script_with(&script.source, &script.params, &modules, &token);
+                respond(id, &session.report_with(outcome.failure))
+            }
+            "script.params" => {
+                #[derive(Deserialize)]
+                struct SourceParams {
+                    source: String,
+                }
+                let script: SourceParams = match serde_json::from_value(params) {
+                    Ok(script) => script,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid script params: {error}"),
+                        );
+                    }
+                };
+                match script_parameters(&script.source) {
+                    Ok(parameters) => respond(id, &parameters),
+                    Err(error) => JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                }
+            }
             "snapshot" => {
                 // Absent params mean the default isometric SVG; present but
                 // malformed params are the caller's mistake and say so.
@@ -322,13 +615,44 @@ impl SharedSession {
                 Ok(journal) => JsonRpcResponse::ok(id, serde_json::Value::String(journal)),
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
-            "script.run" => {
+            "journal.art" => match session.to_art(&DecompileOptions::default()) {
+                Ok(script) => JsonRpcResponse::ok(id, serde_json::Value::String(script)),
+                Err(error) => JsonRpcResponse::api_error(id, &error),
+            },
+            "script.diff" => {
                 #[derive(Deserialize)]
-                struct ScriptParams {
-                    source: String,
+                struct DiffParams {
+                    a: String,
+                    b: String,
                     #[serde(default)]
-                    params: BTreeMap<String, f64>,
+                    params_a: BTreeMap<String, f64>,
+                    #[serde(default)]
+                    params_b: BTreeMap<String, f64>,
+                    #[serde(default)]
+                    modules: BTreeMap<String, String>,
                 }
+                let diff: DiffParams = match serde_json::from_value(params) {
+                    Ok(diff) => diff,
+                    Err(error) => {
+                        return JsonRpcResponse::err(
+                            id,
+                            INVALID_PARAMS,
+                            format!("Invalid diff params: {error}"),
+                        );
+                    }
+                };
+                let modules = InlineModules::new(diff.modules);
+                let old = match compile_program_with(&diff.a, &diff.params_a, &modules) {
+                    Ok(program) => program,
+                    Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                };
+                let new = match compile_program_with(&diff.b, &diff.params_b, &modules) {
+                    Ok(program) => program,
+                    Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
+                };
+                respond(id, &ScriptDiff::between(&old, &new))
+            }
+            "script.run" => {
                 let script: ScriptParams = match serde_json::from_value(params) {
                     Ok(script) => script,
                     Err(error) => {
@@ -339,12 +663,15 @@ impl SharedSession {
                         );
                     }
                 };
-                let commands = match compile_script(&script.source, &script.params) {
-                    Ok(commands) => commands,
+                let modules = InlineModules::new(script.modules);
+                let program = match compile_program_with(&script.source, &script.params, &modules) {
+                    Ok(program) => program,
                     Err(error) => return JsonRpcResponse::api_error(id, &ApiError::from(error)),
                 };
+                session.parameters = program.parameters;
+                session.names = program.names;
                 let mut results = Vec::new();
-                for command in commands {
+                for command in program.commands {
                     match session.execute(command, &token) {
                         Ok(result) => results.push(result),
                         Err(error) => return JsonRpcResponse::api_error(id, &error),
@@ -360,6 +687,14 @@ impl SharedSession {
                 Ok(obj) => JsonRpcResponse::ok(id, serde_json::Value::String(obj)),
                 Err(error) => JsonRpcResponse::api_error(id, &error),
             },
+            "export.step" => match export_step(&session.snapshot, "model") {
+                Ok(step) => JsonRpcResponse::ok(id, serde_json::Value::String(step)),
+                Err(error) => JsonRpcResponse::api_error(id, &error),
+            },
+            "export.step_faceted" => JsonRpcResponse::ok(
+                id,
+                serde_json::Value::String(export_step_faceted(&session.snapshot, "model")),
+            ),
             unknown => JsonRpcResponse::err(
                 id,
                 METHOD_NOT_FOUND,

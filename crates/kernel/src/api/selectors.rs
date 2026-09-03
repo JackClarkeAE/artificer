@@ -438,7 +438,12 @@ fn resolve_history_selector(
             .iter()
             .filter(|record| {
                 record.role.as_ref().is_some_and(|r| {
-                    r.name == role && ordinal.is_none_or(|ord| r.ordinal == Some(ord))
+                    // A role is matched whole, or by its trailing segments:
+                    // `end_face` finds `face_extrude.boss.end_face`, so a
+                    // function need not know the label its step ends up
+                    // under.
+                    (r.name == role || r.name.ends_with(&format!(".{role}")))
+                        && ordinal.is_none_or(|ord| r.ordinal == Some(ord))
                 })
             })
             .flat_map(|record| record.outputs.iter().copied())
@@ -892,7 +897,7 @@ fn resolve_geometric_selector(
 /// Squared distance from a point to a triangle, on the triangle's interior,
 /// an edge or a corner, whichever is nearest (Ericson, Real-Time Collision
 /// Detection, 5.1.5).
-fn point_triangle_distance_sq(p: Point3, tri: &[Point3; 3]) -> f64 {
+pub(crate) fn point_triangle_distance_sq(p: Point3, tri: &[Point3; 3]) -> f64 {
     let sub = |a: Point3, b: Point3| Vector3::new(a.x - b.x, a.y - b.y, a.z - b.z);
     let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
     let scale =

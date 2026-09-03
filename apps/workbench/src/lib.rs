@@ -103,6 +103,11 @@ use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
     paint_tool_icon,
 };
+use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
+use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
+use artificer_kernel::api::sweep::{Sweep, SweepReport, SweepStep, interference_sweep};
+use artificer_model::JointId;
+use artificer_model::kinematics::{self, JointDriver, Kinematics};
 
 use crate::theme::install_style;
 const ORIGIN_PLANE_HALF_EXTENT_MM: f64 = 25.0;
@@ -795,6 +800,11 @@ impl PendingOperation {
     }
 }
 
+/// How many holes a staged hole pattern cuts. The ring is a feature
+/// pattern like any other: one circle repeated at rigid placements in its
+/// own face, carried by a single profile so the cut stays one exact step.
+const HOLE_PATTERN_COUNT: u32 = 6;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SolidFeaturePreset {
     Revolve,
@@ -802,6 +812,8 @@ enum SolidFeaturePreset {
     Rib,
     Mirror,
     LinearPattern,
+    HolePattern,
+    Shell,
     Chamfer,
     Fillet,
 }
@@ -870,6 +882,8 @@ impl SolidFeaturePreset {
             Self::Rib => "Add rib",
             Self::Mirror => "Mirror body",
             Self::LinearPattern => "Linear body pattern",
+            Self::HolePattern => "Hole ring",
+            Self::Shell => "Shell body",
             Self::Chamfer => "Chamfer edge",
             Self::Fillet => "Fillet edge",
         }
@@ -882,6 +896,10 @@ impl SolidFeaturePreset {
             Self::Rib => "Add a straight rectangular rib to the selected planar face",
             Self::Mirror => "Mirror the browser-selected bodies across the selected plane",
             Self::LinearPattern => "Create three separated +X copies as one multi-solid body group",
+            Self::HolePattern => {
+                "Cut a ring of six holes on the selected face, evenly spaced about its centre"
+            }
+            Self::Shell => "Hollow the active body to one uniform wall, open at the selected face",
             Self::Chamfer => {
                 "Finish one or more compatible cuboid edges with exact planar chamfers"
             }
@@ -1529,22 +1547,53 @@ enum Attempt {
 /// What an open Export dialog is about to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExportSubject {
-    Body { ordinal: u32, step: bool },
+    Body { ordinal: u32, format: BodyExport },
     Sketch { index: usize, ordinal: u32 },
-    Document { step: bool },
+    Document { format: BodyExport },
+}
+
+/// The three ways a body leaves the workbench.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyExport {
+    /// The committed tessellation as ASCII STL.
+    Stl,
+    /// The exact B-rep as AP214 `advanced_brep_shape_representation`: every
+    /// analytic face and curve as itself, through the kernel's exporter.
+    StepExact,
+    /// The committed tessellation as an AP214 faceted surface model.
+    StepFaceted,
+}
+
+impl BodyExport {
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Stl => "stl",
+            Self::StepExact | Self::StepFaceted => "step",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Stl => "STL",
+            Self::StepExact => "STEP (exact B-rep)",
+            Self::StepFaceted => "STEP (faceted)",
+        }
+    }
 }
 
 impl ExportSubject {
     const fn extension(self) -> &'static str {
         match self {
-            Self::Body { step: true, .. } | Self::Document { step: true } => "step",
-            Self::Body { step: false, .. } | Self::Document { step: false } => "stl",
+            Self::Body { format, .. } | Self::Document { format } => format.extension(),
             Self::Sketch { .. } => "dxf",
         }
     }
 
     fn title(self) -> String {
-        let format = self.extension().to_ascii_uppercase();
+        let format = match self {
+            Self::Body { format, .. } | Self::Document { format } => format.label().to_owned(),
+            Self::Sketch { .. } => "DXF".to_owned(),
+        };
         match self {
             Self::Body { ordinal, .. } => format!("EXPORT BODY {ordinal} AS {format}"),
             Self::Sketch { ordinal, .. } => format!("EXPORT SKETCH {ordinal} AS {format}"),
@@ -1616,6 +1665,10 @@ enum ControlsScope {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextualSubject {
     PendingOperation,
+    /// A finished interference study. It is a reading rather than an
+    /// operation, so it has no gate; it stays until it is dismissed or the
+    /// bodies move under it.
+    Interference,
     Component,
     Measurement,
     Selection,
@@ -1634,6 +1687,7 @@ impl ContextualSubject {
     const fn title(self) -> &'static str {
         match self {
             Self::PendingOperation => "OPERATION",
+            Self::Interference => "INTERFERENCE",
             Self::Component => "COMPONENT",
             Self::Measurement => "MEASURE",
             Self::Selection => "SELECTION",
@@ -1700,6 +1754,235 @@ struct WorkbenchBody {
     /// The assigned material's stable key. Bodies start unassigned so mass is
     /// never quoted from a default nobody chose.
     material: Option<String>,
+}
+
+/// How many positions of the mechanism a sweep measures.
+///
+/// The sweep walks the same travel the animation plays, so this is the
+/// resolution at which "it looked fine when I watched it" becomes a
+/// measurement. Sixty-four steps put a quarter-turn hinge under a degree
+/// and a half per step, which is finer than a collision that matters is
+/// narrow.
+const SWEEP_STEPS: usize = 64;
+
+/// A sweep running off the UI thread.
+struct AsyncSweep {
+    job: JobHandle<Sweep>,
+    cancellation: CancellationToken,
+    /// The step the worker has reached, so the status line can count.
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    total: usize,
+    /// The bodies the fields belong to, in subject order.
+    bodies: Vec<BodyId>,
+    started: Instant,
+}
+
+/// One joint the user can pose, as the controls need it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DrivableJoint {
+    pub id: JointId,
+    pub name: String,
+    /// The travel the joint allows, in radians, or `None` for a joint with
+    /// no limits at all.
+    pub limits: Option<(f64, f64)>,
+}
+
+/// The clearance measured over every visible body, ready to paint.
+///
+/// One reading per facet corner, in the scene order the viewport walks, so
+/// the renderer interpolates the measurement across each facet instead of
+/// showing the tessellation it was measured on.
+#[derive(Clone, Debug)]
+struct ClearanceHeatMap {
+    fields: Vec<(BodyId, Vec<f32>)>,
+    palette: viewport::HeatPalette,
+    /// Changes with every study, so the viewport's uploaded colours are
+    /// replaced rather than kept.
+    epoch: u64,
+    visible: bool,
+}
+
+impl ClearanceHeatMap {
+    /// The field for one body, when it is showing and still describes the
+    /// facets it is about to be painted over.
+    ///
+    /// The length check is what keeps an edit from painting last study's
+    /// readings onto this body's new facets: a field is bound to the
+    /// tessellation it was measured on, and a body that has been rebuilt
+    /// simply has no reading yet.
+    fn field_for(&self, body: BodyId, samples: usize) -> Option<viewport::SurfaceField<'_>> {
+        if !self.visible {
+            return None;
+        }
+        self.fields
+            .iter()
+            .find(|(held, values)| *held == body && values.len() == samples)
+            .map(|(_, values)| viewport::SurfaceField {
+                values,
+                palette: self.palette,
+                epoch: self.epoch,
+            })
+    }
+}
+
+/// Where one joint sits at a phase of the motion.
+///
+/// A joint with limits swings between them and back — a triangle wave, so
+/// a hinge sweeps its travel instead of jumping back at the end of the
+/// turn. One without turns continuously, because that is what an unlimited
+/// revolute joint does. The animation and the sweep both read this, so the
+/// measurement is of the motion that was watched rather than of a second
+/// motion that resembles it.
+fn swept_angle(phase: f64, limits: Option<(f64, f64)>) -> f64 {
+    match limits {
+        None => phase,
+        Some((min, max)) => {
+            let sweep = (phase / std::f64::consts::PI).rem_euclid(2.0);
+            let fraction = if sweep <= 1.0 { sweep } else { 2.0 - sweep };
+            min + (max - min) * fraction
+        }
+    }
+}
+
+/// The one line a sweep leaves in the status bar.
+fn sweep_status(report: &SweepReport) -> String {
+    if let Some(collision) = report.collision.as_ref() {
+        return format!(
+            "Collision at step {} of {}: {} ↔ {}",
+            collision.step + 1,
+            report.steps_offered,
+            collision.a,
+            collision.b
+        );
+    }
+    if report.cancelled {
+        return format!(
+            "Sweep stopped after {} of {} positions; the rest is unmeasured",
+            report.steps_measured, report.steps_offered
+        );
+    }
+    let travel = format!("{} positions", report.steps_measured);
+    match (report.profile.as_ref(), report.failing) {
+        (Some(profile), 0) => format!("{}: the motion clears over {travel}", profile.name),
+        (Some(profile), failing) => {
+            format!("{}: {failing} pairs too close over {travel}", profile.name)
+        }
+        (None, _) => report.tightest().map_or_else(
+            || format!("No contact over {travel}"),
+            |tightest| {
+                format!(
+                    "Clear over {travel}; closest {:.3} mm between {} and {}",
+                    tightest.distance, tightest.a, tightest.b
+                )
+            },
+        ),
+    }
+}
+
+/// The one line a study leaves in the status bar.
+///
+/// Under a profile it is the fit's answer, because that is the question
+/// that was asked, and it names the pair the fit fails worst on. Without
+/// one there is no fit to report, only the measurement.
+fn study_status(report: &artificer_kernel::api::analysis::InterferenceReport) -> String {
+    if let Some(profile) = report.profile.as_ref() {
+        return match (report.failing, report.worst_fit()) {
+            (0, _) if report.loose == 0 => format!("{}: every pair fits", profile.name),
+            (0, _) => format!(
+                "{}: every pair fits · {} looser than needed",
+                profile.name, report.loose
+            ),
+            (failing, Some(worst)) => format!(
+                "{}: {failing} of {} pairs too close · worst {} \u{2194} {} at {:.3} mm",
+                profile.name,
+                report.pairs.len(),
+                worst.a,
+                worst.b,
+                worst.distance
+            ),
+            (failing, None) => format!("{}: {failing} pairs too close", profile.name),
+        };
+    }
+    match (report.interfering, report.touching) {
+        (0, 0) => format!(
+            "No interference across {} pairs{}",
+            report.pairs.len(),
+            report.tightest.as_ref().map_or(String::new(), |tightest| {
+                format!("; tightest {:.3} mm", tightest.distance)
+            })
+        ),
+        (0, touching) => format!("{touching} pairs touch; none overlap"),
+        (interfering, _) => format!("{interfering} pairs interfere"),
+    }
+}
+
+/// Builds the heat map a study leaves behind.
+fn heat_map_from(
+    bodies: &[BodyId],
+    fields: Vec<Vec<f64>>,
+    profile: Option<&ClearanceProfile>,
+    previous: Option<&ClearanceHeatMap>,
+) -> Option<ClearanceHeatMap> {
+    let fields = bodies
+        .iter()
+        .copied()
+        .zip(fields)
+        .map(|(body, values)| {
+            let values = values.into_iter().map(|value| value as f32).collect();
+            (body, values)
+        })
+        .collect::<Vec<(BodyId, Vec<f32>)>>();
+    if fields.iter().all(|(_, values)| values.is_empty()) {
+        return None;
+    }
+    Some(ClearanceHeatMap {
+        palette: heat_palette(profile, &fields),
+        fields,
+        epoch: previous.map_or(1, |held| held.epoch + 1),
+        // A study is asked for; its picture arrives with it. What the user
+        // then chooses to do with the toggle survives the next study.
+        visible: previous.is_none_or(|held| held.visible),
+    })
+}
+
+/// The scale the readings are painted against.
+///
+/// With a profile, it is the profile's own window: the picture and the
+/// verdict then agree, and green on the model means the same thing as
+/// `pass` in the table. Without one there is no window to draw, so the
+/// readings are ramped over their own range instead.
+fn heat_palette(
+    profile: Option<&ClearanceProfile>,
+    fields: &[(BodyId, Vec<f32>)],
+) -> viewport::HeatPalette {
+    profile.map_or_else(
+        || measured_ramp(fields),
+        |profile| viewport::HeatPalette::Window {
+            minimum: profile.minimum as f32,
+            maximum: profile.maximum.unwrap_or(f64::INFINITY) as f32,
+        },
+    )
+}
+
+/// A ramp over the readings themselves, for a study with no fit to judge.
+///
+/// It spans zero to the ninetieth percentile rather than to the largest
+/// reading: one body parked far across the workspace would otherwise
+/// stretch the scale until every real fit read as tight.
+fn measured_ramp(fields: &[(BodyId, Vec<f32>)]) -> viewport::HeatPalette {
+    let mut readings = fields
+        .iter()
+        .flat_map(|(_, values)| values.iter().copied())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect::<Vec<f32>>();
+    let far = if readings.is_empty() {
+        1.0
+    } else {
+        let index = (readings.len() * 9 / 10).min(readings.len() - 1);
+        let (_, value, _) = readings.select_nth_unstable_by(index, f32::total_cmp);
+        value.max(1.0e-3)
+    };
+    viewport::HeatPalette::Gradient { near: 0.0, far }
 }
 
 #[derive(Clone, Debug)]
@@ -2004,6 +2287,31 @@ pub struct KernelLabApp {
     /// the other; both now open closed, with facts arriving as a contextual
     /// card over the canvas.
     model_inspector_open: bool,
+    /// The last interference study, kept until the document changes under
+    /// it. A study is a reading, not a feature: it never enters the
+    /// history and never touches a snapshot.
+    interference: Option<artificer_kernel::api::analysis::InterferenceReport>,
+    /// The last sweep of the mechanism through its travel, kept beside the
+    /// static study rather than replacing it: one answers for the pose the
+    /// assembly is in, the other for every pose it can reach.
+    sweep: Option<SweepReport>,
+    /// A sweep running off the UI thread.
+    async_sweep: Option<AsyncSweep>,
+    /// The angle each revolute joint is held at, in radians. A joint with
+    /// no entry rests at zero, which is the pose the document assembled.
+    joint_drivers: BTreeMap<JointId, f64>,
+    /// Where the joints put every component this frame. Re-solved once a
+    /// frame rather than cached against edits, because a stale pose is a
+    /// part drawn somewhere it is not.
+    kinematics: Kinematics,
+    /// The fit every study is judged against, and the window the heat map
+    /// is painted to. `None` measures without judging, which is what a
+    /// first look at an assembly is.
+    clearance_profile: Option<ClearanceProfile>,
+    /// The clearance heat map from that study, painted over the bodies it
+    /// was measured on. Kept beside the report rather than inside it: the
+    /// report is a published document, and this is a picture of it.
+    heat_map: Option<ClearanceHeatMap>,
     /// The model camera as it stood before a plane sketch reframed it, so
     /// leaving the sketch hands the three-dimensional view back.
     camera_before_plane_sketch: Option<ViewState>,
@@ -2171,6 +2479,13 @@ impl Default for KernelLabApp {
             edge_finish_distance_text: "0.400".to_owned(),
             edge_finish_tangent_chain: false,
             model_inspector_open: false,
+            interference: None,
+            sweep: None,
+            async_sweep: None,
+            joint_drivers: BTreeMap::new(),
+            kinematics: Kinematics::default(),
+            clearance_profile: None,
+            heat_map: None,
             camera_before_plane_sketch: None,
             show_origin_planes: false,
             section_analysis: SectionAnalysis::default(),
@@ -2396,6 +2711,36 @@ impl KernelLabApp {
                     component.id.get(),
                     [translation.x(), translation.y(), translation.z()],
                     [rotation.w(), rotation.x(), rotation.y(), rotation.z()],
+                )
+            })
+            .collect()
+    }
+
+    /// Where the joints put every component, in the shape
+    /// [`Self::component_poses`] reports the assembled ones.
+    ///
+    /// The two agree exactly when every joint is at rest. What separates
+    /// them is the mechanism.
+    #[must_use]
+    pub fn solved_component_poses(&self) -> Vec<(u64, [f64; 3], [f64; 4])> {
+        self.document
+            .component_instances()
+            .iter()
+            .map(|component| {
+                let pose = self.kinematics.pose(component.id).unwrap_or(component.pose);
+                (
+                    component.id.get(),
+                    [
+                        pose.translation.x(),
+                        pose.translation.y(),
+                        pose.translation.z(),
+                    ],
+                    [
+                        pose.rotation.w(),
+                        pose.rotation.x(),
+                        pose.rotation.y(),
+                        pose.rotation.z(),
+                    ],
                 )
             })
             .collect()
@@ -2813,6 +3158,18 @@ impl KernelLabApp {
     #[must_use]
     pub const fn shell_visibility(&self) -> WorkbenchShellVisibility {
         self.shell.visibility()
+    }
+
+    /// Opens the part library so a catalogue part can be brought into the
+    /// design that is open.
+    ///
+    /// The library is where the part and its parameters are chosen, so this
+    /// raises that panel rather than inserting blind; the insertion itself
+    /// still passes through the confirmation gate every operation does.
+    pub fn open_part_library(&mut self) {
+        *self.part_library.open_mut() = true;
+        self.document_status =
+            Some("Library open · choose a part to insert into this design".to_owned());
     }
 
     #[must_use]
@@ -4129,8 +4486,12 @@ impl KernelLabApp {
         let Some(component) = self.component_for_body(body) else {
             return viewport::RigidOccurrenceTransform::identity();
         };
-        let translation = component.pose.translation;
-        let rotation = component.pose.rotation;
+        // The joints have the last word on where a component is: the pose
+        // the document stores is where it was assembled, and the solver
+        // says where the drivers have since put it.
+        let pose = self.kinematics.pose(component.id).unwrap_or(component.pose);
+        let translation = pose.translation;
+        let rotation = pose.rotation;
         viewport::RigidOccurrenceTransform::new(
             Vector3::new(translation.x(), translation.y(), translation.z()),
             RotationQuaternion::new(rotation.w(), rotation.x(), rotation.y(), rotation.z()),
@@ -9490,6 +9851,315 @@ impl KernelLabApp {
         ));
     }
 
+    /// Measures every pair of visible bodies at the poses they occupy.
+    ///
+    /// Nothing is staged and nothing is committed: a study reads the
+    /// document, so it needs no confirmation gate and leaves no feature
+    /// behind.
+    pub fn run_interference_study(&mut self) {
+        use artificer_kernel::api::analysis::{Subject, clearance_fields, interference_study};
+        use artificer_kernel::api::interference::Placement;
+
+        let visible = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
+        let subjects = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| {
+                let occurrence = self.occurrence_transform_for_body(body.id);
+                let rotation = occurrence.rotation();
+                let translation = occurrence.translation();
+                let placement = Placement::from_quaternion(
+                    [rotation.w, rotation.x, rotation.y, rotation.z],
+                    [translation.x, translation.y, translation.z],
+                )
+                .unwrap_or(Placement::IDENTITY);
+                Subject::new(format!("Body {}", body.ordinal), body.body.snapshot.clone())
+                    .at(placement)
+            })
+            .collect::<Vec<_>>();
+        if subjects.len() < 2 {
+            self.document_status =
+                Some("Interference needs two visible bodies to compare".to_owned());
+            self.interference = None;
+            self.heat_map = None;
+            return;
+        }
+        let cancellation = CancellationToken::new();
+        let mut report = interference_study(&subjects, self.document_precision(), &cancellation);
+        report.judge(self.clearance_profile.clone());
+        let fields = clearance_fields(&subjects, &cancellation);
+        self.heat_map = heat_map_from(
+            &visible,
+            fields,
+            self.clearance_profile.as_ref(),
+            self.heat_map.as_ref(),
+        );
+        self.document_status = Some(study_status(&report));
+        self.interference = Some(report);
+    }
+
+    /// Chooses the fit every study is judged against.
+    ///
+    /// Nothing is measured again. The closest approach of each pair is
+    /// already the number a fit is decided on, so a new fit re-reads the
+    /// same study and repaints the same readings against a different
+    /// window.
+    pub fn set_clearance_profile(&mut self, profile: Option<ClearanceProfile>) {
+        self.clearance_profile = profile.clone();
+        if let Some(heat_map) = self.heat_map.as_mut() {
+            heat_map.palette = heat_palette(profile.as_ref(), &heat_map.fields);
+        }
+        if let Some(report) = self.interference.as_mut() {
+            report.judge(profile);
+            self.document_status = Some(study_status(report));
+        } else {
+            self.document_status = Some(match self.clearance_profile.as_ref() {
+                Some(profile) => format!("{} will judge the next study", profile.name),
+                None => "Studies will measure without judging a fit".to_owned(),
+            });
+        }
+    }
+
+    #[must_use]
+    pub fn clearance_profile(&self) -> Option<&ClearanceProfile> {
+        self.clearance_profile.as_ref()
+    }
+
+    /// Measures the mechanism through the travel the animation plays.
+    ///
+    /// A static study answers for the pose the assembly is in. This
+    /// answers the harder question a mechanism asks — whether it clears
+    /// itself *anywhere it can go* — by stepping the joints through the
+    /// same sweep the play button shows and measuring every step. It stops
+    /// at the first collision, because past that point the parts have
+    /// already passed through one another and nothing beyond is a pose the
+    /// real thing reaches.
+    pub fn run_interference_sweep(&mut self) {
+        use artificer_kernel::api::analysis::Subject;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        if self.async_sweep.is_some() {
+            return;
+        }
+        let joints = self.drivable_joints();
+        if joints.is_empty() {
+            self.document_status =
+                Some("A sweep needs a joint to drive; this document has none".to_owned());
+            return;
+        }
+        let bodies = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
+        if bodies.len() < 2 {
+            self.document_status = Some("A sweep needs two visible bodies to compare".to_owned());
+            return;
+        }
+        let subjects = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| Subject::new(format!("Body {}", body.ordinal), body.body.snapshot.clone()))
+            .collect::<Vec<_>>();
+        let Some(steps) = self.sweep_steps(&joints, &bodies) else {
+            self.document_status =
+                Some("The mechanism could not be posed through its travel".to_owned());
+            return;
+        };
+
+        let total = steps.len();
+        let precision = self.document_precision();
+        let profile = self.clearance_profile.clone();
+        let cancellation = CancellationToken::new();
+        let job_cancellation = cancellation.clone();
+        let progress = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::clone(&progress);
+        let Some(scheduler) = self.feature_preview_scheduler.as_ref() else {
+            // No scheduler is the deterministic-test configuration, where
+            // running it here is what a caller wants anyway.
+            let sweep = interference_sweep(
+                &subjects,
+                &steps,
+                precision,
+                profile.as_ref(),
+                &cancellation,
+                &mut |_, _| {},
+            );
+            self.apply_sweep(sweep, &bodies);
+            return;
+        };
+        let job = scheduler.submit(JobPriority::Commit, None, move |_| {
+            interference_sweep(
+                &subjects,
+                &steps,
+                precision,
+                profile.as_ref(),
+                &job_cancellation,
+                &mut |step, _| {
+                    reported.store(step, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+        });
+        self.async_sweep = Some(AsyncSweep {
+            job,
+            cancellation,
+            progress,
+            total,
+            bodies,
+            started: Instant::now(),
+        });
+        self.document_status = Some(format!("Sweeping {total} positions…"));
+    }
+
+    /// The positions a sweep measures: the animation's own travel, solved.
+    ///
+    /// Every step comes from the same `animated_joint_angle` the play
+    /// button uses, so a sweep measures exactly the motion the user
+    /// watched rather than a second motion that only resembles it.
+    fn sweep_steps(&self, joints: &[DrivableJoint], bodies: &[BodyId]) -> Option<Vec<SweepStep>> {
+        use artificer_kernel::api::interference::Placement;
+
+        let mut steps = Vec::with_capacity(SWEEP_STEPS);
+        for step in 0..SWEEP_STEPS {
+            let phase = std::f64::consts::TAU * step as f64 / SWEEP_STEPS as f64;
+            let mut drivers = Vec::with_capacity(joints.len());
+            let mut values = Vec::with_capacity(joints.len());
+            for joint in joints {
+                let angle = swept_angle(phase, joint.limits);
+                drivers.push(angle);
+                values.push(JointDriver::new(joint.id, angle));
+            }
+            let posed = kinematics::solve(&self.document, &values).ok()?;
+            let mut placements = Vec::with_capacity(bodies.len());
+            for body in bodies {
+                // A body that is not a component occurrence is not in the
+                // assembly graph, so nothing drives it: it stands still
+                // through the whole travel, which is exactly what the
+                // frame of a mechanism does.
+                let Some(component) = self.component_for_body(*body) else {
+                    placements.push(Placement::IDENTITY);
+                    continue;
+                };
+                let pose = posed.pose(component.id).unwrap_or(component.pose);
+                placements.push(Placement::from_quaternion(
+                    [
+                        pose.rotation.w(),
+                        pose.rotation.x(),
+                        pose.rotation.y(),
+                        pose.rotation.z(),
+                    ],
+                    [
+                        pose.translation.x(),
+                        pose.translation.y(),
+                        pose.translation.z(),
+                    ],
+                )?);
+            }
+            steps.push(SweepStep::new(drivers, placements));
+        }
+        Some(steps)
+    }
+
+    /// Takes a finished sweep: its report, and the picture of the whole
+    /// travel that goes with it.
+    fn apply_sweep(&mut self, sweep: Sweep, bodies: &[BodyId]) {
+        self.heat_map = heat_map_from(
+            bodies,
+            sweep.fields,
+            self.clearance_profile.as_ref(),
+            self.heat_map.as_ref(),
+        );
+        self.document_status = Some(sweep_status(&sweep.report));
+        self.sweep = Some(sweep.report);
+    }
+
+    /// Collects a running sweep once its worker is done.
+    fn poll_async_sweep(&mut self, context: &egui::Context) {
+        let Some(running) = self.async_sweep.as_ref() else {
+            return;
+        };
+        let Some(finished) = running.job.try_take() else {
+            let reached = running
+                .progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(running.total);
+            self.document_status = Some(format!(
+                "Sweeping {reached} of {} positions…",
+                running.total
+            ));
+            context.request_repaint();
+            return;
+        };
+        let running = self.async_sweep.take().expect("a finished sweep is staged");
+        match finished {
+            Ok(sweep) => {
+                let bodies = running.bodies.clone();
+                self.apply_sweep(sweep, &bodies);
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Sweep failed: {error:?}"));
+            }
+        }
+        let _ = running.started;
+        context.request_repaint();
+    }
+
+    /// Stops a running sweep. What it measured before the stop is kept and
+    /// says so; what it never reached, it never claims.
+    pub fn cancel_interference_sweep(&mut self) {
+        if let Some(running) = self.async_sweep.as_ref() {
+            running.cancellation.cancel();
+        }
+    }
+
+    #[must_use]
+    pub fn sweep_report(&self) -> Option<&SweepReport> {
+        self.sweep.as_ref()
+    }
+
+    #[must_use]
+    pub fn sweep_is_running(&self) -> bool {
+        self.async_sweep.is_some()
+    }
+
+    /// How many readings the heat map holds for each body, so a caller can
+    /// see that a study or a sweep left a picture without reaching into
+    /// the readings themselves.
+    #[must_use]
+    pub fn heat_map_sample_counts(&self) -> Vec<(u64, usize)> {
+        self.heat_map.as_ref().map_or_else(Vec::new, |heat_map| {
+            heat_map
+                .fields
+                .iter()
+                .map(|(body, values)| (body.get(), values.len()))
+                .collect()
+        })
+    }
+
+    /// The precision the document's bodies were built under.
+    fn document_precision(&self) -> artificer_protocol::PrecisionPolicy {
+        self.bodies
+            .first()
+            .and_then(|body| body.body.snapshot.precision_policy())
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn interference_report(
+        &self,
+    ) -> Option<&artificer_kernel::api::analysis::InterferenceReport> {
+        self.interference.as_ref()
+    }
+
     fn stage_body_boolean(&mut self, operation: BooleanOperation) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
@@ -9546,6 +10216,423 @@ impl KernelLabApp {
         }
         self.document_status = Some(self.boolean_operand_summary());
         true
+    }
+
+    /// The last interference study, pair by pair.
+    ///
+    /// The rows are ordered worst first: what overlaps, then what touches,
+    /// then the tightest gap. A study that has to be scrolled to find the
+    /// failure in is a study that failed to say anything.
+    fn interference_card(&mut self, ui: &mut egui::Ui) {
+        use artificer_kernel::api::interference::ClearanceState;
+
+        let Some(report) = self.interference.clone() else {
+            return;
+        };
+        // Under a fit, the headline is the fit's answer: a study that
+        // measured three clear pairs still fails if the fit wanted them
+        // held, and the card has to lead with that rather than with
+        // "clear".
+        let (colour, headline) = match report.profile.as_ref() {
+            Some(_) if report.failing > 0 => {
+                (theme::bad(), format!("{} too close", report.failing))
+            }
+            Some(_) if report.loose > 0 => (
+                theme::accent(),
+                format!("{} looser than needed", report.loose),
+            ),
+            Some(_) => (theme::good(), "Every pair fits".to_owned()),
+            None => match (report.interfering, report.touching) {
+                (0, 0) => (theme::good(), "Clear".to_owned()),
+                (0, touching) => (theme::accent(), format!("{touching} touching")),
+                (interfering, _) => (theme::bad(), format!("{interfering} interfering")),
+            },
+        };
+        status_line(ui, &headline, colour);
+        ui.label(
+            RichText::new(format!(
+                "{} pairs · {}",
+                report.pairs.len(),
+                if report.tier == artificer_protocol::Tier::Exact {
+                    "exact".to_owned()
+                } else {
+                    "within the chord budget".to_owned()
+                }
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+        ui.add_space(6.0);
+
+        // The fit is picked here rather than before the study, because
+        // choosing it re-reads the measurements this study already has
+        // instead of asking for new ones.
+        ui.label(RichText::new("Fit").small().color(theme::muted()));
+        let mut chosen: Option<Option<ClearanceProfile>> = None;
+        let selected = report
+            .profile
+            .as_ref()
+            .map_or("Measured range", |profile| profile.name.as_str())
+            .to_owned();
+        egui::ComboBox::from_id_salt("clearance_profile_picker")
+            .selected_text(selected)
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(report.profile.is_none(), "Measured range")
+                    .on_hover_text(
+                        "Measure without judging: the heat map ramps over the readings themselves.",
+                    )
+                    .clicked()
+                {
+                    chosen = Some(None);
+                }
+                for built_in in artificer_kernel::api::analysis::BUILT_IN_PROFILES {
+                    let held = report
+                        .profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.key == built_in.key);
+                    let window = built_in.maximum.map_or_else(
+                        || format!("{:.2} mm and over", built_in.minimum),
+                        |maximum| format!("{:.2}–{maximum:.2} mm", built_in.minimum),
+                    );
+                    if ui
+                        .selectable_label(held, format!("{}  ·  {window}", built_in.name))
+                        .on_hover_text(built_in.note)
+                        .clicked()
+                    {
+                        chosen = Some(Some(built_in.profile()));
+                    }
+                }
+            });
+        if let Some(profile) = chosen {
+            self.set_clearance_profile(profile);
+        }
+        if let Some(worst) = report.worst_fit() {
+            ui.label(
+                RichText::new(format!(
+                    "Worst: {} ↔ {} at {:.3} mm",
+                    worst.a, worst.b, worst.distance
+                ))
+                .small()
+                .color(theme::bad()),
+            );
+        }
+        ui.add_space(6.0);
+        self.sweep_controls(ui);
+
+        let mut pairs = report.pairs.clone();
+        pairs.sort_by(|left, right| {
+            let rank = |state: ClearanceState| match state {
+                ClearanceState::Interfering => 0,
+                ClearanceState::Touching => 1,
+                ClearanceState::Clear => 2,
+            };
+            rank(left.state)
+                .cmp(&rank(right.state))
+                .then(left.distance.total_cmp(&right.distance))
+        });
+        for pair in &pairs {
+            let (colour, reading) = match pair.state {
+                ClearanceState::Interfering => (
+                    theme::bad(),
+                    pair.overlap_volume.map_or_else(
+                        || {
+                            pair.overlap_unavailable.clone().map_or_else(
+                                || "overlaps".to_owned(),
+                                |code| format!("overlaps · {code}"),
+                            )
+                        },
+                        |volume| format!("overlaps {volume:.3} mm³"),
+                    ),
+                ),
+                ClearanceState::Touching => (theme::accent(), "touching".to_owned()),
+                ClearanceState::Clear => (theme::muted(), format!("{:.3} mm apart", pair.distance)),
+            };
+            // The verdict overrides the measurement's own colour, because
+            // under a fit it is the verdict that is being read.
+            let (colour, reading) = match pair.verdict {
+                Some(FitVerdict::TooClose) => (theme::bad(), format!("{reading} · too close")),
+                Some(FitVerdict::Pass) => (theme::good(), format!("{reading} · fits")),
+                Some(FitVerdict::Loose) => {
+                    (theme::accent(), format!("{reading} · looser than needed"))
+                }
+                None => (colour, reading),
+            };
+            ui.horizontal_top(|ui| {
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 3.0, colour);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} ↔ {}", pair.a, pair.b)).strong());
+                    ui.label(RichText::new(reading).small().color(theme::muted()));
+                });
+            });
+        }
+
+        ui.add_space(6.0);
+        // The table says which pairs fail; the heat map says where on the
+        // parts they fail. Both come from the same study, so the toggle sits
+        // with the table rather than in a menu somewhere else.
+        if let Some(heat_map) = self.heat_map.as_mut() {
+            let mut visible = heat_map.visible;
+            if ui
+                .checkbox(&mut visible, "Heat map")
+                .on_hover_text(
+                    "Paint every body by how close it comes to the others. \
+                     Magenta is a collision, red is tight, blue is clear.",
+                )
+                .changed()
+            {
+                heat_map.visible = visible;
+            }
+        }
+
+        ui.add_space(4.0);
+        if ui
+            .button("Dismiss")
+            .on_hover_text("Clear the study. Nothing in the document changes either way.")
+            .clicked()
+        {
+            self.interference = None;
+            self.heat_map = None;
+        }
+    }
+
+    /// The sweep: the same fit question asked of the whole motion rather
+    /// than of the pose the assembly happens to be in.
+    ///
+    /// It lives under the study because it answers with the same numbers
+    /// against the same profile. What it adds is the travel.
+    fn sweep_controls(&mut self, ui: &mut egui::Ui) {
+        if !self.animation_drives_joints() {
+            return;
+        }
+        ui.separator();
+        if let Some(running) = self.async_sweep.as_ref() {
+            let reached = running
+                .progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(running.total);
+            ui.add(
+                egui::ProgressBar::new(reached as f32 / running.total.max(1) as f32)
+                    .text(format!("Sweeping {reached} / {}", running.total)),
+            );
+            if ui
+                .button("Stop sweep")
+                .on_hover_text(
+                    "Keep what has been measured. The rest of the travel stays unmeasured, \
+                     and the report says so.",
+                )
+                .clicked()
+            {
+                self.cancel_interference_sweep();
+            }
+            return;
+        }
+        if ui
+            .button("Sweep the motion")
+            .on_hover_text(
+                "Drive every joint through its travel and measure each position, \
+                 stopping at the first collision. The heat map then shows the tightest \
+                 the mechanism ever gets at each point, not just where it is now.",
+            )
+            .clicked()
+        {
+            self.run_interference_sweep();
+        }
+        let Some(sweep) = self.sweep.as_ref() else {
+            return;
+        };
+        let (colour, headline) = match (sweep.collision.as_ref(), sweep.failing) {
+            (Some(collision), _) => (
+                theme::bad(),
+                format!(
+                    "Collision at step {} of {}: {} ↔ {}",
+                    collision.step + 1,
+                    sweep.steps_offered,
+                    collision.a,
+                    collision.b
+                ),
+            ),
+            (None, 0) if sweep.cancelled => (
+                theme::accent(),
+                format!(
+                    "Stopped after {} of {} positions",
+                    sweep.steps_measured, sweep.steps_offered
+                ),
+            ),
+            (None, 0) => (
+                theme::good(),
+                format!("The motion clears over {} positions", sweep.steps_measured),
+            ),
+            (None, failing) => (
+                theme::bad(),
+                format!("{failing} pairs too close over the motion"),
+            ),
+        };
+        ui.add_space(4.0);
+        status_line(ui, &headline, colour);
+        if let Some(tightest) = sweep.tightest() {
+            ui.label(
+                RichText::new(format!(
+                    "Closest {:.3} mm between {} and {}, at {:.1}°",
+                    tightest.distance,
+                    tightest.a,
+                    tightest.b,
+                    tightest
+                        .drivers
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0)
+                        .to_degrees()
+                ))
+                .small()
+                .color(theme::muted()),
+            );
+        }
+        if sweep.cancelled {
+            ui.label(
+                RichText::new("The positions it never reached are not cleared, only unmeasured.")
+                    .small()
+                    .color(theme::muted()),
+            );
+        }
+    }
+
+    /// The staged Boolean's operands, as the card shows them.
+    ///
+    /// Everything here is also reachable by clicking bodies in the viewport;
+    /// this is the surface that says what those clicks did, and the only one
+    /// that can name a target without making it active first.
+    fn boolean_operand_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(PendingOperation::BooleanBodies {
+            target, operation, ..
+        }) = self.pending_operation
+        else {
+            return;
+        };
+        let bodies = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| (body.id, body.ordinal))
+            .collect::<Vec<_>>();
+        let name = |ordinal: u32| format!("Body {ordinal}");
+        let target_name = bodies
+            .iter()
+            .find(|(id, _)| *id == target)
+            .map_or_else(|| "Body".to_owned(), |(_, ordinal)| name(*ordinal));
+
+        status_line(
+            ui,
+            match operation {
+                BooleanOperation::Union => "Join",
+                BooleanOperation::Difference => "Cut",
+                BooleanOperation::Intersection => "Intersect",
+            },
+            theme::accent(),
+        );
+        ui.add_space(4.0);
+
+        // The target survives the operation, so it is named first and on its
+        // own: every other body in the list is something being spent.
+        ui.label(RichText::new("Target · kept").small().color(theme::muted()));
+        let mut chosen_target = None;
+        egui::ComboBox::from_id_salt("boolean_target_picker")
+            .selected_text(target_name)
+            .width(ui.available_width() - 8.0)
+            .show_ui(ui, |ui| {
+                for (id, ordinal) in &bodies {
+                    if ui.selectable_label(*id == target, name(*ordinal)).clicked() {
+                        chosen_target = Some(*id);
+                    }
+                }
+            });
+        if let Some(chosen) = chosen_target {
+            self.set_boolean_target(chosen);
+        }
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(if self.boolean_keep_tools() {
+                "Tools · kept"
+            } else {
+                "Tools · consumed"
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        let mut toggled = None;
+        for (id, ordinal) in &bodies {
+            if *id == target {
+                continue;
+            }
+            let mut held = self.boolean_tools.contains(id);
+            if ui.checkbox(&mut held, name(*ordinal)).changed() {
+                toggled = Some(*id);
+            }
+        }
+        if let Some(body) = toggled {
+            self.toggle_boolean_tool(body);
+        }
+        if bodies.len() < 2 {
+            ui.label(
+                RichText::new("No other visible body to combine with.")
+                    .small()
+                    .color(theme::muted()),
+            );
+        }
+
+        ui.add_space(6.0);
+        let mut keep = self.boolean_keep_tools();
+        if ui
+            .checkbox(&mut keep, "Keep tool bodies after the operation")
+            .changed()
+        {
+            self.set_boolean_keep_tools(keep);
+        }
+
+        // The kernel refuses by name. Repeating that reason where the operands
+        // are picked is what turns a refusal into something the user can act
+        // on, rather than a sentence that scrolled past in the status line.
+        if let Attempt::Rejected { operation, error } = &self.last_attempt
+            && *operation == "Body Boolean"
+        {
+            ui.add_space(6.0);
+            let reason = error
+                .diagnostics
+                .first()
+                .map_or_else(|| error.message.clone(), |first| first.message.clone());
+            ui.label(RichText::new(reason).small().color(theme::bad()));
+        }
+    }
+
+    /// Whether the staged Boolean keeps its tool bodies.
+    fn boolean_keep_tools(&self) -> bool {
+        matches!(
+            self.pending_operation,
+            Some(PendingOperation::BooleanBodies {
+                keep_tools: true,
+                ..
+            })
+        )
+    }
+
+    /// Names a different body as the staged Boolean's target.
+    ///
+    /// A body cannot be both operands, so naming one that is already a tool
+    /// drops it from the tool set rather than refusing the pick.
+    fn set_boolean_target(&mut self, body: BodyId) {
+        let Some(PendingOperation::BooleanBodies { target, .. }) = self.pending_operation.as_mut()
+        else {
+            return;
+        };
+        if *target == body {
+            return;
+        }
+        *target = body;
+        self.boolean_tools.retain(|held| *held != body);
+        self.document_status = Some(self.boolean_operand_summary());
     }
 
     fn set_boolean_keep_tools(&mut self, keep: bool) {
@@ -9830,16 +10917,17 @@ impl KernelLabApp {
         };
         let body = self.bodies[index].id;
         let base_snapshot = self.bodies[index].body.snapshot.id();
-        let (target_face, frame) =
-            if matches!(preset, SolidFeaturePreset::Hole | SolidFeaturePreset::Rib) {
-                let Some(face) = self.selected_face else {
-                    self.document_status = Some("Select a planar face for Hole or Rib".to_owned());
-                    return;
-                };
-                let support = match NativeKernel::planar_face_support(
-                    &self.bodies[index].body.snapshot,
-                    face,
-                ) {
+        let (target_face, frame) = if matches!(
+            preset,
+            SolidFeaturePreset::Hole | SolidFeaturePreset::Rib | SolidFeaturePreset::HolePattern
+        ) {
+            let Some(face) = self.selected_face else {
+                self.document_status =
+                    Some("Select a planar face for Hole, Rib or Hole pattern".to_owned());
+                return;
+            };
+            let support =
+                match NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face) {
                     Ok(support) => support,
                     Err(error) => {
                         self.document_status =
@@ -9847,51 +10935,60 @@ impl KernelLabApp {
                         return;
                     }
                 };
-                (Some(face), Some(support.frame))
-            } else if matches!(
-                preset,
-                SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
-            ) {
-                self.apply_tangent_edge_chain();
-                let selected = self
-                    .selected_edges
-                    .iter()
-                    .copied()
-                    .filter(|selection| selection.body.get() == body.get())
-                    .collect::<Vec<_>>();
-                if selected.is_empty() || selected.len() != self.selected_edges.len() {
-                    self.document_status =
-                        Some("Select one or more edges on the active body".to_owned());
-                    return;
-                }
-                let support = self.edge_finish_selection_support();
-                self.document_status = Some(if support.can_commit() {
-                    "Edge-finish preview staged · confirm with Enter or the green tick".to_owned()
-                } else {
-                    format!("Preview staged · {}", support.detail())
-                });
-                // A fresh staging is a fresh attempt: the editor shows the last
-                // refusal for this preset, and it must not inherit one from
-                // an earlier, cancelled staging.
-                if matches!(
-                    &self.last_attempt,
-                    Attempt::Rejected { operation, .. } if *operation == preset.label()
-                ) {
-                    self.last_attempt = Attempt::NotRun;
-                }
-                (Some(selected[0].edge), None)
-            } else if preset == SolidFeaturePreset::Mirror {
-                let (plane_frame, plane_name) = self.browser_mirror_plane();
-                let target_count = self.browser_selected_body_indices().len().max(1);
-                self.document_status = Some(if target_count > 1 {
-                    format!("Mirror staged across {plane_name} for {target_count} bodies")
-                } else {
-                    format!("Mirror staged across {plane_name}")
-                });
-                (None, Some(plane_frame))
+            (Some(face), Some(support.frame))
+        } else if matches!(
+            preset,
+            SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
+        ) {
+            self.apply_tangent_edge_chain();
+            let selected = self
+                .selected_edges
+                .iter()
+                .copied()
+                .filter(|selection| selection.body.get() == body.get())
+                .collect::<Vec<_>>();
+            if selected.is_empty() || selected.len() != self.selected_edges.len() {
+                self.document_status =
+                    Some("Select one or more edges on the active body".to_owned());
+                return;
+            }
+            let support = self.edge_finish_selection_support();
+            self.document_status = Some(if support.can_commit() {
+                "Edge-finish preview staged · confirm with Enter or the green tick".to_owned()
             } else {
-                (None, None)
-            };
+                format!("Preview staged · {}", support.detail())
+            });
+            // A fresh staging is a fresh attempt: the editor shows the last
+            // refusal for this preset, and it must not inherit one from
+            // an earlier, cancelled staging.
+            if matches!(
+                &self.last_attempt,
+                Attempt::Rejected { operation, .. } if *operation == preset.label()
+            ) {
+                self.last_attempt = Attempt::NotRun;
+            }
+            (Some(selected[0].edge), None)
+        } else if preset == SolidFeaturePreset::Shell {
+            // The selected face is the one the shell opens. With none
+            // selected the body hollows closed, around a void.
+            self.document_status = Some(if self.selected_face.is_some() {
+                "Shell staged, open at the selected face".to_owned()
+            } else {
+                "Shell staged closed · select a face first to open one".to_owned()
+            });
+            (self.selected_face, None)
+        } else if preset == SolidFeaturePreset::Mirror {
+            let (plane_frame, plane_name) = self.browser_mirror_plane();
+            let target_count = self.browser_selected_body_indices().len().max(1);
+            self.document_status = Some(if target_count > 1 {
+                format!("Mirror staged across {plane_name} for {target_count} bodies")
+            } else {
+                format!("Mirror staged across {plane_name}")
+            });
+            (None, Some(plane_frame))
+        } else {
+            (None, None)
+        };
         self.pending_operation = Some(PendingOperation::PresetFeature {
             preset,
             base_snapshot,
@@ -10048,6 +11145,54 @@ impl KernelLabApp {
                 diameter: 1.0,
                 depth: 1_000.0,
             },
+            SolidFeaturePreset::HolePattern => {
+                // Every instance is the same circle at a placement of its
+                // own, and one profile carries them all, so the ring is a
+                // single exact face cut rather than six cuts in a row.
+                let target_face = target_face.expect("staged hole pattern face");
+                let frame = frame.expect("staged hole pattern frame");
+                let reach = NativeKernel::planar_face_support(&input, target_face)
+                    .ok()
+                    .and_then(|support| {
+                        support
+                            .boundary
+                            .iter()
+                            .map(|point| point.x.abs().min(point.y.abs()))
+                            .fold(None, |smallest: Option<f64>, value| {
+                                Some(smallest.map_or(value, |current| current.min(value)))
+                            })
+                    })
+                    .filter(|reach| reach.is_finite() && *reach > 0.0)
+                    .unwrap_or(1.0);
+                let pitch = reach * 0.55;
+                let radius = (pitch * 0.4).min(0.5);
+                let regions = (0..HOLE_PATTERN_COUNT)
+                    .map(|instance| {
+                        let angle = std::f64::consts::TAU * f64::from(instance)
+                            / f64::from(HOLE_PATTERN_COUNT);
+                        PlanarRegion2 {
+                            outer: PlanarLoop2 {
+                                curves: vec![PlanarCurve2::Circle {
+                                    center: ProtocolPoint2::new(
+                                        pitch * angle.cos(),
+                                        pitch * angle.sin(),
+                                    ),
+                                    radius,
+                                    direction: ArcDirection::CounterClockwise,
+                                }],
+                            },
+                            holes: Vec::new(),
+                        }
+                    })
+                    .collect();
+                KernelCommand::ExtrudeFacePlanarProfile {
+                    target_face,
+                    frame,
+                    profile: PlanarProfile2 { regions },
+                    distance: 1_000.0,
+                    operation: FaceExtrusionOperation::Cut,
+                }
+            }
             SolidFeaturePreset::Rib => KernelCommand::AddRib {
                 target_face: target_face.expect("staged rib face"),
                 frame: frame.expect("staged rib frame"),
@@ -10063,6 +11208,20 @@ impl KernelLabApp {
                 KernelCommand::MirrorSnapshot {
                     plane_origin,
                     plane_normal,
+                }
+            }
+            SolidFeaturePreset::Shell => {
+                // A tenth of the body's smallest side leaves a wall that
+                // fits whatever was staged, and the editor tunes it.
+                let wall = input.measures().bounds.map_or(1.0, |bounds| {
+                    let smallest = (bounds.max.x - bounds.min.x)
+                        .min(bounds.max.y - bounds.min.y)
+                        .min(bounds.max.z - bounds.min.z);
+                    (smallest * 0.1).max(1.0e-3)
+                });
+                KernelCommand::ShellSnapshot {
+                    open_faces: target_face.into_iter().collect(),
+                    wall,
                 }
             }
             SolidFeaturePreset::LinearPattern => {
@@ -10137,6 +11296,7 @@ impl KernelLabApp {
             SolidFeaturePreset::Revolve => FeatureKind::BaseBody,
             SolidFeaturePreset::Hole => FeatureKind::Cut,
             SolidFeaturePreset::Rib => FeatureKind::Add,
+            SolidFeaturePreset::HolePattern | SolidFeaturePreset::Shell => FeatureKind::Cut,
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
             | SolidFeaturePreset::Chamfer
@@ -10216,7 +11376,9 @@ impl KernelLabApp {
                 existing.body = displayed.clone();
                 existing.last_feature = appended.feature;
                 existing.kind = match preset {
-                    SolidFeaturePreset::Hole => ModelBodyKind::CutPocket,
+                    SolidFeaturePreset::Hole | SolidFeaturePreset::HolePattern => {
+                        ModelBodyKind::CutPocket
+                    }
                     SolidFeaturePreset::Rib => ModelBodyKind::AddedBoss,
                     _ => ModelBodyKind::Boolean,
                 };
@@ -10265,6 +11427,112 @@ impl KernelLabApp {
             operation: preset.label(),
         };
         self.document_status = Some(format!("{} committed", preset.label()));
+    }
+
+    /// Every revolute joint that can be driven, in document order, with the
+    /// range it is allowed to turn through.
+    ///
+    /// A disabled joint is left out: it is still a structural edge, so its
+    /// child follows its parent, but it has no coordinate to set.
+    #[must_use]
+    pub fn drivable_joints(&self) -> Vec<DrivableJoint> {
+        self.document
+            .joints()
+            .iter()
+            .filter(|joint| joint.enabled)
+            .filter_map(|joint| match joint.kind {
+                JointKind::Revolute { limits, .. } => Some(DrivableJoint {
+                    id: joint.id,
+                    name: joint.name.clone(),
+                    limits: limits.map(|limits| (limits.min_radians(), limits.max_radians())),
+                }),
+                JointKind::Fixed => None,
+            })
+            .collect()
+    }
+
+    /// The angle one joint is held at.
+    #[must_use]
+    pub fn joint_angle(&self, joint: JointId) -> f64 {
+        self.joint_drivers.get(&joint).copied().unwrap_or(0.0)
+    }
+
+    /// Holds one joint at an angle, inside its own limits.
+    ///
+    /// The slider cannot leave the range, so this clamps rather than
+    /// refusing: a control that silently did nothing at its own end stop
+    /// would read as broken. The solver still refuses an out-of-range
+    /// driver, which is the guard for callers that are not a slider.
+    pub fn set_joint_angle(&mut self, joint: JointId, radians: f64) {
+        if !radians.is_finite() {
+            return;
+        }
+        let Some(record) = self.document.joint(joint) else {
+            return;
+        };
+        let JointKind::Revolute { limits, .. } = record.kind else {
+            return;
+        };
+        let name = record.name.clone();
+        let radians = limits.map_or(radians, |limits| {
+            radians.clamp(limits.min_radians(), limits.max_radians())
+        });
+        self.joint_drivers.insert(joint, radians);
+        self.refresh_kinematics();
+        self.document_status = Some(format!("{name} at {:.1}°", radians.to_degrees()));
+    }
+
+    /// Re-poses every component from the joints and the current drivers.
+    ///
+    /// Once a frame, because a pose cached against edits goes stale the
+    /// moment a joint is added, removed or disabled, and a stale pose is a
+    /// part drawn somewhere it is not. A document with a handful of
+    /// components costs a handful of quaternion products.
+    fn refresh_kinematics(&mut self) {
+        let drivers = self
+            .drivable_joints()
+            .into_iter()
+            .map(|joint| {
+                let angle = self.animated_joint_angle(joint.id, joint.limits);
+                JointDriver::new(joint.id, angle)
+            })
+            .collect::<Vec<_>>();
+        // A document whose joints cannot be solved keeps the poses it was
+        // assembled at rather than throwing parts across the workspace.
+        self.kinematics = kinematics::solve(&self.document, &drivers).unwrap_or_default();
+    }
+
+    /// The angle a joint is at this frame: what the user set it to, or,
+    /// while the animation is playing, a sweep through its own range.
+    ///
+    /// This is what replaces the turntable on a document that has a
+    /// mechanism. A joint with limits swings between them and back; one
+    /// without turns continuously, because that is what an unlimited
+    /// revolute joint does.
+    fn animated_joint_angle(&self, joint: JointId, limits: Option<(f64, f64)>) -> f64 {
+        if !self.animation_holds_joints() {
+            return self.joint_angle(joint);
+        }
+        swept_angle(self.motion.phase, limits)
+    }
+
+    /// Whether the animation drives a mechanism rather than spinning the
+    /// active body on the spot.
+    #[must_use]
+    pub fn animation_drives_joints(&self) -> bool {
+        !self.drivable_joints().is_empty()
+    }
+
+    /// Whether the animation, rather than the sliders, is saying where the
+    /// joints are.
+    ///
+    /// A scrubbed phase counts as much as a playing one: the phase is a
+    /// position in the motion whether it is moving or held, and a mechanism
+    /// cannot be in two configurations at once. Pausing returns the phase
+    /// to zero, which hands the joints back to their coordinates.
+    #[must_use]
+    pub fn animation_holds_joints(&self) -> bool {
+        self.animation_drives_joints() && (self.motion.playing || self.motion.phase != 0.0)
     }
 
     fn advance_motion(&mut self, context: &egui::Context) {
@@ -10771,15 +12039,37 @@ impl KernelLabApp {
                     .on_hover_text("Choose where to write an STL of the visible bodies")
                     .clicked()
                 {
-                    self.open_export_dialog(ExportSubject::Document { step: false });
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::Stl,
+                    });
                     ui.close();
                 }
                 if ui
-                    .add_enabled(!operation_pending, egui::Button::new("Export as STEP…"))
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Export as STEP (exact B-rep)…"),
+                    )
+                    .on_hover_text(
+                        "Choose where to write the visible bodies as exact analytic B-rep: every face and curve as itself, nothing tessellated",
+                    )
+                    .clicked()
+                {
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::StepExact,
+                    });
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Export as STEP (faceted)…"),
+                    )
                     .on_hover_text("Choose where to write a faceted STEP of the visible bodies")
                     .clicked()
                 {
-                    self.open_export_dialog(ExportSubject::Document { step: true });
+                    self.open_export_dialog(ExportSubject::Document {
+                        format: BodyExport::StepFaceted,
+                    });
                     ui.close();
                 }
                 ui.separator();
@@ -11289,7 +12579,62 @@ impl KernelLabApp {
         if !self.bodies.iter().any(|body| body.ordinal == ordinal) {
             return;
         }
-        self.open_export_dialog(ExportSubject::Body { ordinal, step });
+        // STEP from a body's own row is the exact B-rep; the faceted
+        // variant is a document-level choice for mesh consumers.
+        let format = if step {
+            BodyExport::StepExact
+        } else {
+            BodyExport::Stl
+        };
+        self.open_export_dialog(ExportSubject::Body { ordinal, format });
+    }
+
+    /// Writes the bodies `include` admits as exact STEP, each in its
+    /// occurrence's position.
+    fn export_exact_step_to_path(
+        &self,
+        path: &Path,
+        include: impl Fn(&WorkbenchBody) -> bool,
+    ) -> Result<(), String> {
+        let bodies: Vec<(&Snapshot, String, StepPlacement)> = self
+            .bodies
+            .iter()
+            .filter(|body| include(body))
+            .map(|body| {
+                let placement = self.occurrence_transform_for_body(body.id);
+                let origin = placement.transform_point(Point3::new(0.0, 0.0, 0.0));
+                let image = |x: f64, y: f64, z: f64| {
+                    let point = placement.transform_point(Point3::new(x, y, z));
+                    [point.x - origin.x, point.y - origin.y, point.z - origin.z]
+                };
+                (
+                    &body.body.snapshot,
+                    format!("Body {}", body.ordinal),
+                    StepPlacement {
+                        columns: [
+                            image(1.0, 0.0, 0.0),
+                            image(0.0, 1.0, 0.0),
+                            image(0.0, 0.0, 1.0),
+                        ],
+                        translation: [origin.x, origin.y, origin.z],
+                    },
+                )
+            })
+            .collect();
+        if bodies.is_empty() {
+            return Err("no body to export".into());
+        }
+        let placed: Vec<(&Snapshot, &str, StepPlacement)> = bodies
+            .iter()
+            .map(|(snapshot, name, placement)| (*snapshot, name.as_str(), *placement))
+            .collect();
+        let product = self
+            .document_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("Artificer");
+        let text = export_step_bodies_placed(&placed, product).map_err(|error| error.message)?;
+        export::atomic_write(path, text.as_bytes())
     }
 
     /// Opens the Export dialog on a chosen destination.
@@ -11326,32 +12671,36 @@ impl KernelLabApp {
             return;
         }
         let written = match subject {
-            ExportSubject::Body { ordinal, step } => {
+            ExportSubject::Body { ordinal, format } => {
                 let body_id = self
                     .bodies
                     .iter()
                     .find(|body| body.ordinal == ordinal)
                     .map(|body| body.id);
                 match body_id {
-                    Some(body_id) => {
-                        let triangles = self.export_triangles_for(|body| body.id == body_id);
-                        if step {
-                            write_faceted_step(&path, &triangles)
-                        } else {
-                            write_ascii_stl(&path, &triangles)
+                    Some(body_id) => match format {
+                        BodyExport::StepExact => {
+                            self.export_exact_step_to_path(&path, |body| body.id == body_id)
                         }
-                    }
+                        BodyExport::StepFaceted => write_faceted_step(
+                            &path,
+                            &self.export_triangles_for(|body| body.id == body_id),
+                        ),
+                        BodyExport::Stl => write_ascii_stl(
+                            &path,
+                            &self.export_triangles_for(|body| body.id == body_id),
+                        ),
+                    },
                     None => Err("that body is no longer in the document".into()),
                 }
             }
-            ExportSubject::Document { step } => {
-                let triangles = self.committed_export_triangles();
-                if step {
-                    write_faceted_step(&path, &triangles)
-                } else {
-                    write_ascii_stl(&path, &triangles)
+            ExportSubject::Document { format } => match format {
+                BodyExport::StepExact => self.export_exact_step_to_path(&path, |body| body.visible),
+                BodyExport::StepFaceted => {
+                    write_faceted_step(&path, &self.committed_export_triangles())
                 }
-            }
+                BodyExport::Stl => write_ascii_stl(&path, &self.committed_export_triangles()),
+            },
             ExportSubject::Sketch { index, .. } => match self.sketch_export_curves(index) {
                 Some(curves) => export::write_sketch_dxf(&path, &curves),
                 None => Err("that sketch is no longer in the document".into()),
@@ -12099,20 +13448,47 @@ impl KernelLabApp {
                             .desired_width(f32::INFINITY),
                     );
                     let step_path = PathBuf::from(self.step_export_path_text.trim());
-                    if ui
-                        .add_enabled(!operation_pending, egui::Button::new("Export faceted STEP"))
-                        .clicked()
-                    {
-                        self.document_status = Some(
-                            self.export_step_to_path(&step_path).map_or_else(
-                                |error| format!("STEP export failed: {error}"),
-                                |()| format!("Exported faceted STEP to {}", step_path.display()),
-                            ),
-                        );
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !operation_pending,
+                                egui::Button::new("Export STEP (exact B-rep)"),
+                            )
+                            .clicked()
+                        {
+                            self.document_status = Some(
+                                self.export_exact_step_to_path(&step_path, |body| body.visible)
+                                    .map_or_else(
+                                        |error| format!("STEP export failed: {error}"),
+                                        |()| {
+                                            format!(
+                                                "Exported exact STEP to {}",
+                                                step_path.display()
+                                            )
+                                        },
+                                    ),
+                            );
+                        }
+                        if ui
+                            .add_enabled(
+                                !operation_pending,
+                                egui::Button::new("Export STEP (faceted)"),
+                            )
+                            .clicked()
+                        {
+                            self.document_status = Some(
+                                self.export_step_to_path(&step_path).map_or_else(
+                                    |error| format!("STEP export failed: {error}"),
+                                    |()| {
+                                        format!("Exported faceted STEP to {}", step_path.display())
+                                    },
+                                ),
+                            );
+                        }
+                    });
                     ui.label(
                         RichText::new(
-                            "STL and this first STEP exporter use the committed visible tessellation in millimetres; previews are never exported.",
+                            "Exact STEP writes every analytic face and curve as itself; STL and faceted STEP use the committed visible tessellation. All in millimetres; previews are never exported.",
                         )
                         .small()
                         .color(theme::muted()),
@@ -12149,6 +13525,9 @@ impl KernelLabApp {
         }
         if self.pending_operation.is_some() {
             return Some(ContextualSubject::PendingOperation);
+        }
+        if self.interference.is_some() {
+            return Some(ContextualSubject::Interference);
         }
         // A ready sketch, or a selected face that can be pushed and pulled, is
         // a feature waiting to happen. Its controls used to live in a separate
@@ -13787,6 +15166,29 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::Interference) && self.interference.is_some() {
+                    card(ui, "interference_study", "INTERFERENCE", &mut |ui| {
+                        self.interference_card(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                // A Boolean's operands used to be nowhere but the status line:
+                // the card asked for a confirmation without showing what was
+                // about to be combined. Naming them here is what makes the
+                // gate answerable.
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(
+                        self.pending_operation,
+                        Some(PendingOperation::BooleanBodies { .. })
+                    )
+                {
+                    card(ui, "boolean_operands", "OPERANDS", &mut |ui| {
+                        self.boolean_operand_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 // A staged transform's inputs used to live only on the gizmo,
                 // which left its card with a title, a lot of nothing, and a
                 // tick. "How far have I moved this" is the question the user
@@ -14434,6 +15836,56 @@ impl KernelLabApp {
                 }
             });
         });
+        self.joint_controls(ui);
+    }
+
+    /// One coordinate per drivable joint, and what the animation does with
+    /// them.
+    ///
+    /// This is the mechanism's own control. A document with no joints has
+    /// nothing here and keeps the turntable, which is the only thing there
+    /// is to animate when nothing is jointed.
+    fn joint_controls(&mut self, ui: &mut egui::Ui) {
+        let joints = self.drivable_joints();
+        if joints.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new("JOINTS").small().color(theme::muted()));
+        let animated = self.animation_holds_joints();
+        ui.label(
+            RichText::new(if animated {
+                "The animation is posing these. Reset the phase to take them back."
+            } else {
+                "Drag to pose the mechanism. Every part below a joint follows it."
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        let mut change = None;
+        for joint in &joints {
+            let (min, max) = joint
+                .limits
+                .unwrap_or((-std::f64::consts::PI, std::f64::consts::PI));
+            let mut degrees = self
+                .animated_joint_angle(joint.id, joint.limits)
+                .to_degrees();
+            let slider = ui.add_enabled(
+                !animated,
+                egui::Slider::new(&mut degrees, min.to_degrees()..=max.to_degrees())
+                    .text(&joint.name)
+                    .suffix("°"),
+            );
+            if slider.changed() {
+                change = Some((joint.id, degrees.to_radians()));
+            }
+            if joint.limits.is_none() {
+                slider.on_hover_text("This joint has no limits: the range shown is one turn.");
+            }
+        }
+        if let Some((joint, radians)) = change {
+            self.set_joint_angle(joint, radians);
+        }
     }
 
     fn transform_controls(&mut self, ui: &mut egui::Ui, scope: TransformControlsScope) {
@@ -15274,6 +16726,12 @@ impl KernelLabApp {
             egui::vec2((available.x - 14.0).max(1.0), (available.y - 14.0).max(1.0));
         self.last_model_viewport_size = Some(viewport_size);
         self.refresh_display_detail_buckets(viewport_size);
+        // The body instances borrow the heat map's readings for as long as
+        // the viewport is drawing them, and the viewport also writes the
+        // camera back. Lifting the readings out of the document for the
+        // duration is what lets both be true at once.
+        let heat_map = self.heat_map.take();
+        let drives_joints = self.animation_drives_joints();
 
         let frame_output = Frame::new()
             .fill(theme::viewport_bottom())
@@ -15333,6 +16791,9 @@ impl KernelLabApp {
                                         .map(|found| found.colour)
                                 },
                             )
+                            .with_field(heat_map.as_ref().and_then(|heat_map| {
+                                heat_map.field_for(body.id, scene.triangles.len() * 3)
+                            }))
                             .with_base_transform(self.occurrence_transform_for_body(body.id)),
                         )
                     })
@@ -15391,7 +16852,15 @@ impl KernelLabApp {
                         self.active_tool,
                         &mut self.display_transform,
                         &mut self.view,
-                        self.motion.phase,
+                        // On a document with a mechanism the phase drives
+                        // the joints instead, and spinning the active body
+                        // on top of that would be two motions at once. The
+                        // turntable is what a document with no joints gets.
+                        if drives_joints {
+                            0.0
+                        } else {
+                            self.motion.phase
+                        },
                         feature_preview.as_ref(),
                         &sketch_overlays,
                         &selected_sketch_regions,
@@ -15558,6 +17027,7 @@ impl KernelLabApp {
                     }
                 }
             });
+        self.heat_map = heat_map;
         self.model_canvas_overlay(ui, frame_output.response.rect.shrink(7.0));
         self.sync_transform_preview();
     }
@@ -16271,9 +17741,11 @@ impl eframe::App for KernelLabApp {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.updates.poll(context);
         self.poll_async_sketch_extrusion_commit(context);
+        self.poll_async_sweep(context);
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }
+        self.refresh_kinematics();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -23019,6 +24491,346 @@ mod extrusion_workbench_tests {
             let volume = app.displayed_measures().unwrap().volume;
             assert_eq!(volume > 24.0, adds_material, "{preset:?}: {volume}");
         }
+    }
+
+    #[test]
+    fn an_interference_study_measures_every_visible_pair_without_touching_the_document() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+        let before = app.document.features().len();
+        let digests = app
+            .bodies
+            .iter()
+            .map(|body| body.body.snapshot.semantic_digest())
+            .collect::<Vec<_>>();
+
+        app.run_interference_study();
+        let report = app.interference_report().expect("a study").clone();
+        assert_eq!(report.pairs.len(), 1, "two bodies make one pair");
+        assert_eq!(report.subjects.len(), 2);
+        assert_eq!(
+            report.interfering + report.touching + report.clear,
+            report.pairs.len()
+        );
+
+        // A study is a reading: no feature, no new snapshot, nothing moved.
+        assert_eq!(app.document.features().len(), before);
+        assert_eq!(
+            app.bodies
+                .iter()
+                .map(|body| body.body.snapshot.semantic_digest())
+                .collect::<Vec<_>>(),
+            digests
+        );
+
+        // One body is not a comparison.
+        app.bodies[1].visible = false;
+        app.run_interference_study();
+        assert!(app.interference_report().is_none());
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("two visible bodies")),
+            "{:?}",
+            app.document_status
+        );
+    }
+
+    #[test]
+    fn a_study_leaves_a_heat_map_bound_to_the_facets_it_was_measured_on() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2);
+
+        app.run_interference_study();
+        let heat_map = app.heat_map.as_ref().expect("a heat map");
+        assert!(heat_map.visible, "the picture arrives with the study");
+        assert_eq!(heat_map.fields.len(), app.bodies.len());
+        for body in &app.bodies {
+            let samples = body.body.scene.triangles.len() * 3;
+            let field = heat_map
+                .field_for(body.id, samples)
+                .expect("a field for every visible body");
+            assert_eq!(field.values.len(), samples);
+            assert!(
+                field.values.iter().all(|value| !value.is_nan()),
+                "every corner was measured"
+            );
+            // A field is bound to the tessellation it was measured on: ask
+            // for a different one and there is no reading.
+            assert!(heat_map.field_for(body.id, samples + 3).is_none());
+        }
+
+        // The ramp is derived from the readings, so it spans a real gap.
+        match heat_map.palette {
+            viewport::HeatPalette::Gradient { near, far } => {
+                assert_eq!(near, 0.0);
+                assert!(far > 0.0 && far.is_finite(), "ramp to {far}");
+            }
+            other => panic!("a study opens on the measured ramp, not {other:?}"),
+        }
+
+        // Turning it off keeps the study and stops the painting; a second
+        // study respects that choice and moves the epoch on.
+        let first_epoch = heat_map.epoch;
+        app.heat_map.as_mut().expect("a heat map").visible = false;
+        app.run_interference_study();
+        let heat_map = app.heat_map.as_ref().expect("a heat map");
+        assert!(!heat_map.visible, "the toggle survives the next study");
+        assert!(heat_map.epoch > first_epoch, "a new study is a new upload");
+        assert!(
+            heat_map
+                .field_for(
+                    app.bodies[0].id,
+                    app.bodies[0].body.scene.triangles.len() * 3
+                )
+                .is_none(),
+            "a hidden heat map paints nothing"
+        );
+
+        // Dismissing the study takes the picture with it.
+        app.interference = None;
+        app.heat_map = None;
+        app.run_interference_study();
+        assert!(app.heat_map.is_some(), "a fresh study builds a fresh map");
+    }
+
+    #[test]
+    fn a_fit_judges_the_study_that_is_already_measured_and_repaints_it() {
+        let mut app = KernelLabApp::default();
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.run_interference_study();
+
+        // A study with no fit measures and does not judge, and its heat map
+        // ramps over the readings rather than against a window.
+        let report = app.interference_report().expect("a study");
+        assert!(report.profile.is_none());
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+        assert!(matches!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Gradient { .. }
+        ));
+
+        let press = artificer_kernel::api::analysis::built_in_profile("fdm-press")
+            .expect("a shipped profile");
+        let measured = app
+            .interference_report()
+            .expect("a study")
+            .pairs
+            .iter()
+            .map(|pair| pair.distance)
+            .collect::<Vec<_>>();
+        app.set_clearance_profile(Some(press.clone()));
+
+        // Nothing was measured again: the same numbers, now with verdicts.
+        let report = app.interference_report().expect("a study");
+        assert_eq!(
+            report
+                .pairs
+                .iter()
+                .map(|pair| pair.distance)
+                .collect::<Vec<_>>(),
+            measured,
+            "choosing a fit re-reads the study, it does not re-run it"
+        );
+        assert_eq!(report.profile.as_ref(), Some(&press));
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_some()));
+        assert_eq!(
+            report.failing
+                + report.loose
+                + report
+                    .pairs
+                    .iter()
+                    .filter(|pair| pair.verdict == Some(FitVerdict::Pass))
+                    .count(),
+            report.pairs.len(),
+            "every pair earns exactly one verdict"
+        );
+
+        // And the heat map now paints the fit's own window, so green on the
+        // model means the same thing as "fits" in the table.
+        assert_eq!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Window {
+                minimum: 0.10,
+                maximum: 0.20,
+            }
+        );
+
+        // The choice outlives the study and is applied to the next one.
+        app.run_interference_study();
+        assert_eq!(
+            app.interference_report().expect("a study").profile.as_ref(),
+            Some(&press)
+        );
+
+        // Withdrawing it leaves the measurements and takes back the window.
+        app.set_clearance_profile(None);
+        let report = app.interference_report().expect("a study");
+        assert!(report.profile.is_none());
+        assert_eq!(report.failing, 0);
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_none()));
+        assert!(matches!(
+            app.heat_map.as_ref().expect("a heat map").palette,
+            viewport::HeatPalette::Gradient { .. }
+        ));
+    }
+
+    #[test]
+    fn a_fit_can_be_chosen_before_any_study_and_judges_the_first_one() {
+        let mut app = KernelLabApp::default();
+        app.set_clearance_profile(artificer_kernel::api::analysis::built_in_profile(
+            "assembly",
+        ));
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("next study")),
+            "{:?}",
+            app.document_status
+        );
+
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.run_interference_study();
+        let report = app.interference_report().expect("a study");
+        assert_eq!(
+            report.profile.as_ref().map(|profile| profile.key.as_str()),
+            Some("assembly")
+        );
+        assert!(report.pairs.iter().all(|pair| pair.verdict.is_some()));
+        // An assembly check has no upper complaint, so nothing is loose.
+        assert_eq!(report.loose, 0);
+    }
+
+    #[test]
+    fn the_boolean_card_names_both_operands_and_keeps_tools_on_request() {
+        let mut app = KernelLabApp::default();
+        // Two bodies: the bootstrap cuboid and a second one from a revolve.
+        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.bodies.len(), 2, "two bodies to combine");
+        let target = app.active_body_id().expect("an active body");
+        let other = app
+            .bodies
+            .iter()
+            .map(|body| body.id)
+            .find(|id| *id != target)
+            .expect("a second body");
+
+        app.stage_body_boolean(BooleanOperation::Union);
+        // Staging names no tool on purpose, so the gate cannot fire yet.
+        assert!(app.boolean_tools.is_empty());
+        assert!(!app.boolean_keep_tools());
+
+        // The panel can name a target that is not the active body, and doing
+        // so cannot leave the same body on both sides.
+        app.toggle_boolean_tool(other);
+        assert_eq!(app.boolean_tools, vec![other]);
+        app.set_boolean_target(other);
+        assert!(
+            app.boolean_tools.is_empty(),
+            "the new target drops out of the tool set"
+        );
+        app.set_boolean_target(target);
+        app.toggle_boolean_tool(other);
+
+        app.set_boolean_keep_tools(true);
+        assert!(app.boolean_keep_tools());
+        let before = app.bodies.len();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(
+            app.bodies.len(),
+            before,
+            "a kept tool stays in the document"
+        );
+    }
+
+    #[test]
+    fn the_ribbon_shells_the_active_body_open_at_the_selected_face() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::Shell);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let after = app.displayed_measures().unwrap();
+        assert!(
+            after.volume < before - 1.0e-9,
+            "a shell removes material: {before} then {} ({:?})",
+            after.volume,
+            app.document_status
+        );
+        let feature = app.selected_history_feature.expect("the shell is selected");
+        let scalars = app.selected_feature_scalars();
+        assert_eq!(
+            scalars.iter().map(|s| s.label).collect::<Vec<_>>(),
+            vec!["Wall"]
+        );
+
+        // The wall is parametric: a thicker one leaves more material.
+        let thicker = scalars[0].value * 1.5;
+        assert!(
+            app.edit_feature_scalar(feature, 0, thicker),
+            "{:?}",
+            app.document_status
+        );
+        assert!(
+            app.displayed_measures().unwrap().volume > after.volume + 1.0e-9,
+            "a thicker wall leaves more behind"
+        );
+    }
+
+    #[test]
+    fn the_ribbon_shells_a_body_closed_when_no_face_is_selected() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = None;
+        app.stage_preset_feature(SolidFeaturePreset::Shell);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let displayed = app.displayed.as_ref().expect("a body");
+        assert_eq!(
+            displayed.snapshot.counts().shells,
+            2,
+            "a closed shell keeps a void"
+        );
+        assert!(app.displayed_measures().unwrap().volume < before - 1.0e-9);
+    }
+
+    #[test]
+    fn the_ribbon_cuts_a_ring_of_holes_on_the_selected_face() {
+        let mut app = KernelLabApp::default();
+        let before = app.displayed_measures().unwrap().volume;
+        app.selected_face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.triangles.first())
+            .map(|triangle| triangle.source_face);
+        app.stage_preset_feature(SolidFeaturePreset::HolePattern);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let displayed = app.displayed.as_ref().expect("a body");
+        let counts = displayed.snapshot.counts();
+        assert_eq!(counts.solids, 1);
+        assert!(
+            app.displayed_measures().unwrap().volume < before - 1.0e-9,
+            "six holes remove material"
+        );
+        // Every instance is exact: the cut names the prism rung, not the
+        // faceted one, and carries no approximation warning.
+        let rung = displayed.report.rung.as_deref().unwrap_or_default();
+        assert!(!rung.ends_with("/faceted"), "{rung}");
+        assert!(
+            displayed.report.warnings.is_empty(),
+            "{:?}",
+            displayed.report.warnings
+        );
     }
 
     #[test]

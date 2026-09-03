@@ -47,7 +47,12 @@ pub enum SketchPlane {
     XY,
     XZ,
     YZ,
-    OnFace(EntitySelector),
+    /// A face of the current body. The selector sits under its own key:
+    /// it carries a `type` tag of its own, which the plane's tag would
+    /// otherwise collide with on the wire.
+    OnFace {
+        face: EntitySelector,
+    },
 }
 
 /// A 2D geometric entity in a sketch.
@@ -88,6 +93,39 @@ pub enum SketchConstraint {
     EqualLength,
     Tangent,
     Fixed,
+}
+
+/// Where a feature pattern puts its instances. `count` is the total
+/// including the original.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PatternPlacement {
+    /// Instances every `spacing` along `direction`, which must lie in the
+    /// feature's face.
+    Linear {
+        direction: Vector3,
+        spacing: f64,
+        count: u16,
+    },
+    /// Instances turned about an axis normal to the feature's face, every
+    /// `angle_step_degrees` (a full turn shared equally when zero).
+    Circular {
+        axis_origin: Point3,
+        axis_direction: Vector3,
+        count: u16,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        angle_step_degrees: f64,
+    },
+}
+
+impl PatternPlacement {
+    /// The total number of instances, the original included.
+    #[must_use]
+    pub const fn count(&self) -> u16 {
+        match self {
+            Self::Linear { count, .. } | Self::Circular { count, .. } => *count,
+        }
+    }
 }
 
 /// Commands for geometry operations.
@@ -169,6 +207,24 @@ pub enum ApiCommand {
         spacing: f64,
         count: u16,
     },
+    /// Repeats an earlier feature, a drilled hole or an extrusion from a
+    /// sketch on a face, at rigid placements on the same face: a row or a
+    /// circular array. Each instance is the same exact feature replayed,
+    /// committed as the step `<label>/<n>`.
+    FeaturePattern {
+        label: String,
+        /// The step to repeat.
+        step: StepLabel,
+        placement: PatternPlacement,
+    },
+    /// Hollows the current body to one uniform wall, open at the given
+    /// faces: one cap, two opposite caps, or none for a closed hollow.
+    Shell {
+        label: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        open: Vec<EntitySelector>,
+        wall: f64,
+    },
     BooleanUnion {
         label: String,
         target: StepLabel,
@@ -187,6 +243,30 @@ pub enum ApiCommand {
 }
 
 impl ApiCommand {
+    /// The command's kind as it appears on the wire: `make_box`,
+    /// `drill_hole`, `boolean_union`, and so on.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::MakeBox { .. } => "make_box",
+            Self::MakeCylinder { .. } => "make_cylinder",
+            Self::Sketch { .. } => "sketch",
+            Self::Extrude { .. } => "extrude",
+            Self::Revolve { .. } => "revolve",
+            Self::PushPull { .. } => "push_pull",
+            Self::DrillHole { .. } => "drill_hole",
+            Self::Fillet { .. } => "fillet",
+            Self::Chamfer { .. } => "chamfer",
+            Self::Mirror { .. } => "mirror",
+            Self::LinearPattern { .. } => "linear_pattern",
+            Self::FeaturePattern { .. } => "feature_pattern",
+            Self::Shell { .. } => "shell",
+            Self::BooleanUnion { .. } => "boolean_union",
+            Self::BooleanDifference { .. } => "boolean_difference",
+            Self::BooleanIntersection { .. } => "boolean_intersection",
+        }
+    }
+
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
@@ -201,6 +281,8 @@ impl ApiCommand {
             | Self::Chamfer { label, .. }
             | Self::Mirror { label, .. }
             | Self::LinearPattern { label, .. }
+            | Self::FeaturePattern { label, .. }
+            | Self::Shell { label, .. }
             | Self::BooleanUnion { label, .. }
             | Self::BooleanDifference { label, .. }
             | Self::BooleanIntersection { label, .. } => label,

@@ -1,0 +1,40 @@
+// A mounting plate with four standoffs, each built by one function.
+//
+// `standoff` takes a face, a position on it, and sizes; it builds a boss
+// with a hole and returns the boss as a body whose top face is exported as
+// `top`. Every step it builds is labelled under the call's `label`, so the
+// loop needs no string arithmetic to keep labels unique: the first call's
+// boss is the step `standoff_0/boss`, its hole `standoff_0/hole`.
+
+param plate_width: f64 [mm] in 40..200 = 80.0 "plate width";
+param plate_depth: f64 [mm] in 40..200 = 60.0 "plate depth";
+param plate_thickness: f64 [mm] in 3..12 = 5.0 "plate thickness";
+param standoff_height: f64 [mm] in 4..30 = 10.0 "standoff height above the plate";
+param screw: f64 [mm] in 2..8 = 3.0 "screw clearance hole diameter";
+param inset: f64 [mm] in 5..40 = 10.0 "standoff centres in from each edge";
+
+fn standoff(on: face, at: [f64; 2], height: f64, hole: f64, label: str) -> body {
+    // The boss centre is in the face's own frame, whose origin is the face
+    // centre; the diameter follows the screw so the wall stays sensible.
+    let boss = cylinder_on(on: on, at: at, diameter: hole * 2.5, height: height, label: "boss");
+    drill(face: boss.top, center: [0, 0], diameter: hole, depth: height, label: "hole");
+    return boss with faces { top: boss.top };
+}
+
+// A boss is a circle sketched on the face and extruded as an addition.
+fn cylinder_on(on: face, at: [f64; 2], diameter: f64, height: f64, label: str) -> body {
+    let profile = sketch(on: on, entities: [circle(center: at, diameter: diameter)], label: "profile");
+    let boss = extrude(sketch: profile, distance: height, operation: "add", label: label);
+    return boss with faces { top: boss.face("end_face") };
+}
+
+let plate = box(size: [plate_width, plate_depth, plate_thickness], label: "plate");
+let plate_top = plate.face("top_face");
+
+let half_w = plate_width / 2 - inset;
+let half_d = plate_depth / 2 - inset;
+let corners = [[half_w, half_d], [-half_w, half_d], [-half_w, -half_d], [half_w, -half_d]];
+
+for i in 0..4 {
+    standoff(on: plate_top, at: corners[i], height: standoff_height, hole: screw, label: "standoff_" + i);
+}

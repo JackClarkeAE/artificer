@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use artificer_protocol::{Aabb3, Diagnostic, EntityKind, EntityRef, SnapshotId, TopologyCounts};
+use artificer_protocol::{
+    Aabb3, Diagnostic, EntityKind, EntityRef, SnapshotId, Tier, TopologyCounts,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -17,7 +19,19 @@ pub struct CommandResult {
     pub bounds: Option<Aabb3>,
     /// Named entities produced or modified by this operation, indexed by role/identifier.
     pub entities: BTreeMap<String, EntityInfo>,
+    /// The validation diagnostics of the committed result.
     pub diagnostics: Vec<Diagnostic>,
+    /// Caveats the construction attached, such as the faceted tier's
+    /// approximation warning.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Diagnostic>,
+    /// The strategy rung that certified the result, such as
+    /// `face-feature/exact-prism`; a sketch, which builds nothing, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rung: Option<String>,
+    /// Exact, or from the faceted approximation tier.
+    #[serde(default)]
+    pub tier: Tier,
     pub elapsed_ms: u64,
     pub summary: String,
 }

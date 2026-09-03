@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 
+pub use crate::StepPlacement;
 use crate::{NativeKernel, Snapshot};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,44 @@ pub enum ExportFormat {
     StlBinary,
     StlAscii,
     Obj,
+    /// AP214 `advanced_brep_shape_representation`: the analytic B-rep
+    /// itself, nothing tessellated.
+    Step,
+    /// AP214 faceted surface model: the display triangles in a STEP
+    /// wrapper.
+    StepFaceted,
+}
+
+/// Exports the snapshot's solids as exact AP214 B-rep STEP text. Every
+/// face keeps its analytic carrier and every edge its exact curve, so a
+/// reader recovers the same volume and area the kernel measures.
+pub fn export_step(snapshot: &Snapshot, product_name: &str) -> Result<String, ApiError> {
+    NativeKernel::export_step(snapshot, &header_name(product_name)).map_err(ApiError::from)
+}
+
+/// Exports several snapshots as the solids of one STEP product.
+pub fn export_step_bodies(
+    bodies: &[(&Snapshot, &str)],
+    product_name: &str,
+) -> Result<String, ApiError> {
+    NativeKernel::export_step_bodies(bodies, &header_name(product_name)).map_err(ApiError::from)
+}
+
+/// Exports several snapshots, each under a rigid placement, as the solids
+/// of one STEP product: an assembly's occurrences in their positions.
+pub fn export_step_bodies_placed(
+    bodies: &[(&Snapshot, &str, StepPlacement)],
+    product_name: &str,
+) -> Result<String, ApiError> {
+    NativeKernel::export_step_bodies_placed(bodies, &header_name(product_name))
+        .map_err(ApiError::from)
+}
+
+/// Exports the snapshot's display tessellation as a faceted STEP surface
+/// model, for consumers that want triangles in a STEP wrapper.
+#[must_use]
+pub fn export_step_faceted(snapshot: &Snapshot, product_name: &str) -> String {
+    NativeKernel::export_step_faceted(snapshot, &header_name(product_name))
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

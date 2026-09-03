@@ -586,6 +586,7 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
             KernelCommand::AddRib { .. } => "native.add_rib.v0",
             KernelCommand::MirrorSnapshot { .. } => "native.mirror_snapshot.v0",
             KernelCommand::LinearPatternSnapshot { .. } => "native.linear_pattern_snapshot.v0",
+            KernelCommand::ShellSnapshot { .. } => "native.shell_snapshot.v0",
             KernelCommand::FinishEdge { .. } => "native.finish_edge.v0",
             KernelCommand::FinishEdges { .. } => "native.finish_edges.v0",
         };

@@ -17,12 +17,15 @@ pub enum CommandIcon {
     Sketch,
     Plane,
     Section,
+    Interference,
     Extrude,
     Revolve,
     Hole,
     Rib,
     Mirror,
     Pattern,
+    HolePattern,
+    Shell,
     Chamfer,
     Fillet,
     Combine,
@@ -248,6 +251,28 @@ impl IconPainter<'_> {
                 self.dashed((0.50, 0.08), (0.50, 0.92));
                 self.closed_path(&[(0.12, 0.28), (0.40, 0.50), (0.12, 0.72)]);
                 self.closed_path(&[(0.88, 0.28), (0.60, 0.50), (0.88, 0.72)]);
+            }
+            CommandIcon::HolePattern => {
+                // Six holes on a pitch circle, as a bolt flange reads.
+                self.circle((0.50, 0.50), 0.34);
+                for step in 0..6 {
+                    let angle = std::f32::consts::TAU * step as f32 / 6.0;
+                    self.circle((0.50 + 0.34 * angle.cos(), 0.50 + 0.34 * angle.sin()), 0.08);
+                }
+            }
+            CommandIcon::Interference => {
+                // Two bodies overlapping, with the shared region marked.
+                self.rectangle((0.10, 0.30), (0.62, 0.86));
+                self.circle((0.62, 0.42), 0.28);
+                self.line((0.44, 0.30), (0.44, 0.62));
+                self.line((0.10, 0.62), (0.62, 0.62));
+            }
+            CommandIcon::Shell => {
+                // A cup in section: one wall all round, open at the top.
+                self.rectangle((0.12, 0.14), (0.88, 0.86));
+                self.line((0.28, 0.14), (0.28, 0.68));
+                self.line((0.72, 0.14), (0.72, 0.68));
+                self.line((0.28, 0.68), (0.72, 0.68));
             }
             CommandIcon::Pattern => {
                 for row in 0..3 {

@@ -1014,65 +1014,6 @@ fn edge_inward_directions(
     (fallback.len() == 2).then(|| [fallback[0], fallback[1]])
 }
 
-pub(crate) fn mirror_scene(
-    scene: &DebugScene,
-    plane_origin: Point3,
-    plane_normal: Vector3,
-    precision: PrecisionPolicy,
-) -> Option<Topology> {
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
-    let normal = plane_normal / plane_normal.length();
-    let polygons = scene
-        .triangles
-        .iter()
-        .filter_map(|triangle| {
-            let mut vertices = triangle
-                .vertices
-                .map(internal_point)
-                .map(|point| point + normal * (-2.0 * (point - plane_origin).dot(normal)))
-                .to_vec();
-            vertices.reverse();
-            Polygon::new(vertices, triangle.role, epsilon)
-        })
-        .collect();
-    topology_from_polygons(polygons, epsilon)
-}
-
-pub(crate) fn linear_pattern_scene(
-    scene: &DebugScene,
-    direction: Vector3,
-    spacing: f64,
-    count: u16,
-    precision: PrecisionPolicy,
-) -> Option<Topology> {
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
-    let direction = direction / direction.length();
-    let mut polygons = Vec::new();
-    for instance in 0..count {
-        let offset = direction * (spacing * f64::from(instance));
-        polygons.extend(scene.triangles.iter().filter_map(|triangle| {
-            Polygon::new(
-                triangle
-                    .vertices
-                    .map(internal_point)
-                    .map(|point| point + offset)
-                    .to_vec(),
-                triangle.role,
-                epsilon,
-            )
-        }));
-    }
-    topology_from_polygons(polygons, epsilon)
-}
-
 /// Subtracts a crossing prismatic profile and returns a fresh immutable body
 /// boundary. The caller still runs the ordinary solid validator before commit.
 pub(crate) fn subtract_crossing_profile(
@@ -1398,10 +1339,6 @@ fn point_in_triangle(point: Point2, triangle: [Point2; 3]) -> bool {
         signed_area(triangle[2], triangle[0], point),
     ];
     signs.iter().all(|value| *value >= 0.0) || signs.iter().all(|value| *value <= 0.0)
-}
-
-fn topology_from_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Option<Topology> {
-    topology_from_polygons_with_heal_limit(polygons, epsilon, None)
 }
 
 fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {

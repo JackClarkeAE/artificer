@@ -6,9 +6,16 @@ pub enum Token {
     Let,
     For,
     In,
+    Fn,
+    Return,
+    Use,
+    With,
+    True,
+    False,
     LBrace,
     RBrace,
     DotDot,
+    Arrow,
     Ident(String),
     Number(f64),
     StringLit(String),
@@ -95,6 +102,12 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
                 "let" => Token::Let,
                 "for" => Token::For,
                 "in" => Token::In,
+                "fn" => Token::Fn,
+                "return" => Token::Return,
+                "use" => Token::Use,
+                "with" => Token::With,
+                "true" => Token::True,
+                "false" => Token::False,
                 _ => Token::Ident(s),
             };
             tokens.push(SpannedToken {
@@ -175,6 +188,18 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
             col += 1;
             tokens.push(SpannedToken {
                 token: Token::DotDot,
+                line,
+                col: start_col,
+            });
+            continue;
+        }
+
+        // `->` is one token: a function's return type.
+        if ch == '-' && chars.peek() == Some(&'>') {
+            chars.next();
+            col += 1;
+            tokens.push(SpannedToken {
+                token: Token::Arrow,
                 line,
                 col: start_col,
             });

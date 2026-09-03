@@ -670,6 +670,17 @@ impl KernelLabApp {
             None
         };
         match command {
+            ModelCommand::InsertPart => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self.workbench_mode == WorkbenchMode::Sketch {
+                    return CommandAvailability::disabled(
+                        "Finish the sketch first; a part is inserted into the model.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::NewSketch => {
                 if let Some(blocked) = free(self) {
                     return blocked;
@@ -704,6 +715,17 @@ impl KernelLabApp {
             ModelCommand::Pattern => {
                 self.preset_feature_availability(SolidFeaturePreset::LinearPattern)
             }
+            ModelCommand::HolePattern => {
+                self.preset_feature_availability(SolidFeaturePreset::HolePattern)
+            }
+            ModelCommand::Interference => {
+                if self.bodies.iter().filter(|body| body.visible).count() < 2 {
+                    CommandAvailability::disabled("Show two bodies to compare first.")
+                } else {
+                    CommandAvailability::Enabled
+                }
+            }
+            ModelCommand::Shell => self.preset_feature_availability(SolidFeaturePreset::Shell),
             ModelCommand::Chamfer => self.preset_feature_availability(SolidFeaturePreset::Chamfer),
             ModelCommand::Fillet => self.preset_feature_availability(SolidFeaturePreset::Fillet),
             ModelCommand::Combine | ModelCommand::Subtract | ModelCommand::Intersect => {
@@ -851,10 +873,14 @@ impl KernelLabApp {
         }
         let ready = match preset {
             SolidFeaturePreset::Revolve => true,
-            SolidFeaturePreset::Hole | SolidFeaturePreset::Rib => self.selected_face.is_some(),
-            SolidFeaturePreset::Mirror | SolidFeaturePreset::LinearPattern => {
-                self.active_body_id().is_some()
-            }
+            SolidFeaturePreset::Hole
+            | SolidFeaturePreset::Rib
+            | SolidFeaturePreset::HolePattern => self.selected_face.is_some(),
+            SolidFeaturePreset::Mirror
+            | SolidFeaturePreset::LinearPattern
+            // A shell with no face selected hollows the body closed, so a
+            // body of its own is all it needs.
+            | SolidFeaturePreset::Shell => self.active_body_id().is_some(),
             SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet => {
                 !self.selected_edges.is_empty()
             }
@@ -863,10 +889,12 @@ impl KernelLabApp {
             CommandAvailability::Enabled
         } else {
             CommandAvailability::disabled(match preset {
-                SolidFeaturePreset::Hole | SolidFeaturePreset::Rib => "Select a planar face first.",
-                SolidFeaturePreset::Mirror | SolidFeaturePreset::LinearPattern => {
-                    "Activate a body first."
-                }
+                SolidFeaturePreset::Hole
+                | SolidFeaturePreset::Rib
+                | SolidFeaturePreset::HolePattern => "Select a planar face first.",
+                SolidFeaturePreset::Mirror
+                | SolidFeaturePreset::LinearPattern
+                | SolidFeaturePreset::Shell => "Activate a body first.",
                 _ => "Select at least one edge first.",
             })
         }
@@ -945,6 +973,11 @@ impl KernelLabApp {
                     self.enter_sketch_mode();
                 }
             }
+            // The library is where a part is chosen and its parameters set,
+            // so the command opens it rather than duplicating that panel: an
+            // insertion still goes through the same confirmation gate every
+            // other operation does.
+            ModelCommand::InsertPart => self.open_part_library(),
             ModelCommand::ConstructionPlane => self.stage_construction_plane(),
             ModelCommand::Extrude => {
                 let eligibility = self.sketch_extrusion_eligibility();
@@ -970,6 +1003,9 @@ impl KernelLabApp {
             ModelCommand::Rib => self.stage_preset_feature(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.stage_preset_feature(SolidFeaturePreset::Mirror),
             ModelCommand::Pattern => self.stage_preset_feature(SolidFeaturePreset::LinearPattern),
+            ModelCommand::HolePattern => self.stage_preset_feature(SolidFeaturePreset::HolePattern),
+            ModelCommand::Interference => self.run_interference_study(),
+            ModelCommand::Shell => self.stage_preset_feature(SolidFeaturePreset::Shell),
             ModelCommand::Chamfer => self.stage_preset_feature(SolidFeaturePreset::Chamfer),
             ModelCommand::Fillet => self.stage_preset_feature(SolidFeaturePreset::Fillet),
             ModelCommand::Combine => self.stage_body_boolean(BooleanOperation::Union),

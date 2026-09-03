@@ -268,7 +268,7 @@ fn entity_list(ids: &[u64]) -> String {
         .join(",")
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "the export path has no parent directory".to_owned())?;

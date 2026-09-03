@@ -2,13 +2,32 @@
 
 use std::collections::BTreeMap;
 
-use crate::NativeKernel;
+use crate::{EdgeDescription, FaceDescription, NativeKernel};
 use artificer_protocol::{Aabb3, EntityId, EntityKind, Point3, SnapshotId, TopologyCounts};
 use serde::{Deserialize, Serialize};
 
 use crate::api::debug::{ApiError, ApiErrorCode, EntityInfo};
 use crate::api::selectors::{EntitySelector, resolve_selector};
 use crate::api::session::Session;
+
+/// What a selected entity is, read off its exact carrier.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntityDescription {
+    Face(FaceDescription),
+    Edge(EdgeDescription),
+}
+
+impl EntityDescription {
+    /// The entity in words.
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        match self {
+            Self::Face(face) => &face.summary,
+            Self::Edge(edge) => &edge.summary,
+        }
+    }
+}
 
 /// Summary information for a body in the current session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -146,6 +165,29 @@ impl<'a> QueryHandle<'a> {
             role: role_name,
             ordinal: None,
         })
+    }
+
+    /// Describes the face or edge a selector names: its carrier with the
+    /// numbers that define it, exact area or length, and a centre.
+    pub fn describe(&self, selector: &EntitySelector) -> Result<EntityDescription, ApiError> {
+        let entity = resolve_selector(
+            selector,
+            &self.session.snapshot,
+            &self.session.step_order,
+            &self.session.step_reports,
+        )?;
+        match entity.kind {
+            EntityKind::Face => NativeKernel::describe_face(&self.session.snapshot, entity)
+                .map(EntityDescription::Face)
+                .map_err(ApiError::from),
+            EntityKind::Edge => NativeKernel::describe_edge(&self.session.snapshot, entity)
+                .map(EntityDescription::Edge)
+                .map_err(ApiError::from),
+            other => Err(ApiError::new(
+                ApiErrorCode::InvalidInput,
+                format!("Only faces and edges are described; the selector named a {other:?}"),
+            )),
+        }
     }
 
     pub fn measure(
