@@ -420,5 +420,33 @@ fn a_dimension_from_an_edge_places_a_hole_snapshot() {
         click_button(&mut harness, "Confirm operation");
     }
     assert_eq!(harness.state().sketch_constraint_count(), 1);
+
+    // The value is a handle: drag it clear of the circle it was sitting on,
+    // and it keeps a thread back to the distance it names.
+    let placed = *harness
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("the dimension has a label");
+    let viewport = harness.get_by_label("Sketch viewport").rect();
+    let grab = harness
+        .state()
+        .sketch_point_screen_position(viewport, placed);
+    let release = harness
+        .state()
+        .sketch_point_screen_position(viewport, SketchPoint::new(-2.0, -2.0));
+    harness.hover_at(grab);
+    harness.step();
+    pointer_button(&mut harness, grab, true);
+    for step in 1..=4_u8 {
+        let fraction = f32::from(step) / 4.0;
+        harness.event(egui::Event::PointerMoved(
+            grab + (release - grab) * fraction,
+        ));
+        harness.step();
+    }
+    pointer_button(&mut harness, release, false);
+    harness.run();
+
     settle_snapshot(&mut harness, "workbench_edge_dimension_1040");
 }

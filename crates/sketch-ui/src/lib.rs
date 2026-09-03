@@ -5038,6 +5038,18 @@ pub struct SketchCanvasState {
     /// canvas so a row in the list can be found in the drawing. Presentation
     /// only: set each frame by whoever draws the list, never persisted.
     relation_highlight: Vec<SketchPoint>,
+    /// Where each dimension's value has been dragged to, as an offset in
+    /// sketch units from where the geometry would otherwise put it.
+    ///
+    /// Sketch units rather than screen points so a placed dimension keeps its
+    /// place under pan and zoom. This is the sketch session's, not the
+    /// document's: a dimension reopened later starts from its computed
+    /// position again.
+    dimension_placements: BTreeMap<CoreConstraintId, (f64, f64)>,
+    /// The drag in progress on a dimension's value, and where inside the chip
+    /// it was grabbed, so the label does not jump to the pointer.
+    dimension_drag: DragHandleState,
+    dimension_drag_target: Option<(CoreConstraintId, (f64, f64))>,
     /// Exact model-space picks keyed by the carrier selected for a corner tool.
     modifier_picks: BTreeMap<CoreEntityId, SketchPoint>,
     hovered: Option<SketchEntityId>,
@@ -5112,6 +5124,9 @@ impl Default for SketchCanvasState {
             dimension_operands: Vec::new(),
             relation_diagnostic: None,
             relation_highlight: Vec::new(),
+            dimension_placements: BTreeMap::new(),
+            dimension_drag: DragHandleState::default(),
+            dimension_drag_target: None,
             modifier_picks: BTreeMap::new(),
             hovered: None,
             trim_hover_fragment: None,
@@ -8748,6 +8763,147 @@ impl SketchCanvasState {
             .collect()
     }
 
+    /// Where a dimension's value is drawn, in sketch coordinates: the middle
+    /// of what it measures, plus wherever the user has dragged it.
+    fn dimension_chip_anchor(
+        &self,
+        id: CoreConstraintId,
+        kind: &CoreConstraintKind,
+    ) -> Option<SketchPoint> {
+        let (from, to) = self.constraint_leader(kind)?;
+        let placed = self
+            .dimension_placements
+            .get(&id)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        Some(SketchPoint::new(
+            (from.u + to.u) * 0.5 + placed.0,
+            (from.v + to.v) * 0.5 + placed.1,
+        ))
+    }
+
+    /// Where every dimension's value is drawn, in sketch coordinates, in the
+    /// order the panel lists them.
+    #[must_use]
+    pub fn dimension_label_positions(&self) -> Vec<SketchPoint> {
+        self.authoring
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .filter_map(|record| self.dimension_chip_anchor(record.id, &record.kind))
+            .collect()
+    }
+
+    /// The rectangle a dimension's value occupies on screen.
+    ///
+    /// One answer for the painter and the pointer alike: a chip you can see
+    /// but not grab, or grab but not see, is worse than no chip.
+    fn dimension_chip_rect(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        id: CoreConstraintId,
+        kind: &CoreConstraintKind,
+    ) -> Option<Rect> {
+        let value = kind.value()?.abs();
+        let centre = self
+            .view
+            .sketch_to_screen(rect, self.dimension_chip_anchor(id, kind)?);
+        let galley = painter.layout_no_wrap(
+            dimension_chip_text(value),
+            FontId::monospace(DIMENSION_CHIP_TEXT_SIZE),
+            Color32::WHITE,
+        );
+        Some(Rect::from_center_size(
+            centre,
+            galley.rect.size() + DIMENSION_CHIP_PADDING,
+        ))
+    }
+
+    /// The dimension whose value the pointer is over, nearest first.
+    fn dimension_chip_at(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        position: Pos2,
+    ) -> Option<CoreConstraintId> {
+        self.authoring
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .filter_map(|record| {
+                let chip = self.dimension_chip_rect(painter, rect, record.id, &record.kind)?;
+                chip.contains(position).then_some(record.id)
+            })
+            .next_back()
+    }
+
+    /// Takes hold of a dimension's value at `position`, remembering where
+    /// inside the chip it was grabbed.
+    fn begin_dimension_drag(
+        &mut self,
+        painter: &egui::Painter,
+        rect: Rect,
+        position: Pos2,
+    ) -> bool {
+        let Some(id) = self.dimension_chip_at(painter, rect, position) else {
+            return false;
+        };
+        let Some(kind) = self
+            .authoring
+            .constraints()
+            .get(&id)
+            .map(|record| record.kind.clone())
+        else {
+            return false;
+        };
+        let Some(anchor) = self.dimension_chip_anchor(id, &kind) else {
+            return false;
+        };
+        let grabbed = self.view.screen_to_sketch(rect, position);
+        self.dimension_drag_target = Some((id, (grabbed.u - anchor.u, grabbed.v - anchor.v)));
+        true
+    }
+
+    /// Moves the dragged value to follow the pointer.
+    fn update_dimension_drag(&mut self, rect: Rect, position: Pos2) -> bool {
+        let Some((id, grab)) = self.dimension_drag_target else {
+            return false;
+        };
+        let Some(kind) = self
+            .authoring
+            .constraints()
+            .get(&id)
+            .map(|record| record.kind.clone())
+        else {
+            return false;
+        };
+        let Some((from, to)) = self.constraint_leader(&kind) else {
+            return false;
+        };
+        let pointer = self.view.screen_to_sketch(rect, position);
+        let placement = (
+            pointer.u - grab.0 - (from.u + to.u) * 0.5,
+            pointer.v - grab.1 - (from.v + to.v) * 0.5,
+        );
+        if self.dimension_placements.get(&id) == Some(&placement) {
+            return false;
+        }
+        self.dimension_placements.insert(id, placement);
+        true
+    }
+
+    /// Forgets placements for relations the sketch no longer holds, so a
+    /// released dimension does not leave its label's position behind.
+    fn prune_dimension_placements(&mut self) {
+        if self.dimension_placements.is_empty() {
+            return;
+        }
+        let held = self.authoring.constraints();
+        self.dimension_placements
+            .retain(|id, _| held.contains_key(id));
+    }
+
     /// Where a dimension's leader runs: from the thing it is measured from to
     /// the thing it holds.
     ///
@@ -10965,6 +11121,82 @@ pub struct SketchCanvasOutput {
     pub recipe_dimension_accepted: bool,
 }
 
+/// Size of the text in a dimension's value chip.
+const DIMENSION_CHIP_TEXT_SIZE: f32 = 10.0;
+/// Breathing room around that text inside the chip.
+const DIMENSION_CHIP_PADDING: Vec2 = egui::vec2(8.0, 4.0);
+
+/// What a dimension's value reads as on the drawing.
+fn dimension_chip_text(value: f64) -> String {
+    format!("{value:.2} mm")
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DimensionDragInteraction {
+    consumes_primary: bool,
+    changed: bool,
+}
+
+/// Drags a dimension's value clear of the geometry it measures.
+///
+/// A dimension whose number sits on top of the drawing is a dimension a drawer
+/// moves, so the chip is a handle. It takes the primary button while it is held
+/// — the same way the pattern manipulator does — so grabbing a label never also
+/// picks the geometry underneath it.
+fn handle_dimension_drag_input(
+    ui: &Ui,
+    canvas: &Response,
+    state: &mut SketchCanvasState,
+) -> DimensionDragInteraction {
+    state.prune_dimension_placements();
+    if state.pending.is_some() {
+        state.dimension_drag.cancel();
+        state.dimension_drag_target = None;
+        return DimensionDragInteraction::default();
+    }
+    let painter = ui.painter();
+    let pointer = PointerSample::primary(ui, canvas.rect);
+    let initial_hit = pointer.position.is_some_and(|position| {
+        state
+            .dimension_chip_at(painter, canvas.rect, position)
+            .is_some()
+    });
+    let handle = state.dimension_drag.update(pointer, initial_hit);
+    let mut interaction = DimensionDragInteraction {
+        consumes_primary: handle.consumes_primary,
+        ..DimensionDragInteraction::default()
+    };
+    // The pointer says the chip is a handle before the user finds out by
+    // trying it.
+    if initial_hit || state.dimension_drag_target.is_some() {
+        ui.ctx()
+            .set_cursor_icon(if state.dimension_drag_target.is_some() {
+                CursorIcon::Grabbing
+            } else {
+                CursorIcon::Grab
+            });
+    }
+    let Some(event) = handle.event else {
+        return interaction;
+    };
+    if event.phase == DragHandlePhase::Started
+        && state.begin_dimension_drag(painter, canvas.rect, event.position)
+    {
+        canvas.request_focus();
+        interaction.changed = true;
+    }
+    if matches!(
+        event.phase,
+        DragHandlePhase::Dragging | DragHandlePhase::Finished
+    ) {
+        interaction.changed |= state.update_dimension_drag(canvas.rect, event.position);
+    }
+    if event.phase == DragHandlePhase::Finished {
+        state.dimension_drag_target = None;
+    }
+    interaction
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct PatternManipulatorInteraction {
     consumes_primary: bool,
@@ -11081,6 +11313,9 @@ pub fn show_with_context(
         handle_navigation(ui, &response, &mut state.view) || context_fit_changed;
     state.refresh_analytic_regions();
     let pattern_interaction = handle_pattern_manipulator_input(ui, &response, state);
+    // Before anything reads the primary button: a label being dragged owns it,
+    // so a grab never doubles as a pick of whatever lies under the chip.
+    let dimension_interaction = handle_dimension_drag_input(ui, &response, state);
 
     let prior_dimension_layouts = dimension_widget_layouts(state, response.rect);
     let pointer_over_dimension = response.hover_pos().is_some_and(|position| {
@@ -11131,12 +11366,13 @@ pub fn show_with_context(
     state.update_region_hover(region_hover_point);
 
     let mut selection_changed = false;
-    let mut draft_changed = pattern_interaction.changed;
+    let mut draft_changed = pattern_interaction.changed || dimension_interaction.changed;
     let mut pending_created = pattern_interaction.pending_created;
     let primary_finish_click = response.double_clicked_by(PointerButton::Primary)
         || response.triple_clicked_by(PointerButton::Primary);
     if (response.clicked_by(PointerButton::Primary) || primary_finish_click)
         && !pattern_interaction.consumes_primary
+        && !dimension_interaction.consumes_primary
         && !pointer_over_dimension
         && state.dimension_error().is_none()
         && let Some(position) = response.interact_pointer_pos()
@@ -11247,6 +11483,7 @@ pub fn show_with_context(
 
     if response.drag_started_by(PointerButton::Primary)
         && !pattern_interaction.consumes_primary
+        && !dimension_interaction.consumes_primary
         && !pointer_over_dimension
         && state.tool == SketchTool::Select
         && state.pending.is_none()
@@ -11272,6 +11509,7 @@ pub fn show_with_context(
     let primary_drag_delta = ui.input(|input| input.pointer.delta());
     if response.dragged_by(PointerButton::Primary)
         && !pattern_interaction.consumes_primary
+        && !dimension_interaction.consumes_primary
         && !pointer_over_dimension
         && state.tool == SketchTool::Select
         && state.pending.is_none()
@@ -12228,14 +12466,19 @@ fn paint_constraint_dimensions(painter: &egui::Painter, rect: Rect, state: &Sket
         let start = state.view.sketch_to_screen(rect, from);
         let end = state.view.sketch_to_screen(rect, to);
         painter.line_segment([start, end], stroke);
-        let text = format!("{value:.2} mm");
-        let centre = start + (end - start) * 0.5;
-        let galley = painter.layout_no_wrap(
-            text.clone(),
-            FontId::monospace(10.0),
-            colours.dimension.gamma_multiply(0.85),
-        );
-        let chip = Rect::from_center_size(centre, galley.rect.size() + egui::vec2(8.0, 4.0));
+        let text = dimension_chip_text(value);
+        let measured = start + (end - start) * 0.5;
+        let Some(chip) = state.dimension_chip_rect(painter, rect, record.id, &record.kind) else {
+            continue;
+        };
+        // A value dragged clear of the geometry keeps a thread back to what it
+        // measures, which is what stops a loose number meaning nothing.
+        if chip.center().distance(measured) > 1.0 {
+            painter.line_segment(
+                [measured, chip.center()],
+                Stroke::new(1.0, colours.dimension.gamma_multiply(0.3)),
+            );
+        }
         painter.rect(
             chip,
             4.0,
@@ -12244,10 +12487,10 @@ fn paint_constraint_dimensions(painter: &egui::Painter, rect: Rect, state: &Sket
             egui::StrokeKind::Inside,
         );
         painter.text(
-            centre,
+            chip.center(),
             Align2::CENTER_CENTER,
             text,
-            FontId::monospace(10.0),
+            FontId::monospace(DIMENSION_CHIP_TEXT_SIZE),
             colours.dimension.gamma_multiply(0.85),
         );
     }

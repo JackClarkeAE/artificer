@@ -472,3 +472,99 @@ fn a_circle_is_placed_in_a_rectangle_by_dimensioning_from_its_edges() {
         "the plate is the reference and does not move"
     );
 }
+
+/// Drags the pointer from `from` to `to` on the canvas.
+fn drag_between(harness: &mut Harness<'static, KernelLabApp>, from: egui::Pos2, to: egui::Pos2) {
+    harness.hover_at(from);
+    harness.step();
+    harness.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    for step in 1..=4_u8 {
+        let fraction = f32::from(step) / 4.0;
+        harness.event(egui::Event::PointerMoved(from + (to - from) * fraction));
+        harness.step();
+    }
+    harness.event(egui::Event::PointerButton {
+        pos: to,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.run();
+}
+
+/// A dimension's value is a handle: dragging it moves the label clear of the
+/// geometry, and does not pick whatever it was sitting on.
+#[test]
+fn a_dimension_label_is_dragged_clear_of_the_geometry_it_measures() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_line(
+        &mut harness,
+        SketchPoint::new(-3.0, 0.0),
+        SketchPoint::new(3.0, 0.0),
+    );
+    draw_line(
+        &mut harness,
+        SketchPoint::new(-3.0, 2.0),
+        SketchPoint::new(3.0, 2.0),
+    );
+
+    // Dimension between the two left endpoints, so its label lands mid-way.
+    click_button(&mut harness, "Sketch dimension");
+    click_sketch_point(&mut harness, SketchPoint::new(-3.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(-3.0, 2.0));
+    confirm_if_staged(&mut harness);
+    assert_eq!(harness.state().sketch_constraint_count(), 1);
+
+    let placed = *harness
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("the dimension has a label");
+    assert!(
+        (placed.u - (-3.0)).abs() <= 1.0e-6 && (placed.v - 1.0).abs() <= 1.0e-6,
+        "the label starts in the middle of what it measures: {placed:?}"
+    );
+
+    let geometry_before = segments(&harness);
+    let viewport = harness.get_by_label("Sketch viewport").rect();
+    let grab = harness
+        .state()
+        .sketch_point_screen_position(viewport, placed);
+    let release = harness
+        .state()
+        .sketch_point_screen_position(viewport, SketchPoint::new(-5.0, 1.0));
+    drag_between(&mut harness, grab, release);
+
+    let moved = *harness
+        .state()
+        .sketch_dimension_label_positions()
+        .first()
+        .expect("the dimension still has a label");
+    assert!(
+        (moved.u - (-5.0)).abs() <= 0.05 && (moved.v - 1.0).abs() <= 0.05,
+        "the label should follow the pointer, got {moved:?}"
+    );
+    assert_eq!(
+        segments(&harness),
+        geometry_before,
+        "dragging a label moves the label, not the drawing"
+    );
+    assert_eq!(
+        harness.state().sketch_constraint_count(),
+        1,
+        "and stages nothing"
+    );
+    assert_eq!(
+        harness.state().sketch_dimension_operand_count(),
+        0,
+        "the grab must not read as the first pick of another dimension"
+    );
+}

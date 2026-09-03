@@ -3424,6 +3424,13 @@ impl KernelLabApp {
         self.sketch.dimension_operand_count()
     }
 
+    /// Where each dimension's value is drawn, in sketch coordinates, in the
+    /// order the panel lists them.
+    #[must_use]
+    pub fn sketch_dimension_label_positions(&self) -> Vec<SketchPoint> {
+        self.sketch.dimension_label_positions()
+    }
+
     /// The values the sketch's dimensions hold, in the order the panel lists
     /// them.
     #[must_use]
