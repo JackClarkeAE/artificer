@@ -133,6 +133,27 @@ fn settle_snapshot(harness: &mut Harness<'static, KernelLabApp>, name: &str) {
     harness.snapshot(name);
 }
 
+/// The chain highlight and the offset it makes, in one pass: what a click will
+/// take, and what taking it produced.
+#[test]
+fn offset_chain_hover_and_committed_outline_snapshots() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, -2.5));
+    click_sketch_point(&mut harness, SketchPoint::new(4.0, 2.5));
+
+    click_button(&mut harness, "Offset chain");
+    hover_sketch_point(&mut harness, SketchPoint::new(0.0, -2.5));
+    settle_hover_snapshot(&mut harness, "workbench_offset_chain_hover_1040");
+
+    // Click just outside the bottom side: the whole outline offsets away from
+    // the pointer, with a round join at every corner.
+    let below = canvas_sketch_point(&harness, SketchPoint::new(0.0, -2.5)) + egui::vec2(0.0, 6.0);
+    click_at(&mut harness, below);
+    settle_snapshot(&mut harness, "workbench_offset_outward_committed_1040");
+}
+
 #[test]
 fn exact_trim_hover_and_staged_span_snapshots() {
     let mut harness = harness();

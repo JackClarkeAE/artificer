@@ -855,13 +855,12 @@ const CHAMFER_PHASES: &[PointAcquisitionPhase] = &[
     phase("second_line", "Select the second connected profile line."),
 ];
 const OFFSET_PHASES: &[PointAcquisitionPhase] = &[
-    phase(
-        "chain",
-        "Hover a curve to highlight every curve connected to it, then click to take the chain.",
-    ),
+    // The canvas draws this over the sketch, so it has to stay short enough to
+    // read beside the plane badge.
+    phase("chain", "Hover a curve to light its chain."),
     phase(
         "distance",
-        "Move to either side of the chain to set which way it offsets, then click; Tab types the distance.",
+        "Click the side to offset onto; Tab types how far.",
     ),
 ];
 const RECTANGULAR_PATTERN_PHASES: &[PointAcquisitionPhase] = &[phase(

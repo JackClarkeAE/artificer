@@ -5066,6 +5066,11 @@ pub struct SketchCanvasState {
     /// Exact removable fragment under the Trim pointer. This intentionally
     /// stores the selected subcurve rather than the carrier entity.
     trim_hover_fragment: Option<CoreEvaluatedCurve2>,
+    /// The chain Offset would take if the pointer clicked where it is. What a
+    /// click will select is worth seeing before the click, because "every
+    /// connected curve" is a claim about geometry the user cannot check by
+    /// looking at one of them.
+    offset_hover: Vec<CoreEvaluatedCurve2>,
     /// Retained primary-pointer handle for pattern direction/centre editing.
     pattern_manipulator: Option<PatternManipulator>,
     pattern_drag: DragHandleState,
@@ -5139,6 +5144,7 @@ impl Default for SketchCanvasState {
             modifier_picks: BTreeMap::new(),
             hovered: None,
             trim_hover_fragment: None,
+            offset_hover: Vec::new(),
             pattern_manipulator: None,
             pattern_drag: DragHandleState::default(),
             active_drag_handle: None,
@@ -8157,6 +8163,27 @@ impl SketchCanvasState {
 
     fn exact_curve_hit(&self, point: SketchPoint, radius: f64) -> Option<CoreEntityId> {
         Self::exact_curve_hit_in(&self.authoring, point, radius)
+    }
+
+    /// How many curves the highlighted chain holds, for tests and diagnostics.
+    #[must_use]
+    pub fn offset_hover_count(&self) -> usize {
+        self.offset_hover.len()
+    }
+
+    /// Highlights the chain a click would take, and reports whether it moved.
+    fn update_offset_hover(&mut self, point: Option<SketchPoint>, pick_radius: f64) -> bool {
+        let next = point
+            .filter(|_| self.exact_tool == ToolVariant::Offset && self.pending.is_none())
+            .and_then(|point| {
+                let picked = self.exact_curve_hit(point, pick_radius)?;
+                let chain = self.offset_chain_for(picked)?;
+                Some(chain_geometry(&self.authoring, &chain).ok()?.curves)
+            })
+            .unwrap_or_default();
+        let changed = next != self.offset_hover;
+        self.offset_hover = next;
+        changed
     }
 
     fn update_trim_hover(&mut self, point: Option<SketchPoint>, pick_radius: f64) -> bool {
@@ -11470,6 +11497,14 @@ pub fn show_with_context(
         })
         .flatten();
     state.update_trim_hover(trim_hover_point, 8.0 / state.view.points_per_unit);
+    let offset_hover_point = (state.exact_tool == ToolVariant::Offset && !pointer_over_dimension)
+        .then(|| {
+            response
+                .hover_pos()
+                .map(|position| state.view.screen_to_sketch(response.rect, position))
+        })
+        .flatten();
+    state.update_offset_hover(offset_hover_point, 8.0 / state.view.points_per_unit);
     let region_hover_point = (state.exact_tool == ToolVariant::Select && !pointer_over_dimension)
         .then(|| {
             response
@@ -11708,6 +11743,7 @@ pub fn show_with_context(
     }
     paint_pending(&painter, response.rect, state);
     paint_trim_hover(&painter, response.rect, state);
+    paint_offset_hover(&painter, response.rect, state);
     paint_creation_preview(&painter, response.rect, state);
     paint_overlay(&painter, response.rect, state, context.is_some());
     let committed_annotations = committed_dimension_annotation_layouts(state, response.rect);
@@ -12624,6 +12660,22 @@ fn paint_relation_highlight(painter: &egui::Painter, rect: Rect, state: &SketchC
     for point in &state.relation_highlight {
         let centre = state.view.sketch_to_screen(rect, *point);
         painter.circle_stroke(centre, 6.0, Stroke::new(1.6, sketch_colours().selected));
+    }
+}
+
+/// The chain Offset would take, drawn heavier in the selection colour.
+///
+/// It is the answer to the only question the gesture leaves open before the
+/// click: how far the connection runs.
+fn paint_offset_hover(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
+    for curve in &state.offset_hover {
+        paint_geometry(
+            painter,
+            rect,
+            state.view,
+            legacy_geometry_from_core(curve.clone()),
+            Stroke::new(3.0, sketch_colours().selected),
+        );
     }
 }
 

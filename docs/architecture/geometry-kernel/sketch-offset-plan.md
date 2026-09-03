@@ -330,10 +330,13 @@ what the picked curve is joined to, the side is which side of it the click
 fell, and the magnitude is the palette's `distance`, which `Tab` retypes. The
 result commits on acceptance like every other sketch stroke
 ([ADR 0027](../adr/0027-sketch-edits-commit-on-acceptance.md)).
-`apps/workbench/tests/sketch_offset_ui.rs` offsets a drawn rectangle outward
-and inward from the canvas and drives the typed distance. The hover highlight
-that shows the chain before the click, and the live drag that sets the distance
-by pointing, are the part of this stage still to come.
+Hovering a curve lights the whole chain a click would take, because "every
+connected curve" is a claim about geometry the user cannot check by looking at
+one of them. `apps/workbench/tests/sketch_offset_ui.rs` offsets a drawn
+rectangle outward and inward from the canvas, drives the typed distance, and
+holds the highlight to the chain; two snapshots record the highlight and the
+outline it makes. The live drag that sets the distance by pointing rather than
+by typing is the part of this stage still to come.
 
 **Stage 5 — self-intersection pruning.** The slice-and-discard pass, replacing
 stage 1's conservative whole-chain refusal for the cases it can resolve. Tested

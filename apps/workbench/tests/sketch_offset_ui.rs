@@ -183,6 +183,31 @@ fn a_click_on_empty_canvas_stages_nothing_at_all() {
 }
 
 #[test]
+fn hovering_a_side_lights_the_whole_chain_a_click_would_take() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    draw_rectangle(&mut harness);
+    click_button(&mut harness, "Offset chain");
+
+    // Nothing under the pointer, nothing lit.
+    harness.hover_at(canvas_sketch_point(&harness, SketchPoint::new(12.0, 12.0)));
+    harness.step();
+    assert_eq!(harness.state().sketch_offset_hover_count(), 0);
+
+    // One side under it, and the whole outline lights: what "the connected
+    // chain" means is a claim about geometry the user cannot check by looking
+    // at one curve, so the tool shows it before the click.
+    harness.hover_at(canvas_sketch_point(&harness, SketchPoint::new(0.0, -3.0)));
+    harness.step();
+    assert_eq!(harness.state().sketch_offset_hover_count(), 4);
+
+    // And moving off it again puts the highlight away.
+    harness.hover_at(canvas_sketch_point(&harness, SketchPoint::new(12.0, 12.0)));
+    harness.step();
+    assert_eq!(harness.state().sketch_offset_hover_count(), 0);
+}
+
+#[test]
 fn the_offset_tile_is_live_and_says_what_it_does() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);

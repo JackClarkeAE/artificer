@@ -3405,6 +3405,13 @@ impl KernelLabApp {
         self.sketch.dimension_error()
     }
 
+    /// How many curves the Offset tool's hover highlight is showing, which is
+    /// what a click would take.
+    #[must_use]
+    pub fn sketch_offset_hover_count(&self) -> usize {
+        self.sketch.offset_hover_count()
+    }
+
     /// How many relations the sketch is holding.
     #[must_use]
     pub fn sketch_constraint_count(&self) -> usize {
