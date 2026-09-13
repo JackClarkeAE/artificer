@@ -13,6 +13,8 @@ artificer-kernel = { path = "../../crates/kernel" }
 artificer-protocol = { path = "../../crates/protocol" }
 artificer-ui-core = { path = "../../crates/ui-core" }
 artificer-viewport = { path = "../../crates/viewport" }
+artificer-spacemouse = { path = "../../crates/spacemouse" }
+rfd = "0.17"
 
 [dev-dependencies]
 egui_kittest.workspace = true
