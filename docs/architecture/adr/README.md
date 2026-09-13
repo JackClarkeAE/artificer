@@ -40,6 +40,8 @@ by tests, and **proposed** is a plan not yet executed.
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
 | [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
 | [0029](0029-velopack-installers-and-in-app-updates.md) | Velopack installers and in-app updates | Accepted and implemented | — |
+| [0030](0030-unsaved-work-and-native-file-dialogs.md) | Unsaved work is never lost silently, and files are chosen in the desktop's own dialog | Accepted and implemented | — |
+| [0031](0031-navigation-cube-and-spacemouse.md) | Navigation cube corners and edges, and 3D-mouse input | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use artificer_script_studio::{ScriptStudio, WELCOME_SCRIPT};
 use egui::accesskit::Role;
+use egui::{ViewportCommand, ViewportId};
 use egui_kittest::{Harness, kittest::Queryable as _};
 
 fn harness(source: &str) -> Harness<'static, ScriptStudio> {
@@ -143,6 +144,125 @@ fn the_run_button_and_menus_are_reachable() {
     settle_past(&mut harness, first);
     harness.get_by_role_and_label(Role::TextInput, "Script");
     harness.get_by_role_and_label(Role::CheckBox, "Auto-run");
+}
+
+/// Whether the last frame asked the window to do `command`.
+fn root_viewport_sent(harness: &Harness<'static, ScriptStudio>, command: &ViewportCommand) -> bool {
+    harness
+        .output()
+        .viewport_output
+        .get(&ViewportId::ROOT)
+        .is_some_and(|output| output.commands.contains(command))
+}
+
+/// The window's close button, as the platform reports it.
+fn request_window_close(harness: &mut Harness<'static, ScriptStudio>) {
+    harness
+        .input_mut()
+        .viewports
+        .entry(ViewportId::ROOT)
+        .or_default()
+        .events
+        .push(egui::ViewportEvent::Close);
+}
+
+/// Steps up to `frames` frames and reports whether any of them asked the
+/// window to do `command`. A click's answer lands a frame or two after the
+/// click, so the check has to span more than the frame of the click.
+fn sent_within_frames(
+    harness: &mut Harness<'static, ScriptStudio>,
+    command: &ViewportCommand,
+    frames: usize,
+) -> bool {
+    (0..frames).any(|_| {
+        harness.step();
+        root_viewport_sent(harness, command)
+    })
+}
+
+#[test]
+fn closing_a_dirty_script_asks_first_and_does_not_close() {
+    let mut harness = harness(WELCOME_SCRIPT);
+    harness.state_mut().set_native_file_dialogs(false);
+    settle_past(&mut harness, 0);
+
+    // A clean script closes without a word.
+    assert!(!harness.state().is_dirty());
+    request_window_close(&mut harness);
+    harness.step();
+    assert!(!harness.state().unsaved_prompt_open());
+    assert!(!root_viewport_sent(&harness, &ViewportCommand::CancelClose));
+
+    // A dirty one is asked about, and the close is cancelled meanwhile.
+    harness
+        .state_mut()
+        .set_source("let a = box(size: [1, 1, 1], label: \"a\");\n");
+    assert!(harness.state().is_dirty());
+    request_window_close(&mut harness);
+    harness.step();
+    assert!(harness.state().unsaved_prompt_open());
+    assert!(root_viewport_sent(&harness, &ViewportCommand::CancelClose));
+    harness.step();
+    harness.get_by_role_and_label(Role::Button, "Save");
+    harness.get_by_role_and_label(Role::Button, "Don't save");
+
+    // Cancel keeps editing; nothing is sent to the window.
+    harness
+        .get_by_role_and_label(Role::Button, "Cancel")
+        .click();
+    harness.step();
+    harness.step();
+    assert!(!harness.state().unsaved_prompt_open());
+    assert!(!root_viewport_sent(&harness, &ViewportCommand::Close));
+    assert!(harness.state().is_dirty(), "cancelling saves nothing");
+
+    // Don't save lets the window go: the close is sent, and the window's
+    // next close request goes through unchallenged.
+    request_window_close(&mut harness);
+    harness.step();
+    harness.step();
+    assert!(harness.state().unsaved_prompt_open());
+    assert!(!harness.state().window_close_confirmed());
+    harness
+        .get_by_role_and_label(Role::Button, "Don't save")
+        .click();
+    assert!(sent_within_frames(&mut harness, &ViewportCommand::Close, 4));
+    assert!(!harness.state().unsaved_prompt_open());
+    assert!(harness.state().window_close_confirmed());
+    request_window_close(&mut harness);
+    harness.step();
+    assert!(!harness.state().unsaved_prompt_open());
+    assert!(!root_viewport_sent(&harness, &ViewportCommand::CancelClose));
+}
+
+#[test]
+fn replacing_a_dirty_script_with_an_example_asks_first() {
+    let mut harness = harness(WELCOME_SCRIPT);
+    harness.state_mut().set_native_file_dialogs(false);
+    settle_past(&mut harness, 0);
+    let edited = "let a = box(size: [1, 1, 1], label: \"a\");\n";
+    harness.state_mut().set_source(edited);
+
+    harness
+        .get_by_role_and_label(Role::Button, "Examples")
+        .click();
+    harness.step();
+    harness
+        .get_by_role_and_label(Role::Button, "Filleted cube")
+        .click();
+    harness.step();
+    harness.step();
+    assert!(harness.state().unsaved_prompt_open());
+    assert_eq!(harness.state().source(), edited, "nothing replaced yet");
+
+    harness
+        .get_by_role_and_label(Role::Button, "Don't save")
+        .click();
+    harness.step();
+    harness.step();
+    assert!(!harness.state().unsaved_prompt_open());
+    assert_ne!(harness.state().source(), edited, "the example took over");
+    assert!(!harness.state().is_dirty());
 }
 
 #[test]

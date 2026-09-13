@@ -345,3 +345,55 @@ let boss = extrude(sketch: s, distance: 10, operation: \"add\", label: \"boss\")
     );
     let _ = Vector3::new(0.0, 0.0, 1.0);
 }
+
+#[test]
+fn rim_selectors_round_trip_through_the_journal_and_the_decompiler() {
+    let scripts = [
+        (
+            "\
+let b = box(size: [40, 30, 20], label: \"b\");
+drill(face: faces(\">Z\"), center: [0, 0], diameter: 10, depth: 20, label: \"hole\");
+fillet(edges: faces(\">Z\").rim(), radius: 2, label: \"soften\");
+",
+            "faces(\">Z\").rim()",
+        ),
+        (
+            "\
+let b = box(size: [40, 30, 20], label: \"b\");
+fillet(edges: edges(\">Z\"), radius: 2, label: \"soften\");
+",
+            "faces(\">Z\").edges()",
+        ),
+        (
+            "\
+let cyl = cylinder(radius: 10, height: 20, label: \"cyl\");
+fillet(edges: cyl.edges(), radius: 1, label: \"round\");
+",
+            "cyl.edges()",
+        ),
+    ];
+    for (source, spelling) in scripts {
+        let session = run(source);
+        // The journal carries the selector as data.
+        let json = session.export_journal().unwrap();
+        assert!(
+            json.contains("edges_of_face") || json.contains("\"role\": \"*\""),
+            "{json}"
+        );
+        let replayed = Session::from_journal(&json).unwrap();
+        assert_eq!(
+            replayed.snapshot.semantic_digest(),
+            session.snapshot.semantic_digest(),
+            "{source}"
+        );
+        // And the decompiler writes it back as the script spelled it.
+        let script = session.to_art(&DecompileOptions::default()).unwrap();
+        assert!(script.contains(spelling), "{spelling} not in:\n{script}");
+        let rebuilt = run(&script);
+        assert_eq!(
+            rebuilt.snapshot.semantic_digest(),
+            session.snapshot.semantic_digest(),
+            "{script}"
+        );
+    }
+}

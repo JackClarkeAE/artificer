@@ -267,6 +267,77 @@ fn a_cancelled_sweep_says_so_and_keeps_what_it_measured() {
 }
 
 #[test]
+fn a_sweep_of_curved_parts_stops_where_the_facets_can_no_longer_rule_out_an_overlap() {
+    // A cylinder slid towards another, closing a 0.05 mm gap to nothing in
+    // steps of 0.002. The chords of two r = 5 cylinders are off by about
+    // 0.005 each, so the facets can vouch for the gap down to roughly
+    // 0.01 and no further: the sweep stops there, before the surfaces
+    // meet, rather than only once a vertex is seen inside the other body.
+    let post = build("let c = cylinder(radius: 5, height: 20, label: \"c\");\n");
+    let subjects = vec![
+        Subject::new("fixed", post.clone()),
+        Subject::new("sliding", post),
+    ];
+    let steps = (0..=25)
+        .map(|step| {
+            let gap = 0.05 - 0.002 * f64::from(step);
+            SweepStep::new(
+                vec![gap],
+                vec![
+                    Placement::IDENTITY,
+                    Placement {
+                        columns: Placement::IDENTITY.columns,
+                        translation: [10.0 + gap, 0.0, 0.0],
+                    },
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let sweep = interference_sweep(
+        &subjects,
+        &steps,
+        precision(),
+        None,
+        &CancellationToken::default(),
+        &mut ignore,
+    );
+    let report = &sweep.report;
+    let collision = report
+        .collision
+        .as_ref()
+        .expect("the parts close to nothing");
+    let gap_at_stop = collision.drivers[0];
+    assert!(
+        gap_at_stop > 0.0 && gap_at_stop < 0.02,
+        "stopped at a gap of {gap_at_stop}: within the bound, before contact"
+    );
+    assert_eq!(report.steps_measured, collision.step + 1);
+    let pair = &report.pairs[0];
+    assert_eq!(pair.state, ClearanceState::Touching, "{pair:?}");
+    assert!(pair.bound > 0.0, "a curved pair carries its bound");
+    assert!(
+        pair.distance - pair.bound < 0.0,
+        "the tightest step is one the facets cannot clear: {pair:?}"
+    );
+    // The stop is where the gap first fell inside the bound, and every
+    // step before it was clear by more than the bound.
+    assert!(
+        gap_at_stop < pair.bound,
+        "{gap_at_stop} against {}",
+        pair.bound
+    );
+    let cleared = &steps[..collision.step];
+    assert!(
+        cleared.iter().all(|step| step.drivers[0] > pair.bound),
+        "a step inside the bound was passed over: {:?}",
+        cleared
+            .iter()
+            .map(|step| step.drivers[0])
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn a_step_that_does_not_place_every_body_is_skipped_rather_than_half_applied() {
     let subjects = mechanism();
     let mut steps = steps(1.0, 10);

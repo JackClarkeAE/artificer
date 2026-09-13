@@ -152,16 +152,30 @@ pub enum FitVerdict {
 impl FitVerdict {
     /// The verdict a measured pair earns under a profile.
     ///
-    /// Contact is judged on the measurement, not on the state: two bodies
-    /// that touch have a gap of zero, and zero is below every window whose
-    /// minimum is positive. A profile that asks for no gap at all passes
-    /// them, which is what an assembly check means.
+    /// The minimum is tested against the pessimistic gap, `distance -
+    /// bound`: the least the true surfaces can be apart is what has to
+    /// clear the window's floor, so a pair whose facets cannot vouch for
+    /// the fit is too close rather than passed on chords. The maximum is
+    /// tested against the measurement itself, so `loose` is raised
+    /// whenever the pair might be loose; it is a warning, not a failure.
+    ///
+    /// Contact is judged the same way. Two planar bodies that touch have a
+    /// gap of zero and a bound of zero, which is below every window whose
+    /// minimum is positive and inside the one that asks for no gap at all,
+    /// which is what an assembly check means. Two curved bodies that touch
+    /// have a pessimistic gap below zero, and no profile passes them: the
+    /// facets cannot say they do not overlap.
     #[must_use]
-    pub fn of(state: ClearanceState, distance: f64, profile: &ClearanceProfile) -> Self {
+    pub fn of(
+        state: ClearanceState,
+        distance: f64,
+        bound: f64,
+        profile: &ClearanceProfile,
+    ) -> Self {
         if state == ClearanceState::Interfering {
             return Self::TooClose;
         }
-        if distance < profile.minimum {
+        if distance - bound < profile.minimum {
             Self::TooClose
         } else if profile.maximum.is_none_or(|maximum| distance <= maximum) {
             Self::Pass
@@ -207,8 +221,13 @@ pub struct PairReport {
     pub witness_a: Point3,
     pub witness_b: Point3,
     pub tier: Tier,
-    /// How far below `distance` the true clearance may sit, from the chord
-    /// budget of each curved body. Zero when the pair is exact.
+    /// How far below `distance` the true clearance may sit: the measured
+    /// facet gap less the least the true surfaces can be apart, from the
+    /// sagitta of every chord that comes as near. The true gap is never
+    /// less than `distance - bound`, and never more than `distance + bound`.
+    /// Zero, and absent, when the pair is exact or when the closest
+    /// approach was read between planar faces with no chorded face as
+    /// near.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bound: f64,
     /// The volume the two bodies share, for a pair that interferes and
@@ -280,7 +299,7 @@ impl InterferenceReport {
         for pair in &mut self.pairs {
             pair.verdict = profile
                 .as_ref()
-                .map(|profile| FitVerdict::of(pair.state, pair.distance, profile));
+                .map(|profile| FitVerdict::of(pair.state, pair.distance, pair.bound, profile));
         }
         self.failing = self.verdicts(FitVerdict::TooClose);
         self.loose = self.verdicts(FitVerdict::Loose);
@@ -515,7 +534,9 @@ pub fn study_session_steps(
 /// The subjects named steps of a session stand for, at the identity.
 ///
 /// Two is the minimum: one body has nothing to be measured against, and a
-/// study of it would be a study of nothing.
+/// study of it would be a study of nothing. Nothing is implied by the
+/// session's current body, so the refusal lists the steps that could be
+/// named.
 pub fn session_subjects(
     session: &crate::api::session::Session,
     steps: &[String],
@@ -523,9 +544,14 @@ pub fn session_subjects(
     use crate::api::debug::{ApiError, ApiErrorCode};
 
     if steps.len() < 2 {
+        let available = if session.step_order.is_empty() {
+            "this session has no steps yet".to_owned()
+        } else {
+            format!("steps in this session: {}", session.step_order.join(", "))
+        };
         return Err(ApiError::new(
             ApiErrorCode::InvalidInput,
-            "An interference study needs at least two bodies to compare",
+            format!("Name at least two subjects; {available}"),
         ));
     }
     let mut subjects = Vec::with_capacity(steps.len());

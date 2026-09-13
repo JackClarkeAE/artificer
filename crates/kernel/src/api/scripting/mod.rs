@@ -412,6 +412,26 @@ pub const MAX_LOOP_ITERATIONS: usize = 10_000;
 /// refused outright; this bounds long chains of helpers calling helpers.
 pub const MAX_CALL_DEPTH: usize = 32;
 
+/// The longest chain of modules importing one another a script may open:
+/// the script's `use` counts as the first link. A library is a few modules
+/// deep; a chain past this is a runaway or an attack on the stack.
+pub const MAX_IMPORT_DEPTH: usize = 16;
+
+/// The most modules one compilation may load, however they are reached.
+pub const MAX_LOADED_MODULES: usize = 256;
+
+/// The longest string one value may hold, in bytes. Labels are words, not
+/// documents; the limit keeps `let s = s + s` in a loop from doubling until
+/// memory runs out.
+pub const MAX_STRING_BYTES: usize = 1 << 20;
+
+/// The most elements one array value may hold.
+pub const MAX_ARRAY_ELEMENTS: usize = 100_000;
+
+/// The most edge selectors `edges(count:)` will spell out at once. A step
+/// makes a handful of edges under one role, not thousands.
+pub const MAX_EDGE_SELECTORS: usize = 4096;
+
 /// Evaluates a `.art` script with optional parameter overrides, returning
 /// its commands and the selector names it bound. Modules are not loaded.
 pub fn compile_program(
@@ -889,6 +909,20 @@ impl<'a> Interp<'a> {
         if self.loaded.contains(&module.name) {
             return Ok(Env::new());
         }
+        if self.loading.len() >= MAX_IMPORT_DEPTH {
+            let mut chain = self.loading.clone();
+            chain.push(module.name.clone());
+            return Err(ScriptError::eval(format!(
+                "Modules import one another more than {MAX_IMPORT_DEPTH} deep: {}",
+                chain.join(" -> ")
+            )));
+        }
+        if self.loaded.len() >= MAX_LOADED_MODULES {
+            return Err(ScriptError::eval(format!(
+                "Loading module {} would exceed the {MAX_LOADED_MODULES} modules one script may load",
+                module.name
+            )));
+        }
         let tokens = tokenize(&module.source).map_err(|message| {
             ScriptError::eval(format!("In module {}: {message}", module.name))
         })?;
@@ -940,6 +974,12 @@ impl<'a> Interp<'a> {
                 })
             }
             Expression::Array(elements) => {
+                if elements.len() > MAX_ARRAY_ELEMENTS {
+                    return Err(ScriptError::eval(format!(
+                        "An array may hold at most {MAX_ARRAY_ELEMENTS} elements; this one has {}",
+                        elements.len()
+                    )));
+                }
                 let mut arr = Vec::new();
                 for el in elements {
                     arr.push(self.eval_expr(el, env)?);
@@ -970,7 +1010,17 @@ impl<'a> Interp<'a> {
                             ))),
                         }
                     };
-                    return Ok(Value::String(format!("{}{}", text(&left)?, text(&right)?)));
+                    let (left, right) = (text(&left)?, text(&right)?);
+                    // Checked before the join, so a string that has already
+                    // doubled itself to the limit is refused rather than
+                    // built one more time.
+                    if left.len() + right.len() > MAX_STRING_BYTES {
+                        return Err(ScriptError::eval(format!(
+                            "A string may hold at most {MAX_STRING_BYTES} bytes; joining these makes {}",
+                            left.len() + right.len()
+                        )));
+                    }
+                    return Ok(Value::String(format!("{left}{right}")));
                 }
                 let l = left.as_number()?;
                 let r = right.as_number()?;
@@ -1552,9 +1602,26 @@ impl<'a> Interp<'a> {
             Value::Step(s) => (s, BTreeMap::new()),
             Value::Command(cmd) => (StepLabel(cmd.label().to_owned()), BTreeMap::new()),
             Value::Body { step, faces } => (step, faces),
+            // A face selector names its edges: `faces(">Z").edges()` is every
+            // edge bounding that face, holes included; `.rim()` is the outer
+            // loop alone. Either resolves when the step using it runs.
+            Value::Selector(face) => {
+                if !named_args.is_empty() || !positional_args.is_empty() {
+                    return Err(ScriptError::eval(format!(
+                        "`.{method}` on a face selector takes no arguments"
+                    )));
+                }
+                return match method {
+                    "edges" => Ok(Value::Selector(EntitySelector::edges_of_face(face))),
+                    "rim" => Ok(Value::Selector(EntitySelector::rim_of_face(face))),
+                    other => Err(ScriptError::eval(format!(
+                        "Unknown method `.{other}` on a face selector; use .edges() for every edge of the face or .rim() for its outer loop"
+                    ))),
+                };
+            }
             other => {
                 return Err(ScriptError::eval(format!(
-                    "`.{method}` is used on a step or a body, got {}",
+                    "`.{method}` is used on a step, a body or a face selector, got {}",
                     other.describe()
                 )));
             }
@@ -1603,13 +1670,32 @@ impl<'a> Interp<'a> {
                 ordinal,
             })),
             "edges" => {
+                // With nothing named, every edge the step made whatever its
+                // role, as a set, so `cyl.edges()` is a cylinder's rims.
+                if positional_args.is_empty()
+                    && !args.values.contains_key("role")
+                    && !args.values.contains_key("count")
+                {
+                    return Ok(Value::Selector(EntitySelector::history_edges(step_label.0)));
+                }
                 // Every edge the step produced under the role, by ordinal; the
                 // session ignores ordinals the step never made.
                 let role = role(self, "edge")?;
                 let count = args
                     .values
                     .get("count")
-                    .map_or(Ok(12.0), Value::as_number)? as u32;
+                    .map_or(Ok(12.0), Value::as_number)?;
+                if !(count.is_finite() && count >= 0.0 && count.fract() == 0.0) {
+                    return Err(ScriptError::eval(format!(
+                        "`edges(count:)` takes a whole number of edges, got {count}"
+                    )));
+                }
+                if count > MAX_EDGE_SELECTORS as f64 {
+                    return Err(ScriptError::eval(format!(
+                        "`edges(count:)` spells out at most {MAX_EDGE_SELECTORS} edges, not {count}"
+                    )));
+                }
+                let count = count as u32;
                 Ok(Value::Array(
                     (0..count)
                         .map(|index| {
@@ -1680,9 +1766,9 @@ fn selector_kind(selector: &EntitySelector) -> Option<EntityKind> {
             GeometricSelector::NearestTo { kind, .. }
             | GeometricSelector::ByType { kind, .. }
             | GeometricSelector::ByExtremum { kind, .. } => Some(*kind),
-            GeometricSelector::EdgeBetween { .. } | GeometricSelector::EdgesParallelTo { .. } => {
-                Some(EntityKind::Edge)
-            }
+            GeometricSelector::EdgeBetween { .. }
+            | GeometricSelector::EdgesParallelTo { .. }
+            | GeometricSelector::EdgesOfFace { .. } => Some(EntityKind::Edge),
         },
     }
 }
@@ -2031,18 +2117,30 @@ fn named_selector(kind: EntityKind, args: &Args<'_>) -> Result<EntitySelector, S
     )))
 }
 
+/// The axis a face spelling points along: `">Z"` and `"top"` are +Z, and
+/// so on for the six directions.
+fn face_direction(spec: &str) -> Option<Vector3> {
+    Some(match spec {
+        ">Z" | "top" => Vector3::new(0.0, 0.0, 1.0),
+        "<Z" | "bottom" => Vector3::new(0.0, 0.0, -1.0),
+        ">Y" | "back" => Vector3::new(0.0, 1.0, 0.0),
+        "<Y" | "front" => Vector3::new(0.0, -1.0, 0.0),
+        ">X" | "right" => Vector3::new(1.0, 0.0, 0.0),
+        "<X" | "left" => Vector3::new(-1.0, 0.0, 0.0),
+        _ => return None,
+    })
+}
+
 fn face_selector(spec: &str) -> Result<EntitySelector, ScriptError> {
-    let by_normal = |direction: Vector3| GeometricSelector::FaceByNormal {
-        direction,
-        match_kind: NormalMatch::Closest,
-    };
+    if let Some(direction) = face_direction(spec) {
+        return Ok(EntitySelector::ByGeometry {
+            selector: GeometricSelector::FaceByNormal {
+                direction,
+                match_kind: NormalMatch::Closest,
+            },
+        });
+    }
     let selector = match spec {
-        ">Z" | "top" => by_normal(Vector3::new(0.0, 0.0, 1.0)),
-        "<Z" | "bottom" => by_normal(Vector3::new(0.0, 0.0, -1.0)),
-        ">Y" | "back" => by_normal(Vector3::new(0.0, 1.0, 0.0)),
-        "<Y" | "front" => by_normal(Vector3::new(0.0, -1.0, 0.0)),
-        ">X" | "right" => by_normal(Vector3::new(1.0, 0.0, 0.0)),
-        "<X" | "left" => by_normal(Vector3::new(-1.0, 0.0, 0.0)),
         "largest" => GeometricSelector::ByExtremum {
             metric: Metric::Area,
             extremum: Extremum::Maximum,
@@ -2099,8 +2197,14 @@ fn edge_selector(spec: &str) -> Result<EntitySelector, ScriptError> {
             kind: EntityKind::Edge,
         },
         _ => {
+            // A face direction names that face's edges: `edges(">Z")` is
+            // `faces(">Z").edges()`. The other face spellings are not
+            // taken, so an edge selector never quietly means many faces.
+            if face_direction(spec).is_some() {
+                return Ok(EntitySelector::edges_of_face(face_selector(spec)?));
+            }
             return Err(ScriptError::eval(format!(
-                "Unknown edge selector `{spec}`; use |X, |Y, |Z, longest or shortest"
+                "Unknown edge selector `{spec}`; use |X, |Y, |Z, longest, shortest, or a face direction such as >Z or top for the edges of that face"
             )));
         }
     };

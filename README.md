@@ -31,7 +31,7 @@ This release is about verification-driven CAD: letting a program, not only a per
 
 - **The session report.** `artificer-api report part.art` (or `run --json`) prints a versioned JSON document: every step with the strategy **rung** that certified it (`face-feature/exact-prism`, `edge-finish/rim-blend`, `boolean/analytic`, ...) and whether it was exact or fell to the faceted tier, the body's exact volume, area and centroid, every face and edge described from its analytic carrier, the names the script gave, and the failing step with its diagnostic codes and script line when a run stops short. The shape is published as a JSON Schema in [`docs/report-schema.json`](docs/report-schema.json) and a test keeps its list of diagnostic codes equal to what the kernel source emits. The JSON-RPC methods `script.report`, `report` and `query.describe` give the same over the wire.
 - **Interference studies.** `analysis.interference` measures every pair of named bodies and publishes a versioned document: apart, touching or overlapping, how close, where on each body, and the shared volume where the Boolean engine can supply it. Where the Boolean engine cannot carry the operands the pair keeps its measured clearance and records the engine's refusal code beside it, so a study never fails because a Boolean did. The workbench runs the same study over its visible bodies from View ▸ Interference and lists the pairs worst first. Its schema is [`docs/analysis-schema.json`](docs/analysis-schema.json), held to the kernel by a test.
-- **Clearance between bodies.** `probe clearance` answers how close two bodies come, where, and whether they are apart, touching or inside one another. It runs over a bounding-volume hierarchy of each body's facets rather than through a Boolean, so it answers for bodies the Boolean engine refuses, and it publishes the chord bound when either body is curved.
+- **Clearance between bodies.** `probe clearance` answers how close two bodies come, where, and whether they are apart, touching or inside one another. It runs over a bounding-volume hierarchy of each body's facets rather than through a Boolean, so it answers for bodies the Boolean engine refuses. Facets are chords, so alongside the measured distance it publishes a `bound` the kernel earns rather than assumes: the sagitta of every display chord that comes as near, summed over the two bodies by a second descent through the same hierarchy. The true gap is never below `distance − bound`, and every judgement — apart, touching, inside, and a fit profile's verdict — is made on that pessimistic figure, so a pair is never called clear, and a running fit never passed, on the strength of where a chord happened to fall.
 - **Probes that change nothing.** `probe` answers volume, surface area, face area, edge length, minimum distance, the overlap volume of two bodies, point containment and thinnest wall, each with a tier and the method behind it, and leaves the session's digest untouched. The reference is [`docs/verification.md`](docs/verification.md).
 - **Clearance profiles, so a measurement becomes an answer.** `0.42 mm` says nothing until a fit says what it wanted. `analysis.profiles` publishes a catalogue an agent can discover rather than guess — a machined running fit at 0.02–0.08 mm, masked stereolithography at 0.05–0.15, an FDM press fit at 0.10–0.20, an FDM sliding fit at 0.30–0.50, and plain assembly, which asks only that nothing shares space — and a study run against one earns every pair a verdict. `too_close` is the only verdict that fails; `loose` still reports a part meant to be held that is not. A fit of your own goes in inline, with no upper complaint if you omit one.
 - **A heat map of where it is tight.** `analysis.clearance_field` reads the signed clearance at every corner and centre of every display facet — positive a gap, negative how far inside — and the workbench paints it straight onto the body, so the tight spot is somewhere you look at rather than a number you correlate. The palette is a measured ramp rather than a fixed scale, and the legend names what the colours are worth.
@@ -39,7 +39,7 @@ This release is about verification-driven CAD: letting a program, not only a per
 - **Sweeping a mechanism through its travel.** The harder question is not whether the parts fit where they sit, but whether they fit *anywhere they can go*. `analysis.sweep` measures every pair at every position and stops at the first collision, because past that the parts have already passed through one another and nothing beyond is a pose the real thing reaches. It reports how much of the travel it answered for against how much it was offered, so an interrupted sweep reads as unmeasured rather than clear. Its schema is [`docs/sweep-schema.json`](docs/sweep-schema.json). The workbench runs it over the joints the play button animates, off the UI thread, with a progress count.
 - **A move gizmo you can grab.** Three arrows on X, Y and Z at the tool's origin. Grab one and the drag is constrained to that axis alone, with the other two dimmed so it is clear what you have hold of; the distance follows the cursor along the axis rather than raw pixels.
 - **Insert a part into the design you have open.** In the Model tab's Create group: a catalogue part arrives as its own body and occurrence, which is how an assembly is built up and what the joint solver then poses.
-- **Everything above is reachable over the wire**, not only from Rust, and [`docs/art-scripting.md`](docs/art-scripting.md) — the reference written to be handed to an AI agent as-is — now covers the analysis surface end to end, with the request an agent would actually send for each and a section on what the numbers are worth: facets are chords, so an approximate answer is never optimistic but can be short by one chord budget per curved body, and a conservative caller subtracts the published bound before concluding a part fits.
+- **Everything above is reachable over the wire**, not only from Rust, and [`docs/art-scripting.md`](docs/art-scripting.md) — the reference written to be handed to an AI agent as-is — now covers the analysis surface end to end, with the request an agent would actually send for each and a section on what the numbers are worth: facets are chords, so an approximate distance can be off by the published `bound` — the sagitta of the chords it was read from — and the kernel's own verdicts already subtract it; a caller reading `distance` alone should do the same before concluding a part fits. `session.reset` returns a server to a fresh session, since `script.run` adds to the one it has.
 - **Every step result** now carries its rung, tier and construction warnings, and Script Studio prints them in the console.
 - **Exact STEP.** `artificer-api export part.art part.step` (JSON-RPC `export.step`, the workbench's "STEP (exact B-rep)") writes the body as AP214 `advanced_brep_shape_representation`: planes, cylinders, cones, spheres and tori as the five STEP elementary surfaces, lines, circles and ellipses as themselves, cavities as `brep_with_voids`, nothing tessellated. The exporter's tests read every file back as a manifold B-rep and check each face's sense against the kernel's own normals; `tools/oracle-occt/step_measure.py` is the OpenCascade oracle a development machine runs to confirm imported volume and area to one part in a billion. Faceted STEP stays for mesh consumers (`--faceted`, "STEP (faceted)").
 - **Journals back to scripts, and scripts compared.** `artificer-api journal session.json --art out.art` (JSON-RPC `journal.art`, `Session::to_art`) writes a session's journal as a `.art` script that rebuilds the same digest, with dimensions as `param`s, snapshot-bound references regenerated as history selectors, and faceted-tier steps annotated. `artificer-api diff a.art b.art --json` (JSON-RPC `script.diff`) compares two scripts semantically: parameters, steps added, removed, moved or changed, names renamed or retargeted. Script Studio pulls a journal into the open script behind that diff, and exports its own.
@@ -68,7 +68,7 @@ Artificer is three things, deliberately kept apart:
 
 | | What it is | Where it lives | Depends on |
 |---|---|---|---|
-| **Artificer Kernel** | A standalone exact B-rep modelling kernel with its programmatic API built in: a Rust API, a JSON-RPC 2.0 server, the `.art` scripting language, headless PNG/SVG rendering, and STL/OBJ export. | [`crates/kernel`](crates/kernel) | Nothing but its own geometry, compute, and protocol crates. No UI, no GPU, no C or C++. |
+| **Artificer Kernel** | A standalone exact B-rep modelling kernel with its programmatic API built in: a Rust API, a JSON-RPC 2.0 server, the `.art` scripting language, headless PNG/SVG rendering, and STL, OBJ and STEP export. | [`crates/kernel`](crates/kernel) | Nothing but its own geometry, compute, and protocol crates. No UI, no GPU, no C or C++. |
 | **Artificer Workbench** | A native desktop parametric CAD application: sketching, features, assemblies, a part library, and a parametric history. | [`apps/workbench`](apps/workbench) | The kernel, through the same protocol every other client uses. |
 | **Artificer Script Studio** | A live `.art` visualiser in the OpenSCAD shape: the script on the left, the exact model on the right, a customizer built from the script's parameters, and a console that points at the failing line. | [`apps/script-studio`](apps/script-studio) | The kernel, through its API session, and the workbench's viewport and theme. |
 
@@ -174,7 +174,7 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `pattern(step:, axis:, axis_origin:, count:, angle:)`, `pattern(step:, direction:, spacing:, count:)` | Repeats a drilled hole or a face-sketch extrusion around an axis or along a row. |
 | `pattern(direction:, spacing:, count:)` | Copies the whole body along a row, exactly. |
 | `union(target:, tool:)`, `difference(target:, tool:)`, `intersection(target:, tool:)` | Booleans between two steps. |
-| `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")` | Selectors. |
+| `faces(">Z")`, `edges("\|Z")`, `nearest(point:, kind:)`, `step.face("role")`, `step.edge("role")`, `faces(">Z").edges()`, `faces(">Z").rim()`, `edges(">Z")`, `step.edges()` | Selectors. `.edges()` on a face is every edge bounding it and `.rim()` its outer loop; `edges(">Z")` is short for `faces(">Z").edges()`; `step.edges()` is every edge a step made. |
 | `fn name(a: f64, on: face, label: str) -> body { ... return step with faces { top: ... }; }` | Functions with typed arguments, call-scoped labels and exported faces. |
 | `use "lib/parts.art";` | Modules of functions and constants. |
 | `param wall: f64 [mm] in 1..4 = 2 "wall";` | Parameters with a unit, a range and a description. |
@@ -189,7 +189,7 @@ Errors name their line and column, so an editor can point at them. `artificer-ap
 - Regularized Boolean union, difference, and intersection, with an exact engine for plane and cylinder operands and a faceted fallback that says so.
 - Analytic surface–surface intersections across the vocabulary, published as a supported-domain matrix.
 - Geometric selectors (`faces(">Z")`, `edges("|Z")`, by extremum, by type, parallel to a direction) that resolve deterministically or refuse with candidates.
-- Headless tessellation at display or authoritative chord budgets, SVG and PNG snapshots from any camera, and STL/OBJ export.
+- Headless tessellation at display or authoritative chord budgets, SVG and PNG snapshots from any camera, and STL, OBJ and STEP export.
 
 ---
 
@@ -226,7 +226,7 @@ The desktop application is the reference client for the kernel and a complete si
 - **Face sketches.** Sketch on any planar face with the body always in view; project the geometry hidden below the surface as an x-ray when you need to line up with it.
 - **Assemblies and library.** A content-addressed part library, rigid placements, grounding, and revolute joints with live motion.
 - **Documents.** Several documents open at once in tabs along the top of the window; a portable native document format with a versioned schema.
-- **Viewport.** Exact silhouettes, hidden-line rendering, smooth shading from analytic normals, a view cube, and themes.
+- **Viewport.** Exact silhouettes, hidden-line rendering, smooth shading from analytic normals, a view cube, and themes. The cube's corners and edges are clickable as well as its faces, so an isometric or a half-turned view is one click with world Z kept upright. A 3Dconnexion SpaceMouse orbits, pans, and zooms the model directly (button 1 fits the view, button 2 flips between the two most recent views), with device status and a sensitivity slider under About Artificer; on Linux the raw HID node is root-only until a udev rule such as `KERNEL=="hidraw*", ATTRS{idVendor}=="256f", MODE="0660", TAG+="uaccess"` (and the same for `046d` with `ATTRS{idProduct}=="c62?"`) in `/etc/udev/rules.d/70-spacemouse.rules` grants it; the rule ships as [`packaging/linux/70-spacemouse.rules`](packaging/linux/70-spacemouse.rules) — see ADR 0031.
 
 ---
 
@@ -314,7 +314,7 @@ Installers are published on the [Releases page](https://github.com/JackClarkeAE/
 | **Protocol** | [`crates/protocol`](crates/protocol) | The serialisable command, snapshot, and diagnostic vocabulary shared by every client. |
 | **Sketch** | [`crates/sketch`](crates/sketch) | Exact 2D authoring: recipes, constraints, the arrangement into regions, profile compilation, text outlines. |
 | **Model** | [`crates/model`](crates/model) | The parametric document: features, persistent references, parameters, journals, and the native file schema. |
-| **Kernel server** | [`apps/api-server`](apps/api-server) | The command-line front for the kernel API: `serve`, `run`, `snapshot`, `export`, `journal`. |
+| **Kernel server** | [`apps/api-server`](apps/api-server) | The command-line front for the kernel API: `serve`, `run`, `report`, `params`, `snapshot`, `export`, `journal`, `diff`. |
 | **Presentation** | [`crates/viewport`](crates/viewport), [`crates/sketch-ui`](crates/sketch-ui), [`crates/ui-core`](crates/ui-core) | The 3D viewport, the sketch canvas, and the shared theme and widgets. None of these can see the kernel's internals. |
 | **Workbench** | [`apps/workbench`](apps/workbench) | The desktop application. |
 | **Script Studio** | [`apps/script-studio`](apps/script-studio) | The live `.art` visualiser: editor, customizer, console, and the shared viewport, driving the kernel through its API session. |
@@ -331,11 +331,13 @@ The dependency rules between these layers are checked by `scripts/check-architec
 - [x] Parametric documents, assemblies, part library, joints.
 - [x] The kernel API: Rust, JSON-RPC, `.art` scripts, headless snapshots and export.
 - [x] Multi-document workbench, sketch text, drafted extrusion as the first loft rung.
-- [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces; shell.
+- [x] Shell.
+- [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces.
 - [x] The ellipse curve, first slice: the mitre seam of a fillet turning a sharp corner, so fillets round square holes and L-shaped rims are exact.
 - [x] Oblique plane sections of cylinders on the same curve, through the analytic Boolean: angled holes, mitred cylinder ends, oblique cuts of round bodies.
 - [ ] Oblique cone sections, and pipe tees (equal cylinders crossing) on the same ellipse.
-- [ ] Native STEP read and write with exact surfaces, IGES import, DXF drawing sheets.
+- [x] Native STEP write with exact surfaces.
+- [ ] Native STEP read, IGES import, DXF drawing sheets.
 
 ---
 

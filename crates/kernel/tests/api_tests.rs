@@ -496,6 +496,342 @@ fn a_deeply_nested_script_is_an_error_not_a_stack_overflow() {
 }
 
 #[test]
+fn deeply_nested_blocks_and_types_are_errors_not_stack_overflows() {
+    use artificer_kernel::api::scripting::parser::MAX_BLOCK_DEPTH;
+
+    let limit = format!("nested deeper than {MAX_BLOCK_DEPTH} levels");
+    let depth = 10_000;
+    let loops = format!(
+        "{}let b = box(size: [1, 1, 1], label: \"b\");{}",
+        "for i in 0..1 { ".repeat(depth),
+        " }".repeat(depth)
+    );
+    let error = compile_script(&loops, &BTreeMap::new()).expect_err("blocks past the limit");
+    assert!(error.to_string().contains(&limit), "{error}");
+    assert!(error.to_string().contains("Blocks"), "{error}");
+
+    let types = format!(
+        "fn f(x: {}f64{}) {{ }}",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    let error = compile_script(&types, &BTreeMap::new()).expect_err("types past the limit");
+    assert!(error.to_string().contains(&limit), "{error}");
+    assert!(error.to_string().contains("Array types"), "{error}");
+
+    // Ordinary nesting is untouched.
+    let fine = "let b = box(size: [10, 10, 10], label: \"b\");
+fn noop(x: [[f64; 2]; 2]) { }
+for i in 0..2 { for j in 0..2 { for k in 0..2 { let n = i + j + k; } } }
+";
+    compile_script(fine, &BTreeMap::new()).expect("three loops deep is a script, not an attack");
+}
+
+#[test]
+fn a_chain_of_imports_and_a_crowd_of_modules_are_refused_by_count() {
+    use artificer_kernel::api::scripting::{MAX_IMPORT_DEPTH, MAX_LOADED_MODULES};
+
+    let server = SharedSession::new();
+    // A hundred modules each importing the next.
+    let modules = (0..100)
+        .map(|index| {
+            let source = if index + 1 < 100 {
+                format!("use \"m{}.art\";\n", index + 1)
+            } else {
+                "let deep = 1;\n".to_owned()
+            };
+            (format!("m{index}.art"), source)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "script.run",
+        "params": {"source": "use \"m0.art\";\n", "modules": modules}
+    });
+    let answer = server.handle_request(&request.to_string());
+    let error = answer.error.expect("a chain of a hundred is refused");
+    assert!(
+        error
+            .message
+            .contains(&format!("more than {MAX_IMPORT_DEPTH} deep")),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("m0.art -> m1.art"),
+        "{}",
+        error.message
+    );
+
+    // Many modules side by side, none deep, past the count.
+    let modules = (0..=MAX_LOADED_MODULES)
+        .map(|index| {
+            (
+                format!("n{index}.art"),
+                format!("let n{index} = {index};\n"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let source = (0..=MAX_LOADED_MODULES)
+        .map(|index| format!("use \"n{index}.art\";\n"))
+        .collect::<String>();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "script.run",
+        "params": {"source": source, "modules": modules}
+    });
+    let answer = server.handle_request(&request.to_string());
+    let error = answer.error.expect("too many modules is refused");
+    assert!(
+        error
+            .message
+            .contains(&format!("{MAX_LOADED_MODULES} modules")),
+        "{}",
+        error.message
+    );
+
+    // A library a few modules deep is what the limit is for, not against.
+    let modules = (0..4)
+        .map(|index| {
+            let source = if index < 3 {
+                format!("use \"lib{}.art\";\nlet l{index} = {index};\n", index + 1)
+            } else {
+                "let l3 = 3;\n".to_owned()
+            };
+            (format!("lib{index}.art"), source)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "script.run",
+        "params": {
+            "source": "use \"lib0.art\";\nlet b = box(size: [l0 + 1, l3, 1], label: \"b\");\n",
+            "modules": modules
+        }
+    });
+    let answer = server.handle_request(&request.to_string());
+    assert_eq!(answer.error, None, "{answer:?}");
+}
+
+#[test]
+fn values_that_would_exhaust_memory_are_refused_by_size() {
+    use artificer_kernel::api::scripting::{
+        MAX_ARRAY_ELEMENTS, MAX_EDGE_SELECTORS, MAX_STRING_BYTES,
+    };
+
+    // A string doubling itself forty times would be a terabyte.
+    let doubling = "let s = \"ab\";\nfor i in 0..40 { let s = s + s; }\n";
+    let error = compile_script(doubling, &BTreeMap::new()).expect_err("a runaway string");
+    assert!(
+        error
+            .message()
+            .contains(&format!("{MAX_STRING_BYTES} bytes")),
+        "{error}"
+    );
+
+    // An array literal past the element count.
+    let elements = MAX_ARRAY_ELEMENTS + 1;
+    let literal = format!("let a = [{}];\n", vec!["1"; elements].join(","));
+    let error = compile_script(&literal, &BTreeMap::new()).expect_err("too many elements");
+    assert!(
+        error
+            .message()
+            .contains(&format!("{MAX_ARRAY_ELEMENTS} elements")),
+        "{error}"
+    );
+
+    // `edges(count:)` spells out one selector per edge and will not spell
+    // out a billion; a fraction or a negative count is not a count at all.
+    let billion =
+        "let b = box(size: [1, 1, 1], label: \"b\");\nlet e = b.edges(count: 1000000000);\n";
+    let error = compile_script(billion, &BTreeMap::new()).expect_err("too many edges");
+    assert!(
+        error
+            .message()
+            .contains(&format!("{MAX_EDGE_SELECTORS} edges")),
+        "{error}"
+    );
+    let fraction = "let b = box(size: [1, 1, 1], label: \"b\");\nlet e = b.edges(count: 2.5);\n";
+    let error = compile_script(fraction, &BTreeMap::new()).expect_err("not a whole number");
+    assert!(error.message().contains("whole number"), "{error}");
+    let usual = "let b = box(size: [1, 1, 1], label: \"b\");\nlet e = b.edges(count: 12);\n";
+    compile_script(usual, &BTreeMap::new()).expect("a dozen edges is the ordinary case");
+}
+
+#[test]
+fn a_snapshot_of_an_absurd_size_is_refused_before_it_is_allocated() {
+    use artificer_kernel::api::snapshot::MAX_SNAPSHOT_DIMENSION;
+
+    let server = SharedSession::new();
+    let make = r#"{"jsonrpc":"2.0","id":1,"method":"execute","params":{"type":"make_box","label":"b","origin":{"x":0,"y":0,"z":0},"size":[10,10,10]}}"#;
+    assert_eq!(server.handle_request(make).error, None);
+    for (width, height) in [
+        (4_294_967_295_u32, 1_u32),
+        (1, 4_294_967_295),
+        (0, 100),
+        (100, 0),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "snapshot",
+            "params": {
+                "format": "png",
+                "camera": {
+                    "position": {"x": 100.0, "y": 100.0, "z": 100.0},
+                    "target": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "up": {"x": 0.0, "y": 0.0, "z": 1.0},
+                    "projection": {"type": "orthographic"},
+                    "width": width,
+                    "height": height
+                }
+            }
+        });
+        let answer = server.handle_request(&request.to_string());
+        let error = answer.error.expect("an impossible image is refused");
+        assert_eq!(error.code, -32602, "{error:?}");
+        assert!(
+            error
+                .message
+                .contains(&format!("between 1 and {MAX_SNAPSHOT_DIMENSION}")),
+            "{}",
+            error.message
+        );
+    }
+    // The server is still there, and an ordinary snapshot still renders.
+    let after = server.handle_request(r#"{"jsonrpc":"2.0","id":3,"method":"query.bounds"}"#);
+    assert_eq!(after.error, None, "{after:?}");
+    let usual = server.handle_request(r#"{"jsonrpc":"2.0","id":4,"method":"snapshot"}"#);
+    assert_eq!(usual.error, None, "{usual:?}");
+
+    // The session refuses the same before allocating, for hosts that
+    // bypass the server.
+    let mut session = Session::new();
+    session
+        .execute(
+            ApiCommand::MakeBox {
+                label: "b".to_owned(),
+                origin: Point3::new(0.0, 0.0, 0.0),
+                size: [10.0, 10.0, 10.0],
+            },
+            &CancellationToken::default(),
+        )
+        .expect("a box");
+    let mut camera = CameraSpec::preset(StandardView::Isometric);
+    camera.width = u32::MAX;
+    let error = session
+        .snapshot(SnapshotOptions {
+            camera,
+            format: artificer_kernel::api::snapshot::SnapshotFormat::Png,
+            ..SnapshotOptions::default()
+        })
+        .expect_err("refused");
+    assert_eq!(
+        error.code,
+        artificer_kernel::api::debug::ApiErrorCode::InvalidInput
+    );
+}
+
+#[test]
+fn a_panic_while_a_request_holds_the_session_does_not_end_the_server() {
+    let server = SharedSession::new();
+    let make = r#"{"jsonrpc":"2.0","id":1,"method":"execute","params":{"type":"make_box","label":"b","origin":{"x":0,"y":0,"z":0},"size":[10,10,10]}}"#;
+    assert_eq!(server.handle_request(make).error, None);
+
+    // A panic on another thread while it holds the session's lock poisons
+    // the mutex, which is what a caught panic inside a request leaves
+    // behind. The next request recovers the session rather than refusing
+    // every request from then on, and the work already in it stands.
+    let poisoner = server.clone();
+    let outcome = std::thread::spawn(move || {
+        let _held = poisoner.session().lock().unwrap();
+        panic!("a kernel invariant tripped");
+    })
+    .join();
+    assert!(outcome.is_err(), "the thread panicked as arranged");
+    assert!(server.session().is_poisoned());
+
+    let after = server.handle_request(r#"{"jsonrpc":"2.0","id":2,"method":"query.bounds"}"#);
+    assert_eq!(after.error, None, "{after:?}");
+    assert_eq!(
+        after.result.unwrap()["max"]["x"],
+        10.0,
+        "the box is still there"
+    );
+    let batch = server
+        .handle_message(r#"[{"jsonrpc":"2.0","id":3,"method":"report"},{"jsonrpc":"2.0","id":4,"method":"query.bodies"}]"#)
+        .expect("a batch is answered");
+    let parsed: serde_json::Value = serde_json::from_str(&batch).expect("json");
+    assert_eq!(parsed.as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn session_reset_returns_the_server_to_a_fresh_state_and_keeps_precision() {
+    let server = SharedSession::new();
+    let run = |id: u32| {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "script.run",
+            "params": {"source": "let b = box(size: [10, 10, 10], label: \"b\");\n"}
+        });
+        server.handle_request(&request.to_string())
+    };
+    assert_eq!(run(1).error, None);
+    // A second run adds to the session, so its labels collide.
+    let again = run(2).error.expect("the label is already used");
+    assert!(again.message.contains("already used"), "{}", again.message);
+
+    let reset = server.handle_request(r#"{"jsonrpc":"2.0","id":3,"method":"session.reset"}"#);
+    assert_eq!(reset.error, None, "{reset:?}");
+    assert_eq!(reset.result.unwrap()["status"], "reset");
+    let report = server.handle_request(r#"{"jsonrpc":"2.0","id":4,"method":"report"}"#);
+    let report = report.result.expect("a report of an empty session");
+    assert_eq!(
+        report["steps"].as_array().map(Vec::len),
+        Some(0),
+        "{report}"
+    );
+    let journal = server.handle_request(r#"{"jsonrpc":"2.0","id":5,"method":"journal.export"}"#);
+    let journal: serde_json::Value =
+        serde_json::from_str(journal.result.unwrap().as_str().unwrap()).expect("json");
+    assert_eq!(
+        journal["entries"].as_array().map(Vec::len),
+        Some(0),
+        "{journal}"
+    );
+    let undo = server.handle_request(r#"{"jsonrpc":"2.0","id":6,"method":"undo"}"#);
+    assert!(undo.error.is_some(), "nothing to undo after a reset");
+    // And the same script runs again.
+    assert_eq!(run(7).error, None);
+
+    // In Rust the precision policy survives the reset; everything else goes.
+    let mut precision = artificer_protocol::PrecisionPolicy::default();
+    precision.linear_agreement *= 4.0;
+    let mut session = Session::with_precision(precision);
+    session
+        .execute(
+            ApiCommand::MakeBox {
+                label: "b".to_owned(),
+                origin: Point3::new(0.0, 0.0, 0.0),
+                size: [10.0, 10.0, 10.0],
+            },
+            &CancellationToken::default(),
+        )
+        .expect("a box");
+    session.reset();
+    assert_eq!(session.precision, precision);
+    assert!(session.step_order.is_empty());
+    assert!(session.journal.entries.is_empty());
+    assert!(session.undo_stack.is_empty());
+    assert_eq!(session.snapshot_cache.len(), 1, "only the empty snapshot");
+    assert_eq!(session.snapshot.measures().volume, 0.0);
+}
+
+#[test]
 fn geometric_selectors_round_trip_through_json() {
     let selector = EntitySelector::ByGeometry {
         selector: GeometricSelector::FaceByNormal {

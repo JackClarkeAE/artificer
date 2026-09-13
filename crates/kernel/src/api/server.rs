@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Read, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use crate::CancellationToken;
@@ -28,6 +29,13 @@ use crate::api::snapshot::SnapshotOptions;
 /// or a journal is kilobytes, never gigabytes, and an unbounded line is an
 /// out-of-memory waiting to happen.
 pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// The stack the server loop runs on. The parser and the evaluator recurse
+/// to the nesting limits they enforce, and the kernel's own construction
+/// code is deep; a main thread's default stack, one megabyte on Windows,
+/// leaves no headroom under those limits, so the loop gets a thread of its
+/// own with room to spare.
+pub const SERVER_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// JSON-RPC error codes, as the specification names them.
 pub const PARSE_ERROR: i32 = -32700;
@@ -144,9 +152,22 @@ impl SharedSession {
         }
     }
 
+    /// The session behind the lock, for a host that embeds the server and
+    /// reads or seeds the session directly. Requests recover the lock after
+    /// a panic on another thread; a caller of this does its own recovering.
+    #[must_use]
+    pub fn session(&self) -> &Mutex<Session> {
+        &self.session
+    }
+
     /// Handles one line of input: a single request, or a batch. Returns the
     /// JSON to write back, or `None` when nothing is owed (a notification,
     /// or a batch made only of notifications).
+    ///
+    /// A panic while handling a request — a kernel invariant tripped by a
+    /// model it had not met before — is answered as an internal error on
+    /// that request, and the server goes on to the next. The other
+    /// requests of a batch are still answered.
     pub fn handle_message(&self, message_json: &str) -> Option<String> {
         let message = match serde_json::from_str::<serde_json::Value>(message_json) {
             Ok(serde_json::Value::Array(requests)) => Message::Batch(requests),
@@ -200,7 +221,7 @@ impl SharedSession {
             ));
         }
         let is_notification = request.id.is_none();
-        let response = self.dispatch(request);
+        let response = self.dispatch_catching(request);
         (!is_notification).then_some(response)
     }
 
@@ -220,21 +241,30 @@ impl SharedSession {
                 "Invalid Request: `jsonrpc` must be \"2.0\"",
             );
         }
-        self.dispatch(request)
+        self.dispatch_catching(request)
+    }
+
+    /// Dispatches one request, turning a panic on the way into an internal
+    /// error carrying the panic's message, with the request's id.
+    fn dispatch_catching(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+        let id = request.id.clone();
+        catch_unwind(AssertUnwindSafe(|| self.dispatch(request)))
+            .unwrap_or_else(|payload| internal_error(id, &payload))
     }
 
     fn dispatch(&self, request: JsonRpcRequest) -> JsonRpcResponse {
         let id = request.id.clone();
-        let mut session = match self.session.lock() {
-            Ok(session) => session,
-            Err(_) => {
-                return JsonRpcResponse::err(
-                    id,
-                    INTERNAL_ERROR,
-                    "The session is unusable after an earlier internal failure; restart the server",
-                );
-            }
-        };
+        // A panic caught while a request held the lock leaves the mutex
+        // poisoned. The guard is recovered with `into_inner` rather than
+        // the session reset: the kernel builds a step's outcome in full
+        // before the session records any of it, so a panic in the kernel
+        // leaves the session as it was before that request, and the work
+        // already in it is worth more than a clean slate nobody asked for.
+        // A caller who wants the slate anyway has `session.reset`.
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let token = CancellationToken::default();
         let params = request.params.unwrap_or(serde_json::Value::Null);
@@ -598,10 +628,23 @@ impl SharedSession {
                         }
                     }
                 };
+                // An image the renderer would not allocate is the caller's
+                // mistake, refused before the session is asked for it.
+                if let Err(message) = options.camera.check_dimensions() {
+                    return JsonRpcResponse::err(
+                        id,
+                        INVALID_PARAMS,
+                        format!("Invalid snapshot params: {message}"),
+                    );
+                }
                 match session.snapshot(options) {
                     Ok(output) => respond(id, &output),
                     Err(error) => JsonRpcResponse::api_error(id, &error),
                 }
+            }
+            "session.reset" => {
+                session.reset();
+                JsonRpcResponse::ok(id, serde_json::json!({ "status": "reset" }))
             }
             "undo" => match session.undo() {
                 Ok(()) => JsonRpcResponse::ok(id, serde_json::json!({ "status": "undone" })),
@@ -711,9 +754,57 @@ fn respond<T: Serialize>(id: Option<serde_json::Value>, value: &T) -> JsonRpcRes
     }
 }
 
+/// The message a panic carried, when it carried one a person can read.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_else(|| "a panic with no message".to_owned())
+}
+
+/// The answer to a request that panicked: an internal error naming what
+/// went wrong, so the caller learns it rather than losing the connection.
+fn internal_error(
+    id: Option<serde_json::Value>,
+    payload: &(dyn std::any::Any + Send),
+) -> JsonRpcResponse {
+    JsonRpcResponse::err(
+        id,
+        INTERNAL_ERROR,
+        format!("Internal error: {}", panic_message(payload)),
+    )
+}
+
+/// The id of a request line, when the line is a single request that names
+/// one, so a failure outside the dispatcher can still be answered to it.
+fn request_id(message_json: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<JsonRpcRequest>(message_json)
+        .ok()
+        .and_then(|request| request.id)
+}
+
 /// Runs the JSON-RPC server listening on standard input and writing to
 /// standard output, one message per line.
+///
+/// The loop runs on its own thread with [`SERVER_STACK_BYTES`] of stack;
+/// this call blocks until standard input closes.
 pub fn serve_stdio() -> io::Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("artificer-json-rpc".to_owned())
+        .stack_size(SERVER_STACK_BYTES)
+        .spawn(serve_stdio_here)?;
+    worker
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("the JSON-RPC server thread panicked")))
+}
+
+/// The server loop itself, on whatever thread calls it.
+fn serve_stdio_here() -> io::Result<()> {
     let session = SharedSession::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -748,7 +839,15 @@ pub fn serve_stdio() -> io::Result<()> {
             if trimmed.is_empty() {
                 continue;
             }
-            session.handle_message(trimmed)
+            // Each request is already answered for its own panic inside
+            // `handle_message`; this catches anything on the way in or
+            // out of it — framing, serialisation — so no line can end the
+            // process. The id is recovered from the line when it has one.
+            catch_unwind(AssertUnwindSafe(|| session.handle_message(trimmed))).unwrap_or_else(
+                |payload| {
+                    serde_json::to_string(&internal_error(request_id(trimmed), &payload)).ok()
+                },
+            )
         };
         if let Some(response) = response {
             writeln!(stdout, "{response}")?;

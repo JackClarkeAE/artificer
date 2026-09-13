@@ -139,7 +139,7 @@ that step left behind; without one it reads the current body.
 
 | Probe | Answer | Tier |
 | --- | --- | --- |
-| `clearance` `{a, b}` | The closest approach of two bodies, mm, with where it is and whether they are apart, touching or inside one another. | Exact between planar bodies; otherwise facet-derived, with the chord bound named in `method`. |
+| `clearance` `{a, b}` | The closest approach of two bodies, mm, with where it is and whether they are apart, touching or inside one another. | Exact between planar bodies; otherwise facet-derived, with the bound — the sagitta of the chords it was read from, which the state is already judged on — named in `method`. |
 | `volume` `{step?}` | Exact volume, mm³. | Exact unless the body is faceted. |
 | `surface_area` `{step?}` | Exact surface area, mm². | As above. |
 | `area` `{face}` | Exact area of one face, mm². | As above. |
@@ -360,10 +360,26 @@ every other.
 
 The tier means what it means everywhere else. Between bodies whose faces
 are all planar, the facets are the surfaces and the distance is exact.
-Where a surface is curved, its facets are chords of it: the measured gap
-is never smaller than the true gap and never larger than it by more than
-the `bound` the pair publishes, which is one chord budget per curved
-body. A study is `approximate` if any pair in it was.
+Where a surface is curved, its facets are chords of it, and the pair
+publishes a `bound` the kernel earns rather than assumes. The display
+tessellation sizes every arc through one function, and the same function
+tells the kernel the sagitta of every chord it spent, face by face
+(`NativeKernel::display_chord_deviations`); a second descent through the
+same facet hierarchies then minimises the facet gap less the sagittas of
+the two facets, which is the least the true surfaces can be apart, and
+`bound` is the difference between that and `distance`. The true gap is
+never below `distance - bound`. The chords of a convex face lie inside the
+body and over-read the gap; those of a bore lie in the void and can
+under-read it, so the true gap can also sit above `distance`, by no more
+than `bound`. Every state and verdict is judged on `distance - bound`: a
+pair is clear only when that is positive, touching when the facets come
+within the bound and cannot tell contact from overlap, and a profile's
+minimum has to be met by it. The descent knows how far a chord can be
+from its arc but not which way, so it is conservative where the direction
+would have helped — a cylinder standing on a plate touches it cap to
+face, exactly, but its wall chords end on that rim at no distance from
+the plate, and the pair carries one sagitta as its bound. A study is
+`approximate` if any pair in it was.
 
 Two distinctions the geometry has to get right. Touching is not
 interfering: a point on a shared boundary is inside neither body, which
@@ -578,7 +594,12 @@ got at each point on each part rather than wherever it happened to stop.
 The sweep stops at the first collision on purpose. Past that point the
 parts have already passed through one another, so nothing beyond is a pose
 the real thing reaches; `steps_measured` against `steps_offered` is how
-much of the travel was actually answered for. A cancelled sweep says so
+much of the travel was actually answered for. A collision is a pair one
+body reaches inside the other, or two curved bodies whose facets come
+within their `bound` of one another, which is contact the facets cannot
+tell from overlap: a chorded pair stops the sweep a bound short of
+touching rather than a vertex past it, and two planar bodies in contact
+do not stop it, because their contact is exact. A cancelled sweep says so
 and keeps what it measured — the positions it never reached are not
 cleared, only unmeasured, and `clears()` is false either way.
 

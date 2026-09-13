@@ -2263,6 +2263,33 @@ impl NativeKernel {
         Self::scene_with_budget(ComputePool::global(), snapshot, ChordBudget::Authoritative)
     }
 
+    /// How far the display facets of each face and the face they stand for
+    /// can sit from one another, in millimetres, keyed by the face
+    /// reference the scene's triangles carry as `source_face`. Zero both
+    /// ways for a planar face with straight edges, whose facets are the
+    /// face.
+    ///
+    /// The figures are the tessellation's own error rather than an estimate
+    /// of it: every arc is sized through the same [`arc_subdivisions`] the
+    /// tessellators call, so the chord count here is the chord count the
+    /// scene was built with, and the sagitta of that chord is the answer.
+    /// A measurement taken over the display scene is honest to within these
+    /// figures, which is what lets a clearance publish a bound it can keep.
+    #[must_use]
+    pub fn display_chord_deviations(snapshot: &Snapshot) -> BTreeMap<EntityRef, ChordDeviation> {
+        chord_deviations(snapshot, ChordBudget::Display)
+    }
+
+    /// The worst of [`Self::display_chord_deviations`] over the whole body,
+    /// in either direction: zero for a body of planes and straight edges.
+    #[must_use]
+    pub fn display_chord_deviation(snapshot: &Snapshot) -> f64 {
+        Self::display_chord_deviations(snapshot)
+            .into_values()
+            .map(ChordDeviation::worst)
+            .fold(0.0, f64::max)
+    }
+
     fn scene_with_budget(
         compute: &ComputePool,
         snapshot: &Snapshot,
@@ -3502,6 +3529,153 @@ fn arc_subdivisions(
     };
     let maximum = 1_usize << precision.max_subdivisions.min(12);
     requested.max(minimum).max(1).min(maximum)
+}
+
+/// How far a chord spanning `angle` of a circle of radius `radius` sits
+/// from the arc it replaces: the sagitta, `r·(1 − cos(θ/2))`. The chord's
+/// midpoint is this far inside the arc, and the arc's midpoint this far
+/// outside the chord, so it bounds the distance between the two in either
+/// direction.
+fn chord_sagitta(radius: f64, angle: f64) -> f64 {
+    let half = (angle.abs() * 0.5).min(std::f64::consts::PI);
+    (radius.abs() * (1.0 - half.cos())).max(0.0)
+}
+
+/// How far a face's display facets and the face can sit from one another,
+/// in millimetres, one figure for each direction. The two differ only for
+/// a plane bounded by arcs, and the difference is what lets a cylinder
+/// standing on a plate report an exact contact while a polygon inscribed
+/// in a bore is still known to reach into the bore.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChordDeviation {
+    /// The furthest any point of the face can sit from the facets that
+    /// account for it. Zero for a plane: its facets lie in it, and where
+    /// its polygon stops short of a curved rim, the curved face beside the
+    /// rim — whose chords end on the same polygon — accounts for that
+    /// sliver within its own figure.
+    pub of_surface: f64,
+    /// The furthest any point of the facets can sit from the face. Zero for
+    /// a plane with straight edges; for a plane bounded by an arc it is the
+    /// arc's sagitta, because a polygon inscribed in a hole's circle covers
+    /// a sliver of the hole.
+    pub of_facets: f64,
+}
+
+impl ChordDeviation {
+    /// The larger of the two figures.
+    #[must_use]
+    pub fn worst(self) -> f64 {
+        self.of_surface.max(self.of_facets)
+    }
+}
+
+/// The furthest the tessellation of each face at `budget` sits from the
+/// face, in either direction, keyed by face reference. See
+/// [`NativeKernel::display_chord_deviations`] for what it is for.
+///
+/// Each curved face is a grid of planar trapezoids between rings of the
+/// surface, sampled with the chord counts `arc_subdivisions` hands the
+/// tessellator, and a point of the surface reaches the facets in two moves:
+/// along its meridian to that meridian's chord, then across to the ring
+/// chords. So a face's deviation is the sum of its two sagittas — the
+/// azimuthal one at the widest ring, and the meridional one, which is zero
+/// for the cylinder and the cone because their generators are straight and
+/// sampled exactly. A cylinder face closed by a harmonic seam (the mitre of
+/// a fillet turning a reflex corner) has that seam chorded as well, so it is
+/// allowed a second azimuthal sagitta. A planar face bounded by an arc is
+/// sampled as a polygon inscribed in that arc, so its facets can reach past
+/// the true face by the arc's sagitta where the arc bounds a hole; the
+/// curved faces take the sagitta of their boundary edges as a floor, so the
+/// rim sliver a plane's polygon falls short of is accounted for by the
+/// chorded face beside it.
+fn chord_deviations(
+    snapshot: &Snapshot,
+    budget: ChordBudget,
+) -> BTreeMap<EntityRef, ChordDeviation> {
+    let precision = snapshot.precision.unwrap_or_default();
+    let topology = &snapshot.topology;
+    let sagitta = |radius: f64, sweep: f64| -> f64 {
+        let subdivisions = arc_subdivisions(radius, sweep, budget, precision);
+        chord_sagitta(radius, sweep / subdivisions as f64)
+    };
+    let edge_sagitta = |edge: &topology::Edge| -> f64 {
+        let sweep = edge.parameter_range.end - edge.parameter_range.start;
+        match edge.curve {
+            Curve3::Line { .. } => 0.0,
+            Curve3::Circle { radius, .. } => sagitta(radius, sweep),
+            // The semi-major axis bounds the sagitta of every chord.
+            Curve3::Ellipse { major_radius, .. } => sagitta(major_radius, sweep),
+        }
+    };
+    topology
+        .faces
+        .iter()
+        .map(|face| {
+            let key = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
+            let face = &face.value;
+            let bounds = face_parameter_bounds(topology, face);
+            let surface = match (face.surface, bounds) {
+                (Surface::Plane(_), _) | (_, None) => 0.0,
+                (Surface::Cylinder(cylinder), Some((u_min, u_max, _, _))) => {
+                    let ring = sagitta(cylinder.radius, u_max - u_min);
+                    if harmonic_bounded(topology, face) {
+                        2.0 * ring
+                    } else {
+                        ring
+                    }
+                }
+                (Surface::Cone(cone), Some((u_min, u_max, v_min, v_max))) => {
+                    let widest = cone
+                        .ring_radius(v_min)
+                        .abs()
+                        .max(cone.ring_radius(v_max).abs());
+                    sagitta(widest, u_max - u_min)
+                }
+                (Surface::Sphere(sphere), Some((u_min, u_max, v_min, v_max))) => {
+                    sagitta(sphere.radius, u_max - u_min) + sagitta(sphere.radius, v_max - v_min)
+                }
+                (Surface::Torus(torus), Some((u_min, u_max, v_min, v_max))) => {
+                    sagitta(torus.major_radius + torus.minor_radius, u_max - u_min)
+                        + sagitta(torus.minor_radius, v_max - v_min)
+                }
+            };
+            let rim = face
+                .loops()
+                .filter_map(|loop_key| topology.loop_record(loop_key))
+                .flat_map(|loop_record| loop_record.value.coedges.iter())
+                .filter_map(|coedge_key| topology.coedge(*coedge_key))
+                .filter_map(|coedge| topology.edge(coedge.value.edge))
+                .map(|edge| edge_sagitta(&edge.value))
+                .fold(0.0, f64::max);
+            let deviation = if matches!(face.surface, Surface::Plane(_)) {
+                ChordDeviation {
+                    of_surface: 0.0,
+                    of_facets: rim,
+                }
+            } else {
+                ChordDeviation {
+                    of_surface: surface.max(rim),
+                    of_facets: surface.max(rim),
+                }
+            };
+            (key, deviation)
+        })
+        .collect()
+}
+
+/// Whether a face's outer loop runs along a harmonic p-curve, which is how
+/// a fillet's mitre seam is carried on its cylinder.
+fn harmonic_bounded(topology: &Topology, face: &topology::Face) -> bool {
+    topology
+        .loop_record(face.outer_loop)
+        .is_some_and(|loop_record| {
+            loop_record
+                .value
+                .coedges
+                .iter()
+                .filter_map(|coedge_key| topology.coedge(*coedge_key))
+                .any(|coedge| matches!(coedge.value.pcurve, Curve2::Harmonic { .. }))
+        })
 }
 
 fn sampled_edge_segments(

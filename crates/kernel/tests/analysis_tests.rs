@@ -174,11 +174,24 @@ fn a_study_places_its_subjects_where_the_assembly_puts_them() {
 
 #[test]
 fn a_study_needs_two_bodies_and_names_a_step_it_cannot_find() {
-    let session = session("let b = box(size: [10, 10, 10], label: \"b\");\n");
-    assert!(
-        study_session_steps(&session, &names(&["b"]), &CancellationToken::default()).is_err(),
-        "one body is not a study"
+    let session = session(
+        "let a = box(size: [10, 10, 10], label: \"a\");
+let b = box(origin: [30, 0, 0], size: [10, 10, 10], label: \"b\");
+let c = box(origin: [60, 0, 0], size: [10, 10, 10], label: \"c\");
+",
     );
+    // One subject is not a study, however many steps the session has: the
+    // current body is not implied, so the refusal says what could be named.
+    let error = study_session_steps(&session, &names(&["b"]), &CancellationToken::default())
+        .expect_err("one body is not a study");
+    assert_eq!(
+        error.message,
+        "Name at least two subjects; steps in this session: a, b, c"
+    );
+    let empty = Session::new();
+    let error = study_session_steps(&empty, &[], &CancellationToken::default())
+        .expect_err("nothing is not a study");
+    assert!(error.message.contains("no steps yet"), "{}", error.message);
     let error = study_session_steps(
         &session,
         &names(&["b", "nowhere"]),

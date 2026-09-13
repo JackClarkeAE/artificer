@@ -7,7 +7,7 @@ use crate::{FaceRole, NativeKernel, Snapshot};
 use artificer_protocol::{EntityRef, OperationReport, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
-use crate::api::debug::ApiError;
+use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::selectors::EntitySelector;
 
 /// Standard view angle presets.
@@ -32,6 +32,13 @@ pub enum Projection {
     Perspective { fov_degrees: f64 },
 }
 
+/// The widest and tallest image a snapshot renders, in pixels. A PNG canvas
+/// is allocated at width times height before anything is drawn, and the
+/// dimensions arrive from the client as plain integers, so a request for a
+/// four-billion-pixel-wide image is refused here rather than answered with
+/// an allocation the process cannot survive.
+pub const MAX_SNAPSHOT_DIMENSION: u32 = 8192;
+
 /// Complete camera specification for 3D snapshot rendering.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraSpec {
@@ -44,6 +51,20 @@ pub struct CameraSpec {
 }
 
 impl CameraSpec {
+    /// Whether the image size is one the renderer will allocate: at least
+    /// one pixel and at most [`MAX_SNAPSHOT_DIMENSION`] on each side. The
+    /// error names the offending side and the limit.
+    pub fn check_dimensions(&self) -> Result<(), String> {
+        for (name, value) in [("width", self.width), ("height", self.height)] {
+            if value == 0 || value > MAX_SNAPSHOT_DIMENSION {
+                return Err(format!(
+                    "A snapshot's {name} must be between 1 and {MAX_SNAPSHOT_DIMENSION} pixels, not {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn preset(view: StandardView) -> Self {
         match view {
@@ -185,13 +206,18 @@ impl Default for SnapshotOptions {
     }
 }
 
-/// Renders a snapshot of the given snapshot model.
+/// Renders a snapshot of the given snapshot model. An image size the
+/// renderer will not allocate is refused before any work is done.
 pub fn render_snapshot(
     snapshot: &Snapshot,
     options: &SnapshotOptions,
     report: Option<&OperationReport>,
     highlighted_entities: &BTreeSet<EntityRef>,
 ) -> Result<SnapshotOutput, ApiError> {
+    options
+        .camera
+        .check_dimensions()
+        .map_err(|message| ApiError::new(ApiErrorCode::InvalidInput, message))?;
     let projected = project_scene(snapshot, options, highlighted_entities);
     match options.format {
         SnapshotFormat::Svg => Ok(SnapshotOutput::Svg(write_svg(&projected, options, report))),

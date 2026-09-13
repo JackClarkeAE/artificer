@@ -76,7 +76,7 @@
         "exact",
         "approximate"
       ],
-      "description": "exact: every body swept is planar throughout, so its facets are its surfaces. approximate: at least one surface is curved and its facets are chords of it, so a measured gap is never smaller than the true gap and never larger than it by more than the pair's `bound`."
+      "description": "exact: every body swept is planar throughout, so its facets are its surfaces. approximate: at least one surface is curved and its facets are chords of it, so the true gap can differ from a measured one by up to the pair's `bound`, and never sits below `distance - bound`."
     },
     "state": {
       "type": "string",
@@ -156,7 +156,8 @@
         },
         "bound": {
           "type": "number",
-          "minimum": 0
+          "minimum": 0,
+          "description": "How far the true clearance may sit from `distance` at that step, in millimetres: the sagitta of every display chord that came as near, summed over the two bodies by a second descent through the facet hierarchies. The true gap is never below `distance - bound`, and the state and verdict are judged on that figure. Absent when zero."
         },
         "verdict": {
           "$ref": "#/$defs/verdict"
@@ -177,7 +178,7 @@
     },
     "collision": {
       "type": "object",
-      "description": "Where the sweep first found two bodies sharing space, which is also where it stopped. Absent when the mechanism cleared itself through every step measured.",
+      "description": "Where the sweep first found two bodies that may share space, which is also where it stopped: one body reaching inside the other, or two curved bodies whose facets came within their `bound` of one another, which is contact the facets cannot tell from overlap. Two planar bodies in contact are not a collision, because their contact is exact. Absent when the mechanism cleared itself through every step measured.",
       "properties": {
         "step": {
           "type": "integer",

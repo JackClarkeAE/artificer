@@ -13,10 +13,18 @@ pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
 /// a stack overflow that takes the whole server with it.
 pub const MAX_EXPRESSION_DEPTH: usize = 64;
 
+/// The deepest nesting of blocks — loop bodies and function bodies — the
+/// parser follows, for the same reason: `for i in 0..1 { for j in 0..1 {
+/// ...` ten thousand deep is an error, not a stack overflow. Array types
+/// (`[[[f64]]]`) nest under the same limit.
+pub const MAX_BLOCK_DEPTH: usize = 64;
+
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     depth: usize,
+    /// How many blocks and array types the parser is inside.
+    nesting: usize,
 }
 
 impl Parser {
@@ -25,7 +33,27 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            nesting: 0,
         }
+    }
+
+    /// Runs `inner` one block or type deeper, refusing past the limit so the
+    /// recursion behind it stays bounded.
+    fn nested<T>(
+        &mut self,
+        what: &str,
+        inner: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.nesting >= MAX_BLOCK_DEPTH {
+            let (line, col) = self.current_span();
+            return Err(format!(
+                "{what} nested deeper than {MAX_BLOCK_DEPTH} levels at {line}:{col}"
+            ));
+        }
+        self.nesting += 1;
+        let result = inner(self);
+        self.nesting -= 1;
+        result
     }
 
     fn peek(&self) -> &Token {
@@ -67,7 +95,7 @@ impl Parser {
             Ok(())
         } else {
             Err(format!(
-                "Expected {expected:?} but found {token:?} at {line}:{col}"
+                "expected {expected} but found {token} at {line}:{col}"
             ))
         }
     }
@@ -76,7 +104,7 @@ impl Parser {
         let (line, col) = self.current_span();
         match self.advance() {
             Token::Ident(name) => Ok(name),
-            other => Err(format!("Expected {what} at {line}:{col}, got {other:?}")),
+            other => Err(format!("expected {what} but found {other} at {line}:{col}")),
         }
     }
 
@@ -182,18 +210,20 @@ impl Parser {
     /// never closes.
     fn parse_block(&mut self, what: &str, line: usize, col: usize) -> Result<Vec<AstNode>, String> {
         self.expect(Token::LBrace)?;
-        let mut body = Vec::new();
-        while self.peek() != &Token::RBrace {
-            if self.peek() == &Token::Eof {
-                let (eof_line, eof_col) = self.current_span();
-                return Err(format!(
-                    "The {what} starting at {line}:{col} has no closing brace at {eof_line}:{eof_col}"
-                ));
+        self.nested("Blocks", |parser| {
+            let mut body = Vec::new();
+            while parser.peek() != &Token::RBrace {
+                if parser.peek() == &Token::Eof {
+                    let (eof_line, eof_col) = parser.current_span();
+                    return Err(format!(
+                        "The {what} starting at {line}:{col} has no closing brace at {eof_line}:{eof_col}"
+                    ));
+                }
+                body.push(parser.parse_statement()?);
             }
-            body.push(self.parse_statement()?);
-        }
-        self.expect(Token::RBrace)?;
-        Ok(body)
+            parser.expect(Token::RBrace)?;
+            Ok(body)
+        })
     }
 
     /// `fn name(param: type [= default], ...) [-> type] { body }`
@@ -270,7 +300,7 @@ impl Parser {
                 )),
             },
             Token::LBracket => {
-                let element = self.parse_type()?;
+                let element = self.nested("Array types", Self::parse_type)?;
                 let length = if self.peek() == &Token::Semi {
                     self.advance();
                     let (length_line, length_col) = self.current_span();
@@ -280,7 +310,7 @@ impl Parser {
                         }
                         other => {
                             return Err(format!(
-                                "Expected an array length at {length_line}:{length_col}, got {other:?}"
+                                "expected an array length but found {other} at {length_line}:{length_col}"
                             ));
                         }
                     }
@@ -290,7 +320,7 @@ impl Parser {
                 self.expect(Token::RBracket)?;
                 Ok(TypeSpec::Array(Box::new(element), length))
             }
-            other => Err(format!("Expected a type at {line}:{col}, got {other:?}")),
+            other => Err(format!("expected a type but found {other} at {line}:{col}")),
         }
     }
 
@@ -311,7 +341,7 @@ impl Parser {
                 Token::Ident(word) if word == "faces" => {}
                 other => {
                     return Err(format!(
-                        "Expected `faces` after `with` at {kw_line}:{kw_col}, got {other:?}"
+                        "expected `faces` after `with` but found {other} at {kw_line}:{kw_col}"
                     ));
                 }
             }
@@ -352,7 +382,7 @@ impl Parser {
             Token::StringLit(path) => path,
             other => {
                 return Err(format!(
-                    "Expected a module path in quotes at {path_line}:{path_col}, got {other:?}"
+                    "expected a module path in quotes but found {other} at {path_line}:{path_col}"
                 ));
             }
         };
@@ -532,7 +562,7 @@ impl Parser {
             }
             other => {
                 let (line, col) = self.current_span();
-                Err(format!("Unexpected token {other:?} at {line}:{col}"))
+                Err(format!("unexpected {other} at {line}:{col}"))
             }
         }
     }
