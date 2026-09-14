@@ -1,0 +1,16 @@
+[package]
+name = "artificer-spacemouse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "3Dconnexion SpaceMouse input for the Artificer desktop applications"
+
+[dependencies]
+# Pure-Rust HID backends on Linux and Windows so no C source or libudev
+# header is needed to build; macOS uses the crate's IOKit backend.
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev", "windows-native"] }
+
+[lints]
+workspace = true

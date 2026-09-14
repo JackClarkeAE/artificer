@@ -3,13 +3,16 @@
 
 use std::collections::BTreeMap;
 
-use artificer_kernel::CancellationToken;
 use artificer_kernel::api::scripting::{
     InlineModules, ScriptError, compile_program, compile_program_with, compile_script,
     script_parameters,
 };
+use artificer_kernel::api::selectors::{
+    EntitySelector, GeometricSelector, NormalMatch, resolve_selector_set,
+};
 use artificer_kernel::api::session::Session;
-use artificer_protocol::{EntityKind, SemanticDigest};
+use artificer_kernel::{CancellationToken, NativeKernel};
+use artificer_protocol::{EntityKind, EntityRef, SemanticDigest, Vector3};
 
 const STANDOFF_PLATE: &str = include_str!("../examples/standoff_plate.art");
 
@@ -348,4 +351,262 @@ block(size: sizes[1]);
         "{error}"
     );
     assert_eq!(location_of(&error), (2, 10));
+}
+
+#[test]
+fn numbers_take_an_exponent_and_a_huge_one_is_the_kernels_to_refuse() {
+    let parameters = script_parameters(
+        "param wall: f64 = 1e-3;\nparam big: f64 = 2.5E+4;\nparam e = 2;\nparam x = 3 * e + 1e1;\nparam y = 2.5E+4 / 1e3;\n",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let defaults: Vec<(&str, f64)> = parameters
+        .iter()
+        .map(|parameter| (parameter.name.as_str(), parameter.default.unwrap()))
+        .collect();
+    assert_eq!(
+        defaults,
+        [
+            ("wall", 0.001),
+            ("big", 25_000.0),
+            ("e", 2.0),
+            ("x", 16.0),
+            ("y", 25.0)
+        ]
+    );
+
+    // A coordinate the size of a light-year parses; it is the kernel, not
+    // the parser, that refuses it.
+    let commands = compile_script(
+        "let b = box(size: [1e12, 1, 1], label: \"b\");\n",
+        &BTreeMap::new(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let mut session = Session::new();
+    let error = session
+        .execute(
+            commands.into_iter().next().unwrap(),
+            &CancellationToken::default(),
+        )
+        .expect_err("the kernel bounds coordinates");
+    assert!(error.to_string().contains("coordinate envelope"), "{error}");
+}
+
+#[test]
+fn parse_errors_name_tokens_as_they_are_written() {
+    let error = |source: &str| compile_script(source, &BTreeMap::new()).expect_err(source);
+
+    let unclosed = error("let x = (1 + 2;\n");
+    assert_eq!(unclosed.message(), "expected `)` but found `;` at 1:15");
+    assert_eq!(location_of(&unclosed), (1, 15));
+
+    let eof = error("let a = [1, 2\n\n");
+    assert_eq!(eof.message(), "expected `]` but found end of file at 3:1");
+    assert_eq!(location_of(&eof), (3, 1));
+
+    let name = error("let a = [1 x];\n");
+    assert_eq!(name.message(), "expected `]` but found `x` at 1:12");
+
+    let stray = error("let a = ];\n");
+    assert_eq!(stray.message(), "unexpected `]` at 1:9");
+
+    // A string holding " at " does not move the location.
+    let text = error("let a = [1 \"cut at 3:4\"];\n");
+    assert_eq!(
+        text.message(),
+        "expected `]` but found `\"cut at 3:4\"` at 1:12"
+    );
+    assert_eq!(location_of(&text), (1, 12));
+}
+
+fn run(source: &str) -> Session {
+    let mut session = Session::new();
+    let outcome = session.run_script(source, &BTreeMap::new(), &CancellationToken::default());
+    assert!(outcome.succeeded(), "{:?}", outcome.failure);
+    session
+}
+
+fn edges_of(session: &Session, selector: &EntitySelector) -> Vec<EntityRef> {
+    resolve_selector_set(
+        selector,
+        &session.snapshot,
+        &session.step_order,
+        &session.step_reports,
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn edge_summary(session: &Session, edge: EntityRef) -> String {
+    NativeKernel::describe_edge(&session.snapshot, edge)
+        .unwrap()
+        .summary
+}
+
+fn top_face() -> EntitySelector {
+    EntitySelector::ByGeometry {
+        selector: GeometricSelector::FaceByNormal {
+            direction: Vector3::new(0.0, 0.0, 1.0),
+            match_kind: NormalMatch::Closest,
+        },
+    }
+}
+
+#[test]
+fn a_face_selector_names_its_edges_and_the_blend_is_the_rim_blend() {
+    // The top's edges from the face, and the same four named one by one.
+    let by_face = "\
+let b = box(size: [40, 30, 20], label: \"b\");
+fillet(edges: faces(\">Z\").edges(), radius: 2, label: \"soften\");
+";
+    let by_point = "\
+let b = box(size: [40, 30, 20], label: \"b\");
+fillet(edges: [nearest(point: [20, 0, 20], kind: \"edge\"), nearest(point: [20, 30, 20], kind: \"edge\"),
+               nearest(point: [0, 15, 20], kind: \"edge\"), nearest(point: [40, 15, 20], kind: \"edge\")],
+       radius: 2, label: \"soften\");
+";
+    let face = run(by_face);
+    let point = run(by_point);
+    assert_eq!(
+        face.snapshot.semantic_digest(),
+        point.snapshot.semantic_digest()
+    );
+    assert_eq!(face.snapshot.counts(), point.snapshot.counts());
+    let box_volume = 40.0 * 30.0 * 20.0;
+    let volume = face.snapshot.measures().volume;
+    assert!(volume < box_volume && volume > 0.9 * box_volume, "{volume}");
+    assert_eq!(
+        face.step_reports["soften"].rung.as_deref(),
+        Some("edge-finish/rim-loop-blend")
+    );
+
+    // The selector is bound to the face, not to a step, so it works inline
+    // and through a `let`, and the `let` form is a named edge set.
+    let through_let = "\
+let b = box(size: [40, 30, 20], label: \"b\");
+let top = faces(\">Z\");
+fillet(edges: top.edges(), radius: 2, label: \"soften\");
+";
+    assert_eq!(
+        run(through_let).snapshot.semantic_digest(),
+        face.snapshot.semantic_digest()
+    );
+    // Mixed with another set selector in one array.
+    let mixed = "\
+let b = box(size: [40, 30, 20], label: \"b\");
+let top = faces(\">Z\");
+chamfer(edges: [top.edges(), edges(\"|Z\")], distance: 1, label: \"break\");
+";
+    let program = compile_program(mixed, &BTreeMap::new()).unwrap();
+    assert!(matches!(
+        &program.commands[1],
+        artificer_kernel::api::commands::ApiCommand::Chamfer { edges, .. } if edges.len() == 2
+    ));
+}
+
+#[test]
+fn the_rim_of_a_drilled_face_leaves_the_hole_out() {
+    let session = run("\
+let b = box(size: [40, 30, 20], label: \"b\");
+drill(face: faces(\">Z\"), center: [0, 0], diameter: 10, depth: 20, label: \"hole\");
+");
+    let rim = edges_of(&session, &EntitySelector::rim_of_face(top_face()));
+    let all = edges_of(&session, &EntitySelector::edges_of_face(top_face()));
+    assert_eq!(rim.len(), 4, "{rim:?}");
+    assert_eq!(all.len(), 6, "{all:?}");
+    for edge in &rim {
+        assert!(all.contains(edge));
+        assert!(edge_summary(&session, *edge).starts_with("straight edge"));
+    }
+    let hole: Vec<_> = all.iter().filter(|edge| !rim.contains(edge)).collect();
+    assert_eq!(hole.len(), 2);
+    for edge in hole {
+        assert!(edge_summary(&session, *edge).starts_with("circular arc"));
+    }
+
+    // And the rim blends exactly while the hole stays sharp.
+    let session = run("\
+let b = box(size: [40, 30, 20], label: \"b\");
+drill(face: faces(\">Z\"), center: [0, 0], diameter: 10, depth: 20, label: \"hole\");
+fillet(edges: faces(\">Z\").rim(), radius: 2, label: \"soften\");
+");
+    assert_eq!(
+        session.step_reports["soften"].rung.as_deref(),
+        Some("edge-finish/rim-loop-blend")
+    );
+}
+
+#[test]
+fn an_edge_spelling_of_a_face_is_that_faces_edges() {
+    let script = |selector: &str| {
+        format!("let b = box(size: [40, 30, 20], label: \"b\");\nlet rim = {selector};\n")
+    };
+    let sugar = compile_program(&script("edges(\">Z\")"), &BTreeMap::new()).unwrap();
+    let explicit = compile_program(&script("faces(\">Z\").edges()"), &BTreeMap::new()).unwrap();
+    assert_eq!(sugar.names, explicit.names);
+    assert_eq!(
+        sugar.names[0].1,
+        EntitySelector::edges_of_face(top_face()),
+        "{:?}",
+        sugar.names
+    );
+    // The axis forms keep their meaning.
+    let parallel = compile_program(&script("edges(\"|Z\")"), &BTreeMap::new()).unwrap();
+    assert_eq!(
+        parallel.names[0].1,
+        EntitySelector::ByGeometry {
+            selector: GeometricSelector::EdgesParallelTo {
+                direction: Vector3::new(0.0, 0.0, 1.0),
+            },
+        }
+    );
+    let unknown = compile_program(&script("edges(\"sideways\")"), &BTreeMap::new())
+        .expect_err("not a selector");
+    assert!(
+        unknown
+            .message()
+            .starts_with("Unknown edge selector `sideways`"),
+        "{unknown}"
+    );
+    // Only a face selector has `.edges()` and `.rim()`.
+    let number = compile_program("let e = 3;\nlet r = e.rim();\n", &BTreeMap::new())
+        .expect_err("a number has no rim");
+    assert!(number.message().contains("face selector"), "{number}");
+}
+
+#[test]
+fn a_step_without_a_role_names_every_crease_edge_it_made() {
+    let cylinder = run("let cyl = cylinder(radius: 10, height: 20, label: \"cyl\");\n");
+    let rims = edges_of(&cylinder, &EntitySelector::history_edges("cyl"));
+    assert_eq!(rims.len(), 4, "{rims:?}");
+    for edge in &rims {
+        let summary = edge_summary(&cylinder, *edge);
+        assert!(summary.starts_with("circular arc"), "{summary}");
+    }
+    // The seams between the wall's halves are not creases and stay out, so
+    // the fillet is the exact rim blend of both rims.
+    let rounded = run("\
+let cyl = cylinder(radius: 10, height: 20, label: \"cyl\");
+fillet(edges: cyl.edges(), radius: 1, label: \"round\");
+");
+    assert_eq!(
+        rounded.step_reports["round"].rung.as_deref(),
+        Some("edge-finish/rim-blend")
+    );
+    // A box still has all twelve, and the role form still counts by ordinal.
+    let block = run("let b = box(size: [40, 30, 20], label: \"b\");\n");
+    assert_eq!(
+        edges_of(&block, &EntitySelector::history_edges("b")).len(),
+        12
+    );
+    let program = compile_program(
+        "let b = box(size: [40, 30, 20], label: \"b\");\nlet four = b.edges(\"edge\", count: 4);\n",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert!(program.names.is_empty());
+    let program = compile_program(
+        "let b = box(size: [40, 30, 20], label: \"b\");\nlet all = b.edges();\n",
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(program.names[0].1, EntitySelector::history_edges("b"));
 }

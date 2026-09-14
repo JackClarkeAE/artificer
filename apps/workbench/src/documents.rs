@@ -24,6 +24,78 @@ pub enum ShellRequest {
 /// height, so the strip is a fixed band that never moves the viewport.
 pub const TAB_STRIP_HEIGHT: f32 = 30.0;
 
+/// The three answers an unsaved-changes prompt takes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsavedChoice {
+    /// Save first, then go ahead.
+    Save,
+    /// Go ahead; the changes are lost.
+    Discard,
+    /// Do neither; keep editing.
+    Cancel,
+}
+
+/// Draws the modal that stands between unsaved work and anything that would
+/// lose it: what is at stake, and Save / Don't save / Cancel. Escape and a
+/// click outside are Cancel. `None` while the user is still deciding.
+///
+/// One helper for every prompt in the workbench, so the window, a tab and an
+/// Open all ask the same question in the same words.
+pub(crate) fn unsaved_changes_prompt(
+    ctx: &egui::Context,
+    title: &str,
+    consequence: &str,
+) -> Option<UnsavedChoice> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("unsaved_changes_prompt"))
+        .frame(
+            Frame::new()
+                .fill(theme::panel().gamma_multiply(0.98))
+                .stroke(Stroke::new(1.0, theme::border()))
+                .corner_radius(6)
+                .inner_margin(Margin::same(12)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(
+                RichText::new(format!("Save changes to {title}?"))
+                    .font(FontId::proportional(14.0))
+                    .color(theme::text())
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(consequence).color(theme::muted())).wrap());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Save").strong()))
+                    .clicked()
+                {
+                    choice = Some(UnsavedChoice::Save);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(UnsavedChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+            });
+        });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(UnsavedChoice::Cancel);
+    }
+    choice
+}
+
+/// What the shell was asked to close when unsaved work stopped it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseIntent {
+    /// The whole window, with every dirty document in it.
+    Window,
+    /// One tab.
+    Tab(usize),
+}
+
 /// One open document.
 struct DocumentTab {
     app: KernelLabApp,
@@ -34,6 +106,11 @@ pub struct WorkbenchShell {
     documents: Vec<DocumentTab>,
     active: usize,
     next_serial: usize,
+    /// The close the unsaved-changes prompt is holding, while it shows.
+    close_prompt: Option<CloseIntent>,
+    /// The user has answered for the window: the next close request goes
+    /// through rather than back to the prompt.
+    close_confirmed: bool,
 }
 
 impl WorkbenchShell {
@@ -58,7 +135,33 @@ impl WorkbenchShell {
             documents: vec![DocumentTab { app }],
             active: 0,
             next_serial: 2,
+            close_prompt: None,
+            close_confirmed: false,
         }
+    }
+
+    /// Whether an unsaved-changes prompt is standing in the way of a close.
+    #[must_use]
+    pub const fn close_prompt_open(&self) -> bool {
+        self.close_prompt.is_some()
+    }
+
+    /// Whether the user has answered the window's close: from then on a
+    /// close request goes through rather than back to the prompt.
+    #[must_use]
+    pub const fn window_close_confirmed(&self) -> bool {
+        self.close_confirmed
+    }
+
+    /// The tab indices of the documents with unsaved changes.
+    #[must_use]
+    pub fn dirty_documents(&self) -> Vec<usize> {
+        self.documents
+            .iter()
+            .enumerate()
+            .filter(|(_, tab)| tab.app.is_document_dirty())
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// How many documents are open.
@@ -105,6 +208,12 @@ impl WorkbenchShell {
         if let Some(sibling) = sibling {
             app.set_document_path(sibling.with_file_name(format!("document-{serial}.artificer")));
         }
+        // Whether this process opens native file dialogs is decided once, by
+        // how the first document was built; every later one follows it.
+        if let Some(first) = self.documents.first() {
+            app.set_native_file_dialogs(first.app.native_file_dialogs());
+        }
+        app.mark_document_saved();
         self.documents.push(DocumentTab { app });
         self.active = self.documents.len() - 1;
         self.active
@@ -144,6 +253,19 @@ impl WorkbenchShell {
         Some(closed.app)
     }
 
+    /// Closes the tab at `index` the way the user does it: a document with
+    /// unsaved changes is asked about first. Returns whether it closed now.
+    pub fn request_close(&mut self, index: usize) -> bool {
+        if index >= self.documents.len() || self.documents.len() == 1 {
+            return false;
+        }
+        if self.documents[index].app.is_document_dirty() {
+            self.close_prompt = Some(CloseIntent::Tab(index));
+            return false;
+        }
+        self.close(index).is_some()
+    }
+
     /// Answers the requests every document made this frame.
     fn service_requests(&mut self, egui_ctx: &egui::Context) {
         let mut open_new = 0;
@@ -159,10 +281,102 @@ impl WorkbenchShell {
         // Close from the back so earlier indices stay valid.
         close.sort_unstable();
         for index in close.into_iter().rev() {
-            self.close(index);
+            self.request_close(index);
         }
         for _ in 0..open_new {
             self.open_document(KernelLabApp::new_document(egui_ctx));
+        }
+    }
+
+    /// The window's close button. A window with unsaved work in any tab is
+    /// held open and asked; the close goes ahead once the user has answered.
+    fn intercept_window_close(&mut self, egui_ctx: &egui::Context) {
+        if !egui_ctx.input(|input| input.viewport().close_requested()) || self.close_confirmed {
+            return;
+        }
+        if self.dirty_documents().is_empty() {
+            return;
+        }
+        egui_ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        self.close_prompt = Some(CloseIntent::Window);
+    }
+
+    /// Saves every document the prompt is about. `false` if one could not
+    /// be saved, or the user cancelled a dialog, in which case nothing
+    /// closes and the status of that document says why.
+    fn save_for_close(&mut self, intent: CloseIntent) -> bool {
+        let indices = match intent {
+            CloseIntent::Window => self.dirty_documents(),
+            CloseIntent::Tab(index) => vec![index],
+        };
+        for index in indices {
+            self.active = index;
+            if !self.documents[index].app.save_document() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn carry_out_close(&mut self, intent: CloseIntent, egui_ctx: &egui::Context) {
+        match intent {
+            CloseIntent::Window => {
+                self.close_confirmed = true;
+                egui_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            CloseIntent::Tab(index) => {
+                self.close(index);
+            }
+        }
+    }
+
+    /// The unsaved-changes prompt for a window or tab close.
+    fn close_prompt_window(&mut self, egui_ctx: &egui::Context) {
+        let Some(intent) = self.close_prompt else {
+            return;
+        };
+        let (title, consequence) = match intent {
+            CloseIntent::Window => {
+                let dirty = self.dirty_documents();
+                let names = dirty
+                    .iter()
+                    .map(|index| self.documents[*index].app.document_title().to_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let title = if dirty.len() == 1 {
+                    names.clone()
+                } else {
+                    format!("{} documents", dirty.len())
+                };
+                (
+                    title,
+                    format!("Closing the window loses the unsaved changes in {names}."),
+                )
+            }
+            CloseIntent::Tab(index) => {
+                let Some(tab) = self.documents.get(index) else {
+                    self.close_prompt = None;
+                    return;
+                };
+                (
+                    tab.app.document_title().to_owned(),
+                    "Closing the tab loses its unsaved changes.".to_owned(),
+                )
+            }
+        };
+        match unsaved_changes_prompt(egui_ctx, &title, &consequence) {
+            Some(UnsavedChoice::Save) => {
+                self.close_prompt = None;
+                if self.save_for_close(intent) {
+                    self.carry_out_close(intent, egui_ctx);
+                }
+            }
+            Some(UnsavedChoice::Discard) => {
+                self.close_prompt = None;
+                self.carry_out_close(intent, egui_ctx);
+            }
+            Some(UnsavedChoice::Cancel) => self.close_prompt = None,
+            None => {}
         }
     }
 
@@ -196,7 +410,7 @@ impl WorkbenchShell {
             self.open_document(KernelLabApp::new_document(egui_ctx));
         }
         if close_document {
-            self.close(self.active);
+            self.request_close(self.active);
         }
         if previous {
             self.activate_previous();
@@ -218,6 +432,14 @@ impl WorkbenchShell {
             for (index, tab) in self.documents.iter().enumerate() {
                 let is_active = index == self.active;
                 let title = tab.app.document_title().to_owned();
+                // The dot every editor uses for "not saved" goes on the tab
+                // too, so a background document's state is visible. The
+                // tab keeps its name: the dot is display, not identity.
+                let shown = if tab.app.is_document_dirty() {
+                    format!("{title} •")
+                } else {
+                    title.clone()
+                };
                 let fill = if is_active {
                     theme::ribbon_fill()
                 } else {
@@ -241,7 +463,7 @@ impl WorkbenchShell {
                         ui.horizontal(|ui| {
                             let label = ui.add(
                                 egui::Label::new(
-                                    RichText::new(&title)
+                                    RichText::new(&shown)
                                         .font(FontId::proportional(13.0))
                                         .color(text_color),
                                 )
@@ -308,7 +530,7 @@ impl WorkbenchShell {
             }
         });
         if let Some(index) = close {
-            self.close(index);
+            self.request_close(index);
         }
         if let Some(index) = activate {
             self.activate(index);
@@ -322,8 +544,13 @@ impl WorkbenchShell {
 
 impl eframe::App for WorkbenchShell {
     fn logic(&mut self, context: &egui::Context, frame: &mut eframe::Frame) {
+        self.intercept_window_close(context);
         self.service_requests(context);
-        self.handle_shortcuts(context);
+        // While the prompt is up the keyboard belongs to it, not to the
+        // tab shortcuts behind it.
+        if self.close_prompt.is_none() {
+            self.handle_shortcuts(context);
+        }
         // Only the document in front runs its frame logic: background
         // documents keep their state exactly as they were left.
         <KernelLabApp as eframe::App>::logic(&mut self.documents[self.active].app, context, frame);
@@ -346,6 +573,8 @@ impl eframe::App for WorkbenchShell {
             )
             .show(ui, |ui| self.tab_strip(ui));
         <KernelLabApp as eframe::App>::ui(&mut self.documents[self.active].app, ui, frame);
+        let ctx = ui.ctx().clone();
+        self.close_prompt_window(&ctx);
     }
 }
 

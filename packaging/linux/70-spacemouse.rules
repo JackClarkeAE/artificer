@@ -1,0 +1,12 @@
+# Lets an ordinary user open a 3Dconnexion SpaceMouse from Artificer.
+#
+# The puck is a plain USB HID device, but Linux creates its hidraw node
+# root-only, so without this rule the workbench reports "access denied" in
+# About and the device is ignored. Install with:
+#
+#   sudo cp packaging/linux/70-spacemouse.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# then unplug and replug the device.
+KERNEL=="hidraw*", ATTRS{idVendor}=="256f", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c62?", MODE="0660", TAG+="uaccess"

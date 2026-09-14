@@ -326,6 +326,7 @@ impl KernelLabApp {
                 ui.separator();
                 ui.add_space(6.0);
                 self.update_section(ui);
+                self.spacemouse_section(ui);
             });
         self.about_open = open;
     }

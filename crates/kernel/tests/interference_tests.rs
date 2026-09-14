@@ -89,12 +89,11 @@ fn bodies_that_meet_are_touching_and_bodies_that_overlap_are_interfering() {
 }
 
 #[test]
-fn a_curved_gap_is_bounded_by_the_chord_budget_it_was_tessellated_to() {
+fn a_curved_gap_is_bounded_by_the_sagitta_of_the_chords_it_was_read_from() {
     // Two parallel cylinders of radius 10, axes 40 apart: the true gap
     // between the surfaces is 20.
-    let left = index(&build(
-        "let c = cylinder(radius: 10, height: 30, label: \"c\");\n",
-    ));
+    let left_body = build("let c = cylinder(radius: 10, height: 30, label: \"c\");\n");
+    let left = index(&left_body);
     let right = index(&build(
         "let c = cylinder(center: [40, 0, 0], radius: 10, height: 30, label: \"c\");\n",
     ));
@@ -103,8 +102,21 @@ fn a_curved_gap_is_bounded_by_the_chord_budget_it_was_tessellated_to() {
     assert_eq!(report.state, ClearanceState::Clear);
     assert_eq!(report.tier, Tier::Approximate, "chords are not the surface");
     assert!(report.bound > 0.0, "a curved pair publishes its bound");
-    // Facets are inscribed, so the measured gap is never smaller than the
-    // true one and never larger than the true one plus both chord budgets.
+    // The bound is the sagitta of the chords the display scene spent, once
+    // per body, and nothing smaller: the kernel names that figure itself.
+    let sagitta = artificer_kernel::NativeKernel::display_chord_deviation(&left_body);
+    assert!(
+        sagitta > 1.0e-3,
+        "a display chord on r = 10 is millimetric, not {sagitta}"
+    );
+    assert!(
+        (report.bound - 2.0 * sagitta).abs() <= 1.0e-9,
+        "bound {} against two sagittas of {sagitta}",
+        report.bound
+    );
+    // Facets of a convex face are inscribed, so the measured gap is never
+    // smaller than the true one and never larger than it by more than the
+    // bound.
     assert!(
         report.distance >= 20.0 - 1.0e-9,
         "under-reported: {}",
@@ -115,6 +127,177 @@ fn a_curved_gap_is_bounded_by_the_chord_budget_it_was_tessellated_to() {
         "over-reported past its own bound: {} against {}",
         report.distance,
         report.bound
+    );
+}
+
+/// Two cylinders of radius 5, height 20, with a true gap of 0.020 mm: the
+/// second is centred 10.02 from the first at `degrees` round the z axis.
+/// Turning the line of centres walks the closest approach from a vertex
+/// of each tessellation onto the middle of a chord, which is where the
+/// facets over-read the gap most.
+fn cylinders_a_hair_apart(
+    degrees: f64,
+) -> (artificer_kernel::Snapshot, artificer_kernel::Snapshot) {
+    let theta = degrees.to_radians();
+    (
+        build("let c = cylinder(radius: 5, height: 20, label: \"c\");\n"),
+        build(&format!(
+            "let c = cylinder(center: [{}, {}, 0], radius: 5, height: 20, label: \"c\");\n",
+            10.02 * theta.cos(),
+            10.02 * theta.sin()
+        )),
+    )
+}
+
+#[test]
+fn the_published_bound_holds_at_every_angle_and_a_running_fit_is_never_passed_on_chords() {
+    use artificer_kernel::api::analysis::{FitVerdict, Subject, built_in_profile};
+
+    let running = built_in_profile("machined-running").expect("a shipped profile");
+    assert!((running.minimum - 0.02).abs() <= 1.0e-12, "{running:?}");
+    for degrees in [0.0, 0.5, 1.0, 1.3, 1.5, 2.0, 2.6, 3.0, 4.0, 5.0] {
+        let (first, second) = cylinders_a_hair_apart(degrees);
+        let report = clearance(&index(&first), &index(&second), precision());
+        // The true gap is 0.020: never above the measurement, never below
+        // the measurement less the bound.
+        assert!(
+            report.distance >= 0.02 - 1.0e-9,
+            "at {degrees}°: facets inside the surfaces read {} below the true gap",
+            report.distance
+        );
+        assert!(
+            report.distance - report.bound <= 0.02 + 1.0e-9,
+            "at {degrees}°: the bound {} does not cover the over-read of {}",
+            report.bound,
+            report.distance
+        );
+        assert_eq!(
+            report.state,
+            ClearanceState::Clear,
+            "at {degrees}°: 0.02 is clear of a 0.01 bound"
+        );
+        // A running fit wants 0.02 at least, and the facets can only say
+        // the gap is at least 0.02 less their bound: too close, at every
+        // angle, rather than a pass that depends on where a chord fell.
+        assert_eq!(
+            FitVerdict::of(report.state, report.distance, report.bound, &running),
+            FitVerdict::TooClose,
+            "at {degrees}°: distance {} bound {}",
+            report.distance,
+            report.bound
+        );
+
+        // The same through a study, which is what the wire answers with.
+        let mut study = artificer_kernel::api::analysis::interference_study(
+            &[Subject::new("a", first), Subject::new("b", second)],
+            precision(),
+            &CancellationToken::default(),
+        );
+        study.judge(Some(running.clone()));
+        assert_eq!(study.pairs[0].verdict, Some(FitVerdict::TooClose));
+        assert_eq!(study.failing, 1, "at {degrees}°");
+        assert!((study.pairs[0].bound - report.bound).abs() <= 1.0e-12);
+    }
+}
+
+#[test]
+fn a_pin_in_a_bore_can_under_read_its_gap_and_the_bound_covers_that_too() {
+    // A 10 mm bore through a plate and a pin of radius 4.98 in it: the
+    // true gap is 0.020 all round. The bore's chords lie in the void, so
+    // a pin turned to put a vertex opposite a chord's middle reads closer
+    // than the surfaces are.
+    let plate = build(
+        "let p = box(origin: [-10, -10, 0], size: [20, 20, 10], label: \"p\");
+let h = drill(face: faces(\">Z\"), center: [0, 0], diameter: 10, depth: 10, label: \"h\");
+",
+    );
+    let bore = index(&plate);
+    let pin =
+        build("let c = cylinder(center: [0, 0, -5], radius: 4.98, height: 20, label: \"c\");\n");
+    let mut under_read = false;
+    for degrees in [0.0, 1.0, 2.0, 2.5, 3.0] {
+        let half = f64::to_radians(degrees) / 2.0;
+        let turned = FacetIndex::build(
+            &pin,
+            Placement::from_quaternion([half.cos(), 0.0, 0.0, half.sin()], [0.0, 0.0, 0.0])
+                .expect("a unit quaternion"),
+        );
+        let report = clearance(&bore, &turned, precision());
+        assert_eq!(
+            report.state,
+            ClearanceState::Clear,
+            "at {degrees}°: {report:?}"
+        );
+        under_read |= report.distance < 0.02 - 1.0e-6;
+        assert!(
+            report.distance - report.bound <= 0.02 + 1.0e-9
+                && report.distance + report.bound >= 0.02 - 1.0e-9,
+            "at {degrees}°: the true gap 0.02 is outside [{} - {b}, {} + {b}]",
+            report.distance,
+            report.distance,
+            b = report.bound
+        );
+    }
+    assert!(
+        under_read,
+        "a bore's chords lie in the void, so some turn of the pin reads under the true gap"
+    );
+}
+
+#[test]
+fn contact_that_rests_on_chords_is_never_passed_and_the_bound_says_which_chords() {
+    // A cylinder standing on a plate touches it cap to face, both planar.
+    // But the wall's chords end on the same rim, at no distance from the
+    // plate at all, and the descent does not know a wall bulges sideways
+    // rather than down: the pair carries the wall's sagitta as its bound,
+    // one body's worth and not two, and no profile passes it. The
+    // alternative — passing a contact the facets cannot vouch for — is the
+    // optimism this bound exists to remove.
+    use artificer_kernel::api::analysis::{FitVerdict, built_in_profile};
+
+    let plate = index(&cuboid([-20.0, -20.0, -10.0], [40.0, 40.0, 10.0]));
+    let post_body = build("let c = cylinder(radius: 5, height: 20, label: \"c\");\n");
+    let post = index(&post_body);
+    let report = clearance(&plate, &post, precision());
+    assert_eq!(report.state, ClearanceState::Touching);
+    assert_eq!(report.tier, Tier::Approximate, "a body is curved");
+    assert!(report.distance <= 1.0e-9, "{report:?}");
+    let sagitta = artificer_kernel::NativeKernel::display_chord_deviation(&post_body);
+    assert!(
+        (report.bound - sagitta).abs() <= 1.0e-9,
+        "one wall's sagitta {sagitta}, not two and not none: {report:?}"
+    );
+    assert!(report.may_overlap());
+    let assembly = built_in_profile("assembly").expect("a shipped profile");
+    assert_eq!(
+        FitVerdict::of(report.state, report.distance, report.bound, &assembly),
+        FitVerdict::TooClose
+    );
+
+    // Two plates in contact are exact, and the same profile passes them.
+    let lid = index(&cuboid([-20.0, -20.0, 0.0], [40.0, 40.0, 10.0]));
+    let report = clearance(&plate, &lid, precision());
+    assert_eq!(report.state, ClearanceState::Touching);
+    assert_eq!(report.bound, 0.0);
+    assert!(!report.may_overlap());
+    assert_eq!(
+        FitVerdict::of(report.state, report.distance, report.bound, &assembly),
+        FitVerdict::Pass
+    );
+
+    // Two cylinders side by side whose surfaces meet are a contact the
+    // chords cannot tell from an overlap: touching, with a bound, and no
+    // profile passes it.
+    let other = index(&build(
+        "let c = cylinder(center: [10, 0, 0], radius: 5, height: 20, label: \"c\");\n",
+    ));
+    let report = clearance(&post, &other, precision());
+    assert_eq!(report.state, ClearanceState::Touching, "{report:?}");
+    assert!(report.bound > 0.0);
+    assert!(report.may_overlap());
+    assert_eq!(
+        FitVerdict::of(report.state, report.distance, report.bound, &assembly),
+        FitVerdict::TooClose
     );
 }
 

@@ -435,7 +435,12 @@ fn save_and_open_buttons_use_native_file_and_universal_confirmation_gate() {
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().component_instance_count(), 2);
 
+    // The second component is unsaved, so reverting to the saved copy asks
+    // about it before the open reaches the confirmation gate.
     click_file_menu_item(&mut harness, "Open saved document");
+    assert!(harness.state().unsaved_prompt_open());
+    assert_eq!(harness.state().pending_operation_label(), None);
+    click_button(&mut harness, "Don't save");
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Open saved document")
@@ -445,6 +450,7 @@ fn save_and_open_buttons_use_native_file_and_universal_confirmation_gate() {
     assert_eq!(harness.state().component_instance_count(), 2);
 
     click_file_menu_item(&mut harness, "Open saved document");
+    click_button(&mut harness, "Don't save");
     click_button(&mut harness, "Confirm operation");
     assert_eq!(harness.state().component_instance_count(), 1);
     assert_eq!(harness.state().body_count(), 2);

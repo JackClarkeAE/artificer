@@ -17,7 +17,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use artificer_kernel::api::commands::ApiCommand;
-use artificer_kernel::api::debug::ApiError;
+use artificer_kernel::api::debug::{ApiError, ApiErrorCode};
 use artificer_kernel::api::decompile::DecompileOptions;
 use artificer_kernel::api::diff::ScriptDiff;
 use artificer_kernel::api::export::{export_obj, export_stl_binary};
@@ -32,8 +32,11 @@ use artificer_protocol::Vector3;
 use artificer_protocol::{
     Aabb3, DiagnosticSeverity, EntityKind, EntityRef, Point3, Tier, TopologyCounts,
 };
+use artificer_spacemouse::SpaceMouse;
 use artificer_ui_core::navigation::NavigationPreset;
-use artificer_ui_core::presentation::{ActiveTool, DisplayTransform, SectionCutPlane, ViewState};
+use artificer_ui_core::presentation::{
+    ActiveTool, DisplayTransform, SectionCutPlane, SixDofMotion, SixDofSettings, ViewState,
+};
 use artificer_ui_core::theme::{self, WorkbenchTheme};
 use artificer_viewport::{
     BodyInstanceKey, DocumentBodyInstance, DocumentFaceSelection, EdgeFrameMemo,
@@ -78,6 +81,9 @@ pub const EXAMPLES: &[(&str, &str)] = &[
 
 /// The script a fresh window opens on.
 pub const WELCOME_SCRIPT: &str = EXAMPLES[0].1;
+
+/// What File ▸ New script puts in the editor.
+const NEW_SCRIPT: &str = "// A new script. Every step needs a label.\nlet body = box(size: [40, 30, 10], label: \"body\");\n";
 
 const BODY: BodyInstanceKey = BodyInstanceKey::new(1);
 const EDITOR_ID: &str = "script-studio-editor";
@@ -126,7 +132,23 @@ impl FaceName {
 /// step's label: the raw material of history names.
 type ReportedRoles = Vec<(String, Vec<(String, Option<u32>)>)>;
 
+/// One entity the kernel offered when a selector matched too many or too
+/// few: the thing to click, and how the kernel describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunCandidate {
+    pub entity: EntityRef,
+    /// "face 12 · planar, facing up (role top)": what a person needs to
+    /// tell the candidates apart.
+    pub description: String,
+}
+
 /// Why a run stopped short of the end of the script.
+///
+/// The kernel refuses a step with more than a message: a suggestion of what
+/// to try, the entities a selector could have meant, and a code that names
+/// the refusal exactly. The console shows all of it, message first, code
+/// last, because the message is what a person acts on and the code is what
+/// a bug report needs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunError {
     /// "Parse error", "Evaluation error", or the failing step's label.
@@ -134,6 +156,17 @@ pub struct RunError {
     pub message: String,
     /// One-based `(line, column)` in the script when it is known.
     pub location: Option<(usize, usize)>,
+    /// What the kernel proposes doing about it, when it has an idea.
+    pub suggestion: Option<String>,
+    /// The entities a selector could have meant, for an ambiguous or
+    /// near-miss selection.
+    pub candidates: Vec<RunCandidate>,
+    /// The messages of the diagnostics behind the refusal, when they say
+    /// more than the headline does.
+    pub details: Vec<String>,
+    /// The refusal's code, `selector_ambiguous` or `kernel_error ·
+    /// profile_not_closed`, for a script error there is none.
+    pub code: Option<String>,
 }
 
 impl RunError {
@@ -142,16 +175,112 @@ impl RunError {
             kind: error.kind().to_owned(),
             message: error.message().to_owned(),
             location: error.location(),
+            suggestion: None,
+            candidates: Vec::new(),
+            details: Vec::new(),
+            code: None,
         }
     }
 
     fn from_step(source: &str, command: &ApiCommand, error: &ApiError) -> Self {
         let label = command.label();
+        let candidates = error
+            .candidates
+            .iter()
+            .map(|info| {
+                let mut description = format!(
+                    "{} {} · {}",
+                    info.kind, info.entity_ref.entity.0, info.geometry_description
+                );
+                if let Some(role) = &info.role {
+                    match info.ordinal {
+                        Some(ordinal) => {
+                            description.push_str(&format!(" (role {role}[{ordinal}])"))
+                        }
+                        None => description.push_str(&format!(" (role {role})")),
+                    }
+                }
+                RunCandidate {
+                    entity: info.entity_ref,
+                    description,
+                }
+            })
+            .collect();
+        // A diagnostic often repeats the headline; only the ones that add
+        // something are worth a line.
+        let details = error
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .filter(|message| !message.is_empty() && *message != error.message)
+            .collect();
+        let code = error.diagnostics.first().map_or_else(
+            || api_error_code_label(error.code).to_owned(),
+            |diagnostic| format!("{} · {}", api_error_code_label(error.code), diagnostic.code),
+        );
         Self {
             kind: format!("Step \"{label}\""),
             message: error.message.clone(),
             location: line_of_label(source, label).map(|line| (line, 1)),
+            suggestion: error.suggestion.clone(),
+            candidates,
+            details,
+            code: Some(code),
         }
+    }
+
+    /// The console's first line for the error: what failed, where, and the
+    /// message in plain words.
+    #[must_use]
+    pub fn headline(&self) -> String {
+        match self.location {
+            Some((line, column)) => format!(
+                "✕ {} at line {line}, column {column}: {}",
+                self.kind, self.message
+            ),
+            None => format!("✕ {}: {}", self.kind, self.message),
+        }
+    }
+
+    /// The lines the console prints beneath the headline, in order: the
+    /// diagnostics' own messages, what to try, the candidate entities, and
+    /// the code last.
+    #[must_use]
+    pub fn console_lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self.details.clone();
+        if let Some(suggestion) = &self.suggestion {
+            lines.push(format!("Try: {suggestion}"));
+        }
+        if !self.candidates.is_empty() {
+            lines.push(format!(
+                "{} candidate{}:",
+                self.candidates.len(),
+                if self.candidates.len() == 1 { "" } else { "s" }
+            ));
+            lines.extend(
+                self.candidates
+                    .iter()
+                    .map(|candidate| format!("· {}", candidate.description)),
+            );
+        }
+        if let Some(code) = &self.code {
+            lines.push(code.clone());
+        }
+        lines
+    }
+}
+
+/// The refusal category as its wire name, the one a bug report quotes.
+const fn api_error_code_label(code: ApiErrorCode) -> &'static str {
+    match code {
+        ApiErrorCode::InvalidInput => "invalid_input",
+        ApiErrorCode::SelectorNotFound => "selector_not_found",
+        ApiErrorCode::SelectorAmbiguous => "selector_ambiguous",
+        ApiErrorCode::KernelError => "kernel_error",
+        ApiErrorCode::ValidationFailed => "validation_failed",
+        ApiErrorCode::SessionError => "session_error",
+        ApiErrorCode::ScriptError => "script_error",
+        ApiErrorCode::IoError => "io_error",
     }
 }
 
@@ -715,6 +844,46 @@ impl PathPurpose {
             Self::ImportJournal => "Compare",
         }
     }
+
+    /// The file filter the native dialog offers: what the file is called
+    /// and the extensions it answers to.
+    const fn filter(self) -> (&'static str, &'static [&'static str]) {
+        match self {
+            Self::Open | Self::SaveAs => ("Artificer script", &["art"]),
+            Self::ExportStl => ("STL mesh", &["stl"]),
+            Self::ExportObj => ("Wavefront OBJ", &["obj"]),
+            Self::ExportJournal | Self::ImportJournal => ("Session journal", &["json"]),
+        }
+    }
+
+    /// Whether the dialog picks an existing file or names a new one.
+    const fn picks_existing(self) -> bool {
+        matches!(self, Self::Open | Self::ImportJournal)
+    }
+}
+
+/// What the user was about to do when unsaved changes stopped them, so the
+/// prompt can carry on with it once they have decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiscardAction {
+    /// Close the window.
+    CloseWindow,
+    /// Put another script in the editor: a new one or an example.
+    Replace(String),
+    /// Open the script at a known path, dropped or given on the command line.
+    Open(PathBuf),
+    /// Ask for a script to open, with the native dialog or the typed prompt.
+    OpenDialog,
+    /// Ask for a path to open by typing it.
+    OpenByPath,
+}
+
+/// The three answers the unsaved-changes prompt takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnsavedChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 /// A journal decompiled to a script, waiting for the user to accept it in
@@ -801,6 +970,24 @@ pub struct ScriptStudio {
     theme_choice: WorkbenchTheme,
     display_mode: ModelDisplayMode,
     section: SectionPlane,
+    /// The 3D mouse, when the process has one; `None` in tests, which never
+    /// open it.
+    spacemouse: Option<SpaceMouse>,
+    /// Whether Open, Save as and the exports use the desktop's own file
+    /// dialog. Off, they fall back to the typed-path prompt, which is also
+    /// what a headless test drives.
+    native_file_dialogs: bool,
+    /// The folder the last dialog ended in, so the next one opens there.
+    last_dialog_directory: Option<PathBuf>,
+    /// The action waiting on the unsaved-changes prompt, while it shows.
+    discard_prompt: Option<DiscardAction>,
+    /// The action to carry on with once a save the prompt asked for lands.
+    resume_after_save: Option<DiscardAction>,
+    /// The user has decided the window may close: the next close request
+    /// goes through rather than back to the prompt.
+    close_confirmed: bool,
+    /// Ask the window to close on the next frame.
+    close_window: bool,
 }
 
 /// The world axis a section plane is normal to.
@@ -867,6 +1054,10 @@ impl ScriptStudio {
     /// none or it cannot be read.
     pub fn new(creation_context: &eframe::CreationContext<'_>, script: Option<PathBuf>) -> Self {
         let mut studio = Self::with_source(creation_context, WELCOME_SCRIPT);
+        // The 3D mouse wakes the window when the cap moves, so the viewport
+        // follows it without polling.
+        let wake_context = creation_context.egui_ctx.clone();
+        studio.spacemouse = SpaceMouse::open_with_wake(move || wake_context.request_repaint());
         if let Some(path) = script {
             studio.open_path(&path);
         }
@@ -906,9 +1097,35 @@ impl ScriptStudio {
             theme_choice: theme::active_theme(),
             display_mode: ModelDisplayMode::ShadedEdges,
             section: SectionPlane::default(),
+            spacemouse: None,
+            native_file_dialogs: true,
+            last_dialog_directory: None,
+            discard_prompt: None,
+            resume_after_save: None,
+            close_confirmed: false,
+            close_window: false,
         };
         studio.refresh_customizer();
         studio
+    }
+
+    /// Whether the studio opens the desktop's file dialogs. A headless
+    /// test turns them off and drives the typed-path prompt instead.
+    pub const fn set_native_file_dialogs(&mut self, enabled: bool) {
+        self.native_file_dialogs = enabled;
+    }
+
+    /// Whether the unsaved-changes prompt is showing.
+    #[must_use]
+    pub const fn unsaved_prompt_open(&self) -> bool {
+        self.discard_prompt.is_some()
+    }
+
+    /// Whether the user has answered the window's close: from then on a
+    /// close request goes through rather than back to the prompt.
+    #[must_use]
+    pub const fn window_close_confirmed(&self) -> bool {
+        self.close_confirmed
     }
 
     // -- state the tests read -------------------------------------------
@@ -1132,6 +1349,7 @@ impl ScriptStudio {
                 self.source = source.clone();
                 self.saved_source = source;
                 self.path = Some(path.to_path_buf());
+                self.remember_dialog_directory(path);
                 self.framed_bounds = None;
                 self.customizer.clear();
                 self.refresh_customizer();
@@ -1149,9 +1367,16 @@ impl ScriptStudio {
             Ok(()) => {
                 self.saved_source.clone_from(&self.source);
                 self.path = Some(path.to_path_buf());
+                self.remember_dialog_directory(path);
                 self.status = Some(format!("Saved {}", path.display()));
+                // The save was the answer to the unsaved-changes prompt:
+                // now the thing the user was doing can go ahead.
+                if let Some(action) = self.resume_after_save.take() {
+                    self.perform(action);
+                }
             }
             Err(error) => {
+                self.resume_after_save = None;
                 self.status = Some(format!("Could not save {}: {error}", path.display()));
             }
         }
@@ -1160,7 +1385,197 @@ impl ScriptStudio {
     fn save(&mut self) {
         match self.path.clone() {
             Some(path) => self.save_to(&path),
-            None => self.open_prompt(PathPurpose::SaveAs),
+            None => self.request_path(PathPurpose::SaveAs),
+        }
+    }
+
+    /// Where a file dialog opens: beside the open script, else where the
+    /// last dialog ended, else the home directory.
+    fn dialog_directory(&self) -> Option<PathBuf> {
+        self.path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .filter(|parent| parent.is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| self.last_dialog_directory.clone())
+            .or_else(|| {
+                ["HOME", "USERPROFILE"]
+                    .into_iter()
+                    .find_map(|variable| {
+                        std::env::var_os(variable).filter(|value| !value.is_empty())
+                    })
+                    .map(PathBuf::from)
+            })
+    }
+
+    fn remember_dialog_directory(&mut self, path: &Path) {
+        if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
+            self.last_dialog_directory = Some(parent.to_path_buf());
+        }
+    }
+
+    /// The desktop's own file dialog for `purpose`, blocking until the user
+    /// has chosen or cancelled. `None` is a cancellation, or a desktop with
+    /// no dialog to offer; the typed prompt is always there for the latter.
+    fn choose_path_natively(&mut self, purpose: PathPurpose) -> Option<PathBuf> {
+        let (name, extensions) = purpose.filter();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(purpose.title())
+            .add_filter(name, extensions);
+        if let Some(directory) = self.dialog_directory() {
+            dialog = dialog.set_directory(directory);
+        }
+        let chosen = if purpose.picks_existing() {
+            dialog.pick_file()
+        } else {
+            let suggested = self.suggested_file_name(purpose);
+            dialog.set_file_name(suggested).save_file()
+        }?;
+        self.remember_dialog_directory(&chosen);
+        Some(chosen)
+    }
+
+    /// The file name a save or export proposes.
+    fn suggested_file_name(&self, purpose: PathPurpose) -> String {
+        match purpose {
+            PathPurpose::Open | PathPurpose::SaveAs => self
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "model.art".to_owned()),
+            PathPurpose::ExportStl => format!("{}.stl", self.model_name()),
+            PathPurpose::ExportObj => format!("{}.obj", self.model_name()),
+            PathPurpose::ExportJournal | PathPurpose::ImportJournal => {
+                format!("{}.journal.json", self.model_name())
+            }
+        }
+    }
+
+    /// Asks for a path the way the desktop does it, and acts on the answer;
+    /// or falls back to the typed prompt where there is no native dialog.
+    fn request_path(&mut self, purpose: PathPurpose) {
+        if !self.native_file_dialogs {
+            self.open_prompt(purpose);
+            return;
+        }
+        match self.choose_path_natively(purpose) {
+            Some(path) => self.act_on_path(&path, purpose),
+            None => self.resume_after_save = None,
+        }
+    }
+
+    /// Does what `purpose` asks with a path, however the path was chosen.
+    fn act_on_path(&mut self, path: &Path, purpose: PathPurpose) {
+        match purpose {
+            PathPurpose::Open => self.open_path(path),
+            PathPurpose::SaveAs => self.save_to(path),
+            PathPurpose::ExportStl | PathPurpose::ExportObj | PathPurpose::ExportJournal => {
+                self.export_to(path, purpose);
+            }
+            PathPurpose::ImportJournal => self.import_journal(path),
+        }
+    }
+
+    // -- never losing unsaved work ----------------------------------------
+
+    /// Runs `action` now if nothing would be lost, otherwise asks first.
+    fn guard_unsaved(&mut self, action: DiscardAction) {
+        if self.is_dirty() {
+            self.discard_prompt = Some(action);
+        } else {
+            self.perform(action);
+        }
+    }
+
+    /// Carries out an action the unsaved-changes prompt was guarding.
+    fn perform(&mut self, action: DiscardAction) {
+        match action {
+            DiscardAction::CloseWindow => {
+                self.close_confirmed = true;
+                self.close_window = true;
+            }
+            DiscardAction::Replace(source) => self.load_example(&source),
+            DiscardAction::Open(path) => self.open_path(&path),
+            DiscardAction::OpenDialog => self.request_path(PathPurpose::Open),
+            DiscardAction::OpenByPath => self.open_prompt(PathPurpose::Open),
+        }
+    }
+
+    /// Answers the prompt with Save: the action goes ahead once the save
+    /// has landed, and not at all if it does not.
+    fn save_then(&mut self, action: DiscardAction) {
+        self.resume_after_save = Some(action);
+        self.save();
+    }
+
+    /// The modal that stands between an unsaved script and anything that
+    /// would replace it.
+    fn unsaved_changes_window(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.discard_prompt.clone() else {
+            return;
+        };
+        let title = self.document_title();
+        let mut choice = None;
+        let modal = egui::Modal::new(egui::Id::new("unsaved-script")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(
+                RichText::new(format!("Save changes to {title}?"))
+                    .font(FontId::proportional(14.0))
+                    .color(theme::text())
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(match &action {
+                    DiscardAction::CloseWindow => {
+                        "The script has unsaved changes. Closing the window without saving loses them."
+                    }
+                    _ => "The script has unsaved changes. Replacing it without saving loses them.",
+                })
+                .color(theme::muted()),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("Save").strong()))
+                    .clicked()
+                {
+                    choice = Some(UnsavedChoice::Save);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(UnsavedChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+            });
+        });
+        if modal.should_close() {
+            choice = Some(UnsavedChoice::Cancel);
+        }
+        match choice {
+            Some(UnsavedChoice::Save) => {
+                self.discard_prompt = None;
+                self.save_then(action);
+            }
+            Some(UnsavedChoice::Discard) => {
+                self.discard_prompt = None;
+                self.perform(action);
+            }
+            Some(UnsavedChoice::Cancel) => self.discard_prompt = None,
+            None => {}
+        }
+    }
+
+    /// The name the header shows for the script.
+    fn document_title(&self) -> String {
+        match &self.path {
+            Some(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            None => "Untitled.art".to_owned(),
         }
     }
 
@@ -1359,14 +1774,7 @@ impl ScriptStudio {
             self.status = Some("A path is needed".to_owned());
             return;
         }
-        match prompt.purpose {
-            PathPurpose::Open => self.open_path(&path),
-            PathPurpose::SaveAs => self.save_to(&path),
-            PathPurpose::ExportStl | PathPurpose::ExportObj | PathPurpose::ExportJournal => {
-                self.export_to(&path, prompt.purpose);
-            }
-            PathPurpose::ImportJournal => self.import_journal(&path),
-        }
+        self.act_on_path(&path, prompt.purpose);
     }
 
     fn load_example(&mut self, source: &str) {
@@ -1389,22 +1797,28 @@ impl ScriptStudio {
     // -- panels -----------------------------------------------------------
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (run, save, open, fit) = ctx.input_mut(|input| {
+        let (run, save_as, save, open, fit) = ctx.input_mut(|input| {
             let run = input.consume_key(egui::Modifiers::NONE, egui::Key::F5);
+            let save_as = input.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::S,
+            );
             let save = input.consume_key(egui::Modifiers::COMMAND, egui::Key::S);
             let open = input.consume_key(egui::Modifiers::COMMAND, egui::Key::O);
             // F only when nothing (the editor, a field) has the keyboard.
             let fit = input.key_pressed(egui::Key::F);
-            (run, save, open, fit)
+            (run, save_as, save, open, fit)
         });
         if run {
             self.run_requested = true;
         }
-        if save {
+        if save_as {
+            self.request_path(PathPurpose::SaveAs);
+        } else if save {
             self.save();
         }
         if open {
-            self.open_prompt(PathPurpose::Open);
+            self.guard_unsaved(DiscardAction::OpenDialog);
         }
         if fit && ctx.memory(|memory| memory.focused().is_none()) {
             self.fit_view();
@@ -1418,7 +1832,7 @@ impl ScriptStudio {
                 .collect()
         });
         if let Some(path) = dropped.into_iter().next() {
-            self.open_path(&path);
+            self.guard_unsaved(DiscardAction::Open(path));
         }
     }
 
@@ -1442,13 +1856,7 @@ impl ScriptStudio {
             ui.add_space(4.0);
             ui.separator();
             ui.add_space(4.0);
-            let title = match &self.path {
-                Some(path) => path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string()),
-                None => "Untitled.art".to_owned(),
-            };
+            let title = self.document_title();
             let title = if self.is_dirty() {
                 format!("{title} •")
             } else {
@@ -1464,19 +1872,19 @@ impl ScriptStudio {
 
             ui.menu_button("File", |ui| {
                 if ui.button("New script").clicked() {
-                    self.load_example("// A new script. Every step needs a label.\nlet body = box(size: [40, 30, 10], label: \"body\");\n");
+                    self.guard_unsaved(DiscardAction::Replace(NEW_SCRIPT.to_owned()));
                     ui.close();
                 }
                 if ui.button("Open…    Ctrl+O").clicked() {
-                    self.open_prompt(PathPurpose::Open);
+                    self.guard_unsaved(DiscardAction::OpenDialog);
                     ui.close();
                 }
                 if ui.button("Save    Ctrl+S").clicked() {
                     self.save();
                     ui.close();
                 }
-                if ui.button("Save as…").clicked() {
-                    self.open_prompt(PathPurpose::SaveAs);
+                if ui.button("Save as…    Ctrl+Shift+S").clicked() {
+                    self.request_path(PathPurpose::SaveAs);
                     ui.close();
                 }
                 ui.separator();
@@ -1488,14 +1896,14 @@ impl ScriptStudio {
                     .add_enabled(exportable, egui::Button::new("Export STL…"))
                     .clicked()
                 {
-                    self.open_prompt(PathPurpose::ExportStl);
+                    self.request_path(PathPurpose::ExportStl);
                     ui.close();
                 }
                 if ui
                     .add_enabled(exportable, egui::Button::new("Export OBJ…"))
                     .clicked()
                 {
-                    self.open_prompt(PathPurpose::ExportObj);
+                    self.request_path(PathPurpose::ExportObj);
                     ui.close();
                 }
                 ui.separator();
@@ -1504,7 +1912,7 @@ impl ScriptStudio {
                     .on_hover_text("The session journal as JSON, for the JSON-RPC server, the command line, or another Script Studio")
                     .clicked()
                 {
-                    self.open_prompt(PathPurpose::ExportJournal);
+                    self.request_path(PathPurpose::ExportJournal);
                     ui.close();
                 }
                 if ui
@@ -1512,14 +1920,54 @@ impl ScriptStudio {
                     .on_hover_text("Decompile a journal to a script and see what it changes before it replaces the open one")
                     .clicked()
                 {
-                    self.open_prompt(PathPurpose::ImportJournal);
+                    self.request_path(PathPurpose::ImportJournal);
                     ui.close();
                 }
+                ui.separator();
+                // Some desktops have no file dialog to offer, and a path is
+                // sometimes quicker to type than to browse to: every action
+                // above is also reachable with a typed path.
+                ui.menu_button("By typed path", |ui| {
+                    ui.set_min_width(200.0);
+                    if ui.button("Open…").clicked() {
+                        self.guard_unsaved(DiscardAction::OpenByPath);
+                        ui.close();
+                    }
+                    if ui.button("Save as…").clicked() {
+                        self.open_prompt(PathPurpose::SaveAs);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(exportable, egui::Button::new("Export STL…"))
+                        .clicked()
+                    {
+                        self.open_prompt(PathPurpose::ExportStl);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(exportable, egui::Button::new("Export OBJ…"))
+                        .clicked()
+                    {
+                        self.open_prompt(PathPurpose::ExportObj);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(exportable, egui::Button::new("Export journal…"))
+                        .clicked()
+                    {
+                        self.open_prompt(PathPurpose::ExportJournal);
+                        ui.close();
+                    }
+                    if ui.button("Pull journal into script…").clicked() {
+                        self.open_prompt(PathPurpose::ImportJournal);
+                        ui.close();
+                    }
+                });
             });
             ui.menu_button("Examples", |ui| {
                 for (name, source) in EXAMPLES {
                     if ui.button(*name).clicked() {
-                        self.load_example(source);
+                        self.guard_unsaved(DiscardAction::Replace((*source).to_owned()));
                         ui.close();
                     }
                 }
@@ -2008,6 +2456,7 @@ impl ScriptStudio {
         });
         ui.add_space(2.0);
         let mut jump = None;
+        let mut pick_candidate = None;
         egui::ScrollArea::vertical()
             .id_salt("console-scroll")
             .auto_shrink([false, false])
@@ -2041,16 +2490,13 @@ impl ScriptStudio {
                     }
                 }
                 if let Some(error) = &outcome.error {
-                    let text = match error.location {
-                        Some((line, column)) => format!(
-                            "✕ {} at line {line}, column {column}: {}",
-                            error.kind, error.message
-                        ),
-                        None => format!("✕ {}: {}", error.kind, error.message),
-                    };
                     let label = ui.add(
-                        egui::Label::new(RichText::new(text).color(theme::bad()).monospace())
-                            .sense(egui::Sense::click()),
+                        egui::Label::new(
+                            RichText::new(error.headline())
+                                .color(theme::bad())
+                                .monospace(),
+                        )
+                        .sense(egui::Sense::click()),
                     );
                     label.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Script error")
@@ -2060,6 +2506,70 @@ impl ScriptStudio {
                         if label.clicked() {
                             jump = error.location.map(|(line, _)| line);
                         }
+                    }
+                    // Beneath the headline, what the kernel added: the
+                    // diagnostics in their own words, what to try, the
+                    // entities it could have meant, and the code last.
+                    for detail in &error.details {
+                        ui.label(
+                            RichText::new(format!("    {detail}"))
+                                .color(theme::muted())
+                                .monospace(),
+                        );
+                    }
+                    if let Some(suggestion) = &error.suggestion {
+                        ui.label(
+                            RichText::new(format!("    Try: {suggestion}"))
+                                .color(theme::warn())
+                                .monospace(),
+                        );
+                    }
+                    if !error.candidates.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "    {} candidate{}:",
+                                error.candidates.len(),
+                                if error.candidates.len() == 1 { "" } else { "s" }
+                            ))
+                            .color(theme::muted())
+                            .monospace(),
+                        );
+                    }
+                    for candidate in &error.candidates {
+                        // The candidates belong to the snapshot on screen,
+                        // the one the failing step was handed, so a face
+                        // among them can be picked out in the viewport.
+                        let selectable = candidate.entity.kind == EntityKind::Face;
+                        let row = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("    · {}", candidate.description))
+                                    .color(theme::text())
+                                    .monospace(),
+                            )
+                            .sense(if selectable {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            }),
+                        );
+                        row.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                format!("Candidate {}", candidate.description),
+                            )
+                        });
+                        if selectable && row.on_hover_text("Select this face").clicked() {
+                            pick_candidate = Some(candidate.entity);
+                        }
+                    }
+                    if let Some(code) = &error.code {
+                        ui.label(
+                            RichText::new(format!("    {code}"))
+                                .color(theme::muted())
+                                .small()
+                                .monospace(),
+                        );
                     }
                 } else if outcome.steps.is_empty() {
                     ui.label(
@@ -2072,9 +2582,50 @@ impl ScriptStudio {
         if jump.is_some() {
             self.jump_to_line = jump;
         }
+        if let Some(entity) = pick_candidate {
+            self.selected_face = Some(DocumentFaceSelection {
+                body: BODY,
+                face: entity,
+            });
+        }
+    }
+
+    /// One frame of 3D-mouse motion, with the default mapping: the cap
+    /// orbits, pans, and zooms the model, and either button fits it again.
+    fn apply_spacemouse(&mut self, ctx: &egui::Context) {
+        let Some(mouse) = self.spacemouse.as_ref() else {
+            return;
+        };
+        let motion = mouse.take_motion();
+        if motion.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        if motion.buttons_pressed != 0 {
+            self.view.reset_orientation();
+            if let Some(bounds) = self.framed_bounds {
+                self.view.frame(bounds);
+            }
+            changed = true;
+        }
+        let seconds = f64::from(ctx.input(|input| input.stable_dt));
+        let six_dof = SixDofMotion {
+            translate: motion.translate,
+            rotate: motion.rotate,
+        };
+        if self
+            .view
+            .apply_six_dof(six_dof, seconds, SixDofSettings::default())
+        {
+            changed = true;
+        }
+        if changed {
+            ctx.request_repaint();
+        }
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
+        self.apply_spacemouse(ui.ctx());
         let scene = self
             .outcome
             .as_ref()
@@ -2173,7 +2724,11 @@ impl ScriptStudio {
         }
         if accepted {
             self.accept_prompt(prompt);
-        } else if !cancelled {
+        } else if cancelled {
+            // A save the unsaved-changes prompt asked for was abandoned:
+            // so is the action that waited on it.
+            self.resume_after_save = None;
+        } else {
             self.prompt = Some(prompt);
         }
     }
@@ -2181,7 +2736,19 @@ impl ScriptStudio {
 
 impl eframe::App for ScriptStudio {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.prompt.is_none() && self.pending_import.is_none() {
+        // The window's close button: a dirty script is asked about first,
+        // and the close goes ahead only once the user has answered.
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.close_confirmed
+            && self.is_dirty()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.discard_prompt = Some(DiscardAction::CloseWindow);
+        }
+        if std::mem::take(&mut self.close_window) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.prompt.is_none() && self.pending_import.is_none() && self.discard_prompt.is_none() {
             self.handle_shortcuts(ctx);
         }
         self.tick(ctx);
@@ -2231,6 +2798,7 @@ impl eframe::App for ScriptStudio {
         let ctx = ui.ctx().clone();
         self.path_prompt(&ctx);
         self.import_window(&ctx);
+        self.unsaved_changes_window(&ctx);
     }
 }
 
@@ -2401,5 +2969,102 @@ mod tests {
         let outcome = run_script(WELCOME_SCRIPT, &BTreeMap::new(), &token);
         assert!(outcome.cancelled);
         assert!(outcome.scene.is_none());
+    }
+
+    /// The console prints a refusal message first, then what to try, then
+    /// the entities the kernel could have meant, and the code last.
+    #[test]
+    fn a_step_refusal_prints_message_suggestion_candidates_then_code() {
+        use artificer_kernel::api::debug::EntityInfo;
+        use artificer_protocol::{EntityId, SnapshotId};
+
+        let snapshot = SnapshotId::new([7; 16]);
+        let candidate = |id: u64, description: &str, role: Option<&str>| EntityInfo {
+            kind: EntityKind::Face,
+            entity_ref: EntityRef {
+                snapshot,
+                entity: EntityId(id),
+                kind: EntityKind::Face,
+            },
+            geometry_description: description.to_owned(),
+            role: role.map(str::to_owned),
+            ordinal: None,
+        };
+        let error = ApiError::new(
+            ApiErrorCode::SelectorAmbiguous,
+            "faces(\"|Z\") matched 2 entities",
+        )
+        .with_suggestion("Use this selector where a set is accepted, or narrow it")
+        .with_candidates(vec![
+            candidate(12, "planar, facing up", Some("top")),
+            candidate(13, "planar, facing down", None),
+        ]);
+        let command = ApiCommand::MakeBox {
+            label: "raise".to_owned(),
+            origin: Point3::new(0.0, 0.0, 0.0),
+            size: [1.0, 1.0, 1.0],
+        };
+        let source = "let a = box(size: [1, 1, 1], label: \"a\");\nlet r = push_pull(face: faces(\"|Z\"), distance: 3, label: \"raise\");\n";
+
+        let run_error = RunError::from_step(source, &command, &error);
+        assert_eq!(
+            run_error.headline(),
+            "✕ Step \"raise\" at line 2, column 1: faces(\"|Z\") matched 2 entities"
+        );
+        assert_eq!(
+            run_error.console_lines(),
+            vec![
+                "Try: Use this selector where a set is accepted, or narrow it".to_owned(),
+                "2 candidates:".to_owned(),
+                "· face 12 · planar, facing up (role top)".to_owned(),
+                "· face 13 · planar, facing down".to_owned(),
+                "selector_ambiguous".to_owned(),
+            ]
+        );
+        assert_eq!(run_error.candidates[0].entity.entity, EntityId(12));
+
+        // A script error has no kernel behind it: nothing but the headline.
+        let parse = RunError::from_script(&ScriptError::Parse {
+            message: "expected `)`".to_owned(),
+            location: Some((1, 4)),
+        });
+        assert!(parse.console_lines().is_empty());
+        assert_eq!(
+            parse.headline(),
+            "✕ Parse error at line 1, column 4: expected `)`"
+        );
+    }
+
+    /// The kernel's own refusal of an ambiguous selector reaches the run
+    /// with its candidates, so the console has faces to offer.
+    #[test]
+    fn an_ambiguous_selector_offers_its_candidates() {
+        let source = "let a = box(size: [10, 10, 10], label: \"a\");\nlet r = push_pull(face: faces(\"planar\"), distance: 3, label: \"raise\");\n";
+        let outcome = run_script(source, &BTreeMap::new(), &CancellationToken::new());
+        let error = outcome
+            .error
+            .as_ref()
+            .expect("every face of a box is planar, so one cannot be meant");
+        assert_eq!(error.location, Some((2, 1)), "{error:?}");
+        assert_eq!(error.candidates.len(), 6, "{error:?}");
+        assert!(error.suggestion.is_some(), "{error:?}");
+        assert_eq!(error.code.as_deref(), Some("selector_ambiguous"));
+        let lines = error.console_lines();
+        assert!(
+            lines.iter().any(|line| line.starts_with("Try: ")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.last().map(String::as_str), Some("selector_ambiguous"));
+        // The candidates belong to the snapshot still on screen.
+        let scene = outcome.scene.as_ref().expect("the box stays on screen");
+        for candidate in &error.candidates {
+            assert!(
+                scene
+                    .triangles
+                    .iter()
+                    .any(|triangle| triangle.source_face == candidate.entity),
+                "{candidate:?} is not a face of the displayed body"
+            );
+        }
     }
 }

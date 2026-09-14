@@ -1,5 +1,7 @@
 //! Lexer for tokenizing .art CAD scripts.
 
+use std::fmt;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
     Param,
@@ -33,6 +35,48 @@ pub enum Token {
     Slash,
     Dot,
     Eof,
+}
+
+/// A token as an error message names it: the source spelling in backticks,
+/// so a message reads "expected `)` but found `e12`", and "end of file"
+/// for the end.
+impl fmt::Display for Token {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let spelling = match self {
+            Self::Param => "param",
+            Self::Let => "let",
+            Self::For => "for",
+            Self::In => "in",
+            Self::Fn => "fn",
+            Self::Return => "return",
+            Self::Use => "use",
+            Self::With => "with",
+            Self::True => "true",
+            Self::False => "false",
+            Self::LBrace => "{",
+            Self::RBrace => "}",
+            Self::DotDot => "..",
+            Self::Arrow => "->",
+            Self::LParen => "(",
+            Self::RParen => ")",
+            Self::LBracket => "[",
+            Self::RBracket => "]",
+            Self::Colon => ":",
+            Self::Semi => ";",
+            Self::Comma => ",",
+            Self::Equal => "=",
+            Self::Plus => "+",
+            Self::Minus => "-",
+            Self::Star => "*",
+            Self::Slash => "/",
+            Self::Dot => ".",
+            Self::Ident(name) => return write!(formatter, "`{name}`"),
+            Self::Number(number) => return write!(formatter, "`{number}`"),
+            Self::StringLit(text) => return write!(formatter, "`\"{text}\"`"),
+            Self::Eof => return formatter.write_str("end of file"),
+        };
+        write!(formatter, "`{spelling}`")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +179,35 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
                     col += 1;
                 } else {
                     break;
+                }
+            }
+            // An exponent: `1e-3`, `1e12`, `2.5E+4`. The `e` belongs to the
+            // number only when digits follow it, directly or after one sign;
+            // otherwise it starts the next token as it always did.
+            if let Some(&marker) = chars.peek()
+                && matches!(marker, 'e' | 'E')
+            {
+                let mut ahead = chars.clone();
+                ahead.next();
+                let sign = ahead.next_if(|c| *c == '+' || *c == '-');
+                if ahead.peek().is_some_and(char::is_ascii_digit) {
+                    s.push(marker);
+                    chars.next();
+                    col += 1;
+                    if let Some(sign) = sign {
+                        s.push(sign);
+                        chars.next();
+                        col += 1;
+                    }
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() {
+                            s.push(c);
+                            chars.next();
+                            col += 1;
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
             let num: f64 = s

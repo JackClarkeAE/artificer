@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+# The command is `artificer-api`, as the usage text and the docs call it;
+# the package keeps its name so `cargo run -p artificer-api-server` works.
+[[bin]]
+name = "artificer-api"
+path = "src/main.rs"
+
 [dependencies]
 artificer-kernel = { path = "../../crates/kernel" }
 artificer-protocol = { path = "../../crates/protocol" }

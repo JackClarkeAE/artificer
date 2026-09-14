@@ -17,6 +17,9 @@ use crate::api::debug::{ApiError, ApiErrorCode, EntityInfo};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EntitySelector {
     /// Select by parametric history: role produced by a named prior step.
+    /// The role [`ANY_ROLE`] (`*`) names every entity of the kind the step
+    /// produced, whatever role it carried; that is a set selector, resolved
+    /// through [`resolve_selector_set`] wherever a set is accepted.
     ByHistory {
         from_step: StepLabel,
         kind: EntityKind,
@@ -35,7 +38,45 @@ pub enum EntitySelector {
     Direct { entity_ref: EntityRef },
 }
 
+/// The history role that matches every role: `step.edges()` in a script.
+pub const ANY_ROLE: &str = "*";
+
 impl EntitySelector {
+    /// Every crease edge the step produced, under any role: what
+    /// `step.edges()` means in a script.
+    #[must_use]
+    pub fn history_edges(step: impl Into<String>) -> Self {
+        Self::ByHistory {
+            from_step: StepLabel(step.into()),
+            kind: EntityKind::Edge,
+            role: ANY_ROLE.to_owned(),
+            ordinal: None,
+        }
+    }
+
+    /// Every crease edge bounding the face `face` names, holes included:
+    /// `face.edges()` in a script.
+    #[must_use]
+    pub fn edges_of_face(face: Self) -> Self {
+        Self::ByGeometry {
+            selector: GeometricSelector::EdgesOfFace {
+                face: Box::new(face),
+                loops: FaceLoops::All,
+            },
+        }
+    }
+
+    /// The outer loop of the face `face` names: `face.rim()` in a script.
+    #[must_use]
+    pub fn rim_of_face(face: Self) -> Self {
+        Self::ByGeometry {
+            selector: GeometricSelector::EdgesOfFace {
+                face: Box::new(face),
+                loops: FaceLoops::Outer,
+            },
+        }
+    }
+
     #[must_use]
     pub fn history_face(step: impl Into<String>, role: impl Into<String>) -> Self {
         Self::ByHistory {
@@ -117,6 +158,29 @@ pub enum GeometricSelector {
     /// (fillets and chamfers), and as a single entity only when exactly one
     /// edge qualifies.
     EdgesParallelTo { direction: Vector3 },
+    /// The crease edges bounding the face another selector names: every
+    /// loop, or the outer loop alone (the rim; a hole's edges are inner
+    /// loops). The face is found when the step using the selector runs, so
+    /// the edges are those of the body as it is then. A set selector like
+    /// [`EdgesParallelTo`](Self::EdgesParallelTo).
+    EdgesOfFace {
+        face: Box<EntitySelector>,
+        #[serde(default)]
+        loops: FaceLoops,
+    },
+}
+
+/// Which loops of a face [`GeometricSelector::EdgesOfFace`] takes.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FaceLoops {
+    /// The outer loop and every hole.
+    #[default]
+    All,
+    /// The outer loop only.
+    Outer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -199,8 +263,9 @@ impl From<SelectorResolutionError> for ApiError {
 }
 
 /// Resolves a selector to every entity it names. Set selectors (edges
-/// parallel to a direction, faces of a surface type) return all of their
-/// matches; every other selector returns exactly one entity.
+/// parallel to a direction, faces of a surface type, the edges of a face,
+/// every entity a step made) return all of their matches; every other
+/// selector returns exactly one entity.
 pub fn resolve_selector_set(
     selector: &EntitySelector,
     current_snapshot: &Snapshot,
@@ -208,6 +273,38 @@ pub fn resolve_selector_set(
     step_reports: &BTreeMap<String, OperationReport>,
 ) -> Result<Vec<EntityRef>, ApiError> {
     match selector {
+        EntitySelector::ByHistory {
+            from_step,
+            kind,
+            role,
+            ordinal: None,
+        } if role == ANY_ROLE => {
+            let entities =
+                step_entities(from_step, *kind, current_snapshot, step_order, step_reports)?;
+            if entities.is_empty() {
+                return Err(ApiError::new(
+                    ApiErrorCode::SelectorNotFound,
+                    format!(
+                        "Step \"{}\" made no {kind:?} that is still on the body",
+                        from_step.0
+                    ),
+                ));
+            }
+            Ok(entities)
+        }
+        EntitySelector::ByGeometry {
+            selector: GeometricSelector::EdgesOfFace { face, loops },
+        } => {
+            let face = resolve_selector(face, current_snapshot, step_order, step_reports)?;
+            let edges = face_edges(current_snapshot, face, *loops)?;
+            if edges.is_empty() {
+                return Err(ApiError::new(
+                    ApiErrorCode::SelectorNotFound,
+                    format!("Face {} has no crease edge to select", face.entity),
+                ));
+            }
+            Ok(edges)
+        }
         EntitySelector::ByGeometry {
             selector: GeometricSelector::EdgesParallelTo { direction },
         } => {
@@ -323,6 +420,114 @@ fn parallel_edges(
         .collect())
 }
 
+/// The crease edges bounding one face, in loop order: the outer loop first
+/// and then each hole, or the outer loop alone. A seam where one carrier
+/// continues smoothly across an edge (the two halves of a cylinder's wall)
+/// is not a crease and is left out, so the result is what a fillet or a
+/// chamfer can take.
+fn face_edges(
+    snapshot: &Snapshot,
+    face: EntityRef,
+    loops: FaceLoops,
+) -> Result<Vec<EntityRef>, ApiError> {
+    let index = crate::resolve_measure_entity(snapshot, face, EntityKind::Face, "face")
+        .map_err(ApiError::from)?;
+    let topology = &snapshot.topology;
+    let record = &topology.faces[index].value;
+    let loop_keys = match loops {
+        FaceLoops::All => record.loops().collect::<Vec<_>>(),
+        FaceLoops::Outer => vec![record.outer_loop],
+    };
+    let smooth = crate::presentation_edge_flags(topology).smooth;
+    let mut edges = Vec::new();
+    for loop_key in loop_keys {
+        let Some(loop_record) = topology.loop_record(loop_key) else {
+            continue;
+        };
+        for coedge_key in &loop_record.value.coedges {
+            let Some(coedge) = topology.coedge(*coedge_key) else {
+                continue;
+            };
+            let edge_key = coedge.value.edge;
+            let Some(edge) = topology.edge(edge_key) else {
+                continue;
+            };
+            if smooth.get(edge_key.0).copied().unwrap_or(false) {
+                continue;
+            }
+            let edge_ref = crate::entity_ref(snapshot.id(), edge.id.get(), EntityKind::Edge);
+            if !edges.contains(&edge_ref) {
+                edges.push(edge_ref);
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// Every entity of `kind` a step produced, under any role, followed
+/// forward to what it is on the current body. Entities later steps
+/// consumed are dropped, and so are seam edges, as in [`face_edges`].
+fn step_entities(
+    from_step: &StepLabel,
+    kind: EntityKind,
+    current_snapshot: &Snapshot,
+    step_order: &[String],
+    step_reports: &BTreeMap<String, OperationReport>,
+) -> Result<Vec<EntityRef>, ApiError> {
+    let (source_index, source_report) = step_source(from_step, step_order, step_reports)?;
+    let produced = source_report
+        .history
+        .iter()
+        .flat_map(|record| record.outputs.iter().copied())
+        .filter(|output| output.kind == kind)
+        .collect::<BTreeSet<_>>();
+    let topology = &current_snapshot.topology;
+    let smooth = crate::presentation_edge_flags(topology).smooth;
+    let present = match kind {
+        EntityKind::Edge => topology
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !smooth.get(*index).copied().unwrap_or(false))
+            .map(|(_, edge)| EntityId(edge.id.get()))
+            .collect::<BTreeSet<_>>(),
+        EntityKind::Face => topology
+            .faces
+            .iter()
+            .map(|face| EntityId(face.id.get()))
+            .collect(),
+        EntityKind::Vertex => topology
+            .vertices
+            .iter()
+            .map(|vertex| EntityId(vertex.id.get()))
+            .collect(),
+        other => {
+            return Err(ApiError::new(
+                ApiErrorCode::InvalidInput,
+                format!(
+                    "A step's every {other:?} cannot be selected; ask for faces, edges or vertices"
+                ),
+            ));
+        }
+    };
+    let mut entities = Vec::new();
+    for output in produced {
+        let traced = trace_forward(output, kind, None, source_index, step_order, step_reports);
+        if !present.contains(&traced.entity) {
+            continue;
+        }
+        let entity = EntityRef {
+            snapshot: current_snapshot.id(),
+            entity: traced.entity,
+            kind,
+        };
+        if !entities.contains(&entity) {
+            entities.push(entity);
+        }
+    }
+    Ok(entities)
+}
+
 /// The faces of one surface class. Curved faces name their carrier in the
 /// scene; a face with triangles and no carrier is planar.
 fn faces_by_type(
@@ -396,7 +601,7 @@ pub fn resolve_selector(
             *kind,
             role,
             *ordinal,
-            current_snapshot.id(),
+            current_snapshot,
             step_order,
             step_reports,
         ),
@@ -411,26 +616,18 @@ fn resolve_history_selector(
     kind: EntityKind,
     role: &str,
     ordinal: Option<u32>,
-    current_snapshot: SnapshotId,
+    current_snapshot: &Snapshot,
     step_order: &[String],
     step_reports: &BTreeMap<String, OperationReport>,
 ) -> Result<EntityRef, ApiError> {
-    let source_index = step_order
-        .iter()
-        .position(|label| label == &from_step.0)
-        .ok_or_else(|| {
-            ApiError::new(
-                ApiErrorCode::SelectorNotFound,
-                format!("Step \"{}\" does not exist in session history", from_step.0),
-            )
-        })?;
-
-    let source_report = step_reports.get(&from_step.0).ok_or_else(|| {
-        ApiError::new(
-            ApiErrorCode::SelectorNotFound,
-            format!("No operation report recorded for step \"{}\"", from_step.0),
-        )
-    })?;
+    if role == ANY_ROLE && ordinal.is_none() {
+        // A set, named singly: it must be the one entity the step made.
+        return exactly_one(
+            step_entities(from_step, kind, current_snapshot, step_order, step_reports)?,
+            &format!("every {kind:?} of step \"{}\"", from_step.0),
+        );
+    }
+    let (source_index, source_report) = step_source(from_step, step_order, step_reports)?;
 
     let matching_outputs = {
         let exact = source_report
@@ -517,9 +714,52 @@ fn resolve_history_selector(
         .with_candidates(candidates));
     }
 
-    let mut current_target = *matching_outputs.iter().next().unwrap();
+    let first = *matching_outputs.iter().next().unwrap();
+    let current_target =
+        trace_forward(first, kind, ordinal, source_index, step_order, step_reports);
 
-    // Trace forward through subsequent operation reports
+    Ok(EntityRef {
+        snapshot: current_snapshot.id(),
+        entity: current_target.entity,
+        kind,
+    })
+}
+
+/// The position of a step in the session and the report it left.
+fn step_source<'a>(
+    from_step: &StepLabel,
+    step_order: &[String],
+    step_reports: &'a BTreeMap<String, OperationReport>,
+) -> Result<(usize, &'a OperationReport), ApiError> {
+    let source_index = step_order
+        .iter()
+        .position(|label| label == &from_step.0)
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::SelectorNotFound,
+                format!("Step \"{}\" does not exist in session history", from_step.0),
+            )
+        })?;
+    let source_report = step_reports.get(&from_step.0).ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCode::SelectorNotFound,
+            format!("No operation report recorded for step \"{}\"", from_step.0),
+        )
+    })?;
+    Ok((source_index, source_report))
+}
+
+/// Follows one entity through the reports of the steps after
+/// `source_index` to the entity it became; where a step split it into
+/// several, `ordinal` picks one.
+fn trace_forward(
+    mut current_target: EntityRef,
+    kind: EntityKind,
+    ordinal: Option<u32>,
+    source_index: usize,
+    step_order: &[String],
+    step_reports: &BTreeMap<String, OperationReport>,
+) -> EntityRef {
     for step_label in &step_order[source_index + 1..] {
         if let Some(report) = step_reports.get(step_label) {
             let next_candidates = report
@@ -540,12 +780,7 @@ fn resolve_history_selector(
             }
         }
     }
-
-    Ok(EntityRef {
-        snapshot: current_snapshot,
-        entity: current_target.entity,
-        kind,
-    })
+    current_target
 }
 
 fn resolve_geometric_selector(
@@ -805,6 +1040,20 @@ fn resolve_geometric_selector(
             parallel_edges(&scene, current_snapshot.id(), *direction)?,
             &format!("edges parallel to {direction:?}"),
         ),
+        GeometricSelector::EdgesOfFace { face, loops } => {
+            let face = resolve_selector(face, current_snapshot, step_order, step_reports)?;
+            exactly_one(
+                face_edges(current_snapshot, face, *loops)?,
+                &format!(
+                    "{} of face {}",
+                    match loops {
+                        FaceLoops::All => "edges",
+                        FaceLoops::Outer => "rim",
+                    },
+                    face.entity
+                ),
+            )
+        }
         GeometricSelector::ByExtremum {
             metric,
             extremum,

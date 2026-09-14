@@ -24,6 +24,7 @@ mod parametric;
 pub mod part_library;
 mod ribbon;
 pub mod shell;
+pub mod spacemouse;
 pub mod update;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,7 +62,7 @@ use artificer_model::{
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
-    DiagnosticSeverity, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
+    DiagnosticSeverity, DiagnosticSubject, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
     FaceExtrusionOperation, HistoryRelation, KernelCommand, KernelError, KernelErrorCode,
     KernelStage, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
     MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarAxis2,
@@ -1601,6 +1602,19 @@ impl ExportSubject {
         }
     }
 
+    /// The same, in the sentence case a desktop dialog's title bar expects.
+    fn dialog_title(self) -> String {
+        let format = match self {
+            Self::Body { format, .. } | Self::Document { format } => format.label().to_owned(),
+            Self::Sketch { .. } => "DXF".to_owned(),
+        };
+        match self {
+            Self::Body { ordinal, .. } => format!("Export body {ordinal} as {format}"),
+            Self::Sketch { ordinal, .. } => format!("Export sketch {ordinal} as {format}"),
+            Self::Document { .. } => format!("Export document as {format}"),
+        }
+    }
+
     fn file_stem(self, document: &Path) -> String {
         let stem = document
             .file_stem()
@@ -1620,6 +1634,191 @@ struct PendingExport {
     subject: ExportSubject,
     path_text: String,
     outcome: Option<Result<PathBuf, String>>,
+}
+
+/// What a typed document path is for. The desktop's own file dialog is the
+/// first choice for Open and Save as; a typed path is the way in on a desktop
+/// that has no dialog to offer, and the one a headless test drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentPathPurpose {
+    Open,
+    SaveAs,
+}
+
+impl DocumentPathPurpose {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN DOCUMENT BY PATH",
+            Self::SaveAs => "SAVE DOCUMENT AS",
+        }
+    }
+
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::SaveAs => "Save",
+        }
+    }
+}
+
+/// The typed-path prompt for the document itself.
+struct DocumentPathPrompt {
+    purpose: DocumentPathPurpose,
+    text: String,
+}
+
+/// A kernel refusal as a person reads it: the message first, the diagnostics'
+/// own words and what to try beneath it, the entities involved as rows they
+/// can click, and the code last.
+///
+/// The code alone is a category — `invalid_input` covers every way a profile
+/// can be refused — while the check names what actually failed. Both stay,
+/// small and monospace, because a bug report from a build we cannot attach a
+/// debugger to needs them; but they come last, because a person acts on the
+/// message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectionSummary {
+    pub message: String,
+    /// The diagnostics' messages, when they say more than the headline.
+    pub details: Vec<String>,
+    /// What the kernel proposes doing about it, when it says.
+    pub suggestion: Option<String>,
+    /// The entities the diagnostics point at.
+    pub candidates: Vec<RejectionCandidate>,
+    /// The refusal's category: `invalid_input`, `stale_snapshot`.
+    pub code: String,
+    /// The first diagnostic's code: the check that failed.
+    pub check: Option<String>,
+}
+
+/// One entity a refusal points at, and how to tell it from the others.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RejectionCandidate {
+    pub entity: EntityRef,
+    /// "face 12 · profile_not_closed": the entity and the check it failed.
+    pub description: String,
+}
+
+impl RejectionSummary {
+    /// The code with its check: `invalid_input · profile_not_closed`.
+    #[must_use]
+    pub fn code_label(&self) -> String {
+        match &self.check {
+            Some(check) => format!("{} · {check}", self.code),
+            None => self.code.clone(),
+        }
+    }
+}
+
+/// Reads a refusal into the shape the panels show.
+#[must_use]
+pub fn summarize_rejection(error: &KernelError) -> RejectionSummary {
+    let mut details: Vec<String> = Vec::new();
+    let mut candidates: Vec<RejectionCandidate> = Vec::new();
+    for diagnostic in &error.diagnostics {
+        if !diagnostic.message.is_empty()
+            && diagnostic.message != error.message
+            && !details.contains(&diagnostic.message)
+        {
+            details.push(diagnostic.message.clone());
+        }
+        for subject in &diagnostic.subjects {
+            let DiagnosticSubject::Entity { entity } = subject else {
+                continue;
+            };
+            if candidates
+                .iter()
+                .any(|candidate| candidate.entity == *entity)
+            {
+                continue;
+            }
+            candidates.push(RejectionCandidate {
+                entity: *entity,
+                description: format!("{} {} · {}", entity.kind, entity.entity.0, diagnostic.code),
+            });
+        }
+    }
+    // The kernel's structured errors carry no suggestion field of their own;
+    // one that has something to propose says so in its details.
+    let suggestion = ["suggestion", "hint"].into_iter().find_map(|key| {
+        error.details.get(key).cloned().or_else(|| {
+            error
+                .diagnostics
+                .iter()
+                .find_map(|diagnostic| diagnostic.details.get(key).cloned())
+        })
+    });
+    RejectionSummary {
+        message: error.message.clone(),
+        details,
+        suggestion,
+        candidates,
+        code: error.code.to_string(),
+        check: error
+            .diagnostics
+            .first()
+            .map(|diagnostic| diagnostic.code.to_string()),
+    }
+}
+
+/// Draws a refusal: message, details, suggestion, candidate rows, code. The
+/// entity the user clicked, if any, is returned for the caller to select,
+/// since selection needs the workbench and the card only needs the error.
+fn rejection_card(ui: &mut egui::Ui, summary: &RejectionSummary) -> Option<EntityRef> {
+    let mut picked = None;
+    ui.add(egui::Label::new(RichText::new(&summary.message).small().color(theme::text())).wrap());
+    for detail in &summary.details {
+        ui.add(egui::Label::new(RichText::new(detail).small().color(theme::muted())).wrap());
+    }
+    if let Some(suggestion) = &summary.suggestion {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Try: {suggestion}"))
+                    .small()
+                    .color(theme::warn()),
+            )
+            .wrap(),
+        );
+    }
+    for candidate in &summary.candidates {
+        let row = ui.add(
+            egui::Label::new(
+                RichText::new(format!("· {}", candidate.description))
+                    .small()
+                    .color(theme::accent()),
+            )
+            .sense(egui::Sense::click()),
+        );
+        row.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Button,
+                true,
+                format!("Select {}", candidate.description),
+            )
+        });
+        if row
+            .on_hover_text("Select this entity in the viewport")
+            .clicked()
+        {
+            picked = Some(candidate.entity);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("Rejected · {}", summary.code))
+                .small()
+                .color(theme::bad()),
+        );
+        if let Some(check) = &summary.check {
+            ui.label(
+                RichText::new(check)
+                    .small()
+                    .monospace()
+                    .color(theme::muted()),
+            );
+        }
+    });
+    picked
 }
 
 #[derive(Clone)]
@@ -2148,6 +2347,24 @@ pub struct KernelLabApp {
     selected_construction_plane: Option<u64>,
     document_properties_open: bool,
     pending_export: Option<PendingExport>,
+    /// The document's revision the last time it was saved or loaded. The
+    /// document is dirty when its revision has moved on from this.
+    saved_revision: u64,
+    /// Whether Open, Save as and the exports use the desktop's own file
+    /// dialog. Off, they fall back to typed paths, which is also what a
+    /// headless test drives.
+    native_file_dialogs: bool,
+    /// The folder the last file dialog ended in, so the next opens there.
+    last_dialog_directory: Option<PathBuf>,
+    /// The typed-path prompt for Open and Save as, while it shows.
+    document_path_prompt: Option<DocumentPathPrompt>,
+    /// A document chosen for opening while this one has unsaved changes:
+    /// the unsaved-changes prompt holds it until the user decides.
+    pending_open_over_unsaved: Option<PathBuf>,
+    /// The document a staged open will load, when it is not this one's own
+    /// path. Held apart from `document_path` so that cancelling the
+    /// confirmation leaves the document pointing where it was.
+    pending_open_path: Option<PathBuf>,
     /// The Parametric tab's variables panel.
     variables_window_open: bool,
     /// The parsed binding a staged `SetParameterBindingEntry` will publish.
@@ -2354,6 +2571,8 @@ pub struct KernelLabApp {
     /// The peek's return flight is in progress: the 3D view stays up until
     /// the camera lands back on the sketch plane, then the canvas returns.
     sketch_orbit_returning: bool,
+    /// The 3D mouse, if the process has one, and how it steers the camera.
+    spacemouse: spacemouse::SpaceMouseNavigation,
 }
 
 impl Default for KernelLabApp {
@@ -2379,6 +2598,12 @@ impl Default for KernelLabApp {
             selected_construction_plane: None,
             document_properties_open: false,
             pending_export: None,
+            saved_revision: 0,
+            native_file_dialogs: true,
+            last_dialog_directory: None,
+            document_path_prompt: None,
+            pending_open_over_unsaved: None,
+            pending_open_path: None,
             variables_window_open: false,
             staged_parameter_binding: None,
             variable_value_drafts: BTreeMap::new(),
@@ -2498,12 +2723,15 @@ impl Default for KernelLabApp {
             ribbon_tab: None,
             sketch_orbit_return_view: None,
             sketch_orbit_returning: false,
+            spacemouse: spacemouse::SpaceMouseNavigation::default(),
         };
         // Internal bootstrap is the sole non-interactive construction path.
         // Once the UI is live, every model mutation is staged first.
         app.execute_case(LabCase::CanonicalCuboid, None);
         app.initialize_document_from_displayed();
         app.history_scrub_position = app.document.history_position();
+        // The fixture is the document as built, not an edit to it.
+        app.saved_revision = app.document.revision();
         app
     }
 }
@@ -2544,6 +2772,9 @@ impl KernelLabApp {
         app.load_theme_preferences(egui_ctx);
         app.user_preferences_path = Some(user_preferences_path());
         app.load_user_preferences();
+        // The 3D mouse is opened once per process; a further document
+        // shares the reader and takes its motion while it is in front.
+        app.spacemouse = spacemouse::SpaceMouseNavigation::attach(egui_ctx);
         if let Err(error) = app.open_catalog_store(default_catalog_root()) {
             app.document_status = Some(format!(
                 "Local Part Library is using its verified built-in fallback: {error}"
@@ -2552,11 +2783,16 @@ impl KernelLabApp {
         app
     }
 
-    /// Deterministic constructor for semantic and pixel tests.
+    /// Deterministic constructor for semantic and pixel tests. A paused
+    /// workbench never opens the desktop's file dialogs: a test drives the
+    /// typed-path prompts instead.
     #[must_use]
     pub fn new_paused(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_style(&creation_context.egui_ctx);
-        Self::default()
+        Self {
+            native_file_dialogs: false,
+            ..Self::default()
+        }
     }
 
     /// Deterministic constructor shaped like production start-up: reference
@@ -2564,7 +2800,10 @@ impl KernelLabApp {
     #[must_use]
     pub fn new_paused_blank(creation_context: &eframe::CreationContext<'_>) -> Self {
         install_style(&creation_context.egui_ctx);
-        let mut app = Self::default();
+        let mut app = Self {
+            native_file_dialogs: false,
+            ..Self::default()
+        };
         app.reset_to_blank_workspace();
         app
     }
@@ -2577,7 +2816,10 @@ impl KernelLabApp {
         root: impl AsRef<Path>,
     ) -> Self {
         install_style(&creation_context.egui_ctx);
-        let mut app = Self::default();
+        let mut app = Self {
+            native_file_dialogs: false,
+            ..Self::default()
+        };
         if let Err(error) = app.open_catalog_store(root) {
             app.document_status = Some(format!("Local Part Library failed to open: {error}"));
         }
@@ -2827,6 +3069,41 @@ impl KernelLabApp {
         std::mem::take(&mut self.shell_requests)
     }
 
+    /// Whether the document has changed since it was last saved or loaded.
+    #[must_use]
+    pub const fn is_document_dirty(&self) -> bool {
+        self.document.revision() != self.saved_revision
+    }
+
+    /// Records that the document as it stands is what is on disk.
+    pub const fn mark_document_saved(&mut self) {
+        self.saved_revision = self.document.revision();
+    }
+
+    /// Whether Open, Save as and the exports open the desktop's file
+    /// dialogs rather than the typed-path prompts.
+    #[must_use]
+    pub const fn native_file_dialogs(&self) -> bool {
+        self.native_file_dialogs
+    }
+
+    pub const fn set_native_file_dialogs(&mut self, enabled: bool) {
+        self.native_file_dialogs = enabled;
+    }
+
+    /// Whether the unsaved-changes prompt is standing between this document
+    /// and one chosen to replace it.
+    #[must_use]
+    pub const fn unsaved_prompt_open(&self) -> bool {
+        self.pending_open_over_unsaved.is_some()
+    }
+
+    /// Whether the typed-path prompt for Open or Save as is showing.
+    #[must_use]
+    pub const fn document_path_prompt_open(&self) -> bool {
+        self.document_path_prompt.is_some()
+    }
+
     #[must_use]
     pub fn document_path(&self) -> &Path {
         &self.document_path
@@ -2950,13 +3227,24 @@ impl KernelLabApp {
         let json = read_bounded_document(path)?;
         self.load_workspace_json(&json)?;
         self.set_document_path(path.to_path_buf());
+        self.remember_dialog_directory(path);
         Ok(())
     }
 
     /// Loads the versioned workspace envelope and accepts legacy raw document
     /// JSON as a one-way migration path. Settings publish only after model
     /// replay succeeds, so a malformed file cannot partially mutate the app.
+    ///
+    /// A document just loaded is, by definition, as saved: the replay that
+    /// rebuilds it moves the revision on, so the saved revision is taken
+    /// after the whole load rather than before it.
     pub fn load_workspace_json(&mut self, json: &str) -> Result<(), String> {
+        self.load_workspace_json_unmarked(json)?;
+        self.mark_document_saved();
+        Ok(())
+    }
+
+    fn load_workspace_json_unmarked(&mut self, json: &str) -> Result<(), String> {
         let value = serde_json::from_str::<serde_json::Value>(json)
             .map_err(|error| format!("Artificer workspace is invalid: {error}"))?;
         if value.get("format").and_then(serde_json::Value::as_str)
@@ -3118,9 +3406,11 @@ impl KernelLabApp {
     #[must_use]
     pub fn last_error_detail(&self) -> Option<String> {
         match &self.last_attempt {
-            Attempt::Rejected { error, .. } => {
-                Some(format!("{} · {}", rejection_label(error), error.message))
-            }
+            Attempt::Rejected { error, .. } => Some(format!(
+                "{} · {}",
+                summarize_rejection(error).code_label(),
+                error.message
+            )),
             Attempt::NotRun | Attempt::Accepted { .. } => None,
         }
     }
@@ -3962,6 +4252,8 @@ impl KernelLabApp {
         self.document_status =
             Some("Blank document ready · choose a plane or create a datum plane".into());
         self.frame_visible_document();
+        // A blank document has nothing in it worth a prompt.
+        self.mark_document_saved();
     }
 
     fn initialize_document_from_displayed(&mut self) {
@@ -8567,10 +8859,18 @@ impl KernelLabApp {
                 self.execute_library_insertion(staging_id);
             }
             PendingOperation::LoadDefaultDocument => {
-                let path = self.document_path.clone();
+                // A document chosen to open, else this one's own path: the
+                // latter is how a saved copy is reverted to.
+                let path = self
+                    .pending_open_path
+                    .take()
+                    .unwrap_or_else(|| self.document_path.clone());
                 self.pending_operation = None;
                 if let Err(error) = self.load_workspace_from_path(&path) {
                     self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+                    if path != self.document_path {
+                        self.pending_open_path = Some(path);
+                    }
                     self.document_status = Some(format!("Open failed: {error}"));
                 }
             }
@@ -8860,7 +9160,10 @@ impl KernelLabApp {
                     self.pending_operation = None;
                 }
             }
-            PendingOperation::LoadDefaultDocument => self.pending_operation = None,
+            PendingOperation::LoadDefaultDocument => {
+                self.pending_operation = None;
+                self.pending_open_path = None;
+            }
             PendingOperation::BooleanBodies { .. } => {
                 self.boolean_tools.clear();
                 self.pending_operation = None;
@@ -11625,6 +11928,68 @@ impl KernelLabApp {
         context.request_repaint();
     }
 
+    /// Carries out a click or a drag on the view cube.
+    ///
+    /// A face, an edge, a corner, a roll arrow and the ISO button each name
+    /// a destination, and the camera flies there the way it flies to a face
+    /// it is asked to look at squarely: the same quintic ease and
+    /// shortest-path turn, so a change of view reads as a turn of the model
+    /// rather than a cut. Dragging the cube orbits directly, as it always
+    /// has, and takes over from any flight in progress.
+    fn apply_view_cube_command(&mut self, command: ViewCubeCommand) {
+        let mut target = self.view;
+        match command {
+            ViewCubeCommand::Face(face) => target.set_standard_view(face),
+            ViewCubeCommand::Roll { clockwise } => target.rotate_in_plane_quarter_turn(clockwise),
+            ViewCubeCommand::Isometric => target.reset_orientation(),
+            ViewCubeCommand::Along { axes } => {
+                if !target.set_view_along(view_cube_direction(axes), Vector3::new(0.0, 0.0, 1.0)) {
+                    return;
+                }
+            }
+            ViewCubeCommand::Drag { delta } => {
+                if self.sketch_flight_pending() {
+                    return;
+                }
+                self.face_camera_transition = None;
+                self.last_face_camera_time = None;
+                self.view
+                    .orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
+                return;
+            }
+        }
+        self.fly_view_to(target);
+    }
+
+    /// Whether a camera flight is carrying the workbench into a sketch: its
+    /// landing opens the sketch on the face it was aimed at, so nothing else
+    /// may steer it.
+    const fn sketch_flight_pending(&self) -> bool {
+        self.pending_face_sketch.is_some() || self.pending_plane_sketch.is_some()
+    }
+
+    /// Flies the camera to `target` with the normal-to-face flight, or
+    /// jumps there when the flights are switched off. A flight a sketch is
+    /// waiting on is left alone and the request is dropped, which the
+    /// return value reports. A flight to a view the camera already has is
+    /// no flight at all.
+    fn fly_view_to(&mut self, target: ViewState) -> bool {
+        if self.sketch_flight_pending() {
+            return false;
+        }
+        if self.animate_face_camera_transitions
+            && let Some(transition) = CameraTransition::to_view(self.view, target)
+        {
+            self.face_camera_transition = Some(transition);
+            self.last_face_camera_time = None;
+        } else {
+            self.face_camera_transition = None;
+            self.last_face_camera_time = None;
+            self.view = target;
+        }
+        true
+    }
+
     fn frame_visible_document(&mut self) {
         if let Some(bounds) = self.visible_document_bounds() {
             self.view.frame(bounds);
@@ -11829,6 +12194,35 @@ impl KernelLabApp {
             return;
         }
 
+        // The file shortcuts work wherever the keyboard is, as they do in
+        // every desktop application; consuming them keeps a focused editor
+        // from also seeing the letter. Save as is checked first because the
+        // plain Ctrl+S match would otherwise never see the shift.
+        if self.pending_operation.is_none() {
+            let (open, save_as, save) = context.input_mut(|input| {
+                (
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::O),
+                    input.consume_key(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::S,
+                    ),
+                    input.consume_key(egui::Modifiers::COMMAND, egui::Key::S),
+                )
+            });
+            if open {
+                self.open_document_with_dialog();
+                return;
+            }
+            if save_as {
+                self.save_document_as_with_dialog();
+                return;
+            }
+            if save {
+                self.save_document();
+                return;
+            }
+        }
+
         if !context.egui_wants_keyboard_input() {
             let (undo, redo) = context.input(|input| {
                 let command = input.modifiers.command;
@@ -11992,9 +12386,71 @@ impl KernelLabApp {
                 }
                 ui.separator();
                 let path = self.document_path.clone();
+                // Open and Save as go through the desktop's own file dialog.
+                // Some Linux desktops have no portal to offer one, so each
+                // is also reachable with a typed path.
+                let open = ui
+                    .add_enabled(!operation_pending, egui::Button::new("Open…"))
+                    .on_hover_text(
+                        "Choose an Artificer document to open in place of this one (Ctrl+O)",
+                    );
+                open.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        !operation_pending,
+                        "Open document",
+                    )
+                });
+                if open.clicked() {
+                    self.open_document_with_dialog();
+                    ui.close();
+                }
+                let open_by_path = ui
+                    .add_enabled(!operation_pending, egui::Button::new("Open by path…"))
+                    .on_hover_text(
+                        "Type the path of an Artificer document to open, for a desktop without a file dialog",
+                    );
+                open_by_path.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        !operation_pending,
+                        "Open document by path",
+                    )
+                });
+                if open_by_path.clicked() {
+                    self.open_document_path_prompt(DocumentPathPurpose::Open);
+                    ui.close();
+                }
+                let can_revert = !operation_pending && path.is_file();
+                let revert = ui
+                    .add_enabled(can_revert, egui::Button::new("Revert to saved"))
+                    .on_hover_text(if path.is_file() {
+                        format!(
+                            "Reopen {} as it was last saved, discarding unsaved changes",
+                            path.display()
+                        )
+                    } else {
+                        format!("No saved document exists at {}", path.display())
+                    });
+                revert.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        can_revert,
+                        "Open saved document",
+                    )
+                });
+                if revert.clicked() {
+                    self.request_open_document(path.clone());
+                    ui.close();
+                }
+                ui.separator();
                 let save = ui
                     .add_enabled(!operation_pending, egui::Button::new("Save"))
-                    .on_hover_text(format!("Save Artificer workspace to {}", path.display()));
+                    .on_hover_text(if self.native_file_dialogs && !self.document_has_user_path() {
+                        "Save the Artificer workspace, choosing where (Ctrl+S)".to_owned()
+                    } else {
+                        format!("Save Artificer workspace to {} (Ctrl+S)", path.display())
+                    });
                 save.widget_info(|| {
                     egui::WidgetInfo::labeled(
                         egui::WidgetType::Button,
@@ -12003,29 +12459,37 @@ impl KernelLabApp {
                     )
                 });
                 if save.clicked() {
-                    self.document_status = Some(match self.save_workspace_to_path(&path) {
-                        Ok(()) => format!("Saved Artificer workspace to {}", path.display()),
-                        Err(error) => format!("Save failed: {error}"),
-                    });
+                    self.save_document();
                     ui.close();
                 }
-                let can_open = !operation_pending && path.is_file();
-                let open = ui
-                    .add_enabled(can_open, egui::Button::new("Open"))
-                    .on_hover_text(if path.is_file() {
-                        format!("Stage opening {}", path.display())
-                    } else {
-                        format!("No saved document exists at {}", path.display())
-                    });
-                open.widget_info(|| {
+                let save_as = ui
+                    .add_enabled(!operation_pending, egui::Button::new("Save as…"))
+                    .on_hover_text("Choose where to save the Artificer workspace (Ctrl+Shift+S)");
+                save_as.widget_info(|| {
                     egui::WidgetInfo::labeled(
                         egui::WidgetType::Button,
-                        can_open,
-                        "Open saved document",
+                        !operation_pending,
+                        "Save document as",
                     )
                 });
-                if open.clicked() {
-                    self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+                if save_as.clicked() {
+                    self.save_document_as_with_dialog();
+                    ui.close();
+                }
+                let save_as_by_path = ui
+                    .add_enabled(!operation_pending, egui::Button::new("Save as by path…"))
+                    .on_hover_text(
+                        "Type where to save the Artificer workspace, for a desktop without a file dialog",
+                    );
+                save_as_by_path.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        !operation_pending,
+                        "Save document as by path",
+                    )
+                });
+                if save_as_by_path.clicked() {
+                    self.open_document_path_prompt(DocumentPathPurpose::SaveAs);
                     ui.close();
                 }
                 ui.separator();
@@ -12072,6 +12536,31 @@ impl KernelLabApp {
                     });
                     ui.close();
                 }
+                ui.menu_button("Export by path", |ui| {
+                    ui.set_min_width(200.0);
+                    for (label, format) in [
+                        ("STL…", BodyExport::Stl),
+                        ("STEP (exact B-rep)…", BodyExport::StepExact),
+                        ("STEP (faceted)…", BodyExport::StepFaceted),
+                    ] {
+                        let button = ui
+                            .add_enabled(!operation_pending, egui::Button::new(label))
+                            .on_hover_text(
+                                "Type the destination path, for a desktop without a file dialog",
+                            );
+                        button.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                !operation_pending,
+                                format!("Export as {} by path", format.label()),
+                            )
+                        });
+                        if button.clicked() {
+                            self.open_export_path_dialog(ExportSubject::Document { format });
+                            ui.close();
+                        }
+                    }
+                });
                 ui.separator();
                 if ui
                     .add_enabled(!operation_pending, egui::Button::new("Document properties"))
@@ -12118,6 +12607,25 @@ impl KernelLabApp {
                     .color(theme::text())
                     .strong(),
             );
+            if self.is_document_dirty() {
+                // The dot every editor uses for "not saved": its own widget,
+                // so the title keeps its name and the state has one too.
+                let marker = ui
+                    .label(
+                        RichText::new("•")
+                            .font(FontId::proportional(14.0))
+                            .color(theme::accent())
+                            .strong(),
+                    )
+                    .on_hover_text("Unsaved changes (Ctrl+S saves)");
+                marker.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Label,
+                        true,
+                        format!("Unsaved changes in {}", self.document_title),
+                    )
+                });
+            }
             ui.add_space(6.0);
             self.file_menu(ui, operation_pending);
             // Undo and redo belong beside the file actions, not buried in the
@@ -12637,7 +13145,17 @@ impl KernelLabApp {
         export::atomic_write(path, text.as_bytes())
     }
 
-    /// Opens the Export dialog on a chosen destination.
+    /// Exports through the desktop's own Save dialog where there is one, and
+    /// through the typed-path Export dialog where there is not.
+    fn open_export_dialog(&mut self, subject: ExportSubject) {
+        if self.native_file_dialogs {
+            self.export_with_native_dialog(subject);
+        } else {
+            self.open_export_path_dialog(subject);
+        }
+    }
+
+    /// Opens the typed-path Export dialog on a proposed destination.
     ///
     /// Exporting used to write immediately to a path derived from the
     /// document's, which for an unsaved document meant a file appearing inside
@@ -12645,7 +13163,7 @@ impl KernelLabApp {
     /// outside that is indistinguishable from the command doing nothing. The
     /// destination is now proposed, shown, and editable before anything is
     /// written, and the result is reported where it was asked for.
-    fn open_export_dialog(&mut self, subject: ExportSubject) {
+    fn open_export_path_dialog(&mut self, subject: ExportSubject) {
         let path = default_export_directory(&self.document_path).join(format!(
             "{}.{}",
             subject.file_stem(&self.document_path),
@@ -12656,6 +13174,331 @@ impl KernelLabApp {
             path_text: path.display().to_string(),
             outcome: None,
         });
+    }
+
+    /// The desktop's Save dialog for an export. The file the user names is
+    /// written at once and reported in the document status; a cancelled
+    /// dialog writes nothing and says nothing.
+    fn export_with_native_dialog(&mut self, subject: ExportSubject) {
+        let (name, extensions): (&str, &[&str]) = match subject {
+            ExportSubject::Body { format, .. } | ExportSubject::Document { format } => match format
+            {
+                BodyExport::Stl => ("STL mesh", &["stl"]),
+                BodyExport::StepExact | BodyExport::StepFaceted => ("STEP model", &["step", "stp"]),
+            },
+            ExportSubject::Sketch { .. } => ("DXF drawing", &["dxf"]),
+        };
+        let file_name = format!(
+            "{}.{}",
+            subject.file_stem(&self.document_path),
+            subject.extension()
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_title(subject.dialog_title())
+            .add_filter(name, extensions)
+            .set_directory(self.dialog_directory())
+            .set_file_name(file_name)
+            .save_file()
+        else {
+            return;
+        };
+        self.remember_dialog_directory(&path);
+        self.pending_export = Some(PendingExport {
+            subject,
+            path_text: path.display().to_string(),
+            outcome: None,
+        });
+        self.write_pending_export();
+        self.pending_export = None;
+    }
+
+    /// Where a file dialog opens: beside the document once it lives somewhere
+    /// the user chose; else where the last dialog ended; else the home
+    /// directory. The application data directory an unsaved document points
+    /// into is no place to browse.
+    fn dialog_directory(&self) -> PathBuf {
+        if self.document_has_user_path()
+            && let Some(parent) = self.document_path.parent().filter(|parent| parent.is_dir())
+        {
+            return parent.to_path_buf();
+        }
+        self.last_dialog_directory
+            .clone()
+            .unwrap_or_else(|| default_export_directory(&default_document_path()))
+    }
+
+    fn remember_dialog_directory(&mut self, path: &Path) {
+        if let Some(parent) = path.parent().filter(|parent| parent.is_dir()) {
+            self.last_dialog_directory = Some(parent.to_path_buf());
+        }
+    }
+
+    /// Whether the document lives somewhere the user chose. Until it does,
+    /// `document_path` is a slot in the application's own data directory,
+    /// and Save has to ask where.
+    fn document_has_user_path(&self) -> bool {
+        self.document_path.parent() != default_document_path().parent()
+    }
+
+    /// The desktop's Open dialog for a document. `None` is a cancellation, or
+    /// a desktop with no dialog to offer.
+    fn pick_document_natively(&mut self) -> Option<PathBuf> {
+        let chosen = rfd::FileDialog::new()
+            .set_title("Open Artificer document")
+            .add_filter("Artificer document", &["artificer"])
+            .set_directory(self.dialog_directory())
+            .pick_file()?;
+        self.remember_dialog_directory(&chosen);
+        Some(chosen)
+    }
+
+    /// The desktop's Save dialog for the document.
+    fn pick_document_save_path_natively(&mut self) -> Option<PathBuf> {
+        let file_name = self
+            .document_has_user_path()
+            .then(|| self.document_path.file_name())
+            .flatten()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}.artificer",
+                    self.document_title.to_lowercase().replace(' ', "-")
+                )
+            });
+        let chosen = rfd::FileDialog::new()
+            .set_title("Save Artificer document")
+            .add_filter("Artificer document", &["artificer"])
+            .set_directory(self.dialog_directory())
+            .set_file_name(file_name)
+            .save_file()?;
+        self.remember_dialog_directory(&chosen);
+        Some(chosen)
+    }
+
+    /// File ▸ Open…, Ctrl+O.
+    fn open_document_with_dialog(&mut self) {
+        if self.native_file_dialogs {
+            if let Some(path) = self.pick_document_natively() {
+                self.request_open_document(path);
+            }
+        } else {
+            self.open_document_path_prompt(DocumentPathPurpose::Open);
+        }
+    }
+
+    /// Asks to open `path` in place of this document. Unsaved changes are
+    /// asked about first; then the open is staged for confirmation like
+    /// every other operation on the model.
+    pub fn request_open_document(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if self.is_document_dirty() {
+            self.pending_open_over_unsaved = Some(path);
+        } else {
+            self.stage_open_document(path);
+        }
+    }
+
+    /// Stages the load. The document keeps its own path until the load has
+    /// succeeded, so a cancelled confirmation changes nothing.
+    fn stage_open_document(&mut self, path: PathBuf) {
+        self.pending_open_path = (path != self.document_path).then_some(path);
+        self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+    }
+
+    /// File ▸ Save, Ctrl+S: to where the document lives, or — for a document
+    /// that has never been given a home — to wherever the user says. `false`
+    /// when the user cancelled or the save failed; the status says which.
+    pub fn save_document(&mut self) -> bool {
+        if self.native_file_dialogs && !self.document_has_user_path() {
+            return self.save_document_as_with_dialog();
+        }
+        let path = self.document_path.clone();
+        self.save_document_to(&path)
+    }
+
+    /// File ▸ Save as…, Ctrl+Shift+S.
+    fn save_document_as_with_dialog(&mut self) -> bool {
+        if self.native_file_dialogs {
+            match self.pick_document_save_path_natively() {
+                Some(path) => self.save_document_to(&path),
+                None => false,
+            }
+        } else {
+            self.open_document_path_prompt(DocumentPathPurpose::SaveAs);
+            false
+        }
+    }
+
+    /// Saves to `path`, adopts it as the document's own, and reports.
+    pub fn save_document_to(&mut self, path: &Path) -> bool {
+        match self.save_workspace_to_path(path) {
+            Ok(()) => {
+                self.set_document_path(path.to_path_buf());
+                self.remember_dialog_directory(path);
+                self.mark_document_saved();
+                self.document_status =
+                    Some(format!("Saved Artificer workspace to {}", path.display()));
+                true
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Save failed: {error}"));
+                false
+            }
+        }
+    }
+
+    fn open_document_path_prompt(&mut self, purpose: DocumentPathPurpose) {
+        self.document_path_prompt = Some(DocumentPathPrompt {
+            purpose,
+            text: self.document_path.display().to_string(),
+        });
+    }
+
+    /// The typed-path prompt for Open and Save as.
+    fn document_path_prompt_window(&mut self, context: &egui::Context) {
+        let Some(mut prompt) = self.document_path_prompt.take() else {
+            return;
+        };
+        let mut accepted = false;
+        let mut cancelled = false;
+        egui::Window::new(prompt.purpose.title())
+            .id(egui::Id::new("document_path_prompt"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(520.0)
+            .min_width(460.0)
+            .resizable(false)
+            .collapsible(false)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(context, |ui| {
+                ui.label(RichText::new("Path").small().color(theme::muted()));
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.text)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/path/to/design.artificer"),
+                );
+                field.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Document path")
+                });
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    accepted = true;
+                }
+                let path = PathBuf::from(prompt.text.trim());
+                match prompt.purpose {
+                    DocumentPathPurpose::Open
+                        if !path.as_os_str().is_empty() && !path.is_file() =>
+                    {
+                        status_line(ui, "No such file", theme::warn());
+                    }
+                    DocumentPathPurpose::SaveAs if path.is_file() => {
+                        status_line(
+                            ui,
+                            "A file is already there and will be replaced",
+                            theme::warn(),
+                        );
+                    }
+                    _ => {}
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(prompt.purpose.verb()).clicked() {
+                        accepted = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+        if accepted {
+            let path = PathBuf::from(prompt.text.trim());
+            if path.as_os_str().is_empty() {
+                self.document_status = Some("A path is needed".to_owned());
+                self.document_path_prompt = Some(prompt);
+                return;
+            }
+            match prompt.purpose {
+                DocumentPathPurpose::Open => self.request_open_document(path),
+                DocumentPathPurpose::SaveAs => {
+                    self.save_document_to(&path);
+                }
+            }
+        } else if !cancelled {
+            self.document_path_prompt = Some(prompt);
+        }
+    }
+
+    /// The unsaved-changes prompt an Open raises over a dirty document.
+    fn unsaved_changes_window(&mut self, context: &egui::Context) {
+        let Some(path) = self.pending_open_over_unsaved.clone() else {
+            return;
+        };
+        let title = self.document_title.clone();
+        let consequence = format!(
+            "Opening {} replaces it. Unsaved changes are lost unless they are saved first.",
+            path.display()
+        );
+        match documents::unsaved_changes_prompt(context, &title, &consequence) {
+            Some(documents::UnsavedChoice::Save) => {
+                self.pending_open_over_unsaved = None;
+                if self.save_document() {
+                    self.stage_open_document(path);
+                }
+            }
+            Some(documents::UnsavedChoice::Discard) => {
+                self.pending_open_over_unsaved = None;
+                self.stage_open_document(path);
+            }
+            Some(documents::UnsavedChoice::Cancel) => self.pending_open_over_unsaved = None,
+            None => {}
+        }
+    }
+
+    /// Selects an entity a refusal pointed at, so the user can see which
+    /// face, edge or vertex the kernel meant.
+    fn select_rejection_candidate(&mut self, entity: EntityRef) {
+        let Some(body) = self
+            .active_body_id()
+            .map(|body| viewport::BodyInstanceKey::new(body.get()))
+        else {
+            return;
+        };
+        match entity.kind {
+            EntityKind::Face => {
+                self.select_model_face(
+                    viewport::DocumentFaceSelection { body, face: entity },
+                    false,
+                );
+            }
+            EntityKind::Edge => {
+                self.select_model_edge(
+                    viewport::DocumentEdgeSelection { body, edge: entity },
+                    false,
+                );
+            }
+            EntityKind::Vertex => self.select_model_vertex(
+                viewport::DocumentVertexSelection {
+                    body,
+                    vertex: entity,
+                },
+                false,
+            ),
+            _ => return,
+        }
+        self.document_status = Some(format!(
+            "Selected {} {} from the refusal",
+            entity.kind, entity.entity.0
+        ));
     }
 
     /// Writes the export the dialog is holding, and reports what happened.
@@ -13391,18 +14234,7 @@ impl KernelLabApp {
                             .add_enabled(!operation_pending, egui::Button::new("Save .ARTIFICER"))
                             .clicked()
                         {
-                            self.set_document_path(requested_document_path.clone());
-                            self.document_status = Some(
-                                self.save_workspace_to_path(&requested_document_path).map_or_else(
-                                    |error| format!("Save failed: {error}"),
-                                    |()| {
-                                        format!(
-                                            "Saved Artificer workspace to {}",
-                                            requested_document_path.display()
-                                        )
-                                    },
-                                ),
-                            );
+                            self.save_document_to(&requested_document_path);
                         }
                         if ui
                             .add_enabled(
@@ -13411,8 +14243,7 @@ impl KernelLabApp {
                             )
                             .clicked()
                         {
-                            self.set_document_path(requested_document_path.clone());
-                            self.pending_operation = Some(PendingOperation::LoadDefaultDocument);
+                            self.request_open_document(requested_document_path.clone());
                         }
                     });
                     ui.label(
@@ -15577,15 +16408,7 @@ impl KernelLabApp {
         if extrusion_pending {
             if let Some(error) = &self.sketch_extrusion_issue {
                 status_line(ui, "EXTRUSION REJECTED · INTENT RETAINED", theme::bad());
-                ui.label(
-                    RichText::new(format!("Rejected · {}", rejection_label(error)))
-                        .small()
-                        .color(theme::bad()),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(&error.message).small().color(theme::muted()))
-                        .wrap(),
-                );
+                let picked = rejection_card(ui, &summarize_rejection(error));
                 ui.label(
                     RichText::new(
                         "Previous body retained · adjust the inputs or cancel this preview",
@@ -15593,6 +16416,9 @@ impl KernelLabApp {
                     .small()
                     .color(theme::good()),
                 );
+                if let Some(entity) = picked {
+                    self.select_rejection_candidate(entity);
+                }
             } else {
                 ui.label(
                     RichText::new(match self.extrusion_mode {
@@ -15733,20 +16559,15 @@ impl KernelLabApp {
         if pending {
             if let Some(error) = &self.sketch_extrusion_issue {
                 status_line(ui, "PUSH/PULL REJECTED · INTENT RETAINED", theme::bad());
-                ui.label(
-                    RichText::new(format!("Rejected · {}", rejection_label(error)))
-                        .small()
-                        .color(theme::bad()),
-                );
-                ui.add(
-                    egui::Label::new(RichText::new(&error.message).small().color(theme::muted()))
-                        .wrap(),
-                );
+                let picked = rejection_card(ui, &summarize_rejection(error));
                 ui.label(
                     RichText::new("Previous body retained · adjust the distance or cancel")
                         .small()
                         .color(theme::good()),
                 );
+                if let Some(entity) = picked {
+                    self.select_rejection_candidate(entity);
+                }
             } else {
                 ui.label(
                     RichText::new(if self.extrusion_distance < 0.0 {
@@ -16115,10 +16936,11 @@ impl KernelLabApp {
         (format!("{fps:.0} FPS UI"), color)
     }
 
-    fn attempt_card(&self, ui: &mut egui::Ui) {
-        match &self.last_attempt {
+    fn attempt_card(&mut self, ui: &mut egui::Ui) {
+        let picked = match &self.last_attempt {
             Attempt::NotRun => {
                 status_line(ui, "Not run", theme::muted());
+                None
             }
             Attempt::Accepted { operation } => {
                 status_line(ui, operation, theme::good());
@@ -16127,43 +16949,44 @@ impl KernelLabApp {
                         .small()
                         .color(theme::muted()),
                 );
+                None
             }
             Attempt::Rejected { operation, error } => {
                 status_line(ui, operation, theme::bad());
-                ui.label(
-                    RichText::new(format!("Rejected · {}", error.code))
-                        .small()
-                        .color(theme::bad()),
-                );
-                ui.label(RichText::new(&error.message).small().color(theme::muted()));
+                let picked = rejection_card(ui, &summarize_rejection(error));
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Last valid snapshot retained")
                         .small()
                         .color(theme::good()),
                 );
+                picked
             }
+        };
+        if let Some(entity) = picked {
+            self.select_rejection_candidate(entity);
         }
     }
 
-    fn compact_attempt_status(&self, ui: &mut egui::Ui) {
+    /// The last transaction's outcome, one line deep. Returns the refusal
+    /// candidate the user clicked, for the caller to select once the
+    /// borrows the status chip holds have ended.
+    fn compact_attempt_status(&self, ui: &mut egui::Ui) -> Option<EntityRef> {
         match &self.last_attempt {
-            Attempt::NotRun => {}
-            Attempt::Accepted { operation } => status_line(ui, operation, theme::good()),
+            Attempt::NotRun => None,
+            Attempt::Accepted { operation } => {
+                status_line(ui, operation, theme::good());
+                None
+            }
             Attempt::Rejected { operation, error } => {
                 status_line(ui, operation, theme::bad());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("Rejected · {}", error.code))
-                            .small()
-                            .color(theme::bad()),
-                    );
-                    ui.label(
-                        RichText::new("Last valid snapshot retained")
-                            .small()
-                            .color(theme::good()),
-                    );
-                });
+                let picked = rejection_card(ui, &summarize_rejection(error));
+                ui.label(
+                    RichText::new("Last valid snapshot retained")
+                        .small()
+                        .color(theme::good()),
+                );
+                picked
             }
         }
     }
@@ -17208,17 +18031,7 @@ impl KernelLabApp {
             egui::vec2(112.0, 128.0),
         );
         if let Some(command) = model_view_cube(ui, cube_rect, self.view, true) {
-            match command {
-                ViewCubeCommand::Face(face) => self.view.set_standard_view(face),
-                ViewCubeCommand::Roll { clockwise } => {
-                    self.view.rotate_in_plane_quarter_turn(clockwise);
-                }
-                ViewCubeCommand::Isometric => self.reset_view(ui.ctx()),
-                ViewCubeCommand::Drag { delta } => {
-                    self.view
-                        .orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
-                }
-            }
+            self.apply_view_cube_command(command);
             ui.ctx().request_repaint();
         }
 
@@ -17293,6 +18106,7 @@ impl KernelLabApp {
                 }
             });
 
+        let mut picked_candidate = None;
         let Some(body) = &self.displayed else {
             return;
         };
@@ -17378,9 +18192,12 @@ impl KernelLabApp {
                             .font(FontId::proportional(10.0))
                             .color(theme::good()),
                     );
-                    self.compact_attempt_status(ui);
+                    picked_candidate = self.compact_attempt_status(ui);
                 });
             });
+        if let Some(entity) = picked_candidate {
+            self.select_rejection_candidate(entity);
+        }
     }
 
     fn collapsed_browser_rail(&mut self, ui: &mut egui::Ui) {
@@ -17745,6 +18562,9 @@ impl eframe::App for KernelLabApp {
         if !self.advance_face_camera_transition(context) {
             self.advance_motion(context);
         }
+        // The 3D mouse steers the camera after the face flight has had its
+        // frame, so a flight in progress is never fought over.
+        self.poll_spacemouse(context);
         self.refresh_kinematics();
     }
 
@@ -17981,6 +18801,8 @@ impl eframe::App for KernelLabApp {
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.export_window(ui.ctx());
+        self.document_path_prompt_window(ui.ctx());
+        self.unsaved_changes_window(ui.ctx());
         self.theme_editor_window(ui.ctx());
         self.variables_window(ui.ctx());
         self.about_window(ui.ctx());
@@ -18106,12 +18928,37 @@ impl eframe::App for KernelLabApp {
     }
 }
 
+impl KernelLabApp {
+    /// The world direction from the model toward the viewer, as the view
+    /// cube's corners and edges set it. Read by the UI tests.
+    #[must_use]
+    pub fn view_direction(&self) -> Vector3 {
+        self.view.view_direction()
+    }
+
+    /// The world direction the camera's screen-up points along.
+    #[must_use]
+    pub fn screen_up_direction(&self) -> Vector3 {
+        self.view.screen_up_direction()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewCubeCommand {
     Face(StandardView),
-    Roll { clockwise: bool },
+    Roll {
+        clockwise: bool,
+    },
     Isometric,
-    Drag { delta: egui::Vec2 },
+    /// Look from a corner or an edge of the cube: the signs of the world
+    /// axes name it, so `[1, -1, 1]` is the front-top-right corner and
+    /// `[0, -1, 1]` the front-top edge. World +Z stays up.
+    Along {
+        axes: [i8; 3],
+    },
+    Drag {
+        delta: egui::Vec2,
+    },
 }
 
 fn model_view_cube(
@@ -18217,7 +19064,67 @@ fn model_view_cube(
     }
 
     if !show_controls {
+        // The sketch indicator answers face clicks alone.
         return command;
+    }
+
+    // Corners and edges, registered after the faces so that a click on one
+    // is theirs rather than the face's: egui gives a click to the topmost
+    // widget under the pointer, and later is higher. The marks show while
+    // the pointer is over the cube, so the cube reads as a cube the rest of
+    // the time; the handles themselves are always there to click.
+    let pointer_over_cube = ui.rect_contains_pointer(cube_bounds);
+    let handle_colour = translucent(Color32::from_rgb(110, 122, 136), 220);
+    for handle in view_cube_handles() {
+        let visible = handle
+            .adjacent_face_normals()
+            .any(|normal| view.project_direction(normal).depth > 1.0e-6);
+        if !visible {
+            continue;
+        }
+        let projected = view.project_direction(handle.cube_point());
+        let center = egui::pos2(
+            cube_center.x + projected.coordinates[0] as f32 * cube_scale,
+            cube_center.y + projected.coordinates[1] as f32 * cube_scale,
+        );
+        let hit_rect = egui::Rect::from_center_size(center, egui::vec2(10.0, 10.0));
+        let response = ui.interact(
+            hit_rect,
+            ui.id().with(("view-cube-handle", handle.axes)),
+            egui::Sense::click(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, handle.accessible_label())
+        });
+        if pointer_over_cube || response.hovered() {
+            let colour = if response.hovered() {
+                theme::accent()
+            } else {
+                handle_colour
+            };
+            match handle.kind() {
+                ViewCubeHandleKind::Corner => {
+                    ui.painter().circle_filled(center, 2.6, colour);
+                }
+                ViewCubeHandleKind::Edge => {
+                    // A short tick along the edge itself.
+                    let along = view.project_direction(handle.edge_axis());
+                    let along =
+                        egui::vec2(along.coordinates[0] as f32, along.coordinates[1] as f32);
+                    if along.length_sq() > 1.0e-4 {
+                        let half = along.normalized() * 4.0;
+                        ui.painter()
+                            .line_segment([center - half, center + half], Stroke::new(2.0, colour));
+                    } else {
+                        ui.painter().circle_filled(center, 2.0, colour);
+                    }
+                }
+            }
+        }
+        if response.clicked() {
+            command = Some(ViewCubeCommand::Along { axes: handle.axes });
+        }
+        response.on_hover_text(format!("Look from the {}", handle.name()));
     }
 
     for (name, direction, target) in view_cube_adjacent_arrows(view) {
@@ -18395,6 +19302,126 @@ fn view_cube_faces() -> [(StandardView, [Vector3; 4]); 6] {
             ],
         ),
     ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewCubeHandleKind {
+    Corner,
+    Edge,
+}
+
+/// A corner or an edge of the view cube, named by the signs of the world
+/// axes it lies on: every non-zero sign is a face the handle belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewCubeHandle {
+    axes: [i8; 3],
+}
+
+impl ViewCubeHandle {
+    fn kind(self) -> ViewCubeHandleKind {
+        if self.axes.iter().all(|sign| *sign != 0) {
+            ViewCubeHandleKind::Corner
+        } else {
+            ViewCubeHandleKind::Edge
+        }
+    }
+
+    /// The vertex or edge midpoint on the unit cube, for drawing.
+    fn cube_point(self) -> Vector3 {
+        Vector3::new(
+            f64::from(self.axes[0]),
+            f64::from(self.axes[1]),
+            f64::from(self.axes[2]),
+        )
+    }
+
+    /// The outward normals of the faces the handle sits on.
+    fn adjacent_face_normals(self) -> impl Iterator<Item = Vector3> {
+        self.axes
+            .into_iter()
+            .enumerate()
+            .filter(|(_, sign)| *sign != 0)
+            .map(|(index, sign)| {
+                let mut normal = [0.0; 3];
+                normal[index] = f64::from(sign);
+                Vector3::new(normal[0], normal[1], normal[2])
+            })
+    }
+
+    /// For an edge, the world axis it runs along; a corner has none, and
+    /// answers with the zero vector.
+    fn edge_axis(self) -> Vector3 {
+        let mut axis = [0.0; 3];
+        if let Some(index) = self.axes.iter().position(|sign| *sign == 0) {
+            axis[index] = 1.0;
+        }
+        Vector3::new(axis[0], axis[1], axis[2])
+    }
+
+    /// "front-top-right": the faces named front to back, top to bottom,
+    /// then left to right, in the words the cube's faces already wear.
+    fn name(self) -> String {
+        let [x, y, z] = self.axes;
+        let words = [
+            match y {
+                -1 => Some(StandardView::Front),
+                1 => Some(StandardView::Back),
+                _ => None,
+            },
+            match z {
+                1 => Some(StandardView::Top),
+                -1 => Some(StandardView::Bottom),
+                _ => None,
+            },
+            match x {
+                -1 => Some(StandardView::Left),
+                1 => Some(StandardView::Right),
+                _ => None,
+            },
+        ];
+        words
+            .into_iter()
+            .flatten()
+            .map(|face| face.label().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// The accessible name: "View cube corner front-top-right".
+    fn accessible_label(self) -> String {
+        let kind = match self.kind() {
+            ViewCubeHandleKind::Corner => "corner",
+            ViewCubeHandleKind::Edge => "edge",
+        };
+        format!("View cube {kind} {}", self.name())
+    }
+}
+
+/// The cube's eight corners and twelve edges.
+fn view_cube_handles() -> Vec<ViewCubeHandle> {
+    let mut handles = Vec::with_capacity(20);
+    for x in [-1_i8, 0, 1] {
+        for y in [-1_i8, 0, 1] {
+            for z in [-1_i8, 0, 1] {
+                let zeros = [x, y, z].iter().filter(|sign| **sign == 0).count();
+                if zeros <= 1 {
+                    handles.push(ViewCubeHandle { axes: [x, y, z] });
+                }
+            }
+        }
+    }
+    handles
+}
+
+/// The unit direction from the cube's centre through a corner or an edge
+/// midpoint: where the viewer stands to look from it.
+fn view_cube_direction(axes: [i8; 3]) -> Vector3 {
+    let point = ViewCubeHandle { axes }.cube_point();
+    let length = (point.x * point.x + point.y * point.y + point.z * point.z).sqrt();
+    if length <= f64::EPSILON {
+        return Vector3::new(0.0, -1.0, 0.0);
+    }
+    Vector3::new(point.x / length, point.y / length, point.z / length)
 }
 
 /// Squares a face support's in-plane axes to the world, keeping the plane, the
@@ -19491,19 +20518,6 @@ fn points_coincide(left: Point3, right: Point3) -> bool {
     (left.x - right.x).abs() <= COINCIDENT
         && (left.y - right.y).abs() <= COINCIDENT
         && (left.z - right.z).abs() <= COINCIDENT
-}
-
-/// Names a rejection precisely enough to act on.
-///
-/// The error code alone is a category — `InvalidInput` covers every way a
-/// profile can be refused — while the first diagnostic names the check that
-/// actually failed. Showing both is what makes a bug report from a build we
-/// cannot attach a debugger to worth having.
-fn rejection_label(error: &KernelError) -> String {
-    error.diagnostics.first().map_or_else(
-        || error.code.to_string(),
-        |diagnostic| format!("{} · {}", error.code, diagnostic.code),
-    )
 }
 
 /// Whether two payloads describe the same *authored* sketch.
@@ -21249,6 +22263,119 @@ mod view_cube_arrow_tests {
         }
         assert!((view.yaw - initial_yaw).abs() > 0.01);
         assert!((view.pitch - initial_pitch).abs() > 0.01);
+    }
+}
+
+/// The cube's corners and edges: the handles that `model_view_cube` offers,
+/// and the direction each turns the camera to.
+#[cfg(test)]
+mod view_cube_handle_tests {
+    use super::*;
+
+    #[test]
+    fn the_cube_offers_eight_corners_and_twelve_edges_with_distinct_names() {
+        let handles = view_cube_handles();
+        assert_eq!(handles.len(), 20);
+        let corners = handles
+            .iter()
+            .filter(|handle| handle.kind() == ViewCubeHandleKind::Corner)
+            .count();
+        assert_eq!(corners, 8);
+        let labels = handles
+            .iter()
+            .map(|handle| handle.accessible_label())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(labels.len(), 20);
+        assert!(labels.contains("View cube corner front-top-right"));
+        assert!(labels.contains("View cube edge front-top"));
+        assert!(labels.contains("View cube edge top-left"));
+        assert!(labels.contains("View cube edge back-right"));
+        assert!(labels.contains("View cube corner back-bottom-left"));
+    }
+
+    #[test]
+    fn a_handle_name_maps_to_the_direction_the_cube_draws_it_at() {
+        let front_top_right = ViewCubeHandle { axes: [1, -1, 1] };
+        assert_eq!(front_top_right.name(), "front-top-right");
+        let direction = view_cube_direction(front_top_right.axes);
+        let unit = 1.0 / 3.0_f64.sqrt();
+        assert!((direction.x - unit).abs() <= 1.0e-12);
+        assert!((direction.y + unit).abs() <= 1.0e-12);
+        assert!((direction.z - unit).abs() <= 1.0e-12);
+
+        let front_top = ViewCubeHandle { axes: [0, -1, 1] };
+        assert_eq!(front_top.name(), "front-top");
+        assert_eq!(front_top.kind(), ViewCubeHandleKind::Edge);
+        assert_eq!(front_top.edge_axis(), Vector3::new(1.0, 0.0, 0.0));
+        let direction = view_cube_direction(front_top.axes);
+        assert!((direction.x).abs() <= 1.0e-12);
+        assert!((direction.y + std::f64::consts::FRAC_1_SQRT_2).abs() <= 1.0e-12);
+        assert!((direction.z - std::f64::consts::FRAC_1_SQRT_2).abs() <= 1.0e-12);
+
+        // Every word in a name is one of the cube's own face labels, and
+        // names the face the handle is adjacent to.
+        for handle in view_cube_handles() {
+            let faces = handle
+                .name()
+                .split('-')
+                .map(|word| {
+                    StandardView::ALL
+                        .into_iter()
+                        .find(|face| face.label().eq_ignore_ascii_case(word))
+                        .unwrap_or_else(|| panic!("{word} is not a face"))
+                })
+                .collect::<Vec<_>>();
+            let normals = handle.adjacent_face_normals().collect::<Vec<_>>();
+            assert_eq!(faces.len(), normals.len(), "{}", handle.name());
+            for face in faces {
+                assert!(
+                    normals.contains(&face.outward_normal()),
+                    "{} does not touch {}",
+                    handle.name(),
+                    face.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn looking_from_every_handle_puts_it_square_in_front_with_z_up() {
+        for handle in view_cube_handles() {
+            let mut view = ViewState::default();
+            let direction = view_cube_direction(handle.axes);
+            assert!(view.set_view_along(direction, Vector3::new(0.0, 0.0, 1.0)));
+            let seen = view.view_direction();
+            assert!(
+                (seen.x - direction.x).abs() <= 1.0e-9
+                    && (seen.y - direction.y).abs() <= 1.0e-9
+                    && (seen.z - direction.z).abs() <= 1.0e-9,
+                "{}: {seen:?} != {direction:?}",
+                handle.name()
+            );
+            // The handle projects to the cube's centre, in front of it.
+            let projected = view.project_direction(handle.cube_point());
+            assert!(
+                projected.coordinates[0].abs() <= 1.0e-9,
+                "{}",
+                handle.name()
+            );
+            assert!(
+                projected.coordinates[1].abs() <= 1.0e-9,
+                "{}",
+                handle.name()
+            );
+            assert!(projected.depth > 0.0);
+            // World +Z is never below the horizon.
+            assert!(view.screen_up_direction().z > 0.0, "{}", handle.name());
+            // Every face the handle touches is visible from it.
+            for normal in handle.adjacent_face_normals() {
+                assert!(
+                    view.project_direction(normal).depth > 0.3,
+                    "{}",
+                    handle.name()
+                );
+            }
+        }
     }
 }
 
@@ -26308,5 +27435,318 @@ mod section_analysis_and_commit_camera {
                 assert_eq!(app.view.target(), target);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rejection_summary_tests {
+    use artificer_protocol::{Diagnostic, DiagnosticCode, EntityId};
+
+    use super::*;
+
+    fn entity(id: u64, kind: EntityKind) -> EntityRef {
+        EntityRef {
+            snapshot: SnapshotId::new([3; 16]),
+            entity: EntityId(id),
+            kind,
+        }
+    }
+
+    fn diagnostic(code: &str, message: &str, subjects: Vec<EntityRef>) -> Diagnostic {
+        Diagnostic {
+            code: DiagnosticCode::from(code),
+            severity: DiagnosticSeverity::Error,
+            stage: KernelStage::Preflight,
+            message: message.to_owned(),
+            subjects: subjects
+                .into_iter()
+                .map(|entity| DiagnosticSubject::Entity { entity })
+                .collect(),
+            path: Vec::new(),
+            measurement: None,
+            details: BTreeMap::new(),
+        }
+    }
+
+    fn refusal(message: &str, diagnostics: Vec<Diagnostic>) -> KernelError {
+        KernelError {
+            code: KernelErrorCode::InvalidInput,
+            stage: KernelStage::Preflight,
+            input_snapshot: SnapshotId::new([3; 16]),
+            message: message.to_owned(),
+            diagnostics,
+            details: BTreeMap::new(),
+        }
+    }
+
+    /// The message leads, the diagnostics that add something follow, the
+    /// entities become rows, and the code with its check comes last.
+    #[test]
+    fn a_refusal_reads_message_first_and_code_last() {
+        let face = entity(12, EntityKind::Face);
+        let edge = entity(40, EntityKind::Edge);
+        let error = refusal(
+            "the profile is not closed",
+            vec![
+                diagnostic(
+                    "PROFILE_NOT_CLOSED",
+                    "the profile is not closed",
+                    vec![face],
+                ),
+                diagnostic("PROFILE_GAP", "a gap of 0.2 mm remains", vec![edge, face]),
+            ],
+        );
+        let summary = summarize_rejection(&error);
+        assert_eq!(summary.message, "the profile is not closed");
+        assert_eq!(summary.details, vec!["a gap of 0.2 mm remains".to_owned()]);
+        assert_eq!(summary.suggestion, None);
+        assert_eq!(summary.code, "invalid_input");
+        assert_eq!(summary.check.as_deref(), Some("PROFILE_NOT_CLOSED"));
+        assert_eq!(summary.code_label(), "invalid_input · PROFILE_NOT_CLOSED");
+        // Each entity once, in the order the diagnostics named them.
+        assert_eq!(
+            summary
+                .candidates
+                .iter()
+                .map(|candidate| candidate.description.as_str())
+                .collect::<Vec<_>>(),
+            vec!["face 12 · PROFILE_NOT_CLOSED", "edge 40 · PROFILE_GAP"]
+        );
+        assert_eq!(summary.candidates[0].entity, face);
+    }
+
+    /// A refusal that proposes something says so in its details, and the
+    /// summary surfaces it as the suggestion.
+    #[test]
+    fn a_suggestion_in_the_details_is_surfaced() {
+        let mut error = refusal("extrusion distance must be strictly positive", Vec::new());
+        error.details.insert(
+            "suggestion".to_owned(),
+            "Pull the arrow the other way".to_owned(),
+        );
+        let summary = summarize_rejection(&error);
+        assert_eq!(
+            summary.suggestion.as_deref(),
+            Some("Pull the arrow the other way")
+        );
+        assert!(summary.details.is_empty());
+        assert_eq!(summary.check, None);
+        assert_eq!(summary.code_label(), "invalid_input");
+    }
+
+    /// The dirty comparison: a fresh document is clean, an edit makes it
+    /// dirty, marking it saved makes it clean again.
+    #[test]
+    fn a_document_is_dirty_from_the_first_edit_until_marked_saved() {
+        let mut app = KernelLabApp::default();
+        assert!(!app.is_document_dirty());
+        app.reset_to_blank_workspace();
+        assert!(
+            !app.is_document_dirty(),
+            "a blank document has nothing to lose"
+        );
+        let before = app.document_revision();
+        // The smallest edit a document takes: one more marker feature.
+        let empty = SnapshotAssociation::new(
+            app.empty_snapshot.id(),
+            app.empty_snapshot.id(),
+            app.empty_snapshot.semantic_digest(),
+        );
+        app.document
+            .append_feature(
+                FeatureDraft::new(FeatureKind::DatumPlane, "Plane", ReplayAction::Marker)
+                    .with_commit(empty),
+            )
+            .expect("a marker feature is a valid edit");
+        assert!(app.document_revision() > before);
+        assert!(app.is_document_dirty());
+        app.mark_document_saved();
+        assert!(!app.is_document_dirty());
+    }
+}
+
+#[cfg(test)]
+mod view_cube_flight_tests {
+    use super::*;
+    use presentation::FACE_CAMERA_TRANSITION_SECONDS;
+
+    fn direction_of(view: ViewState) -> [f64; 3] {
+        let direction = view.view_direction();
+        [direction.x, direction.y, direction.z]
+    }
+
+    fn assert_direction(view: ViewState, expected: [f64; 3], what: &str) {
+        let actual = direction_of(view);
+        for axis in 0..3 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 1e-9,
+                "{what}: view direction {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// With the flights on, a cube click schedules a flight and the camera
+    /// stays put until the flight advances; when it lands the camera looks
+    /// exactly where an instant change would have put it.
+    #[test]
+    fn a_cube_click_flies_the_camera_when_animation_is_on() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        let start = app.view;
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Front));
+        assert!(
+            app.face_camera_transition.is_some(),
+            "a face click should fly rather than jump"
+        );
+        assert_eq!(app.view, start, "the camera does not jump at take-off");
+
+        let mut flight = app.face_camera_transition.take().expect("a flight");
+        let midway = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 0.5);
+        assert_ne!(midway, start, "half-way through, the camera has moved");
+        assert!(!flight.is_complete());
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS);
+        assert!(flight.is_complete());
+        assert_direction(landed, [0.0, -1.0, 0.0], "the front face");
+        assert_eq!(landed.zoom, start.zoom, "a cube click never reframes");
+    }
+
+    /// Corners and edges take the same flight as faces.
+    #[test]
+    fn corner_and_edge_clicks_fly_to_their_directions() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.view.set_standard_view(StandardView::Top);
+
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [1, -1, 1] });
+        let mut flight = app.face_camera_transition.take().expect("a corner flight");
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let root = 1.0 / 3.0_f64.sqrt();
+        assert_direction(landed, [root, -root, root], "the front-top-right corner");
+
+        app.view = landed;
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [0, -1, 1] });
+        let mut flight = app.face_camera_transition.take().expect("an edge flight");
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let half = 1.0 / 2.0_f64.sqrt();
+        assert_direction(landed, [0.0, -half, half], "the front-top edge");
+    }
+
+    /// The roll arrows and the ISO button fly too, and a second click while
+    /// a flight is under way retargets it from wherever the camera is.
+    #[test]
+    fn roll_and_isometric_fly_and_a_new_click_retargets_the_flight() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.view.set_standard_view(StandardView::Front);
+
+        app.apply_view_cube_command(ViewCubeCommand::Roll { clockwise: true });
+        let mut flight = app.face_camera_transition.take().expect("a roll flight");
+        let rolled = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        assert_direction(
+            rolled,
+            [0.0, -1.0, 0.0],
+            "a roll keeps the viewing direction",
+        );
+        let up = rolled.screen_up_direction();
+        assert!(
+            up.z.abs() < 1e-9 && up.x.abs() > 0.99,
+            "a quarter turn lays screen-up along X, got ({}, {}, {})",
+            up.x,
+            up.y,
+            up.z
+        );
+
+        app.view = rolled;
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Right));
+        let mut first = app.face_camera_transition.take().expect("a face flight");
+        let midway = first.advance(FACE_CAMERA_TRANSITION_SECONDS * 0.4);
+        app.view = midway;
+        app.apply_view_cube_command(ViewCubeCommand::Isometric);
+        let mut second = app.face_camera_transition.take().expect("an ISO flight");
+        assert_eq!(
+            second.advance(0.0),
+            midway,
+            "the new flight takes off from where the camera is"
+        );
+        let landed = second.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let mut expected = midway;
+        expected.reset_orientation();
+        assert_eq!(landed, expected, "ISO lands on the default orientation");
+    }
+
+    /// With the flights off (the test and accessibility default) every cube
+    /// command is instant, exactly as before.
+    #[test]
+    fn a_cube_click_jumps_when_animation_is_off() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        assert!(!app.animate_face_camera_transitions);
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Left));
+        assert!(app.face_camera_transition.is_none());
+        assert_direction(app.view, [-1.0, 0.0, 0.0], "the left face");
+
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [-1, 1, -1] });
+        assert!(app.face_camera_transition.is_none());
+        let root = 1.0 / 3.0_f64.sqrt();
+        assert_direction(
+            app.view,
+            [-root, root, -root],
+            "the back-bottom-left corner",
+        );
+    }
+
+    /// Dragging the cube orbits at once and takes over from a flight.
+    #[test]
+    fn a_cube_drag_orbits_immediately_and_cancels_a_flight() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Back));
+        assert!(app.face_camera_transition.is_some());
+        let before = app.view;
+
+        app.apply_view_cube_command(ViewCubeCommand::Drag {
+            delta: egui::vec2(12.0, 0.0),
+        });
+        assert!(
+            app.face_camera_transition.is_none(),
+            "a drag takes the camera out of the flight's hands"
+        );
+        assert_ne!(app.view, before, "the drag orbits straight away");
+    }
+
+    /// A flight that a sketch is waiting on is not steered by the cube: its
+    /// landing opens the sketch on the face it was aimed at.
+    #[test]
+    fn a_cube_click_never_steers_a_flight_into_a_sketch() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.selected_origin_plane = SketchPlane::XY;
+        app.enter_sketch_mode();
+        let flight = app
+            .face_camera_transition
+            .expect("entering a plane sketch flies the camera");
+        assert!(app.pending_plane_sketch.is_some());
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Right));
+        assert_eq!(
+            app.face_camera_transition,
+            Some(flight),
+            "the sketch's flight is untouched"
+        );
+        app.apply_view_cube_command(ViewCubeCommand::Drag {
+            delta: egui::vec2(12.0, 0.0),
+        });
+        assert_eq!(
+            app.face_camera_transition,
+            Some(flight),
+            "a drag does not cancel the sketch's flight either"
+        );
     }
 }

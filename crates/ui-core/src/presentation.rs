@@ -422,6 +422,87 @@ pub enum FillBackend {
     Auto,
 }
 
+/// One frame of six-axis input, as a 3D mouse reports it.
+///
+/// The frame is the one 3Dconnexion's SDK uses: x to the right, y up, z
+/// toward the viewer, with right-hand rotations about those axes. Each axis
+/// is ±1 at full deflection; the value is a rate, applied over the frame's
+/// duration by [`ViewState::apply_six_dof`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SixDofMotion {
+    pub translate: [f64; 3],
+    pub rotate: [f64; 3],
+}
+
+impl SixDofMotion {
+    #[must_use]
+    pub fn is_still(&self) -> bool {
+        self.translate
+            .iter()
+            .chain(&self.rotate)
+            .all(|axis| *axis == 0.0)
+    }
+}
+
+/// How six-axis input steers the camera.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SixDofSettings {
+    /// One multiplier over every rate below; what a single slider adjusts.
+    pub sensitivity: f64,
+    /// Orbit rate at full deflection, in radians per second.
+    pub rotate_rate: f64,
+    /// Pan rate at full deflection, as a fraction of the framed radius per
+    /// second, so a pan covers the same share of the screen at any zoom.
+    pub pan_rate: f64,
+    /// Zoom rate at full deflection, as the natural log of the zoom factor
+    /// per second: 1.0 zooms by e× each second.
+    pub zoom_rate: f64,
+    /// Reverses one translation axis (right, up, toward the viewer).
+    pub invert_translate: [bool; 3],
+    /// Reverses one rotation axis (about right, up, toward the viewer).
+    pub invert_rotate: [bool; 3],
+    /// Whether a twist about the viewing axis rolls the camera. Off by
+    /// default: roll is rarely wanted in CAD and easy to trip while orbiting.
+    pub roll_enabled: bool,
+    /// Object mode: the cap moves the model, as if held in the hand. Off is
+    /// camera mode, where the cap flies the viewer through the scene and
+    /// every axis reverses.
+    pub object_mode: bool,
+}
+
+impl Default for SixDofSettings {
+    fn default() -> Self {
+        Self {
+            sensitivity: 1.0,
+            rotate_rate: 1.6,
+            pan_rate: 1.2,
+            zoom_rate: 1.1,
+            invert_translate: [false; 3],
+            invert_rotate: [false; 3],
+            roll_enabled: false,
+            object_mode: true,
+        }
+    }
+}
+
+impl SixDofSettings {
+    /// The slider's range: a tenth of the default rate to three times it.
+    pub const MIN_SENSITIVITY: f64 = 0.1;
+    pub const MAX_SENSITIVITY: f64 = 3.0;
+
+    /// The overall multiplier, clamped to the slider's range and falling
+    /// back to 1.0 if it is not a number.
+    #[must_use]
+    pub fn bounded_sensitivity(self) -> f64 {
+        if self.sensitivity.is_finite() {
+            self.sensitivity
+                .clamp(Self::MIN_SENSITIVITY, Self::MAX_SENSITIVITY)
+        } else {
+            1.0
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub yaw: f64,
@@ -619,6 +700,17 @@ impl ViewState {
     /// by the curved arrows around the view cube.
     pub fn rotate_in_plane_quarter_turn(&mut self, clockwise: bool) {
         let angle = if clockwise { -PI * 0.5 } else { PI * 0.5 };
+        self.roll_by(angle);
+    }
+
+    /// Rolls the camera about its own viewing axis by `angle` radians. A
+    /// positive angle turns the camera counter-clockwise, so the model
+    /// appears to turn clockwise on screen.
+    pub fn roll_by(&mut self, angle: f64) {
+        let angle = finite_or_zero(angle);
+        if angle == 0.0 {
+            return;
+        }
         let next = quaternion_multiply(
             view_orientation_quaternion(*self),
             axis_angle_quaternion([0.0, 1.0, 0.0], angle),
@@ -628,6 +720,112 @@ impl ViewState {
             self.pitch = pitch;
             self.roll = roll;
         }
+    }
+
+    /// Orients the camera to look at the model from `direction` — the
+    /// outward direction toward the viewer, as a view-cube face's normal is
+    /// — with screen-up taken from `up_hint` projected perpendicular to it.
+    /// Framing is untouched: the target and zoom stay where they are.
+    ///
+    /// A hint parallel to the direction (looking straight down with an
+    /// upward hint) falls back to world +Z and then to the cube's own
+    /// convention for the top and bottom faces — +Y seen from above, −Y
+    /// from below — so a view along a face normal is exactly that face's
+    /// standard view. Returns `false`, changing nothing, when the direction
+    /// itself is degenerate.
+    pub fn set_view_along(&mut self, direction: ProtocolVector3, up_hint: ProtocolVector3) -> bool {
+        let Some(depth) = normalized_protocol_vector(direction) else {
+            return false;
+        };
+        let polar_up = if depth.z >= 0.0 {
+            StandardView::Top.preferred_up()
+        } else {
+            StandardView::Bottom.preferred_up()
+        };
+        let Some(up) = [up_hint, ProtocolVector3::new(0.0, 0.0, 1.0), polar_up]
+            .into_iter()
+            .find_map(|hint| perpendicular_component(hint, depth))
+        else {
+            return false;
+        };
+        let right = protocol_cross(depth, up);
+        let Some([yaw, pitch, roll]) = camera_euler_from_axes(right, depth, up) else {
+            return false;
+        };
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.roll = roll;
+        true
+    }
+
+    /// The world direction the camera's screen-up points along.
+    #[must_use]
+    pub fn screen_up_direction(self) -> ProtocolVector3 {
+        camera_world_axes(self).2
+    }
+
+    /// Steers the camera with one frame of six-axis input held for
+    /// `seconds`, as a 3D mouse drives it.
+    ///
+    /// Rotation about the up axis orbits the yaw, rotation about the right
+    /// axis orbits the pitch, and — only when the settings enable it —
+    /// rotation about the viewing axis rolls. Translation across the screen
+    /// pans the target by a share of the framed radius, so the motion covers
+    /// the same part of the window at any zoom, and translation toward the
+    /// viewer zooms exponentially, so a held cap zooms at a steady visual
+    /// rate. In object mode the model follows the cap; in camera mode the
+    /// viewer does, which reverses every axis. Long frames are capped, as
+    /// the turntable's are, so a stall cannot throw the view.
+    ///
+    /// Returns whether anything changed; a still cap or an unusable frame
+    /// time leaves the view exactly as it was.
+    pub fn apply_six_dof(
+        &mut self,
+        motion: SixDofMotion,
+        seconds: f64,
+        settings: SixDofSettings,
+    ) -> bool {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return false;
+        }
+        let seconds = seconds.min(MAX_FRAME_DELTA_SECONDS);
+        let sign = if settings.object_mode { 1.0 } else { -1.0 };
+        let axis = |value: f64, invert: bool| {
+            let value = finite_or_zero(value).clamp(-1.0, 1.0);
+            let value = if invert { -value } else { value };
+            value * sign
+        };
+        let [tx, ty, tz] = std::array::from_fn(|index| {
+            axis(motion.translate[index], settings.invert_translate[index])
+        });
+        let [rx, ry, rz] =
+            std::array::from_fn(|index| axis(motion.rotate[index], settings.invert_rotate[index]));
+        let rz = if settings.roll_enabled { rz } else { 0.0 };
+        if [tx, ty, tz, rx, ry, rz].iter().all(|axis| *axis == 0.0) {
+            return false;
+        }
+        let gain = settings.bounded_sensitivity() * seconds;
+        let rotate = finite_or_zero(settings.rotate_rate) * gain;
+        let yaw_delta = ry * rotate;
+        let pitch_delta = rx * rotate;
+        if yaw_delta != 0.0 || pitch_delta != 0.0 {
+            self.orbit(yaw_delta, pitch_delta);
+        }
+        if rz != 0.0 {
+            // A twist counter-clockwise on screen turns the model that way,
+            // which is the camera turning the other.
+            self.roll_by(-rz * rotate);
+        }
+        let framed_radius = self.fit_radius / bounded_zoom(self.zoom);
+        let pan = finite_or_zero(settings.pan_rate) * gain * framed_radius;
+        if tx != 0.0 || ty != 0.0 {
+            // Screen-vertical is positive downward; the cap's up is not.
+            self.pan_by(tx * pan, -ty * pan);
+        }
+        if tz != 0.0 {
+            self.zoom_by((finite_or_zero(settings.zoom_rate) * gain * tz).exp());
+        }
+        true
     }
 
     pub fn nearest_standard_view(self) -> StandardView {
@@ -1177,6 +1375,23 @@ fn normalized_protocol_vector(vector: ProtocolVector3) -> Option<ProtocolVector3
     }
     let inverse_length = length_squared.sqrt().recip();
     Some(protocol_scale(vector, inverse_length))
+}
+
+/// The unit component of `vector` perpendicular to the unit `axis`, or
+/// `None` when the two are parallel.
+fn perpendicular_component(
+    vector: ProtocolVector3,
+    axis: ProtocolVector3,
+) -> Option<ProtocolVector3> {
+    if !vector.is_finite() {
+        return None;
+    }
+    let along = protocol_dot(vector, axis);
+    normalized_protocol_vector(ProtocolVector3::new(
+        vector.x - along * axis.x,
+        vector.y - along * axis.y,
+        vector.z - along * axis.z,
+    ))
 }
 
 const fn protocol_cross(left: ProtocolVector3, right: ProtocolVector3) -> ProtocolVector3 {
@@ -2079,5 +2294,311 @@ mod tests {
                 assert!(val.is_finite());
             }
         }
+    }
+
+    fn assert_vector_close(actual: ProtocolVector3, expected: ProtocolVector3) {
+        assert!(
+            (actual.x - expected.x).abs() <= 1.0e-9
+                && (actual.y - expected.y).abs() <= 1.0e-9
+                && (actual.z - expected.z).abs() <= 1.0e-9,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    /// The eight corners and twelve edges of the view cube.
+    fn cube_corner_and_edge_directions() -> Vec<ProtocolVector3> {
+        let mut directions = Vec::new();
+        for x in [-1.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    directions.push(ProtocolVector3::new(x, y, z));
+                }
+            }
+        }
+        for a in [-1.0, 1.0] {
+            for b in [-1.0, 1.0] {
+                directions.push(ProtocolVector3::new(0.0, a, b));
+                directions.push(ProtocolVector3::new(a, 0.0, b));
+                directions.push(ProtocolVector3::new(a, b, 0.0));
+            }
+        }
+        assert_eq!(directions.len(), 20);
+        directions
+            .into_iter()
+            .map(|direction| normalized_protocol_vector(direction).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_cube_corner_and_edge_view_looks_along_its_direction_with_z_up() {
+        let world_up = ProtocolVector3::new(0.0, 0.0, 1.0);
+        for direction in cube_corner_and_edge_directions() {
+            let mut view = ViewState {
+                zoom: 2.5,
+                ..ViewState::default()
+            };
+            view.frame(bounds());
+            let target = view.target();
+            assert!(view.set_view_along(direction, world_up), "{direction:?}");
+            assert_vector_close(view.view_direction(), direction);
+            // Screen-up is world +Z pushed perpendicular to the direction,
+            // which for a horizontal edge is +Z itself.
+            let expected_up = perpendicular_component(world_up, direction).unwrap();
+            assert_vector_close(view.screen_up_direction(), expected_up);
+            assert_projection_close(view.project_direction(direction), [0.0, 0.0], 1.0);
+            // Framing is not part of orientation.
+            assert_eq!(view.zoom, 2.5);
+            assert_eq!(view.target(), target);
+        }
+    }
+
+    #[test]
+    fn a_view_along_a_face_normal_matches_the_standard_view() {
+        for face in StandardView::ALL {
+            let mut standard = ViewState::default();
+            standard.set_standard_view(face);
+            let mut along = ViewState::default();
+            assert!(
+                along.set_view_along(face.outward_normal(), ProtocolVector3::new(0.0, 0.0, 1.0))
+            );
+            assert_vector_close(along.view_direction(), standard.view_direction());
+            assert_vector_close(along.screen_up_direction(), standard.screen_up_direction());
+        }
+    }
+
+    #[test]
+    fn a_degenerate_view_direction_changes_nothing() {
+        let original = ViewState::default();
+        let mut view = original;
+        assert!(!view.set_view_along(
+            ProtocolVector3::new(0.0, 0.0, 0.0),
+            ProtocolVector3::new(0.0, 0.0, 1.0)
+        ));
+        assert!(!view.set_view_along(
+            ProtocolVector3::new(f64::NAN, 0.0, 0.0),
+            ProtocolVector3::new(0.0, 0.0, 1.0)
+        ));
+        assert_eq!(view, original);
+        // A useless hint is replaced rather than refused.
+        assert!(view.set_view_along(
+            ProtocolVector3::new(1.0, 1.0, 1.0),
+            ProtocolVector3::new(2.0, 2.0, 2.0)
+        ));
+        assert_vector_close(
+            view.view_direction(),
+            normalized_protocol_vector(ProtocolVector3::new(1.0, 1.0, 1.0)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn roll_by_turns_only_about_the_viewing_axis() {
+        let mut view = ViewState::default();
+        let direction = view.view_direction();
+        view.roll_by(0.4);
+        assert_vector_close(view.view_direction(), direction);
+        assert!(view.roll.abs() > 0.1);
+        view.roll_by(-0.4);
+        assert!(view.roll.abs() <= 1.0e-9, "roll {}", view.roll);
+        let unchanged = view;
+        view.roll_by(0.0);
+        view.roll_by(f64::NAN);
+        assert_eq!(view, unchanged);
+    }
+
+    fn framed_view() -> ViewState {
+        let mut view = ViewState::default();
+        view.frame(bounds());
+        view
+    }
+
+    #[test]
+    fn a_pure_twist_about_the_up_axis_changes_only_yaw() {
+        let before = framed_view();
+        let mut view = before;
+        let motion = SixDofMotion {
+            rotate: [0.0, 1.0, 0.0],
+            ..SixDofMotion::default()
+        };
+        assert!(view.apply_six_dof(motion, 1.0 / 60.0, SixDofSettings::default()));
+        assert_ne!(view.yaw, before.yaw);
+        assert_eq!(view.pitch, before.pitch);
+        assert_eq!(view.roll, before.roll);
+        assert_eq!(view.zoom, before.zoom);
+        assert_eq!(view.target(), before.target());
+        // Object mode: the model turns with the cap, counter-clockwise from
+        // above, which the turntable expresses as a positive orbit.
+        let expected = SixDofSettings::default().rotate_rate / 60.0;
+        assert!((normalize_angle(before.yaw - view.yaw) - expected).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn pulling_the_cap_toward_the_viewer_zooms_in_and_nothing_else() {
+        let before = framed_view();
+        let mut view = before;
+        let motion = SixDofMotion {
+            translate: [0.0, 0.0, 1.0],
+            ..SixDofMotion::default()
+        };
+        assert!(view.apply_six_dof(motion, 0.2, SixDofSettings::default()));
+        assert!(view.zoom > before.zoom);
+        let expected = (SixDofSettings::default().zoom_rate * 0.2).exp();
+        assert!((view.zoom - expected).abs() <= 1.0e-12, "{}", view.zoom);
+        assert_eq!(view.yaw, before.yaw);
+        assert_eq!(view.pitch, before.pitch);
+        assert_eq!(view.roll, before.roll);
+        assert_eq!(view.target(), before.target());
+        // Pushing away zooms back out by the same factor.
+        let away = SixDofMotion {
+            translate: [0.0, 0.0, -1.0],
+            ..SixDofMotion::default()
+        };
+        view.apply_six_dof(away, 0.2, SixDofSettings::default());
+        assert!((view.zoom - before.zoom).abs() <= 1.0e-12);
+    }
+
+    #[test]
+    fn pushing_the_cap_right_slides_the_model_right_by_a_share_of_the_frame() {
+        let before = framed_view();
+        let mut view = before;
+        let motion = SixDofMotion {
+            translate: [1.0, 0.0, 0.0],
+            ..SixDofMotion::default()
+        };
+        assert!(view.apply_six_dof(motion, 0.25, SixDofSettings::default()));
+        assert_eq!(
+            (view.yaw, view.pitch, view.roll),
+            (before.yaw, before.pitch, before.roll)
+        );
+        assert_eq!(view.zoom, before.zoom);
+        // The old target, drawn at the centre before, now sits to the right.
+        let moved = view.project(before.target());
+        let expected = SixDofSettings::default().pan_rate * 0.25 * before.fit_radius();
+        assert!(
+            (moved.coordinates[0] - expected).abs() <= 1.0e-9,
+            "{moved:?}"
+        );
+        assert!(moved.coordinates[1].abs() <= 1.0e-9, "{moved:?}");
+        // Up is up, whatever egui thinks of screen y.
+        let mut lifted = before;
+        lifted.apply_six_dof(
+            SixDofMotion {
+                translate: [0.0, 1.0, 0.0],
+                ..SixDofMotion::default()
+            },
+            0.25,
+            SixDofSettings::default(),
+        );
+        let raised = lifted.project(before.target());
+        assert!(raised.coordinates[1] < -1.0e-6, "{raised:?}");
+    }
+
+    #[test]
+    fn zero_motion_and_unusable_frame_times_are_no_ops() {
+        let before = framed_view();
+        let mut view = before;
+        assert!(!view.apply_six_dof(
+            SixDofMotion::default(),
+            1.0 / 60.0,
+            SixDofSettings::default()
+        ));
+        let moving = SixDofMotion {
+            translate: [1.0, 1.0, 1.0],
+            rotate: [1.0, 1.0, 1.0],
+        };
+        assert!(!view.apply_six_dof(moving, 0.0, SixDofSettings::default()));
+        assert!(!view.apply_six_dof(moving, -1.0, SixDofSettings::default()));
+        assert!(!view.apply_six_dof(moving, f64::NAN, SixDofSettings::default()));
+        assert_eq!(view, before);
+        // Roll is off by default, so a twist about the viewing axis alone
+        // does nothing until it is switched on.
+        let twist = SixDofMotion {
+            rotate: [0.0, 0.0, 1.0],
+            ..SixDofMotion::default()
+        };
+        assert!(!view.apply_six_dof(twist, 0.1, SixDofSettings::default()));
+        assert_eq!(view, before);
+        let rolling = SixDofSettings {
+            roll_enabled: true,
+            ..SixDofSettings::default()
+        };
+        assert!(view.apply_six_dof(twist, 0.1, rolling));
+        assert!(view.roll.abs() > 1.0e-6);
+    }
+
+    #[test]
+    fn camera_mode_and_axis_inversion_reverse_the_response() {
+        let before = framed_view();
+        let motion = SixDofMotion {
+            translate: [0.0, 0.0, 1.0],
+            rotate: [0.0, 1.0, 0.0],
+        };
+        let mut object = before;
+        object.apply_six_dof(motion, 0.1, SixDofSettings::default());
+        let mut camera = before;
+        camera.apply_six_dof(
+            motion,
+            0.1,
+            SixDofSettings {
+                object_mode: false,
+                ..SixDofSettings::default()
+            },
+        );
+        assert!(object.zoom > before.zoom && camera.zoom < before.zoom);
+        assert!(
+            (normalize_angle(object.yaw - before.yaw) + normalize_angle(camera.yaw - before.yaw))
+                .abs()
+                <= 1.0e-12
+        );
+        let mut inverted = before;
+        inverted.apply_six_dof(
+            motion,
+            0.1,
+            SixDofSettings {
+                invert_translate: [false, false, true],
+                invert_rotate: [false, true, false],
+                ..SixDofSettings::default()
+            },
+        );
+        assert_eq!(inverted.zoom, camera.zoom);
+        assert_eq!(inverted.yaw, camera.yaw);
+        // The sensitivity slider scales every rate together.
+        let mut brisk = before;
+        brisk.apply_six_dof(
+            motion,
+            0.1,
+            SixDofSettings {
+                sensitivity: 2.0,
+                ..SixDofSettings::default()
+            },
+        );
+        assert!((brisk.zoom.ln() - 2.0 * object.zoom.ln()).abs() <= 1.0e-12);
+        assert!(
+            (normalize_angle(before.yaw - brisk.yaw)
+                - 2.0 * normalize_angle(before.yaw - object.yaw))
+            .abs()
+                <= 1.0e-12
+        );
+        assert_eq!(
+            SixDofSettings {
+                sensitivity: f64::INFINITY,
+                ..SixDofSettings::default()
+            }
+            .bounded_sensitivity(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_stalled_frame_is_capped_like_the_turntable() {
+        let before = framed_view();
+        let mut stalled = before;
+        let mut capped = before;
+        let motion = SixDofMotion {
+            translate: [0.0, 0.0, 1.0],
+            ..SixDofMotion::default()
+        };
+        stalled.apply_six_dof(motion, 5.0, SixDofSettings::default());
+        capped.apply_six_dof(motion, MAX_FRAME_DELTA_SECONDS, SixDofSettings::default());
+        assert_eq!(stalled, capped);
     }
 }

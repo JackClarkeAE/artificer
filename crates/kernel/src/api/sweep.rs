@@ -22,14 +22,15 @@
 //! mechanism that never collides is painted by how close it came; one that
 //! does is painted by where it collided, because the sweep stops there.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
-use artificer_protocol::{Point3, PrecisionPolicy, Tier};
+use artificer_protocol::{EntityRef, Point3, PrecisionPolicy, Tier};
 use serde::{Deserialize, Serialize};
 
 use crate::api::analysis::{ClearanceProfile, FitVerdict, Subject};
 use crate::api::interference::{ClearanceState, FacetIndex, Placement, clearance, clearance_field};
-use crate::{CancellationToken, DebugScene, NativeKernel};
+use crate::{CancellationToken, ChordDeviation, DebugScene, NativeKernel};
 
 /// The shape of the document this module publishes.
 pub const SWEEP_SCHEMA_VERSION: u32 = 1;
@@ -69,6 +70,8 @@ pub struct SweptPair {
     pub witness_a: Point3,
     pub witness_b: Point3,
     pub tier: Tier,
+    /// How far below `distance` the true clearance may sit at that step,
+    /// from the sagitta of every chord that came as near. Absent when zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bound: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +82,11 @@ fn is_zero(value: &f64) -> bool {
     *value == 0.0
 }
 
-/// Where a sweep first found two bodies sharing space.
+/// Where a sweep first found two bodies that may share space: one reaching
+/// inside the other, or two curved bodies whose facets came nearer than the
+/// facets can be wrong, which is contact the sweep cannot tell from
+/// overlap. Two planar bodies in contact are not a collision, because
+/// their contact is exact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SweepCollision {
     pub step: usize,
@@ -179,16 +186,11 @@ pub fn interference_sweep(
         .iter()
         .map(|subject| NativeKernel::debug_scene(&subject.snapshot))
         .collect::<Vec<_>>();
-    let polyhedral = subjects
+    // How far each face's facets can sit from the face, so every step's
+    // clearance carries the bound the display chords earn it.
+    let deviations = subjects
         .iter()
-        .map(|subject| NativeKernel::is_polyhedral(&subject.snapshot))
-        .collect::<Vec<_>>();
-    let budget = subjects
-        .iter()
-        .map(|subject| {
-            let policy = subject.snapshot.precision_policy().unwrap_or_default();
-            policy.approximation_budget.max(policy.modeling_resolution)
-        })
+        .map(|subject| NativeKernel::display_chord_deviations(&subject.snapshot))
         .collect::<Vec<_>>();
 
     let mut fields = scenes
@@ -219,8 +221,7 @@ pub fn interference_sweep(
                     subject,
                     step.placements[subject],
                     &scenes[subject],
-                    polyhedral[subject],
-                    budget[subject],
+                    &deviations[subject],
                 )
             })
             .collect::<Vec<_>>();
@@ -246,11 +247,15 @@ pub fn interference_sweep(
                         witness_b: report.witness_b,
                         tier: report.tier,
                         bound: report.bound,
-                        verdict: profile
-                            .map(|profile| FitVerdict::of(report.state, report.distance, profile)),
+                        verdict: profile.map(|profile| {
+                            FitVerdict::of(report.state, report.distance, report.bound, profile)
+                        }),
                     });
                 }
-                if report.state == ClearanceState::Interfering && collision.is_none() {
+                // A pair the facets cannot clear of overlap stops the sweep
+                // as surely as one they can see overlapping: past either,
+                // nothing is known to be a pose the real thing reaches.
+                if report.may_overlap() && collision.is_none() {
                     collision = Some(SweepCollision {
                         step: index,
                         drivers: step.drivers.clone(),
@@ -352,8 +357,7 @@ impl IndexCache {
         subject: usize,
         placement: Placement,
         scene: &DebugScene,
-        exact: bool,
-        budget: f64,
+        deviations: &BTreeMap<EntityRef, ChordDeviation>,
     ) -> FacetIndex {
         if self.held.len() <= subject {
             self.held.resize_with(subject + 1, || None);
@@ -363,7 +367,7 @@ impl IndexCache {
         {
             return index.clone();
         }
-        let index = FacetIndex::from_scene(scene, placement, exact, budget);
+        let index = FacetIndex::from_scene(scene, placement, deviations);
         self.held[subject] = Some((placement, index.clone()));
         index
     }

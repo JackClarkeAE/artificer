@@ -95,6 +95,15 @@ impl Session {
         }
     }
 
+    /// Returns the session to the state it started in — no steps, an empty
+    /// journal, nothing to undo, no cached snapshots — keeping only the
+    /// precision policy it was made with. A second script run into a
+    /// session adds to it; this is how a client starts over without
+    /// starting a new process.
+    pub fn reset(&mut self) {
+        *self = Self::with_precision(self.precision);
+    }
+
     pub fn execute(
         &mut self,
         command: ApiCommand,

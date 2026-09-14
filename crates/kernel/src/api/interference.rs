@@ -15,17 +15,38 @@
 //!
 //! ## What the answer is worth
 //!
-//! Facets are chords of the surfaces they stand for, and two surfaces that
-//! bulge towards one another are closer than their chords are. A facet
-//! clearance therefore *over-reports* the gap, which is the direction that
-//! matters for a fit. So the report carries a bound: the chord budget the
-//! tessellation was built to, once per curved body. Between two bodies of
-//! planar faces there is no chord and no bound, and the answer is exact.
+//! Facets are chords of the surfaces they stand for. The chords of a
+//! convex face — the outside of a boss or a pin — lie inside the body, so
+//! their gap to anything over-reads the true one; the chords of a concave
+//! face — a bore — lie in the void and can under-read it. Either way a
+//! chord is never further from its arc than the arc's sagitta, and the
+//! kernel knows the sagitta of every chord the display tessellation spent,
+//! face by face ([`NativeKernel::display_chord_deviations`]).
+//!
+//! So the report carries a `bound` alongside the measured `distance`, and
+//! the bound is earned rather than assumed: a second descent through the
+//! same hierarchies minimises, over every pair of facets, the facet gap
+//! less the deviations of the two facets, which is the least the true
+//! surfaces can be apart. The true gap is never below `distance - bound`,
+//! and every judgement — apart, touching, inside, and the verdict a fit
+//! profile gives — is made on that pessimistic figure. Between two bodies
+//! of planar faces there is no chord, the bound is zero, and the answer is
+//! exact. The bound is also zero when the closest approach was read between
+//! planar faces and no chorded face comes within the same distance.
+//!
+//! The descent knows how far a chord can be from its arc but not which
+//! way, so it is conservative where the direction would have helped: a
+//! cylinder standing on a plate touches it cap to face, exactly, but the
+//! wall's chords end on that same rim at no distance from the plate, and
+//! the pair carries the wall's sagitta as its bound. A contact the facets
+//! cannot vouch for is reported as one they cannot vouch for.
 
-use artificer_protocol::{Aabb3, Point3, PrecisionPolicy, Tier, Vector3};
+use std::collections::BTreeMap;
+
+use artificer_protocol::{Aabb3, EntityRef, Point3, PrecisionPolicy, Tier, Vector3};
 use serde::{Deserialize, Serialize};
 
-use crate::{DebugScene, NativeKernel, Snapshot};
+use crate::{ChordDeviation, DebugScene, NativeKernel, Snapshot};
 
 /// The rigid placement of a body in the world an interference study is run
 /// in. Assembly occurrences carry one; two bodies of the same session share
@@ -161,11 +182,16 @@ impl Placement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClearanceState {
-    /// The bodies are apart. `distance` is the gap.
+    /// The bodies are apart by more than the facets can be wrong: the
+    /// pessimistic gap, `distance - bound`, is positive.
     Clear,
-    /// The surfaces meet without either reaching inside the other.
+    /// The surfaces meet, or come within the bound of one another, without
+    /// either body reaching inside the other further than the facets can
+    /// account for. Between planar bodies this is contact; between curved
+    /// ones it is a gap the facets cannot tell from contact.
     Touching,
-    /// One body reaches inside the other.
+    /// One body reaches inside the other by more than the facets can be
+    /// wrong.
     Interfering,
 }
 
@@ -194,10 +220,44 @@ pub struct ClearanceReport {
     pub witness_a: Point3,
     pub witness_b: Point3,
     pub tier: Tier,
-    /// How far the true clearance may sit below `distance`, from the chord
-    /// budget each curved body was tessellated to. Zero when both bodies
-    /// are planar and the answer is exact.
+    /// How far below `distance` the true clearance may sit, in millimetres.
+    ///
+    /// The true gap is never less than `distance - bound`. It can also sit
+    /// above `distance`, by no more than `bound`, where the closest facets
+    /// belong to a concave face whose chords lie in the void. Zero when
+    /// both bodies are planar, and zero when the closest approach was read
+    /// between planar faces with no chorded face as near: then the answer
+    /// is exact even though a body is curved elsewhere.
     pub bound: f64,
+}
+
+impl ClearanceReport {
+    /// The least the true surfaces can be apart: `distance - bound`, which
+    /// is negative when the facets cannot rule out an overlap.
+    #[must_use]
+    pub fn pessimistic_distance(&self) -> f64 {
+        self.distance - self.bound
+    }
+
+    /// Whether the bodies may share space: one reaches inside the other,
+    /// or their facets come nearer than the facets can be wrong, so contact
+    /// cannot be told from overlap. Two planar bodies in contact do not,
+    /// because their contact is exact.
+    #[must_use]
+    pub fn may_overlap(&self) -> bool {
+        self.state == ClearanceState::Interfering || self.pessimistic_distance() < 0.0
+    }
+}
+
+/// One facet in world coordinates, with how far the face it stands for can
+/// sit from it (`deviation`, which the bound is built from) and how far it
+/// can sit from that face (`overshoot`, which a point of it has to be inside
+/// another body by before it counts as evidence of an overlap).
+#[derive(Clone, Copy, Debug)]
+struct Facet {
+    points: [Point3; 3],
+    deviation: f64,
+    overshoot: f64,
 }
 
 /// One body's facets in world coordinates, in a bounding-volume hierarchy.
@@ -208,18 +268,19 @@ pub struct ClearanceReport {
 /// get right than a rebuild is to pay for.
 #[derive(Clone, Debug)]
 pub struct FacetIndex {
-    facets: Vec<[Point3; 3]>,
+    facets: Vec<Facet>,
     nodes: Vec<Node>,
-    /// Whether every face of the body is planar, so its facets are the
-    /// surface rather than a chord of it.
+    /// Whether every facet is its surface rather than a chord of it, which
+    /// is what a body of planes and straight edges has.
     exact: bool,
-    /// The chord budget the facets were built to.
-    chord_budget: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
     bounds: Aabb3,
+    /// The largest deviation of any facet under this node, so a descent
+    /// that reasons about the true surfaces can prune on it.
+    deviation: f64,
     /// Facet range for a leaf; `count == 0` marks an interior node, whose
     /// two children are named outright. Deriving the second child from the
     /// first would mean walking its subtree, which turns every descent
@@ -233,40 +294,62 @@ struct Node {
 const LEAF_FACETS: usize = 8;
 
 impl FacetIndex {
-    /// Builds the index for a snapshot at a placement.
+    /// Builds the index for a snapshot at a placement, over the display
+    /// scene and the deviation of each of its faces.
     #[must_use]
     pub fn build(snapshot: &Snapshot, placement: Placement) -> Self {
         let scene = NativeKernel::debug_scene(snapshot);
-        let precision = snapshot.precision_policy().unwrap_or_default();
-        Self::from_scene(
-            &scene,
-            placement,
-            NativeKernel::is_polyhedral(snapshot),
-            chord_budget(precision),
-        )
+        let deviations = NativeKernel::display_chord_deviations(snapshot);
+        Self::from_scene(&scene, placement, &deviations)
     }
 
-    /// Builds the index from a scene the caller already has, saying whether
-    /// that body is planar throughout and what chord budget its facets were
-    /// built to.
+    /// Builds the index from a scene the caller already has, with how far
+    /// the facets of each face can sit from that face, keyed as the scene's
+    /// triangles name their source face
+    /// ([`NativeKernel::display_chord_deviations`]). A face the map does not
+    /// name takes the worst deviation in it, which errs towards a wider
+    /// bound rather than a narrower one.
     #[must_use]
     pub fn from_scene(
         scene: &DebugScene,
         placement: Placement,
-        exact: bool,
-        chord_budget: f64,
+        deviations: &BTreeMap<EntityRef, ChordDeviation>,
     ) -> Self {
+        let worst = deviations
+            .values()
+            .fold(ChordDeviation::default(), |worst, deviation| {
+                ChordDeviation {
+                    of_surface: worst.of_surface.max(deviation.of_surface),
+                    of_facets: worst.of_facets.max(deviation.of_facets),
+                }
+            });
         let facets = scene
             .triangles
             .iter()
-            .map(|triangle| triangle.vertices.map(|point| placement.apply(point)))
-            .filter(|facet| facet.iter().all(|point| point.is_finite()))
+            .map(|triangle| {
+                let deviation = deviations
+                    .get(&triangle.source_face)
+                    .copied()
+                    .unwrap_or(worst);
+                Facet {
+                    points: triangle.vertices.map(|point| placement.apply(point)),
+                    deviation: deviation.of_surface,
+                    overshoot: deviation.of_facets,
+                }
+            })
+            .filter(|facet| {
+                facet.points.iter().all(|point| point.is_finite())
+                    && facet.deviation.is_finite()
+                    && facet.overshoot.is_finite()
+            })
             .collect::<Vec<_>>();
+        let exact = facets
+            .iter()
+            .all(|facet| facet.deviation == 0.0 && facet.overshoot == 0.0);
         let mut index = Self {
             facets,
             nodes: Vec::new(),
             exact,
-            chord_budget,
         };
         if !index.facets.is_empty() {
             let count = index.facets.len();
@@ -294,10 +377,16 @@ impl FacetIndex {
     /// Builds one node over `facets[start..start + count]`, splitting until
     /// a leaf is small enough, and returns its index.
     fn split(&mut self, start: usize, count: usize) -> usize {
-        let bounds = bounds_of(&self.facets[start..start + count]);
+        let facets = &self.facets[start..start + count];
+        let bounds = bounds_of(facets);
+        let deviation = facets
+            .iter()
+            .map(|facet| facet.deviation)
+            .fold(0.0, f64::max);
         let node = self.nodes.len();
         self.nodes.push(Node {
             bounds,
+            deviation,
             start,
             count,
             left: 0,
@@ -357,7 +446,8 @@ impl FacetIndex {
                 continue;
             }
             for facet in &self.facets[node.start..node.start + node.count] {
-                let candidate = squared_distance(point, closest_point_on_triangle(point, facet));
+                let candidate =
+                    squared_distance(point, closest_point_on_triangle(point, &facet.points));
                 if candidate < best {
                     best = candidate;
                 }
@@ -366,11 +456,45 @@ impl FacetIndex {
         best.sqrt()
     }
 
-    /// Whether a point is inside the body and clear of its surface by more
-    /// than `tolerance`.
+    /// The least a point can be from the body's true surface: the distance
+    /// to each facet less that facet's deviation, minimised over the
+    /// facets. Negative when a chord of the surface may pass on the far
+    /// side of the point.
+    #[must_use]
+    pub fn surface_margin(&self, point: Point3) -> f64 {
+        if self.nodes.is_empty() {
+            return f64::INFINITY;
+        }
+        let mut best = f64::INFINITY;
+        let mut stack = vec![0_usize];
+        while let Some(index) = stack.pop() {
+            let node = self.nodes[index];
+            if point_box_distance(point, node.bounds).sqrt() - node.deviation >= best {
+                continue;
+            }
+            if node.count == 0 {
+                stack.push(node.left);
+                stack.push(node.right);
+                continue;
+            }
+            for facet in &self.facets[node.start..node.start + node.count] {
+                let candidate =
+                    squared_distance(point, closest_point_on_triangle(point, &facet.points)).sqrt()
+                        - facet.deviation;
+                if candidate < best {
+                    best = candidate;
+                }
+            }
+        }
+        best
+    }
+
+    /// Whether a point is inside the body and clear of its true surface by
+    /// more than `tolerance`, allowing for how far the facets can sit from
+    /// that surface.
     #[must_use]
     pub fn strictly_contains(&self, point: Point3, tolerance: f64) -> bool {
-        self.distance_to_surface(point) > tolerance && self.contains(point)
+        self.surface_margin(point) > tolerance && self.contains(point)
     }
 
     /// Whether a point lies inside the body, by ray parity through the
@@ -396,7 +520,7 @@ impl FacetIndex {
                 continue;
             }
             for facet in &self.facets[node.start..node.start + node.count] {
-                if ray_triangle(point, direction, facet).is_some_and(|hit| hit > 0.0) {
+                if ray_triangle(point, direction, &facet.points).is_some_and(|hit| hit > 0.0) {
                     crossings += 1;
                 }
             }
@@ -405,23 +529,20 @@ impl FacetIndex {
     }
 }
 
-/// The chord budget a snapshot's authoritative tessellation was built to.
-fn chord_budget(precision: PrecisionPolicy) -> f64 {
-    precision
-        .approximation_budget
-        .max(precision.modeling_resolution)
-}
-
 /// The closest approach of two bodies, and what it means.
 ///
-/// The descent prunes on box distance, so the pair that ends up compared
-/// facet by facet is the one that could hold the minimum. When the surfaces
-/// meet, the two bodies are separated further: touching is not interfering,
-/// and a fit check has to tell them apart.
+/// Two descents. The first minimises the facet gap and gives `distance`
+/// and the witnesses. The second minimises the facet gap less the two
+/// facets' deviations, which is the least the true surfaces can be apart,
+/// and the difference between the two is the `bound` the pair publishes.
+/// Both prune on box distance, so the pairs compared facet by facet are
+/// the ones that could hold the minimum.
+///
+/// The state is judged on the pessimistic figure. When the surfaces meet
+/// or come within the bound, the two bodies are separated further:
+/// touching is not interfering, and a fit check has to tell them apart.
 #[must_use]
 pub fn clearance(a: &FacetIndex, b: &FacetIndex, precision: PrecisionPolicy) -> ClearanceReport {
-    let bound =
-        if a.exact { 0.0 } else { a.chord_budget } + if b.exact { 0.0 } else { b.chord_budget };
     let tier = if a.exact && b.exact {
         Tier::Exact
     } else {
@@ -432,9 +553,33 @@ pub fn clearance(a: &FacetIndex, b: &FacetIndex, precision: PrecisionPolicy) -> 
         witness_a: Point3::new(0.0, 0.0, 0.0),
         witness_b: Point3::new(0.0, 0.0, 0.0),
     };
+    let mut pessimistic = Best {
+        distance: f64::INFINITY,
+        witness_a: Point3::new(0.0, 0.0, 0.0),
+        witness_b: Point3::new(0.0, 0.0, 0.0),
+    };
     if !a.is_empty() && !b.is_empty() {
-        descend(a, 0, b, 0, &mut best);
+        descend(a, 0, b, 0, &mut best, Objective::Measured);
+        if a.exact && b.exact {
+            pessimistic.distance = best.distance;
+        } else {
+            descend(a, 0, b, 0, &mut pessimistic, Objective::Pessimistic);
+        }
     }
+    let distance = if best.distance.is_finite() {
+        best.distance.max(0.0)
+    } else {
+        f64::INFINITY
+    };
+    // The pessimistic minimum is never above the measured one: the pair
+    // that held the measured minimum is in its running too, with something
+    // subtracted. Rounding is the only way they could disagree, and the
+    // bound is clamped so it never reads below zero.
+    let bound = if distance.is_finite() {
+        (distance - pessimistic.distance).max(0.0)
+    } else {
+        0.0
+    };
     let touching = precision.linear_agreement.max(1.0e-9);
     // A body wholly inside another never brings its surfaces close to the
     // other's, so containment cannot wait on the surface distance. It can
@@ -447,18 +592,14 @@ pub fn clearance(a: &FacetIndex, b: &FacetIndex, precision: PrecisionPolicy) -> 
     let state = if boxes_meet && (reaches_inside(a, b, touching) || reaches_inside(b, a, touching))
     {
         ClearanceState::Interfering
-    } else if best.distance <= touching {
+    } else if distance - bound <= touching {
         ClearanceState::Touching
     } else {
         ClearanceState::Clear
     };
     ClearanceReport {
         state,
-        distance: if best.distance.is_finite() {
-            best.distance.max(0.0)
-        } else {
-            f64::INFINITY
-        },
+        distance,
         witness_a: best.witness_a,
         witness_b: best.witness_b,
         tier,
@@ -542,23 +683,37 @@ fn reaches_inside(inner: &FacetIndex, outer: &FacetIndex, agreement: f64) -> boo
     };
     // A point on the shared boundary of two touching bodies is not inside
     // either of them, so the surface clearance is checked before parity.
-    // A curved body's facets sit a chord below its true surface, which is
-    // why the outer body's chord budget joins the tolerance.
-    let tolerance = agreement + outer.chord_budget;
-    let inside =
-        |point: Point3| inside_bounds(point, bounds) && outer.strictly_contains(point, tolerance);
+    // A curved body's facets sit a chord off its true surface, which the
+    // margin test allows for facet by facet: a point counts as inside only
+    // when no chord of the outer body could have carried its surface past
+    // the point. The inner body's own facets can overshoot their surface as
+    // well — a polygon inscribed in a bore reaches into the bore — and a
+    // point of them inside by less than that overshoot is not evidence:
+    // the state then rests on the pessimistic distance, which reads such
+    // a pair as touching rather than clear.
+    let inside = |point: Point3, allowance: f64| {
+        inside_bounds(point, bounds)
+            && outer.surface_margin(point) > agreement + allowance
+            && outer.contains(point)
+    };
     // Vertices alone are not enough. Two boxes that overlap over a slab can
     // have every vertex of each lying on a face of the other, so the facet
     // centres are tested too: they are interior to their own facet, and one
     // of them lands in the overlap whenever the boundaries genuinely cross.
     for facet in &inner.facets {
-        if inside(facet_centre(facet)) || facet.iter().any(|point| inside(*point)) {
+        let deep = |point: Point3| inside(point, facet.overshoot);
+        if deep(facet_centre(&facet.points)) || facet.points.iter().any(|point| deep(*point)) {
             return true;
         }
     }
     // A body wholly coincident with another has its whole boundary on that
-    // boundary, and only a point off the surface settles it.
-    inner.bounds().map(box_centre).is_some_and(inside)
+    // boundary, and only a point off the surface settles it. The point has
+    // to be inside the inner body too: the centre of a ring's box is in its
+    // hole, and a shaft through that hole is not an interference.
+    inner
+        .bounds()
+        .map(box_centre)
+        .is_some_and(|centre| inner.contains(centre) && inside(centre, 0.0))
 }
 
 fn facet_centre(facet: &[Point3; 3]) -> Point3 {
@@ -592,16 +747,49 @@ struct Best {
     witness_b: Point3,
 }
 
-fn descend(a: &FacetIndex, ai: usize, b: &FacetIndex, bi: usize, best: &mut Best) {
+/// What a descent minimises over the facet pairs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Objective {
+    /// The gap between the facets as they stand.
+    Measured,
+    /// The gap less both facets' deviations: the least the true surfaces
+    /// those facets stand for can be apart.
+    Pessimistic,
+}
+
+impl Objective {
+    /// How much the two sides' deviations take off a gap.
+    fn allowance(self, left: f64, right: f64) -> f64 {
+        match self {
+            Self::Measured => 0.0,
+            Self::Pessimistic => left + right,
+        }
+    }
+}
+
+fn descend(
+    a: &FacetIndex,
+    ai: usize,
+    b: &FacetIndex,
+    bi: usize,
+    best: &mut Best,
+    objective: Objective,
+) {
     let (left, right) = (a.nodes[ai], b.nodes[bi]);
-    if box_distance(left.bounds, right.bounds) >= best.distance {
+    if box_distance(left.bounds, right.bounds)
+        - objective.allowance(left.deviation, right.deviation)
+        >= best.distance
+    {
         return;
     }
     match (left.count == 0, right.count == 0) {
         (false, false) => {
             for first in &a.facets[left.start..left.start + left.count] {
                 for second in &b.facets[right.start..right.start + right.count] {
-                    let (point_a, point_b, distance) = closest_points_on_triangles(first, second);
+                    let (point_a, point_b, distance) =
+                        closest_points_on_triangles(&first.points, &second.points);
+                    let distance =
+                        distance - objective.allowance(first.deviation, second.deviation);
                     if distance < best.distance {
                         best.distance = distance;
                         best.witness_a = point_a;
@@ -614,22 +802,22 @@ fn descend(a: &FacetIndex, ai: usize, b: &FacetIndex, bi: usize, best: &mut Best
         // hierarchy balanced against a big body meeting a small one.
         (true, false) => {
             for child in children(&a.nodes, ai) {
-                descend(a, child, b, bi, best);
+                descend(a, child, b, bi, best, objective);
             }
         }
         (false, true) => {
             for child in children(&b.nodes, bi) {
-                descend(a, ai, b, child, best);
+                descend(a, ai, b, child, best, objective);
             }
         }
         (true, true) => {
             if box_extent(left.bounds) >= box_extent(right.bounds) {
                 for child in children(&a.nodes, ai) {
-                    descend(a, child, b, bi, best);
+                    descend(a, child, b, bi, best, objective);
                 }
             } else {
                 for child in children(&b.nodes, bi) {
-                    descend(a, ai, b, child, best);
+                    descend(a, ai, b, child, best, objective);
                 }
             }
         }
@@ -640,11 +828,11 @@ const fn children(nodes: &[Node], node: usize) -> [usize; 2] {
     [nodes[node].left, nodes[node].right]
 }
 
-fn bounds_of(facets: &[[Point3; 3]]) -> Aabb3 {
+fn bounds_of(facets: &[Facet]) -> Aabb3 {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     for facet in facets {
-        for point in facet {
+        for point in &facet.points {
             for (axis, value) in [point.x, point.y, point.z].into_iter().enumerate() {
                 min[axis] = min[axis].min(value);
                 max[axis] = max[axis].max(value);
@@ -657,8 +845,9 @@ fn bounds_of(facets: &[[Point3; 3]]) -> Aabb3 {
     )
 }
 
-fn centroid_axis(facet: &[Point3; 3], axis: usize) -> f64 {
+fn centroid_axis(facet: &Facet, axis: usize) -> f64 {
     facet
+        .points
         .iter()
         .map(|point| [point.x, point.y, point.z][axis])
         .sum::<f64>()

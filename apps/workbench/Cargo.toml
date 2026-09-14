@@ -23,11 +23,15 @@ artificer-protocol = { path = "../../crates/protocol" }
 artificer-model = { path = "../../crates/model" }
 artificer-sketch = { path = "../../crates/sketch" }
 artificer-sketch-ui = { path = "../../crates/sketch-ui" }
+artificer-spacemouse = { path = "../../crates/spacemouse" }
 artificer-ui-core = { path = "../../crates/ui-core" }
 artificer-viewport = { path = "../../crates/viewport" }
 serde.workspace = true
 serde_json.workspace = true
 velopack.workspace = true
+# Native open/save dialogs. On Linux this is the XDG desktop portal over
+# D-Bus, so no GTK development headers are needed to build.
+rfd = "0.17"
 
 [dev-dependencies]
 egui_kittest.workspace = true

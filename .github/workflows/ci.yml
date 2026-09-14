@@ -148,7 +148,13 @@ jobs:
     # the slowest runner is still linking. Now they only ever upload into a
     # release that already exists, and `release-publish` makes it visible after
     # every asset has landed.
-    if: startsWith(github.ref, 'refs/tags/v')
+    #
+    # `github.event.created` is true only when the push created the tag. A
+    # forced update of an existing tag (`scripts/publish-release.sh retag`
+    # moving a tag onto main, or a tag deleted and re-pushed) must not rebuild
+    # the release: the binaries that shipped under that version stay the
+    # binaries that shipped, and the update feed never sees a draft window.
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -179,17 +185,29 @@ jobs:
       - name: Open the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
+        # A draft left behind by a failed run is replaced. A release that has
+        # already been published is never touched: deleting it would take
+        # every installer and the Velopack feed offline until the rebuild
+        # landed, and the rebuild would not be byte-identical to what people
+        # already have.
         run: |
           set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release delete "$GITHUB_REF_NAME" --yes || true
+            is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
+            if [ "$is_draft" != "true" ]; then
+              printf 'error: %s already has a published release; refusing to rebuild it.\n' \
+                "$GITHUB_REF_NAME" >&2
+              printf 'Delete the release by hand first if you really mean to replace it.\n' >&2
+              exit 1
+            fi
+            gh release delete "$GITHUB_REF_NAME" --yes
           fi
           gh release create "$GITHUB_REF_NAME" --draft \
             --title "Artificer $GITHUB_REF_NAME" --generate-notes
 
   release:
     needs: release-prepare
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
     permissions:
       contents: write
     strategy:
@@ -360,7 +378,7 @@ jobs:
     # missing its feed file would leave update checks failing for everyone who
     # installed it, which is worse than a release that lands an hour late.
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
     permissions:
       contents: write
     runs-on: ubuntu-24.04

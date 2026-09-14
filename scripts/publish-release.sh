@@ -320,6 +320,11 @@ already fetched these keeps the old target until they fetch with --prune-tags,
 and a GitHub Release attached to a tag follows the tag to its new commit.
 The trees are identical, so what the release contains does not change — only
 which commit object names it.
+
+The release pipeline runs only when a tag is created (ci.yml gates its
+release jobs on github.event.created), so a moved tag does not rebuild the
+release or replace its assets. A tag moved before that gate existed would
+have; if this repository's CI predates it, stop here.
 EOF
   confirm "Move $moves tag(s) on $REMOTE?"
 

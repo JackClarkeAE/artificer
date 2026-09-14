@@ -79,7 +79,7 @@
         "exact",
         "approximate"
       ],
-      "description": "exact: both bodies are planar throughout, so their facets are their surfaces and the distance is the true one. approximate: at least one surface is curved and its facets are chords of it, so the measured gap is never smaller than the true gap and never larger than it by more than `bound`."
+      "description": "exact: both bodies are planar throughout, so their facets are their surfaces and the distance is the true one. approximate: at least one surface is curved and its facets are chords of it, so the true gap can differ from the measured one by up to `bound`, and never sits below `distance - bound`."
     },
     "state": {
       "type": "string",
@@ -138,7 +138,7 @@
         "bound": {
           "type": "number",
           "minimum": 0,
-          "description": "How far below `distance` the true clearance may sit, in millimetres: one chord budget per curved body. Absent when the pair is exact."
+          "description": "How far the true clearance may sit from `distance`, in millimetres. The facets are display chords, and the kernel knows the sagitta of every chord it spent, face by face; a second descent through the same hierarchies minimises the facet gap less the two facets' sagittas, and this is the difference between that pessimistic figure and `distance`. The true gap is never below `distance - bound`; the chords of a convex face lie inside the body and over-read, those of a bore lie in the void and can under-read, so it can also sit above `distance` by no more than `bound`. Every state and verdict in this document is already judged on `distance - bound`. Absent when zero: the pair is exact, or the closest approach was read between planar faces with no chorded face as near."
         },
         "overlap_volume": {
           "type": "number",
@@ -192,7 +192,7 @@
         "too_close",
         "loose"
       ],
-      "description": "pass: the gap sits inside the profile's window. too_close: nearer than the profile allows, or the bodies overlap outright; this is the only verdict that fails a study. loose: clear by more than the fit needed, which is a part that was meant to be held and is not."
+      "description": "pass: the gap sits inside the profile's window. too_close: nearer than the profile allows, or the bodies overlap outright; this is the only verdict that fails a study. loose: clear by more than the fit needed, which is a part that was meant to be held and is not. The minimum is tested against `distance - bound`, the least the true surfaces can be apart, so a fit is never passed on the strength of where a chord fell; the maximum is tested against `distance`, so loose is raised whenever the pair might be loose."
     },
     "profile": {
       "type": "object",

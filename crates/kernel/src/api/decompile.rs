@@ -17,7 +17,8 @@ use crate::api::commands::{ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::journal::Journal;
 use crate::api::selectors::{
-    EntitySelector, Extremum, GeometricSelector, Metric, NormalMatch, SurfaceFilter,
+    ANY_ROLE, EntitySelector, Extremum, FaceLoops, GeometricSelector, Metric, NormalMatch,
+    SurfaceFilter,
 };
 use crate::api::session::Session;
 use crate::{CancellationToken, NativeKernel};
@@ -444,6 +445,10 @@ impl Writer<'_> {
                         ));
                     }
                 };
+                if role == ANY_ROLE && ordinal.is_none() {
+                    // Every entity the step made: `step.edges()`.
+                    return Ok(format!("{}.{method}s()", self.step_ident(&from_step.0)?));
+                }
                 let ordinal =
                     ordinal.map_or(String::new(), |ordinal| format!(", ordinal: {ordinal}"));
                 format!(
@@ -610,6 +615,14 @@ fn geometric(selector: &GeometricSelector, writer: &mut Writer<'_>) -> Result<St
             Some(word) if word.starts_with('>') => format!("edges(\"|{}\")", &word[1..]),
             _ => format!("edges(direction: {})", vector3(*direction)),
         },
+        GeometricSelector::EdgesOfFace { face, loops } => format!(
+            "{}.{}()",
+            writer.selector(face)?,
+            match loops {
+                FaceLoops::All => "edges",
+                FaceLoops::Outer => "rim",
+            }
+        ),
     })
 }
 

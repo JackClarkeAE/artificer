@@ -1,7 +1,7 @@
 # The `.art` scripting language, version 0.3
 
 A reference for people and for AI agents writing Artificer scripts. Everything
-here is what the kernel implements today (Artificer 0.97, `.art` 0.3); nothing
+here is what the kernel implements today (Artificer 0.98, `.art` 0.3); nothing
 is aspirational. Where a feature has a limit, the limit is stated. Version 0.3
 adds functions, modules, typed parameters with units, ranges and descriptions,
 array indexing, and parameter introspection; sections 14 to 17 cover them.
@@ -16,16 +16,27 @@ runner, the Rust API and Script Studio, because all four compile it with the
 same function into the same commands.
 
 ```sh
-# Run a script headless and print every step's result
-cargo run --release -p artificer-api-server -- run part.art
+# Run a script headless and print every step's result; --param overrides a parameter
+cargo run --release -p artificer-api-server -- run part.art --param width=120
 
-# Render or export the result
-cargo run --release -p artificer-api-server -- snapshot part.art --format png --output part.png
-cargo run --release -p artificer-api-server -- export part.art --format stl --output part.stl
+# Render or export the result: the output file's extension chooses the format
+cargo run --release -p artificer-api-server -- snapshot part.art part.png --view top
+cargo run --release -p artificer-api-server -- export part.art part.stl
+cargo run --release -p artificer-api-server -- export part.art part.step
 
 # Edit it live
 cargo run --release -p artificer-script-studio -- part.art
 ```
+
+The command is `artificer-api`. Its commands are `run`, `report` (the
+session report as JSON), `params`, `snapshot <script> <out>` (`.png` for a
+raster image, anything else for SVG), `export <script> <out>` (`.stl`,
+`.obj`, `.step`), `journal`, `diff` and `serve`. The flags are
+`--param name=value`, which only takes a name the script declares;
+`--view <preset>` for a snapshot's camera (isometric, trimetric, front,
+back, top, bottom, left, right); `--json` for `run`, `params` and `diff`;
+`--faceted` for a faceted STEP; and `--module-path <dir>` for where `use`
+looks. `artificer-api help` lists them.
 
 ---
 
@@ -44,15 +55,18 @@ drill(face: plate.face("top_face"), center: [0, 0], diameter: 5, depth: 6, label
 - **Statements** end with `;`. There are three kinds: `param`, `let`, and a
   bare call.
 - **`param name[: f64] = expr;`** declares a parameter. Parameters are numbers.
-  A host (the customizer, the CLI's `--set name=value`, the JSON-RPC `compile`
-  call) may override a parameter's value; the default is used otherwise.
+  A host (the customizer, the CLI's `--param name=value`, the `params` of
+  the JSON-RPC `script.run` call) may override a parameter's value; the
+  default is used otherwise, and the CLI refuses a name the script does
+  not declare.
   Defaults are evaluated in order, so a default may use earlier parameters.
 - **`let name = expr;`** binds any value to a name.
 - **Calls** are `name(arg: value, ...)`. Feature calls take named arguments
   only; math functions and `faces("...")`/`edges("...")` take positional
   arguments.
-- **Methods** are `step.face("role")`, `step.edge("role")` and
-  `step.edges("role", count: n)`.
+- **Methods** are `step.face("role")`, `step.edge("role")`,
+  `step.edges("role", count: n)` and `step.edges()`; a face selector has
+  `.edges()` and `.rim()` (section 7).
 - **Expressions**: numbers (`12`, `1.5`), strings (`"top"`), arrays
   (`[1, 2, 3]`), identifiers, unary minus, `+ - * /`, parentheses, calls and
   methods. `pi` is predefined.
@@ -103,7 +117,7 @@ the CLI prints them; the JSON-RPC server returns them as the error object.
 | Step | `let b = box(...)` | The bound name of an executed step; passed to Booleans and used for methods. |
 | Body | `let s = standoff(...)` | What a function returns: a step plus the faces it exports, read as `s.top` (section 14). |
 | Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)` | Only valid inside `sketch(entities: [...])`. |
-| Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")` | Names a face or edge of the current body, resolved when the step runs. |
+| Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")`, `faces(">Z").edges()` | Names a face or edge of the current body, or a set of edges, resolved when the step runs. |
 
 ---
 
@@ -147,7 +161,8 @@ let c = box(origin: [-20, -15, 0], size: [40, 30, 10], label: "c");
 
 Face roles for `.face(...)`: `top_face`, `bottom_face`, `front_face`,
 `back_face`, `left_face`, `right_face`. Edge role for `.edge(...)`/
-`.edges(...)`: `edge` with ordinals 0 to 11.
+`.edges(...)`: `edge` with ordinals 0 to 11; `b.edges()` with nothing
+named is all twelve.
 
 ### `cylinder`
 
@@ -275,12 +290,14 @@ removes it.
 ```art
 fillet(edges: [edges("|Z")], radius: 3, label: "round_corners");
 chamfer(edges: [b.edge("edge", ordinal: 0), b.edge("edge", ordinal: 1)], distance: 1, label: "break");
+fillet(edges: faces(">Z").edges(), radius: 2, label: "top_rim");    // every edge of the top face
+fillet(edges: hub.edges(), radius: 1.5, label: "rims");             // every edge a step made
 fillet(edges: [nearest(point: [0, 45, 8], kind: "edge"), nearest(point: [0, -45, 8], kind: "edge")], radius: 1.5, label: "rim");
 ```
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `edges` | yes | An array of edge selectors. Set selectors such as `edges("|Z")` expand to every matching edge. |
+| `edges` | yes | An edge selector or an array of them. Set selectors such as `edges("|Z")`, `faces(">Z").edges()` and `hub.edges()` expand to every matching edge. |
 | `radius` (fillet) / `distance` (chamfer) | yes | The blend size. |
 
 Exact blends cover straight edges, the rims of round and polygonal holes,
@@ -446,6 +463,32 @@ On a stepped part, `faces(">Z")` is the top step, not the plate under it.
 |---|---|
 | `"|X"`, `"|Y"`, `"|Z"` | Every straight edge parallel to the axis (a set). |
 | `"longest"`, `"shortest"` | By length. |
+| `">Z"`, `"top"`, and the other direction spellings of `faces("...")` | The edges of that face: `edges(">Z")` is `faces(">Z").edges()` (a set). |
+
+### The edges of a face: `.edges()` and `.rim()`
+
+```art
+let top = faces(">Z");
+fillet(edges: top.edges(), radius: 2, label: "soften");     // every edge bounding the top
+fillet(edges: faces(">Z").rim(), radius: 2, label: "rim");  // the outer loop only
+fillet(edges: edges(">Z"), radius: 2, label: "same");       // short for faces(">Z").edges()
+fillet(edges: cyl.edges(), radius: 1, label: "rims");       // every edge a step made
+```
+
+`.edges()` on any face selector — a `faces("...")` spelling, a `nearest`,
+a step's `.face("...")`, a body's exported face — names every edge
+bounding that face: the outer loop and every hole in it. `.rim()` is the
+outer loop alone, so on a drilled face it leaves the hole sharp. Both are
+sets, accepted wherever `fillet` and `chamfer` take edges, alone or in an
+array with other selectors, and both are resolved when the step using them
+runs, so a face found by direction names its edges as they are then. A
+seam where one surface continues smoothly across an edge (the two halves
+of a cylinder's wall) is not a crease and is left out, which is why the
+rim of a cylinder's top blends cleanly.
+
+`step.edges()` with nothing named is every crease edge the step made,
+whatever role it reported: a cylinder's four rim arcs, a box's twelve
+edges. `step.edges("role", count: n)` keeps its meaning.
 
 ### Named forms: any direction, any extremum, the edge between two faces
 
@@ -484,12 +527,16 @@ let b = box(size: [40, 30, 10], label: "b");
 let top = b.face("top_face");
 let one_edge = b.edge("edge", ordinal: 3);
 let ring = b.edges("edge", count: 12);   // every edge the step made under that role
+let every = b.edges();                   // every edge the step made, whatever the role
 ```
 
 Roles are what the step reported when it ran. Boxes report the six face
 roles listed under `box`; drills report `FeatureSide` walls and a
 `FeatureEnd` floor; extrusions report their side and end faces. When a role
 has several entities, `ordinal:` picks one and `.edges(count:)` lists them.
+`.edges()` with nothing named needs no role at all: it is every crease edge
+the step made, so `cyl.edges()` is a cylinder's rims although a cylinder
+reports no `edge` role.
 
 ### Naming faces: `let name = <selector>`
 
@@ -814,7 +861,16 @@ standoff(on: plate.face("top_face"), at: [30, 20], height: 10, hole: 3 + clearan
   then along `--module-path` directories. The JSON-RPC server takes the
   sources inline: `script.run` and `script.report` accept a `modules` object
   mapping each path a `use` writes to its source. A host that loads no
-  modules says so.
+  modules says so. A chain of modules importing one another is followed
+  sixteen deep and no further, and one compilation loads at most 256
+  modules; past either the refusal names the chain or the count.
+- `script.run` adds its steps to the session it runs in, so a second script
+  whose labels repeat the first's is refused as a reused label. The JSON-RPC
+  method `session.reset` (no parameters; answers `{"status":"reset"}`)
+  returns the session to a fresh state — no steps, an empty journal,
+  nothing to undo, the precision policy kept — which is how a client runs
+  one script after another without starting a new process. In Rust it is
+  `Session::reset`.
 - Functions and constants share one namespace across the script and every
   module it imports; defining the same function twice is an error naming
   the module that already has it.
@@ -907,10 +963,23 @@ its measured clearance and records the engine's refusal code in
 
 **What the numbers are worth.** Between bodies whose faces are all planar
 the facets are the surfaces and `tier` is `exact`. Where a surface is
-curved its facets are chords of it: the measured gap is never smaller than
-the true gap and never larger than it by more than the `bound` the pair
-publishes, which is one chord budget per curved body. Compare against
-`distance - bound` when the answer has to be conservative.
+curved its facets are chords of it, and the pair publishes a `bound` the
+kernel earns rather than assumes: it knows the sagitta of every display
+chord it spent, face by face, and a second descent through the same
+hierarchies minimises the facet gap less the two facets' sagittas — the
+least the true surfaces can be apart. `bound` is the difference between
+that pessimistic figure and `distance`. The true gap is never below
+`distance - bound`. The chords of a convex face (a boss, a pin) lie inside
+the body, so they over-read; those of a bore lie in the void, so a pin
+turned in a bore can under-read, and the true gap can then sit above
+`distance` by no more than `bound`. Every `state` and `verdict` is already
+judged on `distance - bound`: a pair is `clear` only when that figure is
+positive, `touching` when the facets come within the bound of one another
+and cannot tell contact from overlap, and a fit's minimum has to be met by
+it, not by `distance`. A caller reading `distance` alone should subtract
+`bound` before concluding a part fits. The bound is zero, and absent, when
+the closest approach was read between planar faces with no chorded face
+as near.
 
 ### Judging it against a fit
 
@@ -942,7 +1011,14 @@ Each pair then earns a `verdict`. `pass` is the gap that was asked for.
 `too_close` is nearer than allowed, or an overlap, and it is the only
 verdict that fails a study — `failing` counts them. `loose` is clear by
 more than the fit needed: not a failure, but a part meant to be held that
-is not. An unknown profile key is refused by name rather than ignored.
+is not. The minimum is tested against `distance - bound`, so a running fit
+of 0.02 mm between two chorded parts 0.02 mm apart is `too_close` at every
+turn of the parts rather than a pass that depends on where a chord fell;
+the maximum is tested against `distance`, so `loose` is raised whenever
+the pair might be loose. Two planar bodies in contact pass the `assembly`
+profile; two curved bodies in contact do not, because their facets cannot
+say they do not overlap. An unknown profile key is refused by name rather
+than ignored.
 
 ### Where on the part
 
@@ -980,10 +1056,13 @@ recording or a file alike.
 
 The sweep stops at the first collision: past that the parts have already
 passed through one another, so nothing beyond is a pose the real thing
-reaches. Read `steps_measured` against `steps_offered` to see how much of
-the travel was answered for, and `cancelled` to know the rest is
-unmeasured rather than clear. Its schema is
-[`docs/sweep-schema.json`](sweep-schema.json).
+reaches. A collision is a pair one body reaches inside the other, or two
+curved bodies whose facets come within their `bound` of one another —
+contact the facets cannot tell from overlap — so a chorded pair stops the
+sweep a bound short of touching rather than a vertex past it. Read
+`steps_measured` against `steps_offered` to see how much of the travel
+was answered for, and `cancelled` to know the rest is unmeasured rather
+than clear. Its schema is [`docs/sweep-schema.json`](sweep-schema.json).
 
 ### What the workbench adds
 
@@ -1002,8 +1081,12 @@ solver's rules and what it refuses.
   than reproducing the numbers.
 - Decide on `failing` and the per-pair `verdict` when a profile is in
   play; on `state` and `distance` when one is not.
-- Treat `approximate` as a flag to act on: subtract `bound` from
-  `distance` before concluding a part fits.
+- Treat `approximate` as a flag to act on: the verdicts and states already
+  rest on `distance - bound`, but a number read from `distance` alone
+  should have `bound` subtracted before it is used to conclude a part fits.
+- Name the subjects. Nothing is implied by the session's current body, and
+  a study of fewer than two subjects is refused with the steps that could
+  have been named.
 - A refusal is data. `overlap_unavailable` names why a volume is missing
   and leaves the clearance beside it standing; a study never fails because
   the Boolean engine did.
