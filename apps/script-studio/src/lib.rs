@@ -35,7 +35,8 @@ use artificer_protocol::{
 use artificer_spacemouse::SpaceMouse;
 use artificer_ui_core::navigation::NavigationPreset;
 use artificer_ui_core::presentation::{
-    ActiveTool, DisplayTransform, SectionCutPlane, SixDofMotion, SixDofSettings, ViewState,
+    ActiveTool, DisplayTransform, SectionCutPlane, SixDofFilter, SixDofMotion, SixDofSettings,
+    ViewState,
 };
 use artificer_ui_core::theme::{self, WorkbenchTheme};
 use artificer_viewport::{
@@ -973,6 +974,8 @@ pub struct ScriptStudio {
     /// The 3D mouse, when the process has one; `None` in tests, which never
     /// open it.
     spacemouse: Option<SpaceMouse>,
+    /// The puck's motion, shaped and smoothed before it steers.
+    spacemouse_filter: SixDofFilter,
     /// Whether Open, Save as and the exports use the desktop's own file
     /// dialog. Off, they fall back to the typed-path prompt, which is also
     /// what a headless test drives.
@@ -1098,6 +1101,7 @@ impl ScriptStudio {
             display_mode: ModelDisplayMode::ShadedEdges,
             section: SectionPlane::default(),
             spacemouse: None,
+            spacemouse_filter: SixDofFilter::default(),
             native_file_dialogs: true,
             last_dialog_directory: None,
             discard_prompt: None,
@@ -2597,7 +2601,7 @@ impl ScriptStudio {
             return;
         };
         let motion = mouse.take_motion();
-        if motion.is_empty() {
+        if motion.is_empty() && self.spacemouse_filter.is_still() {
             return;
         }
         let mut changed = false;
@@ -2609,18 +2613,23 @@ impl ScriptStudio {
             changed = true;
         }
         let seconds = f64::from(ctx.input(|input| input.stable_dt));
-        let six_dof = SixDofMotion {
-            translate: motion.translate,
-            rotate: motion.rotate,
-        };
-        if self
-            .view
-            .apply_six_dof(six_dof, seconds, SixDofSettings::default())
-        {
+        let settings = SixDofSettings::default();
+        let six_dof = self.spacemouse_filter.feed(
+            SixDofMotion {
+                translate: motion.translate,
+                rotate: motion.rotate,
+            },
+            seconds,
+            &settings,
+        );
+        if self.view.apply_six_dof(six_dof, seconds, settings) {
             changed = true;
         }
         if changed {
             ctx.request_repaint();
+        }
+        if !self.spacemouse_filter.is_still() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(8));
         }
     }
 

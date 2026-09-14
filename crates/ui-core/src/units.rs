@@ -199,9 +199,7 @@ fn trim_trailing_zeros(text: &str) -> String {
         return text.to_owned();
     }
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-" {
-        "0".to_owned()
-    } else if trimmed == "-0" {
+    if matches!(trimmed, "" | "-" | "-0") {
         "0".to_owned()
     } else {
         trimmed.to_owned()

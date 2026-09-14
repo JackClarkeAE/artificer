@@ -6,7 +6,7 @@
 
 pub use artificer_sketch_ui as sketch;
 pub use artificer_sketch_ui::sketch_toolbar;
-pub use artificer_ui_core::{drag_handle, navigation, presentation, theme};
+pub use artificer_ui_core::{drag_handle, navigation, presentation, theme, units};
 pub use artificer_viewport as viewport;
 
 pub mod assembly;
@@ -191,6 +191,19 @@ impl DisplayLengthUnit {
         let scale = self.millimetres_per_unit();
         let value = value_mm2 / (scale * scale);
         format!("{value:.3} {}²", self.symbol())
+    }
+}
+
+impl From<DisplayLengthUnit> for units::LengthUnit {
+    fn from(unit: DisplayLengthUnit) -> Self {
+        match unit {
+            DisplayLengthUnit::Micrometre => Self::Micrometre,
+            DisplayLengthUnit::Millimetre => Self::Millimetre,
+            DisplayLengthUnit::Centimetre => Self::Centimetre,
+            DisplayLengthUnit::Metre => Self::Metre,
+            DisplayLengthUnit::Inch => Self::Inch,
+            DisplayLengthUnit::Foot => Self::Foot,
+        }
     }
 }
 
@@ -3143,6 +3156,14 @@ impl KernelLabApp {
 
     pub fn set_display_length_unit(&mut self, unit: DisplayLengthUnit) {
         self.document_settings.length_unit = unit;
+    }
+
+    /// The unit every length readout is formatted in and every typed
+    /// length is read in unless it carries its own suffix. Kernel geometry
+    /// stays in millimetres; this is the person's unit, not the model's.
+    #[must_use]
+    pub fn length_unit(&self) -> units::LengthUnit {
+        self.document_settings.length_unit.into()
     }
 
     /// Portable Artificer workspace envelope. Unlike the raw model archive used
@@ -13881,6 +13902,10 @@ impl KernelLabApp {
         if let Some(invert) = self.navigation_invert_zoom {
             bindings.invert_zoom = invert;
         }
+        // The wheel glides under the same switch as the camera flights, so
+        // a test or an accessibility setting that wants instant motion gets
+        // it everywhere at once.
+        bindings.animate_zoom = self.animate_face_camera_transitions;
         bindings
     }
 

@@ -2885,19 +2885,30 @@ fn handle_canvas_input(
             let factor = (f64::from(scroll) * 0.0025 * sense).exp();
             // Anchor the zoom to the pointer, so the geometry under the
             // cursor stays put while the rest of the scene scales around it.
-            match canvas.hover_pos() {
-                Some(pointer) => view.zoom_about(
-                    factor,
-                    [
-                        f64::from(pointer.x - projection.screen_center.x),
-                        f64::from(pointer.y - projection.screen_center.y),
-                    ],
-                    projection.points_per_unit,
-                ),
-                None => view.zoom_by(factor),
+            let anchor = canvas.hover_pos().map(|pointer| {
+                [
+                    f64::from(pointer.x - projection.screen_center.x),
+                    f64::from(pointer.y - projection.screen_center.y),
+                ]
+            });
+            if bindings.animate_zoom {
+                // The notch names a destination; the frames below carry the
+                // view there, so a zoom reads as a glide rather than a cut.
+                view.glide_zoom_by(factor, anchor, projection.points_per_unit);
+            } else {
+                match anchor {
+                    Some(anchor) => view.zoom_about(factor, anchor, projection.points_per_unit),
+                    None => view.zoom_by(factor),
+                }
             }
             changed = true;
         }
+    }
+    // A glide in flight moves every frame until it lands, whether or not
+    // the pointer is still over the canvas.
+    let frame_seconds = f64::from(ui.input(|input| input.stable_dt));
+    if view.advance_zoom_glide(frame_seconds) {
+        changed = true;
     }
     if changed {
         ui.ctx().request_repaint();
@@ -4864,6 +4875,16 @@ fn visible_triangle_edge_keys_by_body(
 /// they form one visually continuous boundary rail. Return the complete
 /// tangent-connected visible group while deliberately excluding smooth
 /// approximation seams.
+///
+/// Two chords continue one rail when they meet at an endpoint and either run
+/// collinear or bound the same pair of faces — where "the same" admits faces
+/// the kernel joined by a smooth seam. That second allowance is what lets a
+/// faceted bore's rim, whose chords ride from one wall panel to the next and
+/// whose cap may itself be split into coplanar fragments, read as one circle,
+/// while a hexagon's rim, whose walls meet at corners the kernel kept hard,
+/// stays six edges. The search walks an endpoint index, so a body of
+/// thousands of chords groups in time linear in the rail rather than
+/// quadratic in the body.
 pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<EntityRef> {
     let scale = scene_bounds(scene)
         .map(|bounds| {
@@ -4880,22 +4901,27 @@ pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
         .iter()
         .filter(|edge| !edge.is_smooth)
         .collect::<Vec<_>>();
-    // Two faces joined across a smooth edge are panels of one curved surface.
-    // That is the fact a curved rail needs: it is the only thing that tells a
-    // bore's rim, whose chords ride from one wall panel to the next, apart from
-    // a hexagon's rim, whose sides meet at a corner the kernel kept hard.
-    // Asking the angle instead cannot separate them — a coarsely sampled arc
-    // turns by as much between chords as a shallow polygon does at a corner.
-    let mut smooth_joins = BTreeSet::new();
-    for edge in &scene.edges {
-        if let (true, [Some(left), Some(right)]) = (edge.is_smooth, edge.incident_faces) {
-            smooth_joins.insert(if left <= right {
-                (left, right)
-            } else {
-                (right, left)
-            });
-        }
-    }
+    // Two faces joined across a smooth edge are panels of one curved surface,
+    // or fragments of one plane. That is the fact a curved rail needs: it is
+    // the only thing that tells a bore's rim, whose chords ride from one wall
+    // panel to the next, apart from a hexagon's rim, whose sides meet at a
+    // corner the kernel kept hard. Asking the angle instead cannot separate
+    // them — a coarsely sampled arc turns by as much between chords as a
+    // shallow polygon does at a corner.
+    //
+    // The joins are transitive: a faceted cap is a fan of coplanar fragments,
+    // and two rim chords' cap pieces may be several seams apart. What the
+    // rail needs is that both pieces belong to one logical face, so faces
+    // are grouped into components under the smooth seams once, and two
+    // faces count as the same when their components do.
+    let logical_face = smooth_face_components(scene);
+    let same_or_joined = |left: EntityRef, right: EntityRef| {
+        left == right
+            || matches!(
+                (logical_face.get(&left), logical_face.get(&right)),
+                (Some(a), Some(b)) if a == b
+            )
+    };
     let meets = |first: [Point3; 2], second: [Point3; 2]| {
         first.iter().any(|left| {
             second
@@ -4917,49 +4943,125 @@ pub fn logical_edge_group(scene: &DebugScene, seed: EntityRef) -> BTreeSet<Entit
                 .abs()
                 >= 1.0 - 1.0e-7
     };
-    // The two chords keep one face between them — the cap the rim bounds — and
-    // leave one each; the rail continues exactly when those two are panels of
-    // the same curved wall.
+    // The rail continues when the two chords bound the same two faces, each
+    // taken up to a smooth join: the cap the rim bounds (or a coplanar
+    // fragment of it) on one side, and one wall panel or the next on the
+    // other.
     let curves_on = |first: [Option<EntityRef>; 2], second: [Option<EntityRef>; 2]| {
-        let first = first.into_iter().flatten().collect::<Vec<_>>();
-        let second = second.into_iter().flatten().collect::<Vec<_>>();
-        if first.len() != 2 || second.len() != 2 {
-            return false;
-        }
-        let (Some(left), Some(right)) = (
-            first.iter().find(|face| !second.contains(face)),
-            second.iter().find(|face| !first.contains(face)),
-        ) else {
+        let ([Some(a), Some(b)], [Some(c), Some(d)]) = (first, second) else {
             return false;
         };
-        first.iter().any(|face| second.contains(face))
-            && smooth_joins.contains(&if left <= right {
-                (*left, *right)
-            } else {
-                (*right, *left)
-            })
+        (same_or_joined(a, c) && same_or_joined(b, d))
+            || (same_or_joined(a, d) && same_or_joined(b, c))
     };
+    // Every chord is filed under the cells its two endpoints fall in, so a
+    // chord's neighbours are found by looking up its own endpoints rather
+    // than by scanning the body.
+    let cell = |point: Point3| {
+        [
+            (point.x / tolerance).floor() as i64,
+            (point.y / tolerance).floor() as i64,
+            (point.z / tolerance).floor() as i64,
+        ]
+    };
+    let mut by_cell = HashMap::<[i64; 3], Vec<usize>>::new();
+    for (index, edge) in visible.iter().enumerate() {
+        for point in edge.endpoints {
+            by_cell.entry(cell(point)).or_default().push(index);
+        }
+    }
+    let neighbours_of = |edge: &DebugEdge| {
+        let mut found = Vec::new();
+        for point in edge.endpoints {
+            let [x, y, z] = cell(point);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(indices) = by_cell.get(&[x + dx, y + dy, z + dz]) {
+                            found.extend(indices.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        found
+    };
+    let mut by_source = HashMap::<EntityRef, Vec<usize>>::new();
+    for (index, edge) in visible.iter().enumerate() {
+        by_source.entry(edge.source_edge).or_default().push(index);
+    }
     let mut group = BTreeSet::from([seed]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for candidate in &visible {
-            if group.contains(&candidate.source_edge) {
+    let mut queue = by_source.get(&seed).cloned().unwrap_or_default();
+    let mut visited = queue.iter().copied().collect::<HashSet<_>>();
+    while let Some(index) = queue.pop() {
+        let selected = visible[index];
+        for candidate_index in neighbours_of(selected) {
+            if visited.contains(&candidate_index) {
                 continue;
             }
-            let connected = visible.iter().any(|selected| {
-                group.contains(&selected.source_edge)
-                    && meets(selected.endpoints, candidate.endpoints)
+            let candidate = visible[candidate_index];
+            // A chord of an edge already in the group is in it by identity;
+            // its far end still has to be walked.
+            if !group.contains(&candidate.source_edge) {
+                let connected = meets(selected.endpoints, candidate.endpoints)
                     && (collinear(selected.endpoints, candidate.endpoints)
-                        || curves_on(selected.incident_faces, candidate.incident_faces))
-            });
-            if connected {
+                        || curves_on(selected.incident_faces, candidate.incident_faces));
+                if !connected {
+                    continue;
+                }
                 group.insert(candidate.source_edge);
-                changed = true;
+            }
+            // Every chord of a newly grouped edge joins the walk, so the
+            // rail is followed from all of them, not only the one that met.
+            for &sibling in by_source.get(&candidate.source_edge).into_iter().flatten() {
+                if visited.insert(sibling) {
+                    queue.push(sibling);
+                }
             }
         }
     }
     group
+}
+
+/// Labels every face with the component it belongs to under the kernel's
+/// smooth seams: the panels of one curved wall share a label, and so do the
+/// coplanar fragments a faceted Boolean leaves in one cap. Tangent rails are
+/// not smooth seams, so a fillet and the planes it blends keep their own
+/// labels.
+fn smooth_face_components(scene: &DebugScene) -> HashMap<EntityRef, usize> {
+    let mut faces = Vec::new();
+    let mut index_of = HashMap::new();
+    let mut parent = Vec::new();
+    let mut id_of = |face: EntityRef, faces: &mut Vec<EntityRef>, parent: &mut Vec<usize>| {
+        *index_of.entry(face).or_insert_with(|| {
+            faces.push(face);
+            parent.push(parent.len());
+            parent.len() - 1
+        })
+    };
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for edge in &scene.edges {
+        if let (true, [Some(left), Some(right)]) = (edge.is_smooth, edge.incident_faces) {
+            let left = id_of(left, &mut faces, &mut parent);
+            let right = id_of(right, &mut faces, &mut parent);
+            let (left, right) = (root(&mut parent, left), root(&mut parent, right));
+            if left != right {
+                parent[left] = right;
+            }
+        }
+    }
+    let mut labels = HashMap::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        let label = root(&mut parent, index);
+        labels.insert(*face, label);
+    }
+    labels
 }
 
 /// Groups the faceted pieces of one visually smooth fillet surface. The only
@@ -10767,5 +10869,127 @@ mod tests {
                 "yaw step {step}: a subdivided piece painted over nearer material"
             );
         }
+    }
+
+    /// A body that went through the faceted tier carries a bore's rim as
+    /// many small B-rep edges between coplanar cap fragments and wall
+    /// panels. Hovering one of them must light the whole rim, as it does on
+    /// an exact body, and a slot's arc must light as one arc.
+    #[test]
+    fn a_faceted_bore_rim_hovers_as_one_logical_edge() {
+        use artificer_kernel::api::scripting::NoModules;
+        use artificer_kernel::api::session::Session;
+        let mut session = Session::new();
+        let token = CancellationToken::default();
+        let plate = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");";
+        let crossed = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");\ndrill(face: faces(\">Z\"), center: [15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_b\");\ndrill(face: faces(\"<Y\"), center: [0.0, 0.0], diameter: 20.0, depth: 30.0, label: \"side_cut\");";
+        let slot = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet s = sketch(on: faces(\">Z\"), entities: [line(start: [-10, -5], end: [10, -5]), arc(center: [10, 0], radius: 5, start_angle: -90, end_angle: 90), line(start: [10, 5], end: [-10, 5]), arc(center: [-10, 0], radius: 5, start_angle: 90, end_angle: 270)], label: \"s\");\nextrude(sketch: s, distance: 10, operation: \"cut\", label: \"slot\");";
+        // Chords on the top face of hole_a's rim: at z = 40, eight from the
+        // hole's centre at (35, 25). The faceted tier splits a rim's polygon
+        // sides at points along the chord, which sit inside the circle by up
+        // to the sagitta of a sixteen-gon, so the band is half a millimetre.
+        let on_hole_a = |edge: &&DebugEdge| {
+            edge.endpoints.iter().all(|point| {
+                (point.z - 40.0).abs() < 1.0e-6
+                    && ((point.x - 35.0).hypot(point.y - 25.0) - 8.0).abs() < 0.5
+            })
+        };
+        for (label, script, expected_sources) in
+            [("exact plate", plate, 2), ("crossing cut", crossed, 0)]
+        {
+            session.reset();
+            let outcome = session.run_script_with(script, &BTreeMap::new(), &NoModules, &token);
+            assert!(outcome.failure.is_none(), "{label}: {:?}", outcome.failure);
+            let scene = NativeKernel::debug_scene(&session.snapshot);
+            let rim = scene
+                .edges
+                .iter()
+                .filter(|edge| !edge.is_smooth)
+                .filter(on_hole_a)
+                .collect::<Vec<_>>();
+            assert!(rim.len() >= 12, "{label}: only {} rim chords", rim.len());
+            let sources = rim
+                .iter()
+                .map(|edge| edge.source_edge)
+                .collect::<BTreeSet<_>>();
+            if expected_sources > 0 {
+                assert_eq!(sources.len(), expected_sources, "{label}");
+            } else {
+                assert!(
+                    sources.len() > 10,
+                    "{label}: a faceted rim should be many edges, got {}",
+                    sources.len()
+                );
+            }
+            let group = logical_edge_group(&scene, rim[0].source_edge);
+            let lit = rim
+                .iter()
+                .filter(|edge| group.contains(&edge.source_edge))
+                .count();
+            assert_eq!(
+                lit,
+                rim.len(),
+                "{label}: hovering one chord must light the whole rim"
+            );
+            // And nothing beyond the rim: no chord of the group lies off it.
+            let strays = scene
+                .edges
+                .iter()
+                .filter(|edge| !edge.is_smooth && group.contains(&edge.source_edge))
+                .filter(|edge| !on_hole_a(edge))
+                .count();
+            if strays != 0 {
+                for edge in scene
+                    .edges
+                    .iter()
+                    .filter(|edge| !edge.is_smooth && group.contains(&edge.source_edge))
+                    .filter(|edge| !on_hole_a(edge))
+                    .take(6)
+                {
+                    eprintln!(
+                        "stray src={:?} tangent={} faces={:?} ends=({:.3},{:.3},{:.3}) ({:.3},{:.3},{:.3})",
+                        edge.source_edge.entity,
+                        edge.is_tangent,
+                        edge.incident_faces.map(|face| face.map(|face| face.entity)),
+                        edge.endpoints[0].x,
+                        edge.endpoints[0].y,
+                        edge.endpoints[0].z,
+                        edge.endpoints[1].x,
+                        edge.endpoints[1].y,
+                        edge.endpoints[1].z
+                    );
+                }
+            }
+            assert_eq!(strays, 0, "{label}: the group must stay on the rim");
+        }
+        session.reset();
+        let outcome = session.run_script_with(slot, &BTreeMap::new(), &NoModules, &token);
+        assert!(outcome.failure.is_none(), "slot: {:?}", outcome.failure);
+        let scene = NativeKernel::debug_scene(&session.snapshot);
+        // The slot's right arc: chords at z = 40 within 5 of (60, 50).
+        let on_arc = |edge: &&DebugEdge| {
+            edge.endpoints.iter().all(|point| {
+                (point.z - 40.0).abs() < 1.0e-6
+                    && ((point.x - 60.0).hypot(point.y - 50.0) - 5.0).abs() < 1.0e-3
+                    && point.x >= 60.0 - 1.0e-6
+            })
+        };
+        let arc = scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .filter(on_arc)
+            .collect::<Vec<_>>();
+        assert!(arc.len() >= 8, "slot: only {} arc chords", arc.len());
+        let group = logical_edge_group(&scene, arc[0].source_edge);
+        let lit = arc
+            .iter()
+            .filter(|edge| group.contains(&edge.source_edge))
+            .count();
+        assert_eq!(
+            lit,
+            arc.len(),
+            "slot: hovering the arc lights the whole arc"
+        );
     }
 }

@@ -3495,6 +3495,32 @@ fn evaluate_named_expression(text: &str, names: &BTreeMap<String, f64>) -> Optio
                             break;
                         }
                     }
+                    // An exponent: `1e3`, `2.5E-2`. The `e` belongs to the
+                    // number only when a digit follows it, directly or after
+                    // one sign; otherwise it starts a name as it always did.
+                    if let Some(&marker) = characters.peek()
+                        && matches!(marker, 'e' | 'E')
+                    {
+                        let mut ahead = characters.clone();
+                        ahead.next();
+                        let sign = ahead.next_if(|piece| *piece == '+' || *piece == '-');
+                        if ahead.peek().is_some_and(char::is_ascii_digit) {
+                            digits.push(marker);
+                            characters.next();
+                            if let Some(sign) = sign {
+                                digits.push(sign);
+                                characters.next();
+                            }
+                            while let Some(&piece) = characters.peek() {
+                                if piece.is_ascii_digit() {
+                                    digits.push(piece);
+                                    characters.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     tokens.push(NamedToken::Number(digits.parse().ok()?));
                 }
                 letter if letter.is_alphabetic() || letter == '_' => {
