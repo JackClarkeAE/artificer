@@ -25,6 +25,20 @@
 
 ---
 
+## What is new in 0.98.1
+
+A point release about the things you touch: the extrusion editor, the units
+every field reads and writes, where the assembly tools live, and what the
+view cube's arrows mean.
+
+- **An extrusion says what it does, how far, and where it stops.** New body, Add and Cut stand together for any sketch with a body to combine with, a sketch on a plane included: the sweep becomes a body and a Boolean folds it in, as its own step in history. Two sides give each direction its own length, with a symmetric lock, built as one sweep from behind the sketch plane. And either side may end at a face you pick rather than a distance you type, stored as the persistent face it reached and measured again on every rebuild, so the feature follows the face when the face moves. ADR 0032 records the design.
+- **The document's length unit reaches every field.** It was a setting the measure panel honoured and nothing else did. Now every readout is formatted in it and every typed length is read in it — the extrusion distance, the fillet radius, the sketch dimension boxes and tool fields, the part library's length, the mass properties, the interference and clearance readouts. A typed value may carry its own suffix (`10mm`, `0.5in`, `1e3um`), which always wins, and a preference names the unit new documents open in. Geometry, files and interchange stay in millimetres. ADR 0033 records the design.
+- **Assembly tools have their own tab.** Move, Rotate, Scale and Insert part left the crowded Model tab for an Assembly tab, with the Select group riding along so picking a part never means changing tabs.
+- **The view cube's turn arrows ride an orbit ring.** Four flat triangles placed along the adjacent faces' normals read as the faces pointing somewhere. The cube now sits inside the ring the camera actually travels on, drawn in the cube's own projection so it tilts with the view, and the side arrows sit on that ring pointing the way the camera goes.
+- **A whole rim highlights as one.** A circular edge on a faceted-tier body no longer lights up one chord at a time under the pointer: coplanar fragments of the same rim are grouped into the logical edge they belong to, slot half-circles included.
+- **A wheel that glides and a 3D mouse that is smooth.** Wheel zoom eases to its target instead of stepping, anchored where the pointer is, and the SpaceMouse's axes pass through a shaped, low-pass filter that settles to rest rather than jittering.
+- **`1e3` in the main application's fields,** as the scripting language already accepted.
+
 ## What is new in 0.98
 
 This release is about trust: in the numbers the analysis publishes, in a server that outlives whatever is sent to it, and in two desktop applications that behave the way desktop applications are expected to. It also gives the view cube its corners and reads a 3D mouse.

@@ -1,6 +1,6 @@
 # Verification-driven CAD: the session report and probes
 
-Artificer 0.98 gives a program the same account of a build that a person
+Artificer 0.98.1 gives a program the same account of a build that a person
 gets from the console, and lets it ask questions of the model without
 changing it. This page is the reference for both. It assumes
 [`docs/art-scripting.md`](art-scripting.md) for the scripting language and

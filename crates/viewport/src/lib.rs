@@ -139,6 +139,9 @@ pub struct FeaturePreview {
     regions: Vec<FeaturePreviewRegion>,
     direction: Vector3,
     distance: f64,
+    /// How far the sweep also runs behind the profile plane, for a
+    /// two-sided extrusion; zero for the ordinary one-sided one.
+    back_distance: f64,
     style: FeaturePreviewStyle,
     candidate: Option<Arc<FeatureCandidatePreview>>,
     prepared: Option<Arc<PreparedFeaturePreview>>,
@@ -167,6 +170,7 @@ impl FeaturePreview {
             regions: vec![FeaturePreviewRegion::new(profile, Vec::new())],
             direction,
             distance,
+            back_distance: 0.0,
             style,
             candidate: None,
             prepared: None,
@@ -186,6 +190,7 @@ impl FeaturePreview {
             regions,
             direction,
             distance,
+            back_distance: 0.0,
             style,
             candidate: None,
             prepared: None,
@@ -228,6 +233,27 @@ impl FeaturePreview {
 
     pub const fn signed_distance(&self) -> f64 {
         self.distance
+    }
+
+    /// How far the feature also sweeps behind its profile plane.
+    pub const fn back_distance(&self) -> f64 {
+        self.back_distance
+    }
+
+    /// Gives the preview a second side, `back_distance` behind the profile
+    /// plane, keeping the sampled profile and any exact candidate.
+    #[must_use]
+    pub fn with_back_distance(mut self, back_distance: f64) -> Self {
+        let back_distance = if back_distance.is_finite() {
+            back_distance.max(0.0)
+        } else {
+            0.0
+        };
+        if self.back_distance != back_distance {
+            self.back_distance = back_distance;
+            self.rebuild_prepared();
+        }
+        self
     }
 
     /// Reuses the already-sampled profile while changing only its live
@@ -5268,8 +5294,20 @@ fn prepare_feature_preview_uncached(preview: &FeaturePreview) -> Option<Prepared
     );
     let profile_center = preview_regions_center(&preview.regions, profile_geometry.normal)?;
     let profile_vertex_count = first_region.outer.len();
+    // A two-sided sweep starts behind the profile plane, which is the way
+    // the first side does not go: a reversed first side puts the second one
+    // along the frame normal rather than against it. The profile centre and
+    // the drag arrow stay on the plane the profile was drawn on.
+    let back_sign = if preview.distance < 0.0 { 1.0 } else { -1.0 };
+    let back_offset = scale_vector(unit_direction, back_sign * preview.back_distance);
     let mut corners = Vec::with_capacity(profile_vertex_count.checked_mul(2)?);
-    corners.extend(first_region.outer.iter().copied());
+    for point in &first_region.outer {
+        let start = offset_point(*point, back_offset);
+        if !start.is_finite() {
+            return None;
+        }
+        corners.push(start);
+    }
     for point in &first_region.outer {
         let end = offset_point(*point, offset);
         if !end.is_finite() {
@@ -5277,8 +5315,12 @@ fn prepare_feature_preview_uncached(preview: &FeaturePreview) -> Option<Prepared
         }
         corners.push(end);
     }
-    let (mesh_triangles, mesh_edges) =
-        prepare_preview_region_meshes(&preview.regions, profile_geometry.normal, offset)?;
+    let (mesh_triangles, mesh_edges) = prepare_preview_region_meshes(
+        &preview.regions,
+        profile_geometry.normal,
+        offset,
+        back_offset,
+    )?;
     let end_center = offset_point(profile_center, offset);
     if !end_center.is_finite() {
         return None;
@@ -5368,17 +5410,25 @@ fn polygon_area_magnitude(profile: &[Point3], normal: Vector3) -> Option<f64> {
     Some(0.5 * twice_area.abs())
 }
 
+/// The prism's faces between the profile moved by `back_offset` (the start
+/// of the sweep, the profile plane itself for a one-sided extrusion) and
+/// the profile moved by `offset` (its end).
 fn prepare_preview_region_meshes(
     regions: &[FeaturePreviewRegion],
     reference_normal: Vector3,
     offset: Vector3,
+    back_offset: Vector3,
 ) -> Option<(Vec<[Point3; 3]>, Vec<PreviewEdge>)> {
     let mut triangles = Vec::new();
     let mut edges = Vec::new();
     for region in regions {
         let cap = triangulate_preview_region(region, reference_normal)?;
         for triangle in cap {
-            triangles.push(triangle);
+            triangles.push([
+                offset_point(triangle[0], back_offset),
+                offset_point(triangle[1], back_offset),
+                offset_point(triangle[2], back_offset),
+            ]);
             triangles.push([
                 offset_point(triangle[0], offset),
                 offset_point(triangle[2], offset),
@@ -5402,11 +5452,15 @@ fn prepare_preview_region_meshes(
             };
             for index in 0..boundary.len() {
                 let next = (index + 1) % boundary.len();
-                let start = boundary[index];
-                let end = boundary[next];
-                let start_offset = offset_point(start, offset);
-                let end_offset = offset_point(end, offset);
-                if !start_offset.is_finite() || !end_offset.is_finite() {
+                let start = offset_point(boundary[index], back_offset);
+                let end = offset_point(boundary[next], back_offset);
+                let start_offset = offset_point(boundary[index], offset);
+                let end_offset = offset_point(boundary[next], offset);
+                if !start.is_finite()
+                    || !end.is_finite()
+                    || !start_offset.is_finite()
+                    || !end_offset.is_finite()
+                {
                     return None;
                 }
                 triangles.push([start, start_offset, end_offset]);
@@ -9141,6 +9195,41 @@ mod tests {
         assert_eq!(prepared.corners[4], Point3::new(-1.0, -2.0, 7.0));
         assert_eq!(prepared.distance, 3.0);
         assert_eq!(prepared.style, FeaturePreviewStyle::Add);
+    }
+
+    /// A second side starts the prism behind the profile plane, opposite the
+    /// way the first side goes, and the drag arrow stays on the plane the
+    /// profile was drawn on.
+    #[test]
+    fn a_two_sided_preview_starts_behind_the_profile_plane() {
+        let square = [
+            Point3::new(-1.0, -2.0, 4.0),
+            Point3::new(1.0, -2.0, 4.0),
+            Point3::new(1.0, 2.0, 4.0),
+            Point3::new(-1.0, 2.0, 4.0),
+        ];
+        let forward = FeaturePreview::rectangular(
+            square,
+            Vector3::new(0.0, 0.0, 8.0),
+            3.0,
+            FeaturePreviewStyle::Neutral,
+        )
+        .with_back_distance(2.0);
+        let prepared = prepare_feature_preview(&forward).expect("finite preview");
+        assert_eq!(prepared.corners[0], Point3::new(-1.0, -2.0, 2.0));
+        assert_eq!(prepared.corners[4], Point3::new(-1.0, -2.0, 7.0));
+        assert_eq!(prepared.profile_center, Point3::new(0.0, 0.0, 4.0));
+
+        let reversed = FeaturePreview::rectangular(
+            square,
+            Vector3::new(0.0, 0.0, 8.0),
+            -3.0,
+            FeaturePreviewStyle::Neutral,
+        )
+        .with_back_distance(2.0);
+        let prepared = prepare_feature_preview(&reversed).expect("finite preview");
+        assert_eq!(prepared.corners[0], Point3::new(-1.0, -2.0, 6.0));
+        assert_eq!(prepared.corners[4], Point3::new(-1.0, -2.0, 1.0));
     }
 
     #[test]

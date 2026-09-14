@@ -57,7 +57,8 @@ use artificer_model::{
     ParameterBinding, ParameterExposure, ParameterId, ParameterMetadata, ParameterOverrides,
     ParameterSpec, ParameterType, ParameterUnit, ParameterValue, QuantityKind, RebuildState,
     ReplayAction, ReplayDisposition, RigidComponentPose, SketchId, SketchPayload,
-    SketchRegionExtrusion, SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
+    SketchRegionExtrusion, SketchRegionRecipeError, SketchSupportRecipe, SnapshotAssociation,
+    extrusion_frame_is_reversed, frame_moved_along_normal, plane_height_above_frame,
     reflected_profile_across_u, reversed_extrusion_direction,
 };
 use artificer_protocol::{
@@ -423,6 +424,13 @@ enum PendingOperation {
         target_face: Option<EntityRef>,
         support_digest: Option<SemanticDigest>,
         mode: ExtrusionMode,
+        /// The second side, behind the sketch plane; `None` is one-sided.
+        second_distance: Option<f64>,
+        /// The faces each side ends at, when it ends at a face.
+        up_to_faces: [Option<EntityRef>; 2],
+        /// For an Add or Cut from a sketch on a plane rather than a face:
+        /// the body the swept solid is combined with once it exists.
+        boolean_target: Option<BodyId>,
     },
     PushPullFace {
         base_snapshot: SnapshotId,
@@ -441,6 +449,7 @@ struct AsyncFeaturePreviewIntent {
     distance: f64,
     draft_degrees: f64,
     mode: ExtrusionMode,
+    second_distance: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -885,6 +894,40 @@ pub enum ExtrusionMode {
     Cut,
 }
 
+/// What a committed extrusion records, beyond the one depth the kernel
+/// command carries: the side it was asked to grow, what it does to the body,
+/// the second side, and the persistent faces a side was told to reach.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtrusionRecord {
+    /// The first side, signed: the sign is the direction the sweep goes.
+    signed_distance: f64,
+    mode: ExtrusionMode,
+    second_distance: Option<f64>,
+    up_to_faces: [Option<PersistentRef>; 2],
+}
+
+/// Where one side of an extrusion ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum ExtrusionExtentIntent {
+    /// At the side's own distance.
+    #[default]
+    Distance,
+    /// At a face still to be picked in the viewport.
+    PickingFace,
+    /// At this face, parallel to the sketch plane; the side's distance is
+    /// the length measured to it.
+    ToFace(EntityRef),
+}
+
+impl ExtrusionExtentIntent {
+    const fn face(self) -> Option<EntityRef> {
+        match self {
+            Self::ToFace(face) => Some(face),
+            Self::Distance | Self::PickingFace => None,
+        }
+    }
+}
+
 impl ExtrusionMode {
     const fn label(self) -> &'static str {
         match self {
@@ -899,6 +942,16 @@ impl ExtrusionMode {
             Self::NewBody => None,
             Self::Add => Some(FaceExtrusionOperation::Add),
             Self::Cut => Some(FaceExtrusionOperation::Cut),
+        }
+    }
+
+    /// The Boolean that folds a swept body into its target, for an Add or a
+    /// Cut whose sketch is on a plane rather than a face.
+    const fn boolean_operation(self) -> Option<BooleanOperation> {
+        match self {
+            Self::NewBody => None,
+            Self::Add => Some(BooleanOperation::Union),
+            Self::Cut => Some(BooleanOperation::Difference),
         }
     }
 }
@@ -2410,6 +2463,13 @@ pub struct KernelLabApp {
     extrusion_distance: f64,
     /// Draft angle for a new-body extrusion, in degrees; zero is straight.
     extrusion_draft_degrees: f64,
+    /// The second side of a two-sided extrusion: a positive length behind
+    /// the sketch plane, `None` while the extrusion is one-sided.
+    extrusion_second_distance: Option<f64>,
+    /// Whether the second side mirrors the first, so one value drives both.
+    extrusion_symmetric: bool,
+    /// Where each side ends: at its distance, or at a picked face.
+    extrusion_extents: [ExtrusionExtentIntent; 2],
     extrusion_mode: ExtrusionMode,
     /// When false, signed face distance retains the convenient Add/Cut
     /// inference. Clicking an operation in Properties turns this on so the
@@ -2621,6 +2681,9 @@ impl Default for KernelLabApp {
             sketch_finish_issue: None,
             extrusion_distance: 4.0,
             extrusion_draft_degrees: 0.0,
+            extrusion_second_distance: None,
+            extrusion_symmetric: false,
+            extrusion_extents: [ExtrusionExtentIntent::Distance; 2],
             extrusion_mode: ExtrusionMode::NewBody,
             extrusion_mode_explicit: false,
             extruded_sketch_revision: None,
@@ -3738,6 +3801,15 @@ impl KernelLabApp {
 
     fn set_extrusion_distance_intent(&mut self, distance: f64) {
         self.extrusion_distance = distance;
+        // A sketch on a plane over a body may be an Add or a Cut, chosen
+        // deliberately; its sign is a direction, not the operation, so the
+        // choice survives a change of distance.
+        if !self.signed_face_distance_context()
+            && self.extrusion_mode != ExtrusionMode::NewBody
+            && self.plane_boolean_target().is_some()
+        {
+            return;
+        }
         if self.signed_face_distance_context() {
             if !self.extrusion_mode_explicit {
                 if distance > 0.0 {
@@ -3756,6 +3828,9 @@ impl KernelLabApp {
         self.extrusion_mode = mode;
         self.extrusion_mode_explicit = matches!(mode, ExtrusionMode::Add | ExtrusionMode::Cut)
             && self.signed_face_distance_context();
+        if self.pending_operation.is_some() {
+            self.sync_pending_sketch_extrusion_inputs();
+        }
         // Only a zero distance needs rescuing. A negative one is a direction,
         // now that New body reads the sign the way Add and Cut do. Defensive:
         // New body is disabled on a face, which is the only place a negative
@@ -5552,6 +5627,10 @@ impl KernelLabApp {
                 }
                 action => action,
             };
+            // A side that ends at a face is measured against the body as it
+            // now stands, before the regions resolve: that is what makes it
+            // follow the face instead of freezing the length it first had.
+            let action = self.remeasured_sketch_region_extents(action, &reports, &input);
             let action = match action.resolve_sketch_regions(
                 &self.document,
                 input.precision_policy().unwrap_or_default(),
@@ -6034,6 +6113,11 @@ impl KernelLabApp {
     }
 
     fn select_model_face(&mut self, selection: viewport::DocumentFaceSelection, additive: bool) {
+        // A side of the extrusion waiting for a face takes this click and
+        // nothing else does: the pick is what the user is in the middle of.
+        if self.adopt_extrusion_extent_face(selection.face) {
+            return;
+        }
         if !additive {
             self.clear_model_entity_selection();
         }
@@ -6573,10 +6657,24 @@ impl KernelLabApp {
         document: &mut ModelDocument,
         sketch: SketchId,
         command: KernelCommand,
-        signed_distance: f64,
         report: &OperationReport,
-        mode: ExtrusionMode,
+        record: &ExtrusionRecord,
     ) -> Result<(FeatureId, Option<BodyId>), String> {
+        let ExtrusionRecord {
+            signed_distance,
+            mode,
+            ..
+        } = *record;
+        // A two-sided sweep and a side that ends at a face are recorded as
+        // intent, not as the one combined depth the command carries, so a
+        // rebuild reproduces the feature the user asked for.
+        let with_sides = |recipe: SketchRegionExtrusion| -> Result<_, SketchRegionRecipeError> {
+            let recipe = match record.second_distance {
+                Some(second) => recipe.with_second_side(second)?,
+                None => recipe,
+            };
+            recipe.with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())
+        };
         let kind = match mode {
             ExtrusionMode::NewBody => FeatureKind::Extrude,
             ExtrusionMode::Add => FeatureKind::Add,
@@ -6607,6 +6705,7 @@ impl KernelLabApp {
                     })?;
                 ReplayAction::SketchRegionExtrusion(
                     SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
+                        .and_then(with_sides)
                         .map_err(|error| format!("invalid sketch-region extrusion: {error}"))?,
                 )
             }
@@ -6626,6 +6725,7 @@ impl KernelLabApp {
                 ReplayAction::SketchRegionExtrusion(
                     SketchRegionExtrusion::new_body(sketch, selected_regions, signed_distance)
                         .and_then(|recipe| recipe.with_draft(draft_degrees))
+                        .and_then(with_sides)
                         .map_err(|error| {
                             format!("invalid drafted sketch-region extrusion: {error}")
                         })?,
@@ -8211,13 +8311,29 @@ impl KernelLabApp {
         {
             return false;
         }
+        // A side that ends at a face is measured against the body as it
+        // stands now, so what is staged is what the viewport shows.
+        self.remeasure_extrusion_extents();
         let base_snapshot = self.active_snapshot_id_or_empty();
         let target_face = self.sketch_support.target_face();
-        let mode = if target_face.is_some() {
+        // A sketch on a face adds to or cuts that face's body. A sketch on
+        // a plane makes a new body, or, when a body is there to combine
+        // with, a tool the chosen Boolean folds into it on commit.
+        let boolean_target = if target_face.is_none() {
+            self.plane_boolean_target()
+        } else {
+            None
+        };
+        let mode = if target_face.is_some() || boolean_target.is_some() {
             self.extrusion_mode
         } else {
             ExtrusionMode::NewBody
         };
+        let boolean_target = boolean_target.filter(|_| mode != ExtrusionMode::NewBody);
+        let second_distance = self
+            .extrusion_second_distance
+            .filter(|_| target_face.is_none());
+        let up_to_faces = self.extrusion_extents.map(ExtrusionExtentIntent::face);
         // Extrusion owns pointer interaction until it is confirmed or
         // cancelled. Do not leave a transform drag tool armed behind the
         // feature preview, where its presentation-only change would be lost
@@ -8251,10 +8367,246 @@ impl KernelLabApp {
             target_face,
             support_digest: self.sketch_support.support_digest(),
             mode,
+            second_distance,
+            up_to_faces,
+            boolean_target,
         });
         self.sketch_extrusion_issue = None;
         self.leave_sketch_mode();
         true
+    }
+
+    /// The body an Add or Cut from a plane sketch combines with: the active
+    /// body, when it is visible. `None` means a plane sketch can only make
+    /// a new body.
+    fn plane_boolean_target(&self) -> Option<BodyId> {
+        self.active_body_id().filter(|id| {
+            self.bodies
+                .iter()
+                .any(|body| body.id == *id && body.visible)
+        })
+    }
+
+    /// Re-measures a replayed extrusion's sides that end at a face.
+    ///
+    /// The recipe stores which face each side reaches and the length last
+    /// measured to it. Rebuild measures again against the body as it now
+    /// stands, so a feature that was told to reach a face keeps reaching it
+    /// when the face moves. A face that cannot be found or is no longer
+    /// parallel leaves the stored length in place: the feature still
+    /// rebuilds, at the size it last had, rather than failing the document.
+    fn remeasured_sketch_region_extents(
+        &self,
+        action: ReplayAction,
+        reports: &[(FeatureId, OperationReport)],
+        input: &Snapshot,
+    ) -> ReplayAction {
+        let ReplayAction::SketchRegionExtrusion(recipe) = &action else {
+            return action;
+        };
+        if !recipe.ends_at_a_face() {
+            return action;
+        }
+        let Some(frame) = self
+            .document
+            .sketch(recipe.sketch)
+            .and_then(|record| {
+                self.document
+                    .sketch_payload(recipe.sketch, record.geometry_revision)
+            })
+            .map(|payload| payload.frame)
+        else {
+            return action;
+        };
+        let ordered = self
+            .document
+            .features()
+            .iter()
+            .filter_map(|node| {
+                reports
+                    .iter()
+                    .find(|(feature, _)| *feature == node.id)
+                    .map(|(feature, report)| FeatureOperationReport::new(*feature, report))
+            })
+            .collect::<Vec<_>>();
+        let measure = |reference: Option<&PersistentRef>, side: usize| {
+            let reference = reference?;
+            let PersistentResolution::Resolved(face) =
+                resolve_persistent_ref(reference, &ordered, input.id())
+            else {
+                return None;
+            };
+            let support = NativeKernel::planar_face_support(input, face).ok()?;
+            let normal = frame_normal(support.frame)?;
+            let height = plane_height_above_frame(frame, support.frame.origin, normal, 1.0e-6)?;
+            let forward = if recipe.distance < 0.0 { -1.0 } else { 1.0 };
+            let along = if side == 0 {
+                height * forward
+            } else {
+                -height * forward
+            };
+            (along > PrecisionPolicy::default().min_feature_size).then_some(along)
+        };
+        let first = measure(recipe.up_to_face.as_ref(), 0);
+        let second = measure(recipe.second_up_to_face.as_ref(), 1);
+        ReplayAction::SketchRegionExtrusion(recipe.clone().with_measured_distances(first, second))
+    }
+
+    /// Drops any side still waiting for a face, leaving the ones already
+    /// chosen alone: a cancelled operation must not keep eating clicks.
+    fn disarm_extrusion_face_picks(&mut self) {
+        for extent in &mut self.extrusion_extents {
+            if *extent == ExtrusionExtentIntent::PickingFace {
+                *extent = ExtrusionExtentIntent::Distance;
+            }
+        }
+    }
+
+    /// Takes a clicked face as the end of whichever side is waiting for one.
+    ///
+    /// Returns whether the click was consumed. A face the sweep cannot end
+    /// at leaves the side still picking and says why, so the next click is
+    /// still a pick rather than an ordinary selection.
+    fn adopt_extrusion_extent_face(&mut self, face: EntityRef) -> bool {
+        let Some(side) = self
+            .extrusion_extents
+            .iter()
+            .position(|extent| *extent == ExtrusionExtentIntent::PickingFace)
+        else {
+            return false;
+        };
+        match self.measure_extent_to_face(face, side) {
+            Ok(distance) => {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::ToFace(face);
+                self.set_extrusion_side_distance(side, distance);
+                self.document_status = Some(format!(
+                    "Side {} ends at face #{} · {}",
+                    side + 1,
+                    face.entity,
+                    self.length_unit().format(distance)
+                ));
+            }
+            Err(reason) => {
+                self.document_status = Some(format!("{reason} · pick another face"));
+            }
+        }
+        if self.pending_operation.is_some() {
+            self.sync_pending_sketch_extrusion_inputs();
+        }
+        true
+    }
+
+    /// Sets one side's length, keeping the first side's direction: a
+    /// measured length says how far, the sign says which way.
+    fn set_extrusion_side_distance(&mut self, side: usize, distance: f64) {
+        if side == 0 {
+            let signed = if self.extrusion_distance < 0.0 {
+                -distance.abs()
+            } else {
+                distance.abs()
+            };
+            self.set_extrusion_distance_intent(signed);
+            if self.extrusion_symmetric && self.extrusion_second_distance.is_some() {
+                self.extrusion_second_distance = Some(distance.abs());
+            }
+        } else {
+            self.extrusion_second_distance = Some(distance.abs());
+            if self.extrusion_symmetric {
+                self.set_extrusion_distance_intent(
+                    distance.abs().copysign(self.extrusion_distance),
+                );
+            }
+        }
+    }
+
+    /// Re-measures every side that ends at a face, after the sketch plane,
+    /// the direction or the body it measures against may have moved.
+    fn remeasure_extrusion_extents(&mut self) {
+        for side in 0..self.extrusion_extents.len() {
+            let Some(face) = self.extrusion_extents[side].face() else {
+                continue;
+            };
+            match self.measure_extent_to_face(face, side) {
+                Ok(distance) => self.set_extrusion_side_distance(side, distance),
+                Err(reason) => {
+                    self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
+                    self.document_status =
+                        Some(format!("Side {} kept its distance: {reason}", side + 1));
+                }
+            }
+        }
+    }
+
+    /// Folds a freshly swept body into the body an Add or Cut named, as a
+    /// Boolean step of its own. A refusal leaves both bodies standing and
+    /// says so: the sweep is committed either way, and the user can retry
+    /// the Boolean from the ribbon or undo it.
+    fn fold_swept_body_into_target(
+        &mut self,
+        target: BodyId,
+        tool: BodyId,
+        operation: BooleanOperation,
+    ) {
+        if target == tool || !self.bodies.iter().any(|body| body.id == target) {
+            return;
+        }
+        let before = self.document.history_position();
+        self.active_body_ordinal = self
+            .bodies
+            .iter()
+            .find(|body| body.id == target)
+            .map_or(self.active_body_ordinal, |body| body.ordinal);
+        self.execute_body_boolean(target, &[tool], operation, false);
+        if self.document.history_position() == before {
+            // The Boolean refused; the swept body stays visible so nothing
+            // the user asked for is lost, and the rejection is already in
+            // the status line.
+            return;
+        }
+        self.document_status = Some(match operation {
+            BooleanOperation::Union => "Extrusion added to the body".to_owned(),
+            BooleanOperation::Difference => "Extrusion cut from the body".to_owned(),
+            BooleanOperation::Intersection => "Extrusion intersected with the body".to_owned(),
+        });
+    }
+
+    /// How far a side of the staged extrusion has to sweep to end at `face`:
+    /// the face must be planar, parallel to the sketch plane and lie on that
+    /// side of it. The length is measured in the body the face belongs to.
+    fn measure_extent_to_face(&self, face: EntityRef, side: usize) -> Result<f64, &'static str> {
+        let snapshot = self
+            .bodies
+            .iter()
+            .map(|body| &body.body.snapshot)
+            .chain(self.displayed.as_ref().map(|body| &body.snapshot))
+            .find(|snapshot| snapshot.id() == face.snapshot)
+            .ok_or("that face belongs to a body that is no longer here")?;
+        let support = NativeKernel::planar_face_support(snapshot, face)
+            .map_err(|_| "an extrusion can only end at a planar face")?;
+        let normal = frame_normal(support.frame).ok_or("that face has no usable normal")?;
+        let height = plane_height_above_frame(
+            self.sketch_support.frame(),
+            support.frame.origin,
+            normal,
+            1.0e-6,
+        )
+        .ok_or("that face is not parallel to the sketch plane")?;
+        // Side one sweeps the way the signed distance points; side two the
+        // other way. A face behind the side it should end cannot end it.
+        let forward = if self.extrusion_distance < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let along = if side == 0 {
+            height * forward
+        } else {
+            -height * forward
+        };
+        if along <= PrecisionPolicy::default().min_feature_size {
+            return Err("that face lies on the other side of the sketch plane from this side");
+        }
+        Ok(along)
     }
 
     fn selected_face_push_pull_support(&self) -> Option<PlanarFaceSupport> {
@@ -8297,22 +8649,44 @@ impl KernelLabApp {
     }
 
     fn sync_pending_sketch_extrusion_inputs(&mut self) {
+        // The body an Add or Cut from a plane sketch folds into is read
+        // before the pending operation is borrowed, and follows the mode the
+        // panel now shows: switching to Cut mid-preview must reach the body,
+        // and switching back to New body must let go of it.
+        let wanted_boolean_target = self.plane_boolean_target();
+        let wanted_mode = self.extrusion_mode;
+        let wanted_distance = self.extrusion_distance;
+        let wanted_second = self.extrusion_second_distance;
+        let wanted_draft = self.extrusion_draft_degrees;
+        let wanted_up_to = self.extrusion_extents.map(ExtrusionExtentIntent::face);
         match self.pending_operation.as_mut() {
             Some(PendingOperation::ExtrudeSketch {
                 distance,
                 draft_degrees,
                 mode,
                 target_face,
+                second_distance,
+                up_to_faces,
+                boolean_target,
                 ..
             }) => {
-                *distance = self.extrusion_distance;
-                *draft_degrees = if target_face.is_none() {
-                    self.extrusion_draft_degrees
+                *distance = wanted_distance;
+                *second_distance = wanted_second.filter(|_| target_face.is_none());
+                *up_to_faces = wanted_up_to;
+                // A draft needs one side to lean from.
+                *draft_degrees = if target_face.is_none() && second_distance.is_none() {
+                    wanted_draft
                 } else {
                     0.0
                 };
-                *mode = if target_face.is_some() {
-                    self.extrusion_mode
+                *boolean_target = if target_face.is_none() && wanted_mode != ExtrusionMode::NewBody
+                {
+                    wanted_boolean_target
+                } else {
+                    None
+                };
+                *mode = if target_face.is_some() || boolean_target.is_some() {
+                    wanted_mode
                 } else {
                     ExtrusionMode::NewBody
                 };
@@ -8365,6 +8739,7 @@ impl KernelLabApp {
             distance,
             draft_degrees,
             mode,
+            second_distance,
             ..
         } = self.pending_operation?
         else {
@@ -8377,15 +8752,17 @@ impl KernelLabApp {
             distance,
             draft_degrees,
             mode,
+            second_distance,
         )
     }
 
     fn current_feature_preview(&self) -> Option<viewport::FeaturePreview> {
-        let (regions, direction, distance, mode) = match self.pending_operation? {
+        let (regions, direction, distance, mode, back) = match self.pending_operation? {
             PendingOperation::ExtrudeSketch {
                 frame,
                 distance,
                 mode,
+                second_distance,
                 ..
             } => {
                 let profile = self.sketch_planar_profile_payload()?;
@@ -8394,6 +8771,7 @@ impl KernelLabApp {
                     frame_normal(frame)?,
                     distance,
                     mode,
+                    second_distance.unwrap_or(0.0),
                 )
             }
             PendingOperation::PushPullFace {
@@ -8419,6 +8797,7 @@ impl KernelLabApp {
                     frame_normal(support.frame)?,
                     distance,
                     mode,
+                    0.0,
                 )
             }
             _ => return None,
@@ -8428,9 +8807,10 @@ impl KernelLabApp {
             ExtrusionMode::Add => viewport::FeaturePreviewStyle::Add,
             ExtrusionMode::Cut => viewport::FeaturePreviewStyle::Cut,
         };
-        Some(viewport::FeaturePreview::planar_regions(
-            regions, direction, distance, style,
-        ))
+        Some(
+            viewport::FeaturePreview::planar_regions(regions, direction, distance, style)
+                .with_back_distance(back),
+        )
     }
 
     fn feature_preview_for_frame(
@@ -8446,6 +8826,7 @@ impl KernelLabApp {
             distance,
             draft_degrees,
             mode,
+            second_distance,
             ..
         }) = self.pending_operation
         else {
@@ -8469,6 +8850,7 @@ impl KernelLabApp {
             distance,
             draft_degrees,
             mode,
+            second_distance,
         };
 
         if self.async_feature_preview_intent.as_ref() != Some(&intent) {
@@ -8523,7 +8905,11 @@ impl KernelLabApp {
         // can be applied immediately and must never tear down pointer capture.
         self.async_feature_preview_cache
             .clone()
-            .map(|preview| preview.with_presentation(distance, style))
+            .map(|preview| {
+                preview
+                    .with_presentation(distance, style)
+                    .with_back_distance(second_distance.unwrap_or(0.0))
+            })
             .or_else(|| self.current_feature_preview())
     }
 
@@ -9168,6 +9554,8 @@ impl KernelLabApp {
                 self.sketch_extrusion_issue = None;
                 self.pending_operation = None;
                 self.workbench_mode = cancel_mode;
+                // An armed face pick belongs to the operation that armed it.
+                self.disarm_extrusion_face_picks();
             }
             PendingOperation::PushPullFace { .. } => {
                 self.sketch_extrusion_issue = None;
@@ -9191,6 +9579,9 @@ impl KernelLabApp {
             target_face,
             support_digest,
             mode,
+            second_distance,
+            up_to_faces: _,
+            boolean_target,
         } = pending
         else {
             unreachable!("only a staged sketch extrusion can reach extrusion execution")
@@ -9270,10 +9661,17 @@ impl KernelLabApp {
             return;
         }
 
-        let support_mode_valid = matches!(
-            (target_face, mode),
-            (None, ExtrusionMode::NewBody) | (Some(_), ExtrusionMode::Add | ExtrusionMode::Cut)
-        );
+        // A sketch on a face is an add or a cut to the kernel. A sketch on a
+        // plane sweeps a body of its own, which an Add or Cut then folds
+        // into the body it named; without such a body it can only be a new
+        // one.
+        let support_mode_valid = match (target_face, mode) {
+            (Some(_), ExtrusionMode::Add | ExtrusionMode::Cut) | (None, ExtrusionMode::NewBody) => {
+                true
+            }
+            (None, ExtrusionMode::Add | ExtrusionMode::Cut) => boolean_target.is_some(),
+            (Some(_), ExtrusionMode::NewBody) => false,
+        };
         if !support_mode_valid {
             self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                 KernelErrorCode::InvalidInput,
@@ -9331,6 +9729,7 @@ impl KernelLabApp {
             distance,
             draft_degrees,
             mode,
+            second_distance,
         ) else {
             self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                 KernelErrorCode::InvalidInput,
@@ -9411,10 +9810,23 @@ impl KernelLabApp {
             finish_sketch_on_commit,
             distance,
             mode,
+            target_face,
+            boolean_target,
+            second_distance,
+            up_to_faces,
             ..
         } = pending
         else {
             return;
+        };
+        // A sketch on a plane always sweeps a body of its own, whatever the
+        // user asked for; an Add or Cut then folds that body into its target
+        // with a Boolean, as its own step in history. Only a sketch on a
+        // face is an add or a cut to the kernel.
+        let record_mode = if target_face.is_none() {
+            ExtrusionMode::NewBody
+        } else {
+            mode
         };
         match result {
             Ok(outcome) => {
@@ -9431,15 +9843,22 @@ impl KernelLabApp {
                     ));
                     return;
                 };
+                let record = ExtrusionRecord {
+                    signed_distance: distance,
+                    mode: record_mode,
+                    second_distance,
+                    up_to_faces: up_to_faces.map(|face| {
+                        face.and_then(|face| self.persistent_ref_for_current_face(face))
+                    }),
+                };
                 let feature_binding = self.append_extrusion_to_document(
                     &mut next_document,
                     sketch_id,
                     replay_command,
-                    distance,
                     &outcome.report,
-                    mode,
+                    &record,
                 );
-                let Ok((feature_id, _created_body)) = feature_binding else {
+                let Ok((feature_id, created_body)) = feature_binding else {
                     self.reject_staged_sketch_extrusion(workbench_extrusion_error(
                         KernelErrorCode::InternalFailure,
                         base_snapshot,
@@ -9474,7 +9893,7 @@ impl KernelLabApp {
                 self.face_sketch_context = None;
                 if let Some(bounds) = bounds {
                     self.body_pivot = Some(bounds_center(bounds));
-                    if mode != ExtrusionMode::NewBody {
+                    if record_mode != ExtrusionMode::NewBody {
                         self.view.frame(bounds);
                     }
                 }
@@ -9487,16 +9906,16 @@ impl KernelLabApp {
                     self.sketch_finished = true;
                     self.feature_preview.finish_active_sketch();
                 }
-                self.model_body_kind = match mode {
+                self.model_body_kind = match record_mode {
                     ExtrusionMode::NewBody => ModelBodyKind::SketchExtrusion,
                     ExtrusionMode::Add => ModelBodyKind::AddedBoss,
                     ExtrusionMode::Cut => ModelBodyKind::CutPocket,
                 };
-                match mode {
+                match record_mode {
                     ExtrusionMode::NewBody => self.publish_new_body_record(),
                     ExtrusionMode::Add | ExtrusionMode::Cut => self.sync_active_body_record(),
                 }
-                if mode == ExtrusionMode::NewBody {
+                if record_mode == ExtrusionMode::NewBody {
                     self.reveal_visible_document();
                 }
                 let active_body = self.active_body_id();
@@ -9507,7 +9926,7 @@ impl KernelLabApp {
                 }
                 self.archive_displayed_body();
                 self.consume_active_sketch();
-                self.feature_preview.append(match mode {
+                self.feature_preview.append(match record_mode {
                     ExtrusionMode::NewBody => FeaturePreviewKind::Extrude,
                     ExtrusionMode::Add => FeaturePreviewKind::Add,
                     ExtrusionMode::Cut => FeaturePreviewKind::Cut,
@@ -9521,6 +9940,13 @@ impl KernelLabApp {
                 };
                 self.selected_history_feature = Some(feature_id);
                 self.document_status = Some("Feature regenerated cleanly".to_owned());
+                // The swept body exists; fold it into its target, which is
+                // the whole of what Add and Cut mean from a plane sketch.
+                if let (Some(target), Some(tool)) = (boolean_target, created_body)
+                    && let Some(operation) = mode.boolean_operation()
+                {
+                    self.fold_swept_body_into_target(target, tool, operation);
+                }
             }
             Err(error) => {
                 self.sketch_extrusion_issue = Some(error.clone());
@@ -16222,6 +16648,212 @@ impl KernelLabApp {
         }
     }
 
+    /// How far the extrusion goes, on one side or on both.
+    ///
+    /// One side is the ordinary extrusion, a signed distance from the sketch
+    /// plane. Two sides give each direction its own length, with a symmetric
+    /// lock for the common case of equal ones, and either side may end at a
+    /// face the user picks instead of at a typed distance. A sketch drawn on
+    /// a face has one side by construction: it grows out of that face.
+    ///
+    /// Returns whether the extrusion's intent changed.
+    fn extrusion_side_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        editable: bool,
+        face_supported: bool,
+    ) -> bool {
+        let mut changed = false;
+        if face_supported {
+            let unit = self.length_unit();
+            ui.add_enabled_ui(editable, |ui| {
+                changed |= self.extrusion_extent_row(ui, 0, unit, "Ends at");
+            });
+            return changed;
+        }
+        let two_sided = self.extrusion_second_distance.is_some();
+        ui.horizontal(|ui| {
+            for (label, wants_two) in [("One side", false), ("Two sides", true)] {
+                let response = ui.add_enabled(
+                    editable,
+                    egui::Button::new(label)
+                        .selected(two_sided == wants_two)
+                        .corner_radius(4),
+                );
+                let response = response.on_hover_text(if wants_two {
+                    "Sweep both ways from the sketch plane, each side its own length."
+                } else {
+                    "Sweep one way from the sketch plane."
+                });
+                if response.clicked() && two_sided != wants_two {
+                    self.set_extrusion_two_sided(wants_two);
+                    changed = true;
+                }
+            }
+            if two_sided {
+                let mut symmetric = self.extrusion_symmetric;
+                if ui
+                    .add_enabled(editable, egui::Checkbox::new(&mut symmetric, "Symmetric"))
+                    .on_hover_text("Keep both sides the same length.")
+                    .changed()
+                {
+                    self.extrusion_symmetric = symmetric;
+                    if symmetric {
+                        self.set_extrusion_side_distance(0, self.extrusion_distance);
+                    }
+                    changed = true;
+                }
+            }
+        });
+        let unit = self.length_unit();
+        ui.add_enabled_ui(editable, |ui| {
+            changed |= self.extrusion_extent_row(
+                ui,
+                0,
+                unit,
+                if two_sided { "Side 1" } else { "Ends at" },
+            );
+            if two_sided {
+                changed |= self.extrusion_extent_row(ui, 1, unit, "Side 2");
+            }
+        });
+        changed
+    }
+
+    /// One side's row: where it ends, and how far that is.
+    fn extrusion_extent_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: usize,
+        unit: units::LengthUnit,
+        label: &str,
+    ) -> bool {
+        let mut changed = false;
+        let extent = self.extrusion_extents[side];
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).small().color(theme::muted()));
+            let to_face = !matches!(extent, ExtrusionExtentIntent::Distance);
+            for (text, wants_face) in [("Distance", false), ("To face", true)] {
+                let response = ui.add(
+                    egui::Button::new(RichText::new(text).small())
+                        .selected(to_face == wants_face)
+                        .corner_radius(3),
+                );
+                let response = response.on_hover_text(if wants_face {
+                    "End this side at a face parallel to the sketch plane."
+                } else {
+                    "End this side at a typed distance."
+                });
+                if response.clicked() && to_face != wants_face {
+                    self.extrusion_extents[side] = if wants_face {
+                        ExtrusionExtentIntent::PickingFace
+                    } else {
+                        ExtrusionExtentIntent::Distance
+                    };
+                    if wants_face {
+                        self.document_status =
+                            Some(format!("Click the face side {} should reach", side + 1));
+                    }
+                    changed = true;
+                }
+            }
+        });
+        match self.extrusion_extents[side] {
+            ExtrusionExtentIntent::Distance => {
+                changed |= self.extrusion_distance_field(ui, side, unit);
+            }
+            ExtrusionExtentIntent::PickingFace => {
+                ui.label(
+                    RichText::new("Pick a face in the viewport")
+                        .small()
+                        .color(theme::warn()),
+                );
+            }
+            ExtrusionExtentIntent::ToFace(face) => {
+                let distance = if side == 0 {
+                    self.extrusion_distance.abs()
+                } else {
+                    self.extrusion_second_distance.unwrap_or_default()
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("Face #{} · {}", face.entity, unit.format(distance)))
+                            .small()
+                            .color(theme::good()),
+                    );
+                    if ui
+                        .add(egui::Button::new(RichText::new("Change").small()).corner_radius(3))
+                        .clicked()
+                    {
+                        self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
+                        self.document_status =
+                            Some(format!("Click the face side {} should reach", side + 1));
+                        changed = true;
+                    }
+                });
+            }
+        }
+        changed
+    }
+
+    /// One side's distance field, in the document's unit.
+    fn extrusion_distance_field(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: usize,
+        unit: units::LengthUnit,
+    ) -> bool {
+        if side == 0 {
+            let mut distance = self.extrusion_distance;
+            let was_negative = distance < 0.0;
+            let response = ui.add(
+                unit.drag_value(&mut distance)
+                    .speed(0.1)
+                    .range(-1_000.0..=1_000.0)
+                    .prefix("Distance "),
+            );
+            if response.changed() {
+                self.set_extrusion_side_distance(0, distance);
+                self.extrusion_distance = distance;
+                // Reversing the sweep swaps which side of the plane each
+                // side is on, so a face either side reaches is measured
+                // again from where it now stands.
+                if was_negative != (distance < 0.0) {
+                    self.remeasure_extrusion_extents();
+                }
+                return true;
+            }
+            return false;
+        }
+        let mut second = self.extrusion_second_distance.unwrap_or(4.0);
+        let response = ui.add(
+            unit.drag_value(&mut second)
+                .speed(0.1)
+                .range(0.001..=1_000.0)
+                .prefix("Distance "),
+        );
+        if response.changed() {
+            self.set_extrusion_side_distance(1, second);
+            return true;
+        }
+        false
+    }
+
+    /// Turns the second side on or off. Turning it on starts it equal to the
+    /// first and symmetric, which is what a two-sided extrusion usually is;
+    /// a draft cannot lean two ways, so it goes.
+    fn set_extrusion_two_sided(&mut self, two_sided: bool) {
+        if two_sided {
+            self.extrusion_second_distance = Some(self.extrusion_distance.abs().max(0.001));
+            self.extrusion_symmetric = true;
+            self.extrusion_draft_degrees = 0.0;
+        } else {
+            self.extrusion_second_distance = None;
+            self.extrusion_symmetric = false;
+            self.extrusion_extents[1] = ExtrusionExtentIntent::Distance;
+        }
+    }
+
     fn extrusion_controls(&mut self, ui: &mut egui::Ui) {
         let profile = self.sketch.certified_profile_status();
         let eligibility = self.sketch_extrusion_eligibility();
@@ -16268,6 +16900,10 @@ impl KernelLabApp {
 
         let editable = self.pending_operation.is_none() || extrusion_pending;
         let face_supported = matches!(&self.sketch_support, SketchSupport::PlanarFace { .. });
+        // A sketch on a plane can add to or cut the body it is drawn over:
+        // the sweep becomes a tool and a Boolean folds it in. Without a body
+        // to fold into, a new body is all there is.
+        let can_combine = face_supported || self.plane_boolean_target().is_some();
         let mut intent_changed = false;
         ui.horizontal(|ui| {
             if face_supported {
@@ -16289,7 +16925,7 @@ impl KernelLabApp {
             ] {
                 let supported = match mode {
                     ExtrusionMode::NewBody => !face_supported,
-                    ExtrusionMode::Add | ExtrusionMode::Cut => face_supported,
+                    ExtrusionMode::Add | ExtrusionMode::Cut => can_combine,
                 };
                 let response = ui.add_enabled(
                     editable && supported,
@@ -16297,24 +16933,22 @@ impl KernelLabApp {
                         .selected(self.extrusion_mode == mode)
                         .corner_radius(4),
                 );
+                let response = response.on_hover_text(match mode {
+                    ExtrusionMode::NewBody => "Sweep a body of its own.",
+                    ExtrusionMode::Add => "Sweep and add the material to the body, in one step.",
+                    ExtrusionMode::Cut => {
+                        "Sweep and remove the material from the body, in one step."
+                    }
+                });
                 if response.clicked() {
                     self.select_extrusion_mode(mode);
                     intent_changed = true;
                 }
             }
         });
+        intent_changed |= self.extrusion_side_controls(ui, editable, face_supported);
         ui.add_enabled_ui(editable, |ui| {
-            intent_changed |= ui
-                .add(
-                    self.document_settings
-                        .length_unit
-                        .drag_value(&mut self.extrusion_distance)
-                        .speed(0.1)
-                        .range(-1_000.0..=1_000.0)
-                        .prefix("Distance "),
-                )
-                .changed();
-            if !face_supported {
+            if !face_supported && self.extrusion_second_distance.is_none() {
                 // Draft is a new-body option: the walls lean by this angle,
                 // built as an exact loft to the profile's offset section.
                 intent_changed |= ui
@@ -16374,7 +17008,11 @@ impl KernelLabApp {
             self.set_extrusion_distance_intent(self.extrusion_distance);
         }
         ui.label(
-            RichText::new(if !face_supported {
+            RichText::new(if !face_supported && self.extrusion_second_distance.is_some() {
+                "Two sides · each its own length, or up to a face you pick"
+            } else if !face_supported && self.extrusion_mode != ExtrusionMode::NewBody {
+                "The sweep is added to or cut from the body, as its own step"
+            } else if !face_supported {
                 "Negative distance builds on the other side of the sketch plane"
             } else if self.extrusion_mode_explicit {
                 "Operation locked · signed distance controls direction only · Auto restores sign-based Add/Cut"
@@ -20207,8 +20845,12 @@ fn build_async_feature_preview(
         ExtrusionMode::Cut => viewport::FeaturePreviewStyle::Cut,
     };
     let preview =
-        viewport::FeaturePreview::planar_regions(regions, direction, intent.distance, style);
+        viewport::FeaturePreview::planar_regions(regions, direction, intent.distance, style)
+            .with_back_distance(intent.second_distance.unwrap_or(0.0));
+    // The exact cut candidate is a face feature's: a cut from a plane sketch
+    // is a Boolean with a new body, previewed as the swept tool.
     if intent.mode != ExtrusionMode::Cut
+        || intent.target_face.is_none()
         || cancellation.is_some_and(artificer_compute::CancellationToken::is_cancelled)
     {
         return Some(preview);
@@ -20221,6 +20863,7 @@ fn build_async_feature_preview(
         intent.distance,
         intent.draft_degrees,
         intent.mode,
+        intent.second_distance,
     )?;
     let precision = input.precision_policy().unwrap_or_default();
     let outcome = NativeKernel::execute(
@@ -21000,9 +21643,12 @@ fn build_planar_profile_extrusion_command(
     distance: f64,
     draft_degrees: f64,
     mode: ExtrusionMode,
+    second_distance: Option<f64>,
 ) -> Option<KernelCommand> {
-    let operation = mode.feature_operation();
-    if target_face.is_some() != operation.is_some() {
+    // An Add or Cut from a sketch on a plane sweeps a new body first; the
+    // Boolean that folds it into its target is a step of its own.
+    let operation = target_face.and(mode.feature_operation());
+    if target_face.is_some() && operation.is_none() {
         return None;
     }
     // One rule for every target, and the same one replay uses, so a feature
@@ -21013,6 +21659,19 @@ fn build_planar_profile_extrusion_command(
         (frame, profile)
     };
     let distance = distance.abs();
+    // A second side starts the sweep behind the plane, exactly as the
+    // sketch-region recipe replays it.
+    let second_distance = second_distance
+        .filter(|second| target_face.is_none() && second.is_finite() && *second > 0.0);
+    let (frame, distance) = match second_distance {
+        Some(second) => (frame_moved_along_normal(frame, -second), distance + second),
+        None => (frame, distance),
+    };
+    let draft_degrees = if second_distance.is_some() {
+        0.0
+    } else {
+        draft_degrees
+    };
     match (target_face, operation) {
         (Some(target_face), Some(operation)) => Some(KernelCommand::ExtrudeFacePlanarProfile {
             target_face,
@@ -23561,6 +24220,130 @@ mod extrusion_workbench_tests {
         assert!(app.pending_operation.is_none());
     }
 
+    /// A second side sweeps both ways from the sketch plane: the committed
+    /// solid is as thick as the two sides together, and its two caps sit
+    /// either side of the plane the profile was drawn on.
+    #[test]
+    fn a_two_sided_extrusion_spans_both_sides_of_the_sketch_plane() {
+        let mut one_sided = active_rectangle_app();
+        one_sided.set_extrusion_distance_intent(6.0);
+        assert!(one_sided.stage_sketch_extrusion());
+        assert!(one_sided.confirm_pending_operation());
+        let thin = one_sided
+            .displayed_measures()
+            .expect("a committed extrusion measures")
+            .volume;
+
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(6.0);
+        app.set_extrusion_two_sided(true);
+        assert!(app.extrusion_symmetric, "two sides start out equal");
+        assert_eq!(app.extrusion_second_distance, Some(6.0));
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let measures = app
+            .displayed_measures()
+            .expect("a committed extrusion measures");
+        assert!(
+            (measures.volume - thin * 2.0).abs() < 1.0e-6,
+            "two equal sides are twice one: {} against {thin}",
+            measures.volume
+        );
+        let bounds = app
+            .displayed
+            .as_ref()
+            .and_then(|body| body.report.bounds)
+            .expect("a committed body has bounds");
+        assert!(bounds.min.z < -5.9 && bounds.max.z > 5.9, "{bounds:?}");
+    }
+
+    /// The second side is recorded as intent, so a rebuild reproduces the
+    /// same slab rather than the single depth the command carried.
+    #[test]
+    fn a_two_sided_extrusion_rebuilds_from_its_recorded_sides() {
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(3.0);
+        app.set_extrusion_two_sided(true);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let digest = app.displayed_semantic_digest();
+
+        let recorded = app
+            .document
+            .features()
+            .iter()
+            .find_map(|node| match &node.action {
+                ReplayAction::SketchRegionExtrusion(recipe) => Some(recipe.clone()),
+                _ => None,
+            })
+            .expect("the extrusion is recorded as a sketch-region recipe");
+        assert_eq!(recorded.second_distance, Some(3.0));
+        assert!((recorded.total_distance() - 6.0).abs() < 1.0e-12);
+
+        let first = app
+            .document
+            .features()
+            .iter()
+            .find(|node| matches!(node.kind, FeatureKind::Extrude))
+            .map(|node| node.id)
+            .expect("an extrude feature");
+        assert!(app.rebuild_document_from(first));
+        assert_eq!(app.displayed_semantic_digest(), digest);
+    }
+
+    /// Add and Cut are offered from a sketch drawn on a plane over a body:
+    /// the sweep becomes a tool and a Boolean folds it in, as two steps in
+    /// history, and the result is smaller than the body it cut.
+    #[test]
+    fn a_cut_from_a_plane_sketch_folds_into_the_body_it_is_drawn_over() {
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(6.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let base = app
+            .displayed_measures()
+            .expect("the base body measures")
+            .volume;
+        let target = app.active_body_id().expect("a committed body");
+
+        // A second sketch on the same origin plane, over the body, cut.
+        app.enter_model_mode();
+        app.enter_sketch_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        app.sketch
+            .stage_geometry(SketchGeometry::rectangle(point(0.5, 0.5), point(1.5, 1.5)))
+            .expect("cut profile stages");
+        app.sketch.commit_pending().expect("cut profile commits");
+        app.sketch_revision = app.sketch_revision.saturating_add(1);
+
+        assert_eq!(app.plane_boolean_target(), Some(target));
+        app.select_extrusion_mode(ExtrusionMode::Cut);
+        app.set_extrusion_distance_intent(4.0);
+        assert_eq!(
+            app.extrusion_mode,
+            ExtrusionMode::Cut,
+            "a distance change must not undo a deliberate Cut"
+        );
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+
+        let after = app
+            .displayed_measures()
+            .expect("the cut body measures")
+            .volume;
+        assert!(
+            after < base,
+            "a cut removes material: {after} against {base}"
+        );
+        assert!(
+            app.document
+                .features()
+                .iter()
+                .any(|node| matches!(node.kind, FeatureKind::Boolean)),
+            "the fold is its own step in history"
+        );
+    }
+
     #[test]
     fn production_preview_queue_supersedes_stale_extrusion_generations() {
         let mut app = active_rectangle_app();
@@ -24393,6 +25176,9 @@ mod extrusion_workbench_tests {
             target_face,
             support_digest,
             mode,
+            second_distance: None,
+            up_to_faces: [None, None],
+            boolean_target: None,
         };
         app.pending_operation = Some(invalid);
 
@@ -27666,6 +28452,7 @@ mod drafted_extrusion_command {
             8.0,
             0.0,
             ExtrusionMode::NewBody,
+            None,
         );
         assert!(matches!(
             straight,
@@ -27678,6 +28465,7 @@ mod drafted_extrusion_command {
             -8.0,
             5.0,
             ExtrusionMode::NewBody,
+            None,
         );
         let Some(KernelCommand::LoftPlanarProfileOffset {
             distance, offset, ..
@@ -27687,6 +28475,73 @@ mod drafted_extrusion_command {
         };
         assert_eq!(distance, 8.0, "the sign moves into the frame");
         assert!((offset - 8.0 * 5.0_f64.to_radians().tan()).abs() < 1.0e-12);
+    }
+
+    /// A second side is one sweep from behind the plane: the frame moves
+    /// back along its normal and the depth covers both sides. A draft
+    /// cannot lean two ways at once, so a second side drops it.
+    #[test]
+    fn a_second_side_starts_the_sweep_behind_the_sketch_plane() {
+        let (frame, profile) = square_profile();
+        let Some(KernelCommand::ExtrudePlanarProfile {
+            frame: swept,
+            distance,
+            ..
+        }) = build_planar_profile_extrusion_command(
+            frame,
+            profile.clone(),
+            None,
+            6.0,
+            0.0,
+            ExtrusionMode::NewBody,
+            Some(2.0),
+        )
+        else {
+            panic!("a two-sided new body is one planar extrusion")
+        };
+        assert!((distance - 8.0).abs() < 1.0e-12);
+        assert!((swept.origin.z + 2.0).abs() < 1.0e-12, "{swept:?}");
+
+        assert!(
+            matches!(
+                build_planar_profile_extrusion_command(
+                    frame,
+                    profile,
+                    None,
+                    6.0,
+                    5.0,
+                    ExtrusionMode::NewBody,
+                    Some(2.0),
+                ),
+                Some(KernelCommand::ExtrudePlanarProfile { .. })
+            ),
+            "a second side has no single side for the walls to lean from"
+        );
+    }
+
+    /// An Add or Cut from a sketch on a plane sweeps a new body first; the
+    /// Boolean that folds it into the target is a separate step, so the
+    /// command is the same plain extrusion a new body would be.
+    #[test]
+    fn a_plane_sketch_add_sweeps_a_plain_new_body() {
+        let (frame, profile) = square_profile();
+        for mode in [ExtrusionMode::Add, ExtrusionMode::Cut] {
+            assert!(
+                matches!(
+                    build_planar_profile_extrusion_command(
+                        frame,
+                        profile.clone(),
+                        None,
+                        6.0,
+                        0.0,
+                        mode,
+                        None,
+                    ),
+                    Some(KernelCommand::ExtrudePlanarProfile { .. })
+                ),
+                "{mode:?} from a plane sketch sweeps a tool body"
+            );
+        }
     }
 }
 
