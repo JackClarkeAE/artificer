@@ -27627,8 +27627,17 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// Three edges meeting at one corner blend exactly, and a chamfer that
+    /// would then have to rebuild a face against the cylinders and the
+    /// sphere octant they leave refuses by name rather than approximating.
+    ///
+    /// Before the corner rung the fillet fell to the faceted tier and left
+    /// an all-planar body, which a faceted chamfer could go on to cut. That
+    /// was the bug the corner rung fixes: the corner is what the user asked
+    /// to blend. The follow-on is the price, and the kernel states it as a
+    /// refusal instead of quietly approximating under an exact name.
     #[test]
-    fn connected_u_chamfer_on_a_filleted_successor_uses_the_exact_preview_body() {
+    fn a_three_edge_corner_blends_exactly_and_a_chamfer_on_it_refuses_by_name() {
         let mut app = KernelLabApp::default();
         let body_id = app.active_body_id().unwrap();
         let body = viewport::BodyInstanceKey::new(body_id.get());
@@ -27667,7 +27676,22 @@ mod extrusion_workbench_tests {
         app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.25;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
-        assert!(app.confirm_pending_operation());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+
+        // The corner itself is exact: the three bands meet in one patch
+        // rather than being approximated into planes.
+        let rung = app
+            .displayed
+            .as_ref()
+            .unwrap()
+            .report
+            .rung
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            !rung.ends_with("/faceted"),
+            "a three-edge corner must blend exactly, not fall to facets: {rung}"
+        );
 
         let scene = &app.displayed.as_ref().unwrap().scene;
         let maximum = Point3::new(
@@ -27734,16 +27758,25 @@ mod extrusion_workbench_tests {
             .current_edge_finish_preview()
             .expect("U chamfer preview");
         assert_eq!(preview.kind, EdgeFinishKind::Chamfer);
-        let candidate = preview
-            .candidate
-            .expect("chamfer must substitute the same exact body as fillet preview");
-        assert!(!candidate.changed_faces.is_empty());
-        let preview_digest = candidate.scene.semantic_digest;
-        assert!(app.confirm_pending_operation());
+        assert!(
+            preview.candidate.is_none(),
+            "no tier can rebuild a face against the corner's cylinders and sphere, \
+             so the preview must offer no exact candidate rather than a false one"
+        );
+
+        // The refusal is the kernel's, by name, and it costs the user
+        // nothing they had: the blended body stays exactly as committed.
+        let before = app.displayed.as_ref().unwrap().scene.semantic_digest;
+        let committed = app.confirm_pending_operation();
         assert_eq!(
             app.displayed.as_ref().unwrap().scene.semantic_digest,
-            preview_digest,
-            "the confirmed U chamfer must be the body that was previewed"
+            before,
+            "a refused chamfer must leave the blended body untouched"
+        );
+        assert!(
+            !committed || app.last_error_code().is_some(),
+            "a chamfer that cannot be built must say so: {:?}",
+            app.document_status
         );
     }
 

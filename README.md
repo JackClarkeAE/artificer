@@ -27,9 +27,11 @@
 
 ## What is new in 0.98.1
 
-A point release about the things you touch: the extrusion editor, the units
-every field reads and writes, where the assembly tools live, and what the
-view cube's arrows mean.
+A point release about the things you touch: corners that finally blend, the
+extrusion editor, the units every field reads and writes, where the assembly
+tools live, and what the view cube's arrows mean.
+
+- **The corner of a block rounds and bevels exactly.** Three edges meeting at a vertex had no exact rung: the request fell to the faceted tier and came back approximated, or refused to blend at all. `edge-finish/vertex-blend` builds the classical rolling ball — a cylinder along each edge, a sphere octant where all three are chosen, a run-out into the face across the end where one is — so a filleted cube is six planes, twelve cylinders and eight octants, and exports as those rather than as a tessellation. Doing it a corner at a time works too. ADR 0034 records the construction, what it refuses by name, and the one capability the exactness costs: a corner blended exactly no longer accepts a *faceted* finish along the edges beside it, because no tier can rebuild a face against the curved surfaces it leaves, and that request now refuses instead of quietly approximating. Two faults in the faceted tier were fixed on the way: a stack overflow that aborted the process on a body carrying a tessellated sphere, and a refusal that took twelve seconds to arrive and now takes twenty milliseconds.
 
 - **An extrusion says what it does, how far, and where it stops.** New body, Add and Cut stand together for any sketch with a body to combine with, a sketch on a plane included: the sweep becomes a body and a Boolean folds it in, as its own step in history. Two sides give each direction its own length, with a symmetric lock, built as one sweep from behind the sketch plane. And either side may end at a face you pick rather than a distance you type, stored as the persistent face it reached and measured again on every rebuild, so the feature follows the face when the face moves. ADR 0032 records the design.
 - **The document's length unit reaches every field.** It was a setting the measure panel honoured and nothing else did. Now every readout is formatted in it and every typed length is read in it — the extrusion distance, the fillet radius, the sketch dimension boxes and tool fields, the part library's length, the mass properties, the interference and clearance readouts. A typed value may carry its own suffix (`10mm`, `0.5in`, `1e3um`), which always wins, and a preference names the unit new documents open in. Geometry, files and interchange stay in millimetres. ADR 0033 records the design.

@@ -454,7 +454,17 @@
         "TRANSFORM_QUATERNION_INVALID",
         "TRANSFORM_SCALE_NON_POSITIVE",
         "TRANSFORM_SOURCE_UNSUPPORTED",
-        "VALIDATION_PROFILE_NOT_SATISFIED"
+        "VALIDATION_PROFILE_NOT_SATISFIED",
+        "VERTEX_BLEND_CONSTRUCTION_FAILED",
+        "VERTEX_BLEND_CORNER_CURVED",
+        "VERTEX_BLEND_CORNER_INCOMPLETE",
+        "VERTEX_BLEND_CORNER_NOT_SQUARE",
+        "VERTEX_BLEND_CORNER_UNSUPPORTED",
+        "VERTEX_BLEND_DISTANCE_INVALID",
+        "VERTEX_BLEND_MIXED_SELECTION",
+        "VERTEX_BLEND_RADIUS_MISMATCH",
+        "VERTEX_BLEND_RUNOUT_NOT_SQUARE",
+        "VERTEX_BLEND_RUNOUT_UNSUPPORTED"
       ],
       "description": "Every diagnostic and refusal code the kernel emits. A test in crates/kernel/tests/report_tests.rs keeps this list in step with the source."
     },

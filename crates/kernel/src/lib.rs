@@ -39,6 +39,7 @@ mod surface_intersection;
 mod topology;
 mod transform;
 mod validator;
+mod vertex_blend;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -3247,6 +3248,30 @@ fn regularized_edge_finish(
         ) => {}
     }
 
+    // The last exact rung: convex edges between planar faces, with a sphere or
+    // a triangle closing every corner the selection completes. Its refusals
+    // are its own, and a refusal it is certain of stops the ladder rather than
+    // spending the faceted tier's seconds to reach the same answer with a
+    // vaguer sentence.
+    let mut owned_refusal = None;
+    match vertex_blend::build_vertex_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology) => return Ok((topology, "edge-finish/vertex-blend")),
+        Err(vertex_blend::VertexBlendError::DomainUnsupported) => {}
+        Err(vertex_blend::VertexBlendError::Refused(refusal)) => {
+            if refusal.certain {
+                return Err(vertex_blend_error(input.id, &refusal));
+            }
+            owned_refusal = Some(refusal);
+        }
+    }
+
     let scene = NativeKernel::authoritative_scene(input);
     let faceted = faceted_boolean::finish_edges(
         Some(&input.topology),
@@ -3271,13 +3296,25 @@ fn regularized_edge_finish(
                 finish_logical_successor_edges(input, targets, kind, distance, precision)
             })
     };
-    let topology = regularized.ok_or_else(|| {
-        simple_invalid_input(
-            input.id,
-            "EDGE_FINISH_BLEND_UNSUPPORTED",
-            "The selected edge neighbourhoods could not form a certified regularized corner blend.",
-        )
-    })?;
+    let topology = match regularized {
+        Some(topology) => topology,
+        // The exact rung that owned this request said why it could not answer;
+        // that sentence beats the generic one the faceted tier's failure would
+        // otherwise publish.
+        None => {
+            return Err(owned_refusal.map_or_else(
+                || {
+                    simple_invalid_input(
+                        input.id,
+                        "EDGE_FINISH_BLEND_UNSUPPORTED",
+                        "The selected edge neighbourhoods could not form a certified regularized \
+                         corner blend.",
+                    )
+                },
+                |refusal| vertex_blend_error(input.id, &refusal),
+            ));
+        }
+    };
     warnings.push(approximation_warning(
         "EDGE_FINISH_FACETED_APPROXIMATION",
         "This finish runs where no exact blend exists in this kernel's line-and-circle vocabulary - \
@@ -3286,6 +3323,21 @@ fn regularized_edge_finish(
          solid rather than certifying it.",
     ));
     Ok((topology, certified_by))
+}
+
+/// Publishes the corner-blend rung's own refusal, code and sentence intact.
+fn vertex_blend_error(snapshot: SnapshotId, refusal: &vertex_blend::Refusal) -> KernelError {
+    error(
+        KernelErrorCode::InvalidInput,
+        KernelStage::Preflight,
+        snapshot,
+        refusal.message.clone(),
+        vec![simple_diagnostic(
+            refusal.code,
+            KernelStage::Preflight,
+            &refusal.message,
+        )],
+    )
 }
 
 fn edge_finish_error(
@@ -8020,7 +8072,7 @@ mod tests {
     }
 
     #[test]
-    fn trihedral_fillet_successor_accepts_a_connected_u_chain_chamfer() {
+    fn half_corner_fillet_successor_accepts_a_connected_u_chain_chamfer() {
         let base = canonical();
         let scene = NativeKernel::debug_scene(&base.snapshot);
         let same = |left: ProtocolPoint3, right: ProtocolPoint3| {
@@ -8029,25 +8081,31 @@ mod tests {
                 && (left.z - right.z).abs() <= 1.0e-9
         };
         let origin = ProtocolPoint3::new(0.0, 0.0, 0.0);
+        // Two of the corner's three edges: the corner-blend rung has no exact
+        // patch for a corner blended part way and declines it, so this is the
+        // faceted tier's own regularized corner, which is what the successor
+        // chain below is here to exercise. (All three edges at once is the
+        // corner-blend rung's, and exact — `vertex_blend_tests` covers that.)
         let fillet_targets = scene
             .edges
             .iter()
             .filter(|edge| edge.endpoints.iter().any(|point| same(*point, origin)))
             .map(|edge| edge.source_edge)
+            .take(2)
             .collect::<Vec<_>>();
-        assert_eq!(fillet_targets.len(), 3);
+        assert_eq!(fillet_targets.len(), 2);
         let fillet_request = ExecuteRequest {
             command: KernelCommand::FinishEdges {
                 target_edges: fillet_targets,
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
             },
-            request_id: RequestId::new("trihedral-fillet-before-u-chamfer"),
+            request_id: RequestId::new("half-corner-fillet-before-u-chamfer"),
             ..request(base.snapshot.id())
         };
         let filleted =
             NativeKernel::execute(&base.snapshot, &fillet_request, &CancellationToken::new())
-                .expect("three-edge corner fillet");
+                .expect("half-corner fillet");
         let filleted_scene = NativeKernel::debug_scene(&filleted.snapshot);
 
         let expected_u = [
@@ -8178,7 +8236,13 @@ mod tests {
     }
 
     #[test]
-    fn intersecting_fillet_patch_rails_accept_a_second_finish() {
+    fn an_exact_corner_replaces_the_intersecting_fillet_patches() {
+        // The faceted tier used to close a three-edge corner by letting the
+        // three patches run into each other, which left a hard rail where two
+        // of them crossed. The corner-blend rung puts a sphere octant there
+        // instead, and the octant meets every band along a shared tangency
+        // arc, so no such rail exists — and the rails the body does keep still
+        // accept a second finish.
         let base = canonical();
         let scene = NativeKernel::debug_scene(&base.snapshot);
         let origin = ProtocolPoint3::new(0.0, 0.0, 0.0);
@@ -8193,87 +8257,100 @@ mod tests {
             .filter(|edge| edge.endpoints.iter().copied().any(near))
             .map(|edge| edge.source_edge)
             .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 3);
         let first = ExecuteRequest {
             command: KernelCommand::FinishEdges {
                 target_edges: targets,
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
             },
-            request_id: RequestId::new("intersecting-fillet-patch-base"),
+            request_id: RequestId::new("exact-corner-patch-base"),
             ..request(base.snapshot.id())
         };
         let filleted = NativeKernel::execute(&base.snapshot, &first, &CancellationToken::new())
-            .expect("trihedral fillet");
-        let rail = filleted
-            .snapshot
-            .topology
-            .edges
-            .iter()
-            .enumerate()
-            .find_map(|(edge_index, edge)| {
-                if presentation_edge_is_smooth(&filleted.snapshot.topology, edge_index) {
-                    return None;
-                }
-                let roles = filleted
-                    .snapshot
-                    .topology
-                    .faces
-                    .iter()
-                    .filter(|face| {
-                        face.value.loops().any(|loop_key| {
-                            filleted.snapshot.topology.loops[loop_key.0]
-                                .value
-                                .coedges
-                                .iter()
-                                .any(|coedge_key| {
-                                    filleted.snapshot.topology.coedges[coedge_key.0]
-                                        .value
-                                        .edge
-                                        .0
-                                        == edge_index
-                                })
-                        })
+            .expect("three-edge corner fillet");
+        assert_eq!(
+            filleted.report.rung.as_deref(),
+            Some("edge-finish/vertex-blend")
+        );
+        assert!(filleted.report.warnings.is_empty());
+
+        let roles_of = |edge_index: usize| {
+            filleted
+                .snapshot
+                .topology
+                .faces
+                .iter()
+                .filter(|face| {
+                    face.value.loops().any(|loop_key| {
+                        filleted.snapshot.topology.loops[loop_key.0]
+                            .value
+                            .coedges
+                            .iter()
+                            .any(|coedge_key| {
+                                filleted.snapshot.topology.coedges[coedge_key.0]
+                                    .value
+                                    .edge
+                                    .0
+                                    == edge_index
+                            })
                     })
-                    .map(|face| face.value.role)
-                    .collect::<Vec<_>>();
-                (roles.len() == 2
+                })
+                .map(|face| face.value.role)
+                .collect::<Vec<_>>()
+        };
+        for edge_index in 0..filleted.snapshot.topology.edges.len() {
+            if presentation_edge_is_smooth(&filleted.snapshot.topology, edge_index) {
+                continue;
+            }
+            let roles = roles_of(edge_index);
+            assert!(
+                !(roles.len() == 2
                     && roles
                         .iter()
-                        .all(|role| matches!(role, FaceRole::FeatureSide(_))))
-                .then(|| entity_ref(filleted.snapshot.id(), edge.id.get(), EntityKind::Edge))
-            })
-            .expect("the regularized corner has a real patch-intersection rail");
+                        .all(|role| matches!(role, FaceRole::FeatureSide(_)))),
+                "an exact corner leaves no hard rail between two blend patches"
+            );
+        }
 
+        // A rail the corner did not touch still takes a second finish, and
+        // that one is exact too: both of its ends run out into the walls.
+        let rail = NativeKernel::debug_scene(&filleted.snapshot)
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.z - 4.0).abs() <= 1.0e-9 && (point.y - 3.0).abs() <= 1.0e-9)
+            })
+            .expect("the far top edge survives the corner blend")
+            .source_edge;
         for (kind, request_id) in [
             (
                 artificer_protocol::EdgeFinishKind::Chamfer,
-                "chamfer-on-fillet-intersection",
+                "chamfer-beside-exact-corner",
             ),
             (
                 artificer_protocol::EdgeFinishKind::Fillet,
-                "fillet-on-fillet-intersection",
+                "fillet-beside-exact-corner",
             ),
         ] {
             let request = ExecuteRequest {
                 command: KernelCommand::FinishEdge {
                     target_edge: rail,
                     kind,
-                    distance: 0.01,
+                    distance: 0.1,
                 },
                 request_id: RequestId::new(request_id),
                 ..request(filleted.snapshot.id())
             };
-            let finished = NativeKernel::execute(
-                &filleted.snapshot,
-                &request,
-                &CancellationToken::new(),
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "a genuine fillet-patch intersection must accept a second {kind:?}: {error:?}"
-                )
-            });
+            let finished =
+                NativeKernel::execute(&filleted.snapshot, &request, &CancellationToken::new())
+                    .unwrap_or_else(|error| {
+                        panic!("a rail beside an exact corner must accept a {kind:?}: {error:?}")
+                    });
             assert!(NativeKernel::validate(&finished.snapshot, ValidationProfile::Solid).valid);
+            assert!(finished.snapshot.measures().volume < filleted.snapshot.measures().volume);
         }
     }
 

@@ -1,11 +1,13 @@
 //! The rails where chamfer slants meet each other.
 //!
-//! Three chamfers meeting at a cube corner leave three mitres between them.
-//! Each is a real rail: a visible line, and a selectable target a later finish
-//! can be stacked on. They are published by the same presentation rule that
-//! hides a curved surface's parameterization seams, and two 45-degree slants
-//! meet at exactly 60 degrees — which is where that rule's fan allowance used
-//! to sit, so whether a mitre survived was decided by rounding.
+//! Three chamfers meeting at a cube corner leave four slanted faces: one bevel
+//! band per edge and the triangle that closes the corner between them (ADR
+//! 0034). Every junction among them is a real rail: a visible line, and a
+//! selectable target a later finish can be stacked on. They are published by
+//! the same presentation rule that hides a curved surface's parameterization
+//! seams, and these slants meet each other at shallow angles — around where
+//! that rule's fan allowance sits, so whether a mitre survived used to be
+//! decided by rounding.
 
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
@@ -102,14 +104,15 @@ fn every_mitre_between_three_corner_chamfers_presents_as_a_rail() {
     }
     assert_eq!(
         slants.len(),
-        3,
-        "three chamfered edges should leave three slant faces, found {slants:?}"
+        4,
+        "three chamfered edges leave three bevel bands and one corner triangle, found {slants:?}"
     );
 
-    // Each pair of slants meets along one mitre, and every one of them must
+    // The triangle meets each band along a mitre, and every one of them must
     // present as a hard edge. Hiding a mitre is what made a corner look like
     // it had lost a line, and it would also take the rail out of reach of any
     // later finish that wanted to stack on it.
+    let mut mitres = 0;
     for (index, first) in slants.iter().enumerate() {
         for second in slants.iter().skip(index + 1) {
             let shared = scene
@@ -120,14 +123,18 @@ fn every_mitre_between_three_corner_chamfers_presents_as_a_rail() {
                     faces.contains(&first) && faces.contains(&second)
                 })
                 .collect::<Vec<_>>();
-            assert!(
-                !shared.is_empty(),
-                "slants {first:?} and {second:?} should meet along a mitre"
-            );
+            if shared.is_empty() {
+                continue;
+            }
+            mitres += 1;
             assert!(
                 shared.iter().all(|edge| !edge.is_smooth),
                 "the mitre between slants {first:?} and {second:?} should draw as a rail"
             );
         }
     }
+    assert_eq!(
+        mitres, 3,
+        "the corner triangle meets each of the three bands along one mitre"
+    );
 }

@@ -42,6 +42,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0029](0029-velopack-installers-and-in-app-updates.md) | Velopack installers and in-app updates | Accepted and implemented | — |
 | [0030](0030-unsaved-work-and-native-file-dialogs.md) | Unsaved work is never lost silently, and files are chosen in the desktop's own dialog | Accepted and implemented | — |
 | [0031](0031-navigation-cube-and-spacemouse.md) | Navigation cube corners and edges, and 3D-mouse input | Accepted and implemented | — |
+| [0034](0034-corner-blends-and-band-run-outs.md) | Corner blends and band run-outs | Implemented | 0023 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.
