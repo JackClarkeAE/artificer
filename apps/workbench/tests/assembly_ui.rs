@@ -35,7 +35,30 @@ fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &s
     click_button(harness, label);
 }
 
+/// Opens the ribbon tab a button lives on when it is not on screen: the
+/// placement and transform tools sit on the Assembly tab, the rest of what
+/// these tests click on Model.
+fn reveal_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    if harness
+        .query_by_role_and_label(Role::Button, label)
+        .is_some()
+    {
+        return;
+    }
+    let tab = match label {
+        "Insert a part into this design" | "M  Move" | "R  Rotate" | "S  Scale" => {
+            "Assembly ribbon tab"
+        }
+        _ => "Model mode",
+    };
+    if let Some(button) = harness.query_by_role_and_label(Role::Button, tab) {
+        button.click_accesskit();
+        harness.run();
+    }
+}
+
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    reveal_button(harness, label);
     harness.get_by_role_and_label(Role::Button, label).click();
     harness.run();
 }
@@ -97,7 +120,7 @@ fn two_component_assembly() -> Harness<'static, KernelLabApp> {
 
 #[test]
 fn repeated_parts_insert_as_distinct_non_overlapping_occurrences() {
-    let harness = two_component_assembly();
+    let mut harness = two_component_assembly();
     let poses = harness.state().component_poses();
     assert_eq!(poses.len(), 2);
     assert_ne!(poses[0].0, poses[1].0);
@@ -108,6 +131,7 @@ fn repeated_parts_insert_as_distinct_non_overlapping_occurrences() {
         "20 mm parts must retain the configured 10 mm assembly clearance: {poses:?}"
     );
     assert_eq!(harness.state().active_component_instance_id(), Some(2));
+    reveal_button(&mut harness, "S  Scale");
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "S  Scale")
@@ -167,6 +191,7 @@ fn grounding_and_named_revolute_joint_share_the_confirmation_gate_and_persist() 
         Some("Ground component")
     );
     click_button(&mut harness, "Cancel operation");
+    reveal_button(&mut harness, "M  Move");
     assert!(
         !harness
             .get_by_role_and_label(Role::Button, "M  Move")

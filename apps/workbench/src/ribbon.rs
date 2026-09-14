@@ -118,11 +118,15 @@ impl KernelLabApp {
     /// workspace — and is therefore reachable while an operation is pending.
     pub(crate) fn ribbon_tab_strip(&mut self, ui: &mut egui::Ui) {
         let active = self.active_ribbon_tab();
+        let workspace_tab = self.workspace_tab();
         let operation_pending = self.pending_operation.is_some();
         ui.spacing_mut().item_spacing.x = 1.0;
         for tab in RibbonTab::ALL {
             let selected = tab == active;
-            let enabled = !tab.switches_workspace() || !operation_pending;
+            // The workspace's own tab never switches workspace, so it stays
+            // open while an operation is pending: a Move started from the
+            // Assembly tab must be able to get back to Model's tools.
+            let enabled = !tab.switches_workspace() || !operation_pending || tab == workspace_tab;
             let response = ui.add_enabled(
                 enabled,
                 egui::Button::new(
@@ -169,7 +173,10 @@ impl KernelLabApp {
                         self.ribbon_tab = None;
                         self.enter_sketch_mode();
                     }
-                    RibbonTab::View | RibbonTab::Parametric | RibbonTab::Theme => {
+                    RibbonTab::Assembly
+                    | RibbonTab::View
+                    | RibbonTab::Parametric
+                    | RibbonTab::Theme => {
                         self.ribbon_tab = Some((self.workbench_mode, tab));
                     }
                 }
@@ -182,13 +189,18 @@ impl KernelLabApp {
     /// contextual tab does elsewhere; an explicit pick overrides it until the
     /// workspace changes again.
     fn active_ribbon_tab(&self) -> RibbonTab {
-        let workspace_tab = match self.workbench_mode {
-            WorkbenchMode::Model => RibbonTab::Model,
-            WorkbenchMode::Sketch => RibbonTab::Sketch,
-        };
+        let workspace_tab = self.workspace_tab();
         self.ribbon_tab
             .filter(|(mode, _)| *mode == self.workbench_mode)
             .map_or(workspace_tab, |(_, tab)| tab)
+    }
+
+    /// The tab that belongs to the current workspace.
+    fn workspace_tab(&self) -> RibbonTab {
+        match self.workbench_mode {
+            WorkbenchMode::Model => RibbonTab::Model,
+            WorkbenchMode::Sketch => RibbonTab::Sketch,
+        }
     }
 
     fn ribbon_groups(&mut self, ui: &mut egui::Ui) {

@@ -18053,7 +18053,7 @@ impl KernelLabApp {
 
         let cube_rect = egui::Rect::from_min_size(
             egui::pos2(rect.right() - 112.0, rect.top()),
-            egui::vec2(112.0, 128.0),
+            egui::vec2(112.0, 136.0),
         );
         if let Some(command) = model_view_cube(ui, cube_rect, self.view, true) {
             self.apply_view_cube_command(command);
@@ -18996,7 +18996,9 @@ fn model_view_cube(
     let cube_center = egui::pos2(
         rect.center().x,
         if show_controls {
-            rect.top() + 52.0
+            // Room above for the up arrow's tip and below for the down
+            // arrow's before the roll and ISO buttons.
+            rect.top() + 56.0
         } else {
             rect.center().y
         },
@@ -19035,13 +19037,25 @@ fn model_view_cube(
         .collect::<Vec<_>>();
     visible_faces.sort_by(|left, right| left.3.total_cmp(&right.3));
 
+    // The orbit ring is a solid the cube sits inside, so the half behind the
+    // cube goes down before the faces and the half in front after them.
+    let ring = show_controls.then(|| view_cube_orbit_ring(view, cube_center, cube_scale));
+    if let Some(ring) = ring.as_ref().filter(|ring| ring.visibility > 0.0) {
+        for segment in &ring.far {
+            ui.painter()
+                .line_segment(*segment, view_cube_ring_stroke(false, ring.visibility));
+        }
+    }
+
     let nearest = view.nearest_standard_view();
+    let mut label_knockouts = Vec::new();
     for (face, _, points, facing) in visible_faces {
         let center = points
             .iter()
             .fold(egui::Vec2::ZERO, |sum, point| sum + point.to_vec2())
             / 4.0;
         let center = egui::pos2(center.x, center.y);
+        label_knockouts.push(egui::Rect::from_center_size(center, egui::vec2(30.0, 11.0)));
         let hit_rect = egui::Rect::from_center_size(center, egui::vec2(34.0, 18.0))
             .intersect(rect.shrink(3.0));
         let response = ui.interact(
@@ -19088,9 +19102,19 @@ fn model_view_cube(
         }
     }
 
-    if !show_controls {
-        // The sketch indicator answers face clicks alone.
+    // The sketch indicator answers face clicks alone.
+    let Some(ring) = ring else {
         return command;
+    };
+    if ring.visibility > 0.0 {
+        // The near half passes in front of the lower faces, which is what
+        // makes it a ring round the cube; it steps round the face labels.
+        for segment in &ring.near {
+            if !segment_touches(*segment, &label_knockouts) {
+                ui.painter()
+                    .line_segment(*segment, view_cube_ring_stroke(true, ring.visibility));
+            }
+        }
     }
 
     // Corners and edges, registered after the faces so that a click on one
@@ -19152,8 +19176,33 @@ fn model_view_cube(
         response.on_hover_text(format!("Look from the {}", handle.name()));
     }
 
-    for (name, direction, target) in view_cube_adjacent_arrows(view) {
-        let center = cube_center + direction * 42.0;
+    // The turn arrows. Left and right ride the orbit ring, tangentially,
+    // either side of its nearest point, so they read as the way the camera
+    // travels round the cube; up and down sit on the screen vertical, where
+    // the meridian the camera would ride is seen edge-on. Each turns to the
+    // face the cube draws on that side of itself.
+    let [left, right] = ring.side_arrows;
+    let vertical = VIEW_CUBE_TURN_ARROW_RADIUS * cube_scale;
+    let turn_arrows = [
+        ("left", egui::vec2(-1.0, 0.0), left.0, left.1),
+        ("right", egui::vec2(1.0, 0.0), right.0, right.1),
+        (
+            "up",
+            egui::vec2(0.0, -1.0),
+            cube_center + egui::vec2(0.0, -vertical),
+            egui::vec2(0.0, -1.0),
+        ),
+        (
+            "down",
+            egui::vec2(0.0, 1.0),
+            cube_center + egui::vec2(0.0, vertical),
+            egui::vec2(0.0, 1.0),
+        ),
+    ];
+    for (name, side, center, direction) in turn_arrows {
+        let Some(target) = view_cube_arrow_target(view, side) else {
+            continue;
+        };
         let hit_rect = egui::Rect::from_center_size(center, egui::vec2(20.0, 20.0));
         let response = ui.interact(
             hit_rect,
@@ -19167,19 +19216,12 @@ fn model_view_cube(
                 format!("View cube turn {name}"),
             )
         });
-        let tip = center + direction * 9.0;
-        let back = center - direction * 3.0;
-        let flank = egui::vec2(-direction.y, direction.x) * 6.0;
         let fill = if response.hovered() {
             theme::accent()
         } else {
             Color32::from_rgb(148, 158, 170)
         };
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![tip, back + flank, back - flank],
-            translucent(fill, 226),
-            Stroke::NONE,
-        ));
+        paint_view_cube_arrowhead(ui.painter(), center, direction, translucent(fill, 226));
         if response.clicked() {
             command = Some(ViewCubeCommand::Face(target));
         }
@@ -19226,44 +19268,190 @@ fn model_view_cube(
     command
 }
 
-/// Computes the 4 rotating adjacent face arrows in 3D screen space around the
-/// dominant visible view cube face.
-fn view_cube_adjacent_arrows(view: ViewState) -> Vec<(&'static str, egui::Vec2, StandardView)> {
-    let nearest = view.nearest_standard_view();
-    let n = nearest.outward_normal();
-    let mut arrows = Vec::new();
-    for target in StandardView::ALL {
-        let t_norm = target.outward_normal();
-        // Check if orthogonal to the nearest face normal (dot product ~ 0)
-        let dot = (n.x * t_norm.x + n.y * t_norm.y + n.z * t_norm.z).abs();
-        if dot > 0.1 {
-            continue;
-        }
-        let projected = view.project_direction(t_norm);
-        let screen_vec = egui::vec2(
-            projected.coordinates[0] as f32,
-            projected.coordinates[1] as f32,
-        );
-        if screen_vec.length_sq() > 1.0e-4 {
-            let normalized = screen_vec.normalized();
-            arrows.push((target.label(), normalized, target));
-        }
-    }
-    arrows
+/// The orbit ring's radius in cube half-extents: outside the corners, so the
+/// ring never cuts through a face seen square-on, and inside the up and down
+/// arrows, so from above they sit just beyond the circle.
+const VIEW_CUBE_RING_RADIUS: f32 = 1.85;
+/// Where the up and down arrows sit on the screen vertical, in cube
+/// half-extents: where the arrows always stood.
+const VIEW_CUBE_TURN_ARROW_RADIUS: f32 = 2.0;
+/// How far round the ring from its nearest point the side arrows sit: far
+/// enough that, with the ring seen edge-on, they clear the cube's silhouette.
+const VIEW_CUBE_SIDE_ARROW_AZIMUTH: f64 = std::f64::consts::FRAC_PI_3;
+/// The side arrows sit just outside the ring, as the up and down arrows sit
+/// outside the cube, so their tips never run into the faces.
+const VIEW_CUBE_SIDE_ARROW_RADIUS: f32 = 2.1;
+const VIEW_CUBE_RING_SAMPLES: usize = 48;
+/// The ring fades out as it turns edge-on: below this much of world Z toward
+/// the viewer it is a line through the cube, which says nothing, and above
+/// `VIEW_CUBE_RING_FULL_FACING` it is a ring anyone can read.
+const VIEW_CUBE_RING_EDGE_ON_FACING: f32 = 0.2;
+const VIEW_CUBE_RING_FULL_FACING: f32 = 0.5;
+
+/// The ring the camera rides when the view turns about world Z, drawn with
+/// the cube's own projection so it tilts with the view: an ellipse round the
+/// cube's waist from an oblique view, a circle from above, a line seen
+/// edge-on. The side turn arrows sit on it, tangentially, either side of the
+/// point nearest the viewer, so they read as the way the camera travels
+/// rather than as anything the faces point along.
+struct ViewCubeOrbitRing {
+    /// Ring segments on the viewer's side of the cube.
+    near: Vec<[egui::Pos2; 2]>,
+    /// Ring segments behind the cube.
+    far: Vec<[egui::Pos2; 2]>,
+    /// The two side arrows, position and pointing direction, left first.
+    side_arrows: [(egui::Pos2, egui::Vec2); 2],
+    /// How much of the ring to draw, 0 (edge-on, nothing) to 1 (a ring).
+    visibility: f32,
 }
 
-/// Fallback for view_cube_arrow_target when needed by tests.
-#[allow(dead_code)]
+fn view_cube_orbit_ring(
+    view: ViewState,
+    cube_center: egui::Pos2,
+    cube_scale: f32,
+) -> ViewCubeOrbitRing {
+    let on_screen = |x: f64, y: f64| {
+        egui::pos2(
+            cube_center.x + x as f32 * cube_scale,
+            cube_center.y + y as f32 * cube_scale,
+        )
+    };
+    let ring_point = |azimuth: f64, radius: f32| {
+        view.project_direction(Vector3::new(
+            f64::from(radius) * azimuth.cos(),
+            f64::from(radius) * azimuth.sin(),
+            0.0,
+        ))
+    };
+    let samples = (0..VIEW_CUBE_RING_SAMPLES)
+        .map(|index| {
+            let azimuth = index as f64 / VIEW_CUBE_RING_SAMPLES as f64 * std::f64::consts::TAU;
+            ring_point(azimuth, VIEW_CUBE_RING_RADIUS)
+        })
+        .collect::<Vec<_>>();
+    let mut near = Vec::new();
+    let mut far = Vec::new();
+    for (index, sample) in samples.iter().enumerate() {
+        let next = &samples[(index + 1) % VIEW_CUBE_RING_SAMPLES];
+        let segment = [
+            on_screen(sample.coordinates[0], sample.coordinates[1]),
+            on_screen(next.coordinates[0], next.coordinates[1]),
+        ];
+        if sample.depth + next.depth >= -1.0e-9 {
+            near.push(segment);
+        } else {
+            far.push(segment);
+        }
+    }
+
+    // The ring's nearest point is where the eye's horizontal direction meets
+    // it; the projection is linear, so the two axes' depths give its
+    // azimuth directly. Looking straight down or up there is no such point,
+    // and the one lowest on screen stands in, so the arrows keep to the
+    // lower half of the circle either way.
+    let x_axis = view.project_direction(Vector3::new(1.0, 0.0, 0.0));
+    let y_axis = view.project_direction(Vector3::new(0.0, 1.0, 0.0));
+    let nearest_azimuth = if x_axis.depth.hypot(y_axis.depth) > 1.0e-3 {
+        y_axis.depth.atan2(x_axis.depth)
+    } else {
+        y_axis.coordinates[1].atan2(x_axis.coordinates[1])
+    };
+    let mut side_arrows = [-1.0_f64, 1.0].map(|sign| {
+        let azimuth = nearest_azimuth + sign * VIEW_CUBE_SIDE_ARROW_AZIMUTH;
+        let point = ring_point(azimuth, VIEW_CUBE_SIDE_ARROW_RADIUS);
+        let position = on_screen(point.coordinates[0], point.coordinates[1]);
+        // The ring's tangent there, taken away from the nearest point: the
+        // way the camera goes when it turns to that side.
+        let travel = view.project_direction(Vector3::new(
+            -sign * azimuth.sin(),
+            sign * azimuth.cos(),
+            0.0,
+        ));
+        let mut direction = egui::vec2(travel.coordinates[0] as f32, travel.coordinates[1] as f32);
+        if direction.length_sq() < 1.0e-4 {
+            direction = position - cube_center;
+        }
+        let direction = if direction.length_sq() < 1.0e-4 {
+            egui::vec2(sign as f32, 0.0)
+        } else {
+            direction.normalized()
+        };
+        (position, direction)
+    });
+    if side_arrows[0].0.x > side_arrows[1].0.x {
+        side_arrows.swap(0, 1);
+    }
+    // Edge-on, the ring is a line through the cube and says nothing; it
+    // fades in as world Z turns toward the viewer and the ellipse opens.
+    let facing = view
+        .project_direction(Vector3::new(0.0, 0.0, 1.0))
+        .depth
+        .abs() as f32;
+    let visibility = ((facing - VIEW_CUBE_RING_EDGE_ON_FACING)
+        / (VIEW_CUBE_RING_FULL_FACING - VIEW_CUBE_RING_EDGE_ON_FACING))
+        .clamp(0.0, 1.0);
+    ViewCubeOrbitRing {
+        near,
+        far,
+        side_arrows,
+        visibility,
+    }
+}
+
+fn view_cube_ring_stroke(near: bool, visibility: f32) -> Stroke {
+    let alpha = if near { 190.0 } else { 70.0 };
+    Stroke::new(
+        1.0,
+        translucent(
+            Color32::from_rgb(148, 158, 170),
+            (alpha * visibility).round().clamp(0.0, 255.0) as u8,
+        ),
+    )
+}
+
+/// Whether a ring segment runs through a face label, which stays readable.
+fn segment_touches(segment: [egui::Pos2; 2], rects: &[egui::Rect]) -> bool {
+    let midpoint = segment[0] + (segment[1] - segment[0]) * 0.5;
+    rects.iter().any(|rect| {
+        rect.contains(segment[0]) || rect.contains(segment[1]) || rect.contains(midpoint)
+    })
+}
+
+/// One turn arrow: a filled triangle pointing along `direction`.
+fn paint_view_cube_arrowhead(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    direction: egui::Vec2,
+    fill: Color32,
+) {
+    let tip = center + direction * 9.0;
+    let back = center - direction * 3.0;
+    let flank = egui::vec2(-direction.y, direction.x) * 6.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, back + flank, back - flank],
+        fill,
+        Stroke::NONE,
+    ));
+}
+
+/// The face a turn arrow reaches: the one the cube draws on that side of
+/// itself. Among the faces whose outward normal leans that way on screen, a
+/// face the viewer can see counts in full and one round the back at four
+/// fifths, so from an oblique view the side arrows name the faces in the
+/// picture rather than the hidden ones leaning the same way, while the
+/// bottom, which nothing in the picture leans toward as squarely, stays the
+/// down arrow's. A square-on view has one candidate per side and the
+/// weighting changes nothing there; the face already in front leans no way
+/// at all and is never offered, from any view.
 fn view_cube_arrow_target(view: ViewState, direction: egui::Vec2) -> Option<StandardView> {
-    let nearest = view.nearest_standard_view();
     StandardView::ALL
         .into_iter()
-        .filter(|face| *face != nearest)
         .filter_map(|face| {
             let projected = view.project_direction(face.outward_normal());
             let along = projected.coordinates[0] as f32 * direction.x
                 + projected.coordinates[1] as f32 * direction.y;
-            (along > 0.35).then_some((face, along))
+            let weight = if projected.depth > 1.0e-6 { 1.0 } else { 0.8 };
+            (along > 0.35).then_some((face, along * weight))
         })
         .max_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(face, _)| face)
@@ -22255,21 +22443,53 @@ mod view_cube_arrow_tests {
         }
     }
 
-    /// An arrow that would barely turn the model is not offered at all: from
-    /// an isometric view every face is oblique, and the arrows must still
-    /// name distinct faces rather than repeating the nearest one.
+    /// An arrow that would barely turn the model is not offered at all: the
+    /// face already facing the viewer leans no way on screen, so no arrow
+    /// names it, from any square-on view.
     #[test]
     fn arrows_never_offer_the_face_already_in_front() {
+        for from in StandardView::ALL {
+            let mut view = ViewState::default();
+            view.set_standard_view(from);
+            for (name, direction) in VIEW_CUBE_ARROWS {
+                assert_ne!(
+                    view_cube_arrow_target(view, direction),
+                    Some(from),
+                    "the {name} arrow from {} points at the face already facing the viewer",
+                    from.label()
+                );
+            }
+        }
+    }
+
+    /// From the isometric view, which looks down on the top face and two
+    /// side faces, the side arrows name those two side faces rather than the
+    /// hidden ones leaning the same way, up names the top, down the bottom,
+    /// and the four are four different faces.
+    #[test]
+    fn oblique_arrows_prefer_the_faces_in_view() {
         let view = ViewState::default();
-        let nearest = view.nearest_standard_view();
-        for (_, direction) in VIEW_CUBE_ARROWS {
-            let target = view_cube_arrow_target(view, direction);
-            assert_ne!(
-                target,
-                Some(nearest),
-                "an arrow should never point at the face already facing the viewer"
+        let mut reached = BTreeMap::new();
+        for (name, direction) in VIEW_CUBE_ARROWS {
+            let target = view_cube_arrow_target(view, direction)
+                .unwrap_or_else(|| panic!("the isometric view should offer a {name} turn"));
+            reached.insert(name, target);
+        }
+        assert_eq!(reached["top"], StandardView::Top);
+        assert_eq!(reached["bottom"], StandardView::Bottom);
+        for name in ["left", "right"] {
+            let target = reached[name];
+            assert!(
+                view.project_direction(target.outward_normal()).depth > 1.0e-6,
+                "the {name} arrow reached {}, which the isometric view does not draw",
+                target.label()
             );
         }
+        let distinct = reached
+            .values()
+            .map(|face| face.label())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(distinct.len(), 4, "{reached:?}");
     }
 
     #[test]
@@ -22288,6 +22508,93 @@ mod view_cube_arrow_tests {
         }
         assert!((view.yaw - initial_yaw).abs() > 0.01);
         assert!((view.pitch - initial_pitch).abs() > 0.01);
+    }
+}
+
+/// The orbit ring the turn arrows ride: drawn with the cube's projection, so
+/// it is a line square-on, a circle from above and an ellipse between.
+#[cfg(test)]
+mod view_cube_ring_tests {
+    use super::*;
+
+    const SCALE: f32 = 22.0;
+
+    fn center() -> egui::Pos2 {
+        egui::pos2(100.0, 100.0)
+    }
+
+    fn every_point(ring: &ViewCubeOrbitRing) -> impl Iterator<Item = egui::Pos2> + '_ {
+        ring.near.iter().chain(&ring.far).flatten().copied()
+    }
+
+    #[test]
+    fn square_on_the_ring_is_edge_on_and_the_arrows_point_out_sideways() {
+        let mut view = ViewState::default();
+        view.set_standard_view(StandardView::Front);
+        let ring = view_cube_orbit_ring(view, center(), SCALE);
+        for point in every_point(&ring) {
+            assert!((point.y - center().y).abs() < 0.5, "{point:?}");
+        }
+        assert_eq!(ring.visibility, 0.0, "edge-on, the ring is not drawn");
+        let [left, right] = ring.side_arrows;
+        assert!(left.0.x < center().x - 30.0, "{left:?}");
+        assert!(right.0.x > center().x + 30.0, "{right:?}");
+        assert!(left.1.x < -0.99 && right.1.x > 0.99, "{left:?} {right:?}");
+    }
+
+    #[test]
+    fn from_above_the_ring_is_a_circle_with_the_arrows_in_its_lower_half() {
+        let mut view = ViewState::default();
+        view.set_standard_view(StandardView::Top);
+        let ring = view_cube_orbit_ring(view, center(), SCALE);
+        assert!(ring.far.is_empty(), "nothing is behind the cube from above");
+        assert_eq!(ring.visibility, 1.0, "from above the ring is a full circle");
+        let radius = VIEW_CUBE_RING_RADIUS * SCALE;
+        for point in every_point(&ring) {
+            assert!(
+                ((point - center()).length() - radius).abs() < 0.5,
+                "{point:?}"
+            );
+        }
+        let [left, right] = ring.side_arrows;
+        assert!(
+            left.0.y > center().y && right.0.y > center().y,
+            "{left:?} {right:?}"
+        );
+        assert!(
+            left.0.x < center().x && right.0.x > center().x,
+            "{left:?} {right:?}"
+        );
+        for (position, direction) in [left, right] {
+            let offset = position - center();
+            assert!(
+                offset.length() > radius && offset.length() < radius + 12.0,
+                "the arrows sit just outside the ring: {offset:?}"
+            );
+            let radial = offset.normalized();
+            assert!(
+                radial.dot(direction).abs() < 0.05,
+                "the arrows run along the ring"
+            );
+        }
+    }
+
+    #[test]
+    fn oblique_the_near_half_hangs_below_the_far_half() {
+        let ring = view_cube_orbit_ring(ViewState::default(), center(), SCALE);
+        assert!(!ring.near.is_empty() && !ring.far.is_empty());
+        assert!(
+            ring.visibility > 0.9,
+            "the isometric ring is open enough to read"
+        );
+        let mean_y = |segments: &[[egui::Pos2; 2]]| {
+            segments.iter().flatten().map(|point| point.y).sum::<f32>()
+                / (2 * segments.len()) as f32
+        };
+        assert!(mean_y(&ring.near) > mean_y(&ring.far));
+        let [left, right] = ring.side_arrows;
+        assert!(left.0.x < right.0.x);
+        assert!(left.1.x < 0.0 && right.1.x > 0.0, "{left:?} {right:?}");
     }
 }
 

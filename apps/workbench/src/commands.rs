@@ -28,15 +28,17 @@ use crate::command_icons::CommandIcon;
 pub enum RibbonTab {
     Model,
     Sketch,
+    Assembly,
     View,
     Parametric,
     Theme,
 }
 
 impl RibbonTab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Model,
         Self::Sketch,
+        Self::Assembly,
         Self::View,
         Self::Parametric,
         Self::Theme,
@@ -46,6 +48,7 @@ impl RibbonTab {
         match self {
             Self::Model => "Model",
             Self::Sketch => "Sketch",
+            Self::Assembly => "Assembly",
             Self::View => "View",
             Self::Parametric => "Parametric",
             Self::Theme => "Theme",
@@ -66,6 +69,7 @@ impl RibbonTab {
         match self {
             Self::Model => "Model mode",
             Self::Sketch => "Sketch mode",
+            Self::Assembly => "Assembly ribbon tab",
             Self::View => "View ribbon tab",
             Self::Parametric => "Parametric ribbon tab",
             Self::Theme => "Theme ribbon tab",
@@ -77,6 +81,7 @@ impl RibbonTab {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash)]
 pub enum RibbonGroupId {
     Create,
+    Place,
     Solid,
     Features,
     Boolean,
@@ -101,6 +106,7 @@ impl RibbonGroupId {
     pub const fn caption(self) -> &'static str {
         match self {
             Self::Create => "CREATE",
+            Self::Place => "PLACE",
             Self::Solid | Self::SketchSolid => "SOLID",
             Self::Features => "FEATURES",
             Self::Boolean => "BOOLEAN",
@@ -125,6 +131,7 @@ impl RibbonGroupId {
     pub const fn stable_key(self) -> &'static str {
         match self {
             Self::Create => "group_create",
+            Self::Place => "group_place",
             Self::Solid => "group_solid",
             Self::Features => "group_features",
             Self::Boolean => "group_boolean",
@@ -281,8 +288,8 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     command(
         ModelCommand::InsertPart,
         "create.insert_part",
-        RibbonTab::Model,
-        RibbonGroupId::Create,
+        RibbonTab::Assembly,
+        RibbonGroupId::Place,
         CommandIcon::Library,
         CommandSize::Large,
         "Insert part",
@@ -497,7 +504,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     command(
         ModelCommand::Move,
         "model.move",
-        RibbonTab::Model,
+        RibbonTab::Assembly,
         RibbonGroupId::Modify,
         CommandIcon::Move,
         CommandSize::Small,
@@ -509,7 +516,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     command(
         ModelCommand::Rotate,
         "model.rotate",
-        RibbonTab::Model,
+        RibbonTab::Assembly,
         RibbonGroupId::Modify,
         CommandIcon::Rotate,
         CommandSize::Small,
@@ -521,7 +528,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
     command(
         ModelCommand::Scale,
         "model.scale",
-        RibbonTab::Model,
+        RibbonTab::Assembly,
         RibbonGroupId::Modify,
         CommandIcon::Scale,
         CommandSize::Small,
@@ -862,6 +869,16 @@ pub fn groups_for_tab(tab: RibbonTab) -> Vec<(RibbonGroupId, Vec<&'static Comman
             Some((group, members)) if *group == descriptor.group => members.push(descriptor),
             _ => groups.push((descriptor.group, vec![descriptor])),
         }
+    }
+    // Placing a part starts with picking it and ends with looking at it, so
+    // the Select group rides along on the Assembly tab rather than sending
+    // the user back to Model for the pointer.
+    if tab == RibbonTab::Assembly {
+        groups.extend(
+            groups_for_tab(RibbonTab::Model)
+                .into_iter()
+                .filter(|(group, _)| *group == RibbonGroupId::Select),
+        );
     }
     groups
 }
