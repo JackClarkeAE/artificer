@@ -221,6 +221,10 @@ jobs:
             printf 'note: %s already exists; leaving it where it points.\n' "$RELEASE_TAG"
             exit 0
           fi
+          # An annotated tag carries a tagger, and a fresh runner has no git
+          # identity at all, so this has to say who is writing it.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$RELEASE_TAG" -m "Artificer ${RELEASE_TAG#v}"
           git push origin "refs/tags/$RELEASE_TAG"
       - name: Open the release as a draft
