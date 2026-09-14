@@ -8,12 +8,17 @@
 //! feature editors cannot disagree about what a number means.
 
 use std::fmt;
+use std::ops::RangeInclusive;
 
 use serde::{Deserialize, Serialize};
 
 /// A unit of length a person reads and types in. Kernel geometry stays in
 /// millimetres whatever this is set to.
+///
+/// Serialised in snake case (`millimetre`, `inch`), the spelling workspace
+/// files have always carried for the document unit.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LengthUnit {
     Micrometre,
     #[default]
@@ -44,6 +49,19 @@ impl LengthUnit {
             Self::Metre => "Metres (m)",
             Self::Inch => "Inches (in)",
             Self::Foot => "Feet (ft)",
+        }
+    }
+
+    /// The unit's plural name in running text: "in millimetres".
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Micrometre => "micrometres",
+            Self::Millimetre => "millimetres",
+            Self::Centimetre => "centimetres",
+            Self::Metre => "metres",
+            Self::Inch => "inches",
+            Self::Foot => "feet",
         }
     }
 
@@ -136,8 +154,7 @@ impl LengthUnit {
         let split = text
             .char_indices()
             .find(|(_, character)| {
-                !(character.is_ascii_digit()
-                    || matches!(character, '.' | '+' | '-' | 'e' | 'E'))
+                !(character.is_ascii_digit() || matches!(character, '.' | '+' | '-' | 'e' | 'E'))
             })
             .map_or(text.len(), |(index, _)| index);
         // `e` starts a suffix only when no digit follows it, so `1e3` is a
@@ -168,6 +185,106 @@ impl LengthUnit {
             "ft" | "'" | "foot" | "feet" => Self::Foot,
             _ => return None,
         })
+    }
+}
+
+impl LengthUnit {
+    /// How many decimals a fixed-width readout in this unit shows: two for
+    /// millimetres, as the sketch readouts always have, and what resolves
+    /// about as finely in the others.
+    #[must_use]
+    pub const fn readout_decimals(self) -> usize {
+        match self {
+            Self::Micrometre => 0,
+            Self::Millimetre => 2,
+            Self::Centimetre => 3,
+            Self::Metre => 4,
+            Self::Inch => 3,
+            Self::Foot => 4,
+        }
+    }
+
+    /// A fixed-width readout: `40.00 mm`, `1.575 in`. Zeros are kept so a
+    /// live value does not change width as it moves.
+    #[must_use]
+    pub fn format_readout(self, millimetres: f64) -> String {
+        if !millimetres.is_finite() {
+            return format!("— {}", self.suffix());
+        }
+        format!(
+            "{:.*} {}",
+            self.readout_decimals(),
+            self.from_millimetres(millimetres),
+            self.suffix()
+        )
+    }
+
+    /// An area in this unit squared: `12.5 mm²`, `0.0194 in²`.
+    #[must_use]
+    pub fn format_area(self, square_millimetres: f64) -> String {
+        if !square_millimetres.is_finite() {
+            return format!("— {}²", self.suffix());
+        }
+        let scale = self.millimetres_per_unit();
+        let value = square_millimetres / (scale * scale);
+        let text = format!("{value:.*}", self.decimals());
+        format!("{} {}²", trim_trailing_zeros(&text), self.suffix())
+    }
+
+    /// A volume in this unit cubed: `12.5 mm³`.
+    #[must_use]
+    pub fn format_volume(self, cubic_millimetres: f64) -> String {
+        if !cubic_millimetres.is_finite() {
+            return format!("— {}³", self.suffix());
+        }
+        let scale = self.millimetres_per_unit();
+        let value = cubic_millimetres / (scale * scale * scale);
+        let text = format!("{value:.*}", self.decimals());
+        format!("{} {}³", trim_trailing_zeros(&text), self.suffix())
+    }
+
+    /// Reads a typed entry that is either a number with an optional unit
+    /// symbol, or anything else `evaluate` can turn into a number in this
+    /// unit: an arithmetic expression, a variable name. Returns millimetres.
+    /// The error is the one the number reading gave, so a bad expression is
+    /// reported as the not-a-number it also is.
+    pub fn parse_entry(
+        self,
+        text: &str,
+        evaluate: impl FnOnce(&str) -> Option<f64>,
+    ) -> Result<f64, LengthParseError> {
+        match self.parse(text) {
+            Ok(millimetres) => Ok(millimetres),
+            Err(LengthParseError::Empty) => Err(LengthParseError::Empty),
+            Err(error) => evaluate(text.trim())
+                .filter(|value| value.is_finite())
+                .map(|value| self.to_millimetres(value))
+                .ok_or(error),
+        }
+    }
+
+    /// A drag value over a millimetre quantity that shows and reads this
+    /// unit; a typed suffix still wins, so `10mm` means the same in an inch
+    /// document. Chain the range and speed as usual; both are in
+    /// millimetres, the quantity's own.
+    pub fn drag_value<'a>(self, millimetres: &'a mut f64) -> egui::DragValue<'a> {
+        egui::DragValue::new(millimetres)
+            .custom_formatter(move |value, _| self.format_value(value))
+            .custom_parser(move |text| self.parse(text).ok())
+            .suffix(format!(" {}", self.suffix()))
+    }
+
+    /// A slider over a millimetre quantity, shown and read in this unit. The
+    /// range is in millimetres, the quantity's own.
+    pub fn slider<'a>(
+        self,
+        millimetres: &'a mut f64,
+        range: RangeInclusive<f64>,
+    ) -> egui::Slider<'a> {
+        egui::Slider::new(millimetres, range)
+            .custom_formatter(move |value, _| self.format_value(value))
+            .custom_parser(move |text| self.parse(text).ok())
+            .suffix(format!(" {}", self.suffix()))
     }
 }
 
@@ -288,7 +405,10 @@ mod tests {
 
     #[test]
     fn bad_input_says_what_is_wrong() {
-        assert_eq!(LengthUnit::Millimetre.parse(""), Err(LengthParseError::Empty));
+        assert_eq!(
+            LengthUnit::Millimetre.parse(""),
+            Err(LengthParseError::Empty)
+        );
         assert_eq!(
             LengthUnit::Millimetre.parse("abc"),
             Err(LengthParseError::NotANumber(String::new()))
@@ -302,5 +422,57 @@ mod tests {
             Err(LengthParseError::UnknownUnit("e".to_owned()))
         );
         assert!(LengthUnit::Millimetre.parse("1e999").is_err());
+    }
+}
+
+#[cfg(test)]
+mod readout_and_entry_tests {
+    use super::*;
+
+    #[test]
+    fn readouts_keep_their_width_and_areas_and_volumes_carry_their_power() {
+        assert_eq!(LengthUnit::Millimetre.format_readout(40.0), "40.00 mm");
+        assert_eq!(LengthUnit::Inch.format_readout(40.0), "1.575 in");
+        assert_eq!(LengthUnit::Millimetre.format_area(12.5), "12.5 mm²");
+        assert_eq!(LengthUnit::Centimetre.format_area(250.0), "2.5 cm²");
+        assert_eq!(LengthUnit::Millimetre.format_volume(1000.0), "1000 mm³");
+        assert_eq!(LengthUnit::Centimetre.format_volume(1000.0), "1 cm³");
+        assert_eq!(LengthUnit::Inch.format_volume(25.4 * 25.4 * 25.4), "1 in³");
+        assert_eq!(LengthUnit::Millimetre.format_area(f64::NAN), "— mm²");
+    }
+
+    #[test]
+    fn an_entry_is_a_number_first_and_an_expression_second() {
+        let evaluate = |text: &str| match text {
+            "width / 2" => Some(20.0),
+            _ => None,
+        };
+        assert_eq!(LengthUnit::Inch.parse_entry("2", evaluate), Ok(50.8));
+        assert_eq!(LengthUnit::Inch.parse_entry("10mm", evaluate), Ok(10.0));
+        // The expression's answer is in the field's unit, like a bare number.
+        assert_eq!(
+            LengthUnit::Inch.parse_entry("width / 2", evaluate),
+            Ok(508.0)
+        );
+        assert_eq!(
+            LengthUnit::Inch.parse_entry("", evaluate),
+            Err(LengthParseError::Empty)
+        );
+        assert_eq!(
+            LengthUnit::Inch.parse_entry("height / 2", evaluate),
+            Err(LengthParseError::NotANumber(String::new()))
+        );
+    }
+
+    #[test]
+    fn the_wire_spelling_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LengthUnit::Millimetre).unwrap(),
+            "\"millimetre\""
+        );
+        assert_eq!(
+            serde_json::from_str::<LengthUnit>("\"inch\"").unwrap(),
+            LengthUnit::Inch
+        );
     }
 }

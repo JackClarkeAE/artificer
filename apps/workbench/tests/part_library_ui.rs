@@ -99,9 +99,7 @@ fn unresolved_parameter_blocks_add_without_mutating_the_document() {
     );
     assert!(
         harness
-            .query_all_by_label(
-                "Length is required. Enter a value in millimetres before adding this part."
-            )
+            .query_all_by_label("Length is required. Enter a value before adding this part.")
             .next()
             .is_some()
     );

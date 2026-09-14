@@ -494,10 +494,11 @@ impl KernelLabApp {
                         .color(theme::muted()),
                 );
                 let mut depth = self.project_3d_body_depth;
-                let slider = egui::DragValue::new(&mut depth)
+                let slider = self
+                    .length_unit()
+                    .drag_value(&mut depth)
                     .range(0.0..=500.0)
-                    .speed(1.0)
-                    .suffix(" mm");
+                    .speed(1.0);
                 if ui
                     .add(slider)
                     .on_hover_text(
@@ -538,7 +539,7 @@ impl KernelLabApp {
             ui.horizontal(|ui| {
                 let mut offset = section.offset;
                 if ui
-                    .add(egui::DragValue::new(&mut offset).speed(0.5).suffix(" mm"))
+                    .add(self.length_unit().drag_value(&mut offset).speed(0.5))
                     .on_hover_text("Where the cut lies along the plane's normal.")
                     .changed()
                     && offset.is_finite()

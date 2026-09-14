@@ -120,92 +120,11 @@ const BOOLEAN_TOOL_TINT: egui::Color32 = egui::Color32::from_rgb(222, 104, 30);
 const ARTIFICER_WORKSPACE_FORMAT: &str = "artificer.workspace";
 const ARTIFICER_WORKSPACE_VERSION: u32 = 1;
 
-/// User-facing document length unit. Kernel and persisted geometry remain in
-/// canonical millimetres; this setting controls entry/readout conversion.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DisplayLengthUnit {
-    Micrometre,
-    #[default]
-    Millimetre,
-    Centimetre,
-    Metre,
-    Inch,
-    Foot,
-}
-
-impl DisplayLengthUnit {
-    const ALL: [Self; 6] = [
-        Self::Micrometre,
-        Self::Millimetre,
-        Self::Centimetre,
-        Self::Metre,
-        Self::Inch,
-        Self::Foot,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Micrometre => "Micrometres (µm)",
-            Self::Millimetre => "Millimetres (mm)",
-            Self::Centimetre => "Centimetres (cm)",
-            Self::Metre => "Metres (m)",
-            Self::Inch => "Inches (in)",
-            Self::Foot => "Feet (ft)",
-        }
-    }
-
-    const fn symbol(self) -> &'static str {
-        match self {
-            Self::Micrometre => "µm",
-            Self::Millimetre => "mm",
-            Self::Centimetre => "cm",
-            Self::Metre => "m",
-            Self::Inch => "in",
-            Self::Foot => "ft",
-        }
-    }
-
-    const fn millimetres_per_unit(self) -> f64 {
-        match self {
-            Self::Micrometre => 0.001,
-            Self::Millimetre => 1.0,
-            Self::Centimetre => 10.0,
-            Self::Metre => 1_000.0,
-            Self::Inch => 25.4,
-            Self::Foot => 304.8,
-        }
-    }
-
-    fn convert_from_millimetres(self, value: f64) -> f64 {
-        value / self.millimetres_per_unit()
-    }
-
-    fn format_length(self, value_mm: f64) -> String {
-        let value = self.convert_from_millimetres(value_mm);
-        let precision = if value.abs() >= 1_000.0 { 2 } else { 3 };
-        format!("{value:.precision$} {}", self.symbol())
-    }
-
-    fn format_area(self, value_mm2: f64) -> String {
-        let scale = self.millimetres_per_unit();
-        let value = value_mm2 / (scale * scale);
-        format!("{value:.3} {}²", self.symbol())
-    }
-}
-
-impl From<DisplayLengthUnit> for units::LengthUnit {
-    fn from(unit: DisplayLengthUnit) -> Self {
-        match unit {
-            DisplayLengthUnit::Micrometre => Self::Micrometre,
-            DisplayLengthUnit::Millimetre => Self::Millimetre,
-            DisplayLengthUnit::Centimetre => Self::Centimetre,
-            DisplayLengthUnit::Metre => Self::Metre,
-            DisplayLengthUnit::Inch => Self::Inch,
-            DisplayLengthUnit::Foot => Self::Foot,
-        }
-    }
-}
+/// The document's length unit: what every readout is formatted in and every
+/// typed length is read in, unless it carries a suffix of its own. Kernel
+/// and persisted geometry stay in millimetres. The name is the one the
+/// workspace format and the tests have always used for `units::LengthUnit`.
+pub type DisplayLengthUnit = units::LengthUnit;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DocumentSettings {
@@ -265,6 +184,10 @@ struct UserPreferencesFile {
     /// `Some` when the user overrode the profile's wheel-zoom sense.
     #[serde(default)]
     navigation_invert_zoom: Option<bool>,
+    /// The unit a new document opens in. Absent in files written before
+    /// 0.98.1, which means millimetres, as it always did.
+    #[serde(default)]
+    length_unit: Option<units::LengthUnit>,
 }
 
 const USER_PREFERENCES_VERSION: u32 = 1;
@@ -2057,7 +1980,7 @@ fn swept_angle(phase: f64, limits: Option<(f64, f64)>) -> f64 {
 }
 
 /// The one line a sweep leaves in the status bar.
-fn sweep_status(report: &SweepReport) -> String {
+fn sweep_status(report: &SweepReport, unit: units::LengthUnit) -> String {
     if let Some(collision) = report.collision.as_ref() {
         return format!(
             "Collision at step {} of {}: {} ↔ {}",
@@ -2083,8 +2006,10 @@ fn sweep_status(report: &SweepReport) -> String {
             || format!("No contact over {travel}"),
             |tightest| {
                 format!(
-                    "Clear over {travel}; closest {:.3} mm between {} and {}",
-                    tightest.distance, tightest.a, tightest.b
+                    "Clear over {travel}; closest {} between {} and {}",
+                    unit.format(tightest.distance),
+                    tightest.a,
+                    tightest.b
                 )
             },
         ),
@@ -2096,7 +2021,10 @@ fn sweep_status(report: &SweepReport) -> String {
 /// Under a profile it is the fit's answer, because that is the question
 /// that was asked, and it names the pair the fit fails worst on. Without
 /// one there is no fit to report, only the measurement.
-fn study_status(report: &artificer_kernel::api::analysis::InterferenceReport) -> String {
+fn study_status(
+    report: &artificer_kernel::api::analysis::InterferenceReport,
+    unit: units::LengthUnit,
+) -> String {
     if let Some(profile) = report.profile.as_ref() {
         return match (report.failing, report.worst_fit()) {
             (0, _) if report.loose == 0 => format!("{}: every pair fits", profile.name),
@@ -2105,12 +2033,12 @@ fn study_status(report: &artificer_kernel::api::analysis::InterferenceReport) ->
                 profile.name, report.loose
             ),
             (failing, Some(worst)) => format!(
-                "{}: {failing} of {} pairs too close · worst {} \u{2194} {} at {:.3} mm",
+                "{}: {failing} of {} pairs too close · worst {} \u{2194} {} at {}",
                 profile.name,
                 report.pairs.len(),
                 worst.a,
                 worst.b,
-                worst.distance
+                unit.format(worst.distance)
             ),
             (failing, None) => format!("{}: {failing} pairs too close", profile.name),
         };
@@ -2120,7 +2048,7 @@ fn study_status(report: &artificer_kernel::api::analysis::InterferenceReport) ->
             "No interference across {} pairs{}",
             report.pairs.len(),
             report.tightest.as_ref().map_or(String::new(), |tightest| {
-                format!("; tightest {:.3} mm", tightest.distance)
+                format!("; tightest {}", unit.format(tightest.distance))
             })
         ),
         (0, touching) => format!("{touching} pairs touch; none overlap"),
@@ -2405,6 +2333,9 @@ pub struct KernelLabApp {
     /// Overrides the profile's wheel sense when the user flips the checkbox;
     /// `None` follows the profile default.
     navigation_invert_zoom: Option<bool>,
+    /// The unit a new document opens in: a user preference, set from the
+    /// document properties beside the document's own unit.
+    preferred_length_unit: units::LengthUnit,
     about_open: bool,
     updates: update::UpdateService,
     stl_export_path_text: String,
@@ -2627,6 +2558,7 @@ impl Default for KernelLabApp {
             user_preferences_path: None,
             navigation_preference: navigation::NavigationPreset::default(),
             navigation_invert_zoom: None,
+            preferred_length_unit: units::LengthUnit::Millimetre,
             about_open: false,
             updates: update::UpdateService::new(),
             stl_export_path_text,
@@ -3163,7 +3095,24 @@ impl KernelLabApp {
     /// stays in millimetres; this is the person's unit, not the model's.
     #[must_use]
     pub fn length_unit(&self) -> units::LengthUnit {
-        self.document_settings.length_unit.into()
+        self.document_settings.length_unit
+    }
+
+    /// The unit the sketch canvas is currently reading and showing lengths
+    /// in; follows the document's, one frame behind at most. For tests.
+    #[must_use]
+    pub fn sketch_length_unit(&self) -> units::LengthUnit {
+        self.sketch.length_unit()
+    }
+
+    /// The part library's Length field as it currently reads, in
+    /// millimetres, or `None` while it holds nothing usable. For tests.
+    #[must_use]
+    pub fn part_library_length_mm(&self) -> Option<f64> {
+        match self.part_library.eligibility() {
+            PartInsertionEligibility::Ready { length_mm, .. } => Some(length_mm),
+            _ => None,
+        }
     }
 
     /// Portable Artificer workspace envelope. Unlike the raw model archive used
@@ -4261,6 +4210,9 @@ impl KernelLabApp {
         self.clear_model_entity_selection();
         self.body_pivot = None;
         self.sketch = SketchCanvasState::default();
+        // A new document opens in the unit the user chose for new documents.
+        self.document_settings.length_unit = self.preferred_length_unit;
+        self.sketch.set_length_unit(self.preferred_length_unit);
         self.sketch_support = SketchSupport::default();
         self.active_sketch_index = None;
         self.sketch_revision = 0;
@@ -4956,7 +4908,7 @@ impl KernelLabApp {
         match geometry.as_slice() {
             [(selection, _, length)] => Some(viewport::DocumentMeasurement::Edge {
                 selection: *selection,
-                label: format!("L {}", unit.format_length(*length)),
+                label: format!("L {}", unit.format(*length)),
             }),
             [(first, first_segments, _), (second, second_segments, _)] => {
                 let distance = first_segments
@@ -4974,8 +4926,8 @@ impl KernelLabApp {
                         first: *first,
                         second: *second,
                         label: angle.map_or_else(
-                            || format!("D {}", unit.format_length(distance)),
-                            |angle| format!("D {} · ∠ {angle:.3}°", unit.format_length(distance)),
+                            || format!("D {}", unit.format(distance)),
+                            |angle| format!("D {} · ∠ {angle:.3}°", unit.format(distance)),
                         ),
                     })
             }
@@ -10224,7 +10176,7 @@ impl KernelLabApp {
             self.clearance_profile.as_ref(),
             self.heat_map.as_ref(),
         );
-        self.document_status = Some(study_status(&report));
+        self.document_status = Some(study_status(&report, self.length_unit()));
         self.interference = Some(report);
     }
 
@@ -10239,9 +10191,10 @@ impl KernelLabApp {
         if let Some(heat_map) = self.heat_map.as_mut() {
             heat_map.palette = heat_palette(profile.as_ref(), &heat_map.fields);
         }
+        let unit = self.length_unit();
         if let Some(report) = self.interference.as_mut() {
             report.judge(profile);
-            self.document_status = Some(study_status(report));
+            self.document_status = Some(study_status(report, unit));
         } else {
             self.document_status = Some(match self.clearance_profile.as_ref() {
                 Some(profile) => format!("{} will judge the next study", profile.name),
@@ -10402,7 +10355,7 @@ impl KernelLabApp {
             self.clearance_profile.as_ref(),
             self.heat_map.as_ref(),
         );
-        self.document_status = Some(sweep_status(&sweep.report));
+        self.document_status = Some(sweep_status(&sweep.report, self.length_unit()));
         self.sweep = Some(sweep.report);
     }
 
@@ -10635,8 +10588,10 @@ impl KernelLabApp {
         if let Some(worst) = report.worst_fit() {
             ui.label(
                 RichText::new(format!(
-                    "Worst: {} ↔ {} at {:.3} mm",
-                    worst.a, worst.b, worst.distance
+                    "Worst: {} ↔ {} at {}",
+                    worst.a,
+                    worst.b,
+                    self.length_unit().format(worst.distance)
                 ))
                 .small()
                 .color(theme::bad()),
@@ -10656,6 +10611,7 @@ impl KernelLabApp {
                 .cmp(&rank(right.state))
                 .then(left.distance.total_cmp(&right.distance))
         });
+        let unit = self.length_unit();
         for pair in &pairs {
             let (colour, reading) = match pair.state {
                 ClearanceState::Interfering => (
@@ -10667,11 +10623,14 @@ impl KernelLabApp {
                                 |code| format!("overlaps · {code}"),
                             )
                         },
-                        |volume| format!("overlaps {volume:.3} mm³"),
+                        |volume| format!("overlaps {}", unit.format_volume(volume)),
                     ),
                 ),
                 ClearanceState::Touching => (theme::accent(), "touching".to_owned()),
-                ClearanceState::Clear => (theme::muted(), format!("{:.3} mm apart", pair.distance)),
+                ClearanceState::Clear => (
+                    theme::muted(),
+                    format!("{} apart", unit.format(pair.distance)),
+                ),
             };
             // The verdict overrides the measurement's own colour, because
             // under a fit it is the verdict that is being read.
@@ -10799,8 +10758,8 @@ impl KernelLabApp {
         if let Some(tightest) = sweep.tightest() {
             ui.label(
                 RichText::new(format!(
-                    "Closest {:.3} mm between {} and {}, at {:.1}°",
-                    tightest.distance,
+                    "Closest {} between {} and {}, at {:.1}°",
+                    self.length_unit().format(tightest.distance),
                     tightest.a,
                     tightest.b,
                     tightest
@@ -12801,11 +12760,11 @@ impl KernelLabApp {
                 ui.label(RichText::new(scalar.label).small().color(theme::muted()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let widget = match scalar.kind {
-                        feature_editor::ScalarKind::Length => egui::DragValue::new(&mut shown)
+                        feature_editor::ScalarKind::Length => self
+                            .length_unit()
+                            .drag_value(&mut shown)
                             .speed(0.1)
-                            .max_decimals(4)
-                            .range(0.0001..=f64::MAX)
-                            .suffix(" mm"),
+                            .range(0.0001..=f64::MAX),
                         feature_editor::ScalarKind::Count => egui::DragValue::new(&mut shown)
                             .speed(0.1)
                             .max_decimals(0)
@@ -12904,16 +12863,7 @@ impl KernelLabApp {
 
         let properties = self.mass_properties();
         let unit = self.document_settings.length_unit;
-        let per_unit = unit.millimetres_per_unit();
-        theme::property_row(
-            ui,
-            "Volume",
-            &format!(
-                "{:.3} {}³",
-                properties.volume / per_unit.powi(3),
-                unit.symbol()
-            ),
-        );
+        theme::property_row(ui, "Volume", &unit.format_volume(properties.volume));
         // The caveat belongs beside the number it qualifies, not in a log.
         if let Some(reason) = self.approximated_body_reason() {
             ui.label(
@@ -12950,11 +12900,11 @@ impl KernelLabApp {
                     ui,
                     "Centre of mass",
                     &format!(
-                        "[{:.3}, {:.3}, {:.3}] {}",
-                        Self::display_coordinate(centre[0] / per_unit),
-                        Self::display_coordinate(centre[1] / per_unit),
-                        Self::display_coordinate(centre[2] / per_unit),
-                        unit.symbol()
+                        "[{}, {}, {}] {}",
+                        unit.format_value(Self::display_coordinate(centre[0])),
+                        unit.format_value(Self::display_coordinate(centre[1])),
+                        unit.format_value(Self::display_coordinate(centre[2])),
+                        unit.suffix()
                     ),
                 );
                 // Same rule as the approximation caveat above: the warning
@@ -13922,6 +13872,12 @@ impl KernelLabApp {
                     self.navigation_preference = navigation;
                 }
                 self.navigation_invert_zoom = preferences.navigation_invert_zoom;
+                if let Some(unit) = preferences.length_unit {
+                    self.preferred_length_unit = unit;
+                    // Preferences load into a fresh, blank document, which
+                    // is exactly the document the preference is for.
+                    self.document_settings.length_unit = unit;
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -13940,6 +13896,7 @@ impl KernelLabApp {
             version: USER_PREFERENCES_VERSION,
             navigation: Some(self.navigation_preference),
             navigation_invert_zoom: self.navigation_invert_zoom,
+            length_unit: Some(self.preferred_length_unit),
         };
         let Ok(text) = serde_json::to_string_pretty(&preferences) else {
             return;
@@ -14230,19 +14187,46 @@ impl KernelLabApp {
                                 );
                             }
                         });
-                    if previous != self.document_settings.length_unit {
+                    let current = self.document_settings.length_unit;
+                    if previous != current {
                         self.document_status = Some(format!(
-                            "Display units changed to {}. Kernel geometry remains canonical millimetres.",
-                            self.document_settings.length_unit.label()
+                            "Lengths are now shown and typed in {}. Geometry and files stay in millimetres.",
+                            current.name()
                         ));
                     }
                     ui.label(
                         RichText::new(
-                            "Measurement readouts use this unit. Kernel geometry, current feature-entry fields, and interchange authority remain millimetres.",
+                            "Every readout and every typed length uses this unit; a typed value can carry its own suffix (10mm, 0.5in, 1e3um). Kernel geometry, files and interchange stay in millimetres.",
                         )
                         .small()
                         .color(theme::muted()),
                     );
+                    ui.horizontal(|ui| {
+                        let is_default = self.preferred_length_unit == current;
+                        let response = ui.add_enabled(
+                            !is_default,
+                            egui::Button::new(RichText::new("Use for new documents").small()),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                !is_default,
+                                "Use this unit for new documents",
+                            )
+                        });
+                        if response.clicked() {
+                            self.preferred_length_unit = current;
+                            self.save_user_preferences();
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "New documents open in {}.",
+                                self.preferred_length_unit.name()
+                            ))
+                            .small()
+                            .color(theme::muted()),
+                        );
+                    });
 
                     ui.separator();
                     ui.label(RichText::new("ARTIFICER DOCUMENT").small().color(theme::muted()));
@@ -15118,6 +15102,7 @@ impl KernelLabApp {
                 } else {
                     "Radius"
                 }).small().color(theme::muted()));
+                let unit = self.length_unit();
                 let slider = ui.add(
                     egui::Slider::new(&mut self.edge_finish_distance, 0.01..=10.0)
                         .logarithmic(true)
@@ -15125,25 +15110,25 @@ impl KernelLabApp {
                         .text("Distance"),
                 );
                 if slider.changed() {
-                    self.edge_finish_distance_text = format!("{:.3}", self.edge_finish_distance);
+                    self.edge_finish_distance_text = unit.format_value(self.edge_finish_distance);
                 }
                 let editor = ui.add(
                     egui::TextEdit::singleline(&mut self.edge_finish_distance_text)
                         .id(egui::Id::new("edge_finish_dimension"))
                         .desired_width(112.0)
                         .font(FontId::monospace(12.0))
-                        .hint_text("Distance mm"),
+                        .hint_text(format!("Distance {}", unit.suffix())),
                 );
+                // Read in the document unit, or the unit the text carries.
                 if editor.changed()
-                    && let Ok(value) = self.edge_finish_distance_text.trim().parse::<f64>()
-                    && value.is_finite()
+                    && let Ok(value) = unit.parse(&self.edge_finish_distance_text)
                     && value > 0.0
                 {
                     self.edge_finish_distance = value;
                 }
                 editor.on_hover_text("Type the exact value; Tab moves to the next feature option.");
                 ui.label(
-                    RichText::new(format!("{:.3} mm", self.edge_finish_distance))
+                    RichText::new(unit.format(self.edge_finish_distance))
                         .monospace()
                         .color(theme::good()),
                 );
@@ -15448,15 +15433,16 @@ impl KernelLabApp {
                                 .color(theme::muted()),
                         );
                     }
+                    let length_unit = self.length_unit();
                     for readout in readouts {
-                        let unit = if matches!(
+                        let text = if matches!(
                             readout.kind,
                             SketchDimensionKind::AngleDegrees
                                 | SketchDimensionKind::SweepDegrees
                         ) {
-                            "°"
+                            format!("{:.3}°", readout.value)
                         } else {
-                            " mm"
+                            length_unit.format(readout.value)
                         };
                         let active = self.sketch.active_dimension() == Some(readout.kind);
                         ui.horizontal(|ui| {
@@ -15469,7 +15455,7 @@ impl KernelLabApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new(format!("{:.3}{unit}", readout.value))
+                                        RichText::new(text)
                                             .monospace()
                                             .color(if readout.locked { theme::good() } else { theme::text() }),
                                     );
@@ -15622,10 +15608,10 @@ impl KernelLabApp {
                     let mut changed = ui.checkbox(&mut settings.enabled, "Enable snapping").changed();
                     changed |= ui
                         .add(
-                            egui::Slider::new(&mut settings.grid_step, 0.05..=2.0)
+                            self.length_unit()
+                                .slider(&mut settings.grid_step, 0.05..=2.0)
                                 .logarithmic(true)
-                                .text("Grid step")
-                                .suffix(" mm"),
+                                .text("Grid step"),
                         )
                         .changed();
                     if changed {
@@ -15898,8 +15884,9 @@ impl KernelLabApp {
                         if let Some((selection, area)) = measured_face {
                             ui.label(
                                 RichText::new(format!(
-                                    "Face #{} · area {:.3} mm²",
-                                    selection.face.entity, area
+                                    "Face #{} · area {}",
+                                    selection.face.entity,
+                                    self.length_unit().format_area(area)
                                 ))
                                 .color(theme::good())
                                 .strong(),
@@ -15910,10 +15897,10 @@ impl KernelLabApp {
                         {
                             ui.label(
                                 RichText::new(format!(
-                                    "Edge {} · #{} · length {:.3} mm",
+                                    "Edge {} · #{} · length {}",
                                     index + 1,
                                     selection.edge.entity,
-                                    length
+                                    self.length_unit().format(*length)
                                 ))
                                 .color(theme::text()),
                             );
@@ -15931,7 +15918,10 @@ impl KernelLabApp {
                                 .fold(f64::INFINITY, f64::min);
                             ui.separator();
                             ui.label(
-                                RichText::new(format!("Minimum distance  {distance:.3} mm"))
+                                RichText::new(format!(
+                                    "Minimum distance  {}",
+                                    self.length_unit().format(distance)
+                                ))
                                     .color(theme::good())
                                     .strong(),
                             );
@@ -16316,12 +16306,12 @@ impl KernelLabApp {
         ui.add_enabled_ui(editable, |ui| {
             intent_changed |= ui
                 .add(
-                    egui::DragValue::new(&mut self.extrusion_distance)
+                    self.document_settings
+                        .length_unit
+                        .drag_value(&mut self.extrusion_distance)
                         .speed(0.1)
                         .range(-1_000.0..=1_000.0)
-                        .max_decimals(3)
-                        .prefix("Distance ")
-                        .suffix(" mm"),
+                        .prefix("Distance "),
                 )
                 .changed();
             if !face_supported {
@@ -16367,7 +16357,8 @@ impl KernelLabApp {
                     }
                     Some(value) => {
                         self.document_status = Some(format!(
-                            "Distance expression evaluates to {value:.3} mm, outside the supported range"
+                            "Distance expression evaluates to {}, outside the supported range",
+                            self.length_unit().format(value)
                         ));
                     }
                     None => {
@@ -16408,13 +16399,13 @@ impl KernelLabApp {
             theme::property_row_colored(
                 ui,
                 "Volume",
-                &format!("{:.3} mm³", measures.volume),
+                &self.length_unit().format_volume(measures.volume),
                 theme::accent(),
             );
             theme::property_row(
                 ui,
                 "Surface area",
-                &format!("{:.3} mm²", measures.surface_area),
+                &self.length_unit().format_area(measures.surface_area),
             );
             if let Some(centroid) = measures.centroid {
                 theme::property_row(
@@ -16559,12 +16550,12 @@ impl KernelLabApp {
         ui.add_enabled_ui(editable && support.is_some(), |ui| {
             intent_changed |= ui
                 .add(
-                    egui::DragValue::new(&mut self.extrusion_distance)
+                    self.document_settings
+                        .length_unit
+                        .drag_value(&mut self.extrusion_distance)
                         .speed(0.1)
                         .range(-1_000.0..=1_000.0)
-                        .max_decimals(3)
-                        .prefix("Distance ")
-                        .suffix(" mm"),
+                        .prefix("Distance "),
                 )
                 .changed();
         });
@@ -18596,11 +18587,15 @@ impl eframe::App for KernelLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sketch_dimension_keys = DimensionKeyClaims::default();
         // Dimension and recipe fields accept document variables by name, so
-        // the canvas carries the current evaluated table.
+        // the canvas carries the current evaluated table, with lengths in the
+        // document unit so that `plate_width / 2` means what `40 / 2` does.
+        let unit = self.length_unit();
+        self.sketch.set_length_unit(unit);
+        self.part_library.set_length_unit(unit);
         let named_values = if self.document.parameters().is_empty() {
             BTreeMap::new()
         } else {
-            self.evaluated_variable_values()
+            self.evaluated_variable_values(unit)
         };
         self.sketch.set_named_values(named_values);
         let operation_at_frame_start = self.pending_operation;
@@ -27234,19 +27229,39 @@ mod user_preference_tests {
             version: USER_PREFERENCES_VERSION,
             navigation: Some(navigation::NavigationPreset::SolidWorks),
             navigation_invert_zoom: Some(false),
+            length_unit: Some(units::LengthUnit::Inch),
         })
         .unwrap();
+        assert!(stored.contains("\"inch\""), "{stored}");
         let loaded: UserPreferencesFile = serde_json::from_str(&stored).unwrap();
         assert_eq!(
             loaded.navigation,
             Some(navigation::NavigationPreset::SolidWorks)
         );
         assert_eq!(loaded.navigation_invert_zoom, Some(false));
+        assert_eq!(loaded.length_unit, Some(units::LengthUnit::Inch));
 
         // A file from before a field existed still loads, keeping defaults.
         let sparse: UserPreferencesFile = serde_json::from_str("{\"version\":1}").unwrap();
         assert_eq!(sparse.navigation, None);
         assert_eq!(sparse.navigation_invert_zoom, None);
+        assert_eq!(sparse.length_unit, None);
+    }
+
+    /// The unit chosen for new documents is what a blank document opens in,
+    /// and what the sketch canvas and the part library read lengths in.
+    #[test]
+    fn a_new_document_opens_in_the_preferred_unit_everywhere() {
+        let mut app = KernelLabApp::default();
+        assert_eq!(app.length_unit(), units::LengthUnit::Millimetre);
+        app.preferred_length_unit = units::LengthUnit::Inch;
+        app.reset_to_blank_workspace();
+        assert_eq!(app.length_unit(), units::LengthUnit::Inch);
+        assert_eq!(app.sketch.length_unit(), units::LengthUnit::Inch);
+        // The document's own unit can still differ from the preference.
+        app.set_display_length_unit(units::LengthUnit::Centimetre);
+        assert_eq!(app.length_unit(), units::LengthUnit::Centimetre);
+        assert_eq!(app.preferred_length_unit, units::LengthUnit::Inch);
     }
 
     #[test]

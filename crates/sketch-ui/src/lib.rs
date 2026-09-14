@@ -44,6 +44,7 @@ use artificer_sketch::{
     select_trim_span,
 };
 use artificer_ui_core::drag_handle::{DragHandlePhase, DragHandleState, PointerSample};
+use artificer_ui_core::units::{LengthParseError, LengthUnit};
 
 use crate::sketch_toolbar::ToolVariant;
 
@@ -1397,10 +1398,14 @@ struct RetainedRecipeParameter {
     label: &'static str,
     text: String,
     unit: &'static str,
+    /// The value in canonical terms: millimetres for a length, degrees for
+    /// an angle, the number itself for a count.
     value: Option<f64>,
     domain: ToolNumberDomain,
     read_only_reason: Option<&'static str>,
     error: Option<RecipeParameterError>,
+    /// Whether the value is a length, shown and read in the document unit.
+    length: bool,
 }
 
 impl RetainedRecipeParameter {
@@ -1420,6 +1425,28 @@ impl RetainedRecipeParameter {
             domain,
             read_only_reason: None,
             error: None,
+            length: false,
+        }
+    }
+
+    /// A length literal, held in millimetres and shown in `unit`.
+    fn literal_length(
+        stable_key: &'static str,
+        label: &'static str,
+        millimetres: f64,
+        unit: LengthUnit,
+        domain: ToolNumberDomain,
+    ) -> Self {
+        Self {
+            stable_key,
+            label,
+            text: format_tool_number(unit.from_millimetres(millimetres)),
+            unit: unit.suffix(),
+            value: Some(millimetres),
+            domain,
+            read_only_reason: None,
+            error: None,
+            length: true,
         }
     }
 
@@ -1438,6 +1465,19 @@ impl RetainedRecipeParameter {
             domain,
             read_only_reason: Some("Driven by a model input; edit the owning parameter instead"),
             error: None,
+            length: false,
+        }
+    }
+
+    fn bound_length(
+        stable_key: &'static str,
+        label: &'static str,
+        unit: LengthUnit,
+        domain: ToolNumberDomain,
+    ) -> Self {
+        Self {
+            length: true,
+            ..Self::bound(stable_key, label, unit.suffix(), domain)
         }
     }
 
@@ -1452,6 +1492,21 @@ impl RetainedRecipeParameter {
             domain: ToolNumberDomain::Text,
             read_only_reason: None,
             error: None,
+            length: false,
+        }
+    }
+
+    /// Re-renders a length after the document unit changed, so the field
+    /// keeps saying what the value is rather than what was typed.
+    fn reformat(&mut self, unit: LengthUnit) {
+        if !self.length {
+            return;
+        }
+        self.unit = unit.suffix();
+        if let Some(millimetres) = self.value
+            && self.error.is_none()
+        {
+            self.text = format_tool_number(unit.from_millimetres(millimetres));
         }
     }
 
@@ -1499,51 +1554,87 @@ enum ToolNumberDomain {
 #[derive(Clone, Debug)]
 struct RetainedToolNumber {
     text: String,
+    /// Canonical: millimetres for a length, the number itself otherwise.
     value: f64,
     error: Option<ToolInputError>,
     user_edited: bool,
+    /// Whether the value is a length, shown and read in the document unit.
+    length: bool,
 }
 
 impl RetainedToolNumber {
-    fn new(default: f64) -> Self {
+    fn new(default: f64, length: bool, unit: LengthUnit) -> Self {
         Self {
-            text: format_tool_number(default),
+            text: display_tool_number(default, length, unit),
             value: default,
             error: None,
             user_edited: false,
+            length,
         }
     }
 
-    fn edit(&mut self, text: String, domain: ToolNumberDomain) {
+    fn edit(&mut self, text: String, domain: ToolNumberDomain, unit: LengthUnit) {
         self.text = text;
         self.user_edited = true;
-        self.error = validate_tool_number(&self.text, domain).map_or_else(Some, |value| {
+        let parsed = if self.length {
+            unit.parse(&self.text)
+                .map_err(tool_input_error_for_length)
+                .and_then(|millimetres| validate_tool_value(millimetres, domain))
+        } else {
+            validate_tool_number(&self.text, domain)
+        };
+        self.error = parsed.map_or_else(Some, |value| {
             self.value = value;
             None
         });
     }
 
-    fn restore_last_valid(&mut self) {
-        self.text = format_tool_number(self.value);
+    fn restore_last_valid(&mut self, unit: LengthUnit) {
+        self.text = display_tool_number(self.value, self.length, unit);
         self.error = None;
     }
 
-    fn sync_live_value(&mut self, value: f64, domain: ToolNumberDomain) {
-        let formatted = format_tool_number(value);
-        if !self.user_edited && validate_tool_number(&formatted, domain).is_ok() {
+    fn sync_live_value(&mut self, value: f64, domain: ToolNumberDomain, unit: LengthUnit) {
+        if !self.user_edited && validate_tool_value(value, domain).is_ok() {
             self.value = value;
-            self.text = formatted;
+            self.text = display_tool_number(value, self.length, unit);
             self.error = None;
         }
     }
 
-    fn set_manipulator_value(&mut self, value: f64, domain: ToolNumberDomain) {
-        let formatted = format_tool_number(value);
-        if validate_tool_number(&formatted, domain).is_ok() {
+    fn set_manipulator_value(&mut self, value: f64, domain: ToolNumberDomain, unit: LengthUnit) {
+        if validate_tool_value(value, domain).is_ok() {
             self.value = value;
-            self.text = formatted;
+            self.text = display_tool_number(value, self.length, unit);
             self.error = None;
             self.user_edited = true;
+        }
+    }
+
+    /// Re-renders a valid length after the document unit changed.
+    fn reformat(&mut self, unit: LengthUnit) {
+        if self.length && self.error.is_none() {
+            self.text = display_tool_number(self.value, true, unit);
+        }
+    }
+}
+
+/// A tool number as the field shows it: a length in the document unit, any
+/// other number as it is.
+fn display_tool_number(value: f64, length: bool, unit: LengthUnit) -> String {
+    if length {
+        format_tool_number(unit.from_millimetres(value))
+    } else {
+        format_tool_number(value)
+    }
+}
+
+/// Why a typed length could not be read, in the tool fields' own terms.
+fn tool_input_error_for_length(error: LengthParseError) -> ToolInputError {
+    match error {
+        LengthParseError::Empty => ToolInputError::Empty,
+        LengthParseError::NotANumber(_) | LengthParseError::UnknownUnit(_) => {
+            ToolInputError::NotANumber
         }
     }
 }
@@ -1586,6 +1677,12 @@ fn validate_tool_number(text: &str, domain: ToolNumberDomain) -> Result<f64, Too
     let value = trimmed
         .parse::<f64>()
         .map_err(|_| ToolInputError::NotANumber)?;
+    validate_tool_value(value, domain)
+}
+
+/// The domain rules alone, for a value already read: finite, and within
+/// what the field's domain allows.
+fn validate_tool_value(value: f64, domain: ToolNumberDomain) -> Result<f64, ToolInputError> {
     if !value.is_finite() {
         return Err(ToolInputError::NonFinite);
     }
@@ -1619,10 +1716,15 @@ fn validate_tool_number(text: &str, domain: ToolNumberDomain) -> Result<f64, Too
     }
 }
 
+/// One tool field's default, domain and whether it is a length (held in
+/// millimetres, shown and read in the document unit) rather than a count
+/// or an angle in degrees.
 fn tool_number_spec(
     variant: ToolVariant,
     stable_key: &'static str,
-) -> Option<(f64, ToolNumberDomain)> {
+) -> Option<(f64, ToolNumberDomain, bool)> {
+    const LENGTH: bool = true;
+    const BARE: bool = false;
     let positive = ToolNumberDomain::Positive;
     let finite = ToolNumberDomain::Finite;
     let non_zero = ToolNumberDomain::NonZero;
@@ -1633,15 +1735,16 @@ fn tool_number_spec(
                 minimum: CORE_MIN_POLYGON_SIDES,
                 maximum: CORE_MAX_POLYGON_SIDES,
             },
+            BARE,
         )),
-        (ToolVariant::Text, "height") => Some((DEFAULT_TEXT_HEIGHT, positive)),
-        (ToolVariant::Text, "angle") => Some((0.0, finite)),
-        (ToolVariant::Fillet, "radius") => Some((DEFAULT_FILLET_RADIUS, positive)),
+        (ToolVariant::Text, "height") => Some((DEFAULT_TEXT_HEIGHT, positive, LENGTH)),
+        (ToolVariant::Text, "angle") => Some((0.0, finite, BARE)),
+        (ToolVariant::Fillet, "radius") => Some((DEFAULT_FILLET_RADIUS, positive, LENGTH)),
         (ToolVariant::Chamfer | ToolVariant::TwoDistanceChamfer, "distance_1") => {
-            Some((DEFAULT_CHAMFER_DISTANCE, positive))
+            Some((DEFAULT_CHAMFER_DISTANCE, positive, LENGTH))
         }
         (ToolVariant::TwoDistanceChamfer, "distance_2") => {
-            Some((DEFAULT_CHAMFER_DISTANCE, positive))
+            Some((DEFAULT_CHAMFER_DISTANCE, positive, LENGTH))
         }
         (ToolVariant::RectangularPattern, "count_u") => Some((
             f64::from(DEFAULT_RECTANGULAR_PATTERN_COLUMNS),
@@ -1649,6 +1752,7 @@ fn tool_number_spec(
                 minimum: 1,
                 maximum: 256,
             },
+            BARE,
         )),
         (ToolVariant::RectangularPattern, "count_v") => Some((
             f64::from(DEFAULT_RECTANGULAR_PATTERN_ROWS),
@@ -1656,9 +1760,10 @@ fn tool_number_spec(
                 minimum: 1,
                 maximum: 256,
             },
+            BARE,
         )),
         (ToolVariant::RectangularPattern, "spacing_u" | "spacing_v") => {
-            Some((DEFAULT_TOOL_LENGTH, non_zero))
+            Some((DEFAULT_TOOL_LENGTH, non_zero, LENGTH))
         }
         (ToolVariant::CircularPattern, "count") => Some((
             f64::from(DEFAULT_CIRCULAR_PATTERN_COUNT),
@@ -1666,24 +1771,25 @@ fn tool_number_spec(
                 minimum: 2,
                 maximum: 256,
             },
+            BARE,
         )),
-        (ToolVariant::CircularPattern, "extent") => Some((360.0, non_zero)),
+        (ToolVariant::CircularPattern, "extent") => Some((360.0, non_zero, BARE)),
         (ToolVariant::InnerDiameterPolygon, "inner_diameter")
         | (ToolVariant::OuterDiameterPolygon, "outer_diameter") => {
-            Some((DEFAULT_POLYGON_DIAMETER, positive))
+            Some((DEFAULT_POLYGON_DIAMETER, positive, LENGTH))
         }
         (ToolVariant::InnerDiameterPolygon | ToolVariant::OuterDiameterPolygon, "rotation") => {
-            Some((0.0, finite))
+            Some((0.0, finite, BARE))
         }
         (ToolVariant::TwoPointSlot, "centre_distance")
         | (ToolVariant::CentreToOuterPointSlot, "overall_length") => {
-            Some((DEFAULT_SLOT_LENGTH, positive))
+            Some((DEFAULT_SLOT_LENGTH, positive, LENGTH))
         }
         (ToolVariant::TwoPointSlot | ToolVariant::CentreToOuterPointSlot, "width") => {
-            Some((DEFAULT_SLOT_WIDTH, positive))
+            Some((DEFAULT_SLOT_WIDTH, positive, LENGTH))
         }
         (ToolVariant::TwoPointSlot | ToolVariant::CentreToOuterPointSlot, "angle") => {
-            Some((0.0, finite))
+            Some((0.0, finite, BARE))
         }
         _ => None,
     }
@@ -1704,18 +1810,22 @@ fn literal_length_parameter(
     stable_key: &'static str,
     label: &'static str,
     value: &CoreValue<CoreLength>,
+    unit: LengthUnit,
 ) -> RetainedRecipeParameter {
     match value {
-        CoreValue::Literal(value) => RetainedRecipeParameter::literal(
+        CoreValue::Literal(value) => RetainedRecipeParameter::literal_length(
             stable_key,
             label,
             value.get(),
-            "mm",
+            unit,
             ToolNumberDomain::Positive,
         ),
-        CoreValue::Input(_) => {
-            RetainedRecipeParameter::bound(stable_key, label, "mm", ToolNumberDomain::Positive)
-        }
+        CoreValue::Input(_) => RetainedRecipeParameter::bound_length(
+            stable_key,
+            label,
+            unit,
+            ToolNumberDomain::Positive,
+        ),
     }
 }
 
@@ -1724,6 +1834,7 @@ fn literal_signed_length_parameter(
     label: &'static str,
     value: &CoreValue<CoreSignedLength>,
     allow_zero: bool,
+    unit: LengthUnit,
 ) -> RetainedRecipeParameter {
     let domain = if allow_zero {
         ToolNumberDomain::Finite
@@ -1732,9 +1843,11 @@ fn literal_signed_length_parameter(
     };
     match value {
         CoreValue::Literal(value) => {
-            RetainedRecipeParameter::literal(stable_key, label, value.get(), "mm", domain)
+            RetainedRecipeParameter::literal_length(stable_key, label, value.get(), unit, domain)
         }
-        CoreValue::Input(_) => RetainedRecipeParameter::bound(stable_key, label, "mm", domain),
+        CoreValue::Input(_) => {
+            RetainedRecipeParameter::bound_length(stable_key, label, unit, domain)
+        }
     }
 }
 
@@ -1773,18 +1886,24 @@ fn literal_angle_parameter(
     }
 }
 
-fn centre_circle_diameter_parameter(radius: &CoreValue<CoreLength>) -> RetainedRecipeParameter {
+fn centre_circle_diameter_parameter(
+    radius: &CoreValue<CoreLength>,
+    unit: LengthUnit,
+) -> RetainedRecipeParameter {
     match radius {
-        CoreValue::Literal(radius) => RetainedRecipeParameter::literal(
+        CoreValue::Literal(radius) => RetainedRecipeParameter::literal_length(
             "diameter",
             "Diameter",
             radius.get() * 2.0,
-            "mm",
+            unit,
             ToolNumberDomain::Positive,
         ),
-        CoreValue::Input(_) => {
-            RetainedRecipeParameter::bound("diameter", "Diameter", "mm", ToolNumberDomain::Positive)
-        }
+        CoreValue::Input(_) => RetainedRecipeParameter::bound_length(
+            "diameter",
+            "Diameter",
+            unit,
+            ToolNumberDomain::Positive,
+        ),
     }
 }
 
@@ -1792,27 +1911,28 @@ fn selected_recipe_editor_for(
     subject: SketchEntityId,
     operation: CoreOperationId,
     recipe: CoreRecipe,
+    unit: LengthUnit,
 ) -> SelectedRecipeEditor {
     let (title, parameters, reference_note) = match &recipe {
         CoreRecipe::TwoPointRectangle { width, height, .. } => (
             "Two-point rectangle",
             vec![
-                literal_signed_length_parameter("width", "Width", width, false),
-                literal_signed_length_parameter("height", "Height", height, false),
+                literal_signed_length_parameter("width", "Width", width, false, unit),
+                literal_signed_length_parameter("height", "Height", height, false, unit),
             ],
             BOUND_REFERENCE_NOTE,
         ),
         CoreRecipe::CentrePointRectangle { width, height, .. } => (
             "Centre-point rectangle",
             vec![
-                literal_length_parameter("width", "Width", width),
-                literal_length_parameter("height", "Height", height),
+                literal_length_parameter("width", "Width", width, unit),
+                literal_length_parameter("height", "Height", height, unit),
             ],
             BOUND_REFERENCE_NOTE,
         ),
         CoreRecipe::CentrePointCircle { radius, .. } => (
             "Centre-point circle",
-            vec![centre_circle_diameter_parameter(radius)],
+            vec![centre_circle_diameter_parameter(radius, unit)],
             "The exact radius is half the displayed diameter; centre and analytic seam stay fixed.",
         ),
         CoreRecipe::InnerDiameterPolygon {
@@ -1830,11 +1950,11 @@ fn selected_recipe_editor_for(
                     CORE_MIN_POLYGON_SIDES,
                     CORE_MAX_POLYGON_SIDES,
                 ),
-                literal_length_parameter("inner_diameter", "Inner diameter", inner_diameter),
+                literal_length_parameter("inner_diameter", "Inner diameter", inner_diameter, unit),
                 // A drafter dimensions a side, not a diameter. Offered beside
                 // the diameter rather than instead of it: both drive the same
                 // single number, so either can be typed.
-                polygon_side_parameter(inner_diameter, sides, true),
+                polygon_side_parameter(inner_diameter, sides, true, unit),
                 literal_angle_parameter("rotation", "Rotation", rotation),
             ],
             BOUND_REFERENCE_NOTE,
@@ -1854,11 +1974,11 @@ fn selected_recipe_editor_for(
                     CORE_MIN_POLYGON_SIDES,
                     CORE_MAX_POLYGON_SIDES,
                 ),
-                literal_length_parameter("outer_diameter", "Outer diameter", outer_diameter),
+                literal_length_parameter("outer_diameter", "Outer diameter", outer_diameter, unit),
                 // A drafter dimensions a side, not a diameter. Offered beside
                 // the diameter rather than instead of it: both drive the same
                 // single number, so either can be typed.
-                polygon_side_parameter(outer_diameter, sides, false),
+                polygon_side_parameter(outer_diameter, sides, false, unit),
                 literal_angle_parameter("rotation", "Rotation", rotation),
             ],
             BOUND_REFERENCE_NOTE,
@@ -1872,14 +1992,14 @@ fn selected_recipe_editor_for(
             "Text",
             vec![
                 RetainedRecipeParameter::text("content", "Text", content),
-                literal_length_parameter("height", "Height", height),
+                literal_length_parameter("height", "Height", height, unit),
                 literal_angle_parameter("angle", "Angle", angle),
             ],
             "The baseline anchor stays fixed; edit the text, its capital height, or its angle.",
         ),
         CoreRecipe::TwoPointSlot { width, .. } => (
             "Two-point slot",
-            vec![literal_length_parameter("width", "Width", width)],
+            vec![literal_length_parameter("width", "Width", width, unit)],
             "Both cap-centre references stay fixed; edit Width to resize the analytic rails and caps.",
         ),
         CoreRecipe::CentreOuterPointSlot {
@@ -1890,8 +2010,8 @@ fn selected_recipe_editor_for(
         } => (
             "Centre-to-outer-point slot",
             vec![
-                literal_length_parameter("overall_length", "Overall length", overall_length),
-                literal_length_parameter("width", "Width", width),
+                literal_length_parameter("overall_length", "Overall length", overall_length, unit),
+                literal_length_parameter("width", "Width", width, unit),
                 literal_angle_parameter("angle", "Angle", angle),
             ],
             BOUND_REFERENCE_NOTE,
@@ -1913,8 +2033,15 @@ fn selected_recipe_editor_for(
                     "Column spacing",
                     column_spacing,
                     false,
+                    unit,
                 ),
-                literal_signed_length_parameter("row_spacing", "Row spacing", row_spacing, true),
+                literal_signed_length_parameter(
+                    "row_spacing",
+                    "Row spacing",
+                    row_spacing,
+                    true,
+                    unit,
+                ),
                 literal_angle_parameter("direction", "Direction", direction),
             ],
             "Source curve IDs are retained; count changes preserve every matching semantic output ID.",
@@ -1931,7 +2058,7 @@ fn selected_recipe_editor_for(
         ),
         CoreRecipe::Fillet { radius, .. } | CoreRecipe::FilletWithHints { radius, .. } => (
             "2D fillet",
-            vec![literal_length_parameter("radius", "Radius", radius)],
+            vec![literal_length_parameter("radius", "Radius", radius, unit)],
             "Source branches and persisted branch hints stay fixed during radius replay.",
         ),
         CoreRecipe::Chamfer {
@@ -1944,11 +2071,17 @@ fn selected_recipe_editor_for(
                     "distance",
                     "Distance",
                     first_distance,
+                    unit,
                 )]
             } else {
                 vec![
-                    literal_length_parameter("first_distance", "Distance 1", first_distance),
-                    literal_length_parameter("second_distance", "Distance 2", second_distance),
+                    literal_length_parameter("first_distance", "Distance 1", first_distance, unit),
+                    literal_length_parameter(
+                        "second_distance",
+                        "Distance 2",
+                        second_distance,
+                        unit,
+                    ),
                 ]
             };
             (
@@ -1973,11 +2106,11 @@ fn selected_recipe_editor_for(
                 (CorePointInput::Position(start), CorePointInput::Position(end)) => (
                     "Authored line",
                     vec![
-                        RetainedRecipeParameter::literal(
+                        RetainedRecipeParameter::literal_length(
                             "length",
                             "Length",
                             (end.u - start.u).hypot(end.v - start.v),
-                            "mm",
+                            unit,
                             ToolNumberDomain::Positive,
                         ),
                         RetainedRecipeParameter::literal(
@@ -2133,6 +2266,7 @@ fn polygon_side_parameter(
     diameter: &CoreValue<CoreLength>,
     sides: &CoreValue<CoreInteger>,
     inner: bool,
+    unit: LengthUnit,
 ) -> RetainedRecipeParameter {
     let derived = match (diameter, sides) {
         (CoreValue::Literal(diameter), CoreValue::Literal(sides)) => {
@@ -2141,9 +2275,15 @@ fn polygon_side_parameter(
         _ => None,
     };
     derived.map_or_else(
-        || RetainedRecipeParameter::bound("side", "Side", "mm", ToolNumberDomain::Positive),
+        || RetainedRecipeParameter::bound_length("side", "Side", unit, ToolNumberDomain::Positive),
         |side| {
-            RetainedRecipeParameter::literal("side", "Side", side, "mm", ToolNumberDomain::Positive)
+            RetainedRecipeParameter::literal_length(
+                "side",
+                "Side",
+                side,
+                unit,
+                ToolNumberDomain::Positive,
+            )
         },
     )
 }
@@ -3042,7 +3182,7 @@ impl DimensionSession {
         self.refresh_derived_values();
     }
 
-    fn begin_edit(&mut self, index: usize) -> bool {
+    fn begin_edit(&mut self, index: usize, unit: LengthUnit) -> bool {
         let Some(field) = self.fields.get(index) else {
             return false;
         };
@@ -3050,7 +3190,13 @@ impl DimensionSession {
             return false;
         }
         self.active = Some(index);
-        self.buffer = format_input_value(field.readout.value);
+        // The box opens on the value as the user reads it: a length in the
+        // document unit, an angle in degrees.
+        self.buffer = if field.readout.kind.is_angle() {
+            format_input_value(field.readout.value)
+        } else {
+            format_input_value(unit.from_millimetres(field.readout.value))
+        };
         self.edit_original = Some(DimensionEditOriginal {
             geometry: self.geometry,
             fields: self.fields.clone(),
@@ -3061,30 +3207,30 @@ impl DimensionSession {
         true
     }
 
-    fn begin_kind(&mut self, kind: SketchDimensionKind) -> bool {
+    fn begin_kind(&mut self, kind: SketchDimensionKind, unit: LengthUnit) -> bool {
         self.field_index(kind)
-            .is_some_and(|index| self.begin_edit(index))
+            .is_some_and(|index| self.begin_edit(index, unit))
     }
 
-    fn begin_first_editable(&mut self, backwards: bool) -> bool {
+    fn begin_first_editable(&mut self, backwards: bool, unit: LengthUnit) -> bool {
         let next = if backwards {
             self.fields.iter().rposition(|field| field.readout.editable)
         } else {
             self.fields.iter().position(|field| field.readout.editable)
         };
-        next.is_some_and(|index| self.begin_edit(index))
+        next.is_some_and(|index| self.begin_edit(index, unit))
     }
 
     fn cycle(
         &mut self,
         backwards: bool,
-        names: &BTreeMap<String, f64>,
+        entry: DimensionEntry<'_>,
     ) -> Result<(), DimensionInputError> {
         let Some(active) = self.active else {
-            self.begin_first_editable(backwards);
+            self.begin_first_editable(backwards, entry.unit);
             return Ok(());
         };
-        self.accept(names)?;
+        self.accept(entry)?;
         let len = self.fields.len();
         for offset in 1..=len {
             let index = if backwards {
@@ -3093,22 +3239,19 @@ impl DimensionSession {
                 (active + offset) % len
             };
             if self.fields[index].readout.editable {
-                self.begin_edit(index);
+                self.begin_edit(index, entry.unit);
                 break;
             }
         }
         Ok(())
     }
 
-    fn apply_buffer_live(
-        &mut self,
-        names: &BTreeMap<String, f64>,
-    ) -> Result<(), DimensionInputError> {
+    fn apply_buffer_live(&mut self, entry: DimensionEntry<'_>) -> Result<(), DimensionInputError> {
         let Some(active) = self.active else {
             return Ok(());
         };
         let kind = self.fields[active].readout.kind;
-        let value = parse_dimension_value(kind, &self.buffer, names)?;
+        let value = parse_dimension_value(kind, &self.buffer, entry)?;
         let previous_geometry = self.geometry;
         let previous_fields = self.fields.clone();
         if let Err(error) = self.apply_value(active, value) {
@@ -3120,8 +3263,8 @@ impl DimensionSession {
         Ok(())
     }
 
-    fn accept(&mut self, names: &BTreeMap<String, f64>) -> Result<(), DimensionInputError> {
-        self.apply_buffer_live(names)?;
+    fn accept(&mut self, entry: DimensionEntry<'_>) -> Result<(), DimensionInputError> {
+        self.apply_buffer_live(entry)?;
         self.active = None;
         self.edit_original = None;
         self.error = None;
@@ -3615,19 +3758,50 @@ fn evaluate_named_expression(text: &str, names: &BTreeMap<String, f64>) -> Optio
     (evaluator.cursor == evaluator.tokens.len() && value.is_finite()).then_some(value)
 }
 
+/// What a typed dimension is read against: the document variables it may
+/// name, and the unit a bare length is in.
+#[derive(Clone, Copy)]
+struct DimensionEntry<'a> {
+    names: &'a BTreeMap<String, f64>,
+    unit: LengthUnit,
+}
+
+#[cfg(test)]
+static NO_NAMED_VALUES: BTreeMap<String, f64> = BTreeMap::new();
+
+#[cfg(test)]
+impl DimensionEntry<'static> {
+    /// Millimetres and no variables: what a canvas has until told otherwise.
+    fn millimetres() -> Self {
+        Self {
+            names: &NO_NAMED_VALUES,
+            unit: LengthUnit::Millimetre,
+        }
+    }
+}
+
 fn parse_dimension_value(
     kind: SketchDimensionKind,
     text: &str,
-    names: &BTreeMap<String, f64>,
+    entry: DimensionEntry<'_>,
 ) -> Result<f64, DimensionInputError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(DimensionInputError::Empty);
     }
-    let value = text.parse::<f64>().map_or_else(
-        |_| evaluate_named_expression(text, names).ok_or(DimensionInputError::NotANumber),
-        Ok,
-    )?;
+    // An angle is degrees, typed or computed. A length is read in the
+    // entry's unit, or the unit it carries, and comes back in millimetres.
+    let value = if kind.is_angle() {
+        text.parse::<f64>().map_or_else(
+            |_| evaluate_named_expression(text, entry.names).ok_or(DimensionInputError::NotANumber),
+            Ok,
+        )?
+    } else {
+        entry
+            .unit
+            .parse_entry(text, |text| evaluate_named_expression(text, entry.names))
+            .map_err(|_| DimensionInputError::NotANumber)?
+    };
     if !value.is_finite() {
         return Err(DimensionInputError::NonFinite);
     }
@@ -5038,6 +5212,8 @@ pub struct SketchCanvasState {
     exact_tool: ToolVariant,
     view: SketchView,
     snap: SnapSettings,
+    /// The unit lengths are shown and typed in; geometry stays millimetres.
+    length_unit: LengthUnit,
     authoring: CoreSketchDefinition,
     undo_journal: CoreUndoJournal,
     entities: Vec<SketchEntity>,
@@ -5117,6 +5293,7 @@ impl Default for SketchCanvasState {
             exact_tool: ToolVariant::Select,
             view: SketchView::default(),
             snap: SnapSettings::default(),
+            length_unit: LengthUnit::Millimetre,
             authoring: CoreSketchDefinition::new(),
             undo_journal: CoreUndoJournal::new(128),
             entities: Vec::new(),
@@ -5386,12 +5563,15 @@ impl SketchCanvasState {
         if let Some(text) = self.active_tool_text(stable_key) {
             return Some(text);
         }
-        let (default, _) = tool_number_spec(self.exact_tool, stable_key)?;
+        let (default, _, length) = tool_number_spec(self.exact_tool, stable_key)?;
         Some(
             self.tool_inputs
                 .numbers
                 .get(&(self.exact_tool, stable_key))
-                .map_or_else(|| format_tool_number(default), |input| input.text.clone()),
+                .map_or_else(
+                    || display_tool_number(default, length, self.length_unit),
+                    |input| input.text.clone(),
+                ),
         )
     }
 
@@ -5421,14 +5601,15 @@ impl SketchCanvasState {
                 .insert((self.exact_tool, stable_key), text);
             return true;
         }
-        let Some((default, domain)) = tool_number_spec(self.exact_tool, stable_key) else {
+        let Some((default, domain, length)) = tool_number_spec(self.exact_tool, stable_key) else {
             return false;
         };
+        let unit = self.length_unit;
         self.tool_inputs
             .numbers
             .entry((self.exact_tool, stable_key))
-            .or_insert_with(|| RetainedToolNumber::new(default))
-            .edit(text, domain);
+            .or_insert_with(|| RetainedToolNumber::new(default, length, unit))
+            .edit(text, domain, unit);
         if stable_key == "sides"
             && self.active_tool_input_error(stable_key).is_none()
             && let Some(sides) = self.active_tool_number(stable_key)
@@ -5447,6 +5628,7 @@ impl SketchCanvasState {
     /// Escape from a focused inspector editor restores the retained valid
     /// value without cancelling a draft or pending model operation.
     pub fn restore_active_tool_input(&mut self, stable_key: &'static str) -> bool {
+        let unit = self.length_unit;
         let Some(input) = self
             .tool_inputs
             .numbers
@@ -5455,7 +5637,7 @@ impl SketchCanvasState {
             return tool_number_spec(self.exact_tool, stable_key).is_some()
                 || tool_text_default(self.exact_tool, stable_key).is_some();
         };
-        input.restore_last_valid();
+        input.restore_last_valid(unit);
         true
     }
 
@@ -5490,7 +5672,7 @@ impl SketchCanvasState {
     }
 
     fn active_tool_number(&self, stable_key: &'static str) -> Option<f64> {
-        let (default, _) = tool_number_spec(self.exact_tool, stable_key)?;
+        let (default, _, _) = tool_number_spec(self.exact_tool, stable_key)?;
         Some(
             self.tool_inputs
                 .numbers
@@ -5500,25 +5682,27 @@ impl SketchCanvasState {
     }
 
     fn sync_active_tool_number(&mut self, stable_key: &'static str, value: f64) {
-        let Some((default, domain)) = tool_number_spec(self.exact_tool, stable_key) else {
+        let Some((default, domain, length)) = tool_number_spec(self.exact_tool, stable_key) else {
             return;
         };
+        let unit = self.length_unit;
         self.tool_inputs
             .numbers
             .entry((self.exact_tool, stable_key))
-            .or_insert_with(|| RetainedToolNumber::new(default))
-            .sync_live_value(value, domain);
+            .or_insert_with(|| RetainedToolNumber::new(default, length, unit))
+            .sync_live_value(value, domain, unit);
     }
 
     fn set_active_tool_number_from_manipulator(&mut self, stable_key: &'static str, value: f64) {
-        let Some((default, domain)) = tool_number_spec(self.exact_tool, stable_key) else {
+        let Some((default, domain, length)) = tool_number_spec(self.exact_tool, stable_key) else {
             return;
         };
+        let unit = self.length_unit;
         self.tool_inputs
             .numbers
             .entry((self.exact_tool, stable_key))
-            .or_insert_with(|| RetainedToolNumber::new(default))
-            .set_manipulator_value(value, domain);
+            .or_insert_with(|| RetainedToolNumber::new(default, length, unit))
+            .set_manipulator_value(value, domain, unit);
     }
 
     /// First validation issue which blocks staging for the active recipe.
@@ -5676,10 +5860,36 @@ impl SketchCanvasState {
         self.snap = settings;
     }
 
+    /// The unit lengths are shown and typed in. Geometry stays in
+    /// millimetres; this is presentation and entry only.
+    #[must_use]
+    pub const fn length_unit(&self) -> LengthUnit {
+        self.length_unit
+    }
+
+    /// Changes the unit and re-renders every retained field that shows a
+    /// length, so a `40` typed in millimetres does not sit there reading as
+    /// forty inches.
+    pub fn set_length_unit(&mut self, unit: LengthUnit) {
+        if self.length_unit == unit {
+            return;
+        }
+        self.length_unit = unit;
+        for number in self.tool_inputs.numbers.values_mut() {
+            number.reformat(unit);
+        }
+        if let Some(editor) = self.selected_recipe_editor.as_mut() {
+            for parameter in &mut editor.parameters {
+                parameter.reformat(unit);
+            }
+        }
+    }
+
     /// Publishes the document's evaluated variables for numeric entries: a
     /// dimension box or recipe field can then name them in arithmetic, so a
-    /// rectangle's width can be `plate_width / 2`. Values are canonical
-    /// magnitudes; lengths arrive in millimetres.
+    /// rectangle's width can be `plate_width / 2`. Lengths arrive in the
+    /// canvas's length unit, so that arithmetic means what a typed number
+    /// beside it means; angles are degrees.
     pub fn set_named_values(&mut self, values: BTreeMap<String, f64>) {
         if self.named_values != values {
             self.named_values = values;
@@ -5687,16 +5897,16 @@ impl SketchCanvasState {
     }
 
     /// Evaluates one numeric entry over the published document variables —
-    /// the same arithmetic the dimension boxes accept. Lengths come back in
-    /// millimetres; a plain number passes straight through.
+    /// the same arithmetic the dimension boxes accept. A bare number, or an
+    /// expression's answer, is in the canvas's length unit; a suffix names
+    /// its own unit; millimetres come back.
     #[must_use]
     pub fn evaluate_value_entry(&self, text: &str) -> Option<f64> {
-        let trimmed = text.trim();
-        trimmed
-            .parse::<f64>()
+        self.length_unit
+            .parse_entry(text, |text| {
+                evaluate_named_expression(text, &self.named_values)
+            })
             .ok()
-            .filter(|value| value.is_finite())
-            .or_else(|| evaluate_named_expression(trimmed, &self.named_values))
     }
 
     /// Publishes the sketch support's analytic curves as snap references.
@@ -6053,7 +6263,12 @@ impl SketchCanvasState {
                     .map(|record| record.provenance.operation)
             })?;
             let recipe = self.authoring.operation(operation)?.recipe.clone();
-            Some(selected_recipe_editor_for(subject, operation, recipe))
+            Some(selected_recipe_editor_for(
+                subject,
+                operation,
+                recipe,
+                self.length_unit,
+            ))
         });
     }
 
@@ -6163,6 +6378,7 @@ impl SketchCanvasState {
             None
         } else {
             let named_values = &self.named_values;
+            let unit = self.length_unit;
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
                 .parameters
@@ -6170,12 +6386,22 @@ impl SketchCanvasState {
                 .find(|parameter| parameter.stable_key == stable_key)?;
             // Plain numbers stay the fast path; anything else may name a
             // document variable — `plate_width / 2` — which evaluates first
-            // and then faces the same domain rules a typed number would.
-            let evaluated = validate_tool_number(&parameter.text, domain).or_else(|error| {
-                evaluate_named_expression(&parameter.text, named_values)
-                    .ok_or(error)
-                    .and_then(|value| validate_tool_number(&value.to_string(), domain))
-            });
+            // and then faces the same domain rules a typed number would. A
+            // length is read in the document unit, or the unit it carries,
+            // and judged in millimetres.
+            let evaluated = if parameter.length {
+                unit.parse_entry(&parameter.text, |text| {
+                    evaluate_named_expression(text, named_values)
+                })
+                .map_err(tool_input_error_for_length)
+                .and_then(|millimetres| validate_tool_value(millimetres, domain))
+            } else {
+                validate_tool_number(&parameter.text, domain).or_else(|error| {
+                    evaluate_named_expression(&parameter.text, named_values)
+                        .ok_or(error)
+                        .and_then(|value| validate_tool_value(value, domain))
+                })
+            };
             match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
@@ -10877,7 +11103,7 @@ pub fn show_with_context(
     paint_creation_preview(&painter, response.rect, state);
     paint_overlay(&painter, response.rect, state, context.is_some());
     let committed_annotations = committed_dimension_annotation_layouts(state, response.rect);
-    paint_committed_dimension_annotations(&painter, &committed_annotations);
+    paint_committed_dimension_annotations(&painter, &committed_annotations, state.length_unit);
     let dimension_layouts = dimension_widget_layouts(state, response.rect);
     paint_dimension_leaders(&painter, &dimension_layouts);
     let dimensions = show_dimension_widgets(ui, state, &dimension_layouts, canvas_owned_keyboard);
@@ -12721,6 +12947,7 @@ fn committed_dimension_annotation_layouts(
 fn paint_committed_dimension_annotations(
     painter: &egui::Painter,
     layouts: &[DimensionWidgetLayout],
+    unit: LengthUnit,
 ) {
     let colours = sketch_colours();
     let stroke = Stroke::new(1.0, colours.dimension.gamma_multiply(0.45));
@@ -12738,7 +12965,7 @@ fn paint_committed_dimension_annotations(
         painter.text(
             layout.rect.center(),
             Align2::CENTER_CENTER,
-            format_dimension_readout(layout.readout),
+            format_dimension_readout(layout.readout, unit),
             FontId::monospace(10.0),
             colours.dimension.gamma_multiply(0.85),
         );
@@ -13125,7 +13352,7 @@ fn show_dimension_widgets(
                 node.set_description(format!(
                     "{} in {}. Enter applies the value; Escape reverts it.",
                     layout.readout.kind.label(),
-                    dimension_unit_label(layout.readout.kind)
+                    dimension_unit_label(layout.readout.kind, state.length_unit)
                 ));
             });
             let char_count = text.chars().count();
@@ -13191,7 +13418,7 @@ fn show_dimension_widgets(
                 node.set_description(format!(
                     "{} in {}. Tab selects the next dimension; Enter accepts this value.",
                     layout.readout.kind.label(),
-                    dimension_unit_label(layout.readout.kind)
+                    dimension_unit_label(layout.readout.kind, state.length_unit)
                 ));
             });
             let char_count = buffer.chars().count();
@@ -13242,7 +13469,7 @@ fn show_dimension_widgets(
             ui.painter().text(
                 layout.rect.center(),
                 Align2::CENTER_CENTER,
-                format_dimension_readout(layout.readout),
+                format_dimension_readout(layout.readout, state.length_unit),
                 FontId::monospace(10.5),
                 color,
             );
@@ -13252,12 +13479,17 @@ fn show_dimension_widgets(
         }
     }
 
+    // Each entry borrows the variable table only as long as the session
+    // reads it, so the state is free to settle between the branches.
     if live_changed {
-        let named_values = &state.named_values;
+        let entry = DimensionEntry {
+            names: &state.named_values,
+            unit: state.length_unit,
+        };
         let result = state
             .dimension_session
             .as_mut()
-            .map_or(Ok(()), |session| session.apply_buffer_live(named_values));
+            .map_or(Ok(()), |session| session.apply_buffer_live(entry));
         if let Some(session) = state.dimension_session.as_mut() {
             session.error = result.err();
         }
@@ -13294,9 +13526,12 @@ fn show_dimension_widgets(
         }
         state.sync_dimension_pending();
     } else if tab_owned && (tab_forward || tab_backward) {
-        let named_values = &state.named_values;
+        let entry = DimensionEntry {
+            names: &state.named_values,
+            unit: state.length_unit,
+        };
         if let Some(session) = state.dimension_session.as_mut()
-            && let Err(error) = session.cycle(tab_backward, named_values)
+            && let Err(error) = session.cycle(tab_backward, entry)
         {
             session.error = Some(error);
             session.focus_next_frame = true;
@@ -13304,9 +13539,12 @@ fn show_dimension_widgets(
         state.sync_dimension_pending();
     } else if active_at_start.is_some() && active_editor_owned_keyboard && enter_pressed {
         claims.enter = true;
-        let named_values = &state.named_values;
+        let entry = DimensionEntry {
+            names: &state.named_values,
+            unit: state.length_unit,
+        };
         let accepted = if let Some(session) = state.dimension_session.as_mut() {
-            match session.accept(named_values) {
+            match session.accept(entry) {
                 Ok(()) => true,
                 Err(error) => {
                     session.error = Some(error);
@@ -13344,10 +13582,14 @@ fn show_dimension_widgets(
         claims.enter = true;
         pending_created = state.finish_polyline_draft().ok();
     } else if let Some(kind) = clicked_kind {
+        let unit = state.length_unit;
         let can_switch = if state.dimension_editor_active() {
-            let named_values = &state.named_values;
+            let entry = DimensionEntry {
+                names: &state.named_values,
+                unit,
+            };
             if let Some(session) = state.dimension_session.as_mut() {
-                match session.accept(named_values) {
+                match session.accept(entry) {
                     Ok(()) => true,
                     Err(error) => {
                         session.error = Some(error);
@@ -13364,7 +13606,7 @@ fn show_dimension_widgets(
         if can_switch {
             state.sync_dimension_pending();
             if let Some(session) = state.dimension_session.as_mut() {
-                session.begin_kind(kind);
+                session.begin_kind(kind, unit);
             }
         }
     }
@@ -13510,20 +13752,24 @@ fn select_all_dimension_text(ui: &Ui, id: Id, response: &Response, char_count: u
     state.store(ui.ctx(), response.id);
 }
 
-fn format_dimension_readout(readout: DimensionReadout) -> String {
-    let unit = if readout.kind.is_angle() { "deg" } else { "mm" };
-    format!(
-        "{} {:.2} {unit}",
-        readout.kind.short_label(),
-        normalized_zero(readout.value)
-    )
+fn format_dimension_readout(readout: DimensionReadout, unit: LengthUnit) -> String {
+    let value = normalized_zero(readout.value);
+    if readout.kind.is_angle() {
+        format!("{} {value:.2} deg", readout.kind.short_label())
+    } else {
+        format!(
+            "{} {}",
+            readout.kind.short_label(),
+            unit.format_readout(value)
+        )
+    }
 }
 
-fn dimension_unit_label(kind: SketchDimensionKind) -> &'static str {
+fn dimension_unit_label(kind: SketchDimensionKind, unit: LengthUnit) -> &'static str {
     if kind.is_angle() {
         "degrees"
     } else {
-        "millimetres"
+        unit.name()
     }
 }
 
@@ -15135,13 +15381,13 @@ mod tests {
             .three_point_arc
             .expect("fixed endpoint constraint")
             .direction;
-        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
+        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees, LengthUnit::Millimetre));
         session.buffer = "120".to_owned();
         session
-            .apply_buffer_live(&BTreeMap::new())
+            .apply_buffer_live(DimensionEntry::millimetres())
             .expect("valid directed sweep");
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("typed sweep accepts");
         let radius = 4.0 / (2.0 * 60_f64.to_radians().sin());
         assert!((session.value(SketchDimensionKind::Radius) - radius).abs() <= EPSILON);
@@ -15189,10 +15435,10 @@ mod tests {
         state.update_dimension_pointer(through);
         let session = state.dimension_session.as_mut().expect("live arc session");
         let valid_geometry = session.geometry;
-        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
+        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees, LengthUnit::Millimetre));
         session.buffer = "400".to_owned();
         let error = session
-            .apply_buffer_live(&BTreeMap::new())
+            .apply_buffer_live(DimensionEntry::millimetres())
             .expect_err("sweep beyond 360 is invalid");
         session.error = Some(error);
         assert_eq!(session.geometry, valid_geometry);
@@ -16116,13 +16362,13 @@ mod tests {
         assert!((readout_value(&session, SketchDimensionKind::Width) - 4.0).abs() <= EPSILON);
         assert!((readout_value(&session, SketchDimensionKind::Height) - 3.0).abs() <= EPSILON);
 
-        assert!(session.begin_kind(SketchDimensionKind::Width));
+        assert!(session.begin_kind(SketchDimensionKind::Width, LengthUnit::Millimetre));
         session.buffer = "10".to_owned();
         session
-            .apply_buffer_live(&BTreeMap::new())
+            .apply_buffer_live(DimensionEntry::millimetres())
             .expect("valid width");
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("width should accept");
         session.update_pointer(SketchPoint::new(-2.0, 9.0));
 
@@ -16146,10 +16392,10 @@ mod tests {
         session.update_pointer(SketchPoint::new(3.0, 4.0));
         assert!((readout_value(&session, SketchDimensionKind::Length) - 5.0).abs() <= EPSILON);
 
-        assert!(session.begin_kind(SketchDimensionKind::Length));
+        assert!(session.begin_kind(SketchDimensionKind::Length, LengthUnit::Millimetre));
         session.buffer = "10".to_owned();
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("length should accept");
         session.update_pointer(SketchPoint::new(0.0, 6.0));
 
@@ -16192,10 +16438,10 @@ mod tests {
         session.update_pointer(SketchPoint::new(3.0, 4.0));
         assert!((readout_value(&session, SketchDimensionKind::Diameter) - 10.0).abs() <= EPSILON);
 
-        assert!(session.begin_kind(SketchDimensionKind::Diameter));
+        assert!(session.begin_kind(SketchDimensionKind::Diameter, LengthUnit::Millimetre));
         session.buffer = "20".to_owned();
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("diameter should accept");
         let SketchGeometry::Circle { rim, .. } = session.geometry else {
             panic!("expected circle geometry");
@@ -16216,15 +16462,15 @@ mod tests {
             ),
             1,
         );
-        assert!(session.begin_kind(SketchDimensionKind::Radius));
+        assert!(session.begin_kind(SketchDimensionKind::Radius, LengthUnit::Millimetre));
         session.buffer = "3".to_owned();
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("radius should accept");
-        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees));
+        assert!(session.begin_kind(SketchDimensionKind::SweepDegrees, LengthUnit::Millimetre));
         session.buffer = "180".to_owned();
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("sweep should accept");
 
         let SketchGeometry::Arc { start, end, .. } = session.geometry else {
@@ -16248,10 +16494,10 @@ mod tests {
             geometry,
             1,
         );
-        assert!(session.begin_kind(SketchDimensionKind::Width));
+        assert!(session.begin_kind(SketchDimensionKind::Width, LengthUnit::Millimetre));
         session.buffer = "not a number".to_owned();
         assert_eq!(
-            session.apply_buffer_live(&BTreeMap::new()),
+            session.apply_buffer_live(DimensionEntry::millimetres()),
             Err(DimensionInputError::NotANumber)
         );
         assert_eq!(session.geometry, geometry);
@@ -16273,10 +16519,10 @@ mod tests {
             .dimension_session
             .as_mut()
             .expect("pending circle should expose dimensions");
-        assert!(session.begin_kind(SketchDimensionKind::Diameter));
+        assert!(session.begin_kind(SketchDimensionKind::Diameter, LengthUnit::Millimetre));
         session.buffer = "10".to_owned();
         session
-            .accept(&BTreeMap::new())
+            .accept(DimensionEntry::millimetres())
             .expect("diameter should accept");
         state.sync_dimension_pending();
 
@@ -16364,9 +16610,11 @@ mod tests {
             .dimension_session
             .as_mut()
             .expect("live segment dimensions");
-        assert!(session.begin_kind(SketchDimensionKind::Length));
+        assert!(session.begin_kind(SketchDimensionKind::Length, LengthUnit::Millimetre));
         session.buffer = "5".to_owned();
-        session.accept(&BTreeMap::new()).expect("valid length");
+        session
+            .accept(DimensionEntry::millimetres())
+            .expect("valid length");
 
         assert_eq!(stage_complete_dimension_draft(&mut state), None);
         assert_eq!(
@@ -18585,5 +18833,100 @@ mod tests {
             .sketch_to_screen(canvas_rect, SketchPoint::new(15.0, 20.0));
         assert!((screen_after.x - screen_before.x).abs() < 1e-4);
         assert!(screen_after.y < screen_before.y); // Y decreases upwards on screen!
+    }
+}
+
+/// Lengths are shown and typed in the canvas's unit; geometry stays in
+/// millimetres underneath.
+#[cfg(test)]
+mod length_unit_tests {
+    use super::*;
+
+    #[test]
+    fn a_value_entry_is_read_in_the_canvas_unit_unless_it_says_otherwise() {
+        let mut state = SketchCanvasState::default();
+        assert_eq!(state.evaluate_value_entry("10"), Some(10.0));
+        state.set_length_unit(LengthUnit::Inch);
+        assert_eq!(state.evaluate_value_entry("1"), Some(25.4));
+        assert_eq!(state.evaluate_value_entry("10mm"), Some(10.0));
+        assert_eq!(state.evaluate_value_entry("1e-1"), Some(2.54));
+        // Variables are published in the canvas unit, so arithmetic on them
+        // means the same as arithmetic on a typed number.
+        state.set_named_values(BTreeMap::from([("width".to_owned(), 2.0)]));
+        assert_eq!(state.evaluate_value_entry("width / 2"), Some(25.4));
+    }
+
+    #[test]
+    fn a_typed_dimension_is_a_length_in_the_entry_unit_and_an_angle_in_degrees() {
+        let names = BTreeMap::new();
+        let inches = DimensionEntry {
+            names: &names,
+            unit: LengthUnit::Inch,
+        };
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "2", inches),
+            Ok(50.8)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "10 mm", inches),
+            Ok(10.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::AngleDegrees, "45", inches),
+            Ok(45.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "", inches),
+            Err(DimensionInputError::Empty)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "2 furlongs", inches),
+            Err(DimensionInputError::NotANumber)
+        );
+    }
+
+    #[test]
+    fn the_dimension_box_opens_on_the_value_in_the_entry_unit() {
+        let mut session = DimensionSession::from_geometry(
+            DimensionTarget::Draft,
+            SketchGeometry::segment(SketchPoint::new(0.0, 0.0), SketchPoint::new(25.4, 0.0)),
+            1,
+        );
+        assert!(session.begin_kind(SketchDimensionKind::Length, LengthUnit::Inch));
+        assert_eq!(session.buffer, "1");
+        assert!(session.begin_kind(SketchDimensionKind::Length, LengthUnit::Millimetre));
+        assert_eq!(session.buffer, "25.4");
+    }
+
+    #[test]
+    fn readouts_wear_the_unit_and_keep_two_millimetre_decimals() {
+        let readout = DimensionReadout {
+            kind: SketchDimensionKind::Width,
+            value: 40.0,
+            locked: false,
+            editable: true,
+        };
+        assert_eq!(
+            format_dimension_readout(readout, LengthUnit::Millimetre),
+            "W 40.00 mm"
+        );
+        assert_eq!(
+            format_dimension_readout(readout, LengthUnit::Inch),
+            "W 1.575 in"
+        );
+    }
+
+    #[test]
+    fn a_tool_field_shows_its_length_in_the_new_unit_after_a_switch() {
+        let mut state = SketchCanvasState::default();
+        state.set_exact_tool(ToolVariant::Fillet);
+        assert!(state.set_active_tool_input_text("radius", "25.4".to_owned()));
+        state.set_length_unit(LengthUnit::Inch);
+        assert_eq!(state.active_tool_input_text("radius").as_deref(), Some("1"));
+        // Typing in the new unit reads in the new unit; a suffix still wins.
+        assert!(state.set_active_tool_input_text("radius", "2".to_owned()));
+        assert_eq!(state.active_tool_number("radius"), Some(50.8));
+        assert!(state.set_active_tool_input_text("radius", "5mm".to_owned()));
+        assert_eq!(state.active_tool_number("radius"), Some(5.0));
     }
 }

@@ -127,6 +127,24 @@ fn document_properties_popout_changes_units_and_exposes_real_file_actions() {
         harness.state().document_settings().length_unit,
         DisplayLengthUnit::Inch
     );
+    // The unit is the document's everywhere: the sketch canvas reads and
+    // shows it, and the part library's Length field is now in inches.
+    harness.run();
+    assert_eq!(
+        harness.state().sketch_length_unit(),
+        DisplayLengthUnit::Inch
+    );
+    click_button(&mut harness, "Library");
+    let length = harness.get_by_role_and_label(Role::TextInput, "Length (in)");
+    length.click();
+    length.type_text("2");
+    harness.run();
+    assert_eq!(
+        harness.state().part_library_length_mm(),
+        Some(50.8),
+        "a bare 2 in an inch document is two inches"
+    );
+    click_button(&mut harness, "Library");
     for action in [
         "Save .ARTIFICER",
         "Open .ARTIFICER",
