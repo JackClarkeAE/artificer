@@ -20,6 +20,15 @@
 # with --dry-run first; it prints every command it would run and touches
 # nothing.
 #
+# Where the environment may push a branch but not create a tag, this script
+# pushes main and then fails on the tag. That is not the end of the road: the
+# ci workflow takes a `workflow_dispatch` with the release number, creates the
+# tag on the commit dispatched and builds the release from it. Either
+#
+#     gh workflow run ci.yml --ref main -f version=0.981
+#
+# or the Run workflow button on the Actions page finishes the job.
+#
 # Usage:
 #   scripts/publish-release.sh publish --version 0.97 --from <branch> [options]
 #   scripts/publish-release.sh retag [options]

@@ -7,6 +7,18 @@ on:
     # Nightly, well clear of the working day: the bench job is long and its
     # only job is to catch catastrophes, not to gate a push.
     - cron: "0 3 * * *"
+  # Releasing by hand means pushing a tag, and not every environment that can
+  # push a branch is allowed to create one. Dispatching this workflow against
+  # the commit to release does the same job: the release jobs below create the
+  # tag themselves, on the commit that was dispatched, and go on to build it.
+  # The safeguards are unchanged — the version still has to agree with the
+  # tag, and an already-published release is still never rebuilt.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release number without the leading v, e.g. 0.981"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -154,7 +166,14 @@ jobs:
     # moving a tag onto main, or a tag deleted and re-pushed) must not rebuild
     # the release: the binaries that shipped under that version stay the
     # binaries that shipped, and the update feed never sees a draft window.
-    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') && github.event.created)
+      || github.event_name == 'workflow_dispatch'
+    env:
+      # The tag this run is releasing, whichever way it was started.
+      RELEASE_TAG: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && format('v{0}', inputs.version) || github.ref_name }}
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -168,7 +187,7 @@ jobs:
           set -euo pipefail
           declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
                           found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
-          tagged="${GITHUB_REF_NAME#v}"
+          tagged="${RELEASE_TAG#v}"
           if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
             decl_compact="$(printf '%s' "$declared" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')"
             if [ "$tagged" = "$decl_compact" ]; then
@@ -179,9 +198,31 @@ jobs:
           fi
           if [ "$tagged" != "$declared" ]; then
             printf 'error: tag %s does not match the workspace version %s\n' \
-              "$GITHUB_REF_NAME" "$declared" >&2
+              "$RELEASE_TAG" "$declared" >&2
             exit 1
           fi
+      - name: Create the tag
+        # Only a dispatched run reaches this: a tag push already has its tag.
+        # The tag lands on the commit that was dispatched, which is the one
+        # this run went on to check out and verify above, so the tag and the
+        # binaries cannot disagree about what was released. An existing tag is
+        # never moved — the draft step below is what decides whether a release
+        # may be built, and a published one is refused there.
+        #
+        # A tag pushed with this workflow's own token starts no further run,
+        # which is why the dispatched run goes on to build the release itself
+        # rather than handing off to the tag-triggered path.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            printf 'note: %s already exists; leaving it where it points.\n' "$RELEASE_TAG"
+            exit 0
+          fi
+          git tag -a "$RELEASE_TAG" -m "Artificer ${RELEASE_TAG#v}"
+          git push origin "refs/tags/$RELEASE_TAG"
       - name: Open the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -192,22 +233,29 @@ jobs:
         # already have.
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            is_draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')"
             if [ "$is_draft" != "true" ]; then
               printf 'error: %s already has a published release; refusing to rebuild it.\n' \
-                "$GITHUB_REF_NAME" >&2
+                "$RELEASE_TAG" >&2
               printf 'Delete the release by hand first if you really mean to replace it.\n' >&2
               exit 1
             fi
-            gh release delete "$GITHUB_REF_NAME" --yes
+            gh release delete "$RELEASE_TAG" --yes
           fi
-          gh release create "$GITHUB_REF_NAME" --draft \
-            --title "Artificer $GITHUB_REF_NAME" --generate-notes
+          gh release create "$RELEASE_TAG" --draft \
+            --title "Artificer $RELEASE_TAG" --generate-notes
 
   release:
     needs: release-prepare
-    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') && github.event.created)
+      || github.event_name == 'workflow_dispatch'
+    env:
+      # The tag this run is releasing, whichever way it was started.
+      RELEASE_TAG: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && format('v{0}', inputs.version) || github.ref_name }}
     permissions:
       contents: write
     strategy:
@@ -273,7 +321,7 @@ jobs:
             || echo "no previous Velopack release found; packing a full release"
           declared="$(awk '/^\[workspace\.package\]/ { found = 1 }
                           found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.toml)"
-          tagged="${GITHUB_REF_NAME#v}"
+          tagged="${RELEASE_TAG#v}"
           if [[ "$tagged" =~ ^[0-9]+\.[0-9]+$ ]]; then
             decl_compact="$(printf '%s' "$declared" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')"
             if [ "$tagged" = "$decl_compact" ]; then
@@ -282,11 +330,11 @@ jobs:
               tagged="${tagged}.0"
             fi
           fi
-          rm -f artifacts/releases/*"$tagged"* artifacts/releases/*"${GITHUB_REF_NAME#v}"*
+          rm -f artifacts/releases/*"$tagged"* artifacts/releases/*"${RELEASE_TAG#v}"*
       - name: Pack
         if: matrix.packaging == 'velopack'
         shell: bash
-        run: bash scripts/pack-release.sh "${GITHUB_REF_NAME#v}"
+        run: bash scripts/pack-release.sh "${RELEASE_TAG#v}"
       - name: Upload the Velopack release
         if: matrix.packaging == 'velopack'
         shell: bash
@@ -299,18 +347,18 @@ jobs:
         run: |
           set -euo pipefail
           channel_asset="releases.${{ runner.os == 'Windows' && 'win' || 'linux' }}.json"
-          gh release delete-asset "$GITHUB_REF_NAME" "$channel_asset" --yes 2>/dev/null || true
+          gh release delete-asset "$RELEASE_TAG" "$channel_asset" --yes 2>/dev/null || true
           for file in artifacts/releases/*; do
             [ -f "$file" ] || continue
             filename="$(basename "$file")"
-            gh release delete-asset "$GITHUB_REF_NAME" "$filename" --yes 2>/dev/null || true
+            gh release delete-asset "$RELEASE_TAG" "$filename" --yes 2>/dev/null || true
           done
           vpk upload github \
             --repoUrl "https://github.com/${{ github.repository }}" \
             --token "$GH_TOKEN" \
             --outputDir artifacts/releases \
-            --tag "$GITHUB_REF_NAME" \
-            --releaseName "Artificer $GITHUB_REF_NAME" \
+            --tag "$RELEASE_TAG" \
+            --releaseName "Artificer $RELEASE_TAG" \
             --merge
       - name: Attach a plain archive as well
         if: matrix.packaging == 'velopack'
@@ -323,7 +371,7 @@ jobs:
         # should be the same shape as the asset they already have.
         run: |
           set -euo pipefail
-          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          name="Artificer-${RELEASE_TAG}-${{ matrix.platform }}"
           mkdir -p dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/release/artificer-workbench.exe dist/Artificer.exe
@@ -338,7 +386,7 @@ jobs:
             tar -czf "$name.tar.gz" -C dist .
             asset="$name.tar.gz"
           fi
-          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          gh release upload "$RELEASE_TAG" "$asset" --clobber
           echo "asset=$asset" >> "$GITHUB_ENV"
 
       # --- macOS bundle ----------------------------------------------------
@@ -359,11 +407,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          name="Artificer-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          name="Artificer-${RELEASE_TAG}-${{ matrix.platform }}"
           release_dir="artifacts/standalone/release"
           cp README.md "$release_dir/"
           (cd "$release_dir" && zip -qry "$GITHUB_WORKSPACE/$name.zip" Artificer.app "Artificer Script Studio.app" README.md)
-          gh release upload "$GITHUB_REF_NAME" "$name.zip" --clobber
+          gh release upload "$RELEASE_TAG" "$name.zip" --clobber
           echo "asset=$name.zip" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
@@ -378,7 +426,14 @@ jobs:
     # missing its feed file would leave update checks failing for everyone who
     # installed it, which is worse than a release that lands an hour late.
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v') && github.event.created
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') && github.event.created)
+      || github.event_name == 'workflow_dispatch'
+    env:
+      # The tag this run is releasing, whichever way it was started.
+      RELEASE_TAG: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && format('v{0}', inputs.version) || github.ref_name }}
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -387,9 +442,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release edit "$GITHUB_REF_NAME" --repo "${{ github.repository }}" \
+          gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" \
             --draft=false --latest
-
   nightly-benches:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-24.04
