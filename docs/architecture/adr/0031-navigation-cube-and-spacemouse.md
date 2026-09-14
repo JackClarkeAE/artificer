@@ -30,6 +30,17 @@ are the face labels the cube already wears, joined front-to-back,
 top-to-bottom, left-to-right: `View cube corner front-top-right`, `View
 cube edge front-top`. Dragging the cube to orbit is unchanged.
 
+A click does not cut to the new view. Every cube command — a face, an
+edge, a corner, a roll arrow, the ISO button — names a destination camera,
+and the workbench flies there through the same `CameraTransition` that
+carries it to a face it is asked to look at squarely: shortest-path
+orientation, the same quintic ease, framing untouched. A second click
+while a flight is under way retargets it from wherever the camera is; a
+drag on the cube takes over at once. A flight that a sketch is waiting on
+is never steered, because its landing opens the sketch on the face it was
+aimed at. With the flights switched off (the accessibility setting and the
+test default) every command is instant, as before.
+
 ### The SpaceMouse is read as raw HID, in its own crate
 
 `artificer-spacemouse` enumerates HID devices with the `hidapi` crate's

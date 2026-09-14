@@ -11928,6 +11928,68 @@ impl KernelLabApp {
         context.request_repaint();
     }
 
+    /// Carries out a click or a drag on the view cube.
+    ///
+    /// A face, an edge, a corner, a roll arrow and the ISO button each name
+    /// a destination, and the camera flies there the way it flies to a face
+    /// it is asked to look at squarely: the same quintic ease and
+    /// shortest-path turn, so a change of view reads as a turn of the model
+    /// rather than a cut. Dragging the cube orbits directly, as it always
+    /// has, and takes over from any flight in progress.
+    fn apply_view_cube_command(&mut self, command: ViewCubeCommand) {
+        let mut target = self.view;
+        match command {
+            ViewCubeCommand::Face(face) => target.set_standard_view(face),
+            ViewCubeCommand::Roll { clockwise } => target.rotate_in_plane_quarter_turn(clockwise),
+            ViewCubeCommand::Isometric => target.reset_orientation(),
+            ViewCubeCommand::Along { axes } => {
+                if !target.set_view_along(view_cube_direction(axes), Vector3::new(0.0, 0.0, 1.0)) {
+                    return;
+                }
+            }
+            ViewCubeCommand::Drag { delta } => {
+                if self.sketch_flight_pending() {
+                    return;
+                }
+                self.face_camera_transition = None;
+                self.last_face_camera_time = None;
+                self.view
+                    .orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
+                return;
+            }
+        }
+        self.fly_view_to(target);
+    }
+
+    /// Whether a camera flight is carrying the workbench into a sketch: its
+    /// landing opens the sketch on the face it was aimed at, so nothing else
+    /// may steer it.
+    const fn sketch_flight_pending(&self) -> bool {
+        self.pending_face_sketch.is_some() || self.pending_plane_sketch.is_some()
+    }
+
+    /// Flies the camera to `target` with the normal-to-face flight, or
+    /// jumps there when the flights are switched off. A flight a sketch is
+    /// waiting on is left alone and the request is dropped, which the
+    /// return value reports. A flight to a view the camera already has is
+    /// no flight at all.
+    fn fly_view_to(&mut self, target: ViewState) -> bool {
+        if self.sketch_flight_pending() {
+            return false;
+        }
+        if self.animate_face_camera_transitions
+            && let Some(transition) = CameraTransition::to_view(self.view, target)
+        {
+            self.face_camera_transition = Some(transition);
+            self.last_face_camera_time = None;
+        } else {
+            self.face_camera_transition = None;
+            self.last_face_camera_time = None;
+            self.view = target;
+        }
+        true
+    }
+
     fn frame_visible_document(&mut self) {
         if let Some(bounds) = self.visible_document_bounds() {
             self.view.frame(bounds);
@@ -17969,21 +18031,7 @@ impl KernelLabApp {
             egui::vec2(112.0, 128.0),
         );
         if let Some(command) = model_view_cube(ui, cube_rect, self.view, true) {
-            match command {
-                ViewCubeCommand::Face(face) => self.view.set_standard_view(face),
-                ViewCubeCommand::Roll { clockwise } => {
-                    self.view.rotate_in_plane_quarter_turn(clockwise);
-                }
-                ViewCubeCommand::Isometric => self.reset_view(ui.ctx()),
-                ViewCubeCommand::Along { axes } => {
-                    self.view
-                        .set_view_along(view_cube_direction(axes), Vector3::new(0.0, 0.0, 1.0));
-                }
-                ViewCubeCommand::Drag { delta } => {
-                    self.view
-                        .orbit(f64::from(delta.x) * 0.009, f64::from(delta.y) * 0.009);
-                }
-            }
+            self.apply_view_cube_command(command);
             ui.ctx().request_repaint();
         }
 
@@ -27514,5 +27562,191 @@ mod rejection_summary_tests {
         assert!(app.is_document_dirty());
         app.mark_document_saved();
         assert!(!app.is_document_dirty());
+    }
+}
+
+#[cfg(test)]
+mod view_cube_flight_tests {
+    use super::*;
+    use presentation::FACE_CAMERA_TRANSITION_SECONDS;
+
+    fn direction_of(view: ViewState) -> [f64; 3] {
+        let direction = view.view_direction();
+        [direction.x, direction.y, direction.z]
+    }
+
+    fn assert_direction(view: ViewState, expected: [f64; 3], what: &str) {
+        let actual = direction_of(view);
+        for axis in 0..3 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 1e-9,
+                "{what}: view direction {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    /// With the flights on, a cube click schedules a flight and the camera
+    /// stays put until the flight advances; when it lands the camera looks
+    /// exactly where an instant change would have put it.
+    #[test]
+    fn a_cube_click_flies_the_camera_when_animation_is_on() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        let start = app.view;
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Front));
+        assert!(
+            app.face_camera_transition.is_some(),
+            "a face click should fly rather than jump"
+        );
+        assert_eq!(app.view, start, "the camera does not jump at take-off");
+
+        let mut flight = app.face_camera_transition.take().expect("a flight");
+        let midway = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 0.5);
+        assert_ne!(midway, start, "half-way through, the camera has moved");
+        assert!(!flight.is_complete());
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS);
+        assert!(flight.is_complete());
+        assert_direction(landed, [0.0, -1.0, 0.0], "the front face");
+        assert_eq!(landed.zoom, start.zoom, "a cube click never reframes");
+    }
+
+    /// Corners and edges take the same flight as faces.
+    #[test]
+    fn corner_and_edge_clicks_fly_to_their_directions() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.view.set_standard_view(StandardView::Top);
+
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [1, -1, 1] });
+        let mut flight = app.face_camera_transition.take().expect("a corner flight");
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let root = 1.0 / 3.0_f64.sqrt();
+        assert_direction(landed, [root, -root, root], "the front-top-right corner");
+
+        app.view = landed;
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [0, -1, 1] });
+        let mut flight = app.face_camera_transition.take().expect("an edge flight");
+        let landed = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let half = 1.0 / 2.0_f64.sqrt();
+        assert_direction(landed, [0.0, -half, half], "the front-top edge");
+    }
+
+    /// The roll arrows and the ISO button fly too, and a second click while
+    /// a flight is under way retargets it from wherever the camera is.
+    #[test]
+    fn roll_and_isometric_fly_and_a_new_click_retargets_the_flight() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.view.set_standard_view(StandardView::Front);
+
+        app.apply_view_cube_command(ViewCubeCommand::Roll { clockwise: true });
+        let mut flight = app.face_camera_transition.take().expect("a roll flight");
+        let rolled = flight.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        assert_direction(
+            rolled,
+            [0.0, -1.0, 0.0],
+            "a roll keeps the viewing direction",
+        );
+        let up = rolled.screen_up_direction();
+        assert!(
+            up.z.abs() < 1e-9 && up.x.abs() > 0.99,
+            "a quarter turn lays screen-up along X, got ({}, {}, {})",
+            up.x,
+            up.y,
+            up.z
+        );
+
+        app.view = rolled;
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Right));
+        let mut first = app.face_camera_transition.take().expect("a face flight");
+        let midway = first.advance(FACE_CAMERA_TRANSITION_SECONDS * 0.4);
+        app.view = midway;
+        app.apply_view_cube_command(ViewCubeCommand::Isometric);
+        let mut second = app.face_camera_transition.take().expect("an ISO flight");
+        assert_eq!(
+            second.advance(0.0),
+            midway,
+            "the new flight takes off from where the camera is"
+        );
+        let landed = second.advance(FACE_CAMERA_TRANSITION_SECONDS * 2.0);
+        let mut expected = midway;
+        expected.reset_orientation();
+        assert_eq!(landed, expected, "ISO lands on the default orientation");
+    }
+
+    /// With the flights off (the test and accessibility default) every cube
+    /// command is instant, exactly as before.
+    #[test]
+    fn a_cube_click_jumps_when_animation_is_off() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        assert!(!app.animate_face_camera_transitions);
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Left));
+        assert!(app.face_camera_transition.is_none());
+        assert_direction(app.view, [-1.0, 0.0, 0.0], "the left face");
+
+        app.apply_view_cube_command(ViewCubeCommand::Along { axes: [-1, 1, -1] });
+        assert!(app.face_camera_transition.is_none());
+        let root = 1.0 / 3.0_f64.sqrt();
+        assert_direction(
+            app.view,
+            [-root, root, -root],
+            "the back-bottom-left corner",
+        );
+    }
+
+    /// Dragging the cube orbits at once and takes over from a flight.
+    #[test]
+    fn a_cube_drag_orbits_immediately_and_cancels_a_flight() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Back));
+        assert!(app.face_camera_transition.is_some());
+        let before = app.view;
+
+        app.apply_view_cube_command(ViewCubeCommand::Drag {
+            delta: egui::vec2(12.0, 0.0),
+        });
+        assert!(
+            app.face_camera_transition.is_none(),
+            "a drag takes the camera out of the flight's hands"
+        );
+        assert_ne!(app.view, before, "the drag orbits straight away");
+    }
+
+    /// A flight that a sketch is waiting on is not steered by the cube: its
+    /// landing opens the sketch on the face it was aimed at.
+    #[test]
+    fn a_cube_click_never_steers_a_flight_into_a_sketch() {
+        let mut app = KernelLabApp::default();
+        app.reset_to_blank_workspace();
+        app.set_face_camera_animation(true);
+        app.selected_origin_plane = SketchPlane::XY;
+        app.enter_sketch_mode();
+        let flight = app
+            .face_camera_transition
+            .expect("entering a plane sketch flies the camera");
+        assert!(app.pending_plane_sketch.is_some());
+
+        app.apply_view_cube_command(ViewCubeCommand::Face(StandardView::Right));
+        assert_eq!(
+            app.face_camera_transition,
+            Some(flight),
+            "the sketch's flight is untouched"
+        );
+        app.apply_view_cube_command(ViewCubeCommand::Drag {
+            delta: egui::vec2(12.0, 0.0),
+        });
+        assert_eq!(
+            app.face_camera_transition,
+            Some(flight),
+            "a drag does not cancel the sketch's flight either"
+        );
     }
 }
