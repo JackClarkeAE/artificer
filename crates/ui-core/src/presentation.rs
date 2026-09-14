@@ -468,6 +468,14 @@ pub struct SixDofSettings {
     /// camera mode, where the cap flies the viewer through the scene and
     /// every axis reverses.
     pub object_mode: bool,
+    /// The shape of the response to a deflection: the normalised deflection
+    /// is raised to this power, sign kept. 1.0 is linear; above it, a light
+    /// touch moves the view finely while a full push keeps its speed.
+    pub response_exponent: f64,
+    /// The time constant of the low-pass filter the motion goes through
+    /// before it steers, in seconds. It rides out the unevenness between the
+    /// puck's report bursts and the frames that consume them; zero is raw.
+    pub smoothing_seconds: f64,
 }
 
 impl Default for SixDofSettings {
@@ -481,7 +489,91 @@ impl Default for SixDofSettings {
             invert_rotate: [false; 3],
             roll_enabled: false,
             object_mode: true,
+            response_exponent: 1.6,
+            smoothing_seconds: 0.05,
         }
+    }
+}
+
+/// Six-axis motion smoothed for the camera: the response curve applied,
+/// then a first-order low-pass with the settings' time constant, so a burst
+/// of reports followed by a gap does not stair-step the view. Feed it once a
+/// frame, with the raw motion held since the last frame (zero when the cap
+/// rests), and steer with what it returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SixDofFilter {
+    state: SixDofMotion,
+}
+
+impl SixDofFilter {
+    /// The smallest filtered deflection that still counts as motion. Below
+    /// it the state snaps to rest, so a released cap stops the view (and the
+    /// repaints) instead of creeping forever. Two per cent of full deflection
+    /// is under the puck's own dead zone and moves the view by less than a
+    /// pixel a frame, so the snap is invisible.
+    pub const REST_THRESHOLD: f64 = 0.02;
+
+    /// Passes one frame's raw motion through the curve and the filter and
+    /// returns the motion to steer with.
+    pub fn feed(
+        &mut self,
+        raw: SixDofMotion,
+        seconds: f64,
+        settings: &SixDofSettings,
+    ) -> SixDofMotion {
+        let exponent = if settings.response_exponent.is_finite() && settings.response_exponent > 0.0
+        {
+            settings.response_exponent
+        } else {
+            1.0
+        };
+        let shape = |value: f64| {
+            let value = finite_or_zero(value).clamp(-1.0, 1.0);
+            value.abs().powf(exponent).copysign(value)
+        };
+        let shaped = SixDofMotion {
+            translate: raw.translate.map(shape),
+            rotate: raw.rotate.map(shape),
+        };
+        let tau = finite_or_zero(settings.smoothing_seconds).max(0.0);
+        let seconds = finite_or_zero(seconds).clamp(0.0, MAX_FRAME_DELTA_SECONDS);
+        let share = if tau <= 0.0 || seconds <= 0.0 {
+            1.0
+        } else {
+            1.0 - (-seconds / tau).exp()
+        };
+        let blend = |state: f64, input: f64| state + (input - state) * share;
+        let mut next = SixDofMotion {
+            translate: std::array::from_fn(|index| {
+                blend(self.state.translate[index], shaped.translate[index])
+            }),
+            rotate: std::array::from_fn(|index| {
+                blend(self.state.rotate[index], shaped.rotate[index])
+            }),
+        };
+        // A resting cap and a state below the threshold: the motion is over.
+        if shaped.is_still()
+            && next
+                .translate
+                .iter()
+                .chain(&next.rotate)
+                .all(|axis| axis.abs() < Self::REST_THRESHOLD)
+        {
+            next = SixDofMotion::default();
+        }
+        self.state = next;
+        next
+    }
+
+    /// Whether the filtered motion has come to rest.
+    #[must_use]
+    pub fn is_still(&self) -> bool {
+        self.state.is_still()
+    }
+
+    /// Forgets any motion in flight, as when the device goes away.
+    pub fn reset(&mut self) {
+        self.state = SixDofMotion::default();
     }
 }
 
@@ -519,7 +611,26 @@ pub struct ViewState {
     pub projection_mode: ProjectionMode,
     pub section_cut_plane: Option<SectionCutPlane>,
     pub fill_backend: FillBackend,
+    /// A wheel zoom under way: the zoom the wheel asked for, which the view
+    /// eases toward over a few frames rather than jumping to. `None` when
+    /// the zoom is where it was asked to be.
+    zoom_glide: Option<ZoomGlide>,
 }
+
+/// The destination of an eased wheel zoom, and the pointer it is anchored
+/// to so the geometry under the cursor stays put while the view arrives.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ZoomGlide {
+    target_log_zoom: f64,
+    anchor: Option<[f64; 2]>,
+    points_per_unit: f64,
+}
+
+/// How long an eased wheel zoom takes to cover most of its distance: the
+/// time constant of its exponential approach. Short enough that a run of
+/// notches feels direct, long enough that one notch is a glide rather than
+/// a jump.
+pub const ZOOM_GLIDE_SECONDS: f64 = 0.09;
 
 impl Default for ViewState {
     fn default() -> Self {
@@ -534,6 +645,7 @@ impl Default for ViewState {
             projection_mode: ProjectionMode::default(),
             section_cut_plane: None,
             fill_backend: FillBackend::default(),
+            zoom_glide: None,
         }
     }
 }
@@ -562,6 +674,7 @@ impl ViewState {
             self.target = bounds_center(bounds);
             self.fit_radius = radius;
             self.focus_pivot = false;
+            self.zoom_glide = None;
         }
     }
 
@@ -891,6 +1004,72 @@ impl ViewState {
         }
     }
 
+    /// Asks for a zoom by `factor` that the view eases toward over the next
+    /// frames instead of taking at once: each wheel notch moves the
+    /// destination, and [`Self::advance_zoom_glide`] carries the view there.
+    /// `anchor` is the pointer's offset from the projection centre, in
+    /// points, kept under the same world point throughout (see
+    /// [`Self::zoom_about`]); without one the zoom is about the pivot. A
+    /// notch that arrives mid-glide adds to the destination, so a run of
+    /// notches covers the same distance it would have taken instantly.
+    pub fn glide_zoom_by(&mut self, factor: f64, anchor: Option<[f64; 2]>, points_per_unit: f64) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let from = self.zoom_glide.map_or_else(
+            || bounded_zoom(self.zoom).ln(),
+            |glide| glide.target_log_zoom,
+        );
+        let target_log_zoom = bounded_zoom((from + factor.ln()).exp()).ln();
+        self.zoom_glide = Some(ZoomGlide {
+            target_log_zoom,
+            anchor: anchor.filter(|offset| offset.iter().all(|value| value.is_finite())),
+            points_per_unit,
+        });
+    }
+
+    /// Whether a wheel zoom is still on its way.
+    #[must_use]
+    pub const fn is_zoom_gliding(&self) -> bool {
+        self.zoom_glide.is_some()
+    }
+
+    /// Moves the zoom toward the destination a wheel asked for, by the share
+    /// of the remaining distance `seconds` covers at [`ZOOM_GLIDE_SECONDS`],
+    /// and lands exactly when close enough. Returns whether the view moved,
+    /// which is when the caller has to draw again.
+    pub fn advance_zoom_glide(&mut self, seconds: f64) -> bool {
+        let Some(glide) = self.zoom_glide else {
+            return false;
+        };
+        let current = bounded_zoom(self.zoom).ln();
+        let remaining = glide.target_log_zoom - current;
+        if !remaining.is_finite() {
+            self.zoom_glide = None;
+            return false;
+        }
+        let seconds = finite_or_zero(seconds).clamp(0.0, MAX_FRAME_DELTA_SECONDS);
+        let share = 1.0 - (-seconds / ZOOM_GLIDE_SECONDS).exp();
+        // Close enough to land: below a ten-thousandth of a zoom step no
+        // frame could show the difference, and a glide that never ended
+        // would keep the application repainting for nothing.
+        let step = if remaining.abs() < 1.0e-4 || share >= 1.0 - 1.0e-9 {
+            self.zoom_glide = None;
+            remaining
+        } else {
+            remaining * share
+        };
+        if step == 0.0 {
+            return self.zoom_glide.is_some();
+        }
+        let factor = step.exp();
+        match glide.anchor {
+            Some(anchor) => self.zoom_about(factor, anchor, glide.points_per_unit),
+            None => self.zoom_by(factor),
+        }
+        true
+    }
+
     /// Converts an orthographic screen-plane delta into a world-space vector.
     /// Horizontal is positive screen-right and vertical is positive down.
     pub fn world_delta_from_screen(self, horizontal: f64, vertical: f64) -> [f64; 3] {
@@ -1029,6 +1208,7 @@ impl ViewState {
             projection_mode: self.projection_mode,
             section_cut_plane: self.section_cut_plane,
             fill_backend: self.fill_backend,
+            zoom_glide: None,
         })
     }
 
@@ -1214,6 +1394,7 @@ impl CameraTransition {
             projection_mode: self.target.projection_mode,
             section_cut_plane: self.target.section_cut_plane,
             fill_backend: self.target.fill_backend,
+            zoom_glide: None,
         }
     }
 
@@ -2600,5 +2781,204 @@ mod tests {
         stalled.apply_six_dof(motion, 5.0, SixDofSettings::default());
         capped.apply_six_dof(motion, MAX_FRAME_DELTA_SECONDS, SixDofSettings::default());
         assert_eq!(stalled, capped);
+    }
+}
+
+#[cfg(test)]
+mod zoom_glide_tests {
+    use super::*;
+
+    const FRAME: f64 = 1.0 / 60.0;
+
+    /// A notch names a destination and the view glides there: it moves on
+    /// the first frame, never overshoots, and lands exactly within a few
+    /// hundred milliseconds.
+    #[test]
+    fn a_wheel_notch_glides_to_its_zoom_without_overshoot() {
+        let mut view = ViewState::default();
+        view.glide_zoom_by(1.5, None, 1.0);
+        assert!(view.is_zoom_gliding());
+        assert!(view.advance_zoom_glide(FRAME));
+        assert!(
+            view.zoom > 1.0 && view.zoom < 1.5,
+            "first frame moved part way: {}",
+            view.zoom
+        );
+        let mut previous = view.zoom;
+        let mut frames = 1;
+        while view.is_zoom_gliding() {
+            view.advance_zoom_glide(FRAME);
+            assert!(view.zoom >= previous - 1e-12, "no going back");
+            assert!(view.zoom <= 1.5 + 1e-9, "no overshoot: {}", view.zoom);
+            previous = view.zoom;
+            frames += 1;
+            assert!(frames < 120, "a glide lands within two seconds");
+        }
+        assert!(
+            (view.zoom - 1.5).abs() < 1e-9,
+            "lands on the notch: {}",
+            view.zoom
+        );
+        assert!(frames <= 60, "lands within a second: {frames} frames");
+        assert!(!view.advance_zoom_glide(FRAME), "nothing moves once landed");
+    }
+
+    /// Notches that arrive mid-glide add to the destination, so a run of
+    /// them covers the distance they would have covered instantly.
+    #[test]
+    fn notches_during_a_glide_add_up() {
+        let mut view = ViewState::default();
+        view.glide_zoom_by(1.5, None, 1.0);
+        view.advance_zoom_glide(FRAME);
+        view.glide_zoom_by(1.5, None, 1.0);
+        while view.is_zoom_gliding() {
+            view.advance_zoom_glide(FRAME);
+        }
+        assert!((view.zoom - 2.25).abs() < 1e-9, "{}", view.zoom);
+    }
+
+    /// The world point under the pointer stays under it throughout the
+    /// glide, as it does for an instant anchored zoom.
+    #[test]
+    fn an_anchored_glide_keeps_the_pointer_point_fixed() {
+        let mut view = ViewState::default();
+        let anchor = [120.0, -80.0];
+        let points_per_unit = 4.0;
+        let under_pointer = |view: &ViewState| {
+            let delta = view.world_delta_from_screen(
+                anchor[0] / (points_per_unit * view.zoom),
+                anchor[1] / (points_per_unit * view.zoom),
+            );
+            [
+                view.target.x + delta[0],
+                view.target.y + delta[1],
+                view.target.z + delta[2],
+            ]
+        };
+        let before = under_pointer(&view);
+        view.glide_zoom_by(2.0, Some(anchor), points_per_unit);
+        while view.is_zoom_gliding() {
+            view.advance_zoom_glide(FRAME);
+            let now = under_pointer(&view);
+            for axis in 0..3 {
+                assert!(
+                    (now[axis] - before[axis]).abs() < 1e-9,
+                    "the anchored point drifted: {now:?} vs {before:?}"
+                );
+            }
+        }
+        assert!((view.zoom - 2.0).abs() < 1e-9);
+    }
+
+    /// Framing the document ends any glide: the frame is the new zoom.
+    #[test]
+    fn framing_cancels_a_glide() {
+        let mut view = ViewState::default();
+        view.glide_zoom_by(3.0, None, 1.0);
+        view.frame(Aabb3 {
+            min: Point3::new(-1.0, -1.0, -1.0),
+            max: Point3::new(1.0, 1.0, 1.0),
+        });
+        assert!(!view.is_zoom_gliding());
+    }
+}
+
+#[cfg(test)]
+mod six_dof_filter_tests {
+    use super::*;
+
+    const FRAME: f64 = 1.0 / 120.0;
+
+    fn held(value: f64) -> SixDofMotion {
+        SixDofMotion {
+            translate: [0.0; 3],
+            rotate: [0.0, value, 0.0],
+        }
+    }
+
+    fn linear() -> SixDofSettings {
+        SixDofSettings {
+            response_exponent: 1.0,
+            ..SixDofSettings::default()
+        }
+    }
+
+    /// A held deflection is reached to within five per cent after three
+    /// time constants, and stays there.
+    #[test]
+    fn a_held_deflection_is_reached_within_three_time_constants() {
+        let settings = linear();
+        let mut filter = SixDofFilter::default();
+        let mut elapsed = 0.0;
+        let mut motion = SixDofMotion::default();
+        while elapsed < settings.smoothing_seconds * 3.0 {
+            motion = filter.feed(held(1.0), FRAME, &settings);
+            elapsed += FRAME;
+        }
+        assert!(motion.rotate[1] > 0.95, "{}", motion.rotate[1]);
+        for _ in 0..120 {
+            motion = filter.feed(held(1.0), FRAME, &settings);
+        }
+        assert!((motion.rotate[1] - 1.0).abs() < 1e-6);
+    }
+
+    /// A released cap decays to rest, and to exactly zero, within two
+    /// hundred milliseconds, so the view (and the repaints) stop.
+    #[test]
+    fn a_released_cap_comes_to_rest() {
+        let settings = linear();
+        let mut filter = SixDofFilter::default();
+        for _ in 0..60 {
+            filter.feed(held(1.0), FRAME, &settings);
+        }
+        let mut elapsed = 0.0;
+        while !filter.is_still() {
+            filter.feed(SixDofMotion::default(), FRAME, &settings);
+            elapsed += FRAME;
+            assert!(elapsed < 0.25, "still moving after {elapsed} s");
+        }
+        assert_eq!(
+            filter.feed(SixDofMotion::default(), FRAME, &settings),
+            SixDofMotion::default()
+        );
+    }
+
+    /// Smoothing must not change how far a held push travels: over one
+    /// second the filtered motion integrates to within ten per cent of the
+    /// raw one (the lag at the start is the only loss).
+    #[test]
+    fn a_held_second_travels_nearly_as_far_filtered() {
+        let settings = linear();
+        let mut filter = SixDofFilter::default();
+        let mut raw_travel = 0.0;
+        let mut filtered_travel = 0.0;
+        let mut elapsed = 0.0;
+        while elapsed < 1.0 {
+            let motion = filter.feed(held(0.7), FRAME, &settings);
+            filtered_travel += motion.rotate[1] * FRAME;
+            raw_travel += 0.7 * FRAME;
+            elapsed += FRAME;
+        }
+        assert!(
+            (filtered_travel / raw_travel - 1.0).abs() < 0.1,
+            "filtered {filtered_travel} vs raw {raw_travel}"
+        );
+    }
+
+    /// The response curve keeps full deflection at full speed and softens
+    /// a light touch, sign kept.
+    #[test]
+    fn the_response_curve_softens_a_light_touch_only() {
+        let settings = SixDofSettings {
+            smoothing_seconds: 0.0,
+            ..SixDofSettings::default()
+        };
+        let mut filter = SixDofFilter::default();
+        assert!((filter.feed(held(1.0), FRAME, &settings).rotate[1] - 1.0).abs() < 1e-12);
+        assert!((filter.feed(held(-1.0), FRAME, &settings).rotate[1] + 1.0).abs() < 1e-12);
+        let light = filter.feed(held(0.5), FRAME, &settings).rotate[1];
+        assert!(light > 0.0 && light < 0.4, "{light}");
+        let lighter = filter.feed(held(-0.25), FRAME, &settings).rotate[1];
+        assert!(lighter < 0.0 && lighter > -0.15, "{lighter}");
     }
 }

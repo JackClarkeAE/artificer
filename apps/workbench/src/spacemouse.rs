@@ -14,11 +14,12 @@
 //! which is the cheapest useful bookmark a puck can offer.
 
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use artificer_spacemouse::{DeviceStatus, Motion, SpaceMouse};
 use egui::RichText;
 
-use crate::presentation::{SixDofMotion, SixDofSettings, ViewState};
+use crate::presentation::{SixDofFilter, SixDofMotion, SixDofSettings, ViewState};
 use crate::{KernelLabApp, WorkbenchMode, status_line, theme};
 
 /// The one reader per process, shared by every document.
@@ -33,7 +34,19 @@ pub struct SpaceMouseNavigation {
     /// per document for now, starting from the defaults.
     pub settings: SixDofSettings,
     bookmark: Option<ViewState>,
+    /// The motion the camera actually follows: the raw reports, shaped and
+    /// low-passed, so a burst of reports and a slow frame do not stair-step
+    /// the view.
+    filter: SixDofFilter,
+    /// When the frame loop last took motion, so each frame integrates the
+    /// time that really passed rather than the renderer's estimate.
+    last_poll: Option<Instant>,
 }
+
+/// How soon the next frame is asked for while the cap is deflected or the
+/// filter is still settling: a steady cadence for the integration, rather
+/// than one repaint per report burst.
+const FOLLOW_UP_FRAME: Duration = Duration::from_millis(8);
 
 impl SpaceMouseNavigation {
     /// Attaches to the process's puck, opening it on the first call. The
@@ -79,14 +92,37 @@ impl KernelLabApp {
     /// Applies whatever the puck reported since the last frame. Called once
     /// per frame from the application's logic pass.
     pub(crate) fn poll_spacemouse(&mut self, context: &egui::Context) {
-        let Some(motion) = self.spacemouse.take_motion() else {
+        let Some(raw) = self.spacemouse.take_motion() else {
             return;
         };
-        if motion.is_empty() {
+        let now = Instant::now();
+        let seconds = self.spacemouse.last_poll.map_or(1.0 / 60.0, |previous| {
+            now.duration_since(previous).as_secs_f64()
+        });
+        self.spacemouse.last_poll = Some(now);
+        if raw.is_empty() && self.spacemouse.filter.is_still() {
             return;
         }
-        let seconds = f64::from(context.input(|input| input.stable_dt));
+        let settings = self.spacemouse.settings;
+        let steered = self.spacemouse.filter.feed(
+            SixDofMotion {
+                translate: raw.translate,
+                rotate: raw.rotate,
+            },
+            seconds,
+            &settings,
+        );
+        let motion = Motion {
+            translate: steered.translate,
+            rotate: steered.rotate,
+            buttons_pressed: raw.buttons_pressed,
+        };
         self.apply_spacemouse_motion(motion, seconds, context);
+        if !self.spacemouse.filter.is_still() {
+            // Keep the frames coming at a steady cadence until the filter
+            // settles, whether or not the puck reports again meanwhile.
+            context.request_repaint_after(FOLLOW_UP_FRAME);
+        }
     }
 
     /// The camera's response to one frame of puck motion held for

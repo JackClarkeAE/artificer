@@ -1531,6 +1531,32 @@ fn tokenize_expression(text: &str) -> Result<Vec<ExpressionToken>, ExpressionPar
                         break;
                     }
                 }
+                // An exponent: `1e3`, `2.5E-2`. The `e` belongs to the
+                // number only when a digit follows it, directly or after
+                // one sign; otherwise it starts a name as it always did.
+                if let Some(&marker) = characters.peek()
+                    && matches!(marker, 'e' | 'E')
+                {
+                    let mut ahead = characters.clone();
+                    ahead.next();
+                    let sign = ahead.next_if(|piece| *piece == '+' || *piece == '-');
+                    if ahead.peek().is_some_and(char::is_ascii_digit) {
+                        digits.push(marker);
+                        characters.next();
+                        if let Some(sign) = sign {
+                            digits.push(sign);
+                            characters.next();
+                        }
+                        while let Some(&piece) = characters.peek() {
+                            if piece.is_ascii_digit() {
+                                digits.push(piece);
+                                characters.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
                 let magnitude = digits
                     .parse::<f64>()
                     .ok()
@@ -2318,5 +2344,39 @@ mod tests {
             }]),
             Err(ParameterError::ExpressionTooDeep)
         );
+    }
+}
+
+#[cfg(test)]
+mod exponent_tests {
+    use super::*;
+
+    fn number(text: &str) -> (f64, Option<ParameterUnit>) {
+        let tokens = tokenize_expression(text).expect("tokenizes");
+        match tokens.as_slice() {
+            [ExpressionToken::Number(value, unit)] => (*value, *unit),
+            other => panic!("{text}: expected one number, got {other:?}"),
+        }
+    }
+
+    /// `1e3` is a thousand, not one with a unit called `e3`, and the unit
+    /// still follows the exponent.
+    #[test]
+    fn exponent_literals_are_numbers() {
+        assert_eq!(number("1e3"), (1000.0, None));
+        assert_eq!(number("2.5E-2"), (0.025, None));
+        assert_eq!(number("1e3mm"), (1000.0, Some(ParameterUnit::Millimeter)));
+        assert_eq!(number("1e3 mm"), (1000.0, Some(ParameterUnit::Millimeter)));
+        assert_eq!(number("1e+2in"), (100.0, Some(ParameterUnit::Inch)));
+    }
+
+    /// A bare `e` after a number is a unit nobody has, so the entry is an
+    /// error rather than a thousand or a one.
+    #[test]
+    fn a_bare_e_is_not_an_exponent() {
+        assert!(matches!(
+            tokenize_expression("1e"),
+            Err(ExpressionParseError::UnknownUnit(unit)) if unit == "e"
+        ));
     }
 }

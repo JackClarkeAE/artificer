@@ -41,6 +41,35 @@ is never steered, because its landing opens the sketch on the face it was
 aimed at. With the flights switched off (the accessibility setting and the
 test default) every command is instant, as before.
 
+### The turn arrows ride an orbit ring (0.98.1)
+
+The four turn arrows used to be flat triangles placed along the projected
+outward normals of the faces adjacent to the one nearest the viewer. From
+an oblique view that put them wherever the normals happened to land, and
+they read as the faces pointing somewhere rather than as a way to turn.
+
+The cube now sits inside an orbit ring: the circle in the world XY plane
+the camera rides when the view turns about world Z, drawn with the cube's
+own projection so it tilts with the view — an ellipse round the cube's
+waist from an oblique view, a full circle from above. Its far half is
+painted faintly before the faces, so the cube hides it, and its near half
+after them, stepping round the face labels, so it passes in front of the
+lower faces the way a real ring would. Seen edge-on it would be a line
+through the cube and say nothing, so it fades out as world Z turns into
+the screen plane; a square-on side view shows the four arrows alone.
+
+The left and right arrows sit just outside the ring, either side of its
+nearest point, pointing along it away from that point: the way the camera
+goes when it turns to that side. Up and down sit on the screen vertical,
+where the meridian the camera would ride is seen edge-on whatever the
+view, so a curve there would be a line. Each arrow still turns to the face
+the cube draws on that side of itself, chosen among the faces whose
+outward normal leans that way on screen, with a face the viewer can see
+counting in full and a hidden one at four fifths, so from an oblique view
+the side arrows name the faces in the picture and the down arrow keeps the
+bottom. The face already in front leans no way and is never offered. The
+accessible names are `View cube turn left`, `right`, `up` and `down`.
+
 ### The SpaceMouse is read as raw HID, in its own crate
 
 `artificer-spacemouse` enumerates HID devices with the `hidapi` crate's

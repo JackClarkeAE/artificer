@@ -191,115 +191,168 @@ impl BspNode {
         node
     }
 
+    /// Every walk over this tree carries its own stack rather than the
+    /// thread's. A tessellated sphere or cylinder splits into thousands of
+    /// near-coplanar facets, and the tree a run of those builds is deep enough
+    /// that recursion overflows and aborts the process — which is not a
+    /// refusal a caller can catch or a kernel can certify.
     fn invert(&mut self) {
-        for polygon in &mut self.polygons {
-            polygon.invert();
+        let mut pending: Vec<&mut Self> = vec![self];
+        while let Some(node) = pending.pop() {
+            for polygon in &mut node.polygons {
+                polygon.invert();
+            }
+            if let Some(plane) = &mut node.plane {
+                plane.flip();
+            }
+            std::mem::swap(&mut node.front, &mut node.back);
+            if let Some(front) = &mut node.front {
+                pending.push(front);
+            }
+            if let Some(back) = &mut node.back {
+                pending.push(back);
+            }
         }
-        if let Some(plane) = &mut self.plane {
-            plane.flip();
-        }
-        if let Some(front) = &mut self.front {
-            front.invert();
-        }
-        if let Some(back) = &mut self.back {
-            back.invert();
-        }
-        std::mem::swap(&mut self.front, &mut self.back);
     }
 
+    /// Pushes polygons down this tree, keeping what falls in front of every
+    /// plane and dropping what falls behind a leaf. Each frame is a node and
+    /// the polygons still to go through it, and a node's two children are
+    /// walked before its two results are joined — front first, exactly as the
+    /// recursive form did, because the order polygons come back in decides
+    /// which plane the next tree built from them splits on. A tree thousands
+    /// deep then costs the heap rather than the thread's stack.
     fn clip_polygons(&self, polygons: Vec<Polygon>) -> Vec<Polygon> {
-        let Some(plane) = self.plane else {
-            return polygons;
-        };
-        let mut front = Vec::new();
-        let mut back = Vec::new();
-        for polygon in polygons {
-            let mut coplanar_front = Vec::new();
-            let mut coplanar_back = Vec::new();
-            plane.split_polygon(
-                &polygon,
-                self.epsilon,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front,
-                &mut back,
-            );
-            front.extend(coplanar_front);
-            back.extend(coplanar_back);
+        enum Step<'a> {
+            /// Push these polygons through this subtree.
+            Descend(&'a BspNode, Vec<Polygon>),
+            /// There is no subtree here; these polygons are already the answer.
+            Ready(Vec<Polygon>),
+            /// Join the front and back halves the two steps above produced.
+            Join,
         }
-        if let Some(node) = &self.front {
-            front = node.clip_polygons(front);
+        let mut pending = vec![Step::Descend(self, polygons)];
+        let mut done: Vec<Vec<Polygon>> = Vec::new();
+        while let Some(step) = pending.pop() {
+            match step {
+                Step::Ready(polygons) => done.push(polygons),
+                Step::Descend(node, polygons) => {
+                    let Some(plane) = node.plane else {
+                        done.push(polygons);
+                        continue;
+                    };
+                    let mut front = Vec::new();
+                    let mut back = Vec::new();
+                    for polygon in polygons {
+                        let mut coplanar_front = Vec::new();
+                        let mut coplanar_back = Vec::new();
+                        plane.split_polygon(
+                            &polygon,
+                            node.epsilon,
+                            &mut coplanar_front,
+                            &mut coplanar_back,
+                            &mut front,
+                            &mut back,
+                        );
+                        front.extend(coplanar_front);
+                        back.extend(coplanar_back);
+                    }
+                    // A leaf behind the plane keeps nothing.
+                    if node.back.is_none() {
+                        back.clear();
+                    }
+                    // The back half is queued first and the front second, so
+                    // the front finishes first and `Join` pops back, then
+                    // front, and appends back to front.
+                    pending.push(Step::Join);
+                    pending.push(match &node.back {
+                        Some(child) => Step::Descend(child, back),
+                        None => Step::Ready(back),
+                    });
+                    pending.push(match &node.front {
+                        Some(child) => Step::Descend(child, front),
+                        None => Step::Ready(front),
+                    });
+                }
+                Step::Join => {
+                    let mut back = done.pop().unwrap_or_default();
+                    let mut front = done.pop().unwrap_or_default();
+                    front.append(&mut back);
+                    done.push(front);
+                }
+            }
         }
-        if let Some(node) = &self.back {
-            back = node.clip_polygons(back);
-        } else {
-            back.clear();
-        }
-        front.extend(back);
-        front
+        done.pop().unwrap_or_default()
     }
 
     fn clip_to(&mut self, other: &Self) {
-        self.polygons = other.clip_polygons(std::mem::take(&mut self.polygons));
-        if let Some(front) = &mut self.front {
-            front.clip_to(other);
-        }
-        if let Some(back) = &mut self.back {
-            back.clip_to(other);
+        let mut pending: Vec<&mut Self> = vec![self];
+        while let Some(node) = pending.pop() {
+            node.polygons = other.clip_polygons(std::mem::take(&mut node.polygons));
+            if let Some(front) = &mut node.front {
+                pending.push(front);
+            }
+            if let Some(back) = &mut node.back {
+                pending.push(back);
+            }
         }
     }
 
+    /// Every polygon in the tree, in the recursive order — this node's own,
+    /// then the whole front subtree, then the whole back — because the first
+    /// polygon of this list becomes the root plane of the next tree built
+    /// from it.
     fn all_polygons(&self) -> Vec<Polygon> {
-        let mut polygons = self.polygons.clone();
-        if let Some(front) = &self.front {
-            polygons.extend(front.all_polygons());
-        }
-        if let Some(back) = &self.back {
-            polygons.extend(back.all_polygons());
+        let mut polygons = Vec::new();
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(node) = pending.pop() {
+            polygons.extend(node.polygons.iter().cloned());
+            if let Some(back) = &node.back {
+                pending.push(back);
+            }
+            if let Some(front) = &node.front {
+                pending.push(front);
+            }
         }
         polygons
     }
 
     fn build(&mut self, polygons: Vec<Polygon>) {
-        if polygons.is_empty() {
-            return;
-        }
-        let plane = *self.plane.get_or_insert(polygons[0].plane);
-        let mut front = Vec::new();
-        let mut back = Vec::new();
-        for polygon in polygons {
-            let mut coplanar_front = Vec::new();
-            let mut coplanar_back = Vec::new();
-            plane.split_polygon(
-                &polygon,
-                self.epsilon,
-                &mut coplanar_front,
-                &mut coplanar_back,
-                &mut front,
-                &mut back,
-            );
-            self.polygons.extend(coplanar_front);
-            self.polygons.extend(coplanar_back);
-        }
-        if !front.is_empty() {
-            self.front
-                .get_or_insert_with(|| {
-                    Box::new(Self {
-                        epsilon: self.epsilon,
-                        ..Self::default()
-                    })
+        let mut pending: Vec<(&mut Self, Vec<Polygon>)> = vec![(self, polygons)];
+        while let Some((node, polygons)) = pending.pop() {
+            if polygons.is_empty() {
+                continue;
+            }
+            let plane = *node.plane.get_or_insert(polygons[0].plane);
+            let mut front = Vec::new();
+            let mut back = Vec::new();
+            for polygon in polygons {
+                let mut coplanar_front = Vec::new();
+                let mut coplanar_back = Vec::new();
+                plane.split_polygon(
+                    &polygon,
+                    node.epsilon,
+                    &mut coplanar_front,
+                    &mut coplanar_back,
+                    &mut front,
+                    &mut back,
+                );
+                node.polygons.extend(coplanar_front);
+                node.polygons.extend(coplanar_back);
+            }
+            let epsilon = node.epsilon;
+            let fresh = || {
+                Box::new(Self {
+                    epsilon,
+                    ..Self::default()
                 })
-                .build(front);
-        }
-        if !back.is_empty() {
-            self.back
-                .get_or_insert_with(|| {
-                    Box::new(Self {
-                        epsilon: self.epsilon,
-                        ..Self::default()
-                    })
-                })
-                .build(back);
+            };
+            if !back.is_empty() {
+                pending.push((node.back.get_or_insert_with(fresh), back));
+            }
+            if !front.is_empty() {
+                pending.push((node.front.get_or_insert_with(fresh), front));
+            }
         }
     }
 }
@@ -338,6 +391,25 @@ fn union(mut left: BspNode, mut right: BspNode) -> BspNode {
 /// crossing face cuts. Chamfers remain planar-exact; fillet arcs are bounded
 /// by the request's explicit approximation budget. No display tessellation is
 /// ever published without passing the ordinary closed-solid validator.
+/// The largest body this tier will rebuild, in polygons of the tessellation it
+/// starts from.
+///
+/// Every face this tier publishes is a plane, so a body carrying exact curved
+/// faces comes back with each of them replaced by its facets: the largest one
+/// this tier has ever certified here went in at 460 polygons and came out as a
+/// 544-face solid. Past that the two costs rise together — the BSP's, which is
+/// superlinear in polygon count and reaches seconds before the tessellation
+/// reaches five figures, and the caller's, who would be handed a body of
+/// thousands of facets to work on afterwards. Neither is worth waiting for, so
+/// the tier declines by returning nothing and the ladder publishes whichever
+/// exact rung's refusal already named the reason.
+///
+/// This is a declared limit rather than a judgement about the request, in the
+/// same way as the 64-target cap below: a body over it might well have been
+/// rebuilt, given the seconds. The figure is roughly eight times the largest
+/// input this tier is known to have certified.
+const MAX_SOURCE_POLYGONS: usize = 4_096;
+
 pub(crate) fn finish_edges(
     source_topology: Option<&Topology>,
     scene: &DebugScene,
@@ -384,7 +456,7 @@ pub(crate) fn finish_edges(
                 })
                 .collect::<Vec<_>>()
         });
-    if source_polygons.is_empty() {
+    if source_polygons.is_empty() || source_polygons.len() > MAX_SOURCE_POLYGONS {
         return None;
     }
 

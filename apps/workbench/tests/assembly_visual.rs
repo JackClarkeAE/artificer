@@ -20,7 +20,30 @@ fn click_scrolled_button(harness: &mut Harness<'static, KernelLabApp>, label: &s
     click_button(harness, label);
 }
 
+/// Opens the ribbon tab a button lives on when it is not on screen: the
+/// placement and transform tools sit on the Assembly tab, the rest of what
+/// these tests click on Model.
+fn reveal_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    if harness
+        .query_by_role_and_label(Role::Button, label)
+        .is_some()
+    {
+        return;
+    }
+    let tab = match label {
+        "Insert a part into this design" | "M  Move" | "R  Rotate" | "S  Scale" => {
+            "Assembly ribbon tab"
+        }
+        _ => "Model mode",
+    };
+    if let Some(button) = harness.query_by_role_and_label(Role::Button, tab) {
+        button.click_accesskit();
+        harness.run();
+    }
+}
+
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    reveal_button(harness, label);
     let position = harness
         .get_by_role_and_label(Role::Button, label)
         .rect()

@@ -100,6 +100,11 @@ fn canonical_cuboid_snapshot() {
 
     let snapshot = harness.state().displayed_snapshot_id();
     let digest = harness.state().displayed_semantic_digest();
+    // The transform tools live on the Assembly tab.
+    harness
+        .get_by_role_and_label(Role::Button, "Assembly ribbon tab")
+        .click_accesskit();
+    harness.run();
     harness
         .get_by_role_and_label(Role::Button, "M  Move")
         .click();
@@ -416,8 +421,24 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
     harness.run();
     let viewport_top = harness.get_by_label("Model viewport").rect().top();
     // "Home" now lives on the View tab, so this checks a Model-tab command from
-    // each weight instead: a large one, a primary one, and a small one.
-    for label in ["Create sketch", "Extrude", "M  Move", "Fillet"] {
+    // each weight instead: a large one, a primary one, and a small one; then
+    // the Assembly tab, whose transform tools moved there.
+    let ribbon_commands = [
+        ("Model mode", "Create sketch"),
+        ("Model mode", "Extrude"),
+        ("Model mode", "Fillet"),
+        ("Assembly ribbon tab", "M  Move"),
+    ];
+    for (tab, label) in ribbon_commands {
+        if harness
+            .query_by_role_and_label(Role::Button, label)
+            .is_none()
+        {
+            harness
+                .get_by_role_and_label(Role::Button, tab)
+                .click_accesskit();
+            harness.run();
+        }
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.height() >= 24.0, "{label} is clipped: {rect:?}");
         assert!(

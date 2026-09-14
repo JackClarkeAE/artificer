@@ -9,6 +9,8 @@
 
 use egui::{FontId, RichText, Stroke};
 
+use crate::units::LengthUnit;
+
 // Aliases rather than a second palette: the library styles itself from the
 // active theme like every other panel, and these names only exist so the
 // module reads in its own vocabulary.
@@ -126,10 +128,12 @@ impl PartInsertionEligibility {
                 Some("Confirm or cancel the current staged insertion before adding another part.")
             }
             Self::MissingLength => {
-                Some("Length is required. Enter a value in millimetres before adding this part.")
+                Some("Length is required. Enter a value before adding this part.")
             }
-            Self::InvalidLength => Some("Length must be a number in millimetres."),
-            Self::NonFiniteLength => Some("Length must be a finite value in millimetres."),
+            Self::InvalidLength => {
+                Some("Length must be a number, in the document unit or with its own (10mm, 1in).")
+            }
+            Self::NonFiniteLength => Some("Length must be a finite value."),
             Self::LengthTooSmall => Some("Length must be at least 0.001 mm."),
             Self::LengthTooLarge => Some("Length must not exceed 100000 mm."),
         }
@@ -141,9 +145,12 @@ impl PartInsertionEligibility {
 pub struct PartLibraryState {
     open: bool,
     search: String,
+    /// The typed length, in `length_unit` unless it carries its own suffix.
     length_text: String,
     length_source: ParameterValueSource,
     length_default_mm: Option<f64>,
+    /// The document's length unit, which the Length field shows and reads.
+    length_unit: LengthUnit,
     definition_digest: String,
     next_staging_id: u64,
     staged: Option<PartInsertionIntent>,
@@ -170,13 +177,16 @@ impl PartLibraryState {
         Self {
             open: false,
             search: String::new(),
-            length_text: valid_default.map(format_millimetres).unwrap_or_default(),
+            length_text: valid_default
+                .map(|millimetres| LengthUnit::Millimetre.format_value(millimetres))
+                .unwrap_or_default(),
             length_source: if valid_default.is_some() {
                 ParameterValueSource::Default
             } else {
                 ParameterValueSource::Entered
             },
             length_default_mm: valid_default,
+            length_unit: LengthUnit::Millimetre,
             definition_digest: String::new(),
             next_staging_id: 1,
             staged: None,
@@ -205,6 +215,25 @@ impl PartLibraryState {
         self.status = None;
     }
 
+    /// The unit the Length field shows and reads.
+    #[must_use]
+    pub const fn length_unit(&self) -> LengthUnit {
+        self.length_unit
+    }
+
+    /// Follows the document's unit. A value already in the field is
+    /// re-rendered in the new unit, so `80` typed as millimetres does not
+    /// sit there reading as eighty inches.
+    pub fn set_length_unit(&mut self, unit: LengthUnit) {
+        if self.length_unit == unit {
+            return;
+        }
+        if let Ok(millimetres) = self.length_unit.parse(&self.length_text) {
+            self.length_text = unit.format_value(millimetres);
+        }
+        self.length_unit = unit;
+    }
+
     /// Pins the visible card to one exact immutable catalog package.
     pub(crate) fn set_definition_digest(&mut self, digest: impl Into<String>) {
         self.definition_digest = digest.into();
@@ -221,12 +250,16 @@ impl PartLibraryState {
         if trimmed.is_empty() {
             return PartInsertionEligibility::MissingLength;
         }
-        let Ok(length_mm) = trimmed.parse::<f64>() else {
-            return PartInsertionEligibility::InvalidLength;
+        // Read in the document unit, or the unit the text carries. The
+        // reader refuses `NaN` and `inf` as not numbers; they are numbers of
+        // a kind, and the diagnostic says so.
+        let Ok(length_mm) = self.length_unit.parse(trimmed) else {
+            return if trimmed.parse::<f64>().is_ok_and(|value| !value.is_finite()) {
+                PartInsertionEligibility::NonFiniteLength
+            } else {
+                PartInsertionEligibility::InvalidLength
+            };
         };
-        if !length_mm.is_finite() {
-            return PartInsertionEligibility::NonFiniteLength;
-        }
         if length_mm < MIN_LENGTH_MM {
             return PartInsertionEligibility::LengthTooSmall;
         }
@@ -300,8 +333,8 @@ impl PartLibraryState {
         }
         self.committed.push(staged);
         self.status = Some(format!(
-            "{name} · {} mm accepted for workspace insertion.",
-            format_millimetres(length)
+            "{name} · {} accepted for workspace insertion.",
+            self.length_unit.format(length)
         ));
         true
     }
@@ -510,18 +543,20 @@ impl PartLibraryState {
                 ui.label(RichText::new("REQUIRED").small().color(library_accent()));
             }
         });
+        let unit = self.length_unit;
         let editor = ui.add(
             egui::TextEdit::singleline(&mut self.length_text)
                 .id(egui::Id::new("part_library_length_mm"))
                 .desired_width(190.0),
         );
         editor.ctx.accesskit_node_builder(editor.id, |node| {
-            node.set_label("Length (mm)");
-            node.set_description(
-                "Required aluminium extrusion length in millimetres. A valid value enables Add to current workspace.",
-            );
+            node.set_label(format!("Length ({})", unit.suffix()));
+            node.set_description(format!(
+                "Required aluminium extrusion length in {}, or with its own unit suffix. A valid value enables Add to current workspace.",
+                unit.name()
+            ));
         });
-        ui.label(RichText::new("millimetres").small().color(library_muted()));
+        ui.label(RichText::new(unit.name()).small().color(library_muted()));
         if editor.changed() {
             self.length_source = ParameterValueSource::Entered;
             self.status = None;
@@ -537,8 +572,8 @@ impl PartLibraryState {
             };
             ui.label(
                 RichText::new(format!(
-                    "Resolved · {} mm · {source_label}",
-                    format_millimetres(length_mm)
+                    "Resolved · {} · {source_label}",
+                    unit.format(length_mm)
                 ))
                 .small()
                 .color(library_good()),
@@ -577,14 +612,6 @@ impl PartLibraryState {
         })
         .inner
     }
-}
-
-fn format_millimetres(value: f64) -> String {
-    let formatted = format!("{value:.6}");
-    formatted
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_owned()
 }
 
 #[cfg(test)]

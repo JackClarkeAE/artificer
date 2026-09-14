@@ -43,7 +43,30 @@ fn click_at(harness: &mut Harness<'static, KernelLabApp>, position: egui::Pos2) 
     harness.step();
 }
 
+/// Opens the ribbon tab a button lives on when it is not on screen: the
+/// placement and transform tools sit on the Assembly tab, the rest of what
+/// these tests click on Model.
+fn reveal_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    if harness
+        .query_by_role_and_label(Role::Button, label)
+        .is_some()
+    {
+        return;
+    }
+    let tab = match label {
+        "Insert a part into this design" | "M  Move" | "R  Rotate" | "S  Scale" => {
+            "Assembly ribbon tab"
+        }
+        _ => "Model mode",
+    };
+    if let Some(button) = harness.query_by_role_and_label(Role::Button, tab) {
+        button.click_accesskit();
+        harness.run();
+    }
+}
+
 fn click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    reveal_button(harness, label);
     let center = harness
         .get_by_role_and_label(Role::Button, label)
         .rect()
@@ -469,6 +492,7 @@ fn rollback_marker_retains_future_timeline_and_restores_the_exact_branch_head() 
             .is_disabled(),
         "new sketches must remain unavailable while viewing an earlier history state"
     );
+    reveal_button(&mut harness, "M  Move");
     assert!(
         harness
             .get_by_role_and_label(Role::Button, "M  Move")

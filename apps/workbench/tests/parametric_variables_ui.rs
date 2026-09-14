@@ -64,7 +64,7 @@ fn create_length_variable(harness: &mut Harness<'static, KernelLabApp>) {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values()
+            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
             .get("Length1")
             .copied(),
         Some(10.0),
@@ -87,7 +87,7 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values()
+            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
             .get("Length1")
             .copied(),
         Some(25.0)
@@ -101,7 +101,7 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values()
+            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
             .get("Length2")
             .copied(),
         Some(55.0),
@@ -111,7 +111,9 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     // Renaming the source re-renders the derived expression by its new name
     // and keeps evaluating: references are by identity, not by text.
     replace_text_input(&mut harness, "Variable name Length1", "depth");
-    let values = harness.state().evaluated_variable_values();
+    let values = harness
+        .state()
+        .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre);
     assert_eq!(values.get("depth").copied(), Some(25.0));
     assert_eq!(values.get("Length2").copied(), Some(55.0));
 }

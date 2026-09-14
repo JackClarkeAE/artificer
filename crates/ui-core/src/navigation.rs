@@ -123,6 +123,11 @@ pub struct Bindings {
     /// `true` when scrolling forward should zoom out, which several
     /// mainstream packages do by default.
     pub invert_zoom: bool,
+    /// Whether a wheel notch glides the view to its new zoom over a few
+    /// frames rather than jumping there. Off in every preset, because a
+    /// preset describes a package's gestures, not its easing; the
+    /// application turns it on alongside its other camera animation.
+    pub animate_zoom: bool,
     /// Hold-to-orbit key applied to a plain left drag.
     pub orbit_key: Option<HoldKey>,
     /// Hold-to-pan key applied to a plain left drag.
@@ -210,6 +215,7 @@ impl NavigationPreset {
             pan_alternate: None,
             zoom_drag: None,
             invert_zoom: false,
+            animate_zoom: false,
             orbit_key: None,
             pan_key: None,
             zoom_key: None,
@@ -220,12 +226,14 @@ impl NavigationPreset {
                 pan: Gesture::CtrlMiddle,
                 zoom_drag: Some(Gesture::ShiftMiddle),
                 invert_zoom: true,
+                animate_zoom: false,
                 ..COMMON
             },
             Self::Fusion => Bindings {
                 orbit: Gesture::ShiftMiddle,
                 pan: Gesture::Middle,
                 invert_zoom: true,
+                animate_zoom: false,
                 ..COMMON
             },
             Self::Onshape => Bindings {
@@ -239,12 +247,14 @@ impl NavigationPreset {
                 pan: Gesture::ShiftMiddle,
                 zoom_drag: Some(Gesture::CtrlMiddle),
                 invert_zoom: false,
+                animate_zoom: false,
                 ..COMMON
             },
             Self::Inventor => Bindings {
                 orbit: Gesture::ShiftMiddle,
                 pan: Gesture::Middle,
                 invert_zoom: true,
+                animate_zoom: false,
                 orbit_key: Some(HoldKey::F4),
                 pan_key: Some(HoldKey::F2),
                 zoom_key: Some(HoldKey::F3),
@@ -255,6 +265,7 @@ impl NavigationPreset {
                 pan: Gesture::ShiftMiddle,
                 zoom_drag: Some(Gesture::CtrlMiddle),
                 invert_zoom: true,
+                animate_zoom: false,
                 ..COMMON
             },
             Self::Nx => Bindings {

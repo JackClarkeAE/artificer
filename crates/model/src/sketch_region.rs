@@ -128,6 +128,75 @@ pub fn reflected_profile_across_u(mut profile: PlanarProfile2) -> PlanarProfile2
     profile
 }
 
+/// The frame moved `offset` along its own normal, `u × v`: the direction a
+/// positive depth sweeps. A two-sided extrusion moves its frame back by the
+/// second side's length so one sweep covers both sides.
+#[must_use]
+pub fn frame_moved_along_normal(mut frame: PlanarFrame3, offset: f64) -> PlanarFrame3 {
+    let (u, v) = (frame.u, frame.v);
+    let normal = Vector3::new(
+        u.y * v.z - u.z * v.y,
+        u.z * v.x - u.x * v.z,
+        u.x * v.y - u.y * v.x,
+    );
+    let length = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+    if !length.is_finite() || length <= f64::EPSILON || !offset.is_finite() {
+        return frame;
+    }
+    let scale = offset / length;
+    frame.origin = artificer_protocol::Point3::new(
+        frame.origin.x + normal.x * scale,
+        frame.origin.y + normal.y * scale,
+        frame.origin.z + normal.z * scale,
+    );
+    frame
+}
+
+/// A plane's height above a frame, measured along the frame's normal: how
+/// far a side has to sweep to end at a face lying in that plane. `None`
+/// when the plane is not parallel to the frame (within `angle_tolerance`
+/// on the cosine) or anything is not finite. The sign says which side of
+/// the frame the plane lies on.
+#[must_use]
+pub fn plane_height_above_frame(
+    frame: PlanarFrame3,
+    plane_origin: artificer_protocol::Point3,
+    plane_normal: Vector3,
+    angle_tolerance: f64,
+) -> Option<f64> {
+    let (u, v) = (frame.u, frame.v);
+    let normal = Vector3::new(
+        u.y * v.z - u.z * v.y,
+        u.z * v.x - u.x * v.z,
+        u.x * v.y - u.y * v.x,
+    );
+    let length = (normal.x * normal.x + normal.y * normal.y + normal.z * normal.z).sqrt();
+    let plane_length = (plane_normal.x * plane_normal.x
+        + plane_normal.y * plane_normal.y
+        + plane_normal.z * plane_normal.z)
+        .sqrt();
+    if !length.is_finite()
+        || length <= f64::EPSILON
+        || !plane_length.is_finite()
+        || plane_length <= f64::EPSILON
+    {
+        return None;
+    }
+    let cosine =
+        (normal.x * plane_normal.x + normal.y * plane_normal.y + normal.z * plane_normal.z)
+            / (length * plane_length);
+    if !cosine.is_finite() || cosine.abs() < 1.0 - angle_tolerance {
+        return None;
+    }
+    let offset = Vector3::new(
+        plane_origin.x - frame.origin.x,
+        plane_origin.y - frame.origin.y,
+        plane_origin.z - frame.origin.z,
+    );
+    let height = (offset.x * normal.x + offset.y * normal.y + offset.z * normal.z) / length;
+    height.is_finite().then_some(height)
+}
+
 const fn reflect_profile_point(point: ProtocolPoint2) -> ProtocolPoint2 {
     ProtocolPoint2::new(point.x, -point.y)
 }
@@ -168,6 +237,21 @@ pub struct SketchRegionExtrusion {
     /// Face features do not draft.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub draft_degrees: f64,
+    /// The other side of the sketch plane, as a positive length: the feature
+    /// then spans from `second_distance` behind the plane to `distance` in
+    /// front of it. `None` is the one-sided extrusion every recipe was
+    /// before 0.98.1. A face feature has no second side: it grows from its
+    /// face, and the kernel holds the profile to that face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_distance: Option<f64>,
+    /// The first side ends at this face instead of at `distance`, which then
+    /// holds the length last measured to it; replay measures it again
+    /// against the face as it then stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to_face: Option<PersistentRef>,
+    /// The second side's face, as `up_to_face` is the first side's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_up_to_face: Option<PersistentRef>,
 }
 
 fn is_zero(value: &f64) -> bool {
@@ -225,9 +309,63 @@ impl SketchRegionExtrusion {
             target,
             distance,
             draft_degrees: 0.0,
+            second_distance: None,
+            up_to_face: None,
+            second_up_to_face: None,
         };
         recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Gives the extrusion a second side, `second_distance` behind the
+    /// sketch plane. Only a new body has one; a face feature is refused.
+    pub fn with_second_side(
+        mut self,
+        second_distance: f64,
+    ) -> Result<Self, SketchRegionRecipeError> {
+        self.second_distance = Some(second_distance);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Ends a side at a face rather than at a distance. The distances stay
+    /// as the lengths last measured to those faces, so the recipe reads
+    /// sensibly on its own; replay measures them again.
+    pub fn with_up_to_faces(
+        mut self,
+        first: Option<PersistentRef>,
+        second: Option<PersistentRef>,
+    ) -> Result<Self, SketchRegionRecipeError> {
+        self.up_to_face = first;
+        self.second_up_to_face = second;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether a side ends at a face, which replay measures before resolving.
+    #[must_use]
+    pub const fn ends_at_a_face(&self) -> bool {
+        self.up_to_face.is_some() || self.second_up_to_face.is_some()
+    }
+
+    /// The recipe with the lengths a replay measured to its faces. A side
+    /// that ends at a distance keeps its own, and the first side keeps its
+    /// direction: the measurement is a length, the sign is which way.
+    #[must_use]
+    pub fn with_measured_distances(mut self, first: Option<f64>, second: Option<f64>) -> Self {
+        if let Some(first) = first {
+            self.distance = first.abs().copysign(self.distance);
+        }
+        if let (Some(second), Some(slot)) = (second, self.second_distance.as_mut()) {
+            *slot = second.abs();
+        }
+        self
+    }
+
+    /// How far the kernel sweeps in all: both sides together.
+    #[must_use]
+    pub fn total_distance(&self) -> f64 {
+        self.distance.abs() + self.second_distance.unwrap_or(0.0)
     }
 
     /// Sets the draft angle of a new-body extrusion. Face features cannot
@@ -275,6 +413,25 @@ impl SketchRegionExtrusion {
         }
         if !self.draft_degrees.is_finite() || self.draft_degrees.abs() > MAX_DRAFT_DEGREES {
             return Err(SketchRegionRecipeError::InvalidDraft);
+        }
+        if let Some(second) = self.second_distance {
+            if !second.is_finite() || second <= 0.0 {
+                return Err(SketchRegionRecipeError::InvalidSecondDistance);
+            }
+            if matches!(self.target, SketchRegionExtrusionTarget::PlanarFace { .. }) {
+                return Err(SketchRegionRecipeError::TwoSidedFaceFeature);
+            }
+            if self.draft_degrees != 0.0 {
+                return Err(SketchRegionRecipeError::InvalidDraft);
+            }
+        } else if self.second_up_to_face.is_some() {
+            return Err(SketchRegionRecipeError::SecondFaceWithoutSecondSide);
+        }
+        for face in [&self.up_to_face, &self.second_up_to_face]
+            .into_iter()
+            .flatten()
+        {
+            validate_face_reference(face, 0)?;
         }
         if let SketchRegionExtrusionTarget::PlanarFace { face, .. } = &self.target {
             if self.draft_degrees != 0.0 {
@@ -365,6 +522,12 @@ impl SketchRegionExtrusion {
             (payload.frame, compiled.profile)
         };
         let distance = self.distance.abs();
+        // A second side starts the sweep behind the plane: the frame moves
+        // back along its own normal and the depth covers both sides.
+        let (frame, distance) = match self.second_distance {
+            Some(second) => (frame_moved_along_normal(frame, -second), distance + second),
+            None => (frame, distance),
+        };
         let command = match operation {
             None if self.is_drafted() => KernelCommand::LoftPlanarProfileOffset {
                 frame,
@@ -429,6 +592,12 @@ pub enum SketchRegionRecipeError {
     InvalidDraft,
     #[error("a face sketch-region feature requires a valid persistent face target")]
     InvalidFaceTarget,
+    #[error("a second side must be a finite, positive length")]
+    InvalidSecondDistance,
+    #[error("a feature on a face grows from that face and has no second side")]
+    TwoSidedFaceFeature,
+    #[error("a second-side face needs a second side")]
+    SecondFaceWithoutSecondSide,
     #[error("persistent face lineage exceeds the depth limit of {limit}")]
     FaceLineageTooDeep { limit: usize },
 }
@@ -580,6 +749,116 @@ mod tests {
             )
             .unwrap();
         (document, appended.created_sketches[0], regions[0].clone())
+    }
+
+    /// A two-sided new body sweeps once, from behind the plane to in front
+    /// of it: the frame moves back by the second side and the depth is the
+    /// two sides together. A reversed first side moves the reversed frame
+    /// back along its own normal, so the solid still spans the same slab.
+    #[test]
+    fn a_second_side_moves_the_frame_back_and_sweeps_both_sides() {
+        let (document, sketch, signature) = document_with_rectangle();
+        let precision = PrecisionPolicy::default();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 5.0)
+            .unwrap()
+            .with_second_side(2.0)
+            .unwrap();
+        assert_eq!(recipe.total_distance(), 7.0);
+        let ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile {
+            frame, distance, ..
+        }) = recipe.resolve(&document, precision).unwrap()
+        else {
+            panic!("a two-sided new body is still one planar extrusion");
+        };
+        assert!((distance - 7.0).abs() < 1.0e-12);
+        assert!((frame.origin.z + 2.0).abs() < 1.0e-12, "{frame:?}");
+
+        let reversed = SketchRegionExtrusion::new_body(sketch, vec![signature], -5.0)
+            .unwrap()
+            .with_second_side(2.0)
+            .unwrap();
+        let ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile {
+            frame, distance, ..
+        }) = reversed.resolve(&document, precision).unwrap()
+        else {
+            panic!("a reversed two-sided new body is still one planar extrusion");
+        };
+        assert!((distance - 7.0).abs() < 1.0e-12);
+        // The reversed frame sweeps -Z, so "back" is +Z.
+        assert!((frame.origin.z - 2.0).abs() < 1.0e-12, "{frame:?}");
+    }
+
+    #[test]
+    fn a_second_side_is_refused_where_it_cannot_be_built() {
+        let (_, sketch, signature) = document_with_rectangle();
+        let new_body =
+            SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 5.0).unwrap();
+        assert_eq!(
+            new_body.clone().with_second_side(0.0).unwrap_err(),
+            SketchRegionRecipeError::InvalidSecondDistance
+        );
+        assert_eq!(
+            new_body
+                .clone()
+                .with_draft(10.0)
+                .unwrap()
+                .with_second_side(1.0)
+                .unwrap_err(),
+            SketchRegionRecipeError::InvalidDraft
+        );
+        let face = PersistentRef::new(
+            crate::FeatureId::from_allocated(7),
+            artificer_protocol::OperationRole::new("base.entity", None),
+            EntityKind::Face,
+        );
+        let on_face = SketchRegionExtrusion::on_face(
+            sketch,
+            vec![signature],
+            face.clone(),
+            FaceExtrusionOperation::Cut,
+            5.0,
+        )
+        .unwrap();
+        assert_eq!(
+            on_face.with_second_side(1.0).unwrap_err(),
+            SketchRegionRecipeError::TwoSidedFaceFeature
+        );
+        assert_eq!(
+            new_body.with_up_to_faces(None, Some(face)).unwrap_err(),
+            SketchRegionRecipeError::SecondFaceWithoutSecondSide
+        );
+    }
+
+    #[test]
+    fn measured_distances_keep_the_direction_and_a_frame_moves_along_its_normal() {
+        let (_, sketch, signature) = document_with_rectangle();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], -5.0)
+            .unwrap()
+            .with_second_side(1.0)
+            .unwrap()
+            .with_measured_distances(Some(8.0), Some(3.0));
+        assert_eq!(recipe.distance, -8.0);
+        assert_eq!(recipe.second_distance, Some(3.0));
+
+        let moved = frame_moved_along_normal(frame(), -2.5);
+        assert!((moved.origin.z + 2.5).abs() < 1.0e-12);
+        let height = plane_height_above_frame(
+            frame(),
+            Point3::new(4.0, 4.0, 6.5),
+            Vector3::new(0.0, 0.0, -1.0),
+            1.0e-9,
+        );
+        assert_eq!(height, Some(6.5));
+        assert_eq!(
+            plane_height_above_frame(
+                frame(),
+                Point3::new(0.0, 0.0, 6.5),
+                Vector3::new(1.0, 0.0, 0.0),
+                1.0e-9,
+            ),
+            None,
+            "a face that is not parallel cannot end a sweep"
+        );
     }
 
     #[test]

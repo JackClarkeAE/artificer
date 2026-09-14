@@ -46,7 +46,8 @@ pub use parameters::{
 pub use sketch_region::{
     CURRENT_SKETCH_REGION_RECIPE_VERSION, MAX_SELECTED_SKETCH_REGIONS, SketchRegionExtrusion,
     SketchRegionExtrusionTarget, SketchRegionRecipeError, SketchRegionResolveError,
-    extrusion_frame_is_reversed, reflected_profile_across_u, reversed_extrusion_direction,
+    extrusion_frame_is_reversed, frame_moved_along_normal, plane_height_above_frame,
+    reflected_profile_across_u, reversed_extrusion_direction,
 };
 pub use sketches::{
     CURRENT_SKETCH_PRECISION_POLICY_VERSION, SketchPayload, SketchPayloadError, SketchSupportRecipe,

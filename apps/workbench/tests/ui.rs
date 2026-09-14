@@ -84,8 +84,21 @@ fn open_ribbon_tab(harness: &mut Harness<'static, KernelLabApp>, tab: &str) {
 }
 
 fn click_tool(harness: &mut Harness<'static, KernelLabApp>, shortcut: &str, label: &str) {
+    // The transform tools live on the Assembly tab and the rest on Model;
+    // open whichever carries the tool when its button is not on screen.
+    let button = format!("{shortcut}  {label}");
+    if harness
+        .query_by_role_and_label(Role::Button, &button)
+        .is_none()
+    {
+        let tab = match label {
+            "Move" | "Rotate" | "Scale" => "Assembly ribbon tab",
+            _ => "Model mode",
+        };
+        open_ribbon_tab(harness, tab);
+    }
     harness
-        .get_by_role_and_label(Role::Button, &format!("{shortcut}  {label}"))
+        .get_by_role_and_label(Role::Button, &button)
         .click_accesskit();
     harness.run();
     assert_eq!(harness.state().active_tool_label(), label);
@@ -805,9 +818,9 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
         (None, "V  Select"),
         (None, "I  Measure"),
         (None, "O  Orbit"),
-        (None, "M  Move"),
-        (None, "R  Rotate"),
-        (None, "S  Scale"),
+        (Some("Assembly ribbon tab"), "M  Move"),
+        (Some("Assembly ribbon tab"), "R  Rotate"),
+        (Some("Assembly ribbon tab"), "S  Scale"),
         (Some("View ribbon tab"), "Frame"),
         (Some("View ribbon tab"), "Home"),
         (Some("View ribbon tab"), "Edges"),
@@ -1190,6 +1203,9 @@ fn transform_model_tools_are_blocked_while_a_case_is_pending() {
         .click_accesskit();
     harness.run();
 
+    // The transform tools sit on the Assembly tab, which stays reachable
+    // while a case is pending; the tools themselves must not be.
+    open_ribbon_tab(&mut harness, "Assembly ribbon tab");
     harness
         .get_by_role_and_label(Role::Button, "M  Move")
         .click_accesskit();

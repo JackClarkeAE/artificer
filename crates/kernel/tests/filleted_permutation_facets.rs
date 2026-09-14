@@ -335,12 +335,20 @@ fn fillet_permutation_2_cuboid_trihedral_corner() {
     );
     assert_fillet_presentation_invariants(&filleted_corner, "fp2-corner-fillet");
 
-    // Verify that corner sphere/torus blend facet seams are hidden
+    // The corner is exact now (ADR 0034): three cylinder bands and one sphere
+    // octant, so there are no facet seams to hide and every edge it draws is
+    // a real rail a later feature can select.
     let scene = NativeKernel::debug_scene(&filleted_corner);
     let smooth_count = scene.edges.iter().filter(|e| e.is_smooth).count();
-    assert!(
-        smooth_count > 0,
-        "corner fillet blend patches must have smooth internal facet seams"
+    assert_eq!(
+        smooth_count, 0,
+        "an exact corner blend draws no hidden facet seams"
+    );
+    let counts = filleted_corner.counts();
+    assert_eq!(
+        (counts.faces, counts.edges, counts.vertices),
+        (10, 21, 13),
+        "six planes, three bands, one octant"
     );
 }
 
