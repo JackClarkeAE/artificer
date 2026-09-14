@@ -149,7 +149,12 @@ gates() {
   run cargo fmt --all --check
   run bash scripts/check-architecture-boundaries.sh
   run cargo clippy --workspace --all-targets -- -D warnings
-  run cargo test --workspace
+  # One workbench snapshot draws the document and export paths, which come
+  # from the running user's home directory, so its baseline only matches on
+  # the machine that recorded it. CI skips it by name for that reason and so
+  # does this, or a release could only ever be cut from one machine. Every
+  # other snapshot is portable within the pixel threshold.
+  run cargo test --workspace -- --skip document_properties_units_and_interchange_snapshot
 
   # addons/scan is a standalone workspace with its own lockfile: no root
   # workspace job compiles it, so a version bump does not reach it and it
