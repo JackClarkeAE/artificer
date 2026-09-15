@@ -3779,6 +3779,24 @@ impl KernelLabApp {
         self.extrusion_mode
     }
 
+    /// Whether this side ends at a face the user picked, rather than at a
+    /// typed distance.
+    #[must_use]
+    pub fn extrusion_side_ends_at_a_face(&self, side: usize) -> bool {
+        self.extrusion_extents
+            .get(side)
+            .is_some_and(|extent| matches!(extent, ExtrusionExtentIntent::ToFace(_)))
+    }
+
+    /// Whether this side is still waiting for the face it should end at, so
+    /// the next click on one belongs to it.
+    #[must_use]
+    pub fn extrusion_side_is_picking_a_face(&self, side: usize) -> bool {
+        self.extrusion_extents
+            .get(side)
+            .is_some_and(|extent| *extent == ExtrusionExtentIntent::PickingFace)
+    }
+
     #[must_use]
     pub const fn extrusion_mode_is_automatic(&self) -> bool {
         !self.extrusion_mode_explicit
@@ -6676,6 +6694,14 @@ impl KernelLabApp {
             };
             recipe.with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())
         };
+        // A feature on a face grows from that face and has no second side, but
+        // its one side may still end at a face the user picked. Dropping that
+        // reference left the feature frozen at the length it first measured,
+        // so it stopped following the face it was told to reach.
+        let with_front_face =
+            |recipe: SketchRegionExtrusion| -> Result<_, SketchRegionRecipeError> {
+                recipe.with_up_to_faces(record.up_to_faces[0].clone(), None)
+            };
         let kind = match mode {
             ExtrusionMode::NewBody => FeatureKind::Extrude,
             ExtrusionMode::Add => FeatureKind::Add,
@@ -6757,6 +6783,7 @@ impl KernelLabApp {
                         operation,
                         signed_distance,
                     )
+                    .and_then(with_front_face)
                     .map_err(|error| format!("invalid face sketch-region extrusion: {error}"))?,
                 )
             }
@@ -6785,6 +6812,7 @@ impl KernelLabApp {
                         operation,
                         signed_distance,
                     )
+                    .and_then(with_front_face)
                     .map_err(|error| format!("invalid face sketch-region extrusion: {error}"))?,
                 )
             }
@@ -8467,6 +8495,22 @@ impl KernelLabApp {
         ReplayAction::SketchRegionExtrusion(recipe.clone().with_measured_distances(first, second))
     }
 
+    /// Whether a side is waiting for the face it should end at.
+    ///
+    /// While one is, the next click on a face belongs to it rather than to
+    /// ordinary selection, and the viewport shows the committed bodies rather
+    /// than a cut candidate, so the face picked is one that can be measured.
+    fn extrusion_face_pick_armed(&self) -> bool {
+        self.extrusion_extents
+            .contains(&ExtrusionExtentIntent::PickingFace)
+    }
+
+    /// Forgets both sides' extents, so the next extrusion starts at a typed
+    /// distance rather than inheriting a face the last one ended at.
+    fn reset_extrusion_extents(&mut self) {
+        self.extrusion_extents = [ExtrusionExtentIntent::Distance; 2];
+    }
+
     /// Drops any side still waiting for a face, leaving the ones already
     /// chosen alone: a cancelled operation must not keep eating clicks.
     fn disarm_extrusion_face_picks(&mut self) {
@@ -9915,6 +9959,11 @@ impl KernelLabApp {
                 self.clear_transform_preview();
                 self.pending_operation = None;
                 self.selected_face = None;
+                // The extents belonged to the extrusion that just committed,
+                // and the recipe carries them now. Leaving them set handed the
+                // next extrusion a face it never asked for, which then
+                // degraded to a plain distance without saying so.
+                self.reset_extrusion_extents();
                 self.extruded_sketch_revision = Some(revision);
                 self.sketch_extrusion_issue = None;
                 if finish_sketch_on_commit {
@@ -18210,6 +18259,7 @@ impl KernelLabApp {
         let active_body = self
             .active_body_id()
             .map(|body| viewport::BodyInstanceKey::new(body.get()));
+        let face_pick_armed = self.extrusion_face_pick_armed();
         let selected = self.selected_face.and_then(|face| {
             active_body.map(|body| viewport::DocumentFaceSelection { body, face })
         });
@@ -18241,7 +18291,13 @@ impl KernelLabApp {
                     .filter_map(|body| {
                         let source_bounds = body.body.report.bounds?;
                         let body_key = viewport::BodyInstanceKey::new(body.id.get());
-                        let feature_candidate = (active_body == Some(body_key))
+                        // A cut candidate is a privately evaluated body shown
+                        // in place of the committed one, and its faces belong
+                        // to a snapshot nothing outside the preview holds. A
+                        // side picking the face it should end at has to pick
+                        // one that can be measured, so while a pick is armed
+                        // the committed body is what is on screen.
+                        let feature_candidate = (active_body == Some(body_key) && !face_pick_armed)
                             .then(|| {
                                 feature_preview
                                     .as_ref()
@@ -18426,6 +18482,28 @@ impl KernelLabApp {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.select_model_edge(edge, additive);
                             self.apply_tangent_edge_chain();
+                        }
+                    } else if self.extrusion_face_pick_armed() {
+                        // A side waiting for its face owns the next click on
+                        // one. This has to sit ahead of the pending-operation
+                        // guard below, because arming the pick is something
+                        // the user does while the extrusion is staged, and
+                        // ahead of region and edge selection, because the
+                        // face being aimed at usually lies under the sketch
+                        // that is being extruded. Nothing else sees the click
+                        // either way: a pick that lands on no face leaves the
+                        // side armed and says so, so the next click is still
+                        // a pick rather than a selection the user did not ask
+                        // for.
+                        if let Some(selection) = output.selected_face {
+                            self.adopt_extrusion_extent_face(selection.face);
+                        } else if output.selected_edge.is_some()
+                            || output.selected_vertex.is_some()
+                            || output.selected_sketch_region.is_some()
+                        {
+                            self.document_status = Some(
+                                "An extrusion ends at a face · click one, or press Escape".into(),
+                            );
                         }
                     } else if self.pending_operation.is_some() {
                         // A live feature handle owns model-selection clicks

@@ -865,3 +865,51 @@ fn shift_select_multiple_sketch_regions_in_viewport() {
     // 8.0 * 4.0 * 2.0 (extrusion distance 2.0) = 64.0
     assert!((volume - 64.0).abs() <= 1.0e-8, "volume: {volume}");
 }
+
+/// Ending a side at a face you click, which never worked in the running
+/// application. The pick was wired from the panel inward but never into the
+/// viewport's click router: every face click was dropped by the guard that
+/// hands model selection to a live feature handle, so the side stayed armed,
+/// the panel kept asking for a face, and the extrusion committed at whatever
+/// distance was typed.
+#[test]
+fn a_side_ends_at_the_face_that_is_clicked() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-0.5, -0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+
+    click_button(&mut harness, "Extrude");
+    assert_eq!(
+        harness.state().pending_operation_label(),
+        Some("Extrude active sketch")
+    );
+
+    {
+        harness
+            .get_by_role_and_label(Role::Button, "To face")
+            .scroll_to_me();
+    }
+    harness.run();
+    click_button(&mut harness, "To face");
+    harness.run();
+    assert!(
+        harness.state().extrusion_side_is_picking_a_face(0),
+        "To face arms the pick"
+    );
+
+    click_button(&mut harness, "Positive Z face");
+    for _ in 0..18 {
+        harness.step();
+    }
+    assert!(
+        harness.state().extrusion_side_ends_at_a_face(0),
+        "the clicked face ends the side (status: {:?})",
+        harness.state().document_status_text()
+    );
+    assert!(
+        harness.state().extrusion_distance().abs() > 0.0,
+        "the side takes the measured length, not zero"
+    );
+}
