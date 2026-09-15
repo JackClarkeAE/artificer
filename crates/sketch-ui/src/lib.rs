@@ -6782,6 +6782,12 @@ impl SketchCanvasState {
         } = presentation;
         let subject = subject
             .or_else(|| entities.first().map(|entity| entity.id))
+            // A trim whose span covers the whole target retires it and leaves
+            // no fragment behind, which is the right answer for an edge with
+            // nothing bounding it inside. The retired entity is then the only
+            // identity the edit has, and without it the transaction was
+            // dropped here and the click did nothing at all.
+            .or_else(|| retired_entities.first().copied())
             .ok_or(SketchEditError::AuthoringRejected)?;
         if entities.is_empty() && !retired_entities.contains(&subject) {
             return Err(SketchEditError::AuthoringRejected);
@@ -17471,6 +17477,94 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(retained.contains(&(-4.0, -1.0)));
         assert!(retained.contains(&(1.0, 4.0)));
+    }
+
+    /// A wedge drawn on a rectangle, then the buried edge trimmed away.
+    ///
+    /// All three of these did nothing at all before. A wedge whose base runs
+    /// along the edge made every trim on that edge refuse, because a limit
+    /// lying along the target was treated as having no usable bound at all
+    /// rather than as two bounds where the overlap starts and ends. A wedge
+    /// reaching the rectangle's own corners left the whole edge as the span,
+    /// so the trim retained nothing and the staging layer dropped an edit it
+    /// could find no identity for. Neither said anything: the click was
+    /// simply ignored.
+    #[test]
+    fn a_wedge_on_a_rectangle_trims_the_edge_buried_under_it() {
+        struct Case {
+            name: &'static str,
+            wedge: [((f64, f64), (f64, f64)); 3],
+            /// Spans left on the line y = 0 after the trim commits.
+            remaining: Vec<(f64, f64)>,
+        }
+
+        for case in [
+            Case {
+                name: "legs standing on the edge",
+                wedge: [
+                    ((-2.0, 0.0), (-1.0, 2.0)),
+                    ((-1.0, 2.0), (1.0, 2.0)),
+                    ((1.0, 2.0), (2.0, 0.0)),
+                ],
+                remaining: vec![(-4.0, -2.0), (2.0, 4.0)],
+            },
+            Case {
+                name: "base drawn along the edge",
+                wedge: [
+                    ((-2.0, 0.0), (2.0, 0.0)),
+                    ((-2.0, 0.0), (0.0, 2.0)),
+                    ((0.0, 2.0), (2.0, 0.0)),
+                ],
+                // The wedge's own base stays; only the edge under it is cut.
+                remaining: vec![(-4.0, -2.0), (-2.0, 2.0), (2.0, 4.0)],
+            },
+            Case {
+                name: "legs on the rectangle's corners",
+                wedge: [
+                    ((-4.0, 0.0), (0.0, 2.0)),
+                    ((0.0, 2.0), (4.0, 0.0)),
+                    ((-1.0, 3.0), (1.0, 3.0)),
+                ],
+                // Nothing bounds the edge inside its own ends, so the whole
+                // edge is what goes.
+                remaining: Vec::new(),
+            },
+        ] {
+            let mut state = SketchCanvasState::default();
+            let rectangle = state
+                .stage_geometry(SketchGeometry::rectangle(
+                    SketchPoint::new(-4.0, -3.0),
+                    SketchPoint::new(4.0, 0.0),
+                ))
+                .expect("stage rectangle");
+            assert_eq!(state.commit_pending(), Ok(rectangle));
+            for (start, end) in case.wedge {
+                commit_test_line(&mut state, start, end);
+            }
+
+            assert!(state.set_exact_tool(ToolVariant::Trim));
+            assert!(
+                state.update_trim_hover(Some(SketchPoint::new(0.0, 0.0)), 0.25),
+                "{}: the span under the pointer must preview",
+                case.name
+            );
+            let staged = state
+                .handle_modifier_click(SketchPoint::new(0.0, 0.0), 0.25)
+                .unwrap_or_else(|| panic!("{}: the trim must stage", case.name));
+            assert_eq!(
+                state.commit_pending(),
+                Ok(staged),
+                "{}: the trim must commit",
+                case.name
+            );
+
+            assert_eq!(
+                horizontal_segment_ranges(state.entities()),
+                case.remaining,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

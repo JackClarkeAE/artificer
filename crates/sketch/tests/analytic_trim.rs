@@ -70,17 +70,42 @@ fn circle_wrap_span_is_exact_and_clicking_a_junction_is_ambiguous() {
     ));
 }
 
+/// A limit drawn along the target bounds it where their overlap starts and
+/// ends. Those two points are not arbitrary — they are exactly what a drafter
+/// means by trimming a line against one drawn over it, which is the shape a
+/// wedge whose base runs along a rectangle's edge leaves behind. Refusing the
+/// whole trim instead made that edge untrimmable.
 #[test]
-fn coincident_limit_never_picks_an_arbitrary_span() {
+fn a_limit_along_the_target_bounds_it_where_the_overlap_ends() {
     let precision = PrecisionPolicy::default();
-    assert!(matches!(
-        select_trim_span(
-            line(1, (0.0, 0.0), (4.0, 0.0)),
-            &[line(2, (1.0, 0.0), (3.0, 0.0))],
-            SketchPoint2::new(2.0, 0.0),
-            &precision,
-            64
-        ),
-        Err(TrimError::NoUniqueSpan { .. })
-    ));
+    let selection = select_trim_span(
+        line(1, (0.0, 0.0), (4.0, 0.0)),
+        &[line(2, (1.0, 0.0), (3.0, 0.0))],
+        SketchPoint2::new(2.0, 0.0),
+        &precision,
+        64,
+    )
+    .expect("the ends of the overlap bound the span");
+    assert_eq!(selection.retained.len(), 2);
+    assert!((selection.removed.source_interval.start - 0.25).abs() < 1.0e-9);
+    assert!((selection.removed.source_interval.end - 0.75).abs() < 1.0e-9);
+}
+
+/// A duplicate drawn over the whole target bounds it only at its own ends, so
+/// the single span is the whole curve and nothing is retained. Trimming one of
+/// two identical lines takes that line, which is what the click asked for.
+#[test]
+fn a_duplicate_over_the_whole_target_leaves_nothing_of_it() {
+    let precision = PrecisionPolicy::default();
+    let selection = select_trim_span(
+        line(1, (0.0, 0.0), (4.0, 0.0)),
+        &[line(2, (0.0, 0.0), (4.0, 0.0))],
+        SketchPoint2::new(2.0, 0.0),
+        &precision,
+        64,
+    )
+    .expect("the whole curve is one span");
+    assert!(selection.retained.is_empty());
+    assert!((selection.removed.source_interval.start).abs() < 1.0e-9);
+    assert!((selection.removed.source_interval.end - 1.0).abs() < 1.0e-9);
 }

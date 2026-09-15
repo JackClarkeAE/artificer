@@ -43,8 +43,6 @@ pub struct TrimSpanSelection {
 pub enum TrimError {
     #[error("trim target geometry is invalid")]
     InvalidTarget,
-    #[error("no unique trim span exists because a limit overlaps the target")]
-    NoUniqueSpan { limit_entity: SketchEntityId },
     #[error("a target/limit intersection could not be certified")]
     IndeterminateLimit { limit_entity: SketchEntityId },
     #[error("the target has no finite span; delete the entity instead")]
@@ -108,11 +106,45 @@ pub fn select_trim_span(
                     }
                 }
             }
-            CurveIntersections::CoincidentFull | CurveIntersections::Overlap { .. } => {
-                return Err(TrimError::NoUniqueSpan {
-                    limit_entity: limit.entity,
-                });
+            CurveIntersections::Overlap { intervals } => {
+                // A limit lying along the target does not cross it, but where
+                // its overlap starts and ends is not arbitrary: those are the
+                // points a drafter means when they trim a line against one
+                // drawn over it, which is what a wedge whose base runs along a
+                // rectangle's edge leaves behind. Each end of each overlap is
+                // a junction like any other.
+                for (index, interval) in intervals.into_iter().enumerate() {
+                    let on_target = if target.entity <= limit.entity {
+                        interval.first
+                    } else {
+                        interval.second
+                    };
+                    for (end, parameter) in [on_target.start, on_target.end].into_iter().enumerate()
+                    {
+                        junctions.push(TrimJunction {
+                            parameter: normalize_trim_parameter(
+                                parameter,
+                                target.curve.is_periodic(),
+                            ),
+                            key: JunctionKey::Intersection {
+                                first_entity: target.entity.min(limit.entity),
+                                second_entity: target.entity.max(limit.entity),
+                                branch: IntersectionBranch(
+                                    u16::try_from(index * 2 + end).unwrap_or(u16::MAX),
+                                ),
+                            },
+                        });
+                        if junctions.len() > max_events {
+                            return Err(TrimError::EventLimitExceeded { limit: max_events });
+                        }
+                    }
+                }
             }
+            // A limit that is the target's own curve end to end bounds
+            // nothing. It contributes no junction and the span rules below
+            // decide what is left, rather than the whole trim refusing
+            // because one stray duplicate exists somewhere in the sketch.
+            CurveIntersections::CoincidentFull => {}
             CurveIntersections::Indeterminate { .. } => {
                 return Err(TrimError::IndeterminateLimit {
                     limit_entity: limit.entity,
