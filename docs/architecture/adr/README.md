@@ -45,6 +45,8 @@ by tests, and **proposed** is a plan not yet executed.
 | [0032](0032-extrusion-sides-and-extents.md) | An extrusion says what it does, how far, and where it stops | Accepted and implemented | — |
 | [0033](0033-length-units-everywhere.md) | The document's length unit is what every field reads and every readout shows | Accepted and implemented | — |
 | [0034](0034-corner-blends-and-band-run-outs.md) | Corner blends and band run-outs | Implemented | 0023 |
+| [0035](0035-drawn-connections-hold.md) | Drawn connections hold, and a deliberate edit outranks the solver | Implemented | — |
+| [0036](0036-editing-a-committed-feature.md) | A committed feature is edited where it was made | Accepted and implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.
