@@ -5,7 +5,8 @@ use artificer_protocol::PlanarProfile2;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CurveDirection, SketchEntityId, SketchInputId, SketchInputKey, SketchPoint2, SketchPointId,
+    CurveDirection, PointOutputRole, SketchEntityId, SketchInputId, SketchInputKey, SketchPoint2,
+    SketchPointId,
 };
 
 /// A finite, strictly positive length used by an authoring recipe.
@@ -496,6 +497,105 @@ impl SketchRecipe {
             | Self::Trim { .. } => {}
         }
         references
+    }
+
+    /// Re-authors the point this recipe supplies for `role`, reporting whether
+    /// the recipe can say it at all.
+    ///
+    /// Only points the recipe states outright can be moved this way. A
+    /// rectangle's three remaining corners, a polygon's vertices, a circle's
+    /// radial point, a pattern's copies and a trim's fragment ends are all
+    /// consequences of other values, and there is no honest literal to write
+    /// them into; those roles are refused rather than approximated. A slot the
+    /// recipe already fills with [`PointInput::Existing`] is refused too,
+    /// because overwriting a deliberate reference to another operation's point
+    /// with a coordinate would quietly sever it.
+    #[must_use]
+    pub fn set_authored_point(&mut self, role: PointOutputRole, position: SketchPoint2) -> bool {
+        fn place(slot: &mut PointInput, position: SketchPoint2) -> bool {
+            if matches!(slot, PointInput::Existing(_)) {
+                return false;
+            }
+            *slot = PointInput::Position(position);
+            true
+        }
+        fn nth(slots: &mut [PointInput], index: u16, position: SketchPoint2) -> bool {
+            slots
+                .get_mut(usize::from(index))
+                .is_some_and(|slot| place(slot, position))
+        }
+        match (self, role) {
+            (Self::Point { position: slot }, PointOutputRole::Point) => {
+                *slot = position;
+                true
+            }
+            (Self::Line { start, .. } | Self::CentreLine { start, .. }, PointOutputRole::Start) => {
+                place(start, position)
+            }
+            (Self::Line { end, .. } | Self::CentreLine { end, .. }, PointOutputRole::End) => {
+                place(end, position)
+            }
+            (Self::Polyline { vertices, .. }, PointOutputRole::Vertex(index)) => {
+                nth(vertices, index, position)
+            }
+            (Self::Text { anchor, .. }, PointOutputRole::Start) => place(anchor, position),
+            // The authored corner carries the whole rectangle with it, because
+            // width and height are measured from it. That is the only shape of
+            // pull this recipe can express.
+            (Self::TwoPointRectangle { first_corner, .. }, PointOutputRole::Corner(0)) => {
+                place(first_corner, position)
+            }
+            (
+                Self::CentrePointRectangle { center, .. }
+                | Self::CentrePointCircle { center, .. }
+                | Self::InnerDiameterPolygon { center, .. }
+                | Self::OuterDiameterPolygon { center, .. }
+                | Self::CentreOuterPointSlot { center, .. }
+                | Self::CircularPattern { center, .. },
+                PointOutputRole::Center,
+            ) => place(center, position),
+            (
+                Self::TwoPointCircle {
+                    first_diameter_point,
+                    ..
+                },
+                PointOutputRole::DiameterPoint(0),
+            ) => place(first_diameter_point, position),
+            (
+                Self::TwoPointCircle {
+                    second_diameter_point,
+                    ..
+                },
+                PointOutputRole::DiameterPoint(1),
+            ) => place(second_diameter_point, position),
+            (Self::CentreStartEndArc { center, .. }, PointOutputRole::Center) => {
+                place(center, position)
+            }
+            (Self::CentreStartEndArc { start, .. }, PointOutputRole::ArcStart) => {
+                place(start, position)
+            }
+            (Self::CentreStartEndArc { end, .. }, PointOutputRole::ArcEnd) => place(end, position),
+            (
+                Self::TwoPointSlot {
+                    first_cap_center, ..
+                },
+                PointOutputRole::CapCenter(0),
+            ) => place(first_cap_center, position),
+            (
+                Self::TwoPointSlot {
+                    second_cap_center, ..
+                },
+                PointOutputRole::CapCenter(1),
+            ) => place(second_cap_center, position),
+            (Self::FitPointSpline { fit_points, .. }, PointOutputRole::FitPoint(index)) => {
+                nth(fit_points, index, position)
+            }
+            (
+                Self::ControlVertexSpline { control_points, .. },
+                PointOutputRole::ControlPoint(index),
+            ) => nth(control_points, index, position),
+            _ => false,
+        }
     }
 
     /// Returns all earlier curve outputs needed to deterministically replay

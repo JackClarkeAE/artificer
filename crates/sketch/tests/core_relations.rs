@@ -311,3 +311,211 @@ fn a_perpendicular_relation_squares_two_lines() {
         "the lines should be square, dot = {dot}"
     );
 }
+
+/// Commits one line and returns its operation together with its two point ids.
+fn commit_line_operation(
+    sketch: &mut SketchDefinition,
+    start: (f64, f64),
+    end: (f64, f64),
+) -> (
+    artificer_sketch::SketchOperationId,
+    artificer_sketch::SketchPointId,
+    artificer_sketch::SketchPointId,
+) {
+    let before = sketch
+        .active_operations()
+        .map(|record| record.id)
+        .collect::<Vec<_>>();
+    let (first, second) = commit_line(sketch, start, end);
+    let operation = sketch
+        .active_operations()
+        .map(|record| record.id)
+        .find(|id| !before.contains(id))
+        .expect("the line owns one operation");
+    (operation, first, second)
+}
+
+/// Joins two lines at a shared position and returns everything the pulling
+/// tests need: the first line's operation and end point, and the second line's
+/// start point which must follow it.
+fn two_lines_joined_at_a_corner() -> (
+    SketchDefinition,
+    artificer_sketch::SketchOperationId,
+    artificer_sketch::SketchPointId,
+    artificer_sketch::SketchPointId,
+) {
+    let mut sketch = SketchDefinition::new();
+    let (first_operation, _, first_end) =
+        commit_line_operation(&mut sketch, (0.0, 0.0), (4.0, 0.0));
+    let (_, second_start, _) = commit_line_operation(&mut sketch, (4.0, 0.0), (4.0, 3.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Coincident {
+                first: first_end,
+                second: second_start,
+            },
+            "Coincident",
+            PrecisionPolicy::default(),
+        )
+        .expect("two points already together should accept a coincidence");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the coincidence");
+    (sketch, first_operation, first_end, second_start)
+}
+
+#[test]
+fn moving_one_end_of_a_joined_pair_pulls_the_other_line_all_the_way_onto_it() {
+    let (sketch, operation, first_end, second_start) = two_lines_joined_at_a_corner();
+    let mut moved = sketch.clone();
+    let transaction = moved
+        .stage_replace_pulling_followers(
+            operation,
+            line((0.0, 0.0), (7.0, 1.0)),
+            "Reshape",
+            &Default::default(),
+            PrecisionPolicy::default(),
+        )
+        .expect("moving one end of a joined line should stage");
+    moved
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the move");
+
+    let dragged = solved(&moved, first_end);
+    let follower = solved(&moved, second_start);
+    assert!(
+        (dragged.u - 7.0).abs() <= 1.0e-9 && (dragged.v - 1.0).abs() <= 1.0e-9,
+        "the edited end must land exactly where it was put, got {dragged:?}"
+    );
+    assert!(
+        (follower.u - 7.0).abs() <= 1.0e-9 && (follower.v - 1.0).abs() <= 1.0e-9,
+        "the joined line must follow the whole way, got {follower:?}"
+    );
+}
+
+/// The point of writing the follower's position back into its own recipe: the
+/// sketch that results satisfies the coincidence outright, so reading it again
+/// with nothing anchored finds nothing left to average.
+#[test]
+fn a_pulled_follower_stays_put_when_the_sketch_is_solved_again() {
+    let (sketch, operation, first_end, second_start) = two_lines_joined_at_a_corner();
+    let mut moved = sketch;
+    let transaction = moved
+        .stage_replace_pulling_followers(
+            operation,
+            line((0.0, 0.0), (7.0, 1.0)),
+            "Reshape",
+            &Default::default(),
+            PrecisionPolicy::default(),
+        )
+        .expect("stage");
+    moved
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+
+    for point in [first_end, second_start] {
+        let record = moved.point(point).expect("the point is still there");
+        let solved_position = solved(&moved, point);
+        assert!(
+            (record.evaluated_position.u - solved_position.u).abs() <= 1.0e-12
+                && (record.evaluated_position.v - solved_position.v).abs() <= 1.0e-12,
+            "the authored position and the solved one must agree for {point}"
+        );
+    }
+    assert!(moved.validate(PrecisionPolicy::default()).is_ok());
+}
+
+/// The old behaviour, kept honest: with nothing anchored the two points still
+/// meet in the middle. This is what the editing paths are opting out of.
+#[test]
+fn an_unanchored_solve_still_shares_the_movement_between_coincident_points() {
+    let (sketch, operation, first_end, second_start) = two_lines_joined_at_a_corner();
+    let mut moved = sketch;
+    let transaction = moved
+        .stage_replace(
+            operation,
+            line((0.0, 0.0), (8.0, 0.0)),
+            "Reshape",
+            &Default::default(),
+            PrecisionPolicy::default(),
+        )
+        .expect("stage");
+    moved
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    let dragged = solved(&moved, first_end);
+    let follower = solved(&moved, second_start);
+    assert!(
+        (dragged.u - 6.0).abs() <= 1.0e-9 && (follower.u - 6.0).abs() <= 1.0e-9,
+        "both should sit at the midpoint, got {dragged:?} and {follower:?}"
+    );
+}
+
+/// A relation whose follower is a consequence of other values cannot be
+/// re-authored, and the edit still has to go through.
+#[test]
+fn a_follower_its_recipe_cannot_state_is_left_to_the_ordinary_solve() {
+    let mut sketch = SketchDefinition::new();
+    let rectangle = sketch
+        .stage(
+            SketchRecipe::TwoPointRectangle {
+                first_corner: point(0.0, 0.0),
+                width: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::SignedLength::new(4.0).expect("width"),
+                ),
+                height: artificer_sketch::SketchValue::Literal(
+                    artificer_sketch::SignedLength::new(3.0).expect("height"),
+                ),
+            },
+            "Rectangle",
+        )
+        .expect("stage rectangle");
+    sketch
+        .commit(rectangle, ConfirmationSource::GreenTick)
+        .expect("commit rectangle");
+    // The far corner is derived from the authored one plus width and height,
+    // so no literal in the recipe can put it somewhere else.
+    let far_corner = sketch
+        .active_points()
+        .find(|record| {
+            (record.evaluated_position.u - 4.0).abs() <= 1.0e-12
+                && (record.evaluated_position.v - 3.0).abs() <= 1.0e-12
+        })
+        .expect("the rectangle has a far corner")
+        .id;
+    let (operation, _, line_end) = commit_line_operation(&mut sketch, (8.0, 8.0), (4.0, 3.0));
+    let joined = sketch
+        .stage_constraint(
+            SketchConstraintKind::Coincident {
+                first: line_end,
+                second: far_corner,
+            },
+            "Coincident",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the coincidence");
+    sketch
+        .commit(joined, ConfirmationSource::GreenTick)
+        .expect("commit the coincidence");
+
+    let transaction = sketch
+        .stage_replace_pulling_followers(
+            operation,
+            line((8.0, 8.0), (6.0, 5.0)),
+            "Reshape",
+            &Default::default(),
+            PrecisionPolicy::default(),
+        )
+        .expect("the edit must still go through");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    assert_eq!(
+        sketch
+            .point(far_corner)
+            .expect("still there")
+            .evaluated_position,
+        SketchPoint2::new(4.0, 3.0),
+        "a derived corner keeps its authored place"
+    );
+}

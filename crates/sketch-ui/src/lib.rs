@@ -5017,6 +5017,14 @@ impl SnapKind {
 pub struct SnapResult {
     pub point: SketchPoint,
     pub kind: SnapKind,
+    /// The authored sketch point this snap landed on, when it landed on one.
+    ///
+    /// Only an endpoint-on-endpoint snap names a point here. Grid, on-curve
+    /// and support snaps produce a coordinate and nothing more, and a stroke
+    /// that ends on one of those is not joined to anything. Carrying the
+    /// identity rather than only the coordinate is what lets the staging path
+    /// persist the coincidence the user drew.
+    pub existing_point: Option<CorePointId>,
 }
 
 /// User-configurable sketch snapping behavior.
@@ -5025,6 +5033,18 @@ pub struct SnapSettings {
     pub enabled: bool,
     pub grid_step: f64,
     pub endpoint_radius_points: f32,
+    /// Whether ending a stroke on another stroke's endpoint actually joins the
+    /// two, and whether the join then holds when one of them is edited.
+    ///
+    /// On, an endpoint snap persists a coincidence between the two points, and
+    /// dragging either line — or retyping its angle or length — carries its
+    /// partner along rather than tearing the corner open. Off, the snap only
+    /// places the new point at the same coordinate: the two are strangers from
+    /// the moment they are drawn, and an edit to one leaves the other where it
+    /// was, which is how every release before this one behaved. Relations the
+    /// user made by hand are unaffected either way; this governs what drawing
+    /// infers on its own.
+    pub keep_points_connected: bool,
 }
 
 impl Default for SnapSettings {
@@ -5033,6 +5053,7 @@ impl Default for SnapSettings {
             enabled: true,
             grid_step: 0.25,
             endpoint_radius_points: 10.0,
+            keep_points_connected: true,
         }
     }
 }
@@ -5243,6 +5264,18 @@ pub struct SketchCanvasState {
     pattern_drag: DragHandleState,
     active_drag_handle: Option<SketchDragHandle>,
     creation_anchor: Option<SketchPoint>,
+    /// Authored points the clicks of the current creation gesture landed on,
+    /// with the coordinate each was taken at.
+    ///
+    /// A click resolves its snap long before the stroke it belongs to is
+    /// staged — a polyline may be several clicks from being a recipe at all —
+    /// so the identity the pointer found has to be kept until there is a
+    /// transaction to hang a coincidence on. The coordinate is what matches an
+    /// anchor to the new point once the recipe has been evaluated; a typed
+    /// dimension that moves the endpoint away from the snap simply stops
+    /// matching, which is the right answer because the stroke no longer ends
+    /// there.
+    snap_anchors: Vec<(SketchPoint, CorePointId)>,
     /// Uncommitted vertices owned by one atomic chained-polyline gesture.
     ///
     /// These points deliberately have no core/UI identity until the complete
@@ -5312,6 +5345,7 @@ impl Default for SketchCanvasState {
             pattern_drag: DragHandleState::default(),
             active_drag_handle: None,
             creation_anchor: None,
+            snap_anchors: Vec::new(),
             polyline_vertices: Vec::new(),
             polyline_current_segment_active: false,
             arc_start: None,
@@ -6415,15 +6449,11 @@ impl SketchCanvasState {
         };
 
         let recipe = rebuilt_selected_recipe(self.selected_recipe_editor.as_ref()?).ok()?;
+        // Typing an angle or a length is as deliberate as dragging the same
+        // endpoint would have been, so it carries its joined neighbours the
+        // same way.
         let transaction = self
-            .authoring
-            .stage_replace(
-                operation,
-                recipe,
-                "Edit sketch parameters",
-                &Default::default(),
-                PrecisionPolicy::default(),
-            )
+            .stage_deliberate_replacement(operation, recipe, "Edit sketch parameters")
             .ok();
         let Some(transaction) = transaction else {
             let editor = self.selected_recipe_editor.as_mut()?;
@@ -6459,6 +6489,30 @@ impl SketchCanvasState {
             true,
         )
         .ok()
+    }
+
+    /// Stages a replacement the user made by hand, dragging whatever is joined
+    /// to that operation along with it.
+    ///
+    /// Dragging an endpoint and typing the angle that places it are the same
+    /// act stated two ways, so they reach the model through the same door. The
+    /// preference decides whether the door pulls anything behind it; with
+    /// connections off this is the plain replacement the canvas always made.
+    fn stage_deliberate_replacement(
+        &self,
+        operation: CoreOperationId,
+        recipe: CoreRecipe,
+        label: &'static str,
+    ) -> Result<CoreTransaction, artificer_sketch::SketchTransactionError> {
+        let inputs = Default::default();
+        let precision = PrecisionPolicy::default();
+        if self.snap.keep_points_connected {
+            self.authoring
+                .stage_replace_pulling_followers(operation, recipe, label, &inputs, precision)
+        } else {
+            self.authoring
+                .stage_replace(operation, recipe, label, &inputs, precision)
+        }
     }
 
     /// Whether a typed parameter value is previewing on the canvas. It is
@@ -6610,23 +6664,22 @@ impl SketchCanvasState {
                 .and_then(|entity| self.authoring.entity(*entity))
                 .map(|record| record.provenance.operation)
         });
+        let mut core_committed = false;
         if let Some(op_id) = op_id
             && let Some(op) = self.authoring.operation(op_id)
         {
             let mut new_recipe = op.recipe.clone();
             reshape_core_recipe(&mut new_recipe, handle, delta_u, delta_v);
-            if let Ok(tx) = self.authoring.stage_replace(
-                op_id,
-                new_recipe,
-                "Reshape sketch entity",
-                &Default::default(),
-                PrecisionPolicy::default(),
-            ) && self
-                .authoring
-                .commit(tx, CoreConfirmationSource::GreenTick)
-                .is_ok()
+            let staged =
+                self.stage_deliberate_replacement(op_id, new_recipe, "Reshape sketch entity");
+            if let Ok(tx) = staged
+                && self
+                    .authoring
+                    .commit(tx, CoreConfirmationSource::GreenTick)
+                    .is_ok()
             {
                 any_reshaped = true;
+                core_committed = true;
             }
         }
         for entity in &mut self.entities {
@@ -6636,6 +6689,14 @@ impl SketchCanvasState {
                 entity.geometry = entity.geometry.reshape(handle, delta_u, delta_v);
                 any_reshaped = true;
             }
+        }
+        if core_committed {
+            // The drag may have pulled a curve the user is not holding, and the
+            // loop above only knows about the one they are. Re-reading every
+            // presentation curve from the exact definition is what puts the
+            // joined line on screen where the solver just put it, and it keeps
+            // user-facing identity while doing so.
+            self.refresh_presentation_geometry();
         }
         if any_reshaped {
             self.refresh_profile_analysis();
@@ -6963,7 +7024,7 @@ impl SketchCanvasState {
             .expect("the pending edit was checked above");
         let subject = pending.subject;
         let prepared_core_transaction = pending.core_transaction.is_some();
-        let transaction = if let Some(transaction) = pending.core_transaction.take() {
+        let mut transaction = if let Some(transaction) = pending.core_transaction.take() {
             transaction
         } else {
             let Some(entity) = pending.entity() else {
@@ -6982,6 +7043,14 @@ impl SketchCanvasState {
                 }
             }
         };
+        // The coincidence a snapped stroke implies joins this transaction
+        // rather than following it, so the stroke and the join are one thing to
+        // confirm and one thing to undo. A join the system cannot accept is
+        // dropped and the geometry still stands: the user asked for a line.
+        let coincidences = self.auto_coincidences(&transaction);
+        if !coincidences.is_empty() {
+            let _ = transaction.append_constraints(coincidences);
+        }
         let inserted_core_entities = transaction
             .impact()
             .inserted_entities
@@ -7082,6 +7151,7 @@ impl SketchCanvasState {
         self.dimension_session = None;
         self.pointer_preview = None;
         self.creation_anchor = None;
+        self.snap_anchors.clear();
         self.polyline_vertices.clear();
         self.polyline_current_segment_active = false;
         self.arc_start = None;
@@ -7226,6 +7296,7 @@ impl SketchCanvasState {
 
     pub fn clear_creation_draft(&mut self) {
         self.creation_anchor = None;
+        self.snap_anchors.clear();
         self.polyline_vertices.clear();
         self.polyline_current_segment_active = false;
         self.arc_start = None;
@@ -7828,6 +7899,7 @@ impl SketchCanvasState {
             return SnapResult {
                 point: raw,
                 kind: SnapKind::None,
+                existing_point: None,
             };
         }
 
@@ -7847,6 +7919,7 @@ impl SketchCanvasState {
             return SnapResult {
                 point: first,
                 kind: SnapKind::None,
+                existing_point: None,
             };
         }
         if let Some(candidate) = query_snap_candidates(
@@ -7860,8 +7933,15 @@ impl SketchCanvasState {
         .next()
         {
             let entity = |id: artificer_sketch::SketchEntityId| SketchEntityId(id.get());
+            let mut existing_point = None;
             let kind = match candidate.key {
-                CoreSnapKey::Endpoint { entity: id, .. } => SnapKind::Endpoint(entity(id)),
+                CoreSnapKey::Endpoint {
+                    entity: id,
+                    point: landed_on,
+                } => {
+                    existing_point = Some(landed_on);
+                    SnapKind::Endpoint(entity(id))
+                }
                 CoreSnapKey::Intersection {
                     first_entity,
                     second_entity,
@@ -7877,6 +7957,7 @@ impl SketchCanvasState {
             return SnapResult {
                 point: SketchPoint::new(candidate.point.u, candidate.point.v),
                 kind,
+                existing_point,
             };
         }
 
@@ -7894,9 +7975,14 @@ impl SketchCanvasState {
             }
         }
         if let Some((_, entity, point)) = closest_endpoint {
+            // This fallback runs on presentation control points, which is the
+            // only handle a curve with no exact counterpart has. There is no
+            // authored point behind it to be coincident with, and saying so is
+            // better than inventing one.
             return SnapResult {
                 point,
                 kind: SnapKind::Endpoint(entity),
+                existing_point: None,
             };
         }
 
@@ -7911,6 +7997,7 @@ impl SketchCanvasState {
                 .snap
                 .snap_to_visible_grid(raw, self.view.points_per_unit),
             kind: SnapKind::Grid,
+            existing_point: None,
         }
     }
 
@@ -7953,7 +8040,15 @@ impl SketchCanvasState {
                 }
             });
             if is_better {
-                best = Some((rank, distance_squared, SnapResult { point, kind }));
+                best = Some((
+                    rank,
+                    distance_squared,
+                    SnapResult {
+                        point,
+                        kind,
+                        existing_point: None,
+                    },
+                ));
             }
         };
 
@@ -7999,7 +8094,75 @@ impl SketchCanvasState {
             .map(|(_, point)| SnapResult {
                 point,
                 kind: SnapKind::SupportEdge,
+                existing_point: None,
             })
+    }
+
+    /// Remembers that a click of the current creation gesture landed on an
+    /// authored point, so the stroke it becomes can be joined to that point.
+    ///
+    /// Only the identity carried by the snap counts. A stroke that happens to
+    /// finish on a gridline that happens to pass through another endpoint was
+    /// not aimed at it, and nothing here invents a relation out of a
+    /// coincidence of coordinates.
+    fn note_creation_snap(&mut self, snap: SnapResult) {
+        let Some(landed_on) = snap.existing_point else {
+            return;
+        };
+        if self
+            .authoring
+            .point(landed_on)
+            .is_none_or(|record| !record.active)
+            || self
+                .snap_anchors
+                .iter()
+                .any(|(_, existing)| *existing == landed_on)
+        {
+            return;
+        }
+        self.snap_anchors.push((snap.point, landed_on));
+    }
+
+    /// The coincidences a staged creation owes to the points its clicks
+    /// snapped onto.
+    ///
+    /// A new point earns one when it came to rest exactly where an anchor was
+    /// taken. Evaluating the recipe is what decides that: a typed dimension can
+    /// move an endpoint away from where the click put it, and a stroke that no
+    /// longer ends on the other one is no longer joined to it.
+    fn auto_coincidences(&self, transaction: &CoreTransaction) -> Vec<CoreConstraintKind> {
+        let authored = &transaction.impact().inserted_operations;
+        if !self.snap.keep_points_connected || self.snap_anchors.is_empty() || authored.is_empty() {
+            return Vec::new();
+        }
+        let candidate = transaction.preview();
+        let tolerance = PrecisionPolicy::default().linear_agreement;
+        transaction
+            .impact()
+            .inserted_points
+            .iter()
+            .filter_map(|new_point| {
+                let record = candidate.point(*new_point).filter(|record| record.active)?;
+                // Only the stroke these clicks drew can inherit their snaps. A
+                // replacement that happens to allocate a point is answering a
+                // typed value, not a pointer, and has no business joining
+                // itself to wherever the pointer was last.
+                if !authored.contains(&record.owner.operation) {
+                    return None;
+                }
+                let (_, existing) = self.snap_anchors.iter().find(|(position, existing)| {
+                    existing != new_point
+                        && record.evaluated_position.distance(core_point(*position)) <= tolerance
+                        && candidate
+                            .point(*existing)
+                            .is_some_and(|record| record.active)
+                })?;
+                Some(CoreConstraintKind::Coincident {
+                    first: *new_point,
+                    second: *existing,
+                })
+            })
+            .collect()
     }
 
     fn handle_creation_click(&mut self, point: SketchPoint) -> Option<SketchEntityId> {
@@ -10988,7 +11151,9 @@ pub fn show_with_context(
                 | SketchTool::Rectangle
                 | SketchTool::Circle
                 | SketchTool::Arc => {
-                    let point = state.snap_point(response.rect, position).point;
+                    let snap = state.snap_point(response.rect, position);
+                    state.note_creation_snap(snap);
+                    let point = snap.point;
                     pending_created = if state.exact_tool == ToolVariant::ChainedPolyline
                         && primary_finish_click
                     {
@@ -14410,6 +14575,7 @@ mod tests {
             enabled: true,
             grid_step: 0.25,
             endpoint_radius_points: 10.0,
+            ..SnapSettings::default()
         };
         // At the default camera the lattice must survive untouched: a user
         // placing a point on a 0.25 gridline expects it to stay there.
@@ -18948,6 +19114,219 @@ mod tests {
             .sketch_to_screen(canvas_rect, SketchPoint::new(15.0, 20.0));
         assert!((screen_after.x - screen_before.x).abs() < 1e-4);
         assert!(screen_after.y < screen_before.y); // Y decreases upwards on screen!
+    }
+
+    /// Draws a line, then a second line whose first click lands on the first
+    /// one's end through the endpoint snap. This is the gesture the whole
+    /// feature is about: two strokes that meet at a corner.
+    fn two_lines_drawn_corner_to_corner() -> (SketchCanvasState, SketchEntityId, SketchEntityId) {
+        let mut state = SketchCanvasState::default();
+        let first = state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("the first line should stage");
+        state
+            .commit_pending()
+            .expect("the first line should commit");
+
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let corner = state
+            .view
+            .sketch_to_screen(rect, SketchPoint::new(4.0, 0.0));
+        let snap = state.snap_point(rect, corner);
+        assert_eq!(snap.kind, SnapKind::Endpoint(first));
+        state.note_creation_snap(snap);
+        let second = state
+            .stage_geometry(SketchGeometry::segment(
+                snap.point,
+                SketchPoint::new(4.0, 3.0),
+            ))
+            .expect("the second line should stage");
+        state
+            .commit_pending()
+            .expect("the second line should commit");
+        (state, first, second)
+    }
+
+    fn segment_ends(state: &SketchCanvasState, id: SketchEntityId) -> (SketchPoint, SketchPoint) {
+        match state
+            .entity_geometry(id)
+            .expect("the entity is on the canvas")
+        {
+            SketchGeometry::Segment { start, end } => (start, end),
+            other => panic!("expected a segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_endpoint_snap_names_the_exact_point_it_landed_on() {
+        let mut state = SketchCanvasState::default();
+        let line = state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("stage");
+        state.commit_pending().expect("commit");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let core = state
+            .core_by_ui
+            .get(&line)
+            .and_then(|ids| ids.first())
+            .copied()
+            .expect("the line has one exact curve");
+        let CoreCurve2::Line { end, .. } = state
+            .authoring
+            .entity(core)
+            .expect("the curve is there")
+            .geometry
+        else {
+            panic!("a line is a line");
+        };
+
+        let snapped = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(4.02, 0.02)),
+        );
+
+        assert_eq!(snapped.existing_point, Some(end));
+        // Landing near a curve rather than on one of its ends names no point,
+        // so nothing about that stroke can be joined to it.
+        let midway = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(2.0, 0.01)),
+        );
+        assert_eq!(midway.existing_point, None);
+    }
+
+    #[test]
+    fn a_stroke_that_ends_on_another_strokes_endpoint_is_joined_to_it() {
+        let (state, _, _) = two_lines_drawn_corner_to_corner();
+        let relations = state.authoring().constraints();
+        assert_eq!(
+            relations.len(),
+            1,
+            "drawing into a corner should persist exactly one coincidence"
+        );
+        assert!(
+            relations
+                .values()
+                .all(|record| matches!(record.kind, CoreConstraintKind::Coincident { .. })),
+            "the relation must be a coincidence, got {relations:?}"
+        );
+    }
+
+    #[test]
+    fn a_stroke_snapped_to_a_grid_line_is_joined_to_nothing() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("stage");
+        state.commit_pending().expect("commit");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let snap = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(1.99, 1.51)),
+        );
+        assert_eq!(snap.kind, SnapKind::Grid);
+        state.note_creation_snap(snap);
+        state
+            .stage_geometry(SketchGeometry::segment(
+                snap.point,
+                SketchPoint::new(4.0, 3.0),
+            ))
+            .expect("stage");
+        state.commit_pending().expect("commit");
+
+        assert!(
+            state.authoring().constraints().is_empty(),
+            "a grid snap is a coordinate, not a connection"
+        );
+    }
+
+    #[test]
+    fn dragging_a_shared_endpoint_carries_the_joined_line_the_whole_way() {
+        let (mut state, first, second) = two_lines_drawn_corner_to_corner();
+        assert!(state.set_selected(Some(first)) || state.selected() == Some(first));
+
+        assert!(state.reshape_selected(SketchDragHandle::EndPoint, 3.0, 1.0));
+
+        let (_, dragged_end) = segment_ends(&state, first);
+        let (follower_start, follower_end) = segment_ends(&state, second);
+        assert_point_near(dragged_end, SketchPoint::new(7.0, 1.0));
+        assert_point_near(follower_start, SketchPoint::new(7.0, 1.0));
+        assert_point_near(follower_end, SketchPoint::new(4.0, 3.0));
+    }
+
+    /// The same edit typed instead of dragged. The user named this case: a line
+    /// turned through its angle box used to leave its neighbour behind.
+    #[test]
+    fn retyping_a_lines_angle_carries_the_joined_line_the_whole_way() {
+        let (mut state, first, second) = two_lines_drawn_corner_to_corner();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.set_selected(Some(first)) || state.selected() == Some(first));
+
+        assert_eq!(
+            state.set_selected_recipe_parameter_text("angle", "90".to_owned()),
+            Some(first)
+        );
+        assert_eq!(state.commit_pending(), Ok(first));
+
+        let (_, turned_end) = segment_ends(&state, first);
+        let (follower_start, follower_end) = segment_ends(&state, second);
+        assert_point_near(turned_end, SketchPoint::new(0.0, 4.0));
+        assert_point_near(follower_start, SketchPoint::new(0.0, 4.0));
+        assert_point_near(follower_end, SketchPoint::new(4.0, 3.0));
+    }
+
+    /// With connections turned off the canvas behaves exactly as it did before
+    /// this existed, which is what the preference is for.
+    #[test]
+    fn with_connections_off_a_corner_is_only_a_coincidence_of_coordinates() {
+        let mut state = SketchCanvasState::default();
+        let mut settings = state.snap_settings();
+        settings.keep_points_connected = false;
+        state.set_snap_settings(settings);
+        let first = state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("stage");
+        state.commit_pending().expect("commit");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let snap = state.snap_point(
+            rect,
+            state
+                .view
+                .sketch_to_screen(rect, SketchPoint::new(4.0, 0.0)),
+        );
+        state.note_creation_snap(snap);
+        let second = state
+            .stage_geometry(SketchGeometry::segment(
+                snap.point,
+                SketchPoint::new(4.0, 3.0),
+            ))
+            .expect("stage");
+        state.commit_pending().expect("commit");
+        assert!(state.authoring().constraints().is_empty());
+
+        assert!(state.set_selected(Some(first)) || state.selected() == Some(first));
+        assert!(state.reshape_selected(SketchDragHandle::EndPoint, 3.0, 1.0));
+
+        let (follower_start, _) = segment_ends(&state, second);
+        assert_point_near(follower_start, SketchPoint::new(4.0, 0.0));
     }
 }
 

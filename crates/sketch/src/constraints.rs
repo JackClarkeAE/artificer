@@ -239,22 +239,35 @@ pub(crate) fn validate_constraint(kind: &SketchConstraintKind) -> Result<(), Con
     }
 }
 
+/// Solves the constraint system, holding `anchored` points where their seeds
+/// already put them.
+///
+/// Anchoring exists because a relation and a deliberate edit are not equal
+/// authorities. Two coincident points that are both free meet in the middle,
+/// which is the fair answer when nothing distinguishes them; but when the user
+/// has just dragged one of them, or typed the angle that placed it, that point
+/// is where they said it should be and the other one is what has to give. The
+/// editing paths anchor the points the edit authored and let everything else
+/// follow. `Fixed` still outranks an anchor: a pinned point is pinned whoever
+/// is pulling at it.
 pub(crate) fn solve(
     seeds: &BTreeMap<SketchPointId, SketchPoint2>,
     constraints: impl Iterator<Item = SketchConstraintRecord>,
     tolerance: f64,
+    anchored: &BTreeSet<SketchPointId>,
 ) -> Result<ConstraintSolution, ConstraintError> {
     let constraints = constraints
         .filter(|record| record.enabled)
         .collect::<Vec<_>>();
     let mut positions = seeds.clone();
-    let pinned = constraints
+    let mut pinned = anchored
         .iter()
-        .filter_map(|record| match record.kind {
-            SketchConstraintKind::Fixed { point, position } => Some((point, position)),
-            _ => None,
-        })
+        .filter_map(|point| seeds.get(point).map(|position| (*point, *position)))
         .collect::<BTreeMap<_, _>>();
+    pinned.extend(constraints.iter().filter_map(|record| match record.kind {
+        SketchConstraintKind::Fixed { point, position } => Some((point, position)),
+        _ => None,
+    }));
     for (point, position) in &pinned {
         if positions.contains_key(point) {
             positions.insert(*point, *position);
@@ -887,7 +900,8 @@ mod tests {
             },
             enabled: true,
         };
-        let solved = solve(&positions, [record].into_iter(), 1.0e-9).expect("solve");
+        let solved =
+            solve(&positions, [record].into_iter(), 1.0e-9, &BTreeSet::new()).expect("solve");
         let moved = solved.positions[&ids[2]];
         assert!((moved.v).abs() < 1.0e-9);
         assert!(

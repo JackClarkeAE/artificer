@@ -4,10 +4,10 @@ use std::fmt;
 use artificer_protocol::PrecisionPolicy;
 
 use crate::{
-    CurveProvenance, OutputRole, PrimitiveEvaluation, SketchConstraintKind, SketchDefinition,
-    SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId, SketchOutputOwner,
-    SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision,
-    SketchValidationError, evaluate_recipe, instantiate_curve,
+    CurveProvenance, OutputRole, PointOutputRole, PrimitiveEvaluation, SketchConstraintKind,
+    SketchDefinition, SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId,
+    SketchOutputOwner, SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord,
+    SketchRecipe, SketchRevision, SketchValidationError, evaluate_recipe, instantiate_curve,
 };
 
 /// Visible confirmation path used to publish an atomic sketch edit.
@@ -113,6 +113,91 @@ impl SketchTransaction {
         Ok(())
     }
 
+    /// Adds relations to this transaction's candidate, so geometry and the
+    /// relations it implies arrive, and are undone, together.
+    ///
+    /// A stroke that ends on another stroke's endpoint is one act as the user
+    /// experiences it, and splitting it into "add the line" followed by "add
+    /// the coincidence" would make them undo twice to take it back. Evaluation
+    /// is copy-on-success exactly as it is for an appended modifier: a relation
+    /// the system cannot satisfy leaves this transaction untouched.
+    pub fn append_constraints(
+        &mut self,
+        kinds: Vec<SketchConstraintKind>,
+    ) -> Result<(), SketchTransactionError> {
+        if kinds.is_empty() {
+            return Err(SketchTransactionError::NoChange);
+        }
+        let before = self
+            .candidate
+            .solve_constraints(self.precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let mut candidate = self.candidate.clone();
+        for kind in kinds {
+            candidate
+                .add_constraint(kind, self.precision)
+                .map_err(SketchTransactionError::ConstraintRejected)?;
+        }
+        let after = candidate
+            .solve_constraints(self.precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+
+        // Each `add_constraint` advances the revision it is applied to; the
+        // batch still publishes the one successor this transaction promised.
+        candidate.set_revision(next_revision(self.expected_revision)?);
+        candidate.validate_with_inputs(&self.inputs, self.precision)?;
+
+        let mut impact = self.impact.clone();
+        impact.profile_changed = true;
+        for (point, position) in &after.positions {
+            let moved = before
+                .positions
+                .get(point)
+                .is_none_or(|previous| !positions_agree(*previous, *position, self.precision));
+            if moved {
+                impact.changed_points.insert(*point);
+                for (entity, record) in candidate.entities() {
+                    if record.active && record.geometry.referenced_points().contains(point) {
+                        impact.changed_entities.insert(*entity);
+                    }
+                }
+            }
+        }
+        normalize_composed_impact(&candidate, &mut impact);
+        self.candidate = candidate;
+        self.impact = impact;
+        Ok(())
+    }
+
+    /// Replaces a further operation's recipe inside this same unpublished edit.
+    ///
+    /// Pulling a relation's follower rewrites the follower's own authored
+    /// intent, and that has to land in the edit that moved it rather than
+    /// trailing behind as a second revision the user can undo separately.
+    fn append_replace(
+        &mut self,
+        operation: SketchOperationId,
+        recipe: SketchRecipe,
+    ) -> Result<(), SketchTransactionError> {
+        let mut append_base = self.candidate.clone();
+        append_base.set_revision(self.expected_revision);
+        let appended = append_base.stage_replace(
+            operation,
+            recipe,
+            self.label.clone(),
+            &self.inputs,
+            self.precision,
+        )?;
+
+        let mut impact = self.impact.clone();
+        merge_impact(&mut impact, appended.impact);
+        normalize_composed_impact(&appended.candidate, &mut impact);
+
+        self.candidate = appended.candidate;
+        self.impact = impact;
+        Ok(())
+    }
+
     /// Convenience seam for accumulating exact Trim modifiers behind one
     /// visible confirmation. Limits are canonicalized exactly as they are for
     /// the first staged Trim, and every append evaluates against the preceding
@@ -146,6 +231,27 @@ impl SketchTransaction {
 /// relation the sketch already satisfies reports no movement.
 fn positions_agree(left: SketchPoint2, right: SketchPoint2, precision: PrecisionPolicy) -> bool {
     (left.u - right.u).hypot(left.v - right.v) <= precision.linear_agreement
+}
+
+/// How many rings of followers one edit may drag behind it.
+///
+/// Each pass settles the operations joined to whatever the previous pass
+/// settled, so a chain of coincident lines straightens out from the edit
+/// outwards. The bound is here so that a sketch whose relations cannot all be
+/// honoured stops rather than trading positions back and forth.
+const MAX_FOLLOWER_PASSES: usize = 8;
+
+/// The active points one operation authored, which an edit to that operation
+/// is entitled to hold still.
+fn points_authored_by(
+    definition: &SketchDefinition,
+    operation: SketchOperationId,
+) -> BTreeSet<SketchPointId> {
+    definition
+        .active_points()
+        .filter(|record| record.owner.operation == operation)
+        .map(|record| record.id)
+        .collect()
 }
 
 fn merge_impact(impact: &mut SketchImpactReport, appended: SketchImpactReport) {
@@ -462,6 +568,95 @@ impl SketchDefinition {
             inputs: inputs.clone(),
             precision,
         })
+    }
+
+    /// Replaces one operation's recipe and drags whatever is joined to it along
+    /// behind, so a relation survives the edit instead of being broken by it.
+    ///
+    /// The plain [`Self::stage_replace`] moves only the operation it is given.
+    /// Anything coincident with a point that operation authored then sits in
+    /// the wrong place, and the read-time solve splits the difference between
+    /// the two, which is why dragging one end of a joined pair used to move it
+    /// half as far as the pointer went and drag its partner half way to meet
+    /// it. Here the edit is solved with its own points anchored — it is the
+    /// authority, the relations are not — and every point the solver has to
+    /// move in consequence is written back into its own operation's recipe.
+    /// The sketch that results satisfies its relations outright, so the next
+    /// ordinary solve has nothing left to average.
+    ///
+    /// Two limits are worth naming. A follower point that its recipe cannot
+    /// state as a literal (see [`SketchRecipe::set_authored_point`]) is left
+    /// where it is, and the ordinary solve goes on splitting the difference
+    /// for it. And an edit whose own points cannot all be held at once —
+    /// dragging both ends of a line that carries a distance relation, say —
+    /// falls back to the plain replacement rather than refusing the drag.
+    pub fn stage_replace_pulling_followers(
+        &self,
+        operation: SketchOperationId,
+        recipe: SketchRecipe,
+        label: impl Into<String>,
+        inputs: &SketchInputValues,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let mut transaction = self.stage_replace(operation, recipe, label, inputs, precision)?;
+        let mut anchored = points_authored_by(&transaction.candidate, operation);
+        for _ in 0..MAX_FOLLOWER_PASSES {
+            let Ok(solution) = transaction
+                .candidate
+                .solve_constraints_anchoring(&anchored, precision)
+            else {
+                break;
+            };
+            let mut pulls: BTreeMap<SketchOperationId, Vec<(PointOutputRole, SketchPoint2)>> =
+                BTreeMap::new();
+            for (point, position) in &solution.positions {
+                if anchored.contains(point) {
+                    continue;
+                }
+                let Some(record) = transaction.candidate.point(*point) else {
+                    continue;
+                };
+                if !record.active
+                    || positions_agree(record.evaluated_position, *position, precision)
+                {
+                    continue;
+                }
+                pulls
+                    .entry(record.owner.operation)
+                    .or_default()
+                    .push((record.owner.role, *position));
+            }
+            let mut pulled = false;
+            for (follower, placements) in pulls {
+                let Some(record) = transaction
+                    .candidate
+                    .operation(follower)
+                    .filter(|record| record.active)
+                else {
+                    continue;
+                };
+                let mut recipe = record.recipe.clone();
+                let mut rewritten = false;
+                for (role, position) in placements {
+                    rewritten |= recipe.set_authored_point(role, position);
+                }
+                if !rewritten {
+                    continue;
+                }
+                // A follower whose replacement does not replay is left alone:
+                // the relation is worth less than the geometry already there.
+                let mut attempt = transaction.clone();
+                if attempt.append_replace(follower, recipe).is_ok() {
+                    transaction = attempt;
+                    anchored.extend(points_authored_by(&transaction.candidate, follower));
+                    pulled = true;
+                }
+            }
+            if !pulled {
+                break;
+            }
+        }
+        Ok(transaction)
     }
 
     pub fn stage_retire_operation(

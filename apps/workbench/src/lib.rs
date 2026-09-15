@@ -16535,6 +16535,15 @@ impl KernelLabApp {
                     let mut settings = self.sketch.snap_settings();
                     let mut changed = ui.checkbox(&mut settings.enabled, "Enable snapping").changed();
                     changed |= ui
+                        .checkbox(&mut settings.keep_points_connected, "Keep drawn connections")
+                        .on_hover_text(
+                            "When a stroke ends on another stroke's endpoint, join the two. \
+                             Dragging either one, or retyping its length or angle, then carries \
+                             its partner along instead of pulling the corner apart. Relations you \
+                             add by hand are unaffected.",
+                        )
+                        .changed();
+                    changed |= ui
                         .add(
                             self.length_unit()
                                 .slider(&mut settings.grid_step, 0.05..=2.0)

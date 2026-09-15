@@ -399,6 +399,23 @@ impl SketchDefinition {
         &self,
         precision: PrecisionPolicy,
     ) -> Result<ConstraintSolution, ConstraintError> {
+        self.solve_constraints_anchoring(&BTreeSet::new(), precision)
+    }
+
+    /// Solves the relation system while holding `anchored` points exactly where
+    /// their recipes already put them.
+    ///
+    /// This is how an edit the user made by hand outranks the solver's freedom
+    /// to share the movement out. Without an anchor two coincident points meet
+    /// at their midpoint, so a dragged endpoint would travel half the distance
+    /// the pointer did and its partner would come only half way to meet it.
+    /// Anchoring the points the edit authored makes the dragged endpoint land
+    /// where it was put and pulls its partner all the way onto it.
+    pub fn solve_constraints_anchoring(
+        &self,
+        anchored: &BTreeSet<SketchPointId>,
+        precision: PrecisionPolicy,
+    ) -> Result<ConstraintSolution, ConstraintError> {
         let seeds = self
             .active_points()
             .map(|record| (record.id, record.evaluated_position))
@@ -407,6 +424,7 @@ impl SketchDefinition {
             &seeds,
             self.constraints.values().cloned(),
             precision.linear_agreement,
+            anchored,
         )
     }
 
