@@ -371,6 +371,60 @@ fn mode_roundtrip_cancels_incomplete_rectangle_and_arc_drafts() {
     }
 }
 
+/// An open sketch is editable from whatever tab is showing, and keeps its way
+/// out.
+///
+/// Finish and Exit are the Sketch tab's own commands, so opening View or
+/// Parametric mid-sketch left the canvas up with no way to finish or leave it.
+/// The tab picked inside a sketch also outlived that sketch, so the next one
+/// opened behind View with no drawing tools. Between them, editing a sketch
+/// meant going back to the drawing tab first.
+#[test]
+fn an_open_sketch_keeps_its_way_out_on_every_tab() {
+    let mut harness = harness([1280.0, 900.0]);
+    enter_sketch(&mut harness, "XY Plane");
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Single line")
+            .is_some(),
+        "a sketch opens on the drawing tools"
+    );
+
+    click_button(&mut harness, "View ribbon tab");
+    harness.run();
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Single line")
+            .is_none(),
+        "the View tab shows its own commands while it is open"
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Finish sketch")
+            .is_some(),
+        "the sketch keeps Finish on every tab"
+    );
+
+    // Leaving from another tab is the point: the user never has to find their
+    // way back to Sketch to get out of the canvas.
+    click_button(&mut harness, "Exit sketch");
+    harness.run();
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Model);
+
+    // Coming back through the ribbon's own command rather than the tab strip,
+    // which would clear the picked tab on the way past.
+    click_button(&mut harness, "Create sketch");
+    harness.run();
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Button, "Single line")
+            .is_some(),
+        "re-entering a sketch shows the drawing tools, not the tab last picked"
+    );
+}
+
 #[test]
 fn point_rectangle_circle_and_arc_gestures_commit_as_they_complete() {
     struct Gesture {

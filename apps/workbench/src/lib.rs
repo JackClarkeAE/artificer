@@ -2563,10 +2563,11 @@ pub struct KernelLabApp {
     browser_selected_sketch: Option<usize>,
     /// The ribbon tab the user explicitly picked, and the workspace they picked
     /// it in. `None` means the tab follows the workspace, which is what makes
-    /// the Sketch tab appear the moment a sketch opens; storing the workspace
-    /// alongside the pick is what makes it stop following an old choice when
-    /// the workspace changes, without every mode switch having to remember to
-    /// clear it.
+    /// the Sketch tab appear the moment a sketch opens. The workspace is stored
+    /// alongside the pick so a tab chosen in one workspace never shows in the
+    /// other, and [`Self::forget_picked_ribbon_tab`] drops it on entering or
+    /// leaving a sketch, so the pick lasts one visit rather than reappearing
+    /// the next time that workspace opens.
     ribbon_tab: Option<(WorkbenchMode, commands::RibbonTab)>,
     /// The camera exactly as the sketch had it when the peek began, so the
     /// return flight restores the drawing view rather than recomputing an
@@ -7660,6 +7661,7 @@ impl KernelLabApp {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
+        self.forget_picked_ribbon_tab();
         if self.selected_face.is_some() && self.active_component_instance().is_some() {
             self.document_status = Some(
                 "Library component faces are read-only in this workspace; edit the source part or start an origin-plane sketch"
@@ -8049,7 +8051,20 @@ impl KernelLabApp {
     /// Leaves the sketch workspace, handing back any camera it borrowed.
     fn leave_sketch_mode(&mut self) {
         self.workbench_mode = WorkbenchMode::Model;
+        self.forget_picked_ribbon_tab();
         self.restore_camera_after_plane_sketch();
+    }
+
+    /// Drops the hand-picked ribbon tab so the next workspace shows its own.
+    ///
+    /// The pick is a choice made during one visit to a workspace, which is
+    /// what the tab strip's own rule says. Keying it on the workspace alone
+    /// was not enough, because a workspace is visited more than once: a View
+    /// tab opened inside one sketch came back when the next sketch opened,
+    /// and the drawing tools stayed hidden until the user clicked Sketch
+    /// again. Every entry to and exit from the sketch workspace clears it.
+    fn forget_picked_ribbon_tab(&mut self) {
+        self.ribbon_tab = None;
     }
 
     /// Releases the camera a plane sketch borrowed, without moving it.
@@ -14100,6 +14115,7 @@ impl KernelLabApp {
             );
             return;
         }
+        self.forget_picked_ribbon_tab();
         self.workbench_mode = WorkbenchMode::Sketch;
     }
 

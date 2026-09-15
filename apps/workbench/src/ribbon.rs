@@ -205,6 +205,22 @@ impl KernelLabApp {
 
     fn ribbon_groups(&mut self, ui: &mut egui::Ui) {
         let tab = self.active_ribbon_tab();
+        // An open sketch keeps its way out on whatever tab is showing. Finish
+        // and Exit are the Sketch tab's COMPLETE group and nothing else on
+        // screen hosts them, so opening View or Parametric mid-sketch used to
+        // leave the canvas up with no way to finish or leave it: the user had
+        // to find their way back to the Sketch tab first. The group leads
+        // here, as it does on the Sketch tab itself.
+        if self.workbench_mode == WorkbenchMode::Sketch && tab != RibbonTab::Sketch {
+            for (group, members) in groups_for_tab(RibbonTab::Sketch)
+                .into_iter()
+                .filter(|(group, _)| *group == RibbonGroupId::Complete)
+            {
+                ribbon_group(ui, group.caption(), group.stable_key(), |ui| {
+                    self.ribbon_group_commands(ui, group, &members);
+                });
+            }
+        }
         // The drawing tools are the sketch crate's own registry-driven toolbar,
         // rendered whole. It leads the Sketch tab because it is what the tab is
         // for; every other group here comes from this crate's table.
