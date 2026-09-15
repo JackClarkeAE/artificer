@@ -25,6 +25,20 @@
 
 ---
 
+## What is new in 0.98.2
+
+A point release about the sketch tools, and about changing your mind: trim
+that works on the edge you drew over, a dimension that answers the question
+you asked, an extrusion that reaches the face you click, and an extrusion you
+can reopen and change after the fact.
+
+- **An extrusion can be reopened in the editor it was made in.** Right-click it in the parametric history and choose Edit. The model rolls back to the body the feature was built on, its sketch comes back with the regions it swept still picked, and the editor opens on the lengths, sides and operation it was given, with the same preview and the same drag handle. Confirming rewrites that feature's own recipe and replays everything after it rather than leaving a second extrusion beside the first; abandoning it puts the whole model back. The properties card covers extrusions too now, which is the one feature it never did — every extrusion the workbench makes is a sketch-region recipe and the card had no arm for one, so it never appeared and a typed change had nowhere to land. ADR 0036 records the design.
+- **Two strokes drawn onto one another stay joined when either moves.** A corner where two lines met was only a coincidence of coordinates: drag either line and it came apart. An endpoint that lands on another endpoint now persists a relation, and an edit outranks that relation — the solver holds the points the edit authored exactly where it put them and carries the partner the whole way onto them, rather than splitting the difference and letting go of the pointer. A drag and a retyped length or angle behave the same. One preference in SNAPPING AND VIEW governs it, on by default. ADR 0035 records the design and names what it does not do.
+- **Trim works on an edge a wedge is drawn over.** Two faults, both reachable from one drawing and both silent. A limit lying along the target aborted the whole trim; where the overlap starts and ends are perfectly good bounds and are used as such now, so a wedge whose base runs along a rectangle's edge no longer makes that edge untrimmable. And a span covering the whole target retained nothing, so the staging layer dropped the edit for want of an identity; the retired entity is that identity, and trimming an edge with nothing bounding it inside takes the edge.
+- **Dimensioning an edge asks about that edge.** Clicking one side of a rectangle brought the whole recipe back up, burying the answer among the shape's other numbers and drawing a bare leader with no arrowheads beside the dimension that had them. A pick names one kind and only that kind gets a box. The chip that sits over each entity carries a side identity too, which is what a rectangle needs once its first edit or a reload explodes it into four segments.
+- **An extrusion can actually end at the face you click.** To face was wired from the panel inward and never into the viewport's click router, so every face click during a staged extrusion was dropped and the panel just kept asking for one. Three faults behind it: a cut preview showed a body whose faces could not be measured at all, a sketch drawn on a face dropped the picked face from its recipe and froze at its first measurement, and the extents outlived the extrusion that set them.
+- **An open sketch keeps its way out on every ribbon tab.** Finish and Exit are the Sketch tab's own commands, so opening View or Parametric mid-sketch left the canvas up with no way to finish or leave it. They ride along on whatever tab is showing. The tab picked inside a sketch no longer outlives it either, so the next sketch opens on the drawing tools rather than behind whatever was last chosen.
+
 ## What is new in 0.98.1
 
 A point release about the things you touch: corners that finally blend, the
