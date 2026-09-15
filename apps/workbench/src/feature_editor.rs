@@ -10,9 +10,15 @@
 //! without a UI. The panel walks [`editable_scalars`] to draw a row per
 //! number and calls [`with_scalar`] to build the replacement command; nothing
 //! about which fields exist is encoded in the widget code.
+//!
+//! Not every feature is a kernel command. Every extrusion the workbench makes
+//! is a late-bound sketch-region recipe instead, and [`action_scalars`] reads
+//! those too — without that arm, the one feature a user is most likely to
+//! want to change was the only one that offered nothing at all.
 
 use artificer_model::ReplayAction;
 use artificer_model::persistent::TargetedKernel;
+use artificer_model::sketch_region::SketchRegionExtrusion;
 use artificer_protocol::KernelCommand;
 
 /// How a scalar is entered and what bounds it.
@@ -170,17 +176,68 @@ pub fn with_scalar(command: &KernelCommand, index: usize, value: f64) -> Option<
     Some(edited)
 }
 
+/// The lengths a sketch-region extrusion lets a user change after the fact.
+///
+/// The distance is offered as a plain length rather than as the signed
+/// quantity the recipe stores. The sign is which way the sweep goes, which
+/// the feature settled when it was made; a field that refused a negative
+/// number would otherwise refuse to shorten an extrusion that happens to
+/// point the other way. A side that ends at a face is not offered at all,
+/// because its length is measured again on every rebuild and a typed one
+/// would be overwritten by the next replay rather than held.
+fn sketch_region_scalars(recipe: &SketchRegionExtrusion) -> Vec<EditableScalar> {
+    let mut scalars = Vec::with_capacity(2);
+    if recipe.up_to_face.is_none() {
+        scalars.push(EditableScalar::length("Distance", recipe.distance.abs()));
+    }
+    if let Some(second) = recipe
+        .second_distance
+        .filter(|_| recipe.second_up_to_face.is_none())
+    {
+        scalars.push(EditableScalar::length("Second side", second));
+    }
+    scalars
+}
+
+/// Returns `recipe` with the named length set, or `None` when the index does
+/// not name one or the recipe would no longer be valid.
+///
+/// The write is matched on the label rather than on the index alone, because
+/// which lengths a recipe offers depends on whether its sides end at faces;
+/// keying both halves on the same name is what stops the two drifting apart.
+fn with_sketch_region_scalar(
+    recipe: &SketchRegionExtrusion,
+    index: usize,
+    value: f64,
+) -> Option<SketchRegionExtrusion> {
+    let scalars = sketch_region_scalars(recipe);
+    let target = scalars.get(index)?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    let edited = match target.label {
+        "Distance" => recipe.clone().with_measured_distances(Some(value), None),
+        "Second side" => recipe.clone().with_measured_distances(None, Some(value)),
+        _ => return None,
+    };
+    edited.validate().ok()?;
+    Some(edited)
+}
+
 /// The editable numbers on a committed feature's replay action.
 ///
-/// Only the two actions that carry a plain kernel command expose anything.
 /// A parameterized recipe already has a named parameter driving it and must
-/// be edited there instead, and a sketch or Boolean recipe's shape lives in
-/// its sketch or its operands rather than in a scalar field.
+/// be edited there instead, and a Boolean recipe's shape lives in its
+/// operands rather than in a scalar field.
 #[must_use]
 pub fn action_scalars(action: &ReplayAction) -> Vec<EditableScalar> {
     match action {
         ReplayAction::Kernel(command) => editable_scalars(command),
         ReplayAction::TargetedKernel(targeted) => editable_scalars(targeted.command_template()),
+        // Every extrusion the workbench makes is stored as this recipe, so
+        // without an arm here the one feature a user is most likely to want
+        // to change was the one feature that offered nothing at all.
+        ReplayAction::SketchRegionExtrusion(recipe) => sketch_region_scalars(recipe),
         _ => Vec::new(),
     }
 }
@@ -203,6 +260,9 @@ pub fn with_action_scalar(action: &ReplayAction, index: usize, value: f64) -> Op
             TargetedKernel::new_many(edited, targets)
                 .ok()
                 .map(ReplayAction::TargetedKernel)
+        }
+        ReplayAction::SketchRegionExtrusion(recipe) => {
+            with_sketch_region_scalar(recipe, index, value).map(ReplayAction::SketchRegionExtrusion)
         }
         _ => None,
     }

@@ -1076,3 +1076,78 @@ fn a_rolled_back_history_cursor_still_opens_a_sketch_for_editing() {
         "the committed geometry is on the canvas"
     );
 }
+
+fn right_click_at(harness: &mut Harness<'static, KernelLabApp>, position: egui::Pos2) {
+    harness.hover_at(position);
+    harness.step();
+    // Press and release inside one frame: egui only reports a click once it
+    // has ruled out a drag.
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.step();
+    harness.step();
+}
+
+fn right_click_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    let center = harness
+        .get_by_role_and_label(Role::Button, label)
+        .rect()
+        .center();
+    right_click_at(harness, center);
+}
+
+/// Right-clicking an extrusion in the history reopens the editor it was made
+/// in. This was the missing half of editing an operation: the properties card
+/// changes a number, and this brings back the 3D view, the sketch and the
+/// regions, with the history standing where the feature was built.
+#[test]
+fn right_clicking_an_extrusion_reopens_the_editor_it_was_made_in() {
+    let mut harness = harness();
+    prepare_finished_sketch(&mut harness, FeatureScenario::Extrude);
+    commit_prepared_feature(&mut harness, FeatureScenario::Extrude);
+    let committed = harness
+        .state()
+        .displayed_measures()
+        .expect("a committed extrusion measures")
+        .volume;
+    let features = harness.state().document_feature_count();
+
+    right_click_button(
+        &mut harness,
+        &FeatureScenario::Extrude.feature_button_label(),
+    );
+    click_button(&mut harness, "Edit this extrusion");
+    harness.run();
+    assert!(
+        harness.state().operation_confirmation_pending(),
+        "the editor reopens staged: {:?}",
+        harness.state().document_status_text()
+    );
+    set_extrusion_distance(&mut harness, "8");
+    // Confirm from the keyboard: scrolling the distance field into view inside
+    // the contextual card takes the rail's tick off screen with it.
+    press_key(&mut harness, egui::Key::Enter);
+    harness.run();
+
+    assert!(!harness.state().operation_confirmation_pending());
+    assert_eq!(
+        harness.state().document_feature_count(),
+        features,
+        "an edit rewrites the extrusion and never appends another"
+    );
+    let rebuilt = harness
+        .state()
+        .displayed_measures()
+        .expect("the rebuilt extrusion measures")
+        .volume;
+    assert!(
+        rebuilt > committed + 1.0e-9,
+        "a longer extrusion is a bigger solid: {committed} then {rebuilt}"
+    );
+}

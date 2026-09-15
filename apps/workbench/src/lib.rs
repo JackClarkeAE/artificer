@@ -57,9 +57,10 @@ use artificer_model::{
     ParameterBinding, ParameterExposure, ParameterId, ParameterMetadata, ParameterOverrides,
     ParameterSpec, ParameterType, ParameterUnit, ParameterValue, QuantityKind, RebuildState,
     ReplayAction, ReplayDisposition, RigidComponentPose, SketchId, SketchPayload,
-    SketchRegionExtrusion, SketchRegionRecipeError, SketchSupportRecipe, SnapshotAssociation,
-    extrusion_frame_is_reversed, frame_moved_along_normal, plane_height_above_frame,
-    reflected_profile_across_u, reversed_extrusion_direction,
+    SketchRegionExtrusion, SketchRegionExtrusionTarget, SketchRegionRecipeError,
+    SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
+    frame_moved_along_normal, plane_height_above_frame, reflected_profile_across_u,
+    reversed_extrusion_direction,
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
@@ -431,6 +432,11 @@ enum PendingOperation {
         /// For an Add or Cut from a sketch on a plane rather than a face:
         /// the body the swept solid is combined with once it exists.
         boolean_target: Option<BodyId>,
+        /// The committed feature this editor was opened on, when it was
+        /// opened from the history rather than from a fresh sketch.
+        /// Confirming then rewrites that feature's own recipe and replays
+        /// everything after it, instead of appending a second extrusion.
+        editing_feature: Option<FeatureId>,
     },
     PushPullFace {
         base_snapshot: SnapshotId,
@@ -1900,6 +1906,35 @@ struct ModelContextMenu {
     just_opened: bool,
 }
 
+/// The history context menu, anchored on the entry that was right-clicked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TimelineContextMenu {
+    position: egui::Pos2,
+    feature: FeatureId,
+    /// As [`ModelContextMenu::just_opened`]: the right-click that opened the
+    /// menu is still in this frame's input.
+    just_opened: bool,
+}
+
+/// One command the history context menu offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineContextCommand {
+    /// Reopen the 3D editor the feature was made in.
+    Edit,
+    Suppress,
+    Restore,
+}
+
+impl TimelineContextCommand {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Edit => "Edit this extrusion",
+            Self::Suppress => "Suppress this feature",
+            Self::Restore => "Restore this feature",
+        }
+    }
+}
+
 /// One command the model context menu offers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ModelContextCommand {
@@ -2553,6 +2588,8 @@ pub struct KernelLabApp {
     /// The open Browser context menu, if one is open. At most one of the two
     /// right-click menus exists at a time.
     browser_context_menu: Option<browser::BrowserContextMenu>,
+    /// The open history context menu, if one is open.
+    timeline_context_menu: Option<TimelineContextMenu>,
     /// Ordinals of the bodies selected in the Browser tree. Multi-body
     /// commands such as Mirror act on this set; the active body remains the
     /// single-body fallback when the set is empty.
@@ -2727,6 +2764,7 @@ impl Default for KernelLabApp {
             sketch_orbit_peek: false,
             model_context_menu: None,
             browser_context_menu: None,
+            timeline_context_menu: None,
             browser_selected_bodies: BTreeSet::new(),
             browser_selected_sketch: None,
             ribbon_tab: None,
@@ -6933,7 +6971,18 @@ impl KernelLabApp {
     /// sourced from its document payload, so selection works after a fresh
     /// process load and does not depend on a surviving UI-canvas cache.
     fn activate_committed_sketch(&mut self, index: usize) -> bool {
-        if self.pending_operation.is_some() || !self.history_is_at_end() {
+        self.history_is_at_end() && self.activate_committed_sketch_at_cursor(index)
+    }
+
+    /// Activates a committed sketch wherever the history cursor stands.
+    ///
+    /// Re-entering a committed feature's editor rolls the cursor back to just
+    /// before that feature, so the body on screen is the one the feature was
+    /// built on rather than the one it produced. The sketch it consumed is
+    /// still active at that point, so refusing on the cursor alone would
+    /// refuse the one case that needs this.
+    fn activate_committed_sketch_at_cursor(&mut self, index: usize) -> bool {
+        if self.pending_operation.is_some() {
             return false;
         }
         let Some(record) = self.sketches.get(index).cloned() else {
@@ -8413,6 +8462,7 @@ impl KernelLabApp {
             second_distance,
             up_to_faces,
             boolean_target,
+            editing_feature: None,
         });
         self.sketch_extrusion_issue = None;
         self.leave_sketch_mode();
@@ -9550,6 +9600,12 @@ impl KernelLabApp {
                     });
                 }
             }
+            PendingOperation::ExtrudeSketch {
+                editing_feature: Some(feature),
+                ..
+            } => {
+                self.apply_extrusion_edit(feature);
+            }
             pending @ PendingOperation::ExtrudeSketch { .. } => {
                 self.execute_sketch_extrusion(pending);
             }
@@ -9608,13 +9664,26 @@ impl KernelLabApp {
                 self.sketch_finish_issue = None;
                 self.pending_operation = None;
             }
-            PendingOperation::ExtrudeSketch { cancel_mode, .. } => {
+            PendingOperation::ExtrudeSketch {
+                cancel_mode,
+                editing_feature,
+                ..
+            } => {
                 self.cancel_async_sketch_extrusion_commit();
                 self.sketch_extrusion_issue = None;
                 self.pending_operation = None;
                 self.workbench_mode = cancel_mode;
                 // An armed face pick belongs to the operation that armed it.
                 self.disarm_extrusion_face_picks();
+                if editing_feature.is_some() {
+                    // Reopening a committed feature rolled the history back to
+                    // see the body it was built on. Abandoning the edit has to
+                    // put the whole model back, or the user is left looking at
+                    // a design missing everything from that feature onward.
+                    self.reset_extrusion_extents();
+                    self.move_history_cursor(self.document.features().len());
+                    self.document_status = Some("Extrusion edit abandoned".to_owned());
+                }
             }
             PendingOperation::PushPullFace { .. } => {
                 self.sketch_extrusion_issue = None;
@@ -9641,6 +9710,7 @@ impl KernelLabApp {
             second_distance,
             up_to_faces: _,
             boolean_target,
+            editing_feature: _,
         } = pending
         else {
             unreachable!("only a staged sketch extrusion can reach extrusion execution")
@@ -14134,6 +14204,373 @@ impl KernelLabApp {
         };
         let ordinal = sketch.ordinal;
         self.open_export_dialog(ExportSubject::Sketch { index, ordinal });
+    }
+
+    /// Resolves a recipe's stored face against the body now on screen.
+    ///
+    /// A recipe keeps the face a side ends at as a persistent reference, which
+    /// only names a current face once it is resolved through the reports of
+    /// the features that built it.
+    fn current_face_for_persistent_ref(&self, reference: &PersistentRef) -> Option<EntityRef> {
+        let input = self.displayed.as_ref()?;
+        let ordered = self
+            .document
+            .features()
+            .iter()
+            .filter_map(|node| {
+                self.feature_reports
+                    .iter()
+                    .find(|(feature, _)| *feature == node.id)
+                    .map(|(feature, report)| FeatureOperationReport::new(*feature, report))
+            })
+            .collect::<Vec<_>>();
+        match resolve_persistent_ref(reference, &ordered, input.snapshot.id()) {
+            PersistentResolution::Resolved(face) => Some(face),
+            _ => None,
+        }
+    }
+
+    /// What the history's right-click menu offers for this feature.
+    ///
+    /// Suppress and Restore also have buttons in the same strip; they are here
+    /// because a menu that offered one item would read as an accident, and
+    /// because the entry under the pointer is the one a user means.
+    fn timeline_context_commands(&self, feature: FeatureId) -> Vec<TimelineContextCommand> {
+        let Some(node) = self
+            .document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+        else {
+            return Vec::new();
+        };
+        let mut commands = Vec::new();
+        if self.feature_has_an_editor(feature) {
+            commands.push(TimelineContextCommand::Edit);
+        }
+        if !node.state.read_only {
+            commands.push(if node.state.suppressed {
+                TimelineContextCommand::Restore
+            } else {
+                TimelineContextCommand::Suppress
+            });
+        }
+        commands
+    }
+
+    fn run_timeline_context_command(
+        &mut self,
+        command: TimelineContextCommand,
+        feature: FeatureId,
+    ) {
+        match command {
+            TimelineContextCommand::Edit => {
+                self.begin_extrusion_edit(feature);
+            }
+            TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
+                self.toggle_feature_suppression(feature);
+            }
+        }
+    }
+
+    pub(crate) fn show_timeline_context_menu(&mut self, context: &egui::Context) {
+        if self.pending_operation.is_some() {
+            self.timeline_context_menu = None;
+            return;
+        }
+        let Some(mut menu) = self.timeline_context_menu else {
+            return;
+        };
+        let commands = self.timeline_context_commands(menu.feature);
+        if commands.is_empty() {
+            self.timeline_context_menu = None;
+            return;
+        }
+        let labels = commands
+            .iter()
+            .map(|command| command.label())
+            .collect::<Vec<_>>();
+        let outcome = browser::floating_context_menu(
+            context,
+            "timeline_context_menu",
+            menu.position,
+            &labels,
+            menu.just_opened,
+        );
+        if let Some(chosen) = outcome.chosen {
+            self.timeline_context_menu = None;
+            self.run_timeline_context_command(commands[chosen], menu.feature);
+            context.request_repaint();
+            return;
+        }
+        if outcome.escape || (!menu.just_opened && outcome.clicked_elsewhere) {
+            self.timeline_context_menu = None;
+            return;
+        }
+        menu.just_opened = false;
+        self.timeline_context_menu = Some(menu);
+    }
+
+    /// Whether this feature has a 3D editor to reopen.
+    #[must_use]
+    pub fn feature_has_an_editor(&self, feature: FeatureId) -> bool {
+        self.document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+            .is_some_and(|node| {
+                matches!(node.action, ReplayAction::SketchRegionExtrusion(_))
+                    && !node.state.read_only
+            })
+    }
+
+    /// Reopens the editor a committed extrusion was made in.
+    ///
+    /// The history rolls back to just before the feature, so the viewport
+    /// shows the body it was built on rather than the body it produced; its
+    /// sketch comes back with the regions it swept still picked, and the
+    /// editor opens on the lengths, sides and operation it was given.
+    /// Confirming rewrites that feature and replays everything after it,
+    /// rather than appending a second extrusion beside the first.
+    ///
+    /// Only a sketch-region extrusion has an editor to reopen. Anything else
+    /// is refused by name and changed in the properties card instead, because
+    /// a feature with no interactive editor has nothing to reopen and saying
+    /// so is better than a menu item that does nothing.
+    pub(crate) fn begin_extrusion_edit(&mut self, feature: FeatureId) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        let Some(index) = self
+            .document
+            .features()
+            .iter()
+            .position(|node| node.id == feature)
+        else {
+            return false;
+        };
+        let Some(ReplayAction::SketchRegionExtrusion(recipe)) = self
+            .document
+            .features()
+            .get(index)
+            .map(|node| node.action.clone())
+        else {
+            self.document_status =
+                Some("That feature has no 3D editor; change its numbers in Properties".to_owned());
+            return false;
+        };
+        let Some(sketch_index) = self
+            .sketches
+            .iter()
+            .position(|sketch| sketch.id == Some(recipe.sketch))
+        else {
+            self.document_status =
+                Some("That extrusion's sketch is not in this document any more".to_owned());
+            return false;
+        };
+
+        // Roll back first: everything below reads the body and the reports as
+        // they stood when the feature was made.
+        if !self.move_history_cursor(index) {
+            return false;
+        }
+        if !self.activate_committed_sketch_at_cursor(sketch_index) {
+            self.document_status = Some(
+                "That extrusion's sketch cannot be opened at this point in history".to_owned(),
+            );
+            self.move_history_cursor(self.document.features().len());
+            return false;
+        }
+
+        // Rebuild the canvas from the recipe's own region set rather than from
+        // the cached profile: the recipe is what replay uses, so it is what
+        // the editor should show picked.
+        let canvas = self
+            .document
+            .sketch(recipe.sketch)
+            .and_then(|record| {
+                self.document
+                    .sketch_payload(recipe.sketch, record.geometry_revision)
+            })
+            .and_then(|payload| payload.authoring().cloned())
+            .and_then(|authoring| {
+                SketchCanvasState::from_authoring_with_regions(
+                    self.selected_origin_plane,
+                    authoring,
+                    &recipe.regions,
+                )
+                .ok()
+            });
+        let Some(canvas) = canvas else {
+            self.document_status =
+                Some("That extrusion's regions no longer resolve in its sketch".to_owned());
+            self.move_history_cursor(self.document.features().len());
+            return false;
+        };
+        self.sketch = canvas;
+        self.sketch_finished = true;
+
+        self.seed_extrusion_editor_from_recipe(&recipe);
+        self.stage_extrusion_edit(feature);
+        true
+    }
+
+    /// Puts the editor's own fields where the recipe says the feature stands.
+    fn seed_extrusion_editor_from_recipe(&mut self, recipe: &SketchRegionExtrusion) {
+        self.extrusion_distance = recipe.distance;
+        self.extrusion_draft_degrees = recipe.draft_degrees;
+        self.extrusion_second_distance = recipe.second_distance;
+        self.extrusion_symmetric = recipe
+            .second_distance
+            .is_some_and(|second| (second - recipe.distance.abs()).abs() <= 1.0e-9);
+        self.extrusion_mode = match &recipe.target {
+            SketchRegionExtrusionTarget::NewBody => ExtrusionMode::NewBody,
+            SketchRegionExtrusionTarget::PlanarFace { operation, .. } => match operation {
+                FaceExtrusionOperation::Add => ExtrusionMode::Add,
+                FaceExtrusionOperation::Cut => ExtrusionMode::Cut,
+            },
+        };
+        // The mode came from the feature rather than from the sign, so sign
+        // inference must not quietly flip it back on the first drag.
+        self.extrusion_mode_explicit = true;
+        // A side whose face still resolves reopens as a face pick, so the
+        // editor shows what the feature actually says. One that no longer
+        // resolves reopens at the length it last measured, and says so rather
+        // than presenting a face it cannot find.
+        let mut lost_a_face = false;
+        self.extrusion_extents = [&recipe.up_to_face, &recipe.second_up_to_face].map(|reference| {
+            match reference
+                .as_ref()
+                .map(|reference| self.current_face_for_persistent_ref(reference))
+            {
+                None => ExtrusionExtentIntent::Distance,
+                Some(Some(face)) => ExtrusionExtentIntent::ToFace(face),
+                Some(None) => {
+                    lost_a_face = true;
+                    ExtrusionExtentIntent::Distance
+                }
+            }
+        });
+        if lost_a_face {
+            self.document_status = Some(
+                "That extrusion's end face is no longer on this body; it reopened at its last measured length"
+                    .to_owned(),
+            );
+        }
+    }
+
+    /// Stages the reopened editor, so the preview, the drag handle and the
+    /// panel are the same ones the extrusion was made with.
+    fn stage_extrusion_edit(&mut self, feature: FeatureId) {
+        self.active_tool = ActiveTool::Select;
+        self.sketch.clear_creation_draft();
+        let target_face = self.sketch_support.target_face();
+        let boolean_target =
+            if target_face.is_none() && self.extrusion_mode != ExtrusionMode::NewBody {
+                self.plane_boolean_target()
+            } else {
+                None
+            };
+        self.pending_operation = Some(PendingOperation::ExtrudeSketch {
+            base_snapshot: self.active_snapshot_id_or_empty(),
+            support_body: self.sketch_support.body(),
+            plane: self.sketch.plane(),
+            revision: self.sketch_revision,
+            // Cancelling a reopened editor goes back to the model, never into
+            // a sketch the user did not open.
+            cancel_mode: WorkbenchMode::Model,
+            // The sketch was finished when the feature was made; reopening its
+            // extrusion must not commit it a second time.
+            finish_sketch_on_commit: false,
+            distance: self.extrusion_distance,
+            draft_degrees: self.extrusion_draft_degrees,
+            frame: self.sketch_support.frame(),
+            target_face,
+            support_digest: self.sketch_support.support_digest(),
+            mode: self.extrusion_mode,
+            second_distance: self.extrusion_second_distance,
+            up_to_faces: self.extrusion_extents.map(ExtrusionExtentIntent::face),
+            boolean_target,
+            editing_feature: Some(feature),
+        });
+        self.sketch_extrusion_issue = None;
+        self.leave_sketch_mode();
+        let label = self
+            .document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+            .map_or_else(|| "this extrusion".to_owned(), |node| node.label.clone());
+        self.document_status = Some(format!(
+            "Editing {label} · confirm to rewrite it and replay what follows"
+        ));
+    }
+
+    /// Rewrites the feature the reopened editor was opened on, then replays
+    /// everything that depends on it.
+    ///
+    /// This deliberately does not run the extrusion command itself. The
+    /// document already knows how to replay a sketch-region recipe and how to
+    /// carry the rebuild of every feature after it, so an edit is a new recipe
+    /// in the same slot rather than a second extrusion beside the first.
+    fn apply_extrusion_edit(&mut self, feature: FeatureId) {
+        let Some(ReplayAction::SketchRegionExtrusion(original)) = self
+            .document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+            .map(|node| node.action.clone())
+        else {
+            self.document_status = Some("That feature is no longer an extrusion".to_owned());
+            self.pending_operation = None;
+            return;
+        };
+
+        let mut edited = original.clone();
+        edited.distance = self.extrusion_distance;
+        edited.draft_degrees = self.extrusion_draft_degrees;
+        edited.second_distance = self
+            .extrusion_second_distance
+            .filter(|_| self.sketch_support.target_face().is_none());
+        let faces = self.extrusion_extents.map(|extent| {
+            extent
+                .face()
+                .and_then(|face| self.persistent_ref_for_current_face(face))
+        });
+        edited.up_to_face = faces[0].clone();
+        edited.second_up_to_face = faces[1]
+            .clone()
+            .filter(|_| edited.second_distance.is_some());
+        // The regions the canvas has picked are what the user just looked at.
+        // An empty selection means the editor never re-resolved them, so the
+        // recipe keeps the set it already had rather than losing its profile.
+        let regions = self.selected_sketch_region_signatures();
+        if !regions.is_empty() {
+            edited.regions = regions;
+        }
+        if let Err(error) = edited.validate() {
+            self.document_status = Some(format!("That change is not a valid extrusion: {error}"));
+            return;
+        }
+
+        self.pending_operation = None;
+        self.reset_extrusion_extents();
+        match self
+            .document
+            .replace_feature_action(feature, ReplayAction::SketchRegionExtrusion(edited))
+        {
+            Ok(_) => {
+                self.move_history_cursor(self.document.features().len());
+                self.selected_history_feature = Some(feature);
+                if self.rebuild_document_from(feature) {
+                    self.document_status = Some("Extrusion rebuilt".to_owned());
+                }
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Edit rejected: {error}"));
+                self.move_history_cursor(self.document.features().len());
+            }
+        }
     }
 
     /// Opens a committed sketch for editing — the Browser's explicit edit
@@ -19157,6 +19594,7 @@ impl KernelLabApp {
             });
             let mut requested_mode = None;
             let mut selected_feature = None;
+            let mut context_request: Option<(FeatureId, egui::Pos2)> = None;
             egui::ScrollArea::horizontal()
                 .id_salt("feature_timeline_scroll")
                 .auto_shrink([false, true])
@@ -19242,6 +19680,21 @@ impl KernelLabApp {
                                     WorkbenchMode::Model
                                 });
                             }
+                            // The entry under the pointer is the one a
+                            // right-click means, which is what lets an
+                            // extrusion be reopened in the editor it was made
+                            // in without first selecting it somewhere else.
+                            if response.secondary_clicked()
+                                && let Some(feature) =
+                                    document_features.get(index).map(|feature| feature.id)
+                            {
+                                context_request = Some((
+                                    feature,
+                                    response
+                                        .interact_pointer_pos()
+                                        .unwrap_or_else(|| response.rect.center()),
+                                ));
+                            }
                         };
 
                         let mut index = 0;
@@ -19283,6 +19736,13 @@ impl KernelLabApp {
                         }
                     });
                 });
+            if let Some((feature, position)) = context_request {
+                self.timeline_context_menu = Some(TimelineContextMenu {
+                    position,
+                    feature,
+                    just_opened: true,
+                });
+            }
             if let Some(feature) = selected_feature {
                 self.selected_history_feature = Some(feature);
                 self.show_properties_tab();
@@ -19550,6 +20010,7 @@ impl eframe::App for KernelLabApp {
         // other binding in the model workspace.
         self.show_model_context_menu(ui.ctx());
         self.show_browser_context_menu(ui.ctx());
+        self.show_timeline_context_menu(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.export_window(ui.ctx());
@@ -24314,6 +24775,162 @@ mod extrusion_workbench_tests {
         assert!(app.pending_operation.is_none());
     }
 
+    /// Every extrusion the workbench makes is stored as a sketch-region
+    /// recipe, and the properties card had no arm for one. The feature a user
+    /// is most likely to want to change afterwards was the single feature
+    /// that offered nothing at all, so the card never appeared and a typed
+    /// change had nowhere to land.
+    #[test]
+    fn an_extrusion_offers_its_distance_and_editing_it_rebuilds_the_solid() {
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(4.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let feature = app
+            .selected_history_feature
+            .expect("the committed extrusion is selected");
+        let extruded = app
+            .displayed_measures()
+            .expect("a committed extrusion measures")
+            .volume;
+
+        let scalars = app.selected_feature_scalars();
+        assert_eq!(
+            scalars
+                .iter()
+                .map(|scalar| scalar.label)
+                .collect::<Vec<_>>(),
+            vec!["Distance"],
+            "an extrusion has to offer how far it sweeps"
+        );
+        assert!((scalars[0].value - 4.0).abs() < 1.0e-12);
+
+        assert!(
+            app.edit_feature_scalar(feature, 0, 8.0),
+            "doubling the distance should rebuild: {:?}",
+            app.document_status
+        );
+        let doubled = app
+            .displayed_measures()
+            .expect("the rebuilt extrusion measures")
+            .volume;
+        assert!(
+            (doubled - extruded * 2.0).abs() < 1.0e-6,
+            "twice the distance is twice the solid: {extruded} then {doubled}"
+        );
+        assert!((app.selected_feature_scalars()[0].value - 8.0).abs() < 1.0e-12);
+        assert_eq!(
+            app.document
+                .features()
+                .iter()
+                .filter(|node| node.id == feature)
+                .count(),
+            1,
+            "editing must rewrite the feature, never append another"
+        );
+    }
+
+    /// Reopening a committed extrusion rolls the history back to the body it
+    /// was built on, brings its sketch back with the regions it swept, and
+    /// opens the editor on the lengths it was given. Confirming rewrites that
+    /// feature and replays what follows, rather than leaving a second
+    /// extrusion beside the first.
+    #[test]
+    fn a_committed_extrusion_reopens_in_its_own_editor_and_confirming_rewrites_it() {
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(4.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let feature = app
+            .selected_history_feature
+            .expect("the committed extrusion is selected");
+        let extruded = app
+            .displayed_measures()
+            .expect("a committed extrusion measures")
+            .volume;
+        let features_before = app.document.features().len();
+
+        assert!(app.feature_has_an_editor(feature));
+        assert!(
+            app.begin_extrusion_edit(feature),
+            "reopening should succeed: {:?}",
+            app.document_status
+        );
+        assert!(matches!(
+            app.pending_operation,
+            Some(PendingOperation::ExtrudeSketch {
+                editing_feature: Some(_),
+                finish_sketch_on_commit: false,
+                ..
+            })
+        ));
+        assert!(
+            (app.extrusion_distance - 4.0).abs() < 1.0e-12,
+            "the editor reopens on the distance the feature recorded"
+        );
+        assert_eq!(
+            app.document.history_position(),
+            features_before - 1,
+            "the history stands just before the feature being edited"
+        );
+        assert!(
+            app.sketch.selected_region_count() > 0,
+            "the regions the extrusion swept come back picked"
+        );
+
+        app.set_extrusion_distance_intent(8.0);
+        assert!(app.confirm_pending_operation());
+        assert!(app.pending_operation.is_none());
+        assert_eq!(
+            app.document.features().len(),
+            features_before,
+            "an edit rewrites the feature and never appends another"
+        );
+        let doubled = app
+            .displayed_measures()
+            .expect("the rebuilt extrusion measures")
+            .volume;
+        assert!(
+            (doubled - extruded * 2.0).abs() < 1.0e-6,
+            "twice the distance is twice the solid: {extruded} then {doubled}"
+        );
+    }
+
+    /// Abandoning a reopened editor has to put the whole model back. The
+    /// history was rolled back to see the body the feature was built on, and
+    /// leaving it there would show a design missing everything from that
+    /// feature onward.
+    #[test]
+    fn abandoning_an_extrusion_edit_restores_the_whole_model() {
+        let mut app = active_rectangle_app();
+        app.set_extrusion_distance_intent(4.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let feature = app
+            .selected_history_feature
+            .expect("the committed extrusion is selected");
+        let extruded = app
+            .displayed_measures()
+            .expect("a committed extrusion measures")
+            .volume;
+        let end = app.document.features().len();
+
+        assert!(app.begin_extrusion_edit(feature));
+        app.set_extrusion_distance_intent(9.0);
+        assert!(app.cancel_pending_operation());
+
+        assert!(app.pending_operation.is_none());
+        assert_eq!(app.document.history_position(), end);
+        let after = app
+            .displayed_measures()
+            .expect("the restored extrusion measures")
+            .volume;
+        assert!(
+            (after - extruded).abs() < 1.0e-9,
+            "an abandoned edit changes nothing: {extruded} then {after}"
+        );
+    }
+
     /// A second side sweeps both ways from the sketch plane: the committed
     /// solid is as thick as the two sides together, and its two caps sit
     /// either side of the plane the profile was drawn on.
@@ -25273,6 +25890,7 @@ mod extrusion_workbench_tests {
             second_distance: None,
             up_to_faces: [None, None],
             boolean_target: None,
+            editing_feature: None,
         };
         app.pending_operation = Some(invalid);
 
