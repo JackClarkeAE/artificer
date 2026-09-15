@@ -109,8 +109,14 @@ fn rectangle_width(harness: &Harness<'static, KernelLabApp>) -> String {
 }
 
 /// The reported gesture, end to end: press D, click the rectangle, type, Enter.
+///
+/// Clicking one edge asks one question. The horizontal side clicked here is a
+/// Width question, and Width is the only box that appears: bringing the whole
+/// recipe back up buried the answer among the shape's other numbers, and the
+/// extra field measures a position rather than a span, so it drew a bare
+/// leader with no arrows beside the dimension that had them.
 #[test]
-fn dimension_pick_arms_the_caret_on_the_first_driving_box() {
+fn dimensioning_one_edge_offers_that_edge_and_nothing_else() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     create_two_point_rectangle(&mut harness);
@@ -118,8 +124,12 @@ fn dimension_pick_arms_the_caret_on_the_first_driving_box() {
 
     let revision = harness.state().sketch_revision();
     click_sketch_point(&mut harness, SketchPoint::new(0.0, 1.0));
-    // Both driving dimensions are real fields, and the first one is armed.
-    harness.get_by_role_and_label(Role::TextInput, HEIGHT_BOX);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, HEIGHT_BOX)
+            .is_none(),
+        "a horizontal side asks for Width, so Height has no box"
+    );
     type_into_armed_box(&mut harness, WIDTH_BOX, "6");
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
     assert_eq!(harness.state().sketch_revision(), revision);

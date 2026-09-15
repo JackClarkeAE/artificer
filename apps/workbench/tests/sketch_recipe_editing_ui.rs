@@ -118,12 +118,25 @@ fn create_two_point_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
 }
 
 /// A rectangle's width and height are dimensions of its own geometry, so the
-/// Dimension tool is where they are typed: picking the top edge selects the
-/// rectangle and turns both driving boxes into real fields on the canvas.
+/// Dimension tool is where they are typed. Picking the top edge selects the
+/// rectangle and asks about that edge, so width is the box that appears.
 fn select_rectangle_top(harness: &mut Harness<'static, KernelLabApp>) {
     click_button(harness, "Sketch dimension");
     click_sketch_point(harness, SketchPoint::new(0.0, 1.0));
     harness.get_by_role_and_label(Role::TextInput, WIDTH_BOX);
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, HEIGHT_BOX)
+            .is_none(),
+        "a horizontal edge asks for width alone"
+    );
+}
+
+/// The height is asked for by picking a vertical wall. The left one is the
+/// rectangle's anchored side, so it stays put when the width changes.
+fn select_rectangle_left(harness: &mut Harness<'static, KernelLabApp>) {
+    click_button(harness, "Sketch dimension");
+    click_sketch_point(harness, SketchPoint::new(-1.0, 0.0));
     harness.get_by_role_and_label(Role::TextInput, HEIGHT_BOX);
 }
 
@@ -155,9 +168,9 @@ fn rectangle_recipe_edit_applies_on_accept_and_drives_exact_new_body_volume() {
 
     let revision = harness.state().sketch_revision();
     accept_selected_parameter(&mut harness, WIDTH_BOX, "3");
-    // An accepted edit rebuilds the rectangle's presentation; pick it again
-    // to arm the boxes for the second dimension.
-    select_rectangle_top(&mut harness);
+    // An accepted edit rebuilds the rectangle's presentation; pick the wall
+    // this time, because the second dimension is a question about that side.
+    select_rectangle_left(&mut harness);
     accept_selected_parameter(&mut harness, HEIGHT_BOX, "2");
     assert!(!harness.state().operation_confirmation_pending());
     assert_eq!(harness.state().sketch_revision(), revision + 2);

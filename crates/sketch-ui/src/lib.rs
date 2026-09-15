@@ -11089,7 +11089,7 @@ pub fn show_with_context(
     );
     paint_modifier_sources(&painter, response.rect, state);
     let semantic_selected = semantic_selection_targets(ui, response.rect, state);
-    if let Some(selected) = semantic_selected {
+    if let Some((selected, chip_position)) = semantic_selected {
         selection_changed |= state.set_selected(Some(selected));
         if !ui.input(|input| input.modifiers.shift) {
             selection_changed |= state.clear_selected_regions();
@@ -11097,10 +11097,11 @@ pub fn show_with_context(
         // The semantic chip sits over the canvas and takes the click outright,
         // so a pick that lands on it never reaches the branch above. Arming
         // here keeps both routes equivalent, and it still runs before the
-        // boxes lay out below. The chip carries no side identity, so the
-        // armed dimension falls back to the field order.
+        // boxes lay out below. The chip stands on the geometry it names, so
+        // its own position is the pick: a rectangle exploded into segments
+        // wears a chip on each side, and a click there is about that side.
         if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
-            state.dimension_pick = None;
+            state.dimension_pick = Some(state.view.screen_to_sketch(response.rect, chip_position));
             state.focus_dimension_box = first_armed_dimension_kind(state);
         }
     }
@@ -12774,8 +12775,21 @@ fn dimension_widget_layouts(
     let sides =
         rectangle_annotation_sides(geometry, (!live).then_some(state.dimension_pick).flatten());
 
+    // A click with the Dimension tool asks one question, about the edge under
+    // it. Answering with every number the shape carries buried that answer
+    // among the others and, where the extra field measures a position rather
+    // than a span, drew a bare leader with no arrows beside the dimension that
+    // had them. The pick names the kind; only that kind gets a box. Without a
+    // pick — the semantic chip, or a plain selection with the tool off — the
+    // shape still shows what it has.
+    let picked_kind =
+        (!live && state.exact_tool == ToolVariant::Dimension && state.dimension_pick.is_some())
+            .then(|| first_armed_dimension_kind(state))
+            .flatten();
+
     readouts
         .into_iter()
+        .filter(|readout| picked_kind.is_none_or(|kind| readout.kind == kind))
         .filter(|readout| readout.kind.shows_on_canvas())
         .filter_map(|readout| {
             dimension_widget_position(geometry, readout.kind, sides, state.view, canvas_rect)
@@ -13831,11 +13845,18 @@ fn geometry_screen_distance(
     }
 }
 
+/// Returns the entity whose chip was clicked, with the chip's own position.
+///
+/// The position matters because a chip often does name a side: a rectangle
+/// that has been exploded into four segments wears one chip per segment, at
+/// that segment's midpoint, so a click there is a question about that edge and
+/// nothing else. The whole-rectangle chip sits on its lower edge and names it
+/// the same way.
 fn semantic_selection_targets(
     ui: &mut Ui,
     canvas_rect: Rect,
     state: &SketchCanvasState,
-) -> Option<SketchEntityId> {
+) -> Option<(SketchEntityId, Pos2)> {
     if !matches!(
         state.exact_tool,
         ToolVariant::Select | ToolVariant::Dimension
@@ -13860,7 +13881,7 @@ fn semantic_selection_targets(
         let label = format!("Sketch {kind} {}", entity.id.get());
         response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
         if response.clicked() {
-            selected = Some(entity.id);
+            selected = Some((entity.id, position));
         }
     }
     selected

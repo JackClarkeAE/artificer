@@ -350,8 +350,10 @@ fn typed_dimension_live_preview_snapshot() {
     settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1040");
 }
 
-/// The Dimension tool, armed: clicking the rectangle turns its two driving
-/// dimensions into real fields on the curve, with the first holding the caret.
+/// The Dimension tool, armed: clicking the rectangle's top edge turns that
+/// edge's width into a real field on the curve, with the caret in it. The
+/// edge that was clicked is the one that gets a dimension — the height is not
+/// what this click asked about, and drawing it too buried the answer.
 #[test]
 fn dimension_tool_armed_on_a_rectangle_snapshot() {
     let mut harness = harness();
