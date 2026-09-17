@@ -519,3 +519,69 @@ fn a_follower_its_recipe_cannot_state_is_left_to_the_ordinary_solve() {
         "a derived corner keeps its authored place"
     );
 }
+
+/// A relation is an authority, not a suggestion.
+///
+/// A deliberate edit holds the points it authored, so a joined neighbour
+/// follows the whole way rather than meeting it half way. That precedence is
+/// about which of two free points moves, and it must never extend to
+/// overruling a relation the user asked for. A drag that would stretch a held
+/// distance has to be refused, or solved so the distance still holds. What the
+/// sketch must never do is commit with its stored relation saying one thing
+/// and its geometry measuring another, because every later reader believes the
+/// relation.
+#[test]
+fn a_drag_cannot_quietly_break_a_distance_it_is_holding() {
+    let mut sketch = SketchDefinition::new();
+    let (operation, start, end) = commit_line_operation(&mut sketch, (0.0, 0.0), (10.0, 0.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Distance {
+                first: start,
+                second: end,
+                distance: 10.0,
+            },
+            "Distance",
+            PrecisionPolicy::default(),
+        )
+        .expect("a line already ten long should accept a distance of ten");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the distance");
+
+    let mut dragged = sketch.clone();
+    let staged = dragged.stage_replace_pulling_followers(
+        operation,
+        line((0.0, 0.0), (15.0, 0.0)),
+        "Reshape",
+        &Default::default(),
+        PrecisionPolicy::default(),
+    );
+    let Ok(staged) = staged else {
+        // Refusing the drag is a perfectly good answer, and it has to leave
+        // the sketch exactly as it was.
+        assert_eq!(
+            dragged, sketch,
+            "a refused drag leaves the sketch bitwise unchanged"
+        );
+        return;
+    };
+    dragged
+        .commit(staged, ConfirmationSource::GreenTick)
+        .expect("commit the drag");
+
+    let held = dragged
+        .constraints()
+        .values()
+        .find_map(|record| match record.kind {
+            SketchConstraintKind::Distance { distance, .. } => Some(distance),
+            _ => None,
+        })
+        .expect("the distance relation survives the drag");
+    let (a, b) = (solved(&dragged, start), solved(&dragged, end));
+    let separation = (b.u - a.u).hypot(b.v - a.v);
+    assert!(
+        (separation - held).abs() <= 1.0e-6,
+        "the sketch holds a distance of {held} while measuring {separation}"
+    );
+}
