@@ -50,7 +50,7 @@ const _: () =
 pub const CHEVRON_CELL_INSET: f32 = 1.0;
 /// Horizontal space between tool families: the same 2 px that separates the
 /// two rows, so the block reads as one grid of tiles rather than a row of
-/// pairs. At 4 px the seven-family strip was 12 px wider than the 1040 px
+/// pairs. At 4 px the seven-family strip was 12 px wider than the then 1040 px
 /// minimum window could give it.
 pub const FAMILY_GAP: f32 = 2.0;
 /// Vertical space between the two persistent toolbar rows.
@@ -64,10 +64,31 @@ pub const TOOLBAR_BOTTOM_PADDING: f32 = 4.0;
 /// the tile is a pixel narrower than it was, so the whole grid is exactly as
 /// wide as the old seven-column one and still fits the minimum window.
 pub const CONSTRAINT_DIVIDER_WIDTH: f32 = 9.0;
+/// Width of one constraint button.
+///
+/// The relations are drawn as a grid of glyphs rather than as one tile with a
+/// chooser behind it. A relation is a thing you reach for directly — you know
+/// whether you want perpendicular or tangent before you look — and burying
+/// eleven of them under one button made choosing one a two-click search
+/// through a menu. Square and unlabelled is what lets all eleven stand out in
+/// the width a single labelled tile and its dropdown used to occupy twice
+/// over; every one carries its name in its tooltip and its accessible name,
+/// which is where a glyph's meaning belongs.
+/// Narrower than it is tall: the height matches a drawing tile so the two
+/// rows of constraints line up with the two rows of tools beside them, and the
+/// width is only what a centred glyph needs. At a full square the grid pushed
+/// the Sketch tab's Extrude button 14 px past the supported window.
+pub const CONSTRAINT_CELL_WIDTH: f32 = 28.0;
+/// Columns in the constraint grid. Two rows of six hold the eleven relations
+/// and the dimension tool, exactly.
+pub const CONSTRAINT_COLUMNS: usize = 6;
+/// Width of the constraint grid.
+pub const CONSTRAINT_GRID_WIDTH: f32 = CONSTRAINT_CELL_WIDTH * CONSTRAINT_COLUMNS as f32
+    + FAMILY_GAP * (CONSTRAINT_COLUMNS as f32 - 1.0);
 /// Width of the toolbar: six columns of drawing tools, the divider, and the
-/// constraint column.
+/// constraint grid.
 pub const SKETCH_TOOLBAR_WIDTH: f32 =
-    PRIMARY_CELL_WIDTH * 7.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH;
+    PRIMARY_CELL_WIDTH * 6.0 + FAMILY_GAP * 5.0 + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_GRID_WIDTH;
 /// Height required by the padded two-row tile grid.
 pub const SKETCH_TOOLBAR_HEIGHT: f32 =
     PRIMARY_CELL_SIZE * 2.0 + ROW_GAP + TOOLBAR_TOP_PADDING + TOOLBAR_BOTTOM_PADDING;
@@ -82,8 +103,17 @@ const _: () = {
     // The grid must fill the ribbon's content height exactly: short leaves the
     // caption floating, tall clips the bottom row.
     assert!(SKETCH_TOOLBAR_HEIGHT == 76.0);
-    // The 1040 px minimum window has exactly this much room for the grid.
-    assert!(SKETCH_TOOLBAR_WIDTH == 698.0);
+    // Spreading the constraints out costs width, and this is what it costs:
+    // 698 when the relations were one tile with a chooser behind it, 779 with
+    // all eleven of them and the dimension tool each on their own button. That
+    // is what raised the workbench's supported minimum window from 1040 to
+    // 1120: at 1040 the Sketch tab's own Frame button ended at 1112. The
+    // minimum-window guards in the workbench's tests are what prove it fits
+    // rather than this arithmetic.
+    assert!(SKETCH_TOOLBAR_WIDTH == 779.0);
+    // Every constraint button has to clear the smallest hit target the
+    // workbench allows itself.
+    assert!(CONSTRAINT_CELL_WIDTH >= 24.0);
 };
 
 /// Left column of a variant-menu row, holding the icon.
@@ -2012,7 +2042,9 @@ const SECOND_ROW: &[ToolFamily] = &[
     ToolFamily::Pattern,
 ];
 /// The constraints: what tells the solver how the geometry has to behave.
-/// They stand apart from the drawing tools, behind a divider, one per row.
+/// They stand apart from the drawing tools, behind a divider, as a grid of
+/// buttons rather than as tiles with choosers — see [`render_constraint_grid`].
+#[cfg(test)]
 const CONSTRAINT_COLUMN: &[ToolFamily] = &[ToolFamily::Relation, ToolFamily::Dimension];
 
 /// Paint the compact two-row sketch tool grid and return an exact chosen tool.
@@ -2064,24 +2096,7 @@ pub fn render_sketch_toolbar(
                     );
                 });
                 render_constraint_divider(ui);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (index, family) in CONSTRAINT_COLUMN.iter().enumerate() {
-                        if index > 0 {
-                            ui.add_space(ROW_GAP);
-                        }
-                        render_toolbar_row(
-                            ui,
-                            std::slice::from_ref(family),
-                            &mut state.preferences,
-                            active,
-                            gate,
-                            capabilities,
-                            &mut output,
-                            &mut escaped_anchor,
-                        );
-                    }
-                });
+                render_constraint_grid(ui, active, gate, capabilities, &mut output);
             });
             ui.add_space(TOOLBAR_BOTTOM_PADDING);
         },
@@ -2114,6 +2129,149 @@ fn render_constraint_divider(ui: &mut Ui) {
         [pos2(x, rect.top() + 3.0), pos2(x, rect.bottom() - 3.0)],
         Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
     );
+}
+
+/// The constraint tools laid out in reading order, one button each: every
+/// relation, then the dimension tool that edits the numbers they hold.
+fn constraint_grid_variants() -> Vec<ToolVariant> {
+    ToolFamily::Relation
+        .variants()
+        .iter()
+        .chain(ToolFamily::Dimension.variants())
+        .copied()
+        .collect()
+}
+
+/// Every constraint as its own button, in a grid beside the drawing tools.
+///
+/// They are laid out in reading order across [`CONSTRAINT_COLUMNS`] columns and
+/// down two rows. There is no chooser and no default variant: each button *is*
+/// its tool, so clicking one arms that tool and nothing else, and the one that
+/// is armed is the one drawn selected.
+fn render_constraint_grid(
+    ui: &mut Ui,
+    active: ToolVariant,
+    gate: SketchOperationGate,
+    capabilities: &SketchToolCapabilities,
+    output: &mut SketchToolbarOutput,
+) {
+    let variants = constraint_grid_variants();
+    let rows = variants.len().div_ceil(CONSTRAINT_COLUMNS);
+    let mut bounds: [Option<Rect>; ToolFamily::COUNT] = [None; ToolFamily::COUNT];
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for row in 0..rows {
+            if row > 0 {
+                ui.add_space(ROW_GAP);
+            }
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = FAMILY_GAP;
+                for column in 0..CONSTRAINT_COLUMNS {
+                    let Some(variant) = variants.get(row * CONSTRAINT_COLUMNS + column) else {
+                        // The grid keeps its shape whether or not the last row
+                        // is full, so adding a relation does not move the ones
+                        // above it.
+                        ui.add_space(CONSTRAINT_CELL_WIDTH);
+                        continue;
+                    };
+                    let (_, cell) =
+                        ui.allocate_space(vec2(CONSTRAINT_CELL_WIDTH, PRIMARY_CELL_SIZE));
+                    let reason = gate
+                        .disabled_reason()
+                        .or_else(|| capabilities.disabled_reason(*variant));
+                    let response =
+                        constraint_button(ui, cell, *variant, active == *variant, reason);
+                    if response.clicked() {
+                        output.chosen = Some(*variant);
+                    }
+                    let slot = &mut bounds[variant.family() as usize];
+                    *slot = Some(slot.map_or(cell, |rect: Rect| rect.union(cell)));
+                }
+            });
+        }
+    });
+    // A family's recorded control region is every button it owns here, which
+    // is what a caller asking where the relations live has to be told now that
+    // they are eleven buttons rather than one tile.
+    for (family, primary) in bounds.into_iter().enumerate() {
+        let Some(primary) = primary else { continue };
+        output.controls[family] = Some(ToolControlLayout {
+            primary,
+            chooser: None,
+        });
+        output.bounds = Some(match output.bounds {
+            Some(existing) => existing.union(primary),
+            None => primary,
+        });
+    }
+}
+
+/// One relation, as a square of its own. The glyph is centred rather than set
+/// in a left column, because there is no label beside it to leave room for.
+fn constraint_button(
+    ui: &mut Ui,
+    rect: Rect,
+    variant: ToolVariant,
+    selected: bool,
+    disabled_reason: Option<&str>,
+) -> Response {
+    let descriptor = variant.descriptor();
+    let enabled = disabled_reason.is_none();
+    let mut button_ui = ui.new_child(
+        UiBuilder::new()
+            .id_salt(("sketch_constraint", variant))
+            .max_rect(rect)
+            .layout(Layout::centered_and_justified(Direction::TopDown)),
+    );
+    if !enabled {
+        button_ui.disable();
+    }
+    let mut response = button_ui.add_sized(
+        rect.size(),
+        Button::new(())
+            .min_size(rect.size())
+            .selected(selected)
+            .corner_radius(4.0),
+    );
+    let icon_color = if enabled {
+        ui.style()
+            .interact_selectable(&response, selected)
+            .fg_stroke
+            .color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    paint_tool_icon(
+        ui.painter(),
+        Rect::from_center_size(response.rect.center(), vec2(TILE_ICON_SIZE, TILE_ICON_SIZE)),
+        descriptor.icon,
+        icon_color,
+    );
+    if selected {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            3.0,
+            Stroke::new(1.4, ui.visuals().selection.stroke.color),
+            StrokeKind::Inside,
+        );
+    }
+    if let Some(reason) = disabled_reason {
+        response = response.on_disabled_hover_text(reason);
+    } else {
+        response = response.on_hover_ui(|tooltip| descriptor_tooltip(tooltip, descriptor));
+    }
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::Button,
+            enabled,
+            selected,
+            descriptor.accessible_name,
+        )
+    });
+    response.ctx.accesskit_node_builder(response.id, |node| {
+        node.set_label(descriptor.accessible_name);
+    });
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3006,9 +3164,18 @@ mod tests {
         assert_eq!(FIRST_ROW.len(), 6);
         assert_eq!(SECOND_ROW.len(), 6);
         assert_eq!(CONSTRAINT_COLUMN.len(), 2);
+        // Beyond the divider: every constraint as a button of its own.
         assert_eq!(
-            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + PRIMARY_CELL_WIDTH,
+            row_width(FIRST_ROW) + CONSTRAINT_DIVIDER_WIDTH + CONSTRAINT_GRID_WIDTH,
             SKETCH_TOOLBAR_WIDTH
+        );
+        // Every constraint has a button, and the grid is big enough to hold
+        // them all. One added without room for it would simply not be drawn.
+        assert!(
+            constraint_grid_variants().len() <= CONSTRAINT_COLUMNS * 2,
+            "the constraint grid holds {} buttons and there are {} to draw",
+            CONSTRAINT_COLUMNS * 2,
+            constraint_grid_variants().len()
         );
         assert_eq!(row_width(FIRST_ROW), row_width(SECOND_ROW));
         assert!((28.0..=36.0).contains(&PRIMARY_CELL_SIZE));

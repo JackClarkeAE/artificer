@@ -1,6 +1,6 @@
 use artificer_sketch_ui::sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
-    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_COLUMNS,
+    CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP,
 };
 use artificer_workbench::{KernelLabApp, WorkbenchMode};
 use egui::accesskit::Role;
@@ -11,7 +11,7 @@ use egui_kittest::{
 
 fn harness() -> Harness<'static, KernelLabApp> {
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -149,13 +149,13 @@ fn compact_dropdown_variants_drive_the_active_tool_palette_at_minimum_size() {
 }
 
 #[test]
-fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
+fn expanded_compact_ribbon_is_unclipped_at_1120_by_700() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     let viewport_top = harness.get_by_label("Sketch viewport").rect().top();
 
-    // Six columns of drawing tools in two rows; the constraints stand in
-    // their own column beyond a divider, Relation above Dimension.
+    // Six columns of drawing tools in two rows; every constraint stands beyond
+    // a divider as a square button of its own, in reading order.
     let rows = [
         [
             "Select sketch geometry",
@@ -174,12 +174,28 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             "Rectangular sketch pattern",
         ],
     ];
-    for (row_index, label) in ["Horizontal relation", "Sketch dimension"]
-        .into_iter()
-        .enumerate()
-    {
+    // Every constraint, in the order the grid lays them out. Eleven relations
+    // and the dimension tool fill two rows of six exactly. Each is checked
+    // where it should be rather than merely present, because a button that
+    // drifts under another is still found by label.
+    const CONSTRAINTS: [&str; 12] = [
+        "Horizontal relation",
+        "Vertical relation",
+        "Coincident relation",
+        "Parallel relation",
+        "Perpendicular relation",
+        "Equal-length relation",
+        "Distance relation",
+        "Distance to midpoint",
+        "Fixed relation",
+        "Tangent relation",
+        "Collinear relation",
+        "Sketch dimension",
+    ];
+    for (index, label) in CONSTRAINTS.into_iter().enumerate() {
+        let (row, column) = (index / CONSTRAINT_COLUMNS, index % CONSTRAINT_COLUMNS);
         let row_first = harness
-            .get_by_role_and_label(Role::Button, rows[row_index][0])
+            .get_by_role_and_label(Role::Button, rows[row][0])
             .rect();
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert_eq!(rect.center().y, row_first.center().y, "{label} row drifted");
@@ -188,10 +204,18 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             row_first.left()
                 + 6.0 * PRIMARY_CELL_WIDTH
                 + 5.0 * FAMILY_GAP
-                + CONSTRAINT_DIVIDER_WIDTH,
-            "{label} sits beyond the divider"
+                + CONSTRAINT_DIVIDER_WIDTH
+                + column as f32 * (CONSTRAINT_CELL_WIDTH + FAMILY_GAP),
+            "{label} column drifted"
         );
-        assert!(rect.max.x <= 1040.0, "{label} is clipped: {rect:?}");
+        assert!(
+            (rect.width() - CONSTRAINT_CELL_WIDTH).abs() <= 0.1
+                && (rect.height() - PRIMARY_CELL_SIZE).abs() <= 0.1,
+            "{label} must remain a complete button: {rect:?}"
+        );
+        // The whole point of the grid: the one furthest right still fits the
+        // supported minimum window.
+        assert!(rect.max.x <= 1120.0, "{label} is clipped: {rect:?}");
     }
     for (row_index, row) in rows.into_iter().enumerate() {
         let first = harness.get_by_role_and_label(Role::Button, row[0]).rect();
@@ -216,7 +240,7 @@ fn expanded_compact_ribbon_is_unclipped_at_1040_by_700() {
             );
             assert!(
                 rect.min.x >= 0.0
-                    && rect.max.x <= 1040.0
+                    && rect.max.x <= 1120.0
                     && rect.min.y >= 0.0
                     && rect.max.y <= viewport_top - 4.0,
                 "{label} is clipped or lacks bottom ribbon padding: {rect:?}; viewport top {viewport_top}"

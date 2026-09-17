@@ -12,7 +12,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Artificer · Workbench")
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([1040.0, 700.0]),
+            .with_min_inner_size([1120.0, 700.0]),
         // egui feathers its own strokes, which is why the edge pass already
         // looks good, but a mesh fill has hard triangle boundaries that
         // feathering never sees: the silhouette of a shaded body is the one

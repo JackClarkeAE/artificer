@@ -19,7 +19,7 @@ fn harness() -> Harness<'static, KernelLabApp> {
 
 fn minimum_window_harness() -> Harness<'static, KernelLabApp> {
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -838,7 +838,7 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
             "{label} is vertically clipped: {rect:?}"
         );
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0,
             "{label}: {rect:?}"
         );
         assert!(
@@ -881,7 +881,7 @@ fn confirmation_slot_preserves_viewport_geometry_at_the_supported_minimum_window
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must have a visible hit region");
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0,
             "{label}: {rect:?}"
         );
         assert!(

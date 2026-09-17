@@ -434,7 +434,7 @@ fn maximum_rectangular_pattern_preview_fits_60hz_budget() {
     assert_eq!(sketch.authoring().revision().get(), 1);
 
     let mut harness = Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -484,7 +484,7 @@ fn maximum_visible_curve_preview_fits_60hz_budget() {
     );
 
     let mut harness = Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)

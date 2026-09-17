@@ -57,7 +57,7 @@ const SMALL_ICON: f32 = 16.0;
 // minimum-window guard in `tests/ui.rs` holds every ribbon button to it.
 // The width is the widest small caption — `Properties`, 49 px at 10.5 pt —
 // after the 24 px icon column, with 2 px to spare. At 86 the sketch tab did
-// not fit the 1040 px minimum window: its last button ended at 1081.
+// not fit the minimum window of the day: its last button ended at 1081.
 const SMALL_BUTTON: Vec2 = vec2(78.0, 24.0);
 
 impl KernelLabApp {
@@ -94,7 +94,7 @@ impl KernelLabApp {
             // Groups already end in a separator and carry their own caption
             // row; the panel's 5 px item spacing on both sides of every
             // separator was 19 px of air per boundary, the single largest
-            // consumer of width at the 1040 px minimum window.
+            // consumer of width at the minimum window.
             ui.spacing_mut().item_spacing.x = 2.0;
             let response = ui
                 .add_sized([24.0, 22.0], egui::Button::new("−").frame(false))

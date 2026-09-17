@@ -9,11 +9,11 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 use sketch_toolbar::{
-    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH, FAMILY_GAP,
-    PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP, SKETCH_TOOLBAR_HEIGHT, SKETCH_TOOLBAR_WIDTH,
-    SketchOperationGate, SketchToolCapabilities, SketchToolbarOutput, SketchToolbarState,
-    TILE_ICON_COLUMN, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily, ToolVariant,
-    render_sketch_toolbar,
+    CHEVRON_CELL_INSET, CHEVRON_CELL_WIDTH, CONSTRAINT_CELL_WIDTH, CONSTRAINT_DIVIDER_WIDTH,
+    FAMILY_GAP, PRIMARY_CELL_SIZE, PRIMARY_CELL_WIDTH, ROW_GAP, SKETCH_TOOLBAR_HEIGHT,
+    SKETCH_TOOLBAR_WIDTH, SketchOperationGate, SketchToolCapabilities, SketchToolbarOutput,
+    SketchToolbarState, TILE_ICON_COLUMN, TOOLBAR_BOTTOM_PADDING, TOOLBAR_TOP_PADDING, ToolFamily,
+    ToolVariant, render_sketch_toolbar,
 };
 
 struct ToolbarHarness {
@@ -42,7 +42,7 @@ impl ToolbarHarness {
         let app_output = Rc::clone(&output);
         let app_state = Rc::clone(&toolbar_state);
         let harness = Harness::builder()
-            .with_size([1040.0, 700.0])
+            .with_size([1120.0, 700.0])
             .with_pixels_per_point(pixels_per_point)
             .with_theme(egui::Theme::Dark)
             .with_os(egui::os::OperatingSystem::Nix)
@@ -87,7 +87,6 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Sketch point",
         "Trim curve span",
         "2D fillet",
-        "Sketch dimension",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert_eq!(node.rect().width(), PRIMARY_CELL_WIDTH, "{label}");
@@ -102,7 +101,6 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Two-point centre-to-centre slot",
         "Equal-distance chamfer",
         "Rectangular sketch pattern",
-        "Horizontal relation",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert_eq!(
@@ -122,7 +120,6 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
         "Choose slot type; current default: Two-point centre-to-centre slot.",
         "Choose chamfer type; current default: Equal-distance chamfer.",
         "Choose pattern type; current default: Rectangular sketch pattern.",
-        "Choose relation; current default: Horizontal.",
     ] {
         let node = fixture.harness.get_by_role_and_label(Role::Button, label);
         assert!(node.rect().width() < PRIMARY_CELL_WIDTH, "{label}");
@@ -148,7 +145,7 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
     );
 
     // Six columns of drawing tools in two rows, then the divider, then the
-    // constraint column: Relation above Dimension.
+    // constraint grid: every relation and the dimension tool, a button each.
     let rows = [
         [
             ToolFamily::Select,
@@ -167,25 +164,66 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
             ToolFamily::Pattern,
         ],
     ];
-    for (row_index, constraint) in [ToolFamily::Relation, ToolFamily::Dimension]
-        .into_iter()
-        .enumerate()
-    {
-        let row_first = output.controls[rows[row_index][0] as usize]
+    // A family's recorded region is every button it owns. The relations own
+    // eleven of them across both rows, so theirs starts at the divider and
+    // reaches the far edge; the dimension tool owns the single cell that
+    // finishes the second row, so its region is that one cell.
+    let grid_left = output.controls[rows[0][0] as usize]
+        .expect("row control")
+        .primary
+        .left()
+        + 6.0 * PRIMARY_CELL_WIDTH
+        + 5.0 * FAMILY_GAP
+        + CONSTRAINT_DIVIDER_WIDTH;
+    let relations = output.controls[ToolFamily::Relation as usize]
+        .expect("relation layout")
+        .primary;
+    assert_eq!(
+        relations.left(),
+        grid_left,
+        "the relations start at the divider"
+    );
+    assert_eq!(relations.right(), bounds.right());
+    for row in rows {
+        let row_first = output.controls[row[0] as usize]
             .expect("row control")
             .primary;
-        let layout = output.controls[constraint as usize].expect("constraint layout");
-        assert_eq!(layout.primary.center().y, row_first.center().y);
-        assert_eq!(
-            layout.primary.left(),
-            row_first.left()
-                + 6.0 * PRIMARY_CELL_WIDTH
-                + 5.0 * FAMILY_GAP
-                + CONSTRAINT_DIVIDER_WIDTH,
-            "{constraint:?} sits beyond the divider"
+        assert!(
+            relations.top() <= row_first.center().y && relations.bottom() >= row_first.center().y,
+            "the relations span both tool rows"
         );
-        assert_eq!(layout.primary.right(), bounds.right());
     }
+    let dimension = output.controls[ToolFamily::Dimension as usize]
+        .expect("dimension layout")
+        .primary;
+    let second_row = output.controls[rows[1][0] as usize]
+        .expect("row control")
+        .primary;
+    assert_eq!(dimension.center().y, second_row.center().y);
+    assert_eq!(dimension.right(), bounds.right());
+    assert_eq!(dimension.width(), CONSTRAINT_CELL_WIDTH);
+
+    // Every relation is its own button: narrower than a drawing tile, the same
+    // height so the two grids line up, and reachable in one click.
+    for label in [
+        "Horizontal relation",
+        "Perpendicular relation",
+        "Sketch dimension",
+    ] {
+        let node = fixture.harness.get_by_role_and_label(Role::Button, label);
+        assert_eq!(node.rect().width(), CONSTRAINT_CELL_WIDTH, "{label}");
+        assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
+    }
+    assert!(
+        fixture
+            .harness
+            .query_by_role_and_label(
+                Role::Button,
+                "Choose relation; current default: Horizontal."
+            )
+            .is_none(),
+        "the relation chooser is gone: every relation is reachable in one click"
+    );
     for (row_index, row) in rows.into_iter().enumerate() {
         let first = output.controls[row[0] as usize]
             .expect("first row control")
@@ -258,6 +296,28 @@ fn chooser_is_separately_focusable_and_arrow_down_escape_round_trip() {
 
     fixture.harness.key_press(egui::Key::Escape);
     fixture.run();
+    // The relations have no chooser at all: each is its own button, narrower
+    // than a drawing tile and the same height, so the two grids line up.
+    for label in [
+        "Horizontal relation",
+        "Perpendicular relation",
+        "Sketch dimension",
+    ] {
+        let node = fixture.harness.get_by_role_and_label(Role::Button, label);
+        assert_eq!(node.rect().width(), CONSTRAINT_CELL_WIDTH, "{label}");
+        assert_eq!(node.rect().height(), PRIMARY_CELL_SIZE, "{label}");
+    }
+    assert!(
+        fixture
+            .harness
+            .query_by_role_and_label(
+                Role::Button,
+                "Choose relation; current default: Horizontal."
+            )
+            .is_none(),
+        "the relation chooser is gone: every relation is reachable in one click"
+    );
+
     let output = fixture.output.borrow();
     let output = output.as_ref().expect("toolbar output");
     assert!(!output.menu_open);

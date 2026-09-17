@@ -14,7 +14,7 @@ use egui_kittest::{Harness, kittest::Queryable as _};
 
 fn harness() -> Harness<'static, KernelLabApp> {
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -136,12 +136,8 @@ fn a_perpendicular_relation_squares_two_lines_picked_in_turn() {
     assert_eq!(segments(&harness).len(), 2);
 
     click_button(&mut harness, "Horizontal relation");
-    // The chooser reaches the rest of the family; the accessible names are
-    // the variants' own.
-    click_button(
-        &mut harness,
-        "Choose relation; current default: Horizontal.",
-    );
+    // Every relation is its own button, so reaching another one is a click
+    // rather than a click into a menu and a second click inside it.
     click_button(&mut harness, "Perpendicular relation");
     click_sketch_point(&mut harness, SketchPoint::new(-1.5, 0.0));
     let untouched = segments(&harness);

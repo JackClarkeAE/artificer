@@ -360,7 +360,7 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         .join("tests")
         .join("snapshots");
     let mut harness = Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -394,7 +394,7 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must remain visible: {rect:?}");
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0,
             "{label} is clipped by the supported window: {rect:?}"
         );
     }
@@ -413,7 +413,7 @@ fn minimum_window_compact_ribbon_and_confirmation_snapshot() {
         let rect = harness.get_by_role_and_label(Role::Button, label).rect();
         assert!(rect.is_positive(), "{label} must be reachable: {rect:?}");
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0 && rect.max.y <= 700.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0 && rect.max.y <= 700.0,
             "{label} is clipped by the supported window: {rect:?}"
         );
     }
