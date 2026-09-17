@@ -442,6 +442,63 @@ fn chain_signed_area(chain: &[Segment]) -> f64 {
         * 0.5
 }
 
+/// Orders the open chains across a periodic window from low to high, by where
+/// they run rather than by their average height.
+///
+/// The bands that close the window are cut between consecutive chains, so this
+/// order decides which chain each band reaches from and to, and therefore which
+/// side of each chain the section claims as the other solid's material.
+///
+/// Averaging a chain's height cannot do it. Two chains that are reflections of
+/// one another about the same level average to the same number, and the two
+/// traces of a Steinmetz seam on a bore wall are exactly that pair:
+/// `v = 980 ± 8·cos u`, both averaging 980 to the last bit. The order then came
+/// from the order the chains happened to arrive in, and the bands came out
+/// spanning the lens between the traces instead of avoiding it — so the section
+/// said the other solid's material was where its void is, and the face's 2D
+/// Boolean was handed a hole where it should have been handed a region.
+///
+/// Comparing heights at sampled azimuths is a real order wherever the chains do
+/// not cross inside the window, which is the case they have to be stackable in
+/// anyway: two chains that cross part the window into more bands than there are
+/// gaps between them. The Steinmetz pair crosses exactly on the seams, where
+/// the window ends.
+fn stack_open_chains(open: &mut [Vec<Segment>], u_min: f64, u_max: f64) {
+    // A chain's height at one azimuth, by bisecting the piece that spans it.
+    // Every chain reaches across the whole window, so every chain has a height
+    // at every azimuth inside it.
+    let height_at = |chain: &[Segment], u: f64| -> f64 {
+        let piece = chain
+            .iter()
+            .find(|piece| piece.start().x <= u && u <= piece.end().x)
+            .copied()
+            .unwrap_or(chain[chain.len() / 2]);
+        let (mut low, mut high) = (0.0_f64, 1.0_f64);
+        for _ in 0..48 {
+            let middle = 0.5 * (low + high);
+            if piece.point_at(middle).x < u {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        piece.point_at(0.5 * (low + high)).y
+    };
+    let profile = |chain: &[Segment]| -> Vec<f64> {
+        (1..8)
+            .map(|step| height_at(chain, (u_max - u_min).mul_add(f64::from(step) / 8.0, u_min)))
+            .collect()
+    };
+    open.sort_by(|left, right| {
+        profile(left)
+            .into_iter()
+            .zip(profile(right))
+            .map(|(left, right)| left.total_cmp(&right))
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn close_periodic_sections(
     pieces: Vec<Segment>,
     region: &[Vec<Segment>],
@@ -615,14 +672,7 @@ fn close_periodic_sections(
                 .ok_or(AnalyticBooleanError::DomainUnsupported)?;
         }
     }
-    let mean_height = |chain: &[Segment]| -> f64 {
-        let samples = chain
-            .iter()
-            .flat_map(|piece| (0..=4).map(move |step| piece.point_at(f64::from(step) / 4.0).y))
-            .collect::<Vec<_>>();
-        samples.iter().sum::<f64>() / samples.len() as f64
-    };
-    open.sort_by(|a, b| mean_height(a).total_cmp(&mean_height(b)));
+    stack_open_chains(&mut open, u_min, u_max);
     let lowest = &open[0];
     let probe = lowest[lowest.len() / 2].point_at(0.5);
     let step = (v_max - v_min).max(1.0) * 1.0e-3;
@@ -1861,6 +1911,72 @@ mod tests {
                 (area - 1.0).abs() < 1.0e-9,
                 "a unit square encloses 1, wound positive; this one encloses \
                  {area}"
+            );
+        }
+    }
+
+    /// The two traces a Steinmetz seam leaves on a bore wall are reflections of
+    /// one another about the middle of the window, so they have the same
+    /// average height — to the last bit, not merely close. Stacking them by
+    /// that average is therefore not stacking them at all: the order comes from
+    /// the order they arrived in, and it decides which chain each band is cut
+    /// between. The bands then span the lens between the traces instead of
+    /// avoiding it, and the section claims the other solid's material is
+    /// exactly where its void is.
+    #[test]
+    fn two_traces_that_average_alike_are_still_stacked_by_where_they_run() {
+        // `v = 980 ± 8·cos(u − 3π/2)` over the window `u ∈ [π, 2π]`, each split
+        // at its apex and reaching a half period past either seam, which is how
+        // the bore wall's own section arrives: one whole period, in two pieces.
+        let pi = std::f64::consts::PI;
+        let (u_min, u_max) = (pi, 2.0 * pi);
+        let apex = 1.5 * pi;
+        let trace = |amplitude: f64| -> Vec<Segment> {
+            let at = |u: f64| Point2::new(u, 8.0f64.mul_add(amplitude * (u - apex).cos(), 980.0));
+            [(u_min - pi / 2.0, apex), (apex, u_max + pi / 2.0)]
+                .into_iter()
+                .map(|(from, to)| Segment::Harmonic {
+                    mean: 980.0,
+                    amplitude: 8.0 * amplitude,
+                    phase: apex,
+                    start: at(from),
+                    end: at(to),
+                })
+                .collect()
+        };
+        let (upper, lower) = (trace(1.0), trace(-1.0));
+
+        // The average cannot tell them apart. This is the premise, so it is
+        // asserted rather than described: if it ever stopped being true the
+        // test below would pass for a reason that has nothing to do with the
+        // fix.
+        let mean = |chain: &[Segment]| -> f64 {
+            let heights: Vec<f64> = chain
+                .iter()
+                .flat_map(|piece| (0..=4).map(move |step| piece.point_at(f64::from(step) / 4.0).y))
+                .collect();
+            heights.iter().sum::<f64>() / heights.len() as f64
+        };
+        assert_eq!(
+            mean(&upper).to_bits(),
+            mean(&lower).to_bits(),
+            "the fixture's two traces must average alike for this test to mean anything"
+        );
+
+        // However they arrive, the lower trace is the lower one.
+        for arrival in [
+            vec![upper.clone(), lower.clone()],
+            vec![lower.clone(), upper.clone()],
+        ] {
+            let mut stacked = arrival;
+            stack_open_chains(&mut stacked, u_min, u_max);
+            let apex_of = |chain: &[Segment]| chain[0].end().y;
+            assert!(
+                apex_of(&stacked[0]) < apex_of(&stacked[1]),
+                "stacked low to high, the first chain's apex ({}) must sit below \
+                 the second's ({})",
+                apex_of(&stacked[0]),
+                apex_of(&stacked[1])
             );
         }
     }

@@ -130,6 +130,13 @@ pub(crate) fn profile_boolean_multi(
     }
 
     // Sew: chain by exact endpoint identity, then nest by even-odd depth.
+    //
+    // Identity is exact, so endpoints that agree to within the precision
+    // policy but not bit for bit have to be made one point first. Two curves
+    // crossing where one of them ends — a tangential touch rather than a
+    // transverse cut — produce exactly that: the crossing is a vertex of one
+    // and an endpoint of the other, and the chain dead-ends between them.
+    let pieces = weld_piece_endpoints(pieces, tolerances);
     let loops = chain_pieces(pieces)?;
     nest_loops(loops, tolerances)
 }
@@ -1227,15 +1234,27 @@ fn split_segment(
             && left.point.y.to_bits() == right.point.y.to_bits()
     });
     let length = segment_length(segment);
+    // A cut that lands on an end, or on the cut before it, is not a cut: the
+    // point it would split at is already a vertex of the arrangement, and
+    // splitting there again yields a piece of no length for the sew to choke
+    // on. Where two curves meet tangentially — the pinch between the lobes of
+    // a Steinmetz seam arrives here as exactly this — several cuts converge on
+    // one point, and keeping the first is what keeps the arrangement whole.
+    let mut kept: Vec<Cut> = Vec::with_capacity(ordered.len());
     let mut previous_parameter = 0.0;
-    for cut in &ordered {
+    for cut in ordered {
         if (cut.parameter - previous_parameter) * length < tolerances.minimum {
-            return Err(ProfileBooleanError::Unsupported);
+            continue;
+        }
+        if (1.0 - cut.parameter) * length < tolerances.minimum {
+            continue;
         }
         previous_parameter = cut.parameter;
+        kept.push(cut);
     }
-    if (1.0 - previous_parameter) * length < tolerances.minimum {
-        return Err(ProfileBooleanError::Unsupported);
+    let ordered = kept;
+    if ordered.is_empty() {
+        return Ok(vec![segment]);
     }
 
     let mut result = Vec::with_capacity(ordered.len() + 1);
@@ -1368,9 +1387,43 @@ fn point_key(point: Point2) -> (u64, u64) {
     (point.x.to_bits(), point.y.to_bits())
 }
 
+/// Makes endpoints that agree within the precision policy into one point, so
+/// the exact-identity chaining below sees the arrangement the geometry means
+/// rather than the one the arithmetic produced.
+fn weld_piece_endpoints(pieces: Vec<Piece>, tolerances: Tolerances) -> Vec<Piece> {
+    let mut representatives: Vec<Point2> = Vec::new();
+    let mut canonical = |point: Point2| -> Point2 {
+        if let Some(found) = representatives.iter().find(|candidate| {
+            (candidate.x - point.x).hypot(candidate.y - point.y) <= tolerances.minimum
+        }) {
+            return *found;
+        }
+        representatives.push(point);
+        point
+    };
+    pieces
+        .into_iter()
+        .map(|piece| {
+            let start = canonical(piece.segment.start());
+            let end = canonical(piece.segment.end());
+            Piece {
+                segment: piece.segment.with_endpoints(start, end),
+            }
+        })
+        .collect()
+}
+
 /// Chains the retained pieces into closed loops by exact endpoint identity.
-/// Every vertex must have exactly one outgoing piece, or the arrangement is
-/// ambiguous and the whole operation refuses.
+///
+/// A vertex usually has one outgoing piece and the walk is forced. Where a
+/// boundary touches itself — the pinch between the two lobes of a Steinmetz
+/// seam is the case that brought this about — several pieces leave the same
+/// point and "the next one" has to be decided by direction rather than by
+/// being the only one. Material lies to the left of every piece, so the walk
+/// takes the first piece clockwise from the way it came in: that is the turn
+/// that keeps the material it is bounding on the same side, and it closes each
+/// touching lobe as its own loop instead of welding them into a figure of
+/// eight no region can own.
 fn chain_pieces(pieces: Vec<Piece>) -> Result<Vec<Vec<Segment>>, ProfileBooleanError> {
     use std::collections::BTreeMap;
     let mut outgoing: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
@@ -1380,9 +1433,26 @@ fn chain_pieces(pieces: Vec<Piece>) -> Result<Vec<Vec<Segment>>, ProfileBooleanE
             .or_default()
             .push(index);
     }
-    if outgoing.values().any(|candidates| candidates.len() != 1) {
+    if outgoing.values().any(Vec::is_empty) {
         return Err(ProfileBooleanError::Unsupported);
     }
+    // The direction a piece sets off in, and the direction it arrives by.
+    let leaving = |index: usize| -> Option<(f64, f64)> {
+        let segment = pieces[index].segment;
+        let from = segment.start();
+        let to = evaluate(segment, 0.05);
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let length = dx.hypot(dy);
+        (length > 0.0).then_some((dx / length, dy / length))
+    };
+    let arriving = |index: usize| -> Option<(f64, f64)> {
+        let segment = pieces[index].segment;
+        let from = evaluate(segment, 0.95);
+        let to = segment.end();
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let length = dx.hypot(dy);
+        (length > 0.0).then_some((dx / length, dy / length))
+    };
     let mut used = vec![false; pieces.len()];
     let mut loops = Vec::new();
     for start in 0..pieces.len() {
@@ -1406,7 +1476,33 @@ fn chain_pieces(pieces: Vec<Piece>) -> Result<Vec<Vec<Segment>>, ProfileBooleanE
             let Some(candidates) = outgoing.get(&next_key) else {
                 return Err(ProfileBooleanError::Unsupported);
             };
-            cursor = candidates[0];
+            let back = arriving(cursor).map(|(x, y)| (-x, -y));
+            let next = candidates
+                .iter()
+                .copied()
+                .filter(|candidate| !used[*candidate])
+                .min_by(|left, right| {
+                    let turn = |candidate: &usize| {
+                        let (Some(back), Some(out)) = (back, leaving(*candidate)) else {
+                            return f64::INFINITY;
+                        };
+                        // Counter-clockwise from the way back, so the
+                        // smallest turn is the sharpest left.
+                        let angle = (back.0 * out.1 - back.1 * out.0)
+                            .atan2(back.0 * out.0 + back.1 * out.1);
+                        if angle <= 1.0e-12 {
+                            angle + std::f64::consts::TAU
+                        } else {
+                            angle
+                        }
+                    };
+                    turn(left).total_cmp(&turn(right))
+                })
+                .or_else(|| candidates.iter().copied().find(|index| !used[*index]));
+            let Some(next) = next else {
+                return Err(ProfileBooleanError::Unsupported);
+            };
+            cursor = next;
         }
         loops.push(chain);
     }

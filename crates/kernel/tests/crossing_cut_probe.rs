@@ -8,11 +8,12 @@
 //! the sweep, that refusal is the sole admission ticket to the faceted BSP
 //! fallback, and the whole body is rebuilt from a tessellation.
 //!
-//! There is no exact route today. Two equal-radius bores on perpendicular
-//! intersecting axes meet in two ellipses — the Steinmetz case that ADR 0026 K1
-//! names as the missing curve vocabulary. Until K1 lands this body is an
-//! approximation, and these gates pin exactly how much of one, so that the day
-//! it becomes exact the change is visible rather than silent.
+//! That is the history. Two equal-radius bores on perpendicular intersecting
+//! axes meet in two ellipses — the Steinmetz case that ADR 0026 K1 named as the
+//! missing curve vocabulary — and K1 has landed, so this body is now exact and
+//! these gates pin the closed form rather than a bound on the error. The
+//! approximation is still reachable, and still warns, for the bore pairs the
+//! vocabulary does not cover: unequal radii, or axes that do not meet.
 
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
@@ -168,48 +169,32 @@ fn one_round_through_cut_is_exact() {
     );
 }
 
-/// The crossing cut is not exact, and this pins how far off it is. When ADR
-/// 0026 K1 lands and the Steinmetz ellipses enter the vocabulary, this test
-/// must fail — that is its purpose.
+/// The crossing cut is exact. This gate used to bound how far off it was and
+/// to say, in its own assertion message, that the day the body became exact the
+/// gate should be replaced by the closed form. That day came.
 #[test]
-fn crossing_cuts_are_a_bounded_approximation_until_ellipses_land() {
+fn crossing_cuts_are_exact_and_publish_the_steinmetz_closed_form() {
     let crossed = crossed_box();
-    assert!(
-        NativeKernel::validate(&crossed, ValidationProfile::Solid).valid,
-        "the faceted fallback must still publish a valid solid"
-    );
+    assert!(NativeKernel::validate(&crossed, ValidationProfile::Solid).valid);
 
-    // Cube, less two bores, plus the Steinmetz solid they share.
+    // Cube, less two bores, plus the Steinmetz solid they share — the volume
+    // counted twice by subtracting each bore whole.
     let exact = SIZE.powi(3) - 2.0 * (std::f64::consts::PI * RADIUS * RADIUS * SIZE)
         + 16.0 * RADIUS.powi(3) / 3.0;
     let volume = crossed.measures().volume;
-    let error = ((volume - exact) / exact).abs();
     assert!(
-        error < 3.0e-3,
-        "the faceted approximation is drifting: {volume} vs {exact} ({:.3}%)",
-        error * 100.0
-    );
-    assert!(
-        error > 1.0e-9,
-        "this body became exact — delete this gate and pin the closed form instead"
+        ((volume - exact) / exact).abs() < 1.0e-12,
+        "two crossing bores must be the closed form, not near it: {volume} vs {exact}"
     );
 
-    // The fragmentation ceiling. Two crossing bores measured 2,959 faces
-    // before the coplanar merge and measure 229 after it, with vertices down
-    // from 2,873 to 391, edges from 5,802 to 624, and this test's own wall
-    // clock from 14.4s to 1.5s.
-    //
-    // The estimate this gate used to carry was roughly 140, on the reasoning
-    // that the box's six planar faces would come back as six. They do not, and
-    // the reason is worth keeping: a box face with a bore through it is a ring,
-    // and a ring needs an inner loop that the faceted tier's one-vertex-list
-    // face cannot state. The merge takes such a face down to a handful of
-    // pieces rather than to one, and stops there rather than guessing.
-    let faces = crossed.counts().faces;
-    assert!(
-        faces < 300,
-        "two crossing bores fragmented into {faces} faces; the merge is not holding"
-    );
+    // Ten faces, and each is a surface rather than a panel of one: the box's
+    // six planes, and two half-walls for each bore, parted at the seam the
+    // bores share. The faceted route reached this body as 2,959 faces before
+    // the coplanar merge of ADR 0039 and 229 after it; the exact route does not
+    // fragment at all, because there is nothing to fragment.
+    let counts = crossed.counts();
+    assert_eq!(counts.faces, 10, "six planes and four half-bore walls");
+    assert_eq!(counts.shells, 1);
 }
 
 /// The cost the user actually felt: the display scene is rebuilt on every
@@ -243,11 +228,17 @@ fn the_display_scene_of_a_faceted_body_builds_promptly() {
 /// "certified", so the one path that publishes a tessellation has to carry a
 /// caveat the caller can see — otherwise a 0.15%-wrong volume is quoted with
 /// exactly the same authority as an exact one.
+///
+/// Equal radii on crossing axes are exact now, so the approximation has to be
+/// reached by a bore the vocabulary does not cover. A *different* radius is the
+/// smallest such change: what makes the equal case exact is that the `r²`
+/// cancels between the two cylinder equations, leaving the two bisector planes,
+/// and with unequal radii it does not cancel and the seam really is a quartic.
 #[test]
 fn the_faceted_fallback_warns_that_it_approximated() {
     let bored = bored_box();
     let side = face_where(&bored, |centre| (centre.x - SIZE).abs() < 1.0e-6);
-    let outcome = through_cut_outcome(
+    let outcome = through_cut_outcome_at(
         &bored,
         side,
         PlanarFrame3::new(
@@ -255,6 +246,8 @@ fn the_faceted_fallback_warns_that_it_approximated() {
             Vector3::new(0.0, 1.0, 0.0),
             Vector3::new(0.0, 0.0, 1.0),
         ),
+        Point2::new(0.0, 0.0),
+        RADIUS * 0.75,
         "crossing-cut-warning",
     );
     let warning = outcome
