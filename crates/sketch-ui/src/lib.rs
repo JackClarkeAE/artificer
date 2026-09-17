@@ -5901,6 +5901,7 @@ impl SketchCanvasState {
             | ToolVariant::HorizontalRelation
             | ToolVariant::VerticalRelation
             | ToolVariant::DistanceRelation
+            | ToolVariant::MidpointDistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
             | ToolVariant::EqualLengthRelation
@@ -8256,6 +8257,7 @@ impl SketchCanvasState {
             | ToolVariant::HorizontalRelation
             | ToolVariant::VerticalRelation
             | ToolVariant::DistanceRelation
+            | ToolVariant::MidpointDistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
             | ToolVariant::EqualLengthRelation
@@ -9045,27 +9047,37 @@ impl SketchCanvasState {
                         .map(|record| record.evaluated_position)
                 })
         };
+        // Every relation that holds a number is a dimension and is drawn as
+        // one. Where its witness line runs is the relation's own business —
+        // between two points for a separation, and to the foot of the
+        // perpendicular for an offset — so it is asked rather than assumed.
+        let positions: std::collections::BTreeMap<CorePointId, CorePoint2> = definition
+            .points()
+            .keys()
+            .filter_map(|id| position(*id).map(|at| (*id, at)))
+            .collect();
         definition
             .constraints()
             .values()
             .filter(|record| record.enabled)
             .filter_map(|record| {
-                let CoreConstraintKind::Distance {
-                    first,
-                    second,
-                    distance,
-                } = record.kind
-                else {
-                    return None;
+                let value = record.kind.measurement()?;
+                let (from, to) = artificer_sketch::dimension_span(&record.kind, &positions)?;
+                // The ends a retype may hold. For a separation that is either
+                // point; for anything measured from a datum the datum is held
+                // anyway, so naming the located point is what is left.
+                let referenced = record.kind.referenced_points();
+                let (first, second) = match record.kind {
+                    CoreConstraintKind::Distance { first, second, .. } => (first, second),
+                    _ => (*referenced.first()?, *referenced.last()?),
                 };
-                let (from, to) = (position(first)?, position(second)?);
                 Some(PointToPointDimension {
                     constraint: record.id,
                     from: SketchPoint::new(from.u, from.v),
                     to: SketchPoint::new(to.u, to.v),
                     first,
                     second,
-                    value: distance,
+                    value,
                 })
             })
             .collect()
@@ -9283,27 +9295,123 @@ impl SketchCanvasState {
                 let (first, second) = pair_points(*first, *second)?;
                 Ok(vec![CoreConstraintKind::Coincident { first, second }])
             }
+            // A distance tells the user where something *is*, and what it is
+            // measured from decides whether it can. Between two points it is a
+            // radius, which leaves the point anywhere on a circle; from an
+            // edge it is an offset, which is the ordinate a drawing is made
+            // of. So this one tool reads what was picked and says the right
+            // thing about it, rather than refusing everything but two corners.
             (ToolVariant::DistanceRelation, [first, second]) => {
-                let (first, second) = pair_points(*first, *second)?;
-                let (from, to) = (
-                    self.relation_point_position(first),
-                    self.relation_point_position(second),
-                );
-                let (Some(from), Some(to)) = (from, to) else {
+                match (*first, *second) {
+                    (RelationOperand::Point(first), RelationOperand::Point(second)) => {
+                        let (from, to) = (
+                            self.relation_point_position(first),
+                            self.relation_point_position(second),
+                        );
+                        let (Some(from), Some(to)) = (from, to) else {
+                            return Err("Those points are no longer part of the sketch.".to_owned());
+                        };
+                        // The present separation becomes the held value: the
+                        // relation locks what the user already sees, and the
+                        // dimension tool edits it afterwards.
+                        let distance = (to.u - from.u).hypot(to.v - from.v);
+                        if distance <= PrecisionPolicy::default().min_feature_size {
+                            return Err(
+                                "Those points are already together; use a coincident relation."
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(vec![CoreConstraintKind::Distance {
+                            first,
+                            second,
+                            distance,
+                        }])
+                    }
+                    (RelationOperand::Point(held), RelationOperand::Curve(edge))
+                    | (RelationOperand::Curve(edge), RelationOperand::Point(held)) => {
+                        let (start, end) = self.relation_line_points(edge).map_err(|_| {
+                            "An offset is measured from a straight edge.".to_owned()
+                        })?;
+                        let distance = self.relation_point_offset(held, start, end)?;
+                        if distance <= PrecisionPolicy::default().min_feature_size {
+                            return Err(
+                                "That point already lies on the edge; use a collinear relation."
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(vec![CoreConstraintKind::PointToLineDistance {
+                            point: held,
+                            start,
+                            end,
+                            distance,
+                        }])
+                    }
+                    (RelationOperand::Curve(_), RelationOperand::Curve(_)) => {
+                        let ((first_start, first_end), (second_start, second_end)) =
+                            pair_lines(*first, *second)?;
+                        // Two lines only have a distance where they are
+                        // parallel; anywhere else they meet, and the number
+                        // would depend on where along them it was read. Say so
+                        // rather than answer with one of the many numbers.
+                        let near =
+                            self.relation_point_offset(second_start, first_start, first_end)?;
+                        let far = self.relation_point_offset(second_end, first_start, first_end)?;
+                        if (near - far).abs() > PrecisionPolicy::default().min_feature_size {
+                            return Err(
+                                "Those edges are not parallel, so they have no one distance. Make them parallel first."
+                                    .to_owned(),
+                            );
+                        }
+                        let distance = 0.5 * (near + far);
+                        if distance <= PrecisionPolicy::default().min_feature_size {
+                            return Err(
+                                "Those edges lie on one another; use a collinear relation."
+                                    .to_owned(),
+                            );
+                        }
+                        Ok(vec![CoreConstraintKind::LineToLineDistance {
+                            first_start,
+                            first_end,
+                            second_start,
+                            second_end,
+                            distance,
+                        }])
+                    }
+                }
+            }
+            // The middle of an edge is the feature a drawing centres things
+            // on, and it is not a point the sketch owns, so it gets its own
+            // way in rather than competing with the offset for the same pick.
+            (ToolVariant::MidpointDistanceRelation, [first, second]) => {
+                let (held, edge) = match (*first, *second) {
+                    (RelationOperand::Point(held), RelationOperand::Curve(edge))
+                    | (RelationOperand::Curve(edge), RelationOperand::Point(held)) => (held, edge),
+                    _ => {
+                        return Err("This relation applies to a point and an edge.".to_owned());
+                    }
+                };
+                let (start, end) = self
+                    .relation_line_points(edge)
+                    .map_err(|_| "A midpoint is measured on a straight edge.".to_owned())?;
+                let (Some(at), Some(from), Some(to)) = (
+                    self.relation_point_position(held),
+                    self.relation_point_position(start),
+                    self.relation_point_position(end),
+                ) else {
                     return Err("Those points are no longer part of the sketch.".to_owned());
                 };
-                // The present separation becomes the held value: the relation
-                // locks what the user already sees, and the dimension tool
-                // edits it afterwards.
-                let distance = (to.u - from.u).hypot(to.v - from.v);
+                let middle = CorePoint2::new((from.u + to.u) * 0.5, (from.v + to.v) * 0.5);
+                let distance = (at.u - middle.u).hypot(at.v - middle.v);
                 if distance <= PrecisionPolicy::default().min_feature_size {
                     return Err(
-                        "Those points are already together; use a coincident relation.".to_owned(),
+                        "That point is already on the edge's midpoint; use a coincident relation."
+                            .to_owned(),
                     );
                 }
-                Ok(vec![CoreConstraintKind::Distance {
-                    first,
-                    second,
+                Ok(vec![CoreConstraintKind::PointToMidpointDistance {
+                    point: held,
+                    start,
+                    end,
                     distance,
                 }])
             }
@@ -9392,6 +9500,32 @@ impl SketchCanvasState {
             }
             _ => Err("This relation needs different operands.".to_owned()),
         }
+    }
+
+    /// How far a point stands from the line through two others, measured along
+    /// that line's normal and reported unsigned — which is what a dimension
+    /// holds. Which side it is on is the geometry's business, and the solver
+    /// keeps it.
+    fn relation_point_offset(
+        &self,
+        point: CorePointId,
+        start: CorePointId,
+        end: CorePointId,
+    ) -> Result<f64, String> {
+        let (Some(at), Some(from), Some(to)) = (
+            self.relation_point_position(point),
+            self.relation_point_position(start),
+            self.relation_point_position(end),
+        ) else {
+            return Err("Those points are no longer part of the sketch.".to_owned());
+        };
+        let along = (to.u - from.u, to.v - from.v);
+        let length = along.0.hypot(along.1);
+        if length <= f64::EPSILON {
+            return Err("That edge has no length to measure from.".to_owned());
+        }
+        let normal = (-along.1 / length, along.0 / length);
+        Ok(((at.u - from.u) * normal.0 + (at.v - from.v) * normal.1).abs())
     }
 
     /// The centre and radius of a circular operand, as the solver holds them.
@@ -9963,6 +10097,7 @@ impl SketchCanvasState {
             | ToolVariant::HorizontalRelation
             | ToolVariant::VerticalRelation
             | ToolVariant::DistanceRelation
+            | ToolVariant::MidpointDistanceRelation
             | ToolVariant::ParallelRelation
             | ToolVariant::PerpendicularRelation
             | ToolVariant::EqualLengthRelation

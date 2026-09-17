@@ -79,6 +79,54 @@ pub enum SketchConstraintKind {
         center: SketchPointId,
         rim: SketchPointId,
     },
+    /// `point` stands `distance` away from the line through `start` and `end`,
+    /// measured along that line's normal.
+    ///
+    /// This is the ordinate a drawing is mostly made of — how far a hole sits
+    /// from an edge — and it is a different statement from a distance to that
+    /// edge's corner. A distance to a corner is a radius, so it leaves the
+    /// point anywhere on a circle and pairs of them meet in two places or in
+    /// none. An offset from the line leaves the point anywhere along it, and
+    /// two offsets from two edges meet in exactly one place.
+    ///
+    /// It is the *line* that is measured from, not the segment: a dimension to
+    /// an edge does not stop being meaningful where the point is past the end
+    /// of it, and the foot of the perpendicular is where the witness line is
+    /// drawn to.
+    PointToLineDistance {
+        point: SketchPointId,
+        start: SketchPointId,
+        end: SketchPointId,
+        distance: f64,
+    },
+    /// `point` stands `distance` away from the midpoint of `start` and `end`.
+    ///
+    /// The midpoint of an edge is the feature a drawing centres things on, and
+    /// it is not a point the sketch owns — an edge carries its two ends and
+    /// nothing between them — so the relation names the ends and measures to
+    /// the middle of them.
+    PointToMidpointDistance {
+        point: SketchPointId,
+        start: SketchPointId,
+        end: SketchPointId,
+        distance: f64,
+    },
+    /// The line through `first_start`/`first_end` and the line through
+    /// `second_start`/`second_end` stand `distance` apart.
+    ///
+    /// Two lines only have a distance when they are parallel; anywhere else
+    /// they meet, and the number would depend on where along them it was
+    /// measured. The relation holds the separation and leaves the parallelism
+    /// to a parallel relation, so that staging one on lines that are not
+    /// parallel is refused by name rather than answered with a number that
+    /// means nothing.
+    LineToLineDistance {
+        first_start: SketchPointId,
+        first_end: SketchPointId,
+        second_start: SketchPointId,
+        second_end: SketchPointId,
+        distance: f64,
+    },
 }
 
 impl SketchConstraintKind {
@@ -104,6 +152,19 @@ impl SketchConstraintKind {
                 center,
                 rim,
             } => vec![start, end, center, rim],
+            Self::PointToLineDistance {
+                point, start, end, ..
+            }
+            | Self::PointToMidpointDistance {
+                point, start, end, ..
+            } => vec![point, start, end],
+            Self::LineToLineDistance {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+                ..
+            } => vec![first_start, first_end, second_start, second_end],
             Self::Parallel {
                 first_start,
                 first_end,
@@ -142,9 +203,35 @@ impl SketchConstraintKind {
     #[must_use]
     pub const fn measurement(&self) -> Option<f64> {
         match *self {
-            Self::Distance { distance, .. } => Some(distance),
+            Self::Distance { distance, .. }
+            | Self::PointToLineDistance { distance, .. }
+            | Self::PointToMidpointDistance { distance, .. }
+            | Self::LineToLineDistance { distance, .. } => Some(distance),
             Self::LineTangentToCircle { radius, .. } => Some(radius),
             _ => None,
+        }
+    }
+
+    /// The points a retype has to hold still for the new number to mean what
+    /// the user just typed.
+    ///
+    /// A distance between two points has no datum — either end may be the one
+    /// that moves, and the caller says which by naming it. A distance measured
+    /// *from* something does: an offset is from an edge, so retyping it must
+    /// move the point and leave the edge alone. Holding one end of that edge is
+    /// not enough, because the projection is free to share the correction with
+    /// the other end and tilt it; the edge has to be held whole.
+    #[must_use]
+    pub fn datum_points(&self) -> Vec<SketchPointId> {
+        match *self {
+            Self::PointToLineDistance { start, end, .. }
+            | Self::PointToMidpointDistance { start, end, .. } => vec![start, end],
+            Self::LineToLineDistance {
+                first_start,
+                first_end,
+                ..
+            } => vec![first_start, first_end],
+            _ => Vec::new(),
         }
     }
 
@@ -168,6 +255,35 @@ impl SketchConstraintKind {
                 center,
                 radius: measurement,
             }),
+            Self::PointToLineDistance {
+                point, start, end, ..
+            } => Some(Self::PointToLineDistance {
+                point,
+                start,
+                end,
+                distance: measurement,
+            }),
+            Self::PointToMidpointDistance {
+                point, start, end, ..
+            } => Some(Self::PointToMidpointDistance {
+                point,
+                start,
+                end,
+                distance: measurement,
+            }),
+            Self::LineToLineDistance {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+                ..
+            } => Some(Self::LineToLineDistance {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+                distance: measurement,
+            }),
             _ => None,
         }
     }
@@ -185,7 +301,10 @@ impl SketchConstraintKind {
             | Self::Tangent { .. }
             | Self::Collinear { .. }
             | Self::LineTangentToCircle { .. }
-            | Self::LineTangentToArc { .. } => 1,
+            | Self::LineTangentToArc { .. }
+            | Self::PointToLineDistance { .. }
+            | Self::PointToMidpointDistance { .. }
+            | Self::LineToLineDistance { .. } => 1,
         }
     }
 }
@@ -276,6 +395,24 @@ pub(crate) fn validate_constraint(kind: &SketchConstraintKind) -> Result<(), Con
             Err(ConstraintError::NonFiniteValue)
         }
         SketchConstraintKind::LineTangentToCircle { radius, .. } if *radius <= 0.0 => {
+            Err(ConstraintError::NonPositiveDistance)
+        }
+        SketchConstraintKind::PointToLineDistance { distance, .. }
+        | SketchConstraintKind::PointToMidpointDistance { distance, .. }
+        | SketchConstraintKind::LineToLineDistance { distance, .. }
+            if !distance.is_finite() =>
+        {
+            Err(ConstraintError::NonFiniteValue)
+        }
+        // An offset of zero is a point *on* the line, which is what a collinear
+        // relation says; a separation of zero is two lines on top of one
+        // another. Neither is a dimension, and both leave the normal these
+        // project along undefined.
+        SketchConstraintKind::PointToLineDistance { distance, .. }
+        | SketchConstraintKind::PointToMidpointDistance { distance, .. }
+        | SketchConstraintKind::LineToLineDistance { distance, .. }
+            if *distance <= 0.0 =>
+        {
             Err(ConstraintError::NonPositiveDistance)
         }
         _ => Ok(()),
@@ -510,6 +647,63 @@ fn project(
         SketchConstraintKind::Vertical { first, second } => {
             set_pair_coordinate(positions, pinned, first, second, false)
         }
+        SketchConstraintKind::PointToLineDistance {
+            point: held,
+            start,
+            end,
+            distance,
+        } => project_point_off_line(positions, pinned, start, end, held, distance),
+        SketchConstraintKind::PointToMidpointDistance {
+            point: held,
+            start,
+            end,
+            distance,
+        } => {
+            // The midpoint is not a point anything can move, so the correction
+            // goes to the point when it can move and to the edge's two ends
+            // together when it cannot — moving both ends the same way carries
+            // the midpoint with them and leaves the edge's length and
+            // direction alone.
+            let p = point(positions, held);
+            let (a, b) = (point(positions, start), point(positions, end));
+            let mid = SketchPoint2::new((a.u + b.u) * 0.5, (a.v + b.v) * 0.5);
+            let away = p - mid;
+            let length = away.length();
+            let direction = if length <= 1.0e-14 {
+                (1.0, 0.0)
+            } else {
+                (away.u / length, away.v / length)
+            };
+            let delta = distance - length;
+            if movable(pinned, held) {
+                positions.insert(
+                    held,
+                    SketchPoint2::new(p.u + direction.0 * delta, p.v + direction.1 * delta),
+                );
+            } else if movable(pinned, start) && movable(pinned, end) {
+                for (id, at) in [(start, a), (end, b)] {
+                    positions.insert(
+                        id,
+                        SketchPoint2::new(at.u - direction.0 * delta, at.v - direction.1 * delta),
+                    );
+                }
+            }
+        }
+        SketchConstraintKind::LineToLineDistance {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+            distance,
+        } => {
+            // Hold each end of the second line the same offset off the first.
+            // Two parallel lines then stand the asked distance apart; two that
+            // are not parallel are refused when the relation is staged, so the
+            // projection never has to decide what their distance would mean.
+            for held in [second_start, second_end] {
+                project_point_off_line(positions, pinned, first_start, first_end, held, distance);
+            }
+        }
         SketchConstraintKind::Distance {
             first,
             second,
@@ -661,6 +855,87 @@ fn line_offset(
     Some((offset, normal))
 }
 
+/// Where a dimension's witness line runs: the two points whose separation is
+/// the number the relation holds.
+///
+/// Every relation that carries a measurement can say this, and saying it is
+/// what lets one drawing path serve all of them. For a distance between two
+/// points it is those points; for an offset from a line it is the point and
+/// the foot of its perpendicular; for two lines it is a point on one and its
+/// foot on the other.
+#[must_use]
+pub fn dimension_span(
+    kind: &SketchConstraintKind,
+    positions: &BTreeMap<SketchPointId, SketchPoint2>,
+) -> Option<(SketchPoint2, SketchPoint2)> {
+    let known = |id: SketchPointId| positions.get(&id).copied();
+    match *kind {
+        SketchConstraintKind::Distance { first, second, .. } => {
+            Some((known(first)?, known(second)?))
+        }
+        SketchConstraintKind::PointToLineDistance {
+            point, start, end, ..
+        } => {
+            let (p, a, b) = (known(point)?, known(start)?, known(end)?);
+            let (offset, normal) = line_offset(a, b, p)?;
+            Some((
+                p,
+                SketchPoint2::new(p.u - normal.0 * offset, p.v - normal.1 * offset),
+            ))
+        }
+        SketchConstraintKind::PointToMidpointDistance {
+            point, start, end, ..
+        } => {
+            let (p, a, b) = (known(point)?, known(start)?, known(end)?);
+            Some((p, SketchPoint2::new((a.u + b.u) * 0.5, (a.v + b.v) * 0.5)))
+        }
+        SketchConstraintKind::LineToLineDistance {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+            ..
+        } => {
+            let (a, b) = (known(first_start)?, known(first_end)?);
+            let c = known(second_start)?;
+            let _ = known(second_end)?;
+            let (offset, normal) = line_offset(a, b, c)?;
+            Some((
+                c,
+                SketchPoint2::new(c.u - normal.0 * offset, c.v - normal.1 * offset),
+            ))
+        }
+        SketchConstraintKind::LineTangentToCircle {
+            start, end, center, ..
+        } => {
+            let (a, b, c) = (known(start)?, known(end)?, known(center)?);
+            let (offset, normal) = line_offset(a, b, c)?;
+            Some((
+                c,
+                SketchPoint2::new(c.u - normal.0 * offset, c.v - normal.1 * offset),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Moves `point` onto the line's normal at `distance`, keeping the side it is
+/// already on, and sharing the movement with the line when the line can move.
+///
+/// This is the same operation as holding a line tangent to a circle — the
+/// circle's centre is a point held one radius off the line — so the two share
+/// their projection.
+fn project_point_off_line(
+    positions: &mut BTreeMap<SketchPointId, SketchPoint2>,
+    pinned: &BTreeMap<SketchPointId, SketchPoint2>,
+    start: SketchPointId,
+    end: SketchPointId,
+    point: SketchPointId,
+    distance: f64,
+) {
+    project_line_tangent(positions, pinned, start, end, point, distance);
+}
+
 /// Slides the line, or failing that the centre, along the line's normal
 /// until the centre sits one radius away from it. The circle stays on the
 /// side it is already on, so a line tangent to a circle never flips through
@@ -724,6 +999,45 @@ fn residual(positions: &BTreeMap<SketchPointId, SketchPoint2>, kind: &SketchCons
             second,
             distance,
         } => (point(positions, first).distance(point(positions, second)) - distance).abs(),
+        SketchConstraintKind::PointToLineDistance {
+            point: held,
+            start,
+            end,
+            distance,
+        } => line_offset(
+            point(positions, start),
+            point(positions, end),
+            point(positions, held),
+        )
+        .map_or(f64::INFINITY, |(offset, _)| (offset.abs() - distance).abs()),
+        SketchConstraintKind::PointToMidpointDistance {
+            point: held,
+            start,
+            end,
+            distance,
+        } => {
+            let (a, b) = (point(positions, start), point(positions, end));
+            (point(positions, held)
+                .distance(SketchPoint2::new((a.u + b.u) * 0.5, (a.v + b.v) * 0.5))
+                - distance)
+                .abs()
+        }
+        SketchConstraintKind::LineToLineDistance {
+            first_start,
+            first_end,
+            second_start,
+            second_end,
+            distance,
+        } => {
+            let (a, b) = (point(positions, first_start), point(positions, first_end));
+            [second_start, second_end]
+                .into_iter()
+                .map(|id| {
+                    line_offset(a, b, point(positions, id))
+                        .map_or(f64::INFINITY, |(offset, _)| (offset.abs() - distance).abs())
+                })
+                .fold(0.0_f64, f64::max)
+        }
         SketchConstraintKind::Parallel {
             first_start,
             first_end,

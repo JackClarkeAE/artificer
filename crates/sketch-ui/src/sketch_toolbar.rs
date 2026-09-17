@@ -189,6 +189,7 @@ pub enum ToolVariant {
     HorizontalRelation,
     VerticalRelation,
     DistanceRelation,
+    MidpointDistanceRelation,
     ParallelRelation,
     PerpendicularRelation,
     EqualLengthRelation,
@@ -198,7 +199,7 @@ pub enum ToolVariant {
 }
 
 impl ToolVariant {
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 36;
     pub const ALL: [Self; Self::COUNT] = [
         Self::Select,
         Self::Point,
@@ -229,6 +230,7 @@ impl ToolVariant {
         Self::HorizontalRelation,
         Self::VerticalRelation,
         Self::DistanceRelation,
+        Self::MidpointDistanceRelation,
         Self::ParallelRelation,
         Self::PerpendicularRelation,
         Self::EqualLengthRelation,
@@ -383,6 +385,7 @@ pub enum ToolIcon {
     HorizontalRelation,
     VerticalRelation,
     DistanceRelation,
+    MidpointDistanceRelation,
     ParallelRelation,
     PerpendicularRelation,
     EqualLengthRelation,
@@ -509,6 +512,7 @@ const RELATION_VARIANTS: &[ToolVariant] = &[
     ToolVariant::PerpendicularRelation,
     ToolVariant::EqualLengthRelation,
     ToolVariant::DistanceRelation,
+    ToolVariant::MidpointDistanceRelation,
     ToolVariant::FixedRelation,
     ToolVariant::TangentRelation,
     ToolVariant::CollinearRelation,
@@ -1598,9 +1602,9 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         "sketch.relation.distance",
         ToolFamily::Relation,
         "Distance relation",
-        "Lock the current separation of two points.",
-        "Click two endpoints. Their present separation becomes the held value; edit it afterwards with the dimension tool.",
-        "Click the first endpoint to lock a separation.",
+        "Lock the current distance between two points, a point and an edge, or two parallel edges.",
+        "Click two things. Two endpoints hold a separation; a point and an edge hold an offset from that edge; two parallel edges hold their spacing. The present distance becomes the held value; edit it afterwards with the dimension tool.",
+        "Click the first point or edge to lock a distance.",
         "Choose relation; current default: Horizontal.",
         Some(SHORTCUT_G),
         ToolIcon::DistanceRelation,
@@ -1610,7 +1614,27 @@ const TOOL_DESCRIPTORS: [ToolDescriptor; ToolVariant::COUNT] = [
         SelectionRequirement::RelationOperands,
         ToolOutputRole::Modification,
         CapabilityRequirement::RelationOperands,
-        "A distance relation needs two endpoints a positive distance apart.",
+        "A distance relation needs two points, a point and an edge, or two parallel edges, a positive distance apart.",
+        CommitContract::StageThenUniversalTickOrEnter,
+    ),
+    descriptor(
+        ToolVariant::MidpointDistanceRelation,
+        "sketch.relation.midpoint-distance",
+        ToolFamily::Relation,
+        "Distance to midpoint",
+        "Lock the distance from a point to the middle of an edge.",
+        "Click a point and an edge. The distance to the edge's midpoint becomes the held value; edit it afterwards with the dimension tool.",
+        "Click a point, then the edge to measure to the middle of.",
+        "Choose relation; current default: Horizontal.",
+        Some(SHORTCUT_G),
+        ToolIcon::MidpointDistanceRelation,
+        ToolCursor::PrecisionPick,
+        RELATION_TWO_OPERAND_PHASES,
+        NO_INPUTS,
+        SelectionRequirement::RelationOperands,
+        ToolOutputRole::Modification,
+        CapabilityRequirement::RelationOperands,
+        "A midpoint distance needs a point and a straight edge, a positive distance apart.",
         CommitContract::StageThenUniversalTickOrEnter,
     ),
     descriptor(
@@ -2797,6 +2821,14 @@ impl<'a> IconPainter<'a> {
                 self.line((0.18, 0.50), (0.30, 0.58));
                 self.line((0.82, 0.50), (0.70, 0.42));
                 self.line((0.82, 0.50), (0.70, 0.58));
+            }
+            ToolIcon::MidpointDistanceRelation => {
+                self.line((0.14, 0.78), (0.86, 0.78));
+                self.line((0.50, 0.72), (0.50, 0.84));
+                self.line((0.50, 0.78), (0.50, 0.26));
+                self.line((0.50, 0.26), (0.44, 0.38));
+                self.line((0.50, 0.26), (0.56, 0.38));
+                self.dot((0.50, 0.22), 0.07);
             }
             ToolIcon::ParallelRelation => {
                 self.line((0.30, 0.82), (0.52, 0.18));
