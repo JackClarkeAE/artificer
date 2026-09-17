@@ -4,10 +4,11 @@ use std::fmt;
 use artificer_protocol::PrecisionPolicy;
 
 use crate::{
-    CurveProvenance, OutputRole, PointOutputRole, PrimitiveEvaluation, SketchConstraintKind,
-    SketchDefinition, SketchEntityId, SketchEntityRecord, SketchInputValues, SketchOperationId,
-    SketchOutputOwner, SketchOutputRef, SketchPoint2, SketchPointId, SketchPointRecord,
-    SketchRecipe, SketchRevision, SketchValidationError, evaluate_recipe, instantiate_curve,
+    ConstraintError, CurveProvenance, OutputRole, PointOutputRole, PrimitiveEvaluation,
+    SketchConstraintId, SketchConstraintKind, SketchDefinition, SketchEntityId, SketchEntityRecord,
+    SketchInputValues, SketchOperationId, SketchOutputOwner, SketchOutputRef, SketchPoint2,
+    SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision, SketchValidationError,
+    evaluate_recipe, instantiate_curve,
 };
 
 /// Visible confirmation path used to publish an atomic sketch edit.
@@ -252,6 +253,78 @@ fn points_authored_by(
         .filter(|record| record.owner.operation == operation)
         .map(|record| record.id)
         .collect()
+}
+
+/// Writes the points an edit moved back into the recipes that author them, so
+/// the sketch satisfies its relations outright rather than by being solved.
+///
+/// `anchored` is what the edit is entitled to hold: its own points. Each pass
+/// solves with that set held, writes every point the solver had to move into
+/// its owning recipe, and adds those points to the held set so the next pass
+/// works outwards from them. A follower whose recipe cannot state the point as
+/// a literal (see [`SketchRecipe::set_authored_point`]), or whose replacement
+/// does not replay, is left where it is and the ordinary solve goes on sharing
+/// the movement for that one relation.
+fn pull_followers(
+    mut transaction: SketchTransaction,
+    mut anchored: BTreeSet<SketchPointId>,
+    precision: PrecisionPolicy,
+) -> SketchTransaction {
+    for _ in 0..MAX_FOLLOWER_PASSES {
+        let Ok(solution) = transaction
+            .candidate
+            .solve_constraints_anchoring(&anchored, precision)
+        else {
+            break;
+        };
+        let mut pulls: BTreeMap<SketchOperationId, Vec<(PointOutputRole, SketchPoint2)>> =
+            BTreeMap::new();
+        for (point, position) in &solution.positions {
+            if anchored.contains(point) {
+                continue;
+            }
+            let Some(record) = transaction.candidate.point(*point) else {
+                continue;
+            };
+            if !record.active || positions_agree(record.evaluated_position, *position, precision) {
+                continue;
+            }
+            pulls
+                .entry(record.owner.operation)
+                .or_default()
+                .push((record.owner.role, *position));
+        }
+        let mut pulled = false;
+        for (follower, placements) in pulls {
+            let Some(record) = transaction
+                .candidate
+                .operation(follower)
+                .filter(|record| record.active)
+            else {
+                continue;
+            };
+            let mut recipe = record.recipe.clone();
+            let mut rewritten = false;
+            for (role, position) in placements {
+                rewritten |= recipe.set_authored_point(role, position);
+            }
+            if !rewritten {
+                continue;
+            }
+            // A follower whose replacement does not replay is left alone: the
+            // relation is worth less than the geometry already there.
+            let mut attempt = transaction.clone();
+            if attempt.append_replace(follower, recipe).is_ok() {
+                transaction = attempt;
+                anchored.extend(points_authored_by(&transaction.candidate, follower));
+                pulled = true;
+            }
+        }
+        if !pulled {
+            break;
+        }
+    }
+    transaction
 }
 
 fn merge_impact(impact: &mut SketchImpactReport, appended: SketchImpactReport) {
@@ -598,65 +671,89 @@ impl SketchDefinition {
         inputs: &SketchInputValues,
         precision: PrecisionPolicy,
     ) -> Result<SketchTransaction, SketchTransactionError> {
-        let mut transaction = self.stage_replace(operation, recipe, label, inputs, precision)?;
-        let mut anchored = points_authored_by(&transaction.candidate, operation);
-        for _ in 0..MAX_FOLLOWER_PASSES {
-            let Ok(solution) = transaction
-                .candidate
-                .solve_constraints_anchoring(&anchored, precision)
-            else {
-                break;
-            };
-            let mut pulls: BTreeMap<SketchOperationId, Vec<(PointOutputRole, SketchPoint2)>> =
-                BTreeMap::new();
-            for (point, position) in &solution.positions {
-                if anchored.contains(point) {
-                    continue;
+        let transaction = self.stage_replace(operation, recipe, label, inputs, precision)?;
+        let anchored = points_authored_by(&transaction.candidate, operation);
+        Ok(pull_followers(transaction, anchored, precision))
+    }
+
+    /// Restates what one relation measures and drags whatever is joined to it
+    /// along behind, exactly as [`Self::stage_replace_pulling_followers`] does
+    /// for a recipe.
+    ///
+    /// A dimension the user types into is an edit, and an edit outranks the
+    /// solver's freedom to share the movement out (ADR 0035). `held` is the end
+    /// the dimension is measured *from*: it stays, and the other end is what
+    /// travels. Holding neither end is legitimate — the solver then moves both,
+    /// symmetrically, which is the fair answer when nothing distinguishes them.
+    ///
+    /// A value the relation system cannot satisfy is refused, and the sketch is
+    /// left exactly as it was. That is the same bargain every other sketch edit
+    /// makes: a dimension that cannot hold is not quietly rounded to one that
+    /// can.
+    pub fn stage_relation_measurement(
+        &self,
+        constraint: SketchConstraintId,
+        measurement: f64,
+        held: Option<SketchPointId>,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let label = checked_label(label)?;
+        let Some(record) = self.constraints().get(&constraint) else {
+            return Err(SketchTransactionError::ConstraintRejected(
+                ConstraintError::MissingConstraint(constraint),
+            ));
+        };
+        let restated = record
+            .kind
+            .with_measurement(measurement)
+            .ok_or(SketchTransactionError::RelationHasNoMeasurement(constraint))?;
+        if restated == record.kind {
+            return Err(SketchTransactionError::NoChange);
+        }
+        let before = self
+            .solve_constraints(precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let mut candidate = self.clone();
+        candidate
+            .set_constraint_kind(constraint, restated, precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+        let anchored = held.into_iter().collect::<BTreeSet<_>>();
+        let after = candidate
+            .solve_constraints_anchoring(&anchored, precision)
+            .map_err(SketchTransactionError::ConstraintRejected)?;
+
+        let mut impact = SketchImpactReport {
+            profile_changed: true,
+            ..SketchImpactReport::default()
+        };
+        for (point, position) in &after.positions {
+            let moved = before
+                .positions
+                .get(point)
+                .is_none_or(|previous| !positions_agree(*previous, *position, precision));
+            if moved {
+                impact.changed_points.insert(*point);
+                for (entity, record) in candidate.entities() {
+                    if record.active && record.geometry.referenced_points().contains(point) {
+                        impact.changed_entities.insert(*entity);
+                    }
                 }
-                let Some(record) = transaction.candidate.point(*point) else {
-                    continue;
-                };
-                if !record.active
-                    || positions_agree(record.evaluated_position, *position, precision)
-                {
-                    continue;
-                }
-                pulls
-                    .entry(record.owner.operation)
-                    .or_default()
-                    .push((record.owner.role, *position));
-            }
-            let mut pulled = false;
-            for (follower, placements) in pulls {
-                let Some(record) = transaction
-                    .candidate
-                    .operation(follower)
-                    .filter(|record| record.active)
-                else {
-                    continue;
-                };
-                let mut recipe = record.recipe.clone();
-                let mut rewritten = false;
-                for (role, position) in placements {
-                    rewritten |= recipe.set_authored_point(role, position);
-                }
-                if !rewritten {
-                    continue;
-                }
-                // A follower whose replacement does not replay is left alone:
-                // the relation is worth less than the geometry already there.
-                let mut attempt = transaction.clone();
-                if attempt.append_replace(follower, recipe).is_ok() {
-                    transaction = attempt;
-                    anchored.extend(points_authored_by(&transaction.candidate, follower));
-                    pulled = true;
-                }
-            }
-            if !pulled {
-                break;
             }
         }
-        Ok(transaction)
+        // `set_constraint_kind` advances the revision itself; the transaction
+        // publishes one successor of the revision it was staged against.
+        candidate.set_revision(next_revision(self.revision())?);
+        candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
+        let transaction = SketchTransaction {
+            expected_revision: self.revision(),
+            label,
+            candidate,
+            impact,
+            inputs: SketchInputValues::default(),
+            precision,
+        };
+        Ok(pull_followers(transaction, anchored, precision))
     }
 
     pub fn stage_retire_operation(
@@ -1092,6 +1189,10 @@ pub enum SketchTransactionError {
     MissingActiveOperation(SketchOperationId),
     MissingActiveEntity(SketchEntityId),
     NotAModifier,
+    /// The relation named holds no number, so there is nothing to retype: a
+    /// perpendicular is perpendicular, and typing into it would have to make it
+    /// a different relation.
+    RelationHasNoMeasurement(SketchConstraintId),
     /// The solver refused the relation: the system is conflicting, or it names
     /// a point that is missing, inactive, or repeated.
     ConstraintRejected(crate::ConstraintError),
@@ -1121,6 +1222,12 @@ impl fmt::Display for SketchTransactionError {
                 write!(formatter, "entity {entity} is missing or retired")
             }
             Self::NotAModifier => formatter.write_str("a modifier recipe is required"),
+            Self::RelationHasNoMeasurement(constraint) => {
+                write!(
+                    formatter,
+                    "relation {constraint} does not hold a measurement"
+                )
+            }
             Self::ConstraintRejected(error) => write!(formatter, "relation refused: {error}"),
             Self::DependentOperations {
                 operation,

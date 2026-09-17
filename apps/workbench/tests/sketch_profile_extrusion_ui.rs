@@ -866,40 +866,277 @@ fn shift_select_multiple_sketch_regions_in_viewport() {
     assert!((volume - 64.0).abs() <= 1.0e-8, "volume: {volume}");
 }
 
-/// Ending a side at a face you click, which never worked in the running
-/// application. The pick was wired from the panel inward but never into the
-/// viewport's click router: every face click was dropped by the guard that
-/// hands model selection to a live feature handle, so the side stayed armed,
-/// the panel kept asking for a face, and the extrusion committed at whatever
-/// distance was typed.
+/// Scrolls a control into the visible panel, so a click aimed at its rectangle
+/// lands on it rather than on whatever the scroll area is clipping it behind.
+fn reveal_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    {
+        harness
+            .get_by_role_and_label(Role::Button, label)
+            .scroll_to_me();
+    }
+    harness.run();
+}
+
+fn click_revealed_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    reveal_button(harness, label);
+    click_button(harness, label);
+    harness.run();
+}
+
+/// The faces the viewport is currently offering to a click.
+fn pickable_faces(harness: &Harness<'static, KernelLabApp>) -> Vec<String> {
+    harness
+        .query_all_by_role(Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .filter(|label| label.ends_with(" face") && label != "To face")
+        .collect()
+}
+
+/// The destinations the extrusion panel is listing for an armed side.
+fn listed_destinations(harness: &Harness<'static, KernelLabApp>) -> Vec<String> {
+    harness
+        .query_all_by_role(Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .filter(|label| label.contains("planar"))
+        .collect()
+}
+
+/// A block with a smaller block on top of it: a ledge at 2 and a top at 4.
+fn stepped_block(harness: &mut Harness<'static, KernelLabApp>) {
+    block_two_tall(harness);
+    click_button(harness, "Extrusion top face");
+    click_button(harness, "Sketch on selected face");
+    for _ in 0..18 {
+        harness.step();
+    }
+    click_button(harness, "Two-point rectangle");
+    click_sketch_point(harness, SketchPoint::new(-0.5, -0.5));
+    click_sketch_point(harness, SketchPoint::new(0.5, 0.5));
+    click_button(harness, "Extrude");
+    set_extrusion_distance(harness, "2");
+    click_button(harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+}
+
+/// A block two millimetres tall, drawn on the XY plane.
+fn block_two_tall(harness: &mut Harness<'static, KernelLabApp>) {
+    enter_xy_sketch(harness);
+    click_button(harness, "Two-point rectangle");
+    click_sketch_point(harness, SketchPoint::new(-1.0, -1.0));
+    click_sketch_point(harness, SketchPoint::new(1.0, 1.0));
+    click_button(harness, "Extrude");
+    set_extrusion_distance(harness, "2");
+    click_button(harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+}
+
+/// Where a cut ends is the far side of the material, and the far side of the
+/// material is the one place the camera is not showing.
+///
+/// This is why To face looked dead in the running application. The viewport
+/// draws only the facets turned towards the viewer, so the only faces it
+/// offered to a click were the ones a cut can never end at, and the side sat
+/// armed forever waiting for a click that had nowhere to land. Discovery asks
+/// the solid instead, and the answer does not change when the camera does.
 #[test]
-fn a_side_ends_at_the_face_that_is_clicked() {
+fn the_plane_a_cut_ends_at_is_one_the_camera_never_shows() {
+    let mut harness = harness();
+    block_two_tall(&mut harness);
+
+    // Sketch on the top of the block and cut downwards.
+    click_button(&mut harness, "Extrusion top face");
+    click_button(&mut harness, "Sketch on selected face");
+    for _ in 0..18 {
+        harness.step();
+    }
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-0.5, -0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_button(&mut harness, "Extrude");
+    set_extrusion_distance(&mut harness, "-1");
+    harness.run();
+
+    let targets = harness.state().extrusion_targets(0);
+    assert_eq!(
+        targets.len(),
+        1,
+        "a cut from the top of a plain block ends at its underside: {targets:?}"
+    );
+    assert!(
+        targets[0].summary.contains("facing down"),
+        "the destination is the underside: {}",
+        targets[0].summary
+    );
+    assert!(
+        (targets[0].reach - 2.0).abs() <= 1.0e-9,
+        "it is the thickness of the block away: {}",
+        targets[0].reach
+    );
+
+    let visible = pickable_faces(&harness);
+    assert!(
+        !visible.iter().any(|label| label.contains("bottom")),
+        "the underside is turned away from the camera, so nothing offers it: {visible:?}"
+    );
+
+    // Turn the model right over. What the viewport offers changes completely;
+    // what the side can end at does not change at all.
+    for _ in 0..3 {
+        click_button(&mut harness, "View cube turn up");
+    }
+    harness.run();
+    let turned = pickable_faces(&harness);
+    assert_ne!(
+        visible, turned,
+        "the camera really did move, so a screen-derived answer would have moved with it"
+    );
+    assert_eq!(
+        harness.state().extrusion_targets(0),
+        targets,
+        "where a side can end is a property of the design, not of the view"
+    );
+}
+
+/// One destination is not a choice, and asking for a click on a face that is
+/// facing away from the camera is asking for a click that cannot be made.
+#[test]
+fn the_only_plane_a_side_can_reach_is_taken_without_a_click() {
     let mut harness = harness();
     enter_xy_sketch(&mut harness);
     click_button(&mut harness, "Two-point rectangle");
     click_sketch_point(&mut harness, SketchPoint::new(-0.5, -0.5));
     click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_button(&mut harness, "Extrude");
 
+    assert_eq!(
+        harness.state().extrusion_targets(0).len(),
+        1,
+        "the starting body offers this side exactly one plane"
+    );
+    click_revealed_button(&mut harness, "To face");
+    assert!(
+        harness.state().extrusion_side_ends_at_a_face(0),
+        "the only plane it can reach ends the side without a click: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("the only face it can reach")),
+        "and says so: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        harness.state().extrusion_distance().abs() > 0.0,
+        "the side takes the measured length, not zero"
+    );
+}
+
+/// Several destinations are a choice, and the choice is made from a list of
+/// what the design actually offers rather than from whatever the camera
+/// happens to be showing.
+#[test]
+fn several_destinations_are_listed_and_the_chosen_one_ends_the_side() {
+    let mut harness = harness();
+    stepped_block(&mut harness);
+
+    // A third body, raised from the XY plane to one of those two planes.
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(3.0, 3.0));
+    click_button(&mut harness, "Extrude");
+    click_revealed_button(&mut harness, "To face");
+    assert!(
+        harness.state().extrusion_side_is_picking_a_face(0),
+        "two destinations is a choice, so the side waits: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.starts_with("2 faces could end side 1")),
+        "and says how many: {:?}",
+        harness.state().document_status_text()
+    );
+
+    let listed = listed_destinations(&harness);
+    assert_eq!(
+        listed.len(),
+        2,
+        "both planes are offered in the panel, whichever way the model is facing: {listed:?}"
+    );
+    let top = listed
+        .iter()
+        .find(|label| label.contains("(0.0, 0.0, 4.0)"))
+        .cloned()
+        .expect("the higher plane is one of them");
+    click_revealed_button(&mut harness, &top);
+
+    assert!(
+        harness.state().extrusion_side_ends_at_a_face(0),
+        "choosing from the list ends the side: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        (harness.state().extrusion_distance() - 4.0).abs() <= 1.0e-9,
+        "at the length measured to the plane chosen: {}",
+        harness.state().extrusion_distance()
+    );
+
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let volume = harness
+        .state()
+        .displayed_measures()
+        .expect("the raised body measures")
+        .volume;
+    assert!(
+        (volume - 4.0).abs() <= 1.0e-9,
+        "a 1 mm square raised 4 mm: {volume}"
+    );
+}
+
+/// Ending a side at a face you click, which never worked in the running
+/// application. The pick was wired from the panel inward but never into the
+/// viewport's click router: every face click was dropped by the guard that
+/// hands model selection to a live feature handle, so the side stayed armed,
+/// the panel kept asking for a face, and the extrusion committed at whatever
+/// distance was typed. The panel's list is now the route that always works;
+/// the click is the shortcut for a destination that happens to be on screen,
+/// and it still has to work.
+#[test]
+fn a_side_ends_at_the_face_that_is_clicked() {
+    let mut harness = harness();
+    stepped_block(&mut harness);
+
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 2.0));
+    click_sketch_point(&mut harness, SketchPoint::new(3.0, 3.0));
     click_button(&mut harness, "Extrude");
     assert_eq!(
         harness.state().pending_operation_label(),
         Some("Extrude active sketch")
     );
 
-    {
-        harness
-            .get_by_role_and_label(Role::Button, "To face")
-            .scroll_to_me();
-    }
-    harness.run();
-    click_button(&mut harness, "To face");
-    harness.run();
+    // Two destinations, so the side stays armed and a click means something.
+    click_revealed_button(&mut harness, "To face");
     assert!(
         harness.state().extrusion_side_is_picking_a_face(0),
-        "To face arms the pick"
+        "To face arms the pick when there is a choice to make"
+    );
+    assert!(
+        pickable_faces(&harness)
+            .iter()
+            .any(|label| label == "Feature end face"),
+        "the higher plane is one the camera is showing: {:?}",
+        pickable_faces(&harness)
     );
 
-    click_button(&mut harness, "Positive Z face");
+    click_button(&mut harness, "Feature end face");
     for _ in 0..18 {
         harness.step();
     }
@@ -909,7 +1146,8 @@ fn a_side_ends_at_the_face_that_is_clicked() {
         harness.state().document_status_text()
     );
     assert!(
-        harness.state().extrusion_distance().abs() > 0.0,
-        "the side takes the measured length, not zero"
+        (harness.state().extrusion_distance() - 4.0).abs() <= 1.0e-9,
+        "at the length measured to the face clicked: {}",
+        harness.state().extrusion_distance()
     );
 }

@@ -353,11 +353,17 @@ fn permutation_2_square_box_multiple_cuts_on_multiple_faces() {
     let scene = NativeKernel::debug_scene(&cut2);
     assert_scene_edge_invariants(&scene, "p2-crossing-cuts");
 
-    // Verify that internal facet seams of both bores remain smooth/hidden
-    let smooth_count = scene.edges.iter().filter(|e| e.is_smooth).count();
+    // Every seam within a bore wall stays smooth. This used to read "more than
+    // twenty", counting the seams between the panels of a faceted bore; two
+    // equal bores on crossing axes are exact now, so there are no panels and
+    // the seams are the ones the walls genuinely have — each bore parted into
+    // halves, and the pair's own shared seam. Counting those is the assertion
+    // that survives: what mattered was never the number but that none of them
+    // is drawn as a crease across curvature that has none.
+    let smooth_count = scene.edges.iter().filter(|edge| edge.is_smooth).count();
     assert!(
-        smooth_count > 20,
-        "internal cylindrical panels must be classified as smooth (found {smooth_count})"
+        smooth_count >= 8,
+        "the seams within a bore wall must be classified as smooth (found {smooth_count})"
     );
 }
 

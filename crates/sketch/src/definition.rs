@@ -387,6 +387,49 @@ impl SketchDefinition {
         Ok(id)
     }
 
+    /// Restates one relation in place, keeping its id.
+    ///
+    /// A dimension drawn on the canvas is bound to the relation it shows, so
+    /// retyping its value has to keep that binding: removing the relation and
+    /// adding a replacement would leave the annotation pointing at something
+    /// that no longer exists, and would reorder the relation against its
+    /// siblings for no reason the user asked for.
+    ///
+    /// The swap is fail-closed in the same way as [`Self::add_constraint`]. A
+    /// value the system cannot satisfy leaves the relation, the revision and
+    /// the geometry exactly as they were.
+    pub fn set_constraint_kind(
+        &mut self,
+        id: SketchConstraintId,
+        kind: SketchConstraintKind,
+        precision: PrecisionPolicy,
+    ) -> Result<(), ConstraintError> {
+        crate::validate_constraint(&kind)?;
+        for point in kind.referenced_points() {
+            let Some(record) = self.points.get(&point) else {
+                return Err(ConstraintError::MissingPoint(point));
+            };
+            if !record.active {
+                return Err(ConstraintError::InactivePoint(point));
+            }
+        }
+        let Some(record) = self.constraints.get_mut(&id) else {
+            return Err(ConstraintError::MissingConstraint(id));
+        };
+        let previous = std::mem::replace(&mut record.kind, kind);
+        if let Err(error) = self.solve_constraints(precision) {
+            if let Some(record) = self.constraints.get_mut(&id) {
+                record.kind = previous;
+            }
+            return Err(error);
+        }
+        self.revision = self
+            .revision
+            .checked_next()
+            .ok_or(ConstraintError::IdSpaceExhausted)?;
+        Ok(())
+    }
+
     pub fn remove_constraint(&mut self, id: SketchConstraintId) -> bool {
         let removed = self.constraints.remove(&id).is_some();
         if removed && let Some(next) = self.revision.checked_next() {

@@ -1151,3 +1151,215 @@ fn right_clicking_an_extrusion_reopens_the_editor_it_was_made_in() {
         "a longer extrusion is a bigger solid: {committed} then {rebuilt}"
     );
 }
+
+/// Scrolls a control into view so a click aimed at its rectangle lands on it.
+fn scroll_to_button(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    {
+        harness
+            .get_by_role_and_label(Role::Button, label)
+            .scroll_to_me();
+    }
+    harness.run();
+}
+
+/// Two bodies: a block two millimetres tall, and a second body beside it
+/// raised to end at that block's top face.
+fn two_bodies_the_second_raised_to_the_first(harness: &mut Harness<'static, KernelLabApp>) {
+    harness.run();
+    click_button(harness, "XY Plane");
+    click_button(harness, "Sketch mode");
+    commit_centered_rectangle(harness);
+    finish_active_sketch(harness);
+    click_button(harness, "Extrude");
+    set_extrusion_distance(harness, "2");
+    // Confirm from the keyboard: scrolling the distance field into view inside
+    // the contextual card takes the rail's tick off screen with it.
+    press_key(harness, egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().last_error_code(), None);
+
+    click_button(harness, "XY Plane");
+    click_button(harness, "Sketch mode");
+    click_button(harness, "Two-point rectangle");
+    click_at(
+        harness,
+        canvas_sketch_point(harness, SketchPoint::new(2.0, 2.0)),
+    );
+    click_at(
+        harness,
+        canvas_sketch_point(harness, SketchPoint::new(4.0, 3.0)),
+    );
+    finish_active_sketch(harness);
+    click_button(harness, "Extrude");
+    scroll_to_button(harness, "To face");
+    click_button(harness, "To face");
+    harness.run();
+    assert!(
+        harness.state().extrusion_side_ends_at_a_face(0),
+        "the first block's top is the only plane this side can reach: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        (harness.state().extrusion_distance() - 2.0).abs() <= 1.0e-9,
+        "measured to that plane: {}",
+        harness.state().extrusion_distance()
+    );
+    // Confirm from the keyboard: scrolling To face into view inside the
+    // contextual card takes the rail's tick off screen with it.
+    press_key(harness, egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().last_error_code(), None);
+    assert_eq!(harness.state().body_count(), 2);
+}
+
+/// The length a side takes from a face is measured again on every rebuild,
+/// even when the face belongs to a different body.
+///
+/// A new body starts from an empty snapshot, so resolving the stored
+/// reference against the feature being rebuilt could only ever fail for a
+/// body raised up to another one: the face is not in that snapshot and never
+/// was. Such a feature froze at the length it first measured and reported a
+/// lost reference on every rebuild afterwards.
+#[test]
+fn a_side_that_ends_at_another_bodys_face_follows_that_body_through_an_edit() {
+    let mut harness = harness();
+    two_bodies_the_second_raised_to_the_first(&mut harness);
+
+    // Make the first block taller. The second body has to grow with it.
+    right_click_button(&mut harness, "Extrude 1 feature");
+    click_button(&mut harness, "Edit this extrusion");
+    harness.run();
+    assert!(harness.state().operation_confirmation_pending());
+    set_extrusion_distance(&mut harness, "5");
+    press_key(&mut harness, egui::Key::Enter);
+    harness.run();
+    assert_eq!(harness.state().last_error_code(), None);
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| !status.contains("kept its last length")),
+        "the face is still there, so nothing is lost: {:?}",
+        harness.state().document_status_text()
+    );
+
+    // Read the rebuilt length back out of the feature that follows the face.
+    right_click_button(&mut harness, "Extrude 2 feature");
+    click_button(&mut harness, "Edit this extrusion");
+    harness.run();
+    assert!(
+        (harness.state().extrusion_distance() - 5.0).abs() <= 1.0e-9,
+        "the raised body followed the face up to 5 mm: {}",
+        harness.state().extrusion_distance()
+    );
+}
+
+/// Suppressing the feature that made the face a side ends at takes the side
+/// with it, rather than leaving it measured against geometry that is gone.
+///
+/// A reference to a face is a dependency on the feature that made it, which
+/// is what puts the dependent feature in the rebuild at all. The document
+/// then skips it by name instead of replaying it against a body that no
+/// longer has the plane it was told to reach, and restoring brings both back
+/// with the reference resolving again.
+#[test]
+fn a_side_whose_target_face_is_suppressed_is_skipped_and_returns_on_restore() {
+    let mut harness = harness();
+    two_bodies_the_second_raised_to_the_first(&mut harness);
+    let features = harness.state().document_feature_count();
+
+    activate_button(&mut harness, "Extrude 1 feature");
+    activate_button(&mut harness, "Suppress selected feature");
+    // One body is left: the block the document starts with, which the
+    // suppressed extrusion's branch falls back to. The body raised to the
+    // suppressed block's face is gone with it.
+    assert_eq!(
+        harness.state().body_count(),
+        1,
+        "the raised body goes with the face it was told to end at: {:?}",
+        harness.state().document_status_text()
+    );
+    assert_eq!(
+        harness.state().document_feature_count(),
+        features,
+        "suppression removes no feature from the document"
+    );
+
+    activate_button(&mut harness, "Restore selected feature");
+    assert_eq!(
+        harness.state().body_count(),
+        2,
+        "restoring brings back the block and the body raised to it: {:?}",
+        harness.state().document_status_text()
+    );
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| !status.contains("kept its last length")),
+        "and the reference resolves again rather than being reported lost: {:?}",
+        harness.state().document_status_text()
+    );
+}
+
+/// A target that can no longer be reached is reported, and the feature keeps
+/// the length it last had rather than attaching itself to something else.
+///
+/// Turning the first block over puts the face the second body was told to end
+/// at level with that body's own sketch plane, so no forward length reaches
+/// it any more. Silently keeping the old length looks identical to still
+/// following the face, which is the failure this reports out loud.
+#[test]
+fn a_side_that_can_no_longer_reach_its_face_keeps_its_length_and_says_so() {
+    let mut harness = harness();
+    two_bodies_the_second_raised_to_the_first(&mut harness);
+
+    right_click_button(&mut harness, "Extrude 1 feature");
+    click_button(&mut harness, "Edit this extrusion");
+    harness.run();
+    set_extrusion_distance(&mut harness, "-2");
+    press_key(&mut harness, egui::Key::Enter);
+    harness.run();
+
+    assert_eq!(
+        harness.state().last_error_code(),
+        None,
+        "an unreachable target is reported, never a failed document: {:?}",
+        harness.state().last_error_detail()
+    );
+    assert_eq!(
+        harness.state().body_count(),
+        2,
+        "the raised body is still there, at the size it last had"
+    );
+    let reports = harness.state().lost_extent_reports().to_vec();
+    assert_eq!(
+        reports.len(),
+        1,
+        "the one side that stopped following its face is reported: {reports:?}"
+    );
+    assert!(
+        reports[0].contains("kept its last length because"),
+        "and the report says what it kept and why: {}",
+        reports[0]
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::Label, "1 END LOST")
+            .is_some(),
+        "and it stays on screen rather than only in a status line"
+    );
+
+    // Turn the block back the right way up and the side finds its face again.
+    right_click_button(&mut harness, "Extrude 1 feature");
+    click_button(&mut harness, "Edit this extrusion");
+    harness.run();
+    set_extrusion_distance(&mut harness, "2");
+    press_key(&mut harness, egui::Key::Enter);
+    harness.run();
+    assert!(
+        harness.state().lost_extent_reports().is_empty(),
+        "the report clears when the face is reachable again: {:?}",
+        harness.state().lost_extent_reports()
+    );
+}

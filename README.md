@@ -25,6 +25,20 @@
 
 ---
 
+## What is new in 0.99
+
+A kernel release. Two bores that cross used to leave the exact domain and come
+back as a tessellation, and now they do not. A wall the Boolean cut into a fan
+of panels is one wall again. And two things that were wired but never finished
+— ending an extrusion at a face, and dimensioning between two points — do what
+they always said they would.
+
+- **Two bores that cross are exact.** Drilling a second hole across the first used to take the whole body out of the exact domain: it was rebuilt from a tessellation, published a warning saying so, and quoted a volume about a tenth of a percent wrong. Two cylinders of the same radius whose axes cross meet in two ellipses rather than a curve nothing here could name — the classic Steinmetz solid, and the derivation is short enough that ADR 0025 states it — so the seam is now two plane sections of a kind the kernel already had. The crossed block is ten faces and one shell, and its volume is the closed form to the last digit, where the approximation reached the same body as 2,959 faces. Bores of *unequal* radius, or on axes that miss one another, really are a quartic; those still take the approximate route and still say so.
+- **A wall the Boolean cut into a fan of panels is one wall again.** Every cutter plane through a face split it, and nothing put the pieces back. Flat walls arrived as fans of creases across geometry that has none, and every stage downstream — validation, the drawn scene, hit testing, history replay — is a function of face count. Facets on one plane are now dissolved back into one face, and a corner is dropped only where every facet agrees it is not one. The merge stops wherever a single face could not state the result, a ring around a bore being the common case, and leaves those pieces exactly as they were; the worst case is the fan it started with. ADR 0039 records it, with what it is worth measured rather than estimated.
+- **An extrusion ends at the face you stop it at, and you pick it from a list.** To face shipped in 0.98.2 and in the running application still did nothing. The deepest reason was that destinations came from the picture: the viewport culls the facets turned away from the camera, so the faces it offers a click are the near side of the material, and the face a through cut ends at is the far side. The prompt was asking for a click on something that was not there. Discovery now walks the solid instead, keeping every face this side can reach and grouping them by the plane they lie on — because a plane is what a side actually stops at, and one tessellated wall is hundreds of faces on one plane. The panel lists them with the length each would sweep and the kernel's own name for the face, and nothing in it reads the camera. ADR 0037 records where a side of an extrusion ends.
+- **A dimension between two points can be seen and changed.** Asking for a dimension between two sketch objects got nothing back, and every piece of it was already in the tree: the solver had held a distance between two arbitrary points since the sketch crate was written, and the relation tool's own tooltip said the dimension tool would edit it afterwards. Nothing drew it and nothing could edit it — the dimension tool resolved a pick to a recipe's number, and a distance between two points is not a number any recipe carries. It is drawn now, with its witness lines and arrowheads, and typing a new value moves the points. ADR 0038 records the design.
+- **A refused operation owes you the body you already had.** A construction the kernel cannot certify is refused rather than published, and that was true by construction and untested — which is how such guarantees quietly stop being true. It is now pinned by tests from both ends: nothing invalid reaches the document, and the snapshot you already had keeps its identity, its volume and its validity, because a snapshot is an immutable value. A sketch also never stores a relation saying one thing while its geometry measures another.
+
 ## What is new in 0.98.2
 
 A point release about the sketch tools, and about changing your mind: trim

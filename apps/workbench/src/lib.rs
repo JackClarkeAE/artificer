@@ -75,8 +75,8 @@ use artificer_protocol::{
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
     CurveIntersections, EvaluatedCurve2 as AuthoringCurve2, ProfileCompileError, RegionSignature,
-    SketchArrangement, SketchDefinition, SketchPoint2 as AuthoringPoint2, build_arrangement,
-    compile_selected_profile, intersect_curves,
+    SketchArrangement, SketchConstraintId, SketchDefinition, SketchPoint2 as AuthoringPoint2,
+    build_arrangement, compile_selected_profile, intersect_curves,
 };
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Frame, Margin, RichText, Stroke};
@@ -96,11 +96,11 @@ use crate::presentation::{
 use crate::shell::{WorkbenchShellState, WorkbenchShellVisibility};
 use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
-    DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
-    SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
-    SketchContextFitKey, SketchContextLayer, SketchContextTriangle, SketchCurveDirection,
-    SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId, SketchGeometry,
-    SketchPlane, SketchPoint, SketchView, SketchViewportContext,
+    DimensionInputError, DimensionKeyClaims, DimensionReadout, PointToPointDimension,
+    SelectedRecipeEditorView, SelectedRecipeParameter, SketchCanvasState, SketchContextCurve,
+    SketchContextEdge, SketchContextFitKey, SketchContextLayer, SketchContextTriangle,
+    SketchCurveDirection, SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId,
+    SketchGeometry, SketchPlane, SketchPoint, SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
@@ -1906,6 +1906,85 @@ struct ModelContextMenu {
     just_opened: bool,
 }
 
+/// A plane a side of an extrusion could end at.
+///
+/// Discovery, validation and selection are deliberately three things. This
+/// type is what discovery produces and what selection chooses between, and
+/// the rule that decides membership is the same one that judges a face
+/// clicked in the viewport, so the two routes can never disagree about what
+/// is reachable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtrusionTarget {
+    /// A face lying on the plane, which is what the recipe stores and what a
+    /// rebuild resolves.
+    pub face: EntityRef,
+    /// How far this side sweeps to reach it, in millimetres.
+    pub reach: f64,
+    /// The face in words, as the kernel describes it, so a list of
+    /// destinations reads as geometry rather than as entity numbers.
+    pub summary: String,
+    /// How many faces of the body lie on this same plane. A tessellated wall
+    /// answers with hundreds, and they are one destination rather than
+    /// hundreds of them.
+    pub coplanar_faces: usize,
+}
+
+/// The destinations last discovered, and the state they were discovered for.
+///
+/// Discovery walks every face of every body, which on a faceted design is
+/// measured in thousands. The panel showing the list would otherwise redo
+/// that on every frame the list is open, on exactly the designs where it
+/// costs the most.
+#[derive(Clone, Debug)]
+struct ExtrusionTargetMemo {
+    side: usize,
+    bodies: Vec<SnapshotId>,
+    sketch_revision: u64,
+    reversed: bool,
+    targets: Vec<ExtrusionTarget>,
+}
+
+/// Why a rebuilt side that ends at a face could not be measured again.
+///
+/// Every one of these leaves the side at the length it last had. Suggesting
+/// the only candidate while a feature is being made is a convenience;
+/// choosing a different one behind the user's back while it rebuilds is not
+/// the same act, and this type exists so the second never happens quietly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LostExtentTarget {
+    /// The reference no longer names any face of this body.
+    Missing,
+    /// More than one face answers to the reference, and picking between them
+    /// would be a guess.
+    Ambiguous,
+    /// The face is still there but is no longer a plane.
+    NoLongerAPlane,
+    /// The face is a plane, but no longer one parallel to the sketch.
+    NoLongerParallel,
+    /// The face is parallel but now lies behind the sketch on this side, so
+    /// no forward length reaches it.
+    NoLongerAhead,
+    /// The sketch the extrusion was drawn on is no longer in the document.
+    SketchGone,
+}
+
+impl LostExtentTarget {
+    /// The reason in the words the user would use.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "the face it ended at is no longer part of this design",
+            Self::Ambiguous => "more than one face now answers to the one it ended at",
+            Self::NoLongerAPlane => "the face it ended at is no longer flat",
+            Self::NoLongerParallel => {
+                "the face it ended at is no longer parallel to the sketch plane"
+            }
+            Self::NoLongerAhead => "the face it ended at no longer lies ahead of the sketch",
+            Self::SketchGone => "the sketch it was drawn on is no longer in the document",
+        }
+    }
+}
+
 /// The history context menu, anchored on the entry that was right-clicked.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TimelineContextMenu {
@@ -2442,6 +2521,15 @@ pub struct KernelLabApp {
     feature_scalar_draft: Option<(FeatureId, usize, f64)>,
     history_scrub_position: usize,
     document_status: Option<String>,
+    /// Sides that end at a face and could not be measured again on the last
+    /// rebuild. The status line is overwritten by the next thing that happens,
+    /// and a feature quietly holding a length measured against geometry that
+    /// has moved is exactly the kind of thing that needs to stay on screen
+    /// until somebody looks at it.
+    lost_extent_reports: Vec<String>,
+    /// See [`ExtrusionTargetMemo`]: what a side could end at, kept for as long
+    /// as the answer cannot have changed.
+    extrusion_target_memo: Option<ExtrusionTargetMemo>,
     displayed: Option<DisplayedBody>,
     bodies: Vec<WorkbenchBody>,
     active_body_ordinal: u32,
@@ -2669,6 +2757,8 @@ impl Default for KernelLabApp {
             feature_scalar_draft: None,
             history_scrub_position: 0,
             document_status: None,
+            lost_extent_reports: Vec::new(),
+            extrusion_target_memo: None,
             displayed: None,
             bodies: Vec::new(),
             active_body_ordinal: 1,
@@ -3165,6 +3255,14 @@ impl KernelLabApp {
     #[must_use]
     pub fn document_status_text(&self) -> Option<&str> {
         self.document_status.as_deref()
+    }
+
+    /// Sides that kept the length they last had because the face they end at
+    /// could not be measured again, one line each, as the last rebuild found
+    /// them. Empty when every such side is still following its face.
+    #[must_use]
+    pub fn lost_extent_reports(&self) -> &[String] {
+        &self.lost_extent_reports
     }
 
     /// The destination the open Export dialog is proposing, if one is open.
@@ -3754,6 +3852,34 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_dimension_error(&self) -> Option<DimensionInputError> {
         self.sketch.dimension_error()
+    }
+
+    /// Every dimension the sketch holds between two points, as drawn.
+    #[must_use]
+    pub fn sketch_point_to_point_dimensions(&self) -> Vec<PointToPointDimension> {
+        self.sketch.point_to_point_dimensions()
+    }
+
+    /// The point-to-point dimension open for typing: its text, and why the last
+    /// entry was refused if it was.
+    #[must_use]
+    pub fn sketch_relation_dimension_entry(&self) -> Option<(String, Option<String>)> {
+        self.sketch
+            .relation_dimension_editor()
+            .map(|(_, text, error)| (text.to_owned(), error.map(ToOwned::to_owned)))
+    }
+
+    pub fn begin_sketch_relation_dimension_edit(&mut self, constraint: SketchConstraintId) -> bool {
+        self.sketch.begin_relation_dimension_edit(constraint)
+    }
+
+    pub fn set_sketch_relation_dimension_text(&mut self, text: String) {
+        self.sketch.set_relation_dimension_text(text);
+    }
+
+    /// Applies the typed distance, staging it behind the confirmation gate.
+    pub fn accept_sketch_relation_dimension_edit(&mut self) -> bool {
+        self.sketch.accept_relation_dimension_edit().is_some()
     }
 
     #[must_use]
@@ -5639,6 +5765,9 @@ impl KernelLabApp {
             .filter_map(|branch| branch.replay_input.map(|snapshot| (branch.body, snapshot)))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut rebuilt_bodies = Vec::<ArchivedBody>::new();
+        // Sides that end at a face and could not be measured again. The
+        // rebuild still succeeds, so nothing else would ever mention them.
+        let mut lost_targets = Vec::<String>::new();
 
         while let Some(step) = transaction.next_executable_step().cloned() {
             debug_assert_eq!(step.disposition, ReplayDisposition::Execute);
@@ -5687,7 +5816,19 @@ impl KernelLabApp {
             // A side that ends at a face is measured against the body as it
             // now stands, before the regions resolve: that is what makes it
             // follow the face instead of freezing the length it first had.
-            let action = self.remeasured_sketch_region_extents(action, &reports, &input);
+            let (action, lost_here) =
+                self.remeasured_sketch_region_extents(action, &reports, &input, &rebuilt_bodies);
+            for (side, reason) in lost_here {
+                let label = self
+                    .document
+                    .feature(feature)
+                    .map_or_else(|| "An extrusion".to_owned(), |node| node.label.clone());
+                lost_targets.push(format!(
+                    "{label} side {} kept its last length because {}",
+                    side + 1,
+                    reason.describe()
+                ));
+            }
             let action = match action.resolve_sketch_regions(
                 &self.document,
                 input.precision_policy().unwrap_or_default(),
@@ -5910,7 +6051,15 @@ impl KernelLabApp {
             self.archive_feature_report(feature, report);
         }
         self.restore_runtime_from_document();
-        self.document_status = Some(format!("Rebuilt {completed} feature(s) atomically"));
+        self.document_status = Some(if lost_targets.is_empty() {
+            format!("Rebuilt {completed} feature(s) atomically")
+        } else {
+            format!(
+                "Rebuilt {completed} feature(s) atomically · {}",
+                lost_targets.join(" · ")
+            )
+        });
+        self.lost_extent_reports = lost_targets;
         true
     }
 
@@ -6867,6 +7016,26 @@ impl KernelLabApp {
             report.output_snapshot,
             report.semantic_digest,
         ));
+        // A side that ends at a face depends on the feature that made that
+        // face, even when the face belongs to another body entirely. Without
+        // that edge in the graph the target can be changed or removed without
+        // this feature ever being replayed, so it goes on holding a length
+        // measured against geometry that has moved and nothing notices.
+        let mut target_producers = record
+            .up_to_faces
+            .iter()
+            .flatten()
+            .map(|reference| reference.producer)
+            .collect::<Vec<_>>();
+        target_producers.sort_unstable();
+        target_producers.dedup();
+        eprintln!(
+            "TRACE append up_to_faces {:?} producers {target_producers:?}",
+            record.up_to_faces
+        );
+        for producer in target_producers {
+            draft = draft.with_dependency(producer);
+        }
         match mode {
             ExtrusionMode::NewBody => {
                 let ordinal = if self.bodies.len() == 1
@@ -8485,20 +8654,34 @@ impl KernelLabApp {
     /// The recipe stores which face each side reaches and the length last
     /// measured to it. Rebuild measures again against the body as it now
     /// stands, so a feature that was told to reach a face keeps reaching it
-    /// when the face moves. A face that cannot be found or is no longer
-    /// parallel leaves the stored length in place: the feature still
-    /// rebuilds, at the size it last had, rather than failing the document.
+    /// when the face moves.
+    ///
+    /// When the face cannot be measured again the stored length stays: the
+    /// feature rebuilds at the size it last had rather than failing the
+    /// document, and rather than attaching itself to whichever other face
+    /// happens to be nearby. That is the safe answer but it is not a silent
+    /// one, so each side that kept its length is returned for the caller to
+    /// say out loud. A side that has quietly stopped following its face
+    /// otherwise looks exactly like one that is still following it.
+    ///
+    /// `rebuilt` are the bodies this rebuild has already produced; they, this
+    /// feature's own input and the document's other bodies are all searched,
+    /// because the face a side ends at need not belong to the body being
+    /// swept. A new body can be raised up to the face of one that is already
+    /// there, and resolving only against this feature's input would find
+    /// nothing at all in that case: a new body starts from an empty snapshot.
     fn remeasured_sketch_region_extents(
         &self,
         action: ReplayAction,
         reports: &[(FeatureId, OperationReport)],
         input: &Snapshot,
-    ) -> ReplayAction {
+        rebuilt: &[ArchivedBody],
+    ) -> (ReplayAction, Vec<(usize, LostExtentTarget)>) {
         let ReplayAction::SketchRegionExtrusion(recipe) = &action else {
-            return action;
+            return (action, Vec::new());
         };
         if !recipe.ends_at_a_face() {
-            return action;
+            return (action, Vec::new());
         }
         let Some(frame) = self
             .document
@@ -8509,7 +8692,7 @@ impl KernelLabApp {
             })
             .map(|payload| payload.frame)
         else {
-            return action;
+            return (action, vec![(0, LostExtentTarget::SketchGone)]);
         };
         let ordered = self
             .document
@@ -8522,27 +8705,86 @@ impl KernelLabApp {
                     .map(|(feature, report)| FeatureOperationReport::new(*feature, report))
             })
             .collect::<Vec<_>>();
-        let measure = |reference: Option<&PersistentRef>, side: usize| {
-            let reference = reference?;
-            let PersistentResolution::Resolved(face) =
-                resolve_persistent_ref(reference, &ordered, input.id())
-            else {
-                return None;
+        // The bodies the reference could name, newest first: the body this
+        // rebuild has just made, then the ones it has not touched, then this
+        // feature's own input.
+        let mut seen = std::collections::BTreeSet::new();
+        let searched = rebuilt
+            .iter()
+            .map(|body| &body.body.snapshot)
+            .chain(self.bodies.iter().map(|body| &body.body.snapshot))
+            .chain(std::iter::once(input))
+            .filter(|snapshot| seen.insert(snapshot.id()))
+            .collect::<Vec<_>>();
+        let measure = |reference: Option<&PersistentRef>,
+                       side: usize|
+         -> Result<Option<f64>, LostExtentTarget> {
+            let Some(reference) = reference else {
+                return Ok(None);
             };
-            let support = NativeKernel::planar_face_support(input, face).ok()?;
-            let normal = frame_normal(support.frame)?;
-            let height = plane_height_above_frame(frame, support.frame.origin, normal, 1.0e-6)?;
+            // A reference names one producing feature, and a feature's output
+            // faces live in one body, so at most one of these can answer. The
+            // search is for which body holds the answer, never for a face that
+            // will do instead.
+            let mut ambiguous = false;
+            let mut found = None;
+            for snapshot in &searched {
+                match resolve_persistent_ref(reference, &ordered, snapshot.id()) {
+                    PersistentResolution::Resolved(face) => {
+                        found = Some((face, *snapshot));
+                        break;
+                    }
+                    PersistentResolution::Ambiguous(_) => ambiguous = true,
+                    PersistentResolution::Missing(_) => {}
+                }
+            }
+            let Some((face, owner)) = found else {
+                return Err(if ambiguous {
+                    LostExtentTarget::Ambiguous
+                } else {
+                    LostExtentTarget::Missing
+                });
+            };
+            let Ok(support) = NativeKernel::planar_face_support(owner, face) else {
+                return Err(LostExtentTarget::NoLongerAPlane);
+            };
+            let Some(normal) = frame_normal(support.frame) else {
+                return Err(LostExtentTarget::NoLongerAPlane);
+            };
+            let Some(height) =
+                plane_height_above_frame(frame, support.frame.origin, normal, 1.0e-6)
+            else {
+                return Err(LostExtentTarget::NoLongerParallel);
+            };
             let forward = if recipe.distance < 0.0 { -1.0 } else { 1.0 };
             let along = if side == 0 {
                 height * forward
             } else {
                 -height * forward
             };
-            (along > PrecisionPolicy::default().min_feature_size).then_some(along)
+            if along > PrecisionPolicy::default().min_feature_size {
+                Ok(Some(along))
+            } else {
+                Err(LostExtentTarget::NoLongerAhead)
+            }
         };
-        let first = measure(recipe.up_to_face.as_ref(), 0);
-        let second = measure(recipe.second_up_to_face.as_ref(), 1);
-        ReplayAction::SketchRegionExtrusion(recipe.clone().with_measured_distances(first, second))
+        let mut lost = Vec::new();
+        let mut side_of =
+            |reference: Option<&PersistentRef>, side: usize| match measure(reference, side) {
+                Ok(measured) => measured,
+                Err(reason) => {
+                    lost.push((side, reason));
+                    None
+                }
+            };
+        let first = side_of(recipe.up_to_face.as_ref(), 0);
+        let second = side_of(recipe.second_up_to_face.as_ref(), 1);
+        (
+            ReplayAction::SketchRegionExtrusion(
+                recipe.clone().with_measured_distances(first, second),
+            ),
+            lost,
+        )
     }
 
     /// Whether a side is waiting for the face it should end at.
@@ -8588,10 +8830,12 @@ impl KernelLabApp {
             Ok(distance) => {
                 self.extrusion_extents[side] = ExtrusionExtentIntent::ToFace(face);
                 self.set_extrusion_side_distance(side, distance);
+                let ends_at = self
+                    .extrusion_extent_face_summary(face)
+                    .unwrap_or_else(|| format!("face #{}", face.entity));
                 self.document_status = Some(format!(
-                    "Side {} ends at face #{} · {}",
+                    "Side {} ends at {ends_at} · {}",
                     side + 1,
-                    face.entity,
                     self.length_unit().format(distance)
                 ));
             }
@@ -8679,9 +8923,169 @@ impl KernelLabApp {
         });
     }
 
+    /// Turns a side over to ending at a face, and answers with the plane it
+    /// will reach when there is only one it could.
+    ///
+    /// Selection is the third of the three jobs here, after discovery and
+    /// validation, and the one the user does. Where the model offers a single
+    /// destination there is nothing to choose, and asking for a click would be
+    /// asking for a click on geometry that is, in the ordinary case of a
+    /// through cut, facing away from the camera. Where it offers several, the
+    /// side stays armed and the count is named, so the click means something.
+    /// Where it offers none, saying so is better than a prompt that can never
+    /// be satisfied.
+    ///
+    /// This runs when the user arms the pick and never during a rebuild. A
+    /// rebuild resolves the reference the feature stored and nothing else:
+    /// suggesting the only candidate while a feature is being made must never
+    /// become choosing a different one behind the user's back later.
+    fn arm_extrusion_face_pick(&mut self, side: usize) {
+        self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
+        let targets = self.remembered_extrusion_targets(side);
+        match targets.len() {
+            0 => {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
+                self.document_status = Some(
+                    "No face of this design is parallel to the sketch plane on that side, \
+                     so there is nothing for this side to end at"
+                        .to_owned(),
+                );
+            }
+            1 => {
+                let only = &targets[0];
+                let face = only.face;
+                let summary = only.summary.clone();
+                self.adopt_extrusion_extent_face(face);
+                if self.extrusion_extents[side] == ExtrusionExtentIntent::ToFace(face) {
+                    self.document_status = Some(format!(
+                        "Side {} ends at the only face it can reach · {summary}",
+                        side + 1
+                    ));
+                }
+            }
+            count => {
+                self.document_status = Some(format!(
+                    "{count} faces could end side {} · click the one you mean",
+                    side + 1
+                ));
+            }
+        }
+    }
+
+    /// [`Self::extrusion_targets`], kept until something it depends on moves.
+    ///
+    /// The bodies on screen, the sketch being swept and which way the sweep
+    /// goes are the whole of what the answer is made from, so comparing those
+    /// is enough to know the remembered answer is still the right one.
+    fn remembered_extrusion_targets(&mut self, side: usize) -> Vec<ExtrusionTarget> {
+        let bodies = self
+            .candidate_snapshots()
+            .iter()
+            .map(|snapshot| snapshot.id())
+            .collect::<Vec<_>>();
+        let reversed = self.extrusion_distance < 0.0;
+        let sketch_revision = self.sketch_revision;
+        if let Some(memo) = &self.extrusion_target_memo
+            && memo.side == side
+            && memo.reversed == reversed
+            && memo.sketch_revision == sketch_revision
+            && memo.bodies == bodies
+        {
+            return memo.targets.clone();
+        }
+        let targets = self.extrusion_targets(side);
+        self.extrusion_target_memo = Some(ExtrusionTargetMemo {
+            side,
+            bodies,
+            sketch_revision,
+            reversed,
+            targets: targets.clone(),
+        });
+        targets
+    }
+
+    /// Every snapshot a face could be picked from, each once.
+    ///
+    /// The body on screen is usually also one of the document's bodies, and
+    /// counting it twice would report every plane as carrying twice the faces
+    /// it has.
+    fn candidate_snapshots(&self) -> Vec<&Snapshot> {
+        let mut seen = std::collections::BTreeSet::new();
+        self.bodies
+            .iter()
+            .map(|body| &body.body.snapshot)
+            .chain(self.displayed.as_ref().map(|body| &body.snapshot))
+            .filter(|snapshot| seen.insert(snapshot.id()))
+            .collect()
+    }
+
+    /// Every plane in the document this side of the sweep could end at,
+    /// nearest first.
+    ///
+    /// Discovery asks the solid rather than the picture. The viewport offers
+    /// only faces whose facets point at the viewer, and the face a through cut
+    /// is aimed at is by construction the far side of the material, so
+    /// candidates taken from the screen are taken from the one place the
+    /// answer cannot be. Nothing here reads the camera, which is what makes
+    /// the set of destinations a property of the model.
+    ///
+    /// Candidates are grouped by the plane they lie on rather than listed one
+    /// per face, because a plane is what this feature actually terminates at.
+    /// Two faces at the same reach are one destination, and a tessellated body
+    /// can carry hundreds of them across a single flat wall.
+    #[must_use]
+    pub fn extrusion_targets(&self, side: usize) -> Vec<ExtrusionTarget> {
+        let tolerance = PrecisionPolicy::default().min_feature_size;
+        let mut grouped: Vec<(ExtrusionTarget, f64)> = Vec::new();
+        for snapshot in self.candidate_snapshots() {
+            for face in NativeKernel::faces(snapshot) {
+                let Ok(reach) = self.measure_extent_to_face(face, side) else {
+                    continue;
+                };
+                let Ok(description) = NativeKernel::describe_face(snapshot, face) else {
+                    continue;
+                };
+                if let Some((target, area)) = grouped
+                    .iter_mut()
+                    .find(|(target, _)| (target.reach - reach).abs() <= tolerance)
+                {
+                    target.coplanar_faces += 1;
+                    // The largest face on a plane is the one worth naming: on
+                    // a tessellated wall the rest are slivers of the same
+                    // destination.
+                    if description.area > *area {
+                        target.face = face;
+                        target.summary = description.summary.clone();
+                        *area = description.area;
+                    }
+                } else {
+                    grouped.push((
+                        ExtrusionTarget {
+                            face,
+                            reach,
+                            summary: description.summary.clone(),
+                            coplanar_faces: 1,
+                        },
+                        description.area,
+                    ));
+                }
+            }
+        }
+        grouped.sort_by(|(first, _), (second, _)| first.reach.total_cmp(&second.reach));
+        grouped.into_iter().map(|(target, _)| target).collect()
+    }
+
     /// How far a side of the staged extrusion has to sweep to end at `face`:
     /// the face must be planar, parallel to the sketch plane and lie on that
     /// side of it. The length is measured in the body the face belongs to.
+    ///
+    /// What this measures is the height of the face's *supporting plane*
+    /// above the sketch frame, not whether the sweep meets the bounded face.
+    /// A parallel face on a ledge elsewhere on the body has a plane the
+    /// profile may never reach, and the single length recorded here cannot
+    /// describe a termination that differs across the profile. That is the
+    /// supported meaning and ADR 0037 records why, so that it is not mistaken
+    /// for general termination against an arbitrary face.
     fn measure_extent_to_face(&self, face: EntityRef, side: usize) -> Result<f64, &'static str> {
         let snapshot = self
             .bodies
@@ -14451,6 +14855,12 @@ impl KernelLabApp {
                 }
             }
         });
+        // The recipe's length is the last one measured, and the face may have
+        // moved since without the recipe being rewritten: replay measures
+        // again on every rebuild. Measuring again here is what makes the
+        // number in the editor the number in the model, rather than a stale
+        // one the user would confirm without noticing.
+        self.remeasure_extrusion_extents();
         if lost_a_face {
             self.document_status = Some(
                 "That extrusion's end face is no longer on this body; it reopened at its last measured length"
@@ -17251,19 +17661,16 @@ impl KernelLabApp {
                         .corner_radius(3),
                 );
                 let response = response.on_hover_text(if wants_face {
-                    "End this side at a face parallel to the sketch plane."
+                    "End this side at the plane of a face parallel to the sketch plane. \
+                     The face is remembered, and the length is measured again on every rebuild."
                 } else {
                     "End this side at a typed distance."
                 });
                 if response.clicked() && to_face != wants_face {
-                    self.extrusion_extents[side] = if wants_face {
-                        ExtrusionExtentIntent::PickingFace
-                    } else {
-                        ExtrusionExtentIntent::Distance
-                    };
                     if wants_face {
-                        self.document_status =
-                            Some(format!("Click the face side {} should reach", side + 1));
+                        self.arm_extrusion_face_pick(side);
+                    } else {
+                        self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
                     }
                     changed = true;
                 }
@@ -17274,11 +17681,7 @@ impl KernelLabApp {
                 changed |= self.extrusion_distance_field(ui, side, unit);
             }
             ExtrusionExtentIntent::PickingFace => {
-                ui.label(
-                    RichText::new("Pick a face in the viewport")
-                        .small()
-                        .color(theme::warn()),
-                );
+                changed |= self.extrusion_target_chooser(ui, side, unit);
             }
             ExtrusionExtentIntent::ToFace(face) => {
                 let distance = if side == 0 {
@@ -17286,9 +17689,13 @@ impl KernelLabApp {
                 } else {
                     self.extrusion_second_distance.unwrap_or_default()
                 };
+                let ends_at = self.extrusion_extent_face_summary(face).map_or_else(
+                    || format!("Face #{}", face.entity),
+                    |summary| format!("Ends at {summary}"),
+                );
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("Face #{} · {}", face.entity, unit.format(distance)))
+                        RichText::new(format!("{ends_at} · {}", unit.format(distance)))
                             .small()
                             .color(theme::good()),
                     );
@@ -17298,13 +17705,86 @@ impl KernelLabApp {
                     {
                         self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
                         self.document_status =
-                            Some(format!("Click the face side {} should reach", side + 1));
+                            Some(format!("Choose where side {} should end", side + 1));
                         changed = true;
                     }
                 });
             }
         }
         changed
+    }
+
+    /// The places this side could end, listed for the user to choose from.
+    ///
+    /// A through cut ends at the far side of the material, which is the one
+    /// face the camera is guaranteed not to be showing: the viewport draws
+    /// only the facets turned towards the viewer. Making a click in the
+    /// viewport the only way to choose is therefore asking for a click on
+    /// something that is not on screen, which is exactly what made this
+    /// option look broken. The list is the route; the click is the shortcut
+    /// for a destination that happens to be visible.
+    fn extrusion_target_chooser(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: usize,
+        unit: units::LengthUnit,
+    ) -> bool {
+        let targets = self.remembered_extrusion_targets(side);
+        if targets.is_empty() {
+            ui.label(
+                RichText::new("Nothing on this side is parallel to the sketch plane")
+                    .small()
+                    .color(theme::warn()),
+            );
+            return false;
+        }
+        ui.label(
+            RichText::new("Choose where this side ends")
+                .small()
+                .color(theme::muted()),
+        );
+        let mut chosen = None;
+        for target in &targets {
+            let response = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!(
+                            "{} · {}",
+                            unit.format(target.reach),
+                            target.summary
+                        ))
+                        .small(),
+                    )
+                    .wrap()
+                    .corner_radius(3),
+                )
+                .on_hover_text(if target.coplanar_faces > 1 {
+                    format!(
+                        "Sweeps {} to this plane, which {} faces of the design lie on",
+                        unit.format(target.reach),
+                        target.coplanar_faces
+                    )
+                } else {
+                    format!("Sweeps {} to this plane", unit.format(target.reach))
+                });
+            if response.clicked() {
+                chosen = Some(target.face);
+            }
+        }
+        if let Some(face) = chosen {
+            self.adopt_extrusion_extent_face(face);
+            return true;
+        }
+        false
+    }
+
+    /// The face a side ends at, in the kernel's own words.
+    fn extrusion_extent_face_summary(&self, face: EntityRef) -> Option<String> {
+        self.candidate_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.id() == face.snapshot)
+            .and_then(|snapshot| NativeKernel::describe_face(snapshot, face).ok())
+            .map(|description| description.summary)
     }
 
     /// One side's distance field, in the document's unit.
@@ -19587,6 +20067,22 @@ impl KernelLabApp {
                     .as_deref()
                     .unwrap_or("Parametric document is current"),
             );
+            // A side that has stopped following the face it was told to end at
+            // looks exactly like one that is still following it, so it says so
+            // here until a rebuild finds the face again.
+            if !self.lost_extent_reports.is_empty() {
+                let count = self.lost_extent_reports.len();
+                ui.label(
+                    RichText::new(if count == 1 {
+                        "1 END LOST".to_owned()
+                    } else {
+                        format!("{count} ENDS LOST")
+                    })
+                    .small()
+                    .color(theme::warn()),
+                )
+                .on_hover_text(self.lost_extent_reports.join("\n"));
+            }
             ui.separator();
             let entries = &self.feature_preview.entries;
             let document_features = self.document.features();

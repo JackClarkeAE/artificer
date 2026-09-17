@@ -11143,16 +11143,37 @@ mod tests {
         assert!(second.snapshot.measures().volume < first.snapshot.measures().volume);
         assert!(NativeKernel::validate(&second.snapshot, ValidationProfile::Solid).valid);
         let presentation = NativeKernel::debug_scene(&second.snapshot);
+        // The planar fragment fan must not reach the screen. This used to be
+        // stated as a ratio — visible edges had to stay under a seventh of the
+        // total — because the fan was there and the question was whether its
+        // seams were being drawn. The coplanar merge removes the fan itself, so
+        // the ratio no longer measures anything: it was counting the smooth
+        // interior seams, and removing them raises it while improving the
+        // drawing.
+        //
+        // The measurement that replaced it is a better statement of the same
+        // intent. This body publishes 4,470 edges without the merge and 834
+        // with it. Of those, 519 draw without the merge and 366 with it — not
+        // because any line went missing, but because a line that arrived as
+        // several collinear pieces now arrives as one edge, the vertices
+        // between them having been dissolved as corners to nobody.
+        //
+        // So bound the total, and pin the direction: the merge takes seams
+        // out and joins collinear runs, and neither can put a new line on
+        // the screen.
         let visible_edges = presentation
             .edges
             .iter()
             .filter(|edge| !edge.is_smooth)
             .count();
         assert!(
-            visible_edges * 7 < presentation.edges.len(),
-            "crossing-cut tessellation must not publish its planar fragment fan: \
-             {visible_edges} visible / {} total edges",
+            presentation.edges.len() < 1_100,
+            "crossing-cut tessellation is publishing a planar fragment fan: {} edges",
             presentation.edges.len(),
+        );
+        assert!(
+            (300..=519).contains(&visible_edges),
+            "the merge may join drawn lines; it may not add one: {visible_edges} visible"
         );
         let logical_cylindrical_sides = second
             .snapshot

@@ -43,7 +43,7 @@ approximated or discovered:
 | | Plane | Cylinder | Cone | Sphere | Torus |
 |---|---|---|---|---|---|
 | **Plane** | line | circle ⟂ axis, generators ∥ axis | circle ⟂ axis | circle | circles ⟂ axis, circles through the axis |
-| **Cylinder** | | coaxial, parallel axes | coaxial | centre on the axis | — |
+| **Cylinder** | | coaxial, parallel axes, equal radii on crossing axes | coaxial | centre on the axis | — |
 | **Cone** | | | coaxial | — | — |
 | **Sphere** | | | | any pair | — |
 | **Torus** | | | | | coaxial, equal major radii |
@@ -245,3 +245,86 @@ The cost is that the matrix is narrow, and widening it is not free — each new
 pair is its own derivation and its own gate. Adding ellipses to the curve
 vocabulary would open a large part of the empty half of the table at once, and
 is the natural next question once reconstruction works.
+
+## Amendment: equal radii on crossing axes (2026-09-17)
+
+The cylinder pair gained one entry. Two cylinders of the same radius whose
+axes cross meet in two ellipses rather than a quartic, and the derivation is
+short enough to state here: take the crossing point as the origin, and a point
+on a cylinder of radius `r` about unit axis `a` satisfies `|x|² − (x·a)² = r²`.
+A point on both cylinders therefore satisfies `(x·a)² = (x·b)²`, which factors
+into `x·(a−b) = 0` and `x·(a+b) = 0` — the two bisector planes of the axes. The
+quartic is a pair of plane sections, and a plane section of a cylinder is an
+ellipse already in the vocabulary, so the new case is served by the existing
+plane-cylinder derivation rather than by one of its own.
+
+Equal radii is what cancels the `r²`; crossing axes are what put the origin on
+both. Away from either, the curve really is a quartic and is still refused.
+This is ADR 0026 K1 stage 3, and it is the entry that prediction in the
+consequences above was pointing at: the ellipse was added to the curve
+vocabulary for oblique plane sections, and it turned out to cover this too.
+
+**The construction now follows.** Two equal bores on crossing axes publish ten
+faces, one shell, and the volume `s³ − 2πr²s + 16r³/3` to the last digit. Ten
+is the box's six planes plus the two half-walls each bore already has — a
+single bore publishes eight — so the crossing adds no face at all: the seam the
+bores share parts neither wall, because each was already parted at its own
+cylinder's seam. The faceted route reached the same body as 2,959 faces before
+ADR 0039's coplanar merge, 229 after it, and a volume 0.0948% wrong.
+
+Getting there took four corrections, and the order matters, because each of the
+first three was hidden by the one after it.
+
+- **Periodic section chaining** refused any welded vertex of degree above two.
+  The crossing bore presents 4 seam segments with one degree-4 vertex and two
+  of degree 2 — the figure of eight, with the two sinusoids crossing at one
+  azimuth in the face's window. Taking the next branch round, rather than
+  asking for the only one, closes each lobe.
+- **That walk was not a walk.** Continuing into whichever piece was still
+  unused is not a rule where several branches leave one point: the successor
+  then depends on where the walk has already been, and the same four arcs trace
+  differently according to the order they arrived in. Walking *directed*
+  halfedges with a fixed successor — the branch immediately clockwise from the
+  way back — makes the cycles a property of the arrangement. Two consequences
+  are peculiar to the directed walk: a dangling run is walked once in each
+  direction and must be kept once, and of each pair of cycles bounding the same
+  loop only the positively wound one is a region.
+- **The bands were stacked by an average that cannot separate them.** A
+  section that does not close is closed by bands cut between consecutive
+  traces, so their order decides which side of each trace the section claims as
+  the other solid's material. The two traces of a Steinmetz seam are
+  reflections of one another about the middle of the window and average to the
+  same number, bit for bit, so the order came from the order they arrived in.
+  Half the time the bands spanned the lens between the traces instead of
+  avoiding it, and the section put the other solid's material exactly where its
+  void is. Stacking by height sampled across the window is a real order
+  wherever the traces do not cross inside it — and this pair crosses exactly on
+  the seams, where the window ends.
+- **The 2D Boolean** hits the pinch in its sew, where it wants exactly one
+  outgoing piece per vertex; then coincident cuts, where the tangential touch
+  puts two cut parameters within tolerance of each other; then a chain that
+  dead-ends because splitting one curve and not its partner leaves endpoints
+  that agree geometrically and not bitwise. Welding piece endpoints before
+  chaining, keeping the first of a run of coincident cuts, and choosing the
+  continuation by angle get past all three.
+
+The record used to end here, with the 2D-Boolean work backed out because
+carried that far it turned a construction that worked approximately into one
+that failed outright — four coedge orientations wrong and an Euler
+characteristic of −5, which is odd and so impossible. That was a true
+measurement and the wrong conclusion drawn from it. Those changes were never
+the fault; they were the layer that got far enough for the band ordering above
+to become visible. With the ordering corrected they go back in unchanged, and
+the same body validates.
+
+Two things were ruled out along the way and stay ruled out. The traversal
+handedness is not free — taking the sharpest left, or continuing straight
+through the pinch, refuses. And the seam does not depend on which wall asks:
+each face requests the intersection with itself named first, which returned two
+parameterizations of one curve until the pair was ordered by axis.
+
+What made the difference in the end was testing the arrangement rather than the
+body. Both remaining faults were the same fault in different clothes — an
+answer that depended on the order its inputs arrived in — and both were found
+by handing one fixture every permutation of its own pieces and asking whether
+the answer changed, which no test of a whole body can localise.

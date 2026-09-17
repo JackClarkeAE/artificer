@@ -491,12 +491,18 @@ fn fillet_permutation_6_cuts_with_filleted_outer_edges() {
     );
     assert_fillet_presentation_invariants(&filleted_cut, "fp6-fillet-crossing-cuts");
 
-    // Internal facet seams of both crossing cuts remain smooth/hidden
+    // Every seam within a bore wall stays smooth. This used to read "more than
+    // twenty", counting the seams between the panels of a faceted bore; two
+    // equal bores on crossing axes are exact now, so there are no panels and
+    // the seams are the ones the walls genuinely have — each bore parted into
+    // halves, and the pair's own shared seam. Counting those is the assertion
+    // that survives: what mattered was never the number but that none of them
+    // is drawn as a crease across curvature that has none.
     let scene = NativeKernel::debug_scene(&filleted_cut);
-    let smooth_count = scene.edges.iter().filter(|e| e.is_smooth).count();
+    let smooth_count = scene.edges.iter().filter(|edge| edge.is_smooth).count();
     assert!(
-        smooth_count > 20,
-        "internal cylindrical panels of cut bores must remain smooth (found {smooth_count})"
+        smooth_count >= 8,
+        "the seams within a bore wall must stay smooth (found {smooth_count})"
     );
 }
 

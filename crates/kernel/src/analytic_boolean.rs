@@ -240,6 +240,265 @@ fn section_on_face(
 /// chain is closed round the outside of the window, on whichever side the
 /// other solid's material lies, so the face's 2D Boolean sees a region
 /// rather than a cut line. Chains that already close are kept as they are.
+/// Walks welded section pieces into oriented chains, each either closed or
+/// running from one loose end to another.
+///
+/// The walk is over *directed* halfedges with a fixed successor, not over
+/// pieces with a "take whichever is still unused" continuation. That
+/// distinction is the whole of this function.
+///
+/// Where a seam crosses itself — the pinch between the two lobes of a
+/// Steinmetz seam is the case that brought this about — several branches leave
+/// one point, and a walk that continues into whichever branch happens to be
+/// unused has a successor that depends on where it has already been. The same
+/// four arcs then trace differently according to the order they arrived in:
+/// measured on the fixture in this module's tests, some orders give two lobes
+/// wound the same way and others give them wound oppositely, which is exactly
+/// the disagreement that leaves two faces traversing a shared edge the same
+/// way round.
+///
+/// With a fixed successor the cycles are a property of the arrangement. At the
+/// far end of a halfedge, take the outgoing branch immediately clockwise from
+/// the way back: that is the standard face-boundary walk, it keeps the
+/// material the chain bounds on one side, and every halfedge lies in exactly
+/// one cycle however the pieces were listed.
+fn trace_section_chains(welded: &[Segment]) -> Vec<Vec<Segment>> {
+    // A halfedge is a piece walked one way: `2·index` forward, `+1` reversed.
+    let count = welded.len();
+    let oriented = |halfedge: usize| -> Segment {
+        let piece = welded[halfedge / 2];
+        if halfedge.is_multiple_of(2) {
+            piece
+        } else {
+            piece.reversed()
+        }
+    };
+    let twin = |halfedge: usize| halfedge ^ 1;
+    let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
+    // The direction a halfedge sets off in from its own origin.
+    let leaving = |halfedge: usize| -> Option<Point2> {
+        let segment = oriented(halfedge);
+        let (from, to) = (segment.start(), segment.point_at(0.05));
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let length = dx.hypot(dy);
+        (length > 0.0).then(|| Point2::new(dx / length, dy / length))
+    };
+    let mut outgoing: std::collections::BTreeMap<(u64, u64), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for halfedge in 0..count * 2 {
+        outgoing
+            .entry(key(oriented(halfedge).start()))
+            .or_default()
+            .push(halfedge);
+    }
+    // The next halfedge round the face this one bounds: the branch immediately
+    // clockwise from the way back. With one branch that is the way back
+    // itself, so a loose end turns the walk around, which is what a face
+    // boundary does at a dangling edge.
+    let successor = |halfedge: usize| -> Option<usize> {
+        let back = twin(halfedge);
+        let branches = outgoing.get(&key(oriented(back).start()))?;
+        let reference = leaving(back)?;
+        branches.iter().copied().min_by(|left, right| {
+            let turn = |branch: &usize| {
+                if *branch == back {
+                    // The way back is the last resort, not the first
+                    // choice: a full turn rather than none.
+                    return std::f64::consts::TAU;
+                }
+                let Some(out) = leaving(*branch) else {
+                    return f64::INFINITY;
+                };
+                let angle = (reference.x * out.y - reference.y * out.x)
+                    .atan2(reference.x * out.x + reference.y * out.y);
+                if angle >= -1.0e-12 {
+                    std::f64::consts::TAU - angle
+                } else {
+                    -angle
+                }
+            };
+            turn(left).total_cmp(&turn(right))
+        })
+    };
+
+    let mut visited = vec![false; count * 2];
+    let mut cycles: Vec<Vec<usize>> = Vec::new();
+    for start in 0..count * 2 {
+        if visited[start] {
+            continue;
+        }
+        let mut cycle = Vec::new();
+        let mut cursor = start;
+        for _ in 0..count * 2 {
+            visited[cursor] = true;
+            cycle.push(cursor);
+            let Some(next) = successor(cursor) else { break };
+            if next == start {
+                break;
+            }
+            if visited[next] {
+                // A successor already spoken for means the relation is not the
+                // permutation it should be; stop rather than loop.
+                break;
+            }
+            cursor = next;
+        }
+        cycles.push(cycle);
+    }
+
+    // A cycle that walks a halfedge and then its twin is going out along a
+    // dangling run and coming back: that is an open chain, and the turn-backs
+    // are where to cut it. A cycle with no turn-back is closed.
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut rings: Vec<Vec<usize>> = Vec::new();
+    for cycle in cycles {
+        let length = cycle.len();
+        let turns_back = |position: usize| cycle[position] == twin(cycle[(position + 1) % length]);
+        let Some(cut) = (0..length).find(|position| turns_back(*position)) else {
+            rings.push(cycle);
+            continue;
+        };
+        // Start just after a turn-back, so the runs between turn-backs are
+        // whole. A cycle whose walk happened to begin in the middle of a
+        // dangling run would otherwise hand back that run's two halves as
+        // though they were separate chains.
+        let mut ordered = cycle;
+        ordered.rotate_left(cut + 1);
+        let mut run: Vec<usize> = Vec::new();
+        for position in 0..length {
+            run.push(ordered[position]);
+            if ordered[position] == twin(ordered[(position + 1) % length]) {
+                runs.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+    }
+
+    let mut chains: Vec<Vec<Segment>> = Vec::new();
+    // A face boundary walks a dangling run once in each direction, because
+    // there is no other face on the far side of it to walk it back. The run is
+    // one chain, not two, so the return journey is dropped. Which of the pair
+    // survives is then settled by the geometry rather than by which was walked
+    // first: an open chain has no material side to hold it one way round, and
+    // left to right is the way the periodic window is stitched.
+    let mut kept: Vec<Vec<usize>> = Vec::new();
+    for run in runs {
+        let back: Vec<usize> = run.iter().rev().map(|halfedge| twin(*halfedge)).collect();
+        if !kept.contains(&back) {
+            kept.push(run);
+        }
+    }
+    for run in kept {
+        let walked: Vec<Segment> = run.into_iter().map(&oriented).collect();
+        let (from, to) = (walked[0].start(), walked[walked.len() - 1].end());
+        let forwards = from
+            .x
+            .total_cmp(&to.x)
+            .then(from.y.total_cmp(&to.y))
+            .is_le();
+        chains.push(if forwards {
+            walked
+        } else {
+            walked.iter().rev().map(|piece| piece.reversed()).collect()
+        });
+    }
+    // Every closed cycle bounds a cell, with the cell on its left. The cells
+    // that hold material wind positive; the arrangement's complement, and the
+    // inside of every ring, wind negative. Keeping the positive ones keeps each
+    // bounding loop exactly once — whether it stands alone, is one of several
+    // disjoint loops, or is a ring, whose inner loop arrives positive as the
+    // boundary of the cell it encloses. Nesting is then read off by
+    // containment, which is `nest_section_loops`, not by winding.
+    for ring in rings {
+        let walked: Vec<Segment> = ring.into_iter().map(&oriented).collect();
+        if chain_signed_area(&walked) > 0.0 {
+            chains.push(walked);
+        }
+    }
+    chains
+}
+
+/// The area a chain encloses in the face's own parameter space, sampled along
+/// each arc so a harmonic's bow counts rather than only its chord.
+fn chain_signed_area(chain: &[Segment]) -> f64 {
+    let mut points: Vec<Point2> = Vec::new();
+    for segment in chain {
+        for step in 0..16 {
+            points.push(segment.point_at(f64::from(step) / 16.0));
+        }
+    }
+    let count = points.len();
+    if count < 3 {
+        return 0.0;
+    }
+    (0..count)
+        .map(|index| {
+            let (a, b) = (points[index], points[(index + 1) % count]);
+            a.x.mul_add(b.y, -(b.x * a.y))
+        })
+        .sum::<f64>()
+        * 0.5
+}
+
+/// Orders the open chains across a periodic window from low to high, by where
+/// they run rather than by their average height.
+///
+/// The bands that close the window are cut between consecutive chains, so this
+/// order decides which chain each band reaches from and to, and therefore which
+/// side of each chain the section claims as the other solid's material.
+///
+/// Averaging a chain's height cannot do it. Two chains that are reflections of
+/// one another about the same level average to the same number, and the two
+/// traces of a Steinmetz seam on a bore wall are exactly that pair:
+/// `v = 980 ± 8·cos u`, both averaging 980 to the last bit. The order then came
+/// from the order the chains happened to arrive in, and the bands came out
+/// spanning the lens between the traces instead of avoiding it — so the section
+/// said the other solid's material was where its void is, and the face's 2D
+/// Boolean was handed a hole where it should have been handed a region.
+///
+/// Comparing heights at sampled azimuths is a real order wherever the chains do
+/// not cross inside the window, which is the case they have to be stackable in
+/// anyway: two chains that cross part the window into more bands than there are
+/// gaps between them. The Steinmetz pair crosses exactly on the seams, where
+/// the window ends.
+fn stack_open_chains(open: &mut [Vec<Segment>], u_min: f64, u_max: f64) {
+    // A chain's height at one azimuth, by bisecting the piece that spans it.
+    // Every chain reaches across the whole window, so every chain has a height
+    // at every azimuth inside it.
+    let height_at = |chain: &[Segment], u: f64| -> f64 {
+        let piece = chain
+            .iter()
+            .find(|piece| piece.start().x <= u && u <= piece.end().x)
+            .copied()
+            .unwrap_or(chain[chain.len() / 2]);
+        let (mut low, mut high) = (0.0_f64, 1.0_f64);
+        for _ in 0..48 {
+            let middle = 0.5 * (low + high);
+            if piece.point_at(middle).x < u {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        piece.point_at(0.5 * (low + high)).y
+    };
+    let profile = |chain: &[Segment]| -> Vec<f64> {
+        (1..8)
+            .map(|step| height_at(chain, (u_max - u_min).mul_add(f64::from(step) / 8.0, u_min)))
+            .collect()
+    };
+    open.sort_by(|left, right| {
+        profile(left)
+            .into_iter()
+            .zip(profile(right))
+            .map(|(left, right)| left.total_cmp(&right))
+            .find(|order| order.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 fn close_periodic_sections(
     pieces: Vec<Segment>,
     region: &[Vec<Segment>],
@@ -332,56 +591,9 @@ fn close_periodic_sections(
         })
         .collect();
     let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
-    let mut touching: std::collections::BTreeMap<(u64, u64), Vec<usize>> =
-        std::collections::BTreeMap::new();
-    for (index, segment) in welded.iter().enumerate() {
-        touching
-            .entry(key(segment.start()))
-            .or_default()
-            .push(index);
-        touching.entry(key(segment.end())).or_default().push(index);
-    }
-    if touching.values().any(|ends| ends.len() > 2) {
-        return Err(AnalyticBooleanError::DomainUnsupported);
-    }
-    let mut used = vec![false; welded.len()];
     let mut loops: Vec<Vec<Segment>> = Vec::new();
     let mut open: Vec<Vec<Segment>> = Vec::new();
-    // Open chains start at a degree-one end; closed ones anywhere.
-    let mut order: Vec<usize> = (0..welded.len())
-        .filter(|index| {
-            touching[&key(welded[*index].start())].len() == 1
-                || touching[&key(welded[*index].end())].len() == 1
-        })
-        .collect();
-    order.extend(0..welded.len());
-    for start in order {
-        if used[start] {
-            continue;
-        }
-        // Start at a free end, if the piece has one, and walk away from it.
-        let start_free = touching[&key(welded[start].start())].len() == 1;
-        let end_free = touching[&key(welded[start].end())].len() == 1;
-        let mut forward = start_free || !end_free;
-        let mut chain = Vec::new();
-        let mut cursor = start;
-        loop {
-            used[cursor] = true;
-            let oriented = if forward {
-                welded[cursor]
-            } else {
-                welded[cursor].reversed()
-            };
-            let arrival = key(oriented.end());
-            chain.push(oriented);
-            let next = touching[&arrival]
-                .iter()
-                .copied()
-                .find(|candidate| !used[*candidate]);
-            let Some(next) = next else { break };
-            forward = key(welded[next].start()) == arrival;
-            cursor = next;
-        }
+    for mut chain in trace_section_chains(&welded) {
         let first = chain[0].start();
         let last = chain[chain.len() - 1].end();
         if key(first) == key(last) {
@@ -460,14 +672,7 @@ fn close_periodic_sections(
                 .ok_or(AnalyticBooleanError::DomainUnsupported)?;
         }
     }
-    let mean_height = |chain: &[Segment]| -> f64 {
-        let samples = chain
-            .iter()
-            .flat_map(|piece| (0..=4).map(move |step| piece.point_at(f64::from(step) / 4.0).y))
-            .collect::<Vec<_>>();
-        samples.iter().sum::<f64>() / samples.len() as f64
-    };
-    open.sort_by(|a, b| mean_height(a).total_cmp(&mean_height(b)));
+    stack_open_chains(&mut open, u_min, u_max);
     let lowest = &open[0];
     let probe = lowest[lowest.len() / 2].point_at(0.5);
     let step = (v_max - v_min).max(1.0) * 1.0e-3;
@@ -995,7 +1200,50 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                     let to_azimuth = section.azimuth_at((start_angle + sweep) * sign);
                     Some(section.segment(from_azimuth, to_azimuth))
                 }
-                Segment::Harmonic { .. } => None,
+                harmonic @ Segment::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                    start,
+                    end,
+                } => {
+                    // The seam two crossing cylinders share (ADR 0026, K1
+                    // stage 3). It is one ellipse in space traced on two
+                    // walls, so it is rebuilt from the source trace and asked
+                    // for its trace here; only the parameterization changes.
+                    //
+                    // This is the first pair where both carriers are
+                    // cylinders. Every earlier in-matrix pair put a plane on
+                    // one side, which is why the arm above exists and this one
+                    // did not.
+                    let Surface::Cylinder(source_cylinder) = from else {
+                        return None;
+                    };
+                    let source = CylinderSectionHarmonic {
+                        cylinder: *source_cylinder,
+                        mean,
+                        amplitude,
+                        phase,
+                    };
+                    let (center, major_axis, minor_axis, major, minor) = source.ellipse()?;
+                    let section = cylinder_section_harmonic(
+                        cylinder, center, major_axis, minor_axis, major, minor,
+                    )?;
+                    // The azimuths come from the endpoints themselves, and the
+                    // midpoint says which way round the branch runs: a pair of
+                    // endpoints alone cannot tell a span from its complement,
+                    // and on a seam that wraps the wall the difference is the
+                    // whole face.
+                    let first = local(world(start)?);
+                    let last = local(world(end)?);
+                    let middle = local(world(harmonic.point_at(0.5))?);
+                    let tau = std::f64::consts::TAU;
+                    let nearest =
+                        |value: f64, target: f64| value + ((target - value) / tau).round() * tau;
+                    let through = nearest(middle.x, first.x);
+                    let to = nearest(last.x, first.x + 2.0 * (through - first.x));
+                    Some(section.segment(first.x, to))
+                }
             }
         }
         _ => None,
@@ -1339,4 +1587,506 @@ pub(crate) fn operands_in_engine_vocabulary(target: &Topology, tool: &Topology) 
         .iter()
         .chain(&tool.faces)
         .all(|face| matches!(face.value.surface, Surface::Plane(_) | Surface::Cylinder(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Steinmetz seam as it reaches a bore wall, reduced to the smallest
+    /// fixture that carries the defect: two harmonics `v = ±8·cos u` over
+    /// `u ∈ [−π/2, 3π/2]`, each split at `u = π/2`.
+    ///
+    /// Four arcs, with endpoint degrees 2, 4 and 2 — the pattern ADR 0025
+    /// records from the real body. The two lobes enclose 32 each, so the
+    /// traversal has exactly one right answer: two loops, of area ±32.
+    fn four_harmonic_arcs() -> Vec<Segment> {
+        let pi = std::f64::consts::PI;
+        // Both curves cross zero at every one of −π/2, π/2 and 3π/2, so the
+        // endpoints are written as exact zeros. Evaluating `8·cos` there
+        // instead gives values a few times 1e-16 apart that differ between the
+        // two curves, and the pinch they are supposed to share stops being one
+        // point. The pipeline welds before it traverses; the fixture has to
+        // arrive welded for the same reason.
+        let arc = |phase: f64, from: f64, to: f64| Segment::Harmonic {
+            mean: 0.0,
+            amplitude: 8.0,
+            phase,
+            start: Point2::new(from, 0.0),
+            end: Point2::new(to, 0.0),
+        };
+        vec![
+            arc(0.0, -pi / 2.0, pi / 2.0),
+            arc(0.0, pi / 2.0, 3.0 * pi / 2.0),
+            arc(pi, -pi / 2.0, pi / 2.0),
+            arc(pi, pi / 2.0, 3.0 * pi / 2.0),
+        ]
+    }
+
+    /// The area a chain encloses in the face's own parameter space, sampled
+    /// along each arc so a harmonic's bow counts rather than only its chord.
+    fn signed_area(chain: &[Segment]) -> f64 {
+        let mut points: Vec<Point2> = Vec::new();
+        for segment in chain {
+            for step in 0..32 {
+                points.push(segment.point_at(f64::from(step) / 32.0));
+            }
+        }
+        let count = points.len();
+        (0..count)
+            .map(|index| {
+                let (a, b) = (points[index], points[(index + 1) % count]);
+                a.x.mul_add(b.y, -(b.x * a.y))
+            })
+            .sum::<f64>()
+            * 0.5
+    }
+
+    /// What a chain *is*, written so two chains describing the same loop from
+    /// different starting pieces come out the same.
+    ///
+    /// Each piece is rendered by where it begins, where it ends and where its
+    /// middle bows to, so an arc is told apart from its chord and from the
+    /// other arc on the same two endpoints. A closed chain is then rotated to
+    /// its least rendering, which is the cyclic-loop-start half of the property
+    /// under test: a loop has no first edge, so the traversal must not depend
+    /// on which one it happened to walk first.
+    fn canonical(chain: &[Segment]) -> String {
+        let place = |point: Point2| format!("{:.6},{:.6}", point.x, point.y);
+        let mut pieces: Vec<String> = chain
+            .iter()
+            .map(|segment| {
+                format!(
+                    "{}>{}~{}",
+                    place(segment.start()),
+                    place(segment.end()),
+                    place(segment.point_at(0.5))
+                )
+            })
+            .collect();
+        let closes = chain
+            .first()
+            .zip(chain.last())
+            .is_some_and(|(first, last)| {
+                let (from, to) = (first.start(), last.end());
+                (from.x - to.x).hypot(from.y - to.y) < 1.0e-9
+            });
+        if closes
+            && let Some(least) = (0..pieces.len()).min_by_key(|start| {
+                let mut rotated = pieces.clone();
+                rotated.rotate_left(*start);
+                rotated.join("|")
+            })
+        {
+            pieces.rotate_left(least);
+        }
+        pieces.join("|")
+    }
+
+    /// What a presentation traces, as one comparable string: how many chains,
+    /// what each encloses, and what each *is*.
+    fn fingerprint(pieces: &[Segment]) -> String {
+        let chains = trace_section_chains(pieces);
+        let mut described: Vec<String> = chains
+            .iter()
+            .map(|chain| {
+                format!(
+                    "[{}] {}",
+                    (signed_area(chain) * 1_000.0).round() as i64,
+                    canonical(chain)
+                )
+            })
+            .collect();
+        described.sort();
+        format!(
+            "{} chain(s):\n    {}",
+            chains.len(),
+            described.join("\n    ")
+        )
+    }
+
+    /// Asserts every presentation traces the same thing, and hands back what
+    /// they agree on so the caller can go on to check it is the right thing.
+    fn agreed(presentations: &[Vec<Segment>]) -> String {
+        let expected = fingerprint(&presentations[0]);
+        let mut wrong: Vec<String> = Vec::new();
+        for (index, pieces) in presentations.iter().enumerate().skip(1) {
+            let found = fingerprint(pieces);
+            if found != expected && wrong.len() < 4 {
+                wrong.push(format!("presentation {index}: {found}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the same pieces trace differently depending on the order they \
+             arrive in.\n  presentation 0: {expected}\n  {}",
+            wrong.join("\n  ")
+        );
+        expected
+    }
+
+    /// Deterministic shufflings of a piece list, each with its own subset
+    /// handed in reversed, for fixtures too large to enumerate exhaustively.
+    fn some_presentations(pieces: &[Segment], how_many: usize) -> Vec<Vec<Segment>> {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        (0..how_many)
+            .map(|_| {
+                let mut order: Vec<usize> = (0..pieces.len()).collect();
+                for slot in (1..order.len()).rev() {
+                    order.swap(slot, (next() % (slot as u64 + 1)) as usize);
+                }
+                order
+                    .into_iter()
+                    .map(|index| {
+                        if next() % 2 == 0 {
+                            pieces[index]
+                        } else {
+                            pieces[index].reversed()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Every ordering of the same four arcs, with every subset of them handed
+    /// in reversed: 24 × 16 ways of describing one curve.
+    fn every_presentation(arcs: &[Segment]) -> Vec<Vec<Segment>> {
+        let mut orders = vec![vec![0, 1, 2, 3]];
+        for _ in 0..3 {
+            let mut grown = Vec::new();
+            for order in &orders {
+                for rotation in 0..4 {
+                    let mut next = order.clone();
+                    next.rotate_left(rotation);
+                    if !grown.contains(&next) {
+                        grown.push(next);
+                    }
+                }
+            }
+            orders = grown;
+        }
+        // Rotations alone are four of the twenty-four; add the swaps that
+        // reach the rest.
+        let mut permutations: Vec<Vec<usize>> = Vec::new();
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = vec![a, b, c, d];
+                        let mut seen = order.clone();
+                        seen.sort_unstable();
+                        seen.dedup();
+                        if seen.len() == 4 {
+                            permutations.push(order);
+                        }
+                    }
+                }
+            }
+        }
+        let mut presentations = Vec::new();
+        for order in permutations {
+            for mask in 0..16_u32 {
+                presentations.push(
+                    order
+                        .iter()
+                        .enumerate()
+                        .map(|(slot, index)| {
+                            let arc = arcs[*index];
+                            if mask >> slot & 1 == 1 {
+                                arc.reversed()
+                            } else {
+                                arc
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        presentations
+    }
+
+    /// The traversal must describe the curve, not the order the curve arrived
+    /// in. Two lobes meeting at a pinch are two loops of 32 however the arcs
+    /// are listed — and a walk that continues into whichever branch is still
+    /// unused can instead return one pinched loop, or one whose lobes cancel
+    /// to nothing.
+    ///
+    /// Two things are asserted, and they are not the same thing. That every
+    /// presentation agrees is the property the fix is for; that what they agree
+    /// on is two lobes of 32 wound the same way is what says the agreement is
+    /// on the right answer rather than on a consistent wrong one.
+    #[test]
+    fn a_pinched_section_traces_the_same_two_lobes_however_its_arcs_arrive() {
+        let arcs = four_harmonic_arcs();
+        let presentations = every_presentation(&arcs);
+        assert_eq!(presentations.len(), 384);
+        // The fingerprint carries the chains themselves, each up to where its
+        // walk started, and not only their areas: that is what makes this a
+        // test of the arrangement rather than of two numbers that could agree
+        // by coincidence.
+        agreed(&presentations);
+
+        // And the answer they agree on is the one the geometry has. Each lobe
+        // is `∫ 8·cos u du` over half a period, which is 32; sampling it as a
+        // polygon undercuts that by a few hundredths.
+        let chains = trace_section_chains(&presentations[0]);
+        assert_eq!(chains.len(), 2, "a pinch is two lobes, not one loop");
+        for chain in &chains {
+            let area = signed_area(chain);
+            assert!(
+                (area - 32.0).abs() < 0.1,
+                "a lobe of this fixture encloses 32, wound positive; this one \
+                 encloses {area:.3}"
+            );
+        }
+    }
+
+    /// A section that does not close is the ordinary case on a bore wall: the
+    /// trace runs across the parameter window and out the other side, and the
+    /// periodic stitching downstream closes it round the seams.
+    ///
+    /// A face boundary walks such a run once each way, because there is no
+    /// second face on the far side of it to walk it back. Both journeys are the
+    /// same chain, and handing back both doubles every open section — which
+    /// `nest_section_loops` reads as a loop containing itself, so every depth
+    /// comes out one too high and outer loops are taken for holes.
+    #[test]
+    fn an_open_run_is_one_chain_and_not_its_return_journey_as_well() {
+        let corner = |from: (f64, f64), to: (f64, f64)| Segment::Line {
+            start: Point2::new(from.0, from.1),
+            end: Point2::new(to.0, to.1),
+        };
+        let path = vec![
+            corner((0.0, 0.0), (1.0, 1.0)),
+            corner((1.0, 1.0), (2.0, 0.0)),
+            corner((2.0, 0.0), (3.0, 1.5)),
+        ];
+        let presentations = some_presentations(&path, 200);
+        agreed(&presentations);
+
+        let chains = trace_section_chains(&presentations[0]);
+        assert_eq!(chains.len(), 1, "one run out and back is one chain");
+        assert_eq!(chains[0].len(), 3, "and it is the whole run");
+        assert!(
+            chains[0][0].start().x < chains[0][2].end().x,
+            "an open chain is handed back running left to right"
+        );
+    }
+
+    /// Two sections that never meet are two loops. The walk finds four cycles —
+    /// each loop's inside and each loop's outside — and only the insides are
+    /// regions. Keeping the single most negative of them, as a first attempt
+    /// did, leaves one loop still doubled by its own outside.
+    #[test]
+    fn two_loops_that_never_meet_come_back_as_two_loops() {
+        let corner = |from: (f64, f64), to: (f64, f64)| Segment::Line {
+            start: Point2::new(from.0, from.1),
+            end: Point2::new(to.0, to.1),
+        };
+        let square = |x: f64| {
+            vec![
+                corner((x, 0.0), (x + 1.0, 0.0)),
+                corner((x + 1.0, 0.0), (x + 1.0, 1.0)),
+                corner((x + 1.0, 1.0), (x, 1.0)),
+                corner((x, 1.0), (x, 0.0)),
+            ]
+        };
+        let mut pieces = square(0.0);
+        pieces.extend(square(4.0));
+        let presentations = some_presentations(&pieces, 200);
+        agreed(&presentations);
+
+        let chains = trace_section_chains(&presentations[0]);
+        assert_eq!(chains.len(), 2, "two squares are two loops");
+        for chain in &chains {
+            let area = signed_area(chain);
+            assert!(
+                (area - 1.0).abs() < 1.0e-9,
+                "a unit square encloses 1, wound positive; this one encloses \
+                 {area}"
+            );
+        }
+    }
+
+    /// The two traces a Steinmetz seam leaves on a bore wall are reflections of
+    /// one another about the middle of the window, so they have the same
+    /// average height — to the last bit, not merely close. Stacking them by
+    /// that average is therefore not stacking them at all: the order comes from
+    /// the order they arrived in, and it decides which chain each band is cut
+    /// between. The bands then span the lens between the traces instead of
+    /// avoiding it, and the section claims the other solid's material is
+    /// exactly where its void is.
+    #[test]
+    fn two_traces_that_average_alike_are_still_stacked_by_where_they_run() {
+        // `v = 980 ± 8·cos(u − 3π/2)` over the window `u ∈ [π, 2π]`, each split
+        // at its apex and reaching a half period past either seam, which is how
+        // the bore wall's own section arrives: one whole period, in two pieces.
+        let pi = std::f64::consts::PI;
+        let (u_min, u_max) = (pi, 2.0 * pi);
+        let apex = 1.5 * pi;
+        let trace = |amplitude: f64| -> Vec<Segment> {
+            let at = |u: f64| Point2::new(u, 8.0f64.mul_add(amplitude * (u - apex).cos(), 980.0));
+            [(u_min - pi / 2.0, apex), (apex, u_max + pi / 2.0)]
+                .into_iter()
+                .map(|(from, to)| Segment::Harmonic {
+                    mean: 980.0,
+                    amplitude: 8.0 * amplitude,
+                    phase: apex,
+                    start: at(from),
+                    end: at(to),
+                })
+                .collect()
+        };
+        let (upper, lower) = (trace(1.0), trace(-1.0));
+
+        // The average cannot tell them apart. This is the premise, so it is
+        // asserted rather than described: if it ever stopped being true the
+        // test below would pass for a reason that has nothing to do with the
+        // fix.
+        let mean = |chain: &[Segment]| -> f64 {
+            let heights: Vec<f64> = chain
+                .iter()
+                .flat_map(|piece| (0..=4).map(move |step| piece.point_at(f64::from(step) / 4.0).y))
+                .collect();
+            heights.iter().sum::<f64>() / heights.len() as f64
+        };
+        assert_eq!(
+            mean(&upper).to_bits(),
+            mean(&lower).to_bits(),
+            "the fixture's two traces must average alike for this test to mean anything"
+        );
+
+        // However they arrive, the lower trace is the lower one.
+        for arrival in [
+            vec![upper.clone(), lower.clone()],
+            vec![lower.clone(), upper.clone()],
+        ] {
+            let mut stacked = arrival;
+            stack_open_chains(&mut stacked, u_min, u_max);
+            let apex_of = |chain: &[Segment]| chain[0].end().y;
+            assert!(
+                apex_of(&stacked[0]) < apex_of(&stacked[1]),
+                "stacked low to high, the first chain's apex ({}) must sit below \
+                 the second's ({})",
+                apex_of(&stacked[0]),
+                apex_of(&stacked[1])
+            );
+        }
+    }
+
+    /// The traversal as it was before directed halfedges: a walk that marks
+    /// the undirected piece used and continues into whichever branch is still
+    /// unused. Kept in the tests only, to show this fixture has teeth.
+    fn previous_traversal(welded: &[Segment]) -> Vec<Vec<Segment>> {
+        let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
+        let mut touching: std::collections::BTreeMap<(u64, u64), Vec<(usize, bool)>> =
+            std::collections::BTreeMap::new();
+        for (index, segment) in welded.iter().enumerate() {
+            touching
+                .entry(key(segment.start()))
+                .or_default()
+                .push((index, true));
+            touching
+                .entry(key(segment.end()))
+                .or_default()
+                .push((index, false));
+        }
+        let departure = |index: usize, at_start: bool| -> Option<Point2> {
+            let piece = welded[index];
+            let (from, to) = if at_start {
+                (piece.start(), piece.point_at(0.05))
+            } else {
+                (piece.end(), piece.point_at(0.95))
+            };
+            let (dx, dy) = (to.x - from.x, to.y - from.y);
+            let length = dx.hypot(dy);
+            (length > 0.0).then(|| Point2::new(dx / length, dy / length))
+        };
+        let mut used = vec![false; welded.len()];
+        let mut chains: Vec<Vec<Segment>> = Vec::new();
+        let mut order: Vec<usize> = (0..welded.len())
+            .filter(|index| {
+                touching[&key(welded[*index].start())].len() == 1
+                    || touching[&key(welded[*index].end())].len() == 1
+            })
+            .collect();
+        order.extend(0..welded.len());
+        for start in order {
+            if used[start] {
+                continue;
+            }
+            let start_free = touching[&key(welded[start].start())].len() == 1;
+            let end_free = touching[&key(welded[start].end())].len() == 1;
+            let mut forward = start_free || !end_free;
+            let mut chain = Vec::new();
+            let mut cursor = start;
+            loop {
+                used[cursor] = true;
+                let piece = if forward {
+                    welded[cursor]
+                } else {
+                    welded[cursor].reversed()
+                };
+                let arrival = key(piece.end());
+                let arriving = departure(cursor, !forward);
+                chain.push(piece);
+                let next = touching[&arrival]
+                    .iter()
+                    .copied()
+                    .filter(|(candidate, _)| !used[*candidate])
+                    .min_by(|left, right| {
+                        let turn = |end: &(usize, bool)| {
+                            let (Some(back), Some(out)) = (arriving, departure(end.0, end.1))
+                            else {
+                                return f64::INFINITY;
+                            };
+                            let angle = (back.x * out.y - back.y * out.x)
+                                .atan2(back.x * out.x + back.y * out.y);
+                            if angle <= 1.0e-12 {
+                                angle + std::f64::consts::TAU
+                            } else {
+                                angle
+                            }
+                        };
+                        turn(left).total_cmp(&turn(right))
+                    });
+                let Some((next, at_start)) = next else { break };
+                forward = at_start;
+                cursor = next;
+            }
+            chains.push(chain);
+        }
+        chains
+    }
+
+    /// The fixture has teeth: the walk this replaced does not describe the
+    /// same curve when the same arcs arrive in a different order.
+    #[test]
+    fn the_previous_traversal_did_depend_on_the_order_its_arcs_arrived_in() {
+        let arcs = four_harmonic_arcs();
+        let presentations = every_presentation(&arcs);
+        let fingerprint = |pieces: &Vec<Segment>| -> String {
+            let chains = previous_traversal(pieces);
+            let mut areas: Vec<i64> = chains
+                .iter()
+                .map(|chain| (signed_area(chain) * 1_000.0).round() as i64)
+                .collect();
+            areas.sort_unstable();
+            format!("{} chain(s) enclosing {areas:?}", chains.len())
+        };
+        let first = fingerprint(&presentations[0]);
+        assert!(
+            presentations
+                .iter()
+                .any(|pieces| fingerprint(pieces) != first),
+            "this fixture no longer catches the fault it was written for"
+        );
+    }
 }

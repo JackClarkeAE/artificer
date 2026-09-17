@@ -519,3 +519,358 @@ fn a_follower_its_recipe_cannot_state_is_left_to_the_ordinary_solve() {
         "a derived corner keeps its authored place"
     );
 }
+
+/// A relation is an authority, not a suggestion.
+///
+/// A deliberate edit holds the points it authored, so a joined neighbour
+/// follows the whole way rather than meeting it half way. That precedence is
+/// about which of two free points moves, and it must never extend to
+/// overruling a relation the user asked for. A drag that would stretch a held
+/// distance has to be refused, or solved so the distance still holds. What the
+/// sketch must never do is commit with its stored relation saying one thing
+/// and its geometry measuring another, because every later reader believes the
+/// relation.
+#[test]
+fn a_drag_cannot_quietly_break_a_distance_it_is_holding() {
+    let mut sketch = SketchDefinition::new();
+    let (operation, start, end) = commit_line_operation(&mut sketch, (0.0, 0.0), (10.0, 0.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Distance {
+                first: start,
+                second: end,
+                distance: 10.0,
+            },
+            "Distance",
+            PrecisionPolicy::default(),
+        )
+        .expect("a line already ten long should accept a distance of ten");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the distance");
+
+    let mut dragged = sketch.clone();
+    let staged = dragged.stage_replace_pulling_followers(
+        operation,
+        line((0.0, 0.0), (15.0, 0.0)),
+        "Reshape",
+        &Default::default(),
+        PrecisionPolicy::default(),
+    );
+    let Ok(staged) = staged else {
+        // Refusing the drag is a perfectly good answer, and it has to leave
+        // the sketch exactly as it was.
+        assert_eq!(
+            dragged, sketch,
+            "a refused drag leaves the sketch bitwise unchanged"
+        );
+        return;
+    };
+    dragged
+        .commit(staged, ConfirmationSource::GreenTick)
+        .expect("commit the drag");
+
+    let held = dragged
+        .constraints()
+        .values()
+        .find_map(|record| match record.kind {
+            SketchConstraintKind::Distance { distance, .. } => Some(distance),
+            _ => None,
+        })
+        .expect("the distance relation survives the drag");
+    let (a, b) = (solved(&dragged, start), solved(&dragged, end));
+    let separation = (b.u - a.u).hypot(b.v - a.v);
+    assert!(
+        (separation - held).abs() <= 1.0e-6,
+        "the sketch holds a distance of {held} while measuring {separation}"
+    );
+}
+
+/// Two separate lines, with a distance held between the free end of one and the
+/// free end of the other. This is the shape a point-to-point dimension takes:
+/// the relation names two points that belong to different operations, so
+/// satisfying it has to move geometry the dimension is not part of.
+fn two_lines_a_distance_apart() -> (
+    SketchDefinition,
+    artificer_sketch::SketchConstraintId,
+    artificer_sketch::SketchPointId,
+    artificer_sketch::SketchPointId,
+) {
+    let mut sketch = SketchDefinition::new();
+    let (_, _, first_end) = commit_line_operation(&mut sketch, (0.0, 0.0), (4.0, 0.0));
+    let (_, second_start, _) = commit_line_operation(&mut sketch, (10.0, 0.0), (14.0, 0.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Distance {
+                first: first_end,
+                second: second_start,
+                distance: 6.0,
+            },
+            "Distance",
+            PrecisionPolicy::default(),
+        )
+        .expect("six apart is what they already are");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the distance");
+    let constraint = *sketch
+        .constraints()
+        .keys()
+        .next()
+        .expect("the sketch holds one relation");
+    (sketch, constraint, first_end, second_start)
+}
+
+fn held_distance(sketch: &SketchDefinition) -> f64 {
+    sketch
+        .constraints()
+        .values()
+        .find_map(|record| record.kind.measurement())
+        .expect("the sketch holds one measured relation")
+}
+
+/// Retyping a dimension is an edit, and an edit outranks the solver's freedom
+/// to share the movement out. The end the dimension is measured from stays
+/// exactly where it was; the other end is what travels.
+#[test]
+fn retyping_a_distance_moves_the_far_end_and_leaves_the_held_one() {
+    let (mut sketch, constraint, first_end, second_start) = two_lines_a_distance_apart();
+    let before = solved(&sketch, first_end);
+
+    let transaction = sketch
+        .stage_relation_measurement(
+            constraint,
+            9.0,
+            Some(first_end),
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("nine is a distance this sketch can hold");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the dimension");
+
+    let after = solved(&sketch, first_end);
+    assert!(
+        (after.u - before.u).hypot(after.v - before.v) <= 1.0e-9,
+        "the held end moved from {before:?} to {after:?}"
+    );
+    let far = solved(&sketch, second_start);
+    let separation = (far.u - after.u).hypot(far.v - after.v);
+    assert!(
+        (separation - 9.0).abs() <= 1.0e-6,
+        "the points should be nine apart, and measure {separation}"
+    );
+    assert!(
+        (held_distance(&sketch) - 9.0).abs() <= 1.0e-12,
+        "the relation should hold the number that was typed"
+    );
+}
+
+/// The anchor only lasts for one solve, so the edit has to write the point it
+/// moved back into that point's own recipe. Without it the next ordinary read
+/// would solve again with nothing held and split the difference, and the far
+/// line would drift back half way (ADR 0035).
+#[test]
+fn a_retyped_distance_stays_put_when_the_sketch_is_solved_again() {
+    let (mut sketch, constraint, first_end, second_start) = two_lines_a_distance_apart();
+    let transaction = sketch
+        .stage_relation_measurement(
+            constraint,
+            9.0,
+            Some(first_end),
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("nine is a distance this sketch can hold");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the dimension");
+
+    let settled = solved(&sketch, second_start);
+    let again = solved(&sketch, second_start);
+    assert!(
+        (again.u - settled.u).hypot(again.v - settled.v) <= 1.0e-12,
+        "a second solve moved the point the first one settled"
+    );
+    let record = sketch
+        .point(second_start)
+        .expect("the moved point is still in the sketch");
+    assert!(
+        (record.evaluated_position.u - settled.u).hypot(record.evaluated_position.v - settled.v)
+            <= 1.0e-9,
+        "the moved point's own recipe should now state where the solver put it"
+    );
+}
+
+/// Holding neither end is legitimate — it is what a dimension applied with no
+/// edit behind it means — and then the solver shares the movement out, which is
+/// the fair answer when nothing distinguishes the two points.
+#[test]
+fn a_distance_retyped_with_neither_end_held_shares_the_movement() {
+    let (mut sketch, constraint, first_end, second_start) = two_lines_a_distance_apart();
+    let (before_first, before_second) = (solved(&sketch, first_end), solved(&sketch, second_start));
+
+    let transaction = sketch
+        .stage_relation_measurement(
+            constraint,
+            9.0,
+            None,
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("nine is a distance this sketch can hold");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the dimension");
+
+    let (after_first, after_second) = (solved(&sketch, first_end), solved(&sketch, second_start));
+    let first_travel = (after_first.u - before_first.u).hypot(after_first.v - before_first.v);
+    let second_travel = (after_second.u - before_second.u).hypot(after_second.v - before_second.v);
+    assert!(
+        first_travel > 1.0e-9 && (first_travel - second_travel).abs() <= 1.0e-6,
+        "both ends should give equally: {first_travel} against {second_travel}"
+    );
+}
+
+/// A relation that states a relationship rather than a measurement has no
+/// number to retype. Refusing by name is what stops a typed value quietly
+/// turning a perpendicular into something else.
+#[test]
+fn a_relation_that_holds_no_measurement_refuses_to_be_retyped() {
+    let mut sketch = SketchDefinition::new();
+    let (_, first_start, first_end) = commit_line_operation(&mut sketch, (0.0, 0.0), (4.0, 0.0));
+    let (_, second_start, second_end) = commit_line_operation(&mut sketch, (0.0, 1.0), (0.0, 5.0));
+    let transaction = sketch
+        .stage_constraint(
+            SketchConstraintKind::Perpendicular {
+                first_start,
+                first_end,
+                second_start,
+                second_end,
+            },
+            "Perpendicular",
+            PrecisionPolicy::default(),
+        )
+        .expect("two already square lines accept a perpendicular");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit the perpendicular");
+    let constraint = *sketch
+        .constraints()
+        .keys()
+        .next()
+        .expect("the sketch holds one relation");
+
+    let before = sketch.clone();
+    let refused = sketch.stage_relation_measurement(
+        constraint,
+        9.0,
+        None,
+        "Dimension",
+        PrecisionPolicy::default(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(SketchTransactionError::RelationHasNoMeasurement(named)) if named == constraint
+        ),
+        "a perpendicular should refuse a typed measurement by name, and gave {refused:?}"
+    );
+    assert_eq!(
+        sketch, before,
+        "a refused dimension leaves the sketch bitwise unchanged"
+    );
+}
+
+/// A dimension that contradicts the rest of the system is refused outright
+/// rather than rounded to whatever the solver could reach. The sketch never
+/// stores a relation saying one thing while its geometry measures another.
+#[test]
+fn a_distance_the_system_cannot_satisfy_is_refused_and_changes_nothing() {
+    let (mut sketch, constraint, first_end, second_start) = two_lines_a_distance_apart();
+    // Pin both ends where they are: the separation is now a fact about two
+    // fixed points, and no typed value other than that one can hold.
+    for point in [first_end, second_start] {
+        let position = solved(&sketch, point);
+        let transaction = sketch
+            .stage_constraint(
+                SketchConstraintKind::Fixed { point, position },
+                "Fixed",
+                PrecisionPolicy::default(),
+            )
+            .expect("pinning a point where it already is always holds");
+        sketch
+            .commit(transaction, ConfirmationSource::GreenTick)
+            .expect("commit the pin");
+    }
+
+    let before = sketch.clone();
+    let refused = sketch.stage_relation_measurement(
+        constraint,
+        9.0,
+        Some(first_end),
+        "Dimension",
+        PrecisionPolicy::default(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(SketchTransactionError::ConstraintRejected(
+                artificer_sketch::ConstraintError::Conflicting { .. }
+            ))
+        ),
+        "a contradictory dimension should be refused as conflicting, and gave {refused:?}"
+    );
+    assert_eq!(
+        sketch, before,
+        "a refused dimension leaves the sketch bitwise unchanged"
+    );
+    assert!(
+        (held_distance(&sketch) - 6.0).abs() <= 1.0e-12,
+        "the relation should still hold the value it had"
+    );
+}
+
+/// Undo has to take back the whole edit — the value and every point the solver
+/// moved to satisfy it — because the user made one change.
+#[test]
+fn undo_returns_a_retyped_distance_and_the_geometry_it_moved() {
+    let (mut sketch, constraint, first_end, second_start) = two_lines_a_distance_apart();
+    let before = sketch.clone();
+    let before_far = solved(&sketch, second_start);
+    let mut journal = SketchUndoJournal::new(8);
+
+    let transaction = sketch
+        .stage_relation_measurement(
+            constraint,
+            9.0,
+            Some(first_end),
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("nine is a distance this sketch can hold");
+    journal
+        .confirm(
+            &mut sketch,
+            transaction,
+            ConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        )
+        .expect("commit the dimension through the journal");
+    assert!((held_distance(&sketch) - 9.0).abs() <= 1.0e-12);
+
+    assert!(
+        journal.undo(&mut sketch),
+        "the dimension should be undoable"
+    );
+    assert_eq!(
+        sketch, before,
+        "undo should return the sketch to life before the dimension"
+    );
+    let far = solved(&sketch, second_start);
+    assert!(
+        (far.u - before_far.u).hypot(far.v - before_far.v) <= 1.0e-12,
+        "undo should bring the point the dimension moved back with it"
+    );
+}

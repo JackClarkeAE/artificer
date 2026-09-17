@@ -133,6 +133,45 @@ impl SketchConstraintKind {
         }
     }
 
+    /// The number this relation holds, for the kinds that hold one.
+    ///
+    /// A relation either states a measurement the user chose — a distance, a
+    /// tangent circle's radius — or states a pure relationship between points.
+    /// Only the first sort can be drawn as a dimension and typed into, and this
+    /// is what tells them apart.
+    #[must_use]
+    pub const fn measurement(&self) -> Option<f64> {
+        match *self {
+            Self::Distance { distance, .. } => Some(distance),
+            Self::LineTangentToCircle { radius, .. } => Some(radius),
+            _ => None,
+        }
+    }
+
+    /// The same relation, restated to hold `measurement` instead.
+    ///
+    /// Returns nothing for a relation that holds no number, so a caller cannot
+    /// quietly turn one kind of relation into another by typing into it.
+    #[must_use]
+    pub const fn with_measurement(&self, measurement: f64) -> Option<Self> {
+        match *self {
+            Self::Distance { first, second, .. } => Some(Self::Distance {
+                first,
+                second,
+                distance: measurement,
+            }),
+            Self::LineTangentToCircle {
+                start, end, center, ..
+            } => Some(Self::LineTangentToCircle {
+                start,
+                end,
+                center,
+                radius: measurement,
+            }),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn equation_count(&self) -> usize {
         match self {
@@ -184,6 +223,7 @@ pub enum ConstraintError {
     MissingPoint(SketchPointId),
     InactivePoint(SketchPointId),
     DuplicatePoint(SketchPointId),
+    MissingConstraint(SketchConstraintId),
     Conflicting { maximum_residual: f64 },
     IdSpaceExhausted,
 }
@@ -200,6 +240,9 @@ impl fmt::Display for ConstraintError {
             }
             Self::InactivePoint(point) => write!(formatter, "constraint point {point} is inactive"),
             Self::DuplicatePoint(point) => write!(formatter, "constraint repeats point {point}"),
+            Self::MissingConstraint(constraint) => {
+                write!(formatter, "relation {constraint} does not exist")
+            }
             Self::Conflicting { maximum_residual } => write!(
                 formatter,
                 "constraint system is conflicting (residual {maximum_residual:.3e})"

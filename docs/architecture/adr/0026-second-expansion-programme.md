@@ -727,6 +727,16 @@ reads the ellipse and harmonic loops back as chords. Oblique cone
 sections (a rational trace in the cone's parameters, not a harmonic) and
 the Steinmetz tee (stage 3) are still to come.
 
+Status (2026-09-17): stage 3 has landed. Two cylinders of equal radius whose
+axes cross meet in two ellipses, `surface_intersection` names the pair, and the
+construction follows it: two crossing bores in a block publish ten faces, one
+shell, and the volume `s³ − 2πr²s + 16r³/3` to the last digit, where the
+faceted route gave 229 faces and 0.0948%. ADR 0025's amendment carries the
+derivation and the four corrections the construction needed, of which the two
+that mattered were both an answer depending on the order its inputs arrived in.
+Unequal radii and axes that do not meet are still a quartic and are still
+refused by name.
+
 
 **Why ellipses and nothing else:** the intersection of a plane with a
 cylinder or cone at any non-degenerate attitude is an ellipse; the
