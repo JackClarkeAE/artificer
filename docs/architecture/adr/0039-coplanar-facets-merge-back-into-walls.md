@@ -82,7 +82,13 @@ it.
 
 ### What it is worth, measured
 
-On the two-crossing-bore body:
+On the two-crossing-bore body, as it stood when this was written. That
+particular body — two bores of **equal** radius on crossing axes — no longer
+reaches this tier at all: ADR 0026 K1 stage 3 landed the same week and it is
+now exact, at ten faces. The measurements below are kept because they are what
+the merge does to a fan, not because this is still the body that produces one.
+A crossing pair of *unequal* radii is a quartic, is still refused by name, and
+still arrives here; it is what the merge's own gates measure now.
 
 | | before | after |
 |---|---|---|
@@ -100,7 +106,11 @@ reason above, and recording why is more useful than recording the number.
 **A cylinder's fan is untouched.** The panels of a faceted bore wall are each
 on their own plane, so they are never in one group. That is the 2,356 faces P1
 measured, and it is the majority of what remains. Only an exact cylindrical
-wall removes them, which is ADR 0026 K1 stage 3 and ADR 0025's amendment.
+wall removes them, which is ADR 0026 K1 stage 3 and ADR 0025's amendment — and
+for bores of equal radius on crossing axes that is exactly what happened: the
+wall is two half-cylinders and there is no fan. It remains true for every
+faceted body, which is now the ones outside the exact vocabulary rather than
+every crossing bore.
 
 **The cutter's subdivision budget stays as it was.** The faceted cut path
 carries a note that handing the cutter the clamped budget halves fragmentation

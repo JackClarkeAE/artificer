@@ -188,10 +188,12 @@ fn crossing_cuts_are_exact_and_publish_the_steinmetz_closed_form() {
     );
 
     // Ten faces, and each is a surface rather than a panel of one: the box's
-    // six planes, and two half-walls for each bore, parted at the seam the
-    // bores share. The faceted route reached this body as 2,959 faces before
-    // the coplanar merge of ADR 0039 and 229 after it; the exact route does not
-    // fragment at all, because there is nothing to fragment.
+    // six planes, plus the two half-walls each bore already has — the test
+    // above pins a single bore at eight. So the crossing adds no face: the seam
+    // the bores share parts neither wall, because each was already parted at
+    // its own cylinder's seam. The faceted route reached this body as 2,959
+    // faces before the coplanar merge of ADR 0039 and 229 after it; the exact
+    // route does not fragment at all, because there is nothing to fragment.
     let counts = crossed.counts();
     assert_eq!(counts.faces, 10, "six planes and four half-bore walls");
     assert_eq!(counts.shells, 1);
