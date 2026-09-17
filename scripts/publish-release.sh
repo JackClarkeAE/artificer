@@ -202,19 +202,20 @@ publish() {
   fi
 
   # Check the version the tree declares against the one being tagged, rather
-  # than trusting the argument. The tags are 0.96, 0.97 while the crates are
-  # 0.9.6, 0.9.7, so "0.97" implies "0.9.7": take the digits after the dot and
-  # put a dot before the last one.
-  local declared expected digits
+  # than trusting the argument.
+  #
+  # This must agree with the "tag and workspace version must agree" step in
+  # ci.yml, which is the gate that actually stops a release; a rule of its own
+  # here only cries wolf. A two-part tag is read two ways and either will do.
+  # Compactly, `v0.981` is `0.98.1`, which is how the 0.98 point releases are
+  # numbered. Loosely, `v0.99` is `0.99.0`, a two-part tag naming a release
+  # with no patch number — which is also how `v0.97` read `0.9.7` under the
+  # older 0.9.x scheme, since there the compact reading is the one that hits.
+  local declared compact
   declared=$(git show "$FROM:Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)
-  digits=${VERSION#*.}
-  if [[ $VERSION == *.*.* || ${#digits} -lt 2 ]]; then
-    expected=$VERSION                       # already 0.9.7, or something unusual
-  else
-    expected="${VERSION%.*}.${digits%${digits: -1}}.${digits: -1}"
-  fi
-  if [[ $declared != "$expected" ]]; then
-    warn "Cargo.toml on $FROM says '$declared'; $TAG implies '$expected'."
+  compact=$(printf '%s' "$declared" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+)$/\1.\2\3/')
+  if [[ $VERSION != "$declared" && $VERSION != "$compact" && "$VERSION.0" != "$declared" ]]; then
+    warn "Cargo.toml on $FROM says '$declared', which $TAG does not name."
     confirm "Publish anyway?"
   fi
 
