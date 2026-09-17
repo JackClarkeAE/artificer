@@ -43,7 +43,7 @@ approximated or discovered:
 | | Plane | Cylinder | Cone | Sphere | Torus |
 |---|---|---|---|---|---|
 | **Plane** | line | circle ⟂ axis, generators ∥ axis | circle ⟂ axis | circle | circles ⟂ axis, circles through the axis |
-| **Cylinder** | | coaxial, parallel axes | coaxial | centre on the axis | — |
+| **Cylinder** | | coaxial, parallel axes, equal radii on crossing axes | coaxial | centre on the axis | — |
 | **Cone** | | | coaxial | — | — |
 | **Sphere** | | | | any pair | — |
 | **Torus** | | | | | coaxial, equal major radii |
@@ -245,3 +245,33 @@ The cost is that the matrix is narrow, and widening it is not free — each new
 pair is its own derivation and its own gate. Adding ellipses to the curve
 vocabulary would open a large part of the empty half of the table at once, and
 is the natural next question once reconstruction works.
+
+## Amendment: equal radii on crossing axes (2026-09-17)
+
+The cylinder pair gained one entry. Two cylinders of the same radius whose
+axes cross meet in two ellipses rather than a quartic, and the derivation is
+short enough to state here: take the crossing point as the origin, and a point
+on a cylinder of radius `r` about unit axis `a` satisfies `|x|² − (x·a)² = r²`.
+A point on both cylinders therefore satisfies `(x·a)² = (x·b)²`, which factors
+into `x·(a−b) = 0` and `x·(a+b) = 0` — the two bisector planes of the axes. The
+quartic is a pair of plane sections, and a plane section of a cylinder is an
+ellipse already in the vocabulary, so the new case is served by the existing
+plane-cylinder derivation rather than by one of its own.
+
+Equal radii is what cancels the `r²`; crossing axes are what put the origin on
+both. Away from either, the curve really is a quartic and is still refused.
+This is ADR 0026 K1 stage 3, and it is the entry that prediction in the
+consequences above was pointing at: the ellipse was added to the curve
+vocabulary for oblique plane sections, and it turned out to cover this too.
+
+**The intersection is exact; the construction that uses it is not yet
+finished.** A crossing bore still falls back to the faceted tier. The seam the
+two walls share crosses itself — it is a figure of eight, two lobes meeting at
+a pinch — and every layer that consumes it assumes a boundary that does not
+touch itself: the periodic section chaining, the regularized 2D Boolean's sew,
+and the shell sewer each need the pinch resolved. Carried far enough by hand,
+the analytic path does build a topology for the crossing bore, and that
+topology fails validation with four coedge orientations wrong and an odd Euler
+characteristic — the signature of a pinch vertex shared where it should be one
+vertex per lobe. That is the remaining work, and it belongs in the sew rather
+than in this matrix.

@@ -332,18 +332,34 @@ fn close_periodic_sections(
         })
         .collect();
     let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
-    let mut touching: std::collections::BTreeMap<(u64, u64), Vec<usize>> =
+    // Each entry is one *end* of one piece, not one piece, because a seam can
+    // pass through the same point twice and the two visits leave along
+    // different branches.
+    let mut touching: std::collections::BTreeMap<(u64, u64), Vec<(usize, bool)>> =
         std::collections::BTreeMap::new();
     for (index, segment) in welded.iter().enumerate() {
         touching
             .entry(key(segment.start()))
             .or_default()
-            .push(index);
-        touching.entry(key(segment.end())).or_default().push(index);
+            .push((index, true));
+        touching
+            .entry(key(segment.end()))
+            .or_default()
+            .push((index, false));
     }
-    if touching.values().any(|ends| ends.len() > 2) {
-        return Err(AnalyticBooleanError::DomainUnsupported);
-    }
+    // The direction a piece sets off in from one of its own ends, which is
+    // what tells branches apart where a seam crosses itself.
+    let departure = |index: usize, at_start: bool| -> Option<Point2> {
+        let piece = welded[index];
+        let (from, to) = if at_start {
+            (piece.start(), piece.point_at(0.05))
+        } else {
+            (piece.end(), piece.point_at(0.95))
+        };
+        let (dx, dy) = (to.x - from.x, to.y - from.y);
+        let length = dx.hypot(dy);
+        (length > 0.0).then(|| Point2::new(dx / length, dy / length))
+    };
     let mut used = vec![false; welded.len()];
     let mut loops: Vec<Vec<Segment>> = Vec::new();
     let mut open: Vec<Vec<Segment>> = Vec::new();
@@ -373,13 +389,37 @@ fn close_periodic_sections(
                 welded[cursor].reversed()
             };
             let arrival = key(oriented.end());
+            let arriving = departure(cursor, !forward);
             chain.push(oriented);
-            let next = touching[&arrival]
+            let candidates = &touching[&arrival];
+            // Where a seam crosses itself, several branches leave the same
+            // point and "the other one" is not a well-formed question. The
+            // boundary of the region is traced by always taking the next
+            // branch counter-clockwise from the way back: that is what makes
+            // the walk hug one side of the curve and close each lobe of a
+            // crossing separately, rather than running straight through it
+            // and welding the two lobes into one twisted loop.
+            let next = candidates
                 .iter()
                 .copied()
-                .find(|candidate| !used[*candidate]);
-            let Some(next) = next else { break };
-            forward = key(welded[next].start()) == arrival;
+                .filter(|(candidate, _)| !used[*candidate])
+                .min_by(|left, right| {
+                    let turn = |end: &(usize, bool)| {
+                        let (Some(back), Some(out)) = (arriving, departure(end.0, end.1)) else {
+                            return f64::INFINITY;
+                        };
+                        let angle = (back.x * out.y - back.y * out.x)
+                            .atan2(back.x * out.x + back.y * out.y);
+                        if angle <= 1.0e-12 {
+                            angle + std::f64::consts::TAU
+                        } else {
+                            angle
+                        }
+                    };
+                    turn(left).total_cmp(&turn(right))
+                });
+            let Some((next, at_start)) = next else { break };
+            forward = at_start;
             cursor = next;
         }
         let first = chain[0].start();
@@ -995,7 +1035,50 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                     let to_azimuth = section.azimuth_at((start_angle + sweep) * sign);
                     Some(section.segment(from_azimuth, to_azimuth))
                 }
-                Segment::Harmonic { .. } => None,
+                harmonic @ Segment::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                    start,
+                    end,
+                } => {
+                    // The seam two crossing cylinders share (ADR 0026, K1
+                    // stage 3). It is one ellipse in space traced on two
+                    // walls, so it is rebuilt from the source trace and asked
+                    // for its trace here; only the parameterization changes.
+                    //
+                    // This is the first pair where both carriers are
+                    // cylinders. Every earlier in-matrix pair put a plane on
+                    // one side, which is why the arm above exists and this one
+                    // did not.
+                    let Surface::Cylinder(source_cylinder) = from else {
+                        return None;
+                    };
+                    let source = CylinderSectionHarmonic {
+                        cylinder: *source_cylinder,
+                        mean,
+                        amplitude,
+                        phase,
+                    };
+                    let (center, major_axis, minor_axis, major, minor) = source.ellipse()?;
+                    let section = cylinder_section_harmonic(
+                        cylinder, center, major_axis, minor_axis, major, minor,
+                    )?;
+                    // The azimuths come from the endpoints themselves, and the
+                    // midpoint says which way round the branch runs: a pair of
+                    // endpoints alone cannot tell a span from its complement,
+                    // and on a seam that wraps the wall the difference is the
+                    // whole face.
+                    let first = local(world(start)?);
+                    let last = local(world(end)?);
+                    let middle = local(world(harmonic.point_at(0.5))?);
+                    let tau = std::f64::consts::TAU;
+                    let nearest =
+                        |value: f64, target: f64| value + ((target - value) / tau).round() * tau;
+                    let through = nearest(middle.x, first.x);
+                    let to = nearest(last.x, first.x + 2.0 * (through - first.x));
+                    Some(section.segment(first.x, to))
+                }
             }
         }
         _ => None,

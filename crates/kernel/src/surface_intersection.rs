@@ -17,7 +17,7 @@
 //! | | Plane | Cylinder | Cone | Sphere | Torus |
 //! |---|---|---|---|---|---|
 //! | **Plane** | line | circle ⟂, ellipse oblique, lines ∥ | circle ⟂ | circle | circles ⟂, circles through the axis |
-//! | **Cylinder** | | coaxial, parallel axes | coaxial | centre on the axis | — |
+//! | **Cylinder** | | coaxial, parallel axes, equal radii on crossing axes | coaxial | centre on the axis | — |
 //! | **Cone** | | | coaxial | — | — |
 //! | **Sphere** | | | | any pair | — |
 //! | **Torus** | | | | | coaxial |
@@ -381,11 +381,123 @@ fn plane_torus(plane: Plane, torus: Torus, tolerances: Tolerances) -> Intersecti
 // Curved pairs
 // ---------------------------------------------------------------------------
 
+/// Two equal-radius cylinders whose axes cross, which is the one case where
+/// the space quartic factors.
+///
+/// Take the crossing point as the origin. A point lies on a cylinder of radius
+/// `r` about unit axis `a` exactly when `|x|² − (x·a)² = r²`, so a point on
+/// both cylinders satisfies `(x·a)² = (x·b)²`, which factors into
+/// `x·(a−b) = 0` and `x·(a+b) = 0`: the two bisector planes of the axes. The
+/// quartic is a pair of plane sections, and a plane section of a cylinder is
+/// an ellipse this kernel already names exactly.
+///
+/// Equal radii is what makes the `r²` cancel, and crossing axes are what put
+/// the origin on both. Neither is a simplification of the general case: away
+/// from them the curve really is a quartic, and saying so is still the right
+/// answer.
+fn equal_radius_crossing_cylinders(
+    first: Cylinder,
+    second: Cylinder,
+    axis: Vector3,
+    other: Vector3,
+    tolerances: Tolerances,
+) -> Option<Intersection> {
+    if (first.radius - second.radius).abs() > tolerances.linear {
+        return None;
+    }
+    let crossing = axes_crossing_point(first.origin, axis, second.origin, other, tolerances)?;
+    // Each bisector is a plane through the crossing point. Only one of them can
+    // be degenerate at a time — `a−b` vanishes for parallel axes and `a+b` for
+    // antiparallel ones — and the caller has already sent both of those to the
+    // parallel branch, so a vanishing normal here means an axis that is not a
+    // direction at all.
+    let mut curves = Vec::new();
+    for normal in [axis - other, axis + other] {
+        let Ok(normal) = unit(normal) else {
+            continue;
+        };
+        let plane = Plane::new(
+            crossing,
+            perpendicular_to(normal),
+            normal.cross(perpendicular_to(normal)),
+        );
+        match plane_cylinder(plane, first, tolerances) {
+            Ok(SurfaceIntersection::Curves(section)) => curves.extend(section),
+            Ok(SurfaceIntersection::Empty) => {}
+            // A bisector can never coincide with a cylinder, and a cylinder
+            // this degenerate should have been refused upstream.
+            Ok(SurfaceIntersection::Coincident) | Err(_) => {
+                return Some(Err(IntersectionError::Indeterminate));
+            }
+        }
+    }
+    Some(Ok(if curves.is_empty() {
+        SurfaceIntersection::Empty
+    } else {
+        SurfaceIntersection::Curves(curves)
+    }))
+}
+
+/// Where two axes cross, or nothing if they are skew.
+///
+/// Skew axes have a common perpendicular of non-zero length and no common
+/// point, so the factorisation above has no origin to work from and the curve
+/// stays a quartic.
+fn axes_crossing_point(
+    first_origin: Point3,
+    first_axis: Vector3,
+    second_origin: Point3,
+    second_axis: Vector3,
+    tolerances: Tolerances,
+) -> Option<Point3> {
+    let between = first_origin - second_origin;
+    let alignment = first_axis.dot(second_axis);
+    let denominator = alignment.mul_add(-alignment, 1.0);
+    if denominator.abs() <= tolerances.angular {
+        return None;
+    }
+    let along_first = between.dot(first_axis);
+    let along_second = between.dot(second_axis);
+    let first_step = alignment.mul_add(along_second, -along_first) / denominator;
+    let second_step = alignment.mul_add(-along_first, along_second) / denominator;
+    let on_first = first_origin + first_axis * first_step;
+    let on_second = second_origin + second_axis * second_step;
+    let gap = on_second - on_first;
+    if gap.length() > tolerances.linear {
+        return None;
+    }
+    // The midpoint, so neither axis is privileged when the two closest points
+    // differ by rounding rather than by geometry.
+    Some(on_first + gap * 0.5)
+}
+
+/// Any unit vector perpendicular to `normal`, chosen from whichever axis
+/// `normal` leans on least so the cross product is well conditioned.
+fn perpendicular_to(normal: Vector3) -> Vector3 {
+    let away = if normal.x.abs() <= normal.y.abs() && normal.x.abs() <= normal.z.abs() {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else if normal.y.abs() <= normal.z.abs() {
+        Vector3::new(0.0, 1.0, 0.0)
+    } else {
+        Vector3::new(0.0, 0.0, 1.0)
+    };
+    let tangent = away - normal * away.dot(normal);
+    tangent * (1.0 / tangent.length())
+}
+
 fn cylinder_cylinder(first: Cylinder, second: Cylinder, tolerances: Tolerances) -> Intersection {
     let axis = unit(first.axis)?;
     let other = unit(second.axis)?;
     if !tolerances.parallel(axis, other) {
-        // Skew or crossing axes give a space quartic.
+        if first.radius <= 0.0 || second.radius <= 0.0 {
+            return Err(IntersectionError::Indeterminate);
+        }
+        if let Some(crossed) =
+            equal_radius_crossing_cylinders(first, second, axis, other, tolerances)
+        {
+            return crossed;
+        }
+        // Unequal radii, or skew axes: a genuine space quartic.
         return Err(IntersectionError::Unsupported);
     }
     if first.radius <= 0.0 || second.radius <= 0.0 {
@@ -967,6 +1079,103 @@ mod tests {
         });
         assert_eq!(
             intersect(first, crossing, precision()),
+            Err(IntersectionError::Unsupported)
+        );
+    }
+
+    /// A cylinder about an arbitrary axis, with an orthonormal radial frame.
+    /// The axis is normalised here because a carrier's axis is a direction and
+    /// the rest of the kernel reads it as one.
+    fn cylinder_about(origin: [f64; 3], axis: [f64; 3], radius: f64) -> Surface {
+        let axis = Vector3::new(axis[0], axis[1], axis[2]);
+        let axis = axis * (1.0 / axis.length());
+        let radial_u = super::perpendicular_to(axis);
+        Surface::Cylinder(Cylinder {
+            origin: Point3::new(origin[0], origin[1], origin[2]),
+            axis,
+            radial_u,
+            radial_v: axis.cross(radial_u),
+            radius,
+            angular_sign: 1.0,
+        })
+    }
+
+    /// The Steinmetz case (ADR 0026, K1 stage 3). Two equal-radius cylinders
+    /// whose axes cross meet in two ellipses, not a quartic: the `r²` cancels
+    /// and what is left factors into the two bisector planes of the axes.
+    #[test]
+    fn equal_radius_cylinders_on_crossing_axes_meet_in_two_ellipses() {
+        let upright = upright_cylinder([0.0, 0.0, 0.0], 5.0);
+        let across = cylinder_about([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 5.0);
+
+        let section = curves(intersect(upright, across, precision()));
+        assert_eq!(section.len(), 2, "a crossed pair meets in two ellipses");
+        for curve in &section {
+            let IntersectionCurve::Ellipse {
+                center,
+                major_radius,
+                minor_radius,
+                ..
+            } = *curve
+            else {
+                panic!("the Steinmetz seam is an ellipse, received {curve:?}");
+            };
+            // Semi-axes R and R√2: the minor across the bore, the major
+            // stretched by the forty-five degree slant of the bisector.
+            assert!((minor_radius - 5.0).abs() < 1.0e-12);
+            assert!((major_radius - 5.0 * 2.0_f64.sqrt()).abs() < 1.0e-12);
+            assert!(
+                center.x.abs() < 1.0e-12 && center.y.abs() < 1.0e-12 && center.z.abs() < 1.0e-12,
+                "both seams pass through the crossing"
+            );
+            assert_on(upright, *curve);
+            assert_on(across, *curve);
+        }
+        // The two seams are distinct planes, not the same curve twice.
+        let (
+            IntersectionCurve::Ellipse { u: first, .. },
+            IntersectionCurve::Ellipse { u: second, .. },
+        ) = (section[0], section[1])
+        else {
+            panic!("both seams are ellipses");
+        };
+        assert!(
+            first.dot(second).abs() < 1.0 - 1.0e-9,
+            "the two seams lie in different planes"
+        );
+    }
+
+    /// The crossing case holds at any angle the axes actually meet at, not
+    /// only at a right angle, and the seam still lies on both walls.
+    #[test]
+    fn crossing_equal_cylinders_meet_exactly_at_an_oblique_angle_too() {
+        let upright = upright_cylinder([1.0, -2.0, 3.0], 4.0);
+        let leaning = cylinder_about([1.0, -2.0, 3.0], [0.0, 1.0, 1.0], 4.0);
+        let section = curves(intersect(upright, leaning, precision()));
+        assert_eq!(section.len(), 2);
+        for curve in section {
+            assert_on(upright, curve);
+            assert_on(leaning, curve);
+        }
+    }
+
+    /// What stays refused, and why. Unequal radii leave the `r²` uncancelled
+    /// and skew axes leave the factorisation with no origin, so both are
+    /// genuine quartics rather than cases this vocabulary is hiding.
+    #[test]
+    fn unequal_or_skew_crossing_cylinders_are_still_refused_by_name() {
+        let upright = upright_cylinder([0.0, 0.0, 0.0], 5.0);
+        let unequal = cylinder_about([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 3.0);
+        assert_eq!(
+            intersect(upright, unequal, precision()),
+            Err(IntersectionError::Unsupported)
+        );
+        // Equal radii, but the axes pass by one another rather than meeting:
+        // this one runs along x at a height of 7 and four to the side, so it
+        // never touches the upright's axis.
+        let skew = cylinder_about([0.0, 4.0, 7.0], [1.0, 0.0, 0.0], 5.0);
+        assert_eq!(
+            intersect(upright, skew, precision()),
             Err(IntersectionError::Unsupported)
         );
     }
