@@ -268,10 +268,42 @@ vocabulary for oblique plane sections, and it turned out to cover this too.
 finished.** A crossing bore still falls back to the faceted tier. The seam the
 two walls share crosses itself — it is a figure of eight, two lobes meeting at
 a pinch — and every layer that consumes it assumes a boundary that does not
-touch itself: the periodic section chaining, the regularized 2D Boolean's sew,
-and the shell sewer each need the pinch resolved. Carried far enough by hand,
-the analytic path does build a topology for the crossing bore, and that
-topology fails validation with four coedge orientations wrong and an odd Euler
-characteristic — the signature of a pinch vertex shared where it should be one
-vertex per lobe. That is the remaining work, and it belongs in the sew rather
-than in this matrix.
+touch itself.
+
+The layers were walked and each was measured rather than guessed at, so the
+next attempt can start from what is known instead of repeating it:
+
+- **Periodic section chaining** refused any welded vertex of degree above two.
+  The crossing bore presents 4 seam segments with one degree-4 vertex and two
+  of degree 2 — the figure of eight, with the two sinusoids crossing at one
+  azimuth in the face's window. Tracing the boundary by taking the next branch
+  round, rather than asking for the only one, closes each lobe. That part is
+  implemented.
+- **The 2D Boolean** hits the same pinch in its sew, where it wants exactly one
+  outgoing piece per vertex; then coincident cuts, where the tangential touch
+  puts two cut parameters within tolerance of each other; then a chain that
+  dead-ends because splitting one curve and not its partner leaves endpoints
+  that agree geometrically and not bitwise. Welding piece endpoints before
+  chaining, keeping the first of a run of coincident cuts, and choosing the
+  continuation by angle get past all three.
+- **Orientation is where it stands.** With the above, the analytic path builds
+  a topology for the crossing bore and validation refuses it: four coedge
+  orientations wrong and an Euler characteristic of −5, which is odd and so
+  impossible. The four are exactly the ellipse seam edges, shared between the
+  two bore walls — both `angular_sign = −1`, both radius 8, one `FeatureSide`
+  and one `ExtrusionSide` — and both traverse the shared seam `Forward` where
+  they must oppose. Each face carries one loop.
+
+Three things were ruled out. The traversal handedness is not free: taking the
+sharpest left, or continuing straight through the pinch, makes the analytic
+path refuse and fall back, so only the sharpest right reaches a topology at
+all. And the seam no longer depends on which wall asks — each face requests the
+intersection with itself named first, which did return two parameterizations of
+one curve, and ordering the pair by axis fixed that. It did not fix the
+orientation, so the cause lies further in: in how a section's loop on a
+cylinder is oriented against the face it bounds, or in the mirror a difference
+applies to the tool's faces.
+
+None of the 2D-Boolean work above is in the tree. Carried that far it turns a
+construction that worked approximately into one that fails outright, which is
+worse than the faceting it was meant to remove.

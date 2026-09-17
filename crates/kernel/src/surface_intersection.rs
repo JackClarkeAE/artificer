@@ -406,6 +406,19 @@ fn equal_radius_crossing_cylinders(
         return None;
     }
     let crossing = axes_crossing_point(first.origin, axis, second.origin, other, tolerances)?;
+    // Both walls have to be handed the *same* seam, not two parameterizations
+    // of it. Each face asks for this intersection with itself first, so
+    // deriving the ellipse from whichever cylinder happened to be named first
+    // gives the two walls curves that agree as point sets and disagree about
+    // which way round they run — and two faces that traverse their shared edge
+    // the same way do not bound anything. Ordering the pair by its axis makes
+    // the answer a property of the pair.
+    let (first, second, axis, other) = if axis_order(axis) <= axis_order(other) {
+        (first, second, axis, other)
+    } else {
+        (second, first, other, axis)
+    };
+    let _ = second;
     // Each bisector is a plane through the crossing point. Only one of them can
     // be degenerate at a time — `a−b` vanishes for parallel axes and `a+b` for
     // antiparallel ones — and the caller has already sent both of those to the
@@ -436,6 +449,13 @@ fn equal_radius_crossing_cylinders(
     } else {
         SurfaceIntersection::Curves(curves)
     }))
+}
+
+/// A total order on directions, so a pair of cylinders can be put in a
+/// canonical order that does not depend on which of them was asked first.
+fn axis_order(axis: Vector3) -> [i64; 3] {
+    let quantize = |value: f64| (value * 1.0e9).round() as i64;
+    [quantize(axis.x), quantize(axis.y), quantize(axis.z)]
 }
 
 /// Where two axes cross, or nothing if they are skew.
@@ -1142,6 +1162,21 @@ mod tests {
         assert!(
             first.dot(second).abs() < 1.0 - 1.0e-9,
             "the two seams lie in different planes"
+        );
+    }
+
+    /// The seam is a property of the pair, not of which wall asked. Each face
+    /// of a Boolean asks for this intersection with itself named first, so an
+    /// answer that depended on the order would hand the two walls curves that
+    /// agree as point sets and disagree about which way round they run.
+    #[test]
+    fn a_crossing_pairs_seam_does_not_depend_on_which_cylinder_asks() {
+        let upright = upright_cylinder([0.0, 0.0, 0.0], 5.0);
+        let across = cylinder_about([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 5.0);
+        assert_eq!(
+            intersect(upright, across, precision()),
+            intersect(across, upright, precision()),
+            "the pair meets where it meets, however it is asked"
         );
     }
 
