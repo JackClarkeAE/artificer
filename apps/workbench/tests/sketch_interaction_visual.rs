@@ -13,7 +13,7 @@ fn harness() -> Harness<'static, KernelLabApp> {
         .join("tests")
         .join("snapshots");
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -171,7 +171,7 @@ fn exact_trim_hover_and_staged_span_snapshots() {
     assert_eq!(harness.state().sketch_pending_entity_count(), 0);
     assert_eq!(harness.state().sketch_entity_count(), 3);
     assert_eq!(harness.state().sketch_revision(), 3);
-    settle_hover_snapshot(&mut harness, "workbench_exact_trim_middle_span_hover_1040");
+    settle_hover_snapshot(&mut harness, "workbench_exact_trim_middle_span_hover_1120");
 
     click_sketch_point(&mut harness, middle_span_pick);
     // The trim commits as it is picked, like every other stroke.
@@ -180,7 +180,7 @@ fn exact_trim_hover_and_staged_span_snapshots() {
     assert_eq!(harness.state().sketch_revision(), 4);
     settle_snapshot(
         &mut harness,
-        "workbench_exact_trim_middle_span_committed_1040",
+        "workbench_exact_trim_middle_span_committed_1120",
     );
 }
 
@@ -221,7 +221,7 @@ fn rectangular_pattern_direction_handle_drag_snapshot() {
     );
     settle_hover_snapshot(
         &mut harness,
-        "workbench_rectangular_pattern_direction_handle_drag_1040",
+        "workbench_rectangular_pattern_direction_handle_drag_1120",
     );
 
     pointer_button(&mut harness, dragged_handle, false);
@@ -267,7 +267,7 @@ fn three_point_arc_tab_sweep_validation_snapshot() {
     assert!(readouts[1].editable);
     settle_hover_snapshot(
         &mut harness,
-        "workbench_three_point_arc_tab_sweep_validation_1040",
+        "workbench_three_point_arc_tab_sweep_validation_1120",
     );
 }
 
@@ -347,7 +347,7 @@ fn typed_dimension_live_preview_snapshot() {
     replace_tool_input(&mut harness, "Rectangle width", "6");
     assert_eq!(harness.state().sketch_pending_entity_count(), 4);
     assert!(!harness.state().operation_confirmation_pending());
-    settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1040");
+    settle_snapshot(&mut harness, "workbench_typed_dimension_live_preview_1120");
 }
 
 /// The Dimension tool, armed: clicking the rectangle's top edge turns that
@@ -365,5 +365,5 @@ fn dimension_tool_armed_on_a_rectangle_snapshot() {
     click_button(&mut harness, "Sketch dimension");
     click_sketch_point(&mut harness, SketchPoint::new(0.0, 1.5));
     harness.get_by_role_and_label(Role::TextInput, "Rectangle width");
-    settle_snapshot(&mut harness, "workbench_dimension_tool_armed_1040");
+    settle_snapshot(&mut harness, "workbench_dimension_tool_armed_1120");
 }

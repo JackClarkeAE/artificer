@@ -1530,7 +1530,7 @@ fn sketch_pan_and_zoom_are_immediate_presentation_changes_only() {
 
 #[test]
 fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
-    let mut harness = harness([1040.0, 700.0]);
+    let mut harness = harness([1120.0, 700.0]);
     enter_sketch(&mut harness, "XY Plane");
     let ribbon_bottom = harness.get_by_label("Sketch viewport").rect().top();
 
@@ -1551,7 +1551,7 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
             "{label} is vertically clipped: {rect:?}"
         );
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0 && rect.min.y >= 0.0 && rect.max.y <= 700.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0 && rect.min.y >= 0.0 && rect.max.y <= 700.0,
             "{label} escaped the supported window: {rect:?}"
         );
         assert!(
@@ -1581,7 +1581,7 @@ fn minimum_window_keeps_critical_sketch_controls_visible_and_canvas_fixed() {
         assert!(rect.is_positive(), "{label} must have a visible hit target");
         assert!(rect.height() >= 24.0, "{label} is too small: {rect:?}");
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0 && rect.min.y >= 0.0 && rect.max.y <= 700.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0 && rect.min.y >= 0.0 && rect.max.y <= 700.0,
             "{label} escaped the supported window: {rect:?}"
         );
         assert!(

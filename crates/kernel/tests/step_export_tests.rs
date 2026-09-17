@@ -649,3 +649,85 @@ fn the_occt_oracle_agrees_with_the_kernel_measures() {
         );
     }
 }
+
+/// A body's colour travels in the file, as the presentation style AP214 has
+/// for it rather than as a comment or a name.
+///
+/// The chain is what other CAD reads: a `styled_item` naming the solid, a
+/// `colour_rgb` reached through the fill-area styles, and one
+/// `mechanical_design_geometric_presentation_representation` gathering them.
+/// Every link is checked, because a chain missing one is a file that opens
+/// grey and says nothing about why.
+#[test]
+fn a_bodys_colour_is_written_as_an_ap214_presentation_style() {
+    use artificer_kernel::{StepBody, StepPlacement, api::export::export_step_bodies_styled};
+
+    let snapshot = build("let b = box(size: [40, 30, 20], label: \"b\");\n");
+    let step = export_step_bodies_styled(
+        &[StepBody {
+            snapshot: &snapshot,
+            name: "block",
+            placement: StepPlacement::IDENTITY,
+            colour: Some([0.25, 0.5, 0.75]),
+        }],
+        "coloured",
+    )
+    .expect("a coloured body exports");
+
+    for entity in [
+        "COLOUR_RGB",
+        "FILL_AREA_STYLE_COLOUR",
+        "FILL_AREA_STYLE",
+        "SURFACE_STYLE_FILL_AREA",
+        "SURFACE_SIDE_STYLE",
+        "SURFACE_STYLE_USAGE(.BOTH.",
+        "PRESENTATION_STYLE_ASSIGNMENT",
+        "STYLED_ITEM",
+        "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION",
+    ] {
+        assert!(
+            step.contains(entity),
+            "the file should carry {entity}:\n{step}"
+        );
+    }
+
+    // The numbers are the ones asked for, not a rounding of them.
+    let colour = step
+        .lines()
+        .find(|line| line.contains("COLOUR_RGB"))
+        .expect("the colour entity");
+    for channel in ["0.25", "0.5", "0.75"] {
+        assert!(colour.contains(channel), "{colour} should hold {channel}");
+    }
+
+    // The styled item names the solid it colours, so a reader can tell which
+    // body is which rather than colouring the whole file.
+    let solid = step
+        .lines()
+        .find(|line| line.contains("MANIFOLD_SOLID_BREP") || line.contains("BREP_WITH_VOIDS"))
+        .and_then(|line| line.split('=').next())
+        .expect("the solid entity")
+        .to_owned();
+    let styled = step
+        .lines()
+        .find(|line| line.contains("STYLED_ITEM"))
+        .expect("the styled item");
+    assert!(
+        styled.contains(&format!(",{solid})")),
+        "{styled} should name {solid}"
+    );
+}
+
+/// An uncoloured body writes no style at all, leaving the receiving system its
+/// own default rather than asserting a colour nobody chose.
+#[test]
+fn a_body_without_a_colour_writes_no_presentation_style() {
+    let snapshot = build("let b = box(size: [40, 30, 20], label: \"b\");\n");
+    let step = export_step(&snapshot, "plain").expect("the body exports");
+    for entity in ["COLOUR_RGB", "STYLED_ITEM", "PRESENTATION_STYLE_ASSIGNMENT"] {
+        assert!(
+            !step.contains(entity),
+            "an uncoloured body must not write {entity}"
+        );
+    }
+}

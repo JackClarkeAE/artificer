@@ -139,3 +139,65 @@ here.
 **Angle and radius dimensions between objects remain unbuilt.** They are
 separate relation kinds with separate residuals — ADR 0026 F1 stage 2 lists
 them — not this one wearing a different label.
+
+## Amendment: a dimension to an edge (2026-09-17)
+
+Two points was not enough to be useful, and the reason is worth stating
+precisely rather than as a preference.
+
+A distance between two points is a **radius**. It leaves the point it locates
+anywhere on a circle, so it does not say where anything is. Two of them
+trilaterate, which nearly works and then does not: the pair of circles meets in
+*two* places, so the answer depends on which side the point started; and for
+many perfectly reasonable numbers they do not meet at all, so the relation is
+refused as conflicting. Measured on the four-corner fixture, asking for 10 and
+14 from corners 28.28 apart is simply impossible, and the solver says so.
+
+What a drawing actually uses is an **ordinate**: how far something sits from an
+edge. That leaves the point anywhere *along* the edge, and two of them, from
+two edges, meet in exactly one place — no twin to choose between and no pair of
+radii that might not reach. Three relations carry it:
+
+- `PointToLineDistance` — the offset. Measured from the edge's *line*, not its
+  segment, because a dimension to an edge does not stop meaning anything where
+  the point is past the end of it. It keeps the side the point is already on,
+  so retyping slides the point out rather than flipping it through the edge.
+- `PointToMidpointDistance` — the middle of an edge is the feature a drawing
+  centres things on, and it is not a point the sketch owns, so the relation
+  names the edge's ends and measures to the middle of them.
+- `LineToLineDistance` — two parallel edges. Two lines only have a distance
+  where they are parallel; anywhere else they meet and the number depends on
+  where it was read, so staging one on edges that are not parallel is refused
+  by name rather than answered with one of the many numbers.
+
+### A dimension holds its datum whole
+
+Retyping an offset has to move the located point and leave the edge alone, and
+holding one end of that edge is not enough: the projection is free to share the
+correction with the other end and tilt it. So the relation says which points
+are its datum, and the retype anchors all of them. The caller keeps the
+override it had; it simply no longer has to know.
+
+### One tool reads what was picked
+
+The Distance relation tool no longer refuses everything but two corners. Two
+points hold a separation, a point and an edge hold an offset, two parallel
+edges hold their spacing — one tool, because the user's question is the same
+one and only the datum differs. The midpoint gets its own variant rather than
+competing with the offset for the same pick, since a point and an edge would
+otherwise mean two things.
+
+### Everything downstream came for free
+
+A dimension is drawn from a *span* — the two points whose separation is the
+number — and asking the relation for its own span is what let one drawing path
+serve all of them. For a separation that is the two points; for an offset it is
+the point and the foot of its perpendicular. Nothing in the widget, the
+keyboard handling or the retype needed to know a new kind existed.
+
+### What is still missing
+
+Offsets are from straight edges only. An arc or a circle has a distance to a
+point too — centre distance less radius — and it is a different residual, so it
+is a different relation rather than this one stretched. Angles between edges
+remain unbuilt, as the record above already says.

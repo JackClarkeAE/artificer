@@ -107,7 +107,7 @@ use crate::sketch_toolbar::{
     paint_tool_icon,
 };
 use artificer_kernel::api::analysis::{ClearanceProfile, FitVerdict};
-use artificer_kernel::api::export::{StepPlacement, export_step_bodies_placed};
+use artificer_kernel::api::export::{StepBody, StepPlacement, export_step_bodies_styled};
 use artificer_kernel::api::sweep::{Sweep, SweepReport, SweepStep, interference_sweep};
 use artificer_model::JointId;
 use artificer_model::kinematics::{self, JointDriver, Kinematics};
@@ -203,6 +203,8 @@ struct ArtificerWorkspaceFile {
     construction_planes: Vec<ConstructionPlane>,
     #[serde(default)]
     materials: Vec<BodyMaterial>,
+    #[serde(default)]
+    colours: Vec<BodyColour>,
     document: ModelDocument,
 }
 
@@ -212,6 +214,18 @@ struct ArtificerWorkspaceFile {
 struct BodyMaterial {
     body: u64,
     material: String,
+}
+
+/// One body's colour, as the sRGB bytes a picker produces.
+///
+/// Separate from its material because the two answer different questions. A
+/// material says what a body is made of, and its colour is a consequence; a
+/// colour says how this one body should look, whatever it is made of. A body
+/// with neither is shaded by the viewport's own default.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct BodyColour {
+    body: u64,
+    rgb: [u8; 3],
 }
 
 /// One document-owned datum plane. Geometry is stored explicitly so the plane
@@ -2056,6 +2070,8 @@ struct WorkbenchBody {
     /// The assigned material's stable key. Bodies start unassigned so mass is
     /// never quoted from a default nobody chose.
     material: Option<String>,
+    /// An explicit colour, which outranks the material's own.
+    colour: Option<[u8; 3]>,
 }
 
 /// How many positions of the mechanism a sweep measures.
@@ -3330,6 +3346,16 @@ impl KernelLabApp {
                     })
                 })
                 .collect(),
+            colours: self
+                .bodies
+                .iter()
+                .filter_map(|body| {
+                    body.colour.map(|rgb| BodyColour {
+                        body: body.id.get(),
+                        rgb,
+                    })
+                })
+                .collect(),
             format: ARTIFICER_WORKSPACE_FORMAT.to_owned(),
             version: ARTIFICER_WORKSPACE_VERSION,
             settings: DocumentSettings {
@@ -3352,6 +3378,39 @@ impl KernelLabApp {
             .find(|entry| entry.id == body)
             .and_then(|entry| entry.material.as_deref())
             .and_then(material::by_key)
+    }
+
+    /// The colour a body is shown in: its own if it has been given one, else
+    /// its material's, else nothing and the viewport's default stands.
+    #[must_use]
+    pub fn body_colour(&self, body: BodyId) -> Option<[u8; 3]> {
+        let entry = self.bodies.iter().find(|entry| entry.id == body)?;
+        entry.colour.or_else(|| {
+            let material = material::by_key(entry.material.as_deref()?)?;
+            Some([
+                material.colour.r(),
+                material.colour.g(),
+                material.colour.b(),
+            ])
+        })
+    }
+
+    /// Whether a body carries a colour of its own, as opposed to showing its
+    /// material's.
+    #[must_use]
+    pub fn body_has_own_colour(&self, body: BodyId) -> bool {
+        self.bodies
+            .iter()
+            .any(|entry| entry.id == body && entry.colour.is_some())
+    }
+
+    /// Sets or clears one body's own colour. Clearing it does not clear the
+    /// material, so a body falls back to what it is made of rather than to
+    /// nothing.
+    pub fn set_body_colour(&mut self, body: BodyId, rgb: Option<[u8; 3]>) {
+        if let Some(entry) = self.bodies.iter_mut().find(|entry| entry.id == body) {
+            entry.colour = rgb;
+        }
     }
 
     /// Assigns or clears a body's material. Passing an unknown key clears it,
@@ -3460,6 +3519,17 @@ impl KernelLabApp {
                     .find(|body| body.id.get() == assignment.body)
             {
                 body.material = Some(found.key.to_owned());
+            }
+        }
+        // Colours are bytes rather than keys, so every one a document names is
+        // restorable whatever this build's material library holds.
+        for assignment in &workspace.colours {
+            if let Some(body) = self
+                .bodies
+                .iter_mut()
+                .find(|body| body.id.get() == assignment.body)
+            {
+                body.colour = Some(assignment.rgb);
             }
         }
         self.rebind_construction_plane_sketch_supports();
@@ -4552,6 +4622,7 @@ impl KernelLabApp {
         self.next_body_ordinal = 2;
         self.bodies.push(WorkbenchBody {
             material: None,
+            colour: None,
             id: body_id,
             last_feature: base.feature,
             ordinal: 1,
@@ -4688,6 +4759,7 @@ impl KernelLabApp {
             let ordinal = bodies.len() as u32 + 1;
             bodies.push(WorkbenchBody {
                 material: None,
+                colour: None,
                 id: record.id,
                 last_feature: record.last_feature,
                 ordinal,
@@ -5611,6 +5683,7 @@ impl KernelLabApp {
                 .unwrap_or_else(|| bodies.len() as u32 + 1);
             bodies.push(WorkbenchBody {
                 material: None,
+                colour: None,
                 id: record.id,
                 last_feature: record.last_feature,
                 ordinal,
@@ -6278,6 +6351,7 @@ impl KernelLabApp {
         self.next_body_ordinal = self.next_body_ordinal.saturating_add(1);
         self.bodies.push(WorkbenchBody {
             material: None,
+            colour: None,
             id: self
                 .document
                 .bodies()
@@ -7432,6 +7506,7 @@ impl KernelLabApp {
         self.next_body_ordinal = self.next_body_ordinal.saturating_add(1);
         self.bodies.push(WorkbenchBody {
             material: None,
+            colour: None,
             id: body_id,
             last_feature: feature_id,
             ordinal,
@@ -12636,6 +12711,7 @@ impl KernelLabApp {
             self.active_body_ordinal = ordinal;
             self.bodies.push(WorkbenchBody {
                 material: None,
+                colour: None,
                 id: body_id,
                 last_feature: appended.feature,
                 ordinal,
@@ -14039,7 +14115,7 @@ impl KernelLabApp {
         path: &Path,
         include: impl Fn(&WorkbenchBody) -> bool,
     ) -> Result<(), String> {
-        let bodies: Vec<(&Snapshot, String, StepPlacement)> = self
+        let bodies: Vec<(&Snapshot, String, StepPlacement, Option<[f64; 3]>)> = self
             .bodies
             .iter()
             .filter(|body| include(body))
@@ -14061,22 +14137,32 @@ impl KernelLabApp {
                         ],
                         translation: [origin.x, origin.y, origin.z],
                     },
+                    // What the body is shaded with, which is its own colour if
+                    // it has one and its material's otherwise. STEP holds
+                    // components in 0..1 where a picker deals in bytes.
+                    self.body_colour(body.id)
+                        .map(|rgb| rgb.map(|channel| f64::from(channel) / 255.0)),
                 )
             })
             .collect();
         if bodies.is_empty() {
             return Err("no body to export".into());
         }
-        let placed: Vec<(&Snapshot, &str, StepPlacement)> = bodies
+        let placed: Vec<StepBody<'_>> = bodies
             .iter()
-            .map(|(snapshot, name, placement)| (*snapshot, name.as_str(), *placement))
+            .map(|(snapshot, name, placement, colour)| StepBody {
+                snapshot,
+                name: name.as_str(),
+                placement: *placement,
+                colour: *colour,
+            })
             .collect();
         let product = self
             .document_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("Artificer");
-        let text = export_step_bodies_placed(&placed, product).map_err(|error| error.message)?;
+        let text = export_step_bodies_styled(&placed, product).map_err(|error| error.message)?;
         export::atomic_write(path, text.as_bytes())
     }
 
@@ -19260,10 +19346,18 @@ impl KernelLabApp {
                                 if self.boolean_tools.contains(&body.id) {
                                     Some(BOOLEAN_TOOL_TINT)
                                 } else {
-                                    body.material
-                                        .as_deref()
-                                        .and_then(material::by_key)
-                                        .map(|found| found.colour)
+                                    // A colour the user chose outranks the one
+                                    // its material implies.
+                                    body.colour
+                                        .map(|[red, green, blue]| {
+                                            egui::Color32::from_rgb(red, green, blue)
+                                        })
+                                        .or_else(|| {
+                                            body.material
+                                                .as_deref()
+                                                .and_then(material::by_key)
+                                                .map(|found| found.colour)
+                                        })
                                 },
                             )
                             .with_field(heat_map.as_ref().and_then(|heat_map| {
@@ -22812,6 +22906,7 @@ fn push_test_cuboid_body(app: &mut KernelLabApp, label: &str, origin: Point3) ->
         kind: ModelBodyKind::Cuboid,
         visible: true,
         material: None,
+        colour: None,
     });
     id
 }
@@ -27809,6 +27904,67 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// A colour the user chose outranks the one its material implies, and
+    /// clearing it falls back to the material rather than to nothing.
+    #[test]
+    fn a_bodys_own_colour_outranks_its_materials_and_clearing_falls_back() {
+        let mut app = KernelLabApp::default();
+        let body = push_test_cuboid_body(&mut app, "colour", Point3::new(0.0, 0.0, 0.0));
+
+        assert_eq!(app.body_colour(body), None, "a bare body has no colour");
+        assert!(!app.body_has_own_colour(body));
+
+        app.set_body_material(body, Some("brass"));
+        let brass = material::by_key("brass").expect("brass is in the library");
+        assert_eq!(
+            app.body_colour(body),
+            Some([brass.colour.r(), brass.colour.g(), brass.colour.b()]),
+            "a material's colour shows where the body has none of its own"
+        );
+        assert!(
+            !app.body_has_own_colour(body),
+            "a material does not give the body a colour of its own"
+        );
+
+        app.set_body_colour(body, Some([10, 20, 30]));
+        assert_eq!(app.body_colour(body), Some([10, 20, 30]));
+        assert!(app.body_has_own_colour(body));
+
+        app.set_body_colour(body, None);
+        assert_eq!(
+            app.body_colour(body),
+            Some([brass.colour.r(), brass.colour.g(), brass.colour.b()]),
+            "clearing the colour leaves the material, not nothing"
+        );
+    }
+
+    /// The colour is saved with the document and comes back, as bytes rather
+    /// than as a key, so it survives whatever the material library holds.
+    #[test]
+    fn a_bodys_colour_survives_a_save_and_a_load() {
+        let mut app = KernelLabApp::default();
+        let body = push_test_cuboid_body(&mut app, "saved", Point3::new(0.0, 0.0, 0.0));
+        app.set_body_colour(body, Some([7, 99, 200]));
+
+        let document = app
+            .workspace_document_json()
+            .expect("the workspace serialises");
+        assert!(
+            document.contains("\"colours\""),
+            "the document should carry the colours it was given"
+        );
+
+        let mut reopened = KernelLabApp::default();
+        reopened
+            .load_workspace_json(&document)
+            .expect("the workspace loads");
+        assert_eq!(
+            reopened.body_colour(body),
+            Some([7, 99, 200]),
+            "the colour should come back with the document"
+        );
+    }
+
     #[test]
     fn body_boolean_is_staged_confirmed_and_replayable() {
         let mut app = KernelLabApp::default();
@@ -27862,6 +28018,7 @@ mod extrusion_workbench_tests {
             kind: ModelBodyKind::Cuboid,
             visible: true,
             material: None,
+            colour: None,
         });
 
         app.stage_body_boolean(BooleanOperation::Union);

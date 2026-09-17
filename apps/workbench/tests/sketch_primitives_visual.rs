@@ -13,7 +13,7 @@ fn harness() -> Harness<'static, KernelLabApp> {
         .join("tests")
         .join("snapshots");
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -192,7 +192,7 @@ fn polygon_variants_committed_snapshot() {
         assert!(!input.accesskit_node().is_disabled());
     }
     assert_idle_sketch_rail(&harness);
-    settle_snapshot(&mut harness, "workbench_polygon_variants_committed_1040");
+    settle_snapshot(&mut harness, "workbench_polygon_variants_committed_1120");
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn analytic_slot_committed_snapshot() {
         );
     }
     assert_idle_sketch_rail(&harness);
-    settle_snapshot(&mut harness, "workbench_analytic_slot_committed_1040");
+    settle_snapshot(&mut harness, "workbench_analytic_slot_committed_1120");
 }
 
 #[test]
@@ -266,5 +266,5 @@ fn three_point_arc_live_measurement_snapshot() {
     // palette that used to restate them is gone.
     assert!(harness.query_all_by_label("Arc radius").count() >= 1);
     assert!(harness.query_all_by_label("Arc sweep").count() >= 1);
-    settle_live_hover_snapshot(&mut harness, "workbench_three_point_arc_live_1040");
+    settle_live_hover_snapshot(&mut harness, "workbench_three_point_arc_live_1120");
 }

@@ -714,11 +714,15 @@ impl SketchDefinition {
         let before = self
             .solve_constraints(precision)
             .map_err(SketchTransactionError::ConstraintRejected)?;
+        let datum = restated.datum_points();
         let mut candidate = self.clone();
         candidate
             .set_constraint_kind(constraint, restated, precision)
             .map_err(SketchTransactionError::ConstraintRejected)?;
-        let anchored = held.into_iter().collect::<BTreeSet<_>>();
+        // Whatever the caller named, plus whatever the relation is measured
+        // from. A dimension typed against a datum must move the thing being
+        // located and leave the datum where it is.
+        let anchored = held.into_iter().chain(datum).collect::<BTreeSet<_>>();
         let after = candidate
             .solve_constraints_anchoring(&anchored, precision)
             .map_err(SketchTransactionError::ConstraintRejected)?;

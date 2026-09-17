@@ -97,6 +97,10 @@ pub enum RibbonGroupId {
     Analyse,
     Panels,
     Appearance,
+    /// One body's own colour, on the Assembly tab. It carries no commands: the
+    /// group *is* the picker, the way the Boolean group becomes its operand
+    /// panel while one is staged.
+    BodyAppearance,
     ThemeChoice,
     ThemeColours,
     ParametricVariables,
@@ -120,6 +124,7 @@ impl RibbonGroupId {
             Self::Analyse => "ANALYSE",
             Self::Panels => "PANELS",
             Self::Appearance => "APPEARANCE",
+            Self::BodyAppearance => "COLOUR",
             Self::ThemeChoice => "THEME",
             Self::ThemeColours => "COLOURS",
             Self::ParametricVariables => "VARIABLES",
@@ -147,6 +152,7 @@ impl RibbonGroupId {
             Self::Analyse => "group_analyse",
             Self::Panels => "group_panels",
             Self::Appearance => "group_appearance",
+            Self::BodyAppearance => "group_body_appearance",
             Self::ThemeChoice => "group_theme_choice",
             Self::ThemeColours => "group_theme_colours",
             Self::ParametricVariables => "group_parametric_variables",
@@ -879,6 +885,10 @@ pub fn groups_for_tab(tab: RibbonTab) -> Vec<(RibbonGroupId, Vec<&'static Comman
                 .into_iter()
                 .filter(|(group, _)| *group == RibbonGroupId::Select),
         );
+        // Colouring a part is an assembly act — it is how you tell one from
+        // another once several are on screen — and it is a picker rather than
+        // a command, so the group carries no members and the ribbon fills it.
+        groups.push((RibbonGroupId::BodyAppearance, Vec::new()));
     }
     groups
 }

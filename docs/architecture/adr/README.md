@@ -50,6 +50,8 @@ by tests, and **proposed** is a plan not yet executed.
 | [0037](0037-where-a-side-of-an-extrusion-ends.md) | Where a side of an extrusion ends | Implemented | — |
 | [0038](0038-a-dimension-between-two-points.md) | A dimension between two points | Implemented | — |
 | [0039](0039-coplanar-facets-merge-back-into-walls.md) | Coplanar facets merge back into walls | Implemented | — |
+| [0040](0040-a-part-has-a-colour.md) | A part has a colour, and the colour travels | Implemented | — |
+| [0041](0041-tools-and-selections-meet-in-either-order.md) | Tools and selections meet in either order | Proposed | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

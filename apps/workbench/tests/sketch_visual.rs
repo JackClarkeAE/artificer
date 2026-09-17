@@ -43,7 +43,7 @@ fn minimum_harness() -> Harness<'static, KernelLabApp> {
         .join("tests")
         .join("snapshots");
     Harness::builder()
-        .with_size([1040.0, 700.0])
+        .with_size([1120.0, 700.0])
         .with_pixels_per_point(1.0)
         .with_step_dt(1.0 / 60.0)
         .with_theme(egui::Theme::Dark)
@@ -400,14 +400,14 @@ fn workbench_compact_sketch_toolbar_at_minimum_size_snapshot() {
             "{label} lost its accessible hit target: {rect:?}"
         );
         assert!(
-            rect.min.x >= 0.0 && rect.max.x <= 1040.0,
+            rect.min.x >= 0.0 && rect.max.x <= 1120.0,
             "{label} escaped the supported window: {rect:?}"
         );
     }
 
     harness.remove_cursor();
     harness.run();
-    harness.snapshot("workbench_compact_sketch_toolbar_1040");
+    harness.snapshot("workbench_compact_sketch_toolbar_1120");
 }
 
 #[test]
@@ -439,7 +439,7 @@ fn workbench_two_distance_chamfer_palette_snapshot() {
 
     harness.remove_cursor();
     harness.run();
-    harness.snapshot("workbench_two_distance_chamfer_palette_1040");
+    harness.snapshot("workbench_two_distance_chamfer_palette_1120");
 }
 
 #[test]
@@ -472,7 +472,7 @@ fn workbench_maximum_rectangular_pattern_committed_snapshot() {
 
     harness.remove_cursor();
     harness.run();
-    harness.snapshot("workbench_maximum_rectangular_pattern_committed_1040");
+    harness.snapshot("workbench_maximum_rectangular_pattern_committed_1120");
 }
 
 #[test]

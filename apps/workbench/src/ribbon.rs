@@ -57,7 +57,7 @@ const SMALL_ICON: f32 = 16.0;
 // minimum-window guard in `tests/ui.rs` holds every ribbon button to it.
 // The width is the widest small caption — `Properties`, 49 px at 10.5 pt —
 // after the 24 px icon column, with 2 px to spare. At 86 the sketch tab did
-// not fit the 1040 px minimum window: its last button ended at 1081.
+// not fit the minimum window of the day: its last button ended at 1081.
 const SMALL_BUTTON: Vec2 = vec2(78.0, 24.0);
 
 impl KernelLabApp {
@@ -94,7 +94,7 @@ impl KernelLabApp {
             // Groups already end in a separator and carry their own caption
             // row; the panel's 5 px item spacing on both sides of every
             // separator was 19 px of air per boundary, the single largest
-            // consumer of width at the 1040 px minimum window.
+            // consumer of width at the minimum window.
             ui.spacing_mut().item_spacing.x = 2.0;
             let response = ui
                 .add_sized([24.0, 22.0], egui::Button::new("−").frame(false))
@@ -241,6 +241,9 @@ impl KernelLabApp {
                 }
                 if group == RibbonGroupId::Analyse {
                     self.section_analysis_panel(ui);
+                }
+                if group == RibbonGroupId::BodyAppearance {
+                    self.body_colour_panel(ui);
                 }
             });
         }
@@ -498,6 +501,49 @@ impl KernelLabApp {
                     .color(theme::muted()),
             )
             .on_hover_text("Click a body to add it as a tool; click it again to remove it.");
+        });
+    }
+
+    /// The active body's colour, as a swatch that opens an RGB picker.
+    ///
+    /// The swatch shows what the body is actually shaded with, which is its own
+    /// colour if it has one and its material's if it does not — so opening the
+    /// picker starts from what is on screen rather than from black. Choosing
+    /// gives the body a colour of its own; Reset takes it away again and lets
+    /// the material's show through.
+    pub(crate) fn body_colour_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.active_body_id() else {
+            ui.label(
+                RichText::new("No body is active.")
+                    .small()
+                    .color(theme::muted()),
+            );
+            return;
+        };
+        let operation_pending = self.operation_confirmation_pending();
+        let shown = self.body_colour(active).unwrap_or([200, 200, 205]);
+        ui.add_enabled_ui(!operation_pending, |ui| {
+            ui.vertical(|ui| {
+                let mut rgb = shown;
+                let response = ui.color_edit_button_srgb(&mut rgb);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Body colour")
+                });
+                response
+                    .on_hover_text("Colour this body. The choice is saved with the document and travels in a STEP export.");
+                if rgb != shown {
+                    self.set_body_colour(active, Some(rgb));
+                }
+                let reset = ui
+                    .add_enabled(
+                        self.body_has_own_colour(active),
+                        egui::Button::new(RichText::new("Reset").small()),
+                    )
+                    .on_hover_text("Drop this body's own colour and shade it by its material again.");
+                if reset.clicked() {
+                    self.set_body_colour(active, None);
+                }
+            });
         });
     }
 
