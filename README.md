@@ -25,6 +25,16 @@
 
 ---
 
+## What is new in 0.99.1
+
+A point release about saying what you mean: reaching a relation in one click
+instead of three, dimensioning to an edge rather than only to its corners, and
+telling one part from another by colouring it.
+
+- **Every relation is a button, not a menu behind one.** The relations were one tile with a chooser behind it, so picking perpendicular meant clicking a tile, reading a menu and clicking again — for a tool you reach for knowing exactly which one you want. All eleven of them and the dimension tool now stand in a grid of their own beside the drawing tools, each its own button, each armed in one click. They are glyphs rather than labelled tiles, which is what lets twelve fit where one tile and its dropdown stood; every one carries its name in its tooltip and its accessible name. The supported minimum window grows from 1040 to 1120 wide to make room for them.
+- **A dimension can measure to an edge, to its middle, or to another edge.** A distance between two points is a radius: it leaves the point it locates anywhere on a circle, so two of them meet in two places or in none, and neither is what a drawing means by "twenty from that edge". Three relations say it properly — an offset from an edge's line, a distance to an edge's midpoint, and the separation of two parallel edges. Two offsets from two edges land a point in exactly one place, which is the ordinate a drawing is mostly made of. The offset is measured from the edge's line rather than its segment, it keeps the side the point is already on, and retyping it moves the thing being located while leaving the edge it is measured from where it is. Edges that are not parallel are refused by name rather than answered with one of the many numbers their distance could be. ADR 0038's amendment records the design.
+- **A part can be given a colour, and the colour travels.** Materials already carried one, which told steel from brass and could not tell this bracket from that one — two parts of the same aluminium shaded identically is exactly the case an assembly needs colour for. A body now has a colour of its own, set from the RGB picker in the Assembly tab's COLOUR group, and it outranks the one its material implies; clearing it falls back to the material rather than to nothing. It is saved with the document and it leaves in a STEP export as the presentation style AP214 has for it, which is the chain other CAD reads. A body with no colour writes no style at all, so the receiving system keeps its own default rather than being told a colour nobody chose. ADR 0040 records the design.
+
 ## What is new in 0.99
 
 A kernel release. Two bores that cross used to leave the exact domain and come
