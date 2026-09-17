@@ -25,6 +25,18 @@ use crate::{DebugTriangle, NativeKernel, Snapshot, error};
 /// The AP214 schema identifier the file claims.
 const SCHEMA: &str = "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }";
 
+/// One body in an exported file: its geometry, its name, where it sits and
+/// what colour it is shown in.
+pub struct StepBody<'a> {
+    pub snapshot: &'a Snapshot,
+    pub name: &'a str,
+    pub placement: StepPlacement,
+    /// Linear sRGB components in `0..=1`, which is what STEP's `colour_rgb`
+    /// holds. `None` writes no style at all, leaving the receiving system its
+    /// own default rather than asserting a colour nobody chose.
+    pub colour: Option<[f64; 3]>,
+}
+
 /// Where a body sits in the exported file: a proper rigid placement, as a
 /// rotation matrix by columns and a translation. Geometry is written in
 /// the placed position; a rotation keeps every normal and every
@@ -105,9 +117,34 @@ impl NativeKernel {
         bodies: &[(&Snapshot, &str, StepPlacement)],
         product: &str,
     ) -> Result<String, KernelError> {
+        let styled: Vec<StepBody<'_>> = bodies
+            .iter()
+            .map(|(snapshot, name, placement)| StepBody {
+                snapshot,
+                name,
+                placement: *placement,
+                colour: None,
+            })
+            .collect();
+        Self::export_step_bodies_styled(&styled, product)
+    }
+
+    /// The same, with each body carrying the colour it is shown in.
+    ///
+    /// A colour travels as AP214's presentation style: a `styled_item` on the
+    /// solid, carrying a `colour_rgb` through the fill-area chain, and one
+    /// `mechanical_design_geometric_presentation_representation` gathering them
+    /// in the same geometric context as the shapes. That is the chain other
+    /// CAD reads, which is the whole point of writing it rather than a comment.
+    pub fn export_step_bodies_styled(
+        bodies: &[StepBody<'_>],
+        product: &str,
+    ) -> Result<String, KernelError> {
         let mut file = StepFile::new(product);
         let mut solids = Vec::new();
-        for (snapshot, name, placement) in bodies {
+        let mut styled_items = Vec::new();
+        for body in bodies {
+            let (snapshot, name, placement) = (body.snapshot, body.name, &body.placement);
             if !placement.is_rigid() {
                 return Err(error(
                     KernelErrorCode::InvalidInput,
@@ -184,7 +221,13 @@ impl NativeKernel {
                     ))
                 };
                 solids.push(solid_id);
+                if let Some(colour) = body.colour {
+                    styled_items.push(writer.file.styled_item(solid_id, colour));
+                }
             }
+        }
+        if !styled_items.is_empty() {
+            file.presentation(&styled_items);
         }
         Ok(file.finish(&solids, "ADVANCED_BREP_SHAPE_REPRESENTATION"))
     }
@@ -303,6 +346,37 @@ impl StepFile {
         file.push_str(&self.data);
         file.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
         file
+    }
+
+    /// The AP214 presentation chain for one solid's colour, ending in the
+    /// `styled_item` that names it.
+    fn styled_item(&mut self, item: u64, colour: [f64; 3]) -> u64 {
+        let [red, green, blue] = colour.map(|channel| channel.clamp(0.0, 1.0));
+        let colour = self.entity(format!(
+            "COLOUR_RGB('',{},{},{})",
+            real(red),
+            real(green),
+            real(blue)
+        ));
+        let fill = self.entity(format!("FILL_AREA_STYLE_COLOUR('',#{colour})"));
+        let area = self.entity(format!("FILL_AREA_STYLE('',(#{fill}))"));
+        let surface_fill = self.entity(format!("SURFACE_STYLE_FILL_AREA(#{area})"));
+        let side = self.entity(format!("SURFACE_SIDE_STYLE('',(#{surface_fill}))"));
+        // `.BOTH.` so a face read from either side carries the colour: a
+        // cavity's wall is as much the body's colour as its outside is.
+        let usage = self.entity(format!("SURFACE_STYLE_USAGE(.BOTH.,#{side})"));
+        let assignment = self.entity(format!("PRESENTATION_STYLE_ASSIGNMENT((#{usage}))"));
+        self.entity(format!("STYLED_ITEM('colour',(#{assignment}),#{item})"))
+    }
+
+    /// Gathers every styled item into the one presentation representation the
+    /// file carries, in the same geometric context as the shapes it styles.
+    fn presentation(&mut self, styled: &[u64]) {
+        self.entity(format!(
+            "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',({}),#{})",
+            ids(styled),
+            self.context
+        ));
     }
 
     fn point(&mut self, point: Point3) -> u64 {

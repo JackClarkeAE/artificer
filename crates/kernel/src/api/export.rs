@@ -2,8 +2,8 @@
 
 use std::fmt::Write as _;
 
-pub use crate::StepPlacement;
 use crate::{NativeKernel, Snapshot};
+pub use crate::{StepBody, StepPlacement};
 use serde::{Deserialize, Serialize};
 
 use crate::api::debug::ApiError;
@@ -44,6 +44,16 @@ pub fn export_step_bodies_placed(
     product_name: &str,
 ) -> Result<String, ApiError> {
     NativeKernel::export_step_bodies_placed(bodies, &header_name(product_name))
+        .map_err(ApiError::from)
+}
+
+/// The same, with each body carrying the colour it is shown in, written as
+/// AP214's presentation style so other CAD reads it back.
+pub fn export_step_bodies_styled(
+    bodies: &[StepBody<'_>],
+    product_name: &str,
+) -> Result<String, ApiError> {
+    NativeKernel::export_step_bodies_styled(bodies, &header_name(product_name))
         .map_err(ApiError::from)
 }
 

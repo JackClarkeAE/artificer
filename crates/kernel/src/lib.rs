@@ -83,7 +83,7 @@ use crate::transform::{Similarity, TransformInputError, transform_topology};
 pub use crate::describe::{
     EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, SurfaceCounts,
 };
-pub use crate::step_export::StepPlacement;
+pub use crate::step_export::{StepBody, StepPlacement};
 pub use crate::topology::FaceRole;
 
 /// Immutable, validated model state.
