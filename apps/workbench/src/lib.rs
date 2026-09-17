@@ -75,8 +75,8 @@ use artificer_protocol::{
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
     CurveIntersections, EvaluatedCurve2 as AuthoringCurve2, ProfileCompileError, RegionSignature,
-    SketchArrangement, SketchDefinition, SketchPoint2 as AuthoringPoint2, build_arrangement,
-    compile_selected_profile, intersect_curves,
+    SketchArrangement, SketchConstraintId, SketchDefinition, SketchPoint2 as AuthoringPoint2,
+    build_arrangement, compile_selected_profile, intersect_curves,
 };
 use eframe::egui;
 use egui::{Color32, CornerRadius, FontId, Frame, Margin, RichText, Stroke};
@@ -96,11 +96,11 @@ use crate::presentation::{
 use crate::shell::{WorkbenchShellState, WorkbenchShellVisibility};
 use crate::sketch::{
     CertifiedProfileStatus, CertifiedSketchCurve, CertifiedSketchLoop, CertifiedSketchProfile,
-    DimensionInputError, DimensionKeyClaims, DimensionReadout, SelectedRecipeEditorView,
-    SelectedRecipeParameter, SketchCanvasState, SketchContextCurve, SketchContextEdge,
-    SketchContextFitKey, SketchContextLayer, SketchContextTriangle, SketchCurveDirection,
-    SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId, SketchGeometry,
-    SketchPlane, SketchPoint, SketchView, SketchViewportContext,
+    DimensionInputError, DimensionKeyClaims, DimensionReadout, PointToPointDimension,
+    SelectedRecipeEditorView, SelectedRecipeParameter, SketchCanvasState, SketchContextCurve,
+    SketchContextEdge, SketchContextFitKey, SketchContextLayer, SketchContextTriangle,
+    SketchCurveDirection, SketchDimensionKind, SketchEditError, SketchEntity, SketchEntityId,
+    SketchGeometry, SketchPlane, SketchPoint, SketchView, SketchViewportContext,
 };
 use crate::sketch_toolbar::{
     CommitContract, SelectionRequirement, SketchToolbarState, ToolInputKind, ToolVariant,
@@ -3852,6 +3852,34 @@ impl KernelLabApp {
     #[must_use]
     pub fn sketch_dimension_error(&self) -> Option<DimensionInputError> {
         self.sketch.dimension_error()
+    }
+
+    /// Every dimension the sketch holds between two points, as drawn.
+    #[must_use]
+    pub fn sketch_point_to_point_dimensions(&self) -> Vec<PointToPointDimension> {
+        self.sketch.point_to_point_dimensions()
+    }
+
+    /// The point-to-point dimension open for typing: its text, and why the last
+    /// entry was refused if it was.
+    #[must_use]
+    pub fn sketch_relation_dimension_entry(&self) -> Option<(String, Option<String>)> {
+        self.sketch
+            .relation_dimension_editor()
+            .map(|(_, text, error)| (text.to_owned(), error.map(ToOwned::to_owned)))
+    }
+
+    pub fn begin_sketch_relation_dimension_edit(&mut self, constraint: SketchConstraintId) -> bool {
+        self.sketch.begin_relation_dimension_edit(constraint)
+    }
+
+    pub fn set_sketch_relation_dimension_text(&mut self, text: String) {
+        self.sketch.set_relation_dimension_text(text);
+    }
+
+    /// Applies the typed distance, staging it behind the confirmation gate.
+    pub fn accept_sketch_relation_dimension_edit(&mut self) -> bool {
+        self.sketch.accept_relation_dimension_edit().is_some()
     }
 
     #[must_use]

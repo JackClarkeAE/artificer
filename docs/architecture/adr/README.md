@@ -48,6 +48,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0035](0035-drawn-connections-hold.md) | Drawn connections hold, and a deliberate edit outranks the solver | Implemented | — |
 | [0036](0036-editing-a-committed-feature.md) | A committed feature is edited where it was made | Accepted and implemented | — |
 | [0037](0037-where-a-side-of-an-extrusion-ends.md) | Where a side of an extrusion ends | Implemented | — |
+| [0038](0038-a-dimension-between-two-points.md) | A dimension between two points | Implemented | — |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

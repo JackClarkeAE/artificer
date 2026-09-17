@@ -32,12 +32,12 @@ use artificer_sketch::{
     MIN_POLYGON_SIDES as CORE_MIN_POLYGON_SIDES, PointInput as CorePointInput,
     ProfileCompileError as CoreProfileCompileError, RegionSignature as CoreRegionSignature,
     RetirementPolicy as CoreRetirementPolicy, SignedLength as CoreSignedLength,
-    SketchArrangement as CoreSketchArrangement, SketchConstraintKind as CoreConstraintKind,
-    SketchCurve2 as CoreCurve2, SketchDefinition as CoreSketchDefinition,
-    SketchEntityId as CoreEntityId, SketchEntityRole as CoreEntityRole,
-    SketchOperationId as CoreOperationId, SketchOutputRef as CoreOutputRef,
-    SketchPoint2 as CorePoint2, SketchPointId as CorePointId, SketchRecipe as CoreRecipe,
-    SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
+    SketchArrangement as CoreSketchArrangement, SketchConstraintId as CoreConstraintId,
+    SketchConstraintKind as CoreConstraintKind, SketchCurve2 as CoreCurve2,
+    SketchDefinition as CoreSketchDefinition, SketchEntityId as CoreEntityId,
+    SketchEntityRole as CoreEntityRole, SketchOperationId as CoreOperationId,
+    SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
+    SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
     SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
@@ -1205,6 +1205,13 @@ pub enum SketchDimensionKind {
     Diameter,
     Radius,
     SweepDegrees,
+    /// The distance between two points that need not belong to the same
+    /// object: what a `Distance` relation holds, drawn as a dimension.
+    ///
+    /// Unlike every other kind here, this one is not a number some recipe
+    /// carries. It belongs to the relation, which is why it is the only kind
+    /// whose value can be typed without a selected operation to write into.
+    Separation,
 }
 
 impl SketchDimensionKind {
@@ -1222,6 +1229,7 @@ impl SketchDimensionKind {
             Self::Diameter => "Circle diameter",
             Self::Radius => "Arc radius",
             Self::SweepDegrees => "Arc sweep",
+            Self::Separation => "Distance between points",
         }
     }
 
@@ -1238,6 +1246,7 @@ impl SketchDimensionKind {
             Self::Diameter => "DIA",
             Self::Radius => "R",
             Self::SweepDegrees => "SWEEP",
+            Self::Separation => "D",
         }
     }
 
@@ -1267,9 +1276,65 @@ impl SketchDimensionKind {
     const fn is_length_magnitude(self) -> bool {
         matches!(
             self,
-            Self::Length | Self::Width | Self::Height | Self::Diameter | Self::Radius
+            Self::Length
+                | Self::Width
+                | Self::Height
+                | Self::Diameter
+                | Self::Radius
+                | Self::Separation
         )
     }
+}
+
+/// What a dimension-tool click that landed on a point did.
+#[derive(Clone, Copy, Debug, Default)]
+struct DimensionPointPick {
+    /// The click was about a point, so it is not also a pick of the object the
+    /// point belongs to.
+    took_click: bool,
+    /// The dimension this pick completed, as the entity its edit hangs from.
+    staged: Option<SketchEntityId>,
+}
+
+impl DimensionPointPick {
+    const fn took_the_click() -> Self {
+        Self {
+            took_click: true,
+            staged: None,
+        }
+    }
+}
+
+/// One distance dimension mid-edit: which relation, and what has been typed.
+#[derive(Clone, Debug, PartialEq)]
+struct RelationDimensionEdit {
+    constraint: CoreConstraintId,
+    text: String,
+    /// The box has not taken the caret yet. Asking for focus is a one-shot:
+    /// asking every frame would take the caret back off whatever the user
+    /// clicked next, and never give it up.
+    focus_wanted: bool,
+    /// Why the last entry was not applied, in the user's terms. A syntax or
+    /// domain fault is a [`DimensionInputError`]; a value the relation system
+    /// cannot satisfy is the solver's own words.
+    error: Option<String>,
+}
+
+/// One distance relation, as a dimension the canvas can draw and the user can
+/// type into.
+///
+/// `first` and `second` are the relation's own ends, in its own order. That
+/// order is what decides which end a retyped value holds still: the dimension
+/// is measured *from* the first point, so the first point is the one that
+/// stays. It is the same rule as a line's length moving only its end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointToPointDimension {
+    pub constraint: CoreConstraintId,
+    pub from: SketchPoint,
+    pub to: SketchPoint,
+    pub first: CorePointId,
+    pub second: CorePointId,
+    pub value: f64,
 }
 
 /// Public, allocation-friendly observation used by the inspector and UI tests.
@@ -5250,6 +5315,13 @@ pub struct SketchCanvasState {
     modifier_sources: Vec<CoreEntityId>,
     /// Operands picked so far for the active relation tool, in click order.
     relation_operands: Vec<RelationOperand>,
+    /// The distance relation being typed into, with the text exactly as typed.
+    ///
+    /// The text is kept apart from the relation's value so a half-typed or
+    /// refused entry stays on screen to be corrected, rather than being rounded
+    /// into the model or thrown away. This is the same bargain every other
+    /// numeric field in the sketch makes.
+    relation_dimension_edit: Option<RelationDimensionEdit>,
     /// Why the last relation was refused, in the solver's own words. Cleared
     /// when a relation succeeds or the tool changes.
     relation_diagnostic: Option<String>,
@@ -5337,6 +5409,7 @@ impl Default for SketchCanvasState {
             selected_recipe_editor: None,
             modifier_sources: Vec::new(),
             relation_operands: Vec::new(),
+            relation_dimension_edit: None,
             relation_diagnostic: None,
             modifier_picks: BTreeMap::new(),
             hovered: None,
@@ -8886,6 +8959,258 @@ impl SketchCanvasState {
             .map(|record| record.evaluated_position)
     }
 
+    /// Takes one pick for a dimension between two points, and stages the
+    /// dimension once both have been named.
+    ///
+    /// Returns whether the pick was a point. A pick that was not is nobody's
+    /// business here — it falls through to the tool's ordinary behaviour of
+    /// arming the clicked object's own numbers.
+    ///
+    /// The relation this stages is the same one the Distance relation tool
+    /// makes, built by the same code, because "the distance between these two
+    /// points" means one thing however the user asked for it.
+    fn take_dimension_point_pick(&mut self, point: SketchPoint, radius: f64) -> DimensionPointPick {
+        let Some(picked) = self.exact_point_hit(point, radius) else {
+            return DimensionPointPick::default();
+        };
+        let operand = RelationOperand::Point(picked);
+        if self.relation_operands.contains(&operand) {
+            self.relation_diagnostic = Some("A dimension needs two different points.".to_owned());
+            return DimensionPointPick::took_the_click();
+        }
+        self.relation_operands.push(operand);
+        if self.relation_operands.len() < 2 {
+            self.relation_diagnostic = None;
+            return DimensionPointPick::took_the_click();
+        }
+        let staged = self.stage_relation(ToolVariant::DistanceRelation);
+        let constraint = staged.and_then(|_| {
+            self.point_to_point_dimensions()
+                .last()
+                .map(|dimension| dimension.constraint)
+        });
+        self.clear_relation_acquisition();
+        // The value is open for typing the moment the dimension exists, so
+        // placing one and giving it a number is a single gesture rather than
+        // two that happen to be next to each other.
+        if let Some(constraint) = constraint {
+            self.begin_relation_dimension_edit(constraint);
+        }
+        DimensionPointPick {
+            took_click: true,
+            staged,
+        }
+    }
+
+    /// The definition the canvas is showing: the staged candidate while an edit
+    /// waits at the confirmation gate, otherwise the committed sketch.
+    ///
+    /// A relation staged but not yet confirmed is part of what the user is
+    /// looking at, so a dimension has to be drawn from it. Reading the
+    /// committed sketch instead would leave a just-placed dimension invisible
+    /// until it was confirmed, which is the whole complaint this work started
+    /// from wearing different clothes.
+    fn presented_definition(&self) -> &CoreSketchDefinition {
+        self.pending
+            .as_ref()
+            .and_then(|pending| pending.core_transaction.as_ref())
+            .map_or(&self.authoring, CoreTransaction::preview)
+    }
+
+    /// Every distance relation the sketch holds, as something that can be drawn
+    /// and typed into.
+    ///
+    /// A relation between two points is the only dimension here that belongs to
+    /// no single object, so it cannot be found by asking an operation what
+    /// numbers its recipe carries. It has to be read from the relation itself,
+    /// which is what this does.
+    ///
+    /// The ends are reported at their *solved* positions rather than their
+    /// authored ones, so the annotation is drawn against the geometry actually
+    /// on screen.
+    #[must_use]
+    pub fn point_to_point_dimensions(&self) -> Vec<PointToPointDimension> {
+        let definition = self.presented_definition();
+        let solved = definition
+            .solve_constraints(PrecisionPolicy::default())
+            .ok();
+        let position = |point: CorePointId| {
+            solved
+                .as_ref()
+                .and_then(|solution| solution.positions.get(&point).copied())
+                .or_else(|| {
+                    definition
+                        .point(point)
+                        .filter(|record| record.active)
+                        .map(|record| record.evaluated_position)
+                })
+        };
+        definition
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .filter_map(|record| {
+                let CoreConstraintKind::Distance {
+                    first,
+                    second,
+                    distance,
+                } = record.kind
+                else {
+                    return None;
+                };
+                let (from, to) = (position(first)?, position(second)?);
+                Some(PointToPointDimension {
+                    constraint: record.id,
+                    from: SketchPoint::new(from.u, from.v),
+                    to: SketchPoint::new(to.u, to.v),
+                    first,
+                    second,
+                    value: distance,
+                })
+            })
+            .collect()
+    }
+
+    /// Opens the value of one distance dimension for typing, seeded with what
+    /// it currently holds in the document unit.
+    ///
+    /// Seeding from the held value rather than from the measured separation is
+    /// deliberate: they are the same number whenever the sketch is solved, and
+    /// where they are not it is the held value the user is editing.
+    pub fn begin_relation_dimension_edit(&mut self, constraint: CoreConstraintId) -> bool {
+        let Some(dimension) = self
+            .point_to_point_dimensions()
+            .into_iter()
+            .find(|dimension| dimension.constraint == constraint)
+        else {
+            return false;
+        };
+        self.relation_dimension_edit = Some(RelationDimensionEdit {
+            constraint,
+            text: self.length_unit.format_value(dimension.value),
+            focus_wanted: true,
+            error: None,
+        });
+        true
+    }
+
+    /// The dimension currently open for typing, with its text and any refusal.
+    #[must_use]
+    pub fn relation_dimension_editor(&self) -> Option<(CoreConstraintId, &str, Option<&str>)> {
+        self.relation_dimension_edit
+            .as_ref()
+            .map(|edit| (edit.constraint, edit.text.as_str(), edit.error.as_deref()))
+    }
+
+    /// Retains what has been typed without touching the model.
+    pub fn set_relation_dimension_text(&mut self, text: String) {
+        if let Some(edit) = self.relation_dimension_edit.as_mut() {
+            edit.text = text;
+            edit.error = None;
+        }
+    }
+
+    pub fn cancel_relation_dimension_edit(&mut self) {
+        self.relation_dimension_edit = None;
+    }
+
+    /// Applies what was typed, staging the sketch edit behind the usual
+    /// confirmation gate.
+    ///
+    /// The relation's own first point is held and the second is what moves, so
+    /// a dimension behaves like every other driven value here: a line's length
+    /// moves its end, not its start. A value the system cannot satisfy is
+    /// refused in the solver's words and the text stays for correction — the
+    /// sketch is never left holding a number its geometry disagrees with.
+    pub fn accept_relation_dimension_edit(&mut self) -> Option<SketchEntityId> {
+        let (constraint, text) = {
+            let edit = self.relation_dimension_edit.as_ref()?;
+            (edit.constraint, edit.text.clone())
+        };
+        let dimension = self
+            .point_to_point_dimensions()
+            .into_iter()
+            .find(|dimension| dimension.constraint == constraint)?;
+        let entry = DimensionEntry {
+            names: &self.named_values,
+            unit: self.length_unit,
+        };
+        let value = match parse_dimension_value(SketchDimensionKind::Separation, &text, entry) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(edit) = self.relation_dimension_edit.as_mut() {
+                    edit.error = Some(error.label().to_owned());
+                }
+                return None;
+            }
+        };
+        let transaction = match self.authoring.stage_relation_measurement(
+            constraint,
+            value,
+            Some(dimension.first),
+            "Dimension",
+            PrecisionPolicy::default(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(artificer_sketch::SketchTransactionError::NoChange) => {
+                self.relation_dimension_edit = None;
+                return None;
+            }
+            Err(error) => {
+                if let Some(edit) = self.relation_dimension_edit.as_mut() {
+                    edit.error = Some(error.to_string());
+                }
+                return None;
+            }
+        };
+        let Some(subject) = self.relation_dimension_subject(&transaction, dimension) else {
+            if let Some(edit) = self.relation_dimension_edit.as_mut() {
+                edit.error = Some("The dimension has no geometry to hang from.".to_owned());
+            }
+            return None;
+        };
+        match self.stage_core_relation(transaction, "Dimension", subject) {
+            Ok(subject) => {
+                self.relation_dimension_edit = None;
+                self.refresh_presentation_geometry();
+                Some(subject)
+            }
+            Err(_) => {
+                if let Some(edit) = self.relation_dimension_edit.as_mut() {
+                    edit.error =
+                        Some("The dimension could not be staged for confirmation.".to_owned());
+                }
+                None
+            }
+        }
+    }
+
+    /// The entity a staged dimension hangs from, so the confirmation gate has a
+    /// presentation subject. A dimension inserts no geometry of its own.
+    fn relation_dimension_subject(
+        &self,
+        transaction: &CoreTransaction,
+        dimension: PointToPointDimension,
+    ) -> Option<SketchEntityId> {
+        self.authoring
+            .point(dimension.second)
+            .and_then(|record| {
+                self.entities
+                    .iter()
+                    .map(|entity| entity.id)
+                    .find(|id| self.operation_by_ui.get(id) == Some(&record.owner.operation))
+            })
+            .or_else(|| {
+                transaction
+                    .impact()
+                    .changed_entities
+                    .iter()
+                    .find_map(|entity| self.ui_by_core.get(entity).copied())
+            })
+            .or(self.selected)
+            .or_else(|| self.entities.first().map(|entity| entity.id))
+    }
+
     /// Turns the picked operands into the equations the solver will hold.
     fn relation_constraints(
         &self,
@@ -11117,15 +11442,39 @@ pub fn show_with_context(
             match state.tool {
                 SketchTool::Select => {
                     let sketch_pt = state.view.screen_to_sketch(response.rect, position);
+                    // A click that lands on an endpoint, with the dimension
+                    // tool armed, is asking about that point rather than about
+                    // the curve it belongs to. Two of them are a dimension
+                    // between two objects, which is the one thing the tool
+                    // could not do. Endpoint beats curve here exactly as it
+                    // does for a relation and for snapping.
+                    let dimension_point =
+                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
+                            state.take_dimension_point_pick(
+                                sketch_pt,
+                                f64::from(entity_pick_radius) / state.view.points_per_unit,
+                            )
+                        } else {
+                            DimensionPointPick::default()
+                        };
+                    let took_dimension_point = dimension_point.took_click;
+                    draft_changed |= took_dimension_point;
+                    pending_created = pending_created.or(dimension_point.staged);
                     let additive = ui.input(|input| input.modifiers.shift);
-                    let selected = hit_test_entities(
-                        &state.entities,
-                        state.view,
-                        response.rect,
-                        position,
-                        entity_pick_radius,
-                    );
-                    if let Some(selected) = selected {
+                    let selected = (!took_dimension_point)
+                        .then(|| {
+                            hit_test_entities(
+                                &state.entities,
+                                state.view,
+                                response.rect,
+                                position,
+                                entity_pick_radius,
+                            )
+                        })
+                        .flatten();
+                    if took_dimension_point {
+                        // The point pick is the whole answer to this click.
+                    } else if let Some(selected) = selected {
                         selection_changed = state.set_selected(Some(selected));
                         if !additive {
                             selection_changed |= state.clear_selected_regions();
@@ -11280,6 +11629,17 @@ pub fn show_with_context(
     paint_dimension_leaders(&painter, &dimension_layouts);
     let dimensions = show_dimension_widgets(ui, state, &dimension_layouts, canvas_owned_keyboard);
     pending_created = pending_created.or(dimensions.pending_created);
+    let relation_dimensions = show_point_to_point_dimensions(
+        ui,
+        state,
+        response.rect,
+        raw_key_pressed(ui, egui::Key::Enter, egui::Modifiers::NONE),
+        raw_key_pressed(ui, egui::Key::Escape, egui::Modifiers::NONE),
+    );
+    pending_created = pending_created.or(relation_dimensions.applied);
+    let mut dimension_keys = dimensions.claims;
+    dimension_keys.enter |= relation_dimensions.enter_claimed;
+    dimension_keys.escape |= relation_dimensions.escape_claimed;
 
     SketchCanvasOutput {
         response,
@@ -11288,8 +11648,10 @@ pub fn show_with_context(
         navigation_changed,
         draft_changed,
         pending_created,
-        dimension_keys: dimensions.claims,
-        recipe_dimension_field: dimensions.recipe_field,
+        dimension_keys,
+        // A relation dimension and a recipe dimension are the same act to the
+        // workbench — a number typed on the canvas — so they share the gate.
+        recipe_dimension_field: dimensions.recipe_field.or(relation_dimensions.field),
         recipe_dimension_accepted: dimensions.recipe_accepted,
     }
 }
@@ -13124,6 +13486,230 @@ fn committed_dimension_annotation_layouts(
         }
     }
     layouts
+}
+
+/// Lays out the annotation for every distance relation the sketch holds.
+///
+/// The plate sits clear of the span it measures, offset along the span's
+/// normal, so the dimension line has somewhere to break and the value does not
+/// land on the geometry it is measuring.
+fn point_to_point_dimension_layouts(
+    state: &SketchCanvasState,
+    canvas_rect: Rect,
+) -> Vec<(CoreConstraintId, DimensionWidgetLayout)> {
+    const PLATE_STANDOFF: f32 = 26.0;
+    let mut layouts = Vec::new();
+    for dimension in state.point_to_point_dimensions() {
+        let from = state.view.sketch_to_screen(canvas_rect, dimension.from);
+        let to = state.view.sketch_to_screen(canvas_rect, dimension.to);
+        let along = to - from;
+        let length = along.length();
+        if !length.is_finite() || length < 1.0 {
+            continue;
+        }
+        let normal = Vec2::new(-along.y, along.x) / length;
+        let centre = from + along * 0.5 + normal * PLATE_STANDOFF;
+        let rect = clamp_dimension_rect(
+            Rect::from_center_size(centre, DIMENSION_WIDGET_SIZE),
+            canvas_rect,
+        );
+        if !rect.is_finite() {
+            continue;
+        }
+        layouts.push((
+            dimension.constraint,
+            DimensionWidgetLayout {
+                readout: DimensionReadout {
+                    kind: SketchDimensionKind::Separation,
+                    value: dimension.value,
+                    locked: true,
+                    editable: true,
+                },
+                rect,
+                leader_start: from,
+                span: Some((from, to)),
+                id: Id::new(("sketch-relation-dimension", dimension.constraint.get())),
+            },
+        ));
+    }
+    layouts
+}
+
+/// What one frame of relation dimensions hands back to the canvas.
+#[derive(Default)]
+struct PointToPointDimensionOutcome {
+    /// The dimension that owns the keyboard, with the rectangle it occupies,
+    /// so the workbench settles Enter and Escape exactly as it does for the
+    /// on-canvas recipe field.
+    field: Option<(Id, Rect)>,
+    escape_claimed: bool,
+    /// The dimension applied this frame, as the entity its edit hangs from. A
+    /// typed dimension applies the moment it is accepted, so this goes to the
+    /// same immediate-commit path a freshly drawn stroke uses.
+    applied: Option<SketchEntityId>,
+    enter_claimed: bool,
+}
+
+/// Draws every distance relation as a dimension and offers the one being
+/// edited to the keyboard.
+///
+/// A relation the user placed *is* a dimension, so it is drawn whenever the
+/// sketch is open rather than only while a tool is armed — that is the whole
+/// difference between a relation you can see and one you have to remember.
+/// Typing into it needs the dimension tool, which is what the tool is for.
+fn show_point_to_point_dimensions(
+    ui: &mut Ui,
+    state: &mut SketchCanvasState,
+    canvas_rect: Rect,
+    enter_pressed: bool,
+    escape_pressed: bool,
+) -> PointToPointDimensionOutcome {
+    let layouts = point_to_point_dimension_layouts(state, canvas_rect);
+    if layouts.is_empty() {
+        return PointToPointDimensionOutcome::default();
+    }
+    let colours = sketch_colours();
+    let editing = state.relation_dimension_edit.as_ref().map(|edit| {
+        (
+            edit.constraint,
+            edit.text.clone(),
+            edit.error.clone(),
+            edit.focus_wanted,
+        )
+    });
+    let armed = state.exact_tool == ToolVariant::Dimension;
+    let mut outcome = PointToPointDimensionOutcome::default();
+    let mut begin = None;
+    for (constraint, layout) in &layouts {
+        let under_edit = editing
+            .as_ref()
+            .is_some_and(|(editing, _, _, _)| editing == constraint);
+        let stroke = Stroke::new(
+            1.0,
+            colours
+                .dimension
+                .gamma_multiply(if under_edit { 1.0 } else { 0.72 }),
+        );
+        if !paint_dimension_annotation(ui.painter(), layout, stroke) {
+            ui.painter()
+                .line_segment([layout.leader_start, layout.rect.center()], stroke);
+        }
+        let Some((_, text, error, take_focus)) = editing.as_ref().filter(|_| under_edit) else {
+            ui.painter().rect(
+                layout.rect,
+                4.0,
+                colours.dimension_background.gamma_multiply(0.85),
+                Stroke::new(1.0, colours.dimension.gamma_multiply(0.55)),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                layout.rect.center(),
+                Align2::CENTER_CENTER,
+                format_dimension_readout(layout.readout, state.length_unit),
+                FontId::monospace(10.0),
+                colours.dimension.gamma_multiply(0.85),
+            );
+            if armed {
+                let response =
+                    ui.interact(layout.rect, layout.id.with("pick"), egui::Sense::click());
+                response.ctx.accesskit_node_builder(response.id, |node| {
+                    node.set_label(SketchDimensionKind::Separation.label());
+                    node.set_description(
+                        "Click to type a new distance between these two points.".to_owned(),
+                    );
+                });
+                if response.clicked() {
+                    begin = Some(*constraint);
+                }
+            }
+            continue;
+        };
+
+        let mut buffer = text.clone();
+        ui.painter().rect(
+            layout.rect,
+            4.0,
+            colours.dimension_background,
+            Stroke::new(
+                1.8,
+                if error.is_some() {
+                    colours.invalid
+                } else {
+                    colours.selected
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let response = ui.put(
+            layout.rect,
+            egui::TextEdit::singleline(&mut buffer)
+                .id(layout.id)
+                .desired_width(layout.rect.width())
+                .horizontal_align(egui::Align::Center)
+                .background_color(Color32::TRANSPARENT)
+                .font(FontId::monospace(11.0))
+                .text_color(if error.is_some() {
+                    colours.invalid
+                } else {
+                    colours.dimension_locked
+                }),
+        );
+        response.ctx.accesskit_node_builder(response.id, |node| {
+            node.set_label(SketchDimensionKind::Separation.label());
+            node.set_description(format!(
+                "Distance between two points, in {}. Enter applies the value; Escape reverts it.",
+                dimension_unit_label(SketchDimensionKind::Separation, state.length_unit)
+            ));
+        });
+        if let Some(error) = error {
+            ui.painter().text(
+                layout.rect.left_bottom() + Vec2::new(0.0, 3.0),
+                Align2::LEFT_TOP,
+                error,
+                FontId::monospace(9.0),
+                colours.invalid,
+            );
+        }
+        if response.changed() {
+            state.set_relation_dimension_text(buffer);
+        }
+        if *take_focus {
+            if let Some(edit) = state.relation_dimension_edit.as_mut() {
+                edit.focus_wanted = false;
+            }
+            response.request_focus();
+            select_all_dimension_text(ui, layout.id, &response, text.chars().count());
+        }
+        if response.has_focus() {
+            outcome.field = Some((response.id, response.rect));
+        }
+        // Enter and Escape mean what they mean in every other numeric field
+        // here (ADR 0027): Enter applies, Escape reverts. Clicking away is the
+        // same as Enter, which is what this tool has always promised.
+        //
+        // egui clears focus before any widget renders, so a key that ends the
+        // edit arrives on the frame the box *lost* focus rather than the frame
+        // it held it. Reading the keys explicitly is what tells a deliberate
+        // Enter or Escape apart from a click somewhere else; without it, an
+        // Escape looks exactly like a click away and applies the value it was
+        // meant to abandon.
+        let owns_keyboard = response.has_focus() || response.lost_focus();
+        if owns_keyboard && escape_pressed {
+            outcome.escape_claimed = true;
+            state.cancel_relation_dimension_edit();
+        } else if owns_keyboard && enter_pressed {
+            outcome.enter_claimed = true;
+            outcome.applied = state.accept_relation_dimension_edit();
+        } else if response.lost_focus() {
+            // A value refused on the way out keeps the box and its reason, but
+            // never the caret: the user asked to be somewhere else.
+            outcome.applied = state.accept_relation_dimension_edit();
+        }
+    }
+    if let Some(constraint) = begin {
+        state.begin_relation_dimension_edit(constraint);
+    }
+    outcome
 }
 
 /// Paints the committed dimension records: the drafted annotation with a
@@ -19327,6 +19913,226 @@ mod tests {
 
         let (follower_start, _) = segment_ends(&state, second);
         assert_point_near(follower_start, SketchPoint::new(4.0, 0.0));
+    }
+
+    /// Two separate lines whose near ends are four apart. This is the shape the
+    /// user's report takes: two objects, and a distance between them that the
+    /// tool could measure but never show or let them change.
+    fn two_separate_lines() -> (SketchCanvasState, SketchPoint, SketchPoint) {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(-8.0, 0.0),
+                SketchPoint::new(-4.0, 0.0),
+            ))
+            .expect("the first line should stage");
+        state
+            .commit_pending()
+            .expect("the first line should commit");
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("the second line should stage");
+        state
+            .commit_pending()
+            .expect("the second line should commit");
+        (
+            state,
+            SketchPoint::new(-4.0, 0.0),
+            SketchPoint::new(0.0, 0.0),
+        )
+    }
+
+    /// The tool is named for the thing it could not do. Clicking an endpoint of
+    /// one object and an endpoint of another has to produce a dimension between
+    /// them, holding what they already measure.
+    #[test]
+    fn the_dimension_tool_measures_between_two_objects() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(
+            state.point_to_point_dimensions().is_empty(),
+            "one point named is half a dimension, and half a dimension is none"
+        );
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+
+        let dimensions = state.point_to_point_dimensions();
+        assert_eq!(dimensions.len(), 1, "two points make one dimension");
+        assert!(
+            (dimensions[0].value - 4.0).abs() <= 1.0e-9,
+            "the dimension should hold what the points already measure, and holds {}",
+            dimensions[0].value
+        );
+        assert!(
+            state.pending().is_some(),
+            "a dimension is a sketch edit and waits at the confirmation gate"
+        );
+    }
+
+    /// A click that lands on no point is still a question about the object
+    /// under it, so the tool's existing behaviour has to survive untouched.
+    #[test]
+    fn a_dimension_click_away_from_any_point_names_no_point() {
+        let (mut state, _, _) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(
+            !state
+                .take_dimension_point_pick(SketchPoint::new(-6.0, 2.5), 0.5)
+                .took_click
+        );
+        assert!(state.point_to_point_dimensions().is_empty());
+    }
+
+    /// Placing a dimension and giving it a value is one act. The value is open
+    /// for typing the moment the dimension exists.
+    #[test]
+    fn a_placed_dimension_opens_for_typing_straight_away() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+
+        let (constraint, text, error) = state
+            .relation_dimension_editor()
+            .expect("the new dimension should be open for typing");
+        assert_eq!(constraint, state.point_to_point_dimensions()[0].constraint);
+        assert_eq!(text, "4", "the box is seeded with the value it holds");
+        assert!(error.is_none());
+    }
+
+    /// The whole point of a driving dimension: type a number and the geometry
+    /// goes there. The end the dimension is measured from stays put.
+    #[test]
+    fn retyping_a_dimension_moves_the_far_object() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        state.commit_pending().expect("the dimension should commit");
+
+        let constraint = state.point_to_point_dimensions()[0].constraint;
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("10".to_owned());
+        assert!(
+            state.accept_relation_dimension_edit().is_some(),
+            "ten is a distance this sketch can hold"
+        );
+        state.commit_pending().expect("the edit should commit");
+
+        let dimension = state.point_to_point_dimensions()[0];
+        assert!(
+            (dimension.value - 10.0).abs() <= 1.0e-9,
+            "the dimension should hold ten and holds {}",
+            dimension.value
+        );
+        assert!(
+            (dimension.from.u - first.u).abs() <= 1.0e-6,
+            "the end the dimension is measured from should not have moved"
+        );
+        assert!(
+            (dimension.to.u - dimension.from.u).abs() - 10.0 < 1.0e-6,
+            "the far end should have travelled to ten away"
+        );
+        assert!(
+            state.relation_dimension_editor().is_none(),
+            "an applied value closes the box"
+        );
+    }
+
+    /// Text that is not a number never reaches the model, and stays on screen
+    /// to be corrected.
+    #[test]
+    fn a_dimension_refuses_text_that_is_not_a_length() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        state.commit_pending().expect("the dimension should commit");
+
+        let constraint = state.point_to_point_dimensions()[0].constraint;
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("nonsense".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_none());
+
+        let (_, text, error) = state
+            .relation_dimension_editor()
+            .expect("a refused entry stays open");
+        assert_eq!(text, "nonsense", "the text stays exactly as typed");
+        assert!(error.is_some(), "and the refusal is named");
+        assert!(
+            (state.point_to_point_dimensions()[0].value - 4.0).abs() <= 1.0e-9,
+            "the model still holds the value it had"
+        );
+    }
+
+    /// A dimension the relation system cannot satisfy is refused in the
+    /// solver's own words rather than rounded to whatever it could reach.
+    #[test]
+    fn a_dimension_the_sketch_cannot_hold_is_refused_by_the_solver() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        state.commit_pending().expect("the dimension should commit");
+
+        // Pin both ends: their separation is now a fact, and no other value
+        // can hold.
+        assert!(state.set_exact_tool(ToolVariant::FixedRelation));
+        state.handle_modifier_click(first, 0.5);
+        state.commit_pending().expect("the first pin should commit");
+        state.handle_modifier_click(second, 0.5);
+        state
+            .commit_pending()
+            .expect("the second pin should commit");
+
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        let constraint = state.point_to_point_dimensions()[0].constraint;
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("10".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_none());
+
+        let (_, _, error) = state
+            .relation_dimension_editor()
+            .expect("a refused entry stays open");
+        let error = error.expect("the solver should say why");
+        assert!(
+            error.contains("conflicting"),
+            "the refusal should be the solver's own words, and reads {error}"
+        );
+        assert!(
+            (state.point_to_point_dimensions()[0].value - 4.0).abs() <= 1.0e-9,
+            "the model still holds the value it had"
+        );
+    }
+
+    /// The annotation is drawn against the two points it measures, so it moves
+    /// with them and is nowhere near the objects it does not belong to.
+    #[test]
+    fn a_dimension_is_drawn_between_the_two_points_it_measures() {
+        let (mut state, first, second) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+
+        let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
+        let layouts = point_to_point_dimension_layouts(&state, canvas);
+        assert_eq!(layouts.len(), 1);
+        let (_, layout) = &layouts[0];
+        let (from, to) = layout.span.expect("a distance is a span, so it has one");
+        assert!(
+            (from - state.view.sketch_to_screen(canvas, first)).length() <= 0.5
+                && (to - state.view.sketch_to_screen(canvas, second)).length() <= 0.5,
+            "the span should run between the two points the dimension names"
+        );
+        assert_eq!(layout.readout.kind, SketchDimensionKind::Separation);
+        assert!(
+            !layout.rect.contains(from) && !layout.rect.contains(to),
+            "the value plate stands clear of the points it measures between"
+        );
     }
 }
 

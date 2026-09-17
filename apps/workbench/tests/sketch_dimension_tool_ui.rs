@@ -325,3 +325,247 @@ fn line_length_is_driven_and_moves_only_the_end_point() {
         "a line is drivable by exactly the two numbers that define it"
     );
 }
+
+const SEPARATION_BOX: &str = "Distance between points";
+
+/// A typed dimension applies the moment it is accepted, so nothing should be
+/// left waiting at the confirmation gate.
+fn assert_dimension_applied_without_a_gate(harness: &Harness<'static, KernelLabApp>) {
+    assert_eq!(
+        harness.state().sketch_pending_label(),
+        None,
+        "a typed dimension applies on acceptance, like a drawn stroke"
+    );
+}
+
+/// Draws two separate lines, four apart at their near ends.
+fn two_separate_lines(harness: &mut Harness<'static, KernelLabApp>) {
+    click_button(harness, "Single line");
+    click_sketch_point(harness, SketchPoint::new(-8.0, 0.0));
+    click_sketch_point(harness, SketchPoint::new(-4.0, 0.0));
+    click_button(harness, "Single line");
+    click_sketch_point(harness, SketchPoint::new(0.0, 0.0));
+    click_sketch_point(harness, SketchPoint::new(4.0, 0.0));
+}
+
+/// The reported gesture: dimension between two objects, then change it.
+///
+/// Every piece of this was present and none of it was connected. The solver
+/// has held a distance between two arbitrary points since the sketch crate was
+/// written; the relation tool created one and captured what the points already
+/// measured; and the tool's own tooltip promised the dimension tool would edit
+/// it afterwards. Nothing drew the relation and nothing could retype it, so
+/// what the user got for dimensioning between two objects was silence.
+#[test]
+fn a_dimension_between_two_objects_is_drawn_and_can_be_retyped() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    two_separate_lines(&mut harness);
+    arm_dimension_tool(&mut harness);
+
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    let dimensions = harness.state().sketch_point_to_point_dimensions();
+    assert_eq!(
+        dimensions.len(),
+        1,
+        "picking an endpoint of each line should make one dimension"
+    );
+    assert!(
+        (dimensions[0].value - 4.0).abs() <= 1.0e-6,
+        "the dimension holds what the points already measure, and holds {}",
+        dimensions[0].value
+    );
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, SEPARATION_BOX)
+            .is_some(),
+        "a placed dimension offers its value to type into"
+    );
+
+    type_into_armed_box(&mut harness, SEPARATION_BOX, "10");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    let dimensions = harness.state().sketch_point_to_point_dimensions();
+    assert_eq!(dimensions.len(), 1, "the dimension survives its own edit");
+    assert!(
+        (dimensions[0].value - 10.0).abs() <= 1.0e-6,
+        "the dimension should hold ten and holds {}",
+        dimensions[0].value
+    );
+    let separation = (dimensions[0].to.u - dimensions[0].from.u)
+        .hypot(dimensions[0].to.v - dimensions[0].from.v);
+    assert!(
+        (separation - 10.0).abs() <= 1.0e-3,
+        "the geometry should have moved to match, and measures {separation}"
+    );
+    assert!(
+        (dimensions[0].from.u + 4.0).abs() <= 1.0e-3,
+        "the end the dimension is measured from should have stayed put"
+    );
+}
+
+/// A value the sketch cannot hold is refused in the solver's words, and the
+/// text stays on the canvas to be corrected. The model keeps what it had.
+#[test]
+fn a_dimension_the_sketch_cannot_hold_keeps_its_text_and_says_why() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    two_separate_lines(&mut harness);
+    arm_dimension_tool(&mut harness);
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    type_into_armed_box(&mut harness, SEPARATION_BOX, "nonsense");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+
+    let (text, error) = harness
+        .state()
+        .sketch_relation_dimension_entry()
+        .expect("a refused entry stays open for correction");
+    assert_eq!(text, "nonsense", "the text stays exactly as typed");
+    assert!(error.is_some(), "and the refusal is named");
+    assert!(
+        (harness.state().sketch_point_to_point_dimensions()[0].value - 4.0).abs() <= 1.0e-6,
+        "the model still holds the value it had"
+    );
+}
+
+/// The tool's original behaviour is untouched: a click that lands on a curve
+/// rather than an endpoint is still a question about that curve's own numbers.
+#[test]
+fn dimensioning_a_curve_still_asks_about_that_curve() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    click_button(&mut harness, "Single line");
+    click_sketch_point(&mut harness, SketchPoint::new(-2.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 0.0));
+    arm_dimension_tool(&mut harness);
+
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, LENGTH_BOX)
+            .is_some(),
+        "the middle of a line is a question about its length"
+    );
+    assert!(
+        harness
+            .state()
+            .sketch_point_to_point_dimensions()
+            .is_empty(),
+        "and it makes no relation"
+    );
+}
+
+/// A dimension is design intent, so it has to be in the file. Reopening the
+/// document brings back the dimension, its value, and the geometry it holds —
+/// and it stays editable, which is what makes it intent rather than a note.
+#[test]
+fn a_dimension_between_two_objects_survives_reopening_the_document() {
+    let mut source = harness();
+    enter_xy_sketch(&mut source);
+    two_separate_lines(&mut source);
+    arm_dimension_tool(&mut source);
+    click_sketch_point(&mut source, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut source, SketchPoint::new(0.0, 0.0));
+    type_into_armed_box(&mut source, SEPARATION_BOX, "10");
+    source.key_press(egui::Key::Enter);
+    source.run();
+    assert_dimension_applied_without_a_gate(&source);
+    click_button(&mut source, "Finish sketch");
+    let saved = source.state().native_document_json().unwrap();
+
+    let mut restored = harness();
+    restored.run();
+    restored
+        .state_mut()
+        .load_native_document_json(&saved)
+        .expect("the saved sketch should hydrate");
+    restored.run();
+    click_button(&mut restored, "Sketch 1 feature");
+    assert_eq!(restored.state().workbench_mode(), WorkbenchMode::Sketch);
+
+    let dimensions = restored.state().sketch_point_to_point_dimensions();
+    assert_eq!(dimensions.len(), 1, "the dimension is part of the document");
+    assert!(
+        (dimensions[0].value - 10.0).abs() <= 1.0e-6,
+        "it comes back holding ten and holds {}",
+        dimensions[0].value
+    );
+
+    arm_dimension_tool(&mut restored);
+    let constraint = dimensions[0].constraint;
+    assert!(
+        restored
+            .state_mut()
+            .begin_sketch_relation_dimension_edit(constraint),
+        "a reloaded dimension is still editable"
+    );
+    restored
+        .state_mut()
+        .set_sketch_relation_dimension_text("14".to_owned());
+    assert!(restored.state_mut().accept_sketch_relation_dimension_edit());
+    restored.run();
+    assert!(
+        (restored.state().sketch_point_to_point_dimensions()[0].value - 14.0).abs() <= 1.0e-6,
+        "and retyping it still drives the geometry"
+    );
+}
+
+/// Escape abandons the typed value and leaves the dimension holding what it
+/// had — the same meaning Escape has in every other numeric field here.
+#[test]
+fn escape_abandons_a_typed_distance_without_moving_anything() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    two_separate_lines(&mut harness);
+    arm_dimension_tool(&mut harness);
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    type_into_armed_box(&mut harness, SEPARATION_BOX, "25");
+
+    harness.key_press(egui::Key::Escape);
+    harness.run();
+    assert!(
+        harness.state().sketch_relation_dimension_entry().is_none(),
+        "Escape closes the box"
+    );
+    let dimensions = harness.state().sketch_point_to_point_dimensions();
+    assert_eq!(dimensions.len(), 1, "and leaves the dimension in place");
+    assert!(
+        (dimensions[0].value - 4.0).abs() <= 1.0e-6,
+        "still holding what it had, and holds {}",
+        dimensions[0].value
+    );
+}
+
+/// The value box asks for the caret once. Asking every frame would take it
+/// back off whatever the user clicked next and never let go, which is the kind
+/// of fault that only shows up in the running application.
+#[test]
+fn the_dimension_box_does_not_take_the_caret_back_after_a_click_away() {
+    let mut harness = harness();
+    enter_xy_sketch(&mut harness);
+    two_separate_lines(&mut harness);
+    arm_dimension_tool(&mut harness);
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    assert!(
+        harness
+            .get_by_role_and_label(Role::TextInput, SEPARATION_BOX)
+            .is_focused(),
+        "the new dimension takes the caret"
+    );
+
+    // Click empty canvas, well away from the annotation and both lines.
+    click_sketch_point(&mut harness, SketchPoint::new(6.0, -6.0));
+    harness.run();
+    harness.run();
+    assert!(
+        harness
+            .query_by_role_and_label(Role::TextInput, SEPARATION_BOX)
+            .is_none_or(|box_| !box_.is_focused()),
+        "clicking away gives the caret up for good"
+    );
+}
