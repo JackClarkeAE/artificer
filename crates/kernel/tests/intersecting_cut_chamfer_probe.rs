@@ -140,10 +140,17 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
         },
     );
 
-    // 3. Chamfer one outer top edge of the cube. The pocket walls are
-    //    curved, so no exact rung owns a lone edge of this body; the
-    //    faceted tier answers and must say so, with a valid solid whose
+    // 3. Chamfer one outer top edge of the cube, for a valid solid whose
     //    volume lost at most the full 45-degree wedge along the edge.
+    //
+    //    This used to require the faceted tier and its approximation label.
+    //    The premise was that the pocket walls are curved, so no exact rung
+    //    owned a lone edge of this body — but what actually disqualified the
+    //    edge was the cube's own top and side faces arriving as fans of
+    //    panels, not the pockets. The coplanar merge (ADR 0039) puts those
+    //    faces back together, the edge between two of them is an ordinary
+    //    prism edge again, and the exact rung answers. So the label must now
+    //    be absent, and the solid and its volume are checked as before.
     let edge = outer_top_edge(&slot_cut);
     let distance = 2.0;
     let request = ExecuteRequest {
@@ -160,12 +167,13 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
     let outcome = NativeKernel::execute(&slot_cut, &request, &CancellationToken::new())
         .unwrap_or_else(|error| panic!("the chamfer must build: {error:?}"));
     assert!(
-        outcome
+        !outcome
             .report
             .warnings
             .iter()
             .any(|warning| warning.code.as_str() == "EDGE_FINISH_FACETED_APPROXIMATION"),
-        "a faceted finish is labelled: {:?}",
+        "an edge between two whole planar faces is finished exactly, not \
+         approximated: {:?}",
         outcome.report.warnings
     );
     assert!(

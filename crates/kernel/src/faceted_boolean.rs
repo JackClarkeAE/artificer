@@ -1464,6 +1464,296 @@ fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
     result
 }
 
+/// Dissolves the shared edges between facets that lie on one plane, so a wall
+/// the Boolean cut into a fan of panels comes back as the one face it always
+/// was.
+///
+/// The BSP splits a face every time a cutter plane passes through it, and the
+/// pieces are all still the same flat wall: a crossing bore leaves a bore wall
+/// as hundreds of panels that differ in nothing but where they were cut. Each
+/// costs a face, its edges and its vertices in every stage downstream, and the
+/// seams between them are drawn as creases on geometry that has none.
+///
+/// The merge is the standard one — an edge used once each way by two facets of
+/// the same plane is interior and goes; what is left is the outline — with one
+/// deliberate restriction. It only replaces a group when the outline chains
+/// into exactly one simple loop. A group whose union has a hole, or that falls
+/// into separate islands, is left exactly as it was: those are the shapes a
+/// single polygon cannot state, and guessing at them is how a facet merge
+/// turns into a shell that no longer closes.
+///
+/// Nothing is moved. Every vertex of the merged outline is a vertex the group
+/// already had, so the merge cannot change what the body occupies.
+fn merge_coplanar_polygons(polygons: Vec<Polygon>, weld: f64) -> Vec<Polygon> {
+    // A plane's key has to be coarse enough that two facets of one wall agree
+    // and fine enough that two nearby walls do not. The normal is a direction,
+    // so it is keyed at a fixed angular scale; the offset is a length and is
+    // keyed at the weld distance, which is already the scale at which this
+    // pipeline calls two points the same.
+    let plane_key = |polygon: &Polygon| -> ([i64; 3], i64, FaceRole) {
+        let normal = polygon.plane.normal;
+        let length = normal.length();
+        let unit = if length > 0.0 {
+            normal * (1.0 / length)
+        } else {
+            normal
+        };
+        let scale = 1.0e6;
+        let quantize = |value: f64| (value * scale).round() as i64;
+        (
+            [quantize(unit.x), quantize(unit.y), quantize(unit.z)],
+            (polygon.plane.offset / weld.max(f64::MIN_POSITIVE)).round() as i64,
+            polygon.role,
+        )
+    };
+
+    let mut groups: BTreeMap<([i64; 3], i64, FaceRole), Vec<usize>> = BTreeMap::new();
+    for (index, polygon) in polygons.iter().enumerate() {
+        groups.entry(plane_key(polygon)).or_default().push(index);
+    }
+
+    let mut merged: Vec<Polygon> = Vec::with_capacity(polygons.len());
+    let mut by_index: Vec<Option<Polygon>> = polygons.into_iter().map(Some).collect();
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        merged.extend(merge_group_pairwise(&mut by_index, members, weld));
+    }
+    merged.extend(by_index.into_iter().flatten());
+    dissolve_shared_collinear_vertices(merged, weld)
+}
+
+/// Removes the corners a merge left in the middle of a straight run, but only
+/// where *every* facet using them agrees they are not corners.
+///
+/// A merged outline walks the outsides of the panels it replaced, so the two
+/// ends of each dissolved seam stay on it as points where the boundary goes
+/// straight on. Left there they are vertices joining two edges and two faces,
+/// and the blend preflight — which closes a corner where three edges and three
+/// flat faces meet — refuses them.
+///
+/// Dropping them from the merged outline alone is what a first attempt does
+/// and is wrong: a neighbouring facet still ends at such a point, so removing
+/// it here leaves a T-junction, and conforming that back changes what meets at
+/// the corner beside it. The test that caught it was a fillet on an outer edge
+/// of a crossed body finding four faces at a corner that has three.
+///
+/// Asking every facet first is what makes it safe. A point that is mid-run on
+/// all of them is a corner to nobody, and removing it everywhere at once
+/// leaves no junction behind.
+fn dissolve_shared_collinear_vertices(polygons: Vec<Polygon>, weld: f64) -> Vec<Polygon> {
+    // Where each point is used, and whether the facet using it turns there.
+    let mut turns_somewhere: BTreeMap<[i64; 3], bool> = BTreeMap::new();
+    for polygon in &polygons {
+        let count = polygon.vertices.len();
+        if count < 3 {
+            continue;
+        }
+        for index in 0..count {
+            let previous = polygon.vertices[(index + count - 1) % count];
+            let current = polygon.vertices[index];
+            let next = polygon.vertices[(index + 1) % count];
+            let turns = is_a_corner(previous, current, next, weld);
+            let entry = turns_somewhere
+                .entry(quantized_key(current, weld))
+                .or_insert(false);
+            *entry |= turns;
+        }
+    }
+    polygons
+        .into_iter()
+        .map(|polygon| {
+            let count = polygon.vertices.len();
+            if count < 4 {
+                return polygon;
+            }
+            let kept: Vec<Point3> = polygon
+                .vertices
+                .iter()
+                .copied()
+                .filter(|point| {
+                    turns_somewhere
+                        .get(&quantized_key(*point, weld))
+                        .copied()
+                        .unwrap_or(true)
+                })
+                .collect();
+            if kept.len() < 3 || kept.len() == count {
+                return polygon;
+            }
+            // The dissolve may not change the plane the facet lies on, and a
+            // facet that will not rebuild keeps every point it had.
+            match Polygon::new_narrow(kept, polygon.role, weld * weld) {
+                Some(rebuilt) if rebuilt.plane.normal.dot(polygon.plane.normal) > 0.0 => rebuilt,
+                _ => polygon,
+            }
+        })
+        .collect()
+}
+
+/// Whether a facet actually turns at `current`, rather than running straight
+/// through it.
+fn is_a_corner(previous: Point3, current: Point3, next: Point3, weld: f64) -> bool {
+    let before = current - previous;
+    let after = next - current;
+    let lengths = before.length() * after.length();
+    if lengths <= 0.0 {
+        return true;
+    }
+    // The height of the triangle the three points span over the run they sit
+    // on: a bend of less than the weld distance is not a bend.
+    before.cross(after).length() / lengths.sqrt() > weld
+}
+
+/// Merges the facets of one plane into as few as they will go, two at a time.
+///
+/// A whole group rarely becomes one polygon: a box face with a bore through it
+/// is a ring, and a ring needs an inner loop that a single vertex list cannot
+/// state. Merging pairwise gets the reduction anyway — the ring comes back as
+/// a handful of pieces rather than hundreds — and every step is the same
+/// question asked of two facets at a time: does dissolving the edge between
+/// them leave a simple loop? Where the answer is no the pair is left alone, so
+/// no step can produce a face the shell cannot carry.
+fn merge_group_pairwise(
+    polygons: &mut [Option<Polygon>],
+    members: &[usize],
+    weld: f64,
+) -> Vec<Polygon> {
+    let mut live: Vec<Polygon> = members
+        .iter()
+        .filter_map(|index| polygons[*index].take())
+        .collect();
+    let mut progress = true;
+    while progress && live.len() > 1 {
+        progress = false;
+        // An edge shared by exactly two of the remaining facets is the seam
+        // between them, and dissolving it is the only merge worth trying: two
+        // facets that share nothing cannot become one loop, and one shared by
+        // three is a plane folding onto itself.
+        let mut using: BTreeMap<([i64; 3], [i64; 3]), Vec<usize>> = BTreeMap::new();
+        for (index, polygon) in live.iter().enumerate() {
+            for (from, to) in polygon
+                .vertices
+                .iter()
+                .zip(polygon.vertices.iter().cycle().skip(1))
+            {
+                let (from_key, to_key) = (quantized_key(*from, weld), quantized_key(*to, weld));
+                if from_key == to_key {
+                    continue;
+                }
+                let undirected = if from_key <= to_key {
+                    (from_key, to_key)
+                } else {
+                    (to_key, from_key)
+                };
+                let sharers = using.entry(undirected).or_default();
+                if !sharers.contains(&index) {
+                    sharers.push(index);
+                }
+            }
+        }
+        let mut retired = vec![false; live.len()];
+        let mut produced: Vec<Polygon> = Vec::new();
+        for sharers in using.values() {
+            let [first, second] = sharers[..] else {
+                continue;
+            };
+            if retired[first] || retired[second] {
+                continue;
+            }
+            let Some(union) = merge_two_polygons(&live[first], &live[second], weld) else {
+                continue;
+            };
+            retired[first] = true;
+            retired[second] = true;
+            produced.push(union);
+            progress = true;
+        }
+        if progress {
+            let kept = live
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !retired[*index])
+                .map(|(_, polygon)| polygon);
+            live = produced.into_iter().chain(kept).collect();
+        }
+    }
+    live
+}
+
+/// Two coplanar facets as one, or nothing when their union is not a simple
+/// loop: a pair that meets at a point, or in two places, or not at all.
+fn merge_two_polygons(first: &Polygon, second: &Polygon, weld: f64) -> Option<Polygon> {
+    let mut edges: BTreeMap<([i64; 3], [i64; 3]), Point3> = BTreeMap::new();
+    for polygon in [first, second] {
+        if polygon.vertices.len() < 3 {
+            return None;
+        }
+        for (from, to) in polygon
+            .vertices
+            .iter()
+            .zip(polygon.vertices.iter().cycle().skip(1))
+        {
+            let (from_key, to_key) = (quantized_key(*from, weld), quantized_key(*to, weld));
+            if from_key == to_key {
+                continue;
+            }
+            if edges.remove(&(to_key, from_key)).is_some() {
+                continue;
+            }
+            // The same directed edge twice is two facets overlapping rather
+            // than meeting, which this merge has no business resolving.
+            if edges.insert((from_key, to_key), *from).is_some() {
+                return None;
+            }
+        }
+    }
+    if edges.len() < 3 {
+        return None;
+    }
+    // One outgoing edge per vertex is what makes the walk forced. More than
+    // one is a pinch, and a pinched face is what the shell cannot carry.
+    let mut next: BTreeMap<[i64; 3], ([i64; 3], Point3)> = BTreeMap::new();
+    for ((from, to), point) in &edges {
+        if next.insert(*from, (*to, *point)).is_some() {
+            return None;
+        }
+    }
+    let start = *next.keys().next()?;
+    let mut loop_points = Vec::with_capacity(next.len());
+    let mut cursor = start;
+    for _ in 0..next.len() {
+        let (to, point) = *next.get(&cursor)?;
+        loop_points.push(point);
+        cursor = to;
+        if cursor == start {
+            break;
+        }
+    }
+    // Every boundary edge has to be in the one loop, or the union is a ring or
+    // two islands and one vertex list cannot say so.
+    if cursor != start || loop_points.len() != next.len() {
+        return None;
+    }
+    if loop_points.len() < 3 {
+        return None;
+    }
+    // The corners left mid-run where two panels used to meet are kept, not
+    // dropped. Dropping them reads as the obvious next saving and is not one:
+    // a neighbouring facet still ends at such a point, so removing it from this
+    // outline leaves a T-junction, and conforming the junction back changes
+    // what meets at the corner next to it. Filleting an outer edge of a crossed
+    // body then finds four faces at a corner that has three, and refuses. It
+    // also merges less, not more: this outline stays simple more often with
+    // them in, and the face count is lower with them kept than dropped.
+    let merged = Polygon::new_narrow(loop_points, first.role, weld * weld)?;
+    // The merge may not turn the wall over: a normal that flipped means the
+    // outline was chained the other way round, and a face pointing into the
+    // material is worse than a fan of panels pointing out of it.
+    (merged.plane.normal.dot(first.plane.normal) > 0.0).then_some(merged)
+}
+
 fn topology_from_polygons_with_heal_limit(
     polygons: Vec<Polygon>,
     epsilon: f64,
@@ -1486,6 +1776,15 @@ fn topology_from_polygons_with_heal_limit(
     let extent = polygon_extent(&polygons);
     let weld = (extent * 1.0e-5).max(epsilon);
     let polygons = weld_polygon_vertices(polygons, weld);
+    let polygons = conform_polygon_edges(polygons, weld / 8.0);
+    // One wall cut into a fan of panels is still one wall. Merging them back
+    // before they become faces is what keeps a crossing bore's face count in
+    // proportion to the shape rather than to how many times the BSP happened
+    // to split it, and what stops the seams being drawn as creases.
+    let polygons = merge_coplanar_polygons(polygons, weld);
+    // A merged outline is a new loop, so its edges have to be conformed against
+    // its neighbours again: a vertex that sat mid-edge on the panel next door
+    // is still a T-junction on the face that replaced the panels.
     let polygons = conform_polygon_edges(polygons, weld / 8.0);
     let mut pending = VecDeque::from(polygons);
     let mut topology = Topology::default();
@@ -2498,5 +2797,190 @@ mod tests {
         let sampled = sampled_loop(&loop_, PrecisionPolicy::default());
         assert_eq!(sampled.len(), 64);
         assert!(sampled.iter().all(|sample| sample.source_curve == 0));
+    }
+
+    fn square(corners: [[f64; 3]; 4]) -> Polygon {
+        Polygon::new(
+            corners
+                .iter()
+                .map(|point| Point3::new(point[0], point[1], point[2]))
+                .collect(),
+            FaceRole::PositiveZ,
+            1.0e-12,
+        )
+        .expect("a square is a polygon")
+    }
+
+    /// Two panels of one wall are one wall. The seam between them goes, and
+    /// the corners left in the middle of the straight runs go with it.
+    #[test]
+    fn two_panels_sharing_an_edge_become_one_face() {
+        let left = square([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let right = square([
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ]);
+        let merged = merge_two_polygons(&left, &right, 1.0e-6).expect("the panels merge");
+        // Six points, not four: the two ends of the dissolved seam stay as
+        // corners of the outline. They are kept deliberately — see the note in
+        // `merge_two_polygons` on why dropping them costs more than it saves.
+        assert_eq!(
+            merged.vertices.len(),
+            6,
+            "the union walks both panels' outsides: {:?}",
+            merged.vertices
+        );
+        assert!(
+            !merged
+                .vertices
+                .iter()
+                .any(|point| (point.x - 1.0).abs() < 1.0e-9
+                    && point.y > 1.0e-9
+                    && point.y < 1.0 - 1.0e-9),
+            "no interior point of the dissolved seam survives"
+        );
+        let area = newell_normal(&merged.vertices).length() * 0.5;
+        assert!(
+            (area - 2.0).abs() < 1.0e-9,
+            "the union covers both panels and no more, and measures {area}"
+        );
+        let span = merged
+            .vertices
+            .iter()
+            .fold(f64::NEG_INFINITY, |widest, point| widest.max(point.x));
+        assert!(
+            (span - 2.0).abs() < 1.0e-12,
+            "the union reaches both panels"
+        );
+        assert!(
+            merged.plane.normal.dot(left.plane.normal) > 0.0,
+            "a merge may not turn the wall over"
+        );
+    }
+
+    /// Facets that share only a corner have no seam to dissolve, and their
+    /// union is a bow tie no single loop can state. Left alone.
+    #[test]
+    fn panels_meeting_at_only_a_point_are_left_alone() {
+        let first = square([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let second = square([
+            [1.0, 1.0, 0.0],
+            [2.0, 1.0, 0.0],
+            [2.0, 2.0, 0.0],
+            [1.0, 2.0, 0.0],
+        ]);
+        assert!(merge_two_polygons(&first, &second, 1.0e-6).is_none());
+    }
+
+    /// Facets that do not touch at all are not a merge either.
+    #[test]
+    fn panels_that_do_not_touch_are_left_alone() {
+        let first = square([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]);
+        let apart = square([
+            [5.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+            [6.0, 1.0, 0.0],
+            [5.0, 1.0, 0.0],
+        ]);
+        assert!(merge_two_polygons(&first, &apart, 1.0e-6).is_none());
+    }
+
+    /// A ring is the case the merge must refuse: the union of the four panels
+    /// round a hole has an inner loop, and a face here carries one vertex list.
+    /// Refusing leaves four faces where one would have been wrong.
+    #[test]
+    fn panels_that_would_close_a_ring_keep_their_hole() {
+        // Four panels round a square hole from (1,1) to (2,2) in a 3x3 face.
+        let panels = vec![
+            square([
+                [0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ]),
+            square([
+                [0.0, 2.0, 0.0],
+                [3.0, 2.0, 0.0],
+                [3.0, 3.0, 0.0],
+                [0.0, 3.0, 0.0],
+            ]),
+            square([
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 2.0, 0.0],
+                [0.0, 2.0, 0.0],
+            ]),
+            square([
+                [2.0, 1.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [3.0, 2.0, 0.0],
+                [2.0, 2.0, 0.0],
+            ]),
+        ];
+        let merged = merge_coplanar_polygons(panels, 1.0e-6);
+        assert!(
+            merged.len() > 1,
+            "the ring must not collapse into one loop, and gave {merged:?}"
+        );
+        // Whatever it did, it never invented or lost material: the union's
+        // area is the same either way.
+        let area: f64 = merged
+            .iter()
+            .map(|polygon| newell_normal(&polygon.vertices).length() * 0.5)
+            .sum();
+        assert!(
+            (area - 8.0).abs() < 1.0e-9,
+            "the four panels cover eight square units, and measure {area}"
+        );
+    }
+
+    /// The whole point, on the shape that prompted it: a wall the Boolean cut
+    /// into a row of panels comes back as one face.
+    #[test]
+    fn a_row_of_panels_collapses_to_a_single_face() {
+        let panels: Vec<Polygon> = (0..16)
+            .map(|step| {
+                let x = f64::from(step);
+                square([
+                    [x, 0.0, 0.0],
+                    [x + 1.0, 0.0, 0.0],
+                    [x + 1.0, 1.0, 0.0],
+                    [x, 1.0, 0.0],
+                ])
+            })
+            .collect();
+        let merged = merge_coplanar_polygons(panels, 1.0e-6);
+        assert_eq!(merged.len(), 1, "sixteen panels of one wall are one wall");
+        let area = newell_normal(&merged[0].vertices).length() * 0.5;
+        assert!(
+            (area - 16.0).abs() < 1.0e-9,
+            "and it covers exactly what the sixteen did, measuring {area}"
+        );
+        let corners = merged[0]
+            .vertices
+            .iter()
+            .filter(|point| {
+                (point.x.abs() < 1.0e-9 || (point.x - 16.0).abs() < 1.0e-9)
+                    && (point.y.abs() < 1.0e-9 || (point.y - 1.0).abs() < 1.0e-9)
+            })
+            .count();
+        assert_eq!(corners, 4, "with the rectangle's own four corners among it");
     }
 }

@@ -194,14 +194,21 @@ fn crossing_cuts_are_a_bounded_approximation_until_ellipses_land() {
         "this body became exact — delete this gate and pin the closed form instead"
     );
 
-    // The fragmentation ceiling. Two crossing bores measure 2,959 faces today.
-    // A coplanar merge after the BSP is measured to bring that to roughly 140,
-    // restoring the box's six planar faces as six faces; tighten this ceiling
-    // when that lands.
+    // The fragmentation ceiling. Two crossing bores measured 2,959 faces
+    // before the coplanar merge and measure 229 after it, with vertices down
+    // from 2,873 to 391, edges from 5,802 to 624, and this test's own wall
+    // clock from 14.4s to 1.5s.
+    //
+    // The estimate this gate used to carry was roughly 140, on the reasoning
+    // that the box's six planar faces would come back as six. They do not, and
+    // the reason is worth keeping: a box face with a bore through it is a ring,
+    // and a ring needs an inner loop that the faceted tier's one-vertex-list
+    // face cannot state. The merge takes such a face down to a handful of
+    // pieces rather than to one, and stops there rather than guessing.
     let faces = crossed.counts().faces;
     assert!(
-        faces < 3_200,
-        "two crossing bores fragmented into {faces} faces; the clamp is not holding"
+        faces < 300,
+        "two crossing bores fragmented into {faces} faces; the merge is not holding"
     );
 }
 
