@@ -6472,13 +6472,28 @@ impl KernelLabApp {
             .map(|body| body.id)
     }
 
+    /// Whether an edge finish could ever be satisfied here.
+    ///
+    /// Availability answers only what arming cannot fix, and it runs for every
+    /// ribbon control every frame, so this asks whether there is a body with
+    /// edges at all rather than enumerating which of them a finish would
+    /// accept. "No compatible edges on this body" is something to be told
+    /// after pressing, not a reason to grey the icon (ADR 0041).
+    #[must_use]
+    fn edge_finish_is_possible(&self) -> bool {
+        self.active_body_id().is_some()
+            && self
+                .displayed
+                .as_ref()
+                .is_some_and(|displayed| !displayed.scene.edges.is_empty())
+    }
+
     /// Presses a tool: stages straight away when the selection already
     /// satisfies it, and otherwise arms it holding whatever fits.
     ///
     /// The two orders are one path. Which of them happened is the return
     /// value, not a different function, which is what stops preselection and
     /// tool-first drifting apart.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn invoke_tool(
         &mut self,
         tool: &'static str,
@@ -12432,8 +12447,15 @@ impl KernelLabApp {
                 .filter(|selection| selection.body.get() == body.get())
                 .collect::<Vec<_>>();
             if selected.is_empty() || selected.len() != self.selected_edges.len() {
-                self.document_status =
-                    Some("Select one or more edges on the active body".to_owned());
+                // Nothing usable is picked, so the tool asks for it rather than
+                // refusing and leaving the user to guess. Pressing it *is*
+                // entering it (ADR 0041).
+                let tool = if preset == SolidFeaturePreset::Fillet {
+                    "Fillet"
+                } else {
+                    "Chamfer"
+                };
+                self.invoke_tool(tool, &invocation::EDGE_FINISH);
                 return;
             }
             let support = self.edge_finish_selection_support();
@@ -28935,9 +28957,11 @@ mod extrusion_workbench_tests {
         #[derive(Clone, Copy)]
         enum Satisfy {
             Face,
-            Edge,
             ActiveBody,
         }
+        // Fillet and Chamfer have been converted (stage 4): their availability
+        // no longer turns on the selection at all, so they are checked by
+        // `a_converted_tool_is_never_disabled_by_an_empty_selection` instead.
         let cases = [
             (
                 SolidFeaturePreset::Hole,
@@ -28953,16 +28977,6 @@ mod extrusion_workbench_tests {
                 SolidFeaturePreset::HolePattern,
                 &invocation::PLANAR_FACE_FEATURE,
                 Satisfy::Face,
-            ),
-            (
-                SolidFeaturePreset::Chamfer,
-                &invocation::EDGE_FINISH,
-                Satisfy::Edge,
-            ),
-            (
-                SolidFeaturePreset::Fillet,
-                &invocation::EDGE_FINISH,
-                Satisfy::Edge,
             ),
             (
                 SolidFeaturePreset::Shell,
@@ -29000,19 +29014,6 @@ mod extrusion_workbench_tests {
             // Now pick what the preset wants and check they still agree.
             match satisfy {
                 Satisfy::Face => select_first_test_face(&mut app),
-                Satisfy::Edge => {
-                    let body = app.active_body_id().expect("default active body");
-                    let edge = app
-                        .displayed
-                        .as_ref()
-                        .and_then(|displayed| displayed.scene.edges.first())
-                        .expect("default body edge")
-                        .source_edge;
-                    app.selected_edges.push(viewport::DocumentEdgeSelection {
-                        body: viewport::BodyInstanceKey::new(body.get()),
-                        edge,
-                    });
-                }
                 Satisfy::ActiveBody => {}
             }
             let gate_ready = app.preset_feature_availability(preset).is_enabled();
@@ -29021,6 +29022,69 @@ mod extrusion_workbench_tests {
             assert_eq!(
                 gate_ready, resolver_ready,
                 "{preset:?} with its operand picked: gate says {gate_ready}, resolver says {resolver_ready} ({resolved:?})"
+            );
+        }
+    }
+
+    /// The invariant ADR 0041 exists for, on every command converted so far:
+    /// changing *only* the selection must never move a tool from available to
+    /// blocked. Missing operands are asked for, not refused.
+    #[test]
+    fn a_converted_tool_is_never_disabled_by_an_empty_selection() {
+        for preset in [SolidFeaturePreset::Fillet, SolidFeaturePreset::Chamfer] {
+            let mut app = KernelLabApp::default();
+
+            app.clear_model_entity_selection();
+            assert!(
+                app.preset_feature_availability(preset).is_enabled(),
+                "{preset:?} must stay available with nothing picked"
+            );
+
+            let body = app.active_body_id().expect("default active body");
+            let edge = app
+                .displayed
+                .as_ref()
+                .and_then(|displayed| displayed.scene.edges.first())
+                .expect("default body edge")
+                .source_edge;
+            app.selected_edges.push(viewport::DocumentEdgeSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                edge,
+            });
+            assert!(
+                app.preset_feature_availability(preset).is_enabled(),
+                "{preset:?} must stay available with one picked"
+            );
+        }
+    }
+
+    /// Pressing a converted tool with nothing picked enters it and asks, which
+    /// the old gate made impossible.
+    #[test]
+    fn pressing_an_edge_finish_with_nothing_picked_asks_for_edges() {
+        for (preset, tool) in [
+            (SolidFeaturePreset::Fillet, "Fillet"),
+            (SolidFeaturePreset::Chamfer, "Chamfer"),
+        ] {
+            let mut app = KernelLabApp::default();
+            app.clear_model_entity_selection();
+            app.stage_preset_feature(preset);
+
+            assert!(
+                app.pending_operation.is_none(),
+                "{tool} with no edges must not stage anything"
+            );
+            let armed = app.armed_tool.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "{tool} should arm and ask for edges, status: {:?}",
+                    app.document_status
+                )
+            });
+            assert_eq!(armed.tool, tool);
+            assert!(
+                armed.prompt().contains("Pick the edges to finish"),
+                "it should say what it wants: {}",
+                armed.prompt()
             );
         }
     }

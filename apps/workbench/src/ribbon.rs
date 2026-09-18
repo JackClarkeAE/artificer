@@ -959,8 +959,11 @@ impl KernelLabApp {
             // A shell with no face selected hollows the body closed, so a
             // body of its own is all it needs.
             | SolidFeaturePreset::Shell => self.active_body_id().is_some(),
+            // An empty selection is not a reason to disable a tool (ADR
+            // 0041). Pressing Fillet with nothing picked enters Fillet and
+            // asks for edges, so availability no longer turns on having them.
             SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet => {
-                !self.selected_edges.is_empty()
+                self.edge_finish_is_possible()
             }
         };
         if ready {
@@ -973,7 +976,10 @@ impl KernelLabApp {
                 SolidFeaturePreset::Mirror
                 | SolidFeaturePreset::LinearPattern
                 | SolidFeaturePreset::Shell => "Activate a body first.",
-                _ => "Select at least one edge first.",
+                // Not "select an edge first": the tool asks for them itself.
+                // This is the appetite being unsatisfiable in principle, which
+                // arming cannot fix.
+                _ => "This body has no edges to finish.",
             })
         }
     }
