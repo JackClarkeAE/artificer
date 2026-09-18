@@ -12421,8 +12421,14 @@ impl KernelLabApp {
             SolidFeaturePreset::Hole | SolidFeaturePreset::Rib | SolidFeaturePreset::HolePattern
         ) {
             let Some(face) = self.selected_face().map(|selection| selection.face) else {
-                self.document_status =
-                    Some("Select a planar face for Hole, Rib or Hole pattern".to_owned());
+                // The tool asks for its face rather than refusing: pressing it
+                // is entering it (ADR 0041).
+                let tool = match preset {
+                    SolidFeaturePreset::Hole => "Hole",
+                    SolidFeaturePreset::Rib => "Rib",
+                    _ => "Hole pattern",
+                };
+                self.invoke_tool(tool, &invocation::PLANAR_FACE_FEATURE);
                 return;
             };
             let support =
@@ -28956,28 +28962,13 @@ mod extrusion_workbench_tests {
         // (preset, its appetite, what to select to satisfy it)
         #[derive(Clone, Copy)]
         enum Satisfy {
-            Face,
             ActiveBody,
         }
-        // Fillet and Chamfer have been converted (stage 4): their availability
-        // no longer turns on the selection at all, so they are checked by
-        // `a_converted_tool_is_never_disabled_by_an_empty_selection` instead.
+        // Converted presets are checked by
+        // `a_converted_tool_is_never_disabled_by_an_empty_selection` instead:
+        // their availability no longer turns on the selection at all. What
+        // remains here is whatever has not been converted yet.
         let cases = [
-            (
-                SolidFeaturePreset::Hole,
-                &invocation::PLANAR_FACE_FEATURE,
-                Satisfy::Face,
-            ),
-            (
-                SolidFeaturePreset::Rib,
-                &invocation::PLANAR_FACE_FEATURE,
-                Satisfy::Face,
-            ),
-            (
-                SolidFeaturePreset::HolePattern,
-                &invocation::PLANAR_FACE_FEATURE,
-                Satisfy::Face,
-            ),
             (
                 SolidFeaturePreset::Shell,
                 &invocation::WHOLE_BODY_FEATURE,
@@ -29013,7 +29004,6 @@ mod extrusion_workbench_tests {
 
             // Now pick what the preset wants and check they still agree.
             match satisfy {
-                Satisfy::Face => select_first_test_face(&mut app),
                 Satisfy::ActiveBody => {}
             }
             let gate_ready = app.preset_feature_availability(preset).is_enabled();
@@ -29031,7 +29021,13 @@ mod extrusion_workbench_tests {
     /// blocked. Missing operands are asked for, not refused.
     #[test]
     fn a_converted_tool_is_never_disabled_by_an_empty_selection() {
-        for preset in [SolidFeaturePreset::Fillet, SolidFeaturePreset::Chamfer] {
+        for preset in [
+            SolidFeaturePreset::Fillet,
+            SolidFeaturePreset::Chamfer,
+            SolidFeaturePreset::Hole,
+            SolidFeaturePreset::Rib,
+            SolidFeaturePreset::HolePattern,
+        ] {
             let mut app = KernelLabApp::default();
 
             app.clear_model_entity_selection();
@@ -29083,6 +29079,38 @@ mod extrusion_workbench_tests {
             assert_eq!(armed.tool, tool);
             assert!(
                 armed.prompt().contains("Pick the edges to finish"),
+                "it should say what it wants: {}",
+                armed.prompt()
+            );
+        }
+    }
+
+    /// A face feature pressed with nothing picked enters it and asks for a
+    /// planar face.
+    #[test]
+    fn pressing_a_face_feature_with_nothing_picked_asks_for_a_face() {
+        for (preset, tool) in [
+            (SolidFeaturePreset::Hole, "Hole"),
+            (SolidFeaturePreset::Rib, "Rib"),
+            (SolidFeaturePreset::HolePattern, "Hole pattern"),
+        ] {
+            let mut app = KernelLabApp::default();
+            app.clear_model_entity_selection();
+            app.stage_preset_feature(preset);
+
+            assert!(
+                app.pending_operation.is_none(),
+                "{tool} with no face must not stage anything"
+            );
+            let armed = app.armed_tool.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "{tool} should arm and ask for a face, status: {:?}",
+                    app.document_status
+                )
+            });
+            assert_eq!(armed.tool, tool);
+            assert!(
+                armed.prompt().contains("Pick a planar face"),
                 "it should say what it wants: {}",
                 armed.prompt()
             );

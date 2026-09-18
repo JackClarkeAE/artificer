@@ -951,9 +951,12 @@ impl KernelLabApp {
         }
         let ready = match preset {
             SolidFeaturePreset::Revolve => true,
+            // Converted (ADR 0041): pressing one with nothing picked enters it
+            // and asks for a face, so availability asks only whether this
+            // workspace has a body to put a face feature on.
             SolidFeaturePreset::Hole
             | SolidFeaturePreset::Rib
-            | SolidFeaturePreset::HolePattern => self.selected_face().is_some(),
+            | SolidFeaturePreset::HolePattern => self.active_body_id().is_some(),
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
             // A shell with no face selected hollows the body closed, so a
@@ -972,7 +975,7 @@ impl KernelLabApp {
             CommandAvailability::disabled(match preset {
                 SolidFeaturePreset::Hole
                 | SolidFeaturePreset::Rib
-                | SolidFeaturePreset::HolePattern => "Select a planar face first.",
+                | SolidFeaturePreset::HolePattern => "Create a body first.",
                 SolidFeaturePreset::Mirror
                 | SolidFeaturePreset::LinearPattern
                 | SolidFeaturePreset::Shell => "Activate a body first.",
