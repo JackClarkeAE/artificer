@@ -1543,8 +1543,7 @@ impl NativeKernel {
                 // user asked for, so a route that cannot make it refuses.
                 if *standing_apart {
                     let built = edge_finish_apart::build_edge_finishes_apart(
-                        input.id,
-                        &input.topology,
+                        input,
                         target_edges,
                         *kind,
                         *distance,

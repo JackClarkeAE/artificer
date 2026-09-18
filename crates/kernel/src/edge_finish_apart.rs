@@ -12,28 +12,33 @@
 //! band's own removal — which is why it is built here as a Boolean rather than
 //! as topology surgery on faces a previous feature owns.
 //!
-//! A bevel's removal is a half-space. It crosses every face it meets, so the
-//! analytic Boolean takes it and the result is exact: three bevels off one
-//! corner, taken one at a time, land on `3·½d²L − d³ + d³/4` to the last digit
-//! the measure carries.
+//! A bevel's removal is a half-space, and a fillet's is the curvilinear
+//! triangle between the two walls and the band — the corner a rolling ball
+//! cannot reach. Both are prisms swept along the edge, so a finish standing
+//! apart is a prism against a prism, which is the reduction ADR 0025 built
+//! first and the one that now carries a tangential contact.
 //!
-//! A fillet's removal does not. The band is *tangent* to the two walls it
-//! rolls between — that is what makes it a fillet — and the engine fails
-//! closed on tangential contact between operands (ADR 0025). So a fillet
-//! standing apart is refused here by name. The seam it would need is not the
-//! obstacle: two crossing equal cylinders meet in a planar ellipse the
-//! vocabulary already carries. What is missing is a Boolean that will accept
-//! an operand touching the target along a line, or a direct construction that
-//! re-trims the bands a previous feature committed.
+//! The fillet's tangency is what makes it delicate. Its band touches each wall
+//! rather than crossing it, and a touch is only a touch if it is exact: the
+//! tangency points are taken as the feet of the perpendiculars from the band's
+//! own axis, not as `r/tan(θ/2)` along each face, because that trig round trip
+//! lands a bit or two off and a flank plane 4e-16 outside the band does not
+//! graze it at all — it misses, and every stage after is entitled to believe
+//! the miss.
+//!
+//! What is not cut yet is a finish standing apart from a *band*: a corner an
+//! earlier feature rounded, or a second edge running across the first. No one
+//! axis reduces those to prisms, so the general engine has to answer, and it
+//! carries no tangency of its own. They are refused by name.
 
 use artificer_protocol::{
-    BooleanOperation, EdgeFinishKind, EntityKind, EntityRef, PlanarFrame3, PlanarLoop2,
-    PlanarProfile2, PlanarRegion2, Point2 as ProtocolPoint2, Point3 as ProtocolPoint3,
-    PrecisionPolicy, SnapshotId, Vector3 as ProtocolVector3,
+    ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
+    EntityKind, EntityRef, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
+    Point2 as ProtocolPoint2, Point3 as ProtocolPoint3, PrecisionPolicy, RequestId,
+    Vector3 as ProtocolVector3,
 };
 
-use crate::analytic_boolean::{AnalyticBooleanError, build_analytic_boolean};
-use crate::planar_profile::validate_linear_profile_extrusion;
+use crate::Snapshot;
 use crate::topology::{Curve3, Point3, Topology, Vector3};
 
 /// Why a finish could not be stood apart from the corner it reaches.
@@ -52,8 +57,7 @@ fn refuse(code: &'static str, message: impl Into<String>) -> ApartRefusal {
 
 /// Builds every selected edge's finish as its own cut, one after another.
 pub(crate) fn build_edge_finishes_apart(
-    snapshot: SnapshotId,
-    topology: &Topology,
+    input: &Snapshot,
     targets: &[EntityRef],
     kind: EdgeFinishKind,
     distance: f64,
@@ -67,73 +71,70 @@ pub(crate) fn build_edge_finishes_apart(
     }
     if targets
         .iter()
-        .any(|target| target.snapshot != snapshot || target.kind != EntityKind::Edge)
+        .any(|target| target.snapshot != input.id() || target.kind != EntityKind::Edge)
     {
         return Err(refuse(
             "EDGE_FINISH_APART_TARGET_INVALID",
             "Every target must be an edge of the body this feature is being built on.",
         ));
     }
-    if kind != EdgeFinishKind::Chamfer {
-        return Err(refuse(
-            "EDGE_FINISH_APART_FILLET_UNSUPPORTED",
-            "A fillet standing apart is not built yet. Its band is tangent to the two walls it \
-             rolls between, and this release's Boolean fails closed where two solids touch along \
-             a line rather than crossing. Join this fillet to the finish that already shapes the \
-             corner, or bevel the edge instead.",
-        ));
-    }
     if !distance.is_finite() || distance <= 0.0 {
         return Err(refuse(
             "EDGE_FINISH_APART_DISTANCE_INVALID",
-            "A setback must be a positive length.",
+            "A size must be a positive length.",
         ));
     }
-    let reach = body_reach(topology, distance);
-    let mut body = topology.clone();
+    let reach = body_reach(&input.topology, distance);
+    let mut body = input.clone();
     for target in targets {
-        let tool = bevel_tool(&body, *target, distance, reach, precision)?;
-        body = match build_analytic_boolean(&body, &tool, BooleanOperation::Difference, precision) {
-            Ok(cut) => cut,
-            Err(AnalyticBooleanError::EmptyResult) => {
-                return Err(refuse(
-                    "EDGE_FINISH_APART_DISTANCE_INVALID",
-                    format!(
-                        "A setback of {distance:.6} would take the whole body away. Use a smaller \
-                         one."
-                    ),
-                ));
-            }
-            Err(AnalyticBooleanError::DomainUnsupported) => {
-                return Err(refuse(
-                    "EDGE_FINISH_APART_DOMAIN_UNSUPPORTED",
-                    format!(
-                        "A bevel of {distance:.6} standing apart here would have to cut a face \
-                         this release's Boolean cannot cut — a blend an earlier feature left, a \
-                         hole wall, or a face it would touch rather than cross. Join this chamfer \
-                         to the finish that already shapes the corner instead."
-                    ),
-                ));
-            }
+        let tool = removal_tool(&body.topology, *target, kind, distance, reach, precision)?;
+        // Through the engine's own dispatch, not straight into one of its
+        // rungs. The prism reduction is what carries a cut like this — both
+        // operands are prisms on parallel axes — and it is also where a
+        // tangential contact is answered exactly. Reaching past it to the
+        // general engine would take a slower route that refuses this shape.
+        let request = BooleanRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("edge-finish-apart"),
+            expected_target_snapshot: body.id(),
+            expected_tool_snapshot: tool.id(),
+            precision,
+            operation: BooleanOperation::Difference,
         };
-        // Certify each cut before the next one builds on it. A Boolean can sew
-        // a shell the validator will not take — a corner already rounded is
-        // where that happens today — and the generic refusal that follows says
-        // only that something failed. Saying it here means saying which route
-        // failed and what to do instead.
-        let report = crate::validator::validate(&body, precision.linear_agreement);
+        body = crate::NativeKernel::execute_boolean(
+            &body,
+            &tool,
+            &request,
+            &crate::CancellationToken::new(),
+        )
+        .map_err(|error| {
+            refuse(
+                "EDGE_FINISH_APART_DOMAIN_UNSUPPORTED",
+                format!(
+                    "A finish of {distance:.6} standing apart here could not be cut: {error}. \
+                     Join it to the finish that already shapes the corner instead."
+                ),
+            )
+        })?
+        .snapshot;
+        // Certify each cut before the next one builds on it, so a refusal
+        // names this route and what to do instead rather than arriving later
+        // as a bare validation failure.
+        let report = crate::validator::validate(&body.topology, precision.linear_agreement);
         if let Some(first) = report.diagnostics.first() {
             return Err(refuse(
                 "EDGE_FINISH_APART_CONSTRUCTION_FAILED",
                 format!(
-                    "A bevel of {distance:.6} standing apart here was cut but did not certify                      ({} at {}). Nothing is published from a route that cannot prove its own                      answer: join this chamfer to the finish that already shapes the corner                      instead.",
+                    "A finish of {distance:.6} standing apart here was cut but did not certify \
+                     ({} at {}). Nothing is published from a route that cannot prove its own \
+                     answer: join this finish to the one that already shapes the corner instead.",
                     first.code.as_str(),
                     first.path
                 ),
             ));
         }
     }
-    Ok(body)
+    Ok(body.topology)
 }
 
 /// Far enough that a tool built at this size covers everything the body can
@@ -167,13 +168,14 @@ fn body_reach(topology: &Topology, distance: f64) -> f64 {
 /// It is a prism swept along the edge, whose section is a triangle with one
 /// side on the bevel line and an apex far outside the body, oversized at both
 /// ends so nothing but that one side ever meets the body.
-fn bevel_tool(
+fn removal_tool(
     topology: &Topology,
     target: EntityRef,
+    kind: EdgeFinishKind,
     distance: f64,
     reach: f64,
     precision: PrecisionPolicy,
-) -> Result<Topology, ApartRefusal> {
+) -> Result<Snapshot, ApartRefusal> {
     let edge = topology
         .edges
         .iter()
@@ -238,16 +240,61 @@ fn bevel_tool(
             "That edge runs along one of its own faces, which leaves no direction to set back in.",
         ));
     };
-    // Where the bevel meets each face, and so the line it cuts along.
     let anchor = endpoints[0];
-    let toe = offset(anchor, scale(out_first, distance));
-    let heel = offset(anchor, scale(out_second, distance));
+    // How wide the material wedge is at this edge. A fillet's circle is
+    // inscribed in it, so the angle sets both how far from the edge the band
+    // touches each face and how deep its axis sits.
+    let opening = dot(out_first, out_second).clamp(-1.0, 1.0).acos();
+    let half = opening / 2.0;
+    if half.sin().abs() <= precision.angular_agreement_radians.max(1.0e-12) {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "The two faces at that edge lie flat against each other, so a finish of them has no \
+             width.",
+        ));
+    }
+    let bisector = {
+        let sum = Vector3::new(
+            out_first.x + out_second.x,
+            out_first.y + out_second.y,
+            out_first.z + out_second.z,
+        );
+        let span = magnitude(sum);
+        if span <= f64::EPSILON {
+            return Err(refuse(
+                "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+                "The two faces at that edge fold back on each other, which leaves no wedge to \
+                 finish.",
+            ));
+        }
+        scale(sum, 1.0 / span)
+    };
+    // Where the band's axis runs: on the bisector, far enough in that the
+    // circle of this radius touches both walls.
+    let axis = offset(anchor, scale(bisector, distance / half.sin()));
+    // A chamfer sets back along each face by the distance itself. A fillet
+    // touches each face at the foot of the perpendicular from its axis, and
+    // that is where it is taken from rather than from `r/tan(θ/2)` along the
+    // face: the trig round trip lands a bit or two off the true foot, and a
+    // tangency a bit off is not a tangency at all — the flank plane then sits
+    // outside the band by 4e-16 and the two stop touching, which every stage
+    // after this one is entitled to believe.
+    let (toe, heel) = match kind {
+        EdgeFinishKind::Chamfer => (
+            offset(anchor, scale(out_first, distance)),
+            offset(anchor, scale(out_second, distance)),
+        ),
+        EdgeFinishKind::Fillet => (
+            offset(axis, scale(first.normal, distance)),
+            offset(axis, scale(second.normal, distance)),
+        ),
+    };
     let base = difference(heel, toe);
     let width = magnitude(base);
     if width <= precision.linear_agreement {
         return Err(refuse(
             "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "The two faces at that edge lie flat against each other, so a bevel of them has no \
+            "The two faces at that edge lie flat against each other, so a finish of them has no \
              width.",
         ));
     }
@@ -272,54 +319,172 @@ fn bevel_tool(
             candidate
         }
     };
-    // A section frame square to the edge: `u` along the bevel, `v` outwards,
-    // and the sweep along the edge itself.
-    let u = base;
+    // A section frame square to the edge, laid on the faces themselves rather
+    // than on the chord between them: the tool's own flanks then run along the
+    // frame's axes, and the planes it is cut from come out axis-aligned in it
+    // rather than at an angle to everything.
+    let u = out_first;
     let v = cross(along, u);
-    let apex = offset(midpoint(toe, heel), scale(backward, reach));
     let plane = |point: Point3| {
         let delta = difference(point, anchor);
         ProtocolPoint2::new(dot(delta, u), dot(delta, v))
     };
-    let section = [
-        plane(offset(toe, scale(base, -reach))),
-        plane(offset(heel, scale(base, reach))),
-        plane(apex),
-    ];
     let start = offset(anchor, scale(along, -reach));
     let frame = PlanarFrame3::new(
         ProtocolPoint3::new(start.x, start.y, start.z),
         ProtocolVector3::new(u.x, u.y, u.z),
         ProtocolVector3::new(v.x, v.y, v.z),
     );
-    // Wound so the section encloses material rather than a hole, whichever way
-    // the two faces happened to sit.
-    let mut corners = section.to_vec();
-    let turn = (corners[1].x - corners[0].x) * (corners[2].y - corners[0].y)
-        - (corners[1].y - corners[0].y) * (corners[2].x - corners[0].x);
-    if turn < 0.0 {
-        corners.reverse();
-    }
+    let outer = match kind {
+        // A triangle with one side on the bevel line and an apex far behind
+        // it: everything the flat cut takes away, and more, safely outside.
+        EdgeFinishKind::Chamfer => {
+            let apex = offset(midpoint(toe, heel), scale(backward, reach));
+            wound(vec![
+                straight(plane(offset(toe, scale(base, -reach))), plane(apex)),
+                straight(plane(apex), plane(offset(heel, scale(base, reach)))),
+                straight(
+                    plane(offset(heel, scale(base, reach))),
+                    plane(offset(toe, scale(base, -reach))),
+                ),
+            ])
+        }
+        // The curvilinear triangle between the two walls and the band: the
+        // corner the rolling ball cannot reach. Its two straight sides run
+        // out past the body so nothing but the arc is ever in contact — and
+        // the arc is tangent to each wall, which is what a fillet means and
+        // what the Boolean now takes.
+        EdgeFinishKind::Fillet => {
+            let behind_first = offset(heel, scale(out_first, -reach));
+            let behind_second = offset(toe, scale(out_second, -reach));
+            let far = offset(
+                offset(anchor, scale(out_first, -reach)),
+                scale(out_second, -reach),
+            );
+            wound(vec![
+                straight(plane(far), plane(behind_first)),
+                straight(plane(behind_first), plane(heel)),
+                // Tangent to both walls, bulging at the edge: the minor arc,
+                // which is the only one a convex corner can mean.
+                minor_arc(plane(heel), plane(toe), plane(axis)),
+                straight(plane(toe), plane(behind_second)),
+                straight(plane(behind_second), plane(far)),
+            ])
+        }
+    };
     let profile = PlanarProfile2 {
         regions: vec![PlanarRegion2 {
-            outer: PlanarLoop2::from_polygon(&corners),
+            outer,
             holes: Vec::new(),
         }],
     };
-    validate_linear_profile_extrusion(
-        target.snapshot,
-        frame,
-        &profile,
-        length + reach * 2.0,
+    let sweep = length + reach * 2.0;
+    // Built by the same route any other body is: the extrusion command, run
+    // on an empty snapshot. Calling the construction helpers directly would
+    // skip the normalizing and certifying the command does on the way, and a
+    // tool that is a solid in every respect but one is exactly the kind that
+    // fails much later and says something else.
+    let empty = crate::NativeKernel::empty();
+    let request = crate::ExecuteRequest {
+        protocol_version: artificer_protocol::CURRENT_PROTOCOL_VERSION,
+        request_id: artificer_protocol::RequestId::new("edge-finish-apart-tool"),
+        expected_snapshot: empty.id(),
         precision,
-    )
-    .map(|extrusion| extrusion.topology)
-    .map_err(|reason| {
-        refuse(
-            "EDGE_FINISH_APART_CONSTRUCTION_FAILED",
-            format!("The bevel's own solid could not be built ({reason:?})."),
-        )
-    })
+        command: artificer_protocol::KernelCommand::ExtrudePlanarProfile {
+            frame,
+            profile,
+            distance: sweep,
+        },
+    };
+    crate::NativeKernel::execute(&empty, &request, &crate::CancellationToken::new())
+        .map(|outcome| outcome.snapshot)
+        .map_err(|error| {
+            refuse(
+                "EDGE_FINISH_APART_CONSTRUCTION_FAILED",
+                format!("The finish's own solid could not be built ({error})."),
+            )
+        })
+}
+
+fn straight(start: ProtocolPoint2, end: ProtocolPoint2) -> PlanarCurve2 {
+    PlanarCurve2::Line { start, end }
+}
+
+/// The shorter of the two arcs between these points about this centre.
+///
+/// A convex corner's fillet always wants the minor arc — the one that bulges
+/// towards the edge. The major arc through the far side of the circle is a
+/// different shape entirely, and picking it silently is how a removal solid
+/// stops being a fillet without anything saying so.
+fn minor_arc(start: ProtocolPoint2, end: ProtocolPoint2, center: ProtocolPoint2) -> PlanarCurve2 {
+    let angle = |point: ProtocolPoint2| (point.y - center.y).atan2(point.x - center.x);
+    let mut sweep = angle(end) - angle(start);
+    while sweep <= -std::f64::consts::PI {
+        sweep += std::f64::consts::TAU;
+    }
+    while sweep > std::f64::consts::PI {
+        sweep -= std::f64::consts::TAU;
+    }
+    PlanarCurve2::CircularArc {
+        center,
+        start,
+        end,
+        direction: if sweep >= 0.0 {
+            ArcDirection::CounterClockwise
+        } else {
+            ArcDirection::Clockwise
+        },
+    }
+}
+
+/// The same loop, wound so it encloses material rather than a hole.
+///
+/// Which way round the two faces happen to sit decides the sign, so it is
+/// measured rather than assumed: the chord polygon's signed area has the same
+/// sign as the loop's, a minor arc never being enough to turn it.
+fn wound(curves: Vec<PlanarCurve2>) -> PlanarLoop2 {
+    let ends = |curve: &PlanarCurve2| match curve {
+        PlanarCurve2::Line { start, end } => (*start, *end),
+        PlanarCurve2::CircularArc { start, end, .. } => (*start, *end),
+        _ => unreachable!("this tool builds only lines and circular arcs"),
+    };
+    let twice_area: f64 = curves
+        .iter()
+        .map(|curve| {
+            let (start, end) = ends(curve);
+            start.x.mul_add(end.y, -(end.x * start.y))
+        })
+        .sum();
+    if twice_area >= 0.0 {
+        return PlanarLoop2 { curves };
+    }
+    PlanarLoop2 {
+        curves: curves
+            .into_iter()
+            .rev()
+            .map(|curve| match curve {
+                PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
+                    start: end,
+                    end: start,
+                },
+                PlanarCurve2::CircularArc {
+                    center,
+                    start,
+                    end,
+                    direction,
+                } => PlanarCurve2::CircularArc {
+                    center,
+                    start: end,
+                    end: start,
+                    direction: match direction {
+                        ArcDirection::Clockwise => ArcDirection::CounterClockwise,
+                        ArcDirection::CounterClockwise => ArcDirection::Clockwise,
+                    },
+                },
+                other => other,
+            })
+            .collect(),
+    }
 }
 
 /// The two faces an edge separates, if it separates exactly two.
