@@ -2571,6 +2571,15 @@ pub struct KernelLabApp {
     selected_vertices: Vec<viewport::DocumentVertexSelection>,
     measured_edges: Vec<viewport::DocumentEdgeSelection>,
     measured_face: Option<viewport::DocumentFaceSelection>,
+    /// The tool that has been pressed and is waiting to be told what to work
+    /// on (ADR 0041). Separate from `pending_operation`: an armed tool has
+    /// changed no document state, so it blocks nothing, another tool press
+    /// replaces it, and Escape drops it.
+    ///
+    /// Nothing arms a tool yet. Stage 3 builds the path and stage 4 is the
+    /// first command to take it; flipping a gate before the path exists would
+    /// ship a live button with nothing behind it.
+    armed_tool: Option<invocation::ArmedTool>,
     /// Tool bodies picked while a Boolean is staged, in click order. Empty
     /// outside a staged Boolean; the target is never a member.
     boolean_tools: Vec<BodyId>,
@@ -2797,6 +2806,7 @@ impl Default for KernelLabApp {
             selected_vertices: Vec::new(),
             measured_edges: Vec::new(),
             measured_face: None,
+            armed_tool: None,
             boolean_tools: Vec::new(),
             staged_revolve: None,
             active_tool: ActiveTool::Select,
@@ -6426,11 +6436,6 @@ impl KernelLabApp {
     /// therefore safe for symmetric operands, and which no asymmetric role is
     /// allowed to read meaning into.
     #[must_use]
-    // Nothing invokes the resolver yet: stage 2 lands the model and proves it
-    // describes today's behaviour, and stage 3 builds the armed path that
-    // calls it. Flipping a gate before that would ship a live button with
-    // nothing behind it, which is the defect ADR 0041 exists to remove.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 3"))]
     fn selection_items(&self) -> Vec<invocation::SelectionItem> {
         let mut items = Vec::new();
         if let Some(body) = self.active_body_id() {
@@ -6465,6 +6470,90 @@ impl KernelLabApp {
             .iter()
             .find(|body| body.id.get() == key.get())
             .map(|body| body.id)
+    }
+
+    /// Presses a tool: stages straight away when the selection already
+    /// satisfies it, and otherwise arms it holding whatever fits.
+    ///
+    /// The two orders are one path. Which of them happened is the return
+    /// value, not a different function, which is what stops preselection and
+    /// tool-first drifting apart.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
+    fn invoke_tool(
+        &mut self,
+        tool: &'static str,
+        spec: &'static invocation::ToolInvocationSpec,
+    ) -> invocation::OperandResolution {
+        let resolution = invocation::resolve(self, spec, &self.selection_items());
+        match &resolution {
+            invocation::OperandResolution::NeedsOperands {
+                bindings,
+                diagnostics,
+                ..
+            } => {
+                // Arming replaces whatever was armed before: changing your mind
+                // is one click rather than a cancel and a click.
+                self.armed_tool = Some(invocation::ArmedTool::arm(
+                    tool,
+                    spec.alternatives
+                        .first()
+                        .expect("a tool declares at least one reading"),
+                    bindings.clone(),
+                    diagnostics.clone(),
+                    self.document_revision(),
+                ));
+                self.document_status = self.armed_tool.as_ref().map(invocation::ArmedTool::prompt);
+            }
+            invocation::OperandResolution::Complete { .. }
+            | invocation::OperandResolution::InvalidSelection(_) => {
+                self.armed_tool = None;
+            }
+        }
+        resolution
+    }
+
+    /// Drops the armed tool and leaves the selection exactly as it was.
+    ///
+    /// Disarming and clearing the selection are different intentions and must
+    /// not share a key: the tool never owned the selection, so there is
+    /// nothing here to restore.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
+    fn disarm_tool(&mut self) -> bool {
+        self.armed_tool.take().is_some()
+    }
+
+    /// Offers a pick to the armed tool, if one is waiting for operands.
+    ///
+    /// Returns whether the tool took it, so the ordinary selection paths can
+    /// leave the click alone when it did.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
+    fn offer_to_armed_tool(&mut self, item: invocation::SelectionItem) -> bool {
+        let revision = self.document_revision();
+        let Some(mut armed) = self.armed_tool.take() else {
+            return false;
+        };
+        armed.revalidate(self, revision);
+        let took = armed.offer(self, item);
+        self.document_status = Some(armed.prompt());
+        self.armed_tool = Some(armed);
+        took
+    }
+
+    /// Whether the armed tool could use this pick, which is what narrows the
+    /// viewport's hit test while one is waiting.
+    #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
+    fn armed_tool_accepts(&self, item: invocation::SelectionItem) -> bool {
+        self.armed_tool
+            .as_ref()
+            .is_some_and(|armed| armed.accepts(self, item))
+    }
+
+    /// What the status line says while a tool waits for operands.
+    #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
+    fn armed_tool_prompt(&self) -> Option<String> {
+        self.armed_tool.as_ref().map(invocation::ArmedTool::prompt)
     }
 
     fn clear_model_entity_selection(&mut self) {
@@ -28696,6 +28785,140 @@ mod extrusion_workbench_tests {
                     .and_then(|feature| app.document.feature(feature))
                     .is_some_and(|node| !feature_editor::action_scalars(&node.action).is_empty()),
             "the default selection must not advertise dimensions it cannot write"
+        );
+    }
+
+    /// The acceptance invariant of the whole project: preselecting the
+    /// operands and then invoking must produce exactly what invoking and then
+    /// picking the same operands produces. Not "looks the same" — the same
+    /// bindings (ADR 0041).
+    #[test]
+    fn preselecting_and_picking_afterwards_reach_the_same_bindings() {
+        use crate::invocation::{self, OperandResolution};
+
+        let edge_of = |app: &KernelLabApp, index: usize| {
+            let body = app.active_body_id().expect("default active body");
+            let edge = app
+                .displayed
+                .as_ref()
+                .and_then(|displayed| displayed.scene.edges.get(index))
+                .expect("a body edge")
+                .source_edge;
+            invocation::SelectionItem::Edge(viewport::DocumentEdgeSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                edge,
+            })
+        };
+
+        // Selection first: pick two edges, then press the tool.
+        let mut first = KernelLabApp::default();
+        first.clear_model_entity_selection();
+        for index in [0, 1] {
+            let invocation::SelectionItem::Edge(edge) = edge_of(&first, index) else {
+                unreachable!("an edge item");
+            };
+            first.selected_edges.push(edge);
+        }
+        let OperandResolution::Complete {
+            bindings: preselected,
+            ..
+        } = first.invoke_tool("Fillet", &invocation::EDGE_FINISH)
+        else {
+            panic!("two edges satisfy an edge finish");
+        };
+        assert!(
+            first.armed_tool.is_none(),
+            "a satisfied tool stages rather than arming"
+        );
+
+        // Tool first: press the tool with nothing picked, then pick the same
+        // two edges.
+        let mut second = KernelLabApp::default();
+        second.clear_model_entity_selection();
+        let resolution = second.invoke_tool("Fillet", &invocation::EDGE_FINISH);
+        assert!(
+            matches!(resolution, OperandResolution::NeedsOperands { .. }),
+            "an empty selection arms the tool rather than failing: {resolution:?}"
+        );
+        for index in [0, 1] {
+            let item = edge_of(&second, index);
+            assert!(
+                second.armed_tool_accepts(item),
+                "the armed tool should accept an edge it asked for"
+            );
+            assert!(second.offer_to_armed_tool(item), "the pick should bind");
+        }
+        let armed = second.armed_tool.as_ref().expect("still armed");
+        assert!(armed.is_satisfied(), "two edges satisfy the finish");
+
+        assert_eq!(
+            armed.bindings().get(invocation::EDGES_TO_FINISH),
+            preselected.get(invocation::EDGES_TO_FINISH),
+            "both orders must reach the same bindings"
+        );
+    }
+
+    /// Arming owns no document state, so dropping it leaves the selection
+    /// alone. Disarming and clearing are different intentions.
+    #[test]
+    fn disarming_a_tool_leaves_the_selection_untouched() {
+        use crate::invocation;
+
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        select_first_test_face(&mut app);
+        let picked = app.selected_face().expect("a face is picked");
+
+        app.invoke_tool("Fillet", &invocation::EDGE_FINISH);
+        assert!(app.armed_tool.is_some(), "a face does not satisfy a finish");
+
+        assert!(app.disarm_tool(), "Escape drops the armed tool");
+        assert!(app.armed_tool.is_none());
+        assert_eq!(
+            app.selected_face(),
+            Some(picked),
+            "the tool never owned the selection, so nothing is restored"
+        );
+    }
+
+    /// Pressing another tool replaces the armed one: changing your mind is one
+    /// click, not a cancel and a click.
+    #[test]
+    fn pressing_another_tool_replaces_the_armed_one() {
+        use crate::invocation;
+
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.invoke_tool("Fillet", &invocation::EDGE_FINISH);
+        assert_eq!(
+            app.armed_tool.as_ref().map(|armed| armed.tool),
+            Some("Fillet")
+        );
+
+        app.invoke_tool("Hole", &invocation::PLANAR_FACE_FEATURE);
+        assert_eq!(
+            app.armed_tool.as_ref().map(|armed| armed.tool),
+            Some("Hole")
+        );
+    }
+
+    /// An armed tool asks for what it still needs, and says what it is holding.
+    #[test]
+    fn an_armed_tool_says_what_it_is_waiting_for() {
+        use crate::invocation;
+
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.invoke_tool("Fillet", &invocation::EDGE_FINISH);
+        let prompt = app.armed_tool_prompt().expect("armed");
+        assert!(
+            prompt.contains("Pick the edges to finish"),
+            "the prompt should name the role: {prompt}"
+        );
+        assert_eq!(
+            app.document_status.as_deref(),
+            Some(prompt.as_str()),
+            "and it is what the status line shows"
         );
     }
 

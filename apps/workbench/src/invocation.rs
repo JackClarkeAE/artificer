@@ -211,6 +211,28 @@ impl OperandBindings {
         self.get(role).len()
     }
 
+    fn remove(&mut self, role: &str, item: SelectionItem) {
+        if let Some((_, items)) = self.bound.iter_mut().find(|(id, _)| *id == role) {
+            items.retain(|held| *held != item);
+        }
+    }
+
+    /// Drops every binding the document no longer resolves, returning them so
+    /// the readout can say what went.
+    fn retain_resolvable(&mut self, context: &dyn InvocationContext) -> Vec<SelectionItem> {
+        let mut lost = Vec::new();
+        for (_, items) in &mut self.bound {
+            items.retain(|item| {
+                let resolves = context.resolves(*item);
+                if !resolves {
+                    lost.push(*item);
+                }
+                resolves
+            });
+        }
+        lost
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bound.iter().all(|(_, items)| items.is_empty())
@@ -528,6 +550,171 @@ pub const WHOLE_BODY_FEATURE: ToolInvocationSpec = ToolInvocationSpec {
     }],
 };
 
+// ---------------------------------------------------------------------------
+// A tool waiting to be told what to work on (ADR 0041 stage 3)
+// ---------------------------------------------------------------------------
+
+/// A tool that has been pressed and is collecting the operands it still needs.
+///
+/// Armed is not staged. A staged operation owns the ribbon and awaits
+/// confirmation; an armed tool has changed no document state at all, so it
+/// needs no undo entry, another tool press simply replaces it, and Escape
+/// drops it. The bindings live here rather than in the selection because the
+/// tool owns them and the user owns the selection — which is why nothing has
+/// to be "restored" when a tool is dropped.
+pub struct ArmedTool {
+    pub tool: &'static str,
+    schema: &'static OperandSchema,
+    bindings: OperandBindings,
+    diagnostics: ResolutionDiagnostics,
+    /// The document revision these bindings were resolved against. They are
+    /// re-resolved when it changes, not because a frame was painted.
+    resolved_at: u64,
+}
+
+impl ArmedTool {
+    /// Arms a tool, keeping whatever the selection already satisfies.
+    #[must_use]
+    pub fn arm(
+        tool: &'static str,
+        schema: &'static OperandSchema,
+        bindings: OperandBindings,
+        diagnostics: ResolutionDiagnostics,
+        revision: u64,
+    ) -> Self {
+        Self {
+            tool,
+            schema,
+            bindings,
+            diagnostics,
+            resolved_at: revision,
+        }
+    }
+
+    #[must_use]
+    pub const fn bindings(&self) -> &OperandBindings {
+        &self.bindings
+    }
+
+    #[must_use]
+    pub const fn diagnostics(&self) -> &ResolutionDiagnostics {
+        &self.diagnostics
+    }
+
+    /// The role still waiting, and what to ask for. `None` once every role is
+    /// satisfied and the tool is ready to stage.
+    #[must_use]
+    pub fn waiting_for(&self) -> Option<&'static OperandRoleSpec> {
+        self.schema
+            .roles
+            .iter()
+            .find(|role| !role.cardinality.satisfied_by(self.bindings.count(role.id)))
+    }
+
+    #[must_use]
+    pub fn is_satisfied(&self) -> bool {
+        self.waiting_for().is_none()
+    }
+
+    /// What the status line says while this tool waits.
+    #[must_use]
+    pub fn prompt(&self) -> String {
+        let Some(role) = self.waiting_for() else {
+            // Ready still owes the tally: a tool that lost an operand to a
+            // rebuild must say so rather than quietly staging with fewer.
+            return match self.diagnostics.summary() {
+                Some(tally) => format!("{} · ready · {tally}", self.tool),
+                None => format!("{} · ready", self.tool),
+            };
+        };
+        let held = self.bindings.count(role.id);
+        let base = match role.cardinality {
+            Cardinality::Exactly(n) if n > 1 => {
+                format!("{} · {} ({held} of {n})", self.tool, role.prompt)
+            }
+            Cardinality::Between(_, high) => {
+                format!("{} · {} ({held} of {high})", self.tool, role.prompt)
+            }
+            _ if held > 0 => format!("{} · {} ({held} so far)", self.tool, role.prompt),
+            _ => format!("{} · {}", self.tool, role.prompt),
+        };
+        match self.diagnostics.summary() {
+            Some(tally) => format!("{base} · {tally}"),
+            None => base,
+        }
+    }
+
+    /// The role that would take the next pick.
+    ///
+    /// Not the same as the role being waited for. A fillet asking for "one or
+    /// more edges" is *satisfied* by the first one and still wants the rest,
+    /// so a tool can be ready to stage and taking picks at the same time.
+    #[must_use]
+    fn taking(&self) -> Option<&'static OperandRoleSpec> {
+        self.waiting_for().or_else(|| {
+            self.schema
+                .roles
+                .iter()
+                .rev()
+                .find(|role| role.cardinality.accepts_more(self.bindings.count(role.id)))
+        })
+    }
+
+    /// Whether a pick could serve the role currently being waited for.
+    ///
+    /// This is what narrows the viewport's hit test: an armed tool masks
+    /// picking to the candidates it can actually use, so aiming at the wrong
+    /// kind of thing is impossible rather than merely futile.
+    #[must_use]
+    pub fn accepts(&self, context: &dyn InvocationContext, item: SelectionItem) -> bool {
+        self.taking().is_some_and(|role| {
+            matches!(
+                (role.accepts)(context, &self.bindings, item),
+                OperandEligibility::Accept
+            )
+        })
+    }
+
+    /// Offers a pick to the role being waited for. Returns whether it bound.
+    pub fn offer(&mut self, context: &dyn InvocationContext, item: SelectionItem) -> bool {
+        let Some(role) = self.taking() else {
+            return false;
+        };
+        // Clicking a bound operand again takes it back off, which is how every
+        // multi-pick tool in the workbench already behaves.
+        if self.bindings.get(role.id).contains(&item) {
+            self.bindings.remove(role.id, item);
+            return true;
+        }
+        match (role.accepts)(context, &self.bindings, item) {
+            OperandEligibility::Accept => {
+                self.bindings.push(role.id, item);
+                true
+            }
+            OperandEligibility::Incompatible(why) | OperandEligibility::Immutable(why) => {
+                self.diagnostics.rejected.push((item, why));
+                false
+            }
+            OperandEligibility::WrongKind | OperandEligibility::Stale => false,
+        }
+    }
+
+    /// Re-resolves against the document when it has moved on.
+    ///
+    /// References go stale under a rebuild, an undo or a history move, and a
+    /// tool must never stage against one it cannot resolve. This runs when the
+    /// revision changes and once more immediately before staging — not because
+    /// egui painted another frame.
+    pub fn revalidate(&mut self, context: &dyn InvocationContext, revision: u64) {
+        if self.resolved_at == revision {
+            return;
+        }
+        self.resolved_at = revision;
+        let lost = self.bindings.retain_resolvable(context);
+        self.diagnostics.stale.extend(lost);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +910,84 @@ mod tests {
             panic!("an asymmetric role must not be inferred from selection order: {resolution:?}");
         };
         assert_eq!(role, TARGET_BODY);
+    }
+
+    /// A bound operand the document has lost is dropped and reported when the
+    /// revision moves, not left to be staged against. And re-resolution happens
+    /// because the document changed, never because a frame was painted.
+    #[test]
+    fn an_armed_tool_drops_bindings_the_document_has_lost() {
+        let mut context = Fake::default();
+        let held = edge(1, 10);
+        let OperandResolution::Complete {
+            bindings,
+            diagnostics,
+        } = resolve(&context, &EDGE_FINISH, &[held, edge(1, 11)])
+        else {
+            panic!("two edges satisfy a finish");
+        };
+        let mut armed = ArmedTool::arm(
+            "Fillet",
+            &EDGE_FINISH.alternatives[0],
+            bindings,
+            diagnostics,
+            1,
+        );
+        assert_eq!(armed.bindings().get(EDGES_TO_FINISH).len(), 2);
+
+        // The same revision does no work at all.
+        context.missing = vec![held];
+        armed.revalidate(&context, 1);
+        assert_eq!(
+            armed.bindings().get(EDGES_TO_FINISH).len(),
+            2,
+            "nothing is re-resolved while the document has not moved"
+        );
+
+        // A new revision drops what no longer resolves and says so.
+        armed.revalidate(&context, 2);
+        assert_eq!(armed.bindings().get(EDGES_TO_FINISH).len(), 1);
+        assert_eq!(armed.diagnostics().stale, vec![held]);
+        assert!(
+            armed.prompt().contains("no longer in the model"),
+            "the readout should say what went: {}",
+            armed.prompt()
+        );
+    }
+
+    /// Clicking a bound operand again takes it back off, which is how every
+    /// multi-pick tool in the workbench already behaves.
+    #[test]
+    fn offering_a_bound_operand_again_takes_it_off() {
+        let context = Fake::default();
+        let mut armed = ArmedTool::arm(
+            "Fillet",
+            &EDGE_FINISH.alternatives[0],
+            OperandBindings::default(),
+            ResolutionDiagnostics::default(),
+            1,
+        );
+        let held = edge(1, 10);
+        assert!(armed.offer(&context, held));
+        assert_eq!(armed.bindings().get(EDGES_TO_FINISH), &[held]);
+        assert!(armed.offer(&context, held));
+        assert!(armed.bindings().get(EDGES_TO_FINISH).is_empty());
+    }
+
+    /// An armed tool narrows what can be picked to what it can use, so aiming
+    /// at the wrong sort of thing is impossible rather than merely futile.
+    #[test]
+    fn an_armed_tool_only_accepts_what_its_role_can_use() {
+        let context = Fake::default();
+        let armed = ArmedTool::arm(
+            "Fillet",
+            &EDGE_FINISH.alternatives[0],
+            OperandBindings::default(),
+            ResolutionDiagnostics::default(),
+            1,
+        );
+        assert!(armed.accepts(&context, edge(1, 10)));
+        assert!(!armed.accepts(&context, face(1, 20)));
     }
 
     /// Symmetric operands do not care what order they were picked in, which is
