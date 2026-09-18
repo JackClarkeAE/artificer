@@ -747,7 +747,7 @@ fn source_face_click_selects_kernel_entity() {
         .state()
         .selected_face()
         .expect("face click should select a source entity");
-    assert_eq!(selected.kind, artificer_protocol::EntityKind::Face);
+    assert_eq!(selected.face.kind, artificer_protocol::EntityKind::Face);
     assert_eq!(
         harness.state().selected_face_role(),
         Some(artificer_kernel::FaceRole::PositiveZ)
@@ -1019,9 +1019,9 @@ fn tick_confirms_preview_through_kernel_and_preserves_view_motion_and_selection(
     assert_eq!(harness.state().view_frame(), frame_before);
     assert!((harness.state().animation_phase() - 0.52).abs() <= EPSILON);
     let selected_after = harness.state().selected_face().unwrap();
-    assert_eq!(selected_after.kind, selected_before.kind);
-    assert_eq!(selected_after.entity, selected_before.entity);
-    assert_eq!(selected_after.snapshot, snapshot_after);
+    assert_eq!(selected_after.face.kind, selected_before.face.kind);
+    assert_eq!(selected_after.face.entity, selected_before.face.entity);
+    assert_eq!(selected_after.face.snapshot, snapshot_after);
     assert_eq!(
         harness.state().selected_face_role(),
         Some(artificer_kernel::FaceRole::PositiveZ)

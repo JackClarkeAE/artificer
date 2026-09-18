@@ -25,6 +25,15 @@
 
 ---
 
+## What is new in 0.99.3
+
+A release about how tools and selections meet, and one picking bug that had
+made edges unreachable at some camera angles.
+
+- **A tool can be pressed before its operands are picked.** Pressing Fillet with nothing selected used to be impossible: the button was dead until you had guessed it wanted edges, and the tooltip told you so — a door that tells you where the key is instead of opening. It now enters Fillet and asks for edges. Picking the edges first and pressing it still stages immediately, because the two orders are one code path whose only difference is whether what was already selected was enough. The same is true of Chamfer, Hole, Rib and Hole pattern. A command is now disabled only for reasons that picking something cannot fix — a staged operation, a history marker away from the tip, immutable library geometry, or a workspace with nothing to act on. ADR 0041 records the design and what it does not yet do.
+- **A click picks what it highlights.** Every visible face carries an invisible hit box at its label position so assistive technology can name it, and that box won the hit test against the canvas — so wherever one sat, the edge under the pointer was neither highlighted nor clickable, and the face answered the click instead. Label positions move with the camera, which is why it came and went with the angle. Hover is now read from the pointer rather than from that contest, and a box stops sensing clicks while a vertex or edge is highlighted under it. Naming a face still selects it, and right-clicking for its context menu is unchanged.
+- **A picked face knows which occurrence it belongs to.** There were two representations of every pick, kept in step by hand, and they drifted apart in both directions: a push-pull remapped one and left the other holding the reference from before the operation. There is now one, and a face carries the body instance it came from rather than a bare entity reference that could not say which of two occurrences was meant.
+
 ## What is new in 0.99.1
 
 A point release about saying what you mean: reaching a relation in one click

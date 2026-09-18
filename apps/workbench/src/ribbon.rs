@@ -41,7 +41,7 @@ pub(crate) enum CommandAvailability {
 }
 
 impl CommandAvailability {
-    const fn is_enabled(&self) -> bool {
+    pub(crate) const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
     }
 
@@ -701,7 +701,7 @@ impl KernelLabApp {
     /// Which sketch the Create group would open, which decides both its name
     /// and whether it is available at all.
     fn sketch_entry_action(&self) -> SketchEntryAction {
-        if self.selected_face.is_some() {
+        if self.selected_face().is_some() {
             return SketchEntryAction::OnSelectedFace;
         }
         let starts_new_origin_sketch = !self.sketch.entities().is_empty()
@@ -760,7 +760,7 @@ impl KernelLabApp {
                 if let Some(blocked) = free(self) {
                     return blocked;
                 }
-                if self.selected_face.is_some() && self.active_component_instance().is_some() {
+                if self.selected_face().is_some() && self.active_component_instance().is_some() {
                     return CommandAvailability::disabled(
                         "Library components are immutable occurrences. Edit the source part or create an independent workspace sketch.",
                     );
@@ -937,7 +937,10 @@ impl KernelLabApp {
         }
     }
 
-    fn preset_feature_availability(&self, preset: SolidFeaturePreset) -> CommandAvailability {
+    pub(crate) fn preset_feature_availability(
+        &self,
+        preset: SolidFeaturePreset,
+    ) -> CommandAvailability {
         if self.pending_operation.is_some() {
             return CommandAvailability::disabled("Confirm or cancel the pending operation first.");
         }
@@ -948,16 +951,27 @@ impl KernelLabApp {
         }
         let ready = match preset {
             SolidFeaturePreset::Revolve => true,
+            // Converted (ADR 0041): pressing one with nothing picked enters it
+            // and asks for a face, so availability asks only whether this
+            // workspace has a body to put a face feature on.
             SolidFeaturePreset::Hole
             | SolidFeaturePreset::Rib
-            | SolidFeaturePreset::HolePattern => self.selected_face.is_some(),
+            | SolidFeaturePreset::HolePattern => self.active_body_id().is_some(),
+            // Converted (ADR 0041). A body is not an operand these ask for —
+            // it is the workspace's active body, which is why they were never
+            // gated on a *selection* in the first place — so availability is
+            // simply whether this workspace has one to act on. A shell with no
+            // face picked hollows the body closed, and mirror falls back
+            // through construction plane, planar face and origin plane, so
+            // neither has anything left to wait for.
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
-            // A shell with no face selected hollows the body closed, so a
-            // body of its own is all it needs.
             | SolidFeaturePreset::Shell => self.active_body_id().is_some(),
+            // An empty selection is not a reason to disable a tool (ADR
+            // 0041). Pressing Fillet with nothing picked enters Fillet and
+            // asks for edges, so availability no longer turns on having them.
             SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet => {
-                !self.selected_edges.is_empty()
+                self.edge_finish_is_possible()
             }
         };
         if ready {
@@ -966,11 +980,14 @@ impl KernelLabApp {
             CommandAvailability::disabled(match preset {
                 SolidFeaturePreset::Hole
                 | SolidFeaturePreset::Rib
-                | SolidFeaturePreset::HolePattern => "Select a planar face first.",
+                | SolidFeaturePreset::HolePattern => "Create a body first.",
                 SolidFeaturePreset::Mirror
                 | SolidFeaturePreset::LinearPattern
                 | SolidFeaturePreset::Shell => "Activate a body first.",
-                _ => "Select at least one edge first.",
+                // Not "select an edge first": the tool asks for them itself.
+                // This is the appetite being unsatisfiable in principle, which
+                // arming cannot fix.
+                _ => "This body has no edges to finish.",
             })
         }
     }
@@ -1022,11 +1039,11 @@ impl KernelLabApp {
             "Move the history marker to the end before creating another feature.".to_owned()
         } else if !distance_valid {
             "Enter a finite, non-zero extrusion distance.".to_owned()
-        } else if linked_sketch_support || (self.selected_face.is_some() && linked_active_body) {
+        } else if linked_sketch_support || (self.selected_face().is_some() && linked_active_body) {
             "Library component geometry is immutable in this workspace; edit its source definition or place another component.".to_owned()
-        } else if self.selected_face.is_some() && push_pull_support.is_none() {
+        } else if self.selected_face().is_some() && push_pull_support.is_none() {
             "Direct push/pull requires one unholed planar extrusion cap.".to_owned()
-        } else if self.selected_face.is_some() && !active_sketch_consumed {
+        } else if self.selected_face().is_some() && !active_sketch_consumed {
             "Finish or consume the active sketch before pushing the selected face.".to_owned()
         } else if already_extruded {
             "Select an eligible face to push/pull, or create another sketch.".to_owned()

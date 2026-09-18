@@ -1,7 +1,7 @@
 # The `.art` scripting language, version 0.3
 
 A reference for people and for AI agents writing Artificer scripts. Everything
-here is what the kernel implements today (Artificer 0.99.1, `.art` 0.3); nothing
+here is what the kernel implements today (Artificer 0.99.3, `.art` 0.3); nothing
 is aspirational. Where a feature has a limit, the limit is stated. Version 0.3
 adds functions, modules, typed parameters with units, ranges and descriptions,
 array indexing, and parameter introspection; sections 14 to 17 cover them.

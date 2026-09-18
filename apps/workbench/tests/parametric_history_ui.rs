@@ -11,6 +11,18 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const CONFIRM_OPERATION: &str = "Confirm operation";
 
 fn harness() -> Harness<'static, KernelLabApp> {
@@ -275,7 +287,7 @@ fn prepare_finished_sketch(harness: &mut Harness<'static, KernelLabApp>, case: F
             assert!(!harness.state().sketch_is_face_supported());
         }
         FeatureScenario::Add | FeatureScenario::Cut => {
-            click_button(harness, "Positive Z face");
+            activate_face(harness, "Positive Z face");
             click_button(harness, "Sketch on selected face");
             assert!(harness.state().sketch_is_face_supported());
         }
@@ -713,7 +725,7 @@ fn identical_new_bodies_keep_independent_history_branches() {
 
     // Make the overlapping face target unambiguous, then mutate only Body 2.
     click_button(&mut harness, "Hide Body 1");
-    click_button(&mut harness, "Extrusion top face");
+    activate_face(&mut harness, "Extrusion top face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::ExtrusionTop)
@@ -1192,7 +1204,7 @@ fn two_bodies_the_second_raised_to_the_first(harness: &mut Harness<'static, Kern
     finish_active_sketch(harness);
     click_button(harness, "Extrude");
     scroll_to_button(harness, "To face");
-    click_button(harness, "To face");
+    activate_face(harness, "To face");
     harness.run();
     assert!(
         harness.state().extrusion_side_ends_at_a_face(0),

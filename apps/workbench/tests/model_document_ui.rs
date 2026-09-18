@@ -9,6 +9,18 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const CONFIRM_OPERATION: &str = "Confirm operation";
 
 fn harness() -> Harness<'static, KernelLabApp> {
@@ -144,7 +156,7 @@ fn create_origin_extruded_body(harness: &mut Harness<'static, KernelLabApp>) -> 
 }
 
 fn begin_top_face_sketch(harness: &mut Harness<'static, KernelLabApp>) {
-    click_button(harness, "Extrusion top face");
+    activate_face(harness, "Extrusion top face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::ExtrusionTop)
@@ -252,7 +264,7 @@ fn browser_body_visibility_control_removes_hidden_body_from_selection() {
     let snapshot = harness.state().displayed_snapshot_id();
     let attempts = harness.state().transaction_attempt_count();
 
-    click_button(&mut harness, "Positive Z face");
+    activate_face(&mut harness, "Positive Z face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::PositiveZ)
@@ -293,7 +305,7 @@ fn finished_face_sketch_stays_visible_until_hidden_or_extruded() {
     let snapshot = harness.state().displayed_snapshot_id();
     let attempts = harness.state().transaction_attempt_count();
 
-    click_button(&mut harness, "Positive Z face");
+    activate_face(&mut harness, "Positive Z face");
     click_button(&mut harness, "Sketch on selected face");
     commit_centered_rectangle(&mut harness, 1.0, 1.0);
     finish_active_sketch(&mut harness);

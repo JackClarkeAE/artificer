@@ -8,6 +8,18 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const CONFIRM_OPERATION: &str = "Confirm operation";
 
 fn harness() -> Harness<'static, KernelLabApp> {
@@ -112,7 +124,7 @@ fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
 
 fn enter_positive_z_face_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
-    click_button(harness, "Positive Z face");
+    activate_face(harness, "Positive Z face");
     click_button(harness, "Sketch on selected face");
     for _ in 0..18 {
         harness.step();
@@ -904,7 +916,7 @@ fn listed_destinations(harness: &Harness<'static, KernelLabApp>) -> Vec<String> 
 /// A block with a smaller block on top of it: a ledge at 2 and a top at 4.
 fn stepped_block(harness: &mut Harness<'static, KernelLabApp>) {
     block_two_tall(harness);
-    click_button(harness, "Extrusion top face");
+    activate_face(harness, "Extrusion top face");
     click_button(harness, "Sketch on selected face");
     for _ in 0..18 {
         harness.step();
@@ -944,7 +956,7 @@ fn the_plane_a_cut_ends_at_is_one_the_camera_never_shows() {
     block_two_tall(&mut harness);
 
     // Sketch on the top of the block and cut downwards.
-    click_button(&mut harness, "Extrusion top face");
+    activate_face(&mut harness, "Extrusion top face");
     click_button(&mut harness, "Sketch on selected face");
     for _ in 0..18 {
         harness.step();
@@ -1136,7 +1148,7 @@ fn a_side_ends_at_the_face_that_is_clicked() {
         pickable_faces(&harness)
     );
 
-    click_button(&mut harness, "Feature end face");
+    activate_face(&mut harness, "Feature end face");
     for _ in 0..18 {
         harness.step();
     }
