@@ -17215,10 +17215,10 @@ impl KernelLabApp {
             .color(theme::muted()),
         );
         ui.add_space(4.0);
-        // Both kinds are cut now. Which shapes the kernel can still not reach
-        // — a finish standing apart from a band an earlier feature left — is
-        // not something the panel can tell from the selection, so the refusal
-        // names it rather than the option pretending to know in advance.
+        // Both kinds are cut, against a flat corner or against a band an
+        // earlier feature left. Where a shape is still out of reach the
+        // kernel names it, which is better than an option greyed on a guess
+        // the panel would have to make from the selection alone.
         let buildable = true;
         let apart = ui
             .add_enabled_ui(buildable, |ui| {

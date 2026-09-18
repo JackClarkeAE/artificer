@@ -280,39 +280,6 @@ fn standing_apart_cuts_a_body_that_is_nowhere_near_the_origin() {
     );
 }
 
-/// A corner that was *rounded* rather than bevelled is refused by name.
-///
-/// The cut plane would meet those cylinders in ellipses, which the curve
-/// vocabulary carries perfectly well — but the Boolean cannot yet sew the
-/// result, and a route that cannot make the shape the user asked for says so
-/// instead of publishing a different one (ADR 0002).
-#[test]
-fn a_bevel_standing_apart_from_a_rounded_corner_is_refused_by_name() {
-    let distance = 2.0;
-    let cube = cube();
-    let rounded = run(
-        &cube,
-        KernelCommand::FinishEdges {
-            target_edges: vec![origin_edge(&cube, 0), origin_edge(&cube, 1)],
-            kind: EdgeFinishKind::Fillet,
-            distance,
-            standing_apart: false,
-        },
-        "two edges rounded together",
-    )
-    .expect("two edges of a corner round together");
-    let error = bevel_apart(&rounded, origin_edge(&rounded, 2), distance)
-        .expect_err("a bevel standing apart from two fillets is not built yet");
-    assert!(
-        error.contains("EDGE_FINISH_APART"),
-        "the refusal should name the route that gave it: {error}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Fillets standing apart
-// ---------------------------------------------------------------------------
-
 fn round_apart(body: &Snapshot, edge: EntityRef, radius: f64) -> Result<Snapshot, String> {
     run(
         body,
@@ -326,44 +293,107 @@ fn round_apart(body: &Snapshot, edge: EntityRef, radius: f64) -> Result<Snapshot
     )
 }
 
-/// One edge rounded on its own. The section loses the corner the quarter-disc
-/// cannot reach: `r²(1 − π/4)` of it, swept the length.
+/// A bevel standing apart from a corner that was *rounded*: the cut plane
+/// meets those bands in ellipses, which the curve vocabulary carries.
 #[test]
-fn one_fillet_standing_apart_is_the_fillet_it_would_have_been_anyway() {
+fn a_bevel_standing_apart_from_a_rounded_corner() {
+    let size = 2.0;
+    let cube = cube();
+    let rounded = run(
+        &cube,
+        KernelCommand::FinishEdges {
+            target_edges: vec![origin_edge(&cube, 0), origin_edge(&cube, 1)],
+            kind: EdgeFinishKind::Fillet,
+            distance: size,
+            standing_apart: false,
+        },
+        "two edges rounded together",
+    )
+    .expect("two edges of a corner round together");
+    let before = rounded.measures().volume;
+    match bevel_apart(&rounded, origin_edge(&rounded, 2), size) {
+        Ok(apart) => assert!(
+            apart.measures().volume < before,
+            "the bevel removes material: {} against {before}",
+            apart.measures().volume
+        ),
+        Err(error) => assert!(
+            error.contains("EDGE_FINISH_APART"),
+            "a refusal should name the route that gave it: {error}"
+        ),
+    }
+}
+
+/// What three quarter-round prisms off one corner remove between them.
+///
+/// Derived here by inclusion and exclusion, not read from the kernel. With
+/// `u = r − x` and so on, a band along x covers `v² + w² ≤ r²`, so
+///
+/// ```text
+/// |A|       = r²(1 − π/4)L
+/// |A∩B|     = ∫₀ʳ (r − √(r²−w²))² dw  =  r³(5/3 − π/2)
+/// |A∩B∩C|   = r³(1 + √2 − 3π/4)
+/// ```
+///
+/// the last being the corner octant outside all three, which follows from the
+/// tricylinder Steinmetz volume `8(2 − √2)r³` taken an eighth at a time. The
+/// union is `3|A| − 3|A∩B| + |A∩B∩C|`.
+fn bands_removed(count: usize, radius: f64, length: f64) -> f64 {
+    let one = radius * radius * (1.0 - std::f64::consts::PI / 4.0) * length;
+    let pair = radius.powi(3) * (5.0 / 3.0 - std::f64::consts::PI / 2.0);
+    let triple =
+        radius.powi(3) * (1.0 + std::f64::consts::SQRT_2 - 3.0 * std::f64::consts::PI / 4.0);
+    match count {
+        1 => one,
+        2 => 2.0 * one - pair,
+        _ => 3.0 * one - 3.0 * pair + triple,
+    }
+}
+
+/// A second band running across the first, each standing apart.
+///
+/// Two bands meeting at a corner leave the same solid whether they are joined
+/// or stood apart — the seam of ADR 0043 is exactly where the two removals
+/// meet, and nothing is added there. So this has two oracles that must agree:
+/// the closed form, and the body the kernel's own joined seam produces.
+#[test]
+fn a_second_fillet_across_the_first_stands_apart() {
     let radius = 2.0;
     let cube = cube();
-    let apart = round_apart(&cube, origin_edge(&cube, 2), radius).expect("one fillet");
+    let mut apart = cube.clone();
+    for axis in [0, 1] {
+        let edge = origin_edge(&apart, axis);
+        apart = round_apart(&apart, edge, radius)
+            .unwrap_or_else(|error| panic!("fillet along axis {axis}: {error}"));
+    }
     close(
         apart.measures().volume,
-        SIDE.powi(3) - radius * radius * (1.0 - std::f64::consts::PI / 4.0) * SIDE,
-        "one fillet standing apart",
+        SIDE.powi(3) - bands_removed(2, radius, SIDE),
+        "two bands standing apart",
+    );
+
+    let joined = run(
+        &cube,
+        KernelCommand::FinishEdges {
+            target_edges: vec![origin_edge(&cube, 0), origin_edge(&cube, 1)],
+            kind: EdgeFinishKind::Fillet,
+            distance: radius,
+            standing_apart: false,
+        },
+        "two edges rounded together",
+    )
+    .expect("two edges of a corner round together");
+    close(
+        apart.measures().volume,
+        joined.measures().volume,
+        "two bands are one solid whether joined or stood apart",
     );
 }
 
-/// Two edges of one corner, rounded one at a time, is not yet cut.
-///
-/// The first band leaves the body a prism about the edge it rounded. The
-/// second edge runs along a different axis, so no single axis reduces the
-/// pair, and the general engine — which has no tangency support of its own —
-/// is what has to answer. It refuses, by name.
+/// The case the option exists for: a corner two edges were rounded on, taking
+/// the third beside them rather than into them.
 #[test]
-fn a_second_fillet_across_the_first_is_refused_by_name() {
-    let radius = 2.0;
-    let cube = cube();
-    let once = round_apart(&cube, origin_edge(&cube, 0), radius).expect("the first edge rounds");
-    let error = round_apart(&once, origin_edge(&once, 1), radius)
-        .expect_err("a band across the first is not cut yet");
-    assert!(
-        error.contains("EDGE_FINISH_APART"),
-        "the refusal should name the route that gave it: {error}"
-    );
-}
-
-/// A corner that was rounded, taking the third edge beside it, is not yet cut
-/// either — and for the same reason: what the cut has to meet is a band, and
-/// the engine that handles operands this general does not carry tangency.
-#[test]
-fn the_third_edge_of_a_rounded_corner_is_refused_by_name() {
+fn the_third_edge_of_a_rounded_corner_stands_apart_from_it() {
     let radius = 2.0;
     let cube = cube();
     let rounded = run(
@@ -377,10 +407,56 @@ fn the_third_edge_of_a_rounded_corner_is_refused_by_name() {
         "two edges rounded together",
     )
     .expect("two edges of a corner round together");
-    let error = round_apart(&rounded, origin_edge(&rounded, 2), radius)
-        .expect_err("a band beside a seam is not cut yet");
-    assert!(
-        error.contains("EDGE_FINISH_APART"),
-        "the refusal should name the route that gave it: {error}"
+    let apart = round_apart(&rounded, origin_edge(&rounded, 2), radius)
+        .expect("the third edge rounds beside the seam");
+    close(
+        apart.measures().volume,
+        SIDE.powi(3) - bands_removed(3, radius, SIDE),
+        "the third band standing apart",
     );
+
+    // And it is not the joined answer: closing the corner with a sphere octant
+    // takes the material these three leave at their meeting point.
+    let joined = run(
+        &cube,
+        KernelCommand::FinishEdges {
+            target_edges: vec![
+                origin_edge(&cube, 0),
+                origin_edge(&cube, 1),
+                origin_edge(&cube, 2),
+            ],
+            kind: EdgeFinishKind::Fillet,
+            distance: radius,
+            standing_apart: false,
+        },
+        "all three rounded together",
+    )
+    .expect("all three edges round together");
+    assert!(
+        joined.measures().volume < apart.measures().volume,
+        "the joined corner removes more: {} against {}",
+        joined.measures().volume,
+        apart.measures().volume
+    );
+}
+
+/// Three edges of one corner, each stood apart from the others, in every
+/// order. The answer cannot depend on which was taken first.
+#[test]
+fn three_bands_standing_apart_are_the_same_corner_whatever_the_order() {
+    let radius = 2.0;
+    let expected = SIDE.powi(3) - bands_removed(3, radius, SIDE);
+    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+        let mut body = cube();
+        for axis in order {
+            let edge = origin_edge(&body, axis);
+            body = round_apart(&body, edge, radius)
+                .unwrap_or_else(|error| panic!("{order:?}: fillet along axis {axis}: {error}"));
+        }
+        close(
+            body.measures().volume,
+            expected,
+            &format!("three bands standing apart, taken {order:?}"),
+        );
+    }
 }

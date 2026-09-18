@@ -26,10 +26,12 @@
 //! graze it at all — it misses, and every stage after is entitled to believe
 //! the miss.
 //!
-//! What is not cut yet is a finish standing apart from a *band*: a corner an
-//! earlier feature rounded, or a second edge running across the first. No one
-//! axis reduces those to prisms, so the general engine has to answer, and it
-//! carries no tangency of its own. They are refused by name.
+//! A finish standing apart from a *band* — a corner an earlier feature
+//! rounded, or a second edge running across the first — is cut by the general
+//! engine rather than by the prism reduction, since no one axis reduces it.
+//! That route now carries tangency too, so those work as well: three bands off
+//! one corner, each stood apart from the others, land on the union of three
+//! quarter-round prisms whichever order they are taken in.
 
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,

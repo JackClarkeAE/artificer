@@ -35,7 +35,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0022](0022-development-incidents-and-input-tracing.md) | Development incidents and privacy-conscious input tracing | Accepted | — |
 | [0023](0023-carrier-unified-rims-and-exact-rim-blends.md) | Carrier-unified rims and exact rim blends | Implemented | — |
 | 0024 | *never written* | — | — |
-| [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | — |
+| [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | 0045 (tangency and coincidence) |
 | [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
 | [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
@@ -54,7 +54,8 @@ by tests, and **proposed** is a plan not yet executed.
 | [0041](0041-tools-and-selections-meet-in-either-order.md) | Tools and selections meet in either order | Implemented | — |
 | [0042](0042-a-sketch-can-measure-against-the-body-it-sits-on.md) | A sketch can measure against the body it sits on | Implemented | 0038, 0041 |
 | [0043](0043-two-edges-of-a-corner-meet-in-a-seam.md) | Two edges of a corner meet in a seam | Implemented | 0034 |
-| [0044](0044-a-corner-already-finished-asks-before-it-answers.md) | A corner already finished asks before it answers | Accepted; joining implemented, standing apart implemented for both kinds on prism reductions | 0034, 0043 |
+| [0044](0044-a-corner-already-finished-asks-before-it-answers.md) | A corner already finished asks before it answers | Accepted and implemented | 0034, 0043, 0045 |
+| [0045](0045-a-boolean-that-resolves-what-it-touches.md) | A Boolean that resolves what it touches | Implemented | 0025, 0044 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

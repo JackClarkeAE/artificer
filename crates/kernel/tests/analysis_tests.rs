@@ -107,9 +107,11 @@ let b = box(origin: [30, 0, 0], size: [10, 10, 10], label: \"b\");
 }
 
 #[test]
-fn an_interfering_pair_the_boolean_refuses_keeps_its_clearance_and_says_why() {
-    // Two boxes sharing a face plane and overlapping: the engine refuses
-    // coincident geometry, and the study still reports the interference.
+fn an_interfering_pair_that_shares_a_face_plane_reports_how_much_it_overlaps() {
+    // Two boxes sharing four face planes and overlapping along the fifth.
+    // The engine used to refuse coincident geometry, leaving the study able
+    // to say only *that* they interfered; it now resolves the shared
+    // boundaries, so the study can say by how much.
     let session = session(
         "let a = box(size: [20, 20, 20], label: \"a\");
 let b = box(origin: [10, 0, 0], size: [20, 20, 20], label: \"b\");
@@ -119,11 +121,16 @@ let b = box(origin: [10, 0, 0], size: [20, 20, 20], label: \"b\");
         .expect("a study");
     let pair = &report.pairs[0];
     assert_eq!(pair.state, ClearanceState::Interfering);
-    assert!(pair.overlap_volume.is_none(), "the engine cannot say");
-    assert_eq!(
-        pair.overlap_unavailable.as_deref(),
-        Some("BOOLEAN_CONTACT_UNSUPPORTED"),
-        "the refusal is named rather than dropped"
+    assert!(
+        pair.overlap_unavailable.is_none(),
+        "nothing is unavailable now: {:?}",
+        pair.overlap_unavailable
+    );
+    // They share x from 10 to 20 across the whole 20 by 20 section.
+    let overlap = pair.overlap_volume.expect("the engine can say");
+    assert!(
+        (overlap - 10.0 * 20.0 * 20.0).abs() < 1.0e-6,
+        "the shared block: {overlap}"
     );
 }
 

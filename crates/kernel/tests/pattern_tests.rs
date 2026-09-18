@@ -673,13 +673,13 @@ fn overlapping_copies_join_through_the_boolean_ladder() {
 }
 
 #[test]
-fn copies_that_overlap_on_a_shared_face_plane_are_refused_by_the_ladder() {
-    // Stepping a box along one axis leaves the other four face planes
-    // shared between the copies, which is the Boolean engine's tangency
-    // limit rather than a pattern of its own. It refuses instead of
-    // falling to a tessellation.
+fn copies_that_overlap_on_a_shared_face_plane_merge_into_one_run() {
+    // Stepping a box 30 along its own 60 leaves the copies overlapping, with
+    // four face planes shared between them. That used to be the engine's
+    // tangency limit; a coincident boundary is now resolved rather than
+    // refused, so the two become the one run of material they describe.
     let mut session = run("let block = box(size: [60, 40, 25], label: \"block\");\n");
-    let error = session
+    session
         .execute(
             ApiCommand::LinearPattern {
                 label: "row".to_owned(),
@@ -689,15 +689,13 @@ fn copies_that_overlap_on_a_shared_face_plane_are_refused_by_the_ladder() {
             },
             &CancellationToken::default(),
         )
-        .expect_err("coincident geometry");
+        .expect("overlapping copies merge");
+    // From 0 to 90 along x, the overlap counted once.
     assert!(
-        error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code.as_str() == "BOOLEAN_CONTACT_UNSUPPORTED"),
-        "{error:?}"
+        (session.snapshot.measures().volume - 90.0 * 40.0 * 25.0).abs() < 1.0e-6,
+        "one run of material: {}",
+        session.snapshot.measures().volume
     );
-    assert_eq!(session.snapshot.measures().volume, 60.0 * 40.0 * 25.0);
 }
 
 #[test]

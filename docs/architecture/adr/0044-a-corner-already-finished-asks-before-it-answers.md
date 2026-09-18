@@ -1,8 +1,7 @@
 # ADR 0044: A corner already finished asks before it answers
 
-Status: accepted; joining is implemented, and standing apart is implemented
-for both kinds where one axis reduces the cut to a prism against a prism.
-Standing apart from a band an earlier feature left is refused by name.
+Status: accepted and implemented — both answers, for both kinds, including
+standing apart from a band an earlier feature left.
 
 - Date: 2026-09-18
 - Decision owners: Artificer project
@@ -114,15 +113,19 @@ stage after that is entitled to believe the miss. The contacts are therefore
 taken as the feet of the perpendiculars from the band's own axis, where they
 are exact by construction.
 
-What is still not cut is a finish standing apart from a *band*: a corner an
-earlier feature rounded, or a second edge running across the first. There no
-single axis reduces the pair to prisms, so the general analytic engine has to
-answer, and it carries no tangency of its own. Those are refused by name, and
-what they need is the same reasoning carried from the 2D pipeline into the 3D
-one — a larger piece of work, because the section assembly meets its own
-degeneracies there: a chord lying along a face's boundary, one curve arriving
-twice from two faces that share a tangency, and faces that abut rather than
-cross.
+A finish standing apart from a *band* — a corner an earlier feature rounded,
+or a second edge running across the first — has no single axis that reduces it
+to prisms, so the general engine answers it. That engine carries tangency too
+now (ADR 0045), so those work as well. Three bands off one corner, each stood
+apart from the others, land on the union of three quarter-round prisms
+whichever order they are taken in:
+
+```text
+3·r²(1 − π/4)L − 3·r³(5/3 − π/2) + r³(1 + √2 − 3π/4)
+```
+
+the last term being the corner octant outside all three, which follows from
+the tricylinder Steinmetz volume an eighth at a time.
 
 ### How a finished corner is recognised
 
@@ -169,9 +172,8 @@ Joining edits a committed feature, so everything after it replays. That is
 already how a sketch or an extrusion is edited, and the history reads better
 for it: one corner, one feature.
 
-The second answer ships for both kinds on the shapes one axis reduces, and is
-refused by name on the rest — so the panel never has to pretend the first is
-the only thing anyone could have meant.
+The second answer ships for both kinds, so the panel never has to pretend the
+first is the only thing anyone could have meant.
 
 Nothing here changes what the kernel refuses. The vocabulary is untouched; the
 workbench stopped treating a refusal as the end of the conversation.
