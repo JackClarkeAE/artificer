@@ -18,6 +18,7 @@ pub mod document_replay;
 pub mod documents;
 mod export;
 pub mod feature_editor;
+pub mod invocation;
 pub mod library_catalog;
 pub mod material;
 mod parametric;
@@ -6414,6 +6415,56 @@ impl KernelLabApp {
     #[must_use]
     fn selected_vertex(&self) -> Option<viewport::DocumentVertexSelection> {
         self.selected_vertices.last().copied()
+    }
+
+    /// Everything picked, in click order, as the resolver sees it.
+    ///
+    /// The workbench keeps a collection per kind, which cannot express the
+    /// order a heterogeneous selection was made in. Until there is one ordered
+    /// model (ADR 0041 stage 1 continues), this concatenates them in a fixed
+    /// order — bodies, faces, edges, vertices — which is deterministic and
+    /// therefore safe for symmetric operands, and which no asymmetric role is
+    /// allowed to read meaning into.
+    #[must_use]
+    // Nothing invokes the resolver yet: stage 2 lands the model and proves it
+    // describes today's behaviour, and stage 3 builds the armed path that
+    // calls it. Flipping a gate before that would ship a live button with
+    // nothing behind it, which is the defect ADR 0041 exists to remove.
+    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 3"))]
+    fn selection_items(&self) -> Vec<invocation::SelectionItem> {
+        let mut items = Vec::new();
+        if let Some(body) = self.active_body_id() {
+            items.push(invocation::SelectionItem::Body(
+                viewport::BodyInstanceKey::new(body.get()),
+            ));
+        }
+        items.extend(
+            self.selected_faces
+                .iter()
+                .copied()
+                .map(invocation::SelectionItem::Face),
+        );
+        items.extend(
+            self.selected_edges
+                .iter()
+                .copied()
+                .map(invocation::SelectionItem::Edge),
+        );
+        items.extend(
+            self.selected_vertices
+                .iter()
+                .copied()
+                .map(invocation::SelectionItem::Vertex),
+        );
+        items
+    }
+
+    /// The body an occurrence key names, where the document still holds it.
+    fn body_for_instance(&self, key: viewport::BodyInstanceKey) -> Option<BodyId> {
+        self.bodies
+            .iter()
+            .find(|body| body.id.get() == key.get())
+            .map(|body| body.id)
     }
 
     fn clear_model_entity_selection(&mut self) {
@@ -22888,6 +22939,31 @@ fn select_test_face(app: &mut KernelLabApp, face: EntityRef) {
         .push(viewport::DocumentFaceSelection { body, face });
 }
 
+impl invocation::InvocationContext for KernelLabApp {
+    fn active_body(&self) -> Option<viewport::BodyInstanceKey> {
+        self.active_body_id()
+            .map(|body| viewport::BodyInstanceKey::new(body.get()))
+    }
+
+    fn resolves(&self, item: invocation::SelectionItem) -> bool {
+        self.body_for_instance(item.body()).is_some()
+    }
+
+    fn body_is_editable(&self, body: viewport::BodyInstanceKey) -> bool {
+        self.body_for_instance(body)
+            .is_some_and(|body| self.component_for_body(body).is_none())
+    }
+
+    fn face_is_planar_support(&self, face: viewport::DocumentFaceSelection) -> bool {
+        self.bodies
+            .iter()
+            .find(|body| body.id.get() == face.body.get())
+            .is_some_and(|body| {
+                NativeKernel::planar_face_support(&body.body.snapshot, face.face).is_ok()
+            })
+    }
+}
+
 /// Picks the first face the displayed body offers, which is what a test that
 /// merely needs "some face selected" is asking for.
 #[cfg(test)]
@@ -28621,6 +28697,109 @@ mod extrusion_workbench_tests {
                     .is_some_and(|node| !feature_editor::action_scalars(&node.action).is_empty()),
             "the default selection must not advertise dimensions it cannot write"
         );
+    }
+
+    /// The resolver has to describe the software as it *is* before it is
+    /// allowed to change it. For every preset whose availability turns on the
+    /// selection, the resolver's verdict and today's gate must agree about
+    /// whether the operands are there — with nothing selected and with the
+    /// right thing selected (ADR 0041 stage 2).
+    #[test]
+    fn the_resolver_agrees_with_todays_availability_about_operands() {
+        use crate::invocation::{self, OperandResolution};
+
+        // (preset, its appetite, what to select to satisfy it)
+        #[derive(Clone, Copy)]
+        enum Satisfy {
+            Face,
+            Edge,
+            ActiveBody,
+        }
+        let cases = [
+            (
+                SolidFeaturePreset::Hole,
+                &invocation::PLANAR_FACE_FEATURE,
+                Satisfy::Face,
+            ),
+            (
+                SolidFeaturePreset::Rib,
+                &invocation::PLANAR_FACE_FEATURE,
+                Satisfy::Face,
+            ),
+            (
+                SolidFeaturePreset::HolePattern,
+                &invocation::PLANAR_FACE_FEATURE,
+                Satisfy::Face,
+            ),
+            (
+                SolidFeaturePreset::Chamfer,
+                &invocation::EDGE_FINISH,
+                Satisfy::Edge,
+            ),
+            (
+                SolidFeaturePreset::Fillet,
+                &invocation::EDGE_FINISH,
+                Satisfy::Edge,
+            ),
+            (
+                SolidFeaturePreset::Shell,
+                &invocation::WHOLE_BODY_FEATURE,
+                Satisfy::ActiveBody,
+            ),
+            (
+                SolidFeaturePreset::Mirror,
+                &invocation::WHOLE_BODY_FEATURE,
+                Satisfy::ActiveBody,
+            ),
+            (
+                SolidFeaturePreset::LinearPattern,
+                &invocation::WHOLE_BODY_FEATURE,
+                Satisfy::ActiveBody,
+            ),
+        ];
+
+        for (preset, spec, satisfy) in cases {
+            let mut app = KernelLabApp::default();
+            app.clear_model_entity_selection();
+
+            // Nothing picked: today's gate and the resolver must agree about
+            // whether the operands are present. A whole-body feature is
+            // satisfied by the active body without a pick, and the other two
+            // are not satisfied at all.
+            let gate_ready = app.preset_feature_availability(preset).is_enabled();
+            let resolved = invocation::resolve(&app, spec, &app.selection_items());
+            let resolver_ready = matches!(resolved, OperandResolution::Complete { .. });
+            assert_eq!(
+                gate_ready, resolver_ready,
+                "{preset:?} with nothing picked: gate says {gate_ready}, resolver says {resolver_ready} ({resolved:?})"
+            );
+
+            // Now pick what the preset wants and check they still agree.
+            match satisfy {
+                Satisfy::Face => select_first_test_face(&mut app),
+                Satisfy::Edge => {
+                    let body = app.active_body_id().expect("default active body");
+                    let edge = app
+                        .displayed
+                        .as_ref()
+                        .and_then(|displayed| displayed.scene.edges.first())
+                        .expect("default body edge")
+                        .source_edge;
+                    app.selected_edges.push(viewport::DocumentEdgeSelection {
+                        body: viewport::BodyInstanceKey::new(body.get()),
+                        edge,
+                    });
+                }
+                Satisfy::ActiveBody => {}
+            }
+            let gate_ready = app.preset_feature_availability(preset).is_enabled();
+            let resolved = invocation::resolve(&app, spec, &app.selection_items());
+            let resolver_ready = matches!(resolved, OperandResolution::Complete { .. });
+            assert_eq!(
+                gate_ready, resolver_ready,
+                "{preset:?} with its operand picked: gate says {gate_ready}, resolver says {resolver_ready} ({resolved:?})"
+            );
+        }
     }
 
     /// The singular selection is a view, so it cannot disagree with the

@@ -41,7 +41,7 @@ pub(crate) enum CommandAvailability {
 }
 
 impl CommandAvailability {
-    const fn is_enabled(&self) -> bool {
+    pub(crate) const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
     }
 
@@ -937,7 +937,10 @@ impl KernelLabApp {
         }
     }
 
-    fn preset_feature_availability(&self, preset: SolidFeaturePreset) -> CommandAvailability {
+    pub(crate) fn preset_feature_availability(
+        &self,
+        preset: SolidFeaturePreset,
+    ) -> CommandAvailability {
         if self.pending_operation.is_some() {
             return CommandAvailability::disabled("Confirm or cancel the pending operation first.");
         }
