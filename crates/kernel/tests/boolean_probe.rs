@@ -738,9 +738,11 @@ fn a_fully_rotated_interior_tool_hollows_through_the_general_engine() {
 }
 
 #[test]
-fn tangential_and_coincident_contacts_refuse_closed() {
-    // ADR 0025's tangency gates: shared faces and coincident carriers must
-    // refuse rather than guess.
+fn a_shared_face_joins_while_a_kissing_cylinder_still_refuses() {
+    // Two contacts that look alike and are not. A whole shared face is a
+    // coincident boundary, which the engine resolves; a cylinder touching a
+    // plate along one line would weld two solids at a seam of no width, which
+    // is not a solid at all and still refuses.
     let first = extrude_profile(
         rectangle((0.0, 0.0), (4.0, 4.0)),
         Point3::new(0.0, 0.0, 0.0),
@@ -754,14 +756,21 @@ fn tangential_and_coincident_contacts_refuse_closed() {
         4.0,
         "tangent-flush",
     );
-    let refused = boolean(&first, &flush, BooleanOperation::Union, "tangent-union")
-        .expect_err("face-on-face contact refuses");
+    // Two boxes meeting on a whole shared face are one box, and the engine
+    // now says so rather than refusing: the shared face is interior to the
+    // union, so it dissolves and the result spans both.
+    let joined = boolean(&first, &flush, BooleanOperation::Union, "tangent-union")
+        .expect("face-on-face contact joins into one box");
+    let measures = joined.measures();
     assert!(
-        refused.diagnostics.iter().any(|diagnostic| {
-            let code = diagnostic.code.as_str();
-            code == "BOOLEAN_CONTACT_UNSUPPORTED" || code == "BOOLEAN_EMPTY_OR_UNRESOLVED_RESULT"
-        }),
-        "unexpected refusal: {refused:?}"
+        (measures.volume - 128.0).abs() < 1.0e-9,
+        "one 8 by 4 by 4 box: {}",
+        measures.volume
+    );
+    assert!(
+        (measures.surface_area - 160.0).abs() < 1.0e-9,
+        "and its whole skin, the shared face gone: {}",
+        measures.surface_area
     );
 
     // A cylinder tangent to a plane from outside.

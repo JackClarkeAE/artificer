@@ -86,7 +86,39 @@ pub(crate) fn profile_boolean_multi(
         for (index_a, segment_a) in segments_a.iter().enumerate() {
             for (loop_b, segments_b) in second_loops.iter().enumerate() {
                 for (index_b, segment_b) in segments_b.iter().enumerate() {
-                    for crossing in segment_crossings(*segment_a, *segment_b, tolerances)? {
+                    let crossings = match segment_crossings(*segment_a, *segment_b, tolerances) {
+                        Ok(crossings) => crossings,
+                        Err(refusal) => {
+                            // A shared stretch rather than a crossing. Its two
+                            // ends are where either side's classification can
+                            // change, so both sides are cut there — with the
+                            // same points, so their pieces align bit for bit —
+                            // and what the stretch between them means is left
+                            // to the classifier, which has a rule for it.
+                            let Some(overlap) = carrier_overlap(*segment_a, *segment_b, tolerances)
+                            else {
+                                return Err(refusal);
+                            };
+                            for point in overlap.ends {
+                                if let Placement::Interior(parameter) = place(
+                                    parameter_of(*segment_a, point),
+                                    segment_length(*segment_a),
+                                    tolerances,
+                                ) {
+                                    first_cuts[loop_a][index_a].push(Cut { parameter, point });
+                                }
+                                if let Placement::Interior(parameter) = place(
+                                    parameter_of(*segment_b, point),
+                                    segment_length(*segment_b),
+                                    tolerances,
+                                ) {
+                                    second_cuts[loop_b][index_b].push(Cut { parameter, point });
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    for crossing in crossings {
                         if let Some(parameter) = crossing.first_interior {
                             first_cuts[loop_a][index_a].push(Cut {
                                 parameter,
@@ -113,6 +145,7 @@ pub(crate) fn profile_boolean_multi(
         &first_loops,
         &first_cuts,
         &second_wrapped,
+        &second_loops,
         FirstOperandRule::from(operation),
         tolerances,
         &mut pieces,
@@ -121,6 +154,7 @@ pub(crate) fn profile_boolean_multi(
         &second_loops,
         &second_cuts,
         &first_wrapped,
+        &first_loops,
         SecondOperandRule::from(operation),
         tolerances,
         &mut pieces,
@@ -214,9 +248,25 @@ pub(crate) fn chord_region_pieces(
     precision: PrecisionPolicy,
 ) -> Result<Vec<Segment>, ProfileBooleanError> {
     let tolerances = Tolerances::from(precision);
+    let chord_length = segment_length(chord);
     let mut cuts: Vec<Cut> = Vec::new();
     for segments in loops {
         for boundary in segments {
+            // A chord running *along* a piece of the boundary rather than
+            // across it. A clip is not asking which side the material is on —
+            // it asks which parts of the chord lie in this region, and a
+            // region contains its own boundary. So the shared stretch's ends
+            // become cuts and the stretch itself is kept below.
+            if let Some(overlap) = carrier_overlap(chord, *boundary, tolerances) {
+                for point in overlap.ends {
+                    if let Placement::Interior(parameter) =
+                        place(parameter_of(chord, point), chord_length, tolerances)
+                    {
+                        cuts.push(Cut { parameter, point });
+                    }
+                }
+                continue;
+            }
             for crossing in segment_crossings(chord, *boundary, tolerances)? {
                 if let Some(parameter) = crossing.first_interior {
                     cuts.push(Cut {
@@ -231,6 +281,10 @@ pub(crate) fn chord_region_pieces(
     let wrapped = wrap_loops(loops);
     let mut inside = Vec::new();
     for piece in pieces {
+        if coincidence_with(piece, loops, tolerances).is_some() {
+            inside.push(piece);
+            continue;
+        }
         let sample = point_in_loops(evaluate(piece, 0.5), &wrapped);
         let confirm = point_in_loops(evaluate(piece, 0.37), &wrapped);
         if sample != confirm {
@@ -434,6 +488,12 @@ pub(crate) fn region_containment(
 struct Keep {
     keep_inside: bool,
     reverse: bool,
+    /// What to do with a piece lying along the other operand's boundary,
+    /// where an interior sample decides nothing because both sides of it are
+    /// the other operand's edge. `Some(true)` keeps it where the two run the
+    /// same way — materials on the same side — `Some(false)` where they run
+    /// against each other, and `None` never keeps it.
+    keep_coincident: Option<bool>,
 }
 
 struct FirstOperandRule;
@@ -442,13 +502,24 @@ struct SecondOperandRule;
 impl FirstOperandRule {
     fn from(operation: BooleanOperation) -> Keep {
         match operation {
-            BooleanOperation::Union | BooleanOperation::Difference => Keep {
+            // A shared stretch bounds the difference only where the two
+            // materials lie on opposite sides of it: co-oriented, the
+            // minuend's material there is the subtrahend's too and goes with
+            // it.
+            BooleanOperation::Difference => Keep {
                 keep_inside: false,
                 reverse: false,
+                keep_coincident: Some(false),
+            },
+            BooleanOperation::Union => Keep {
+                keep_inside: false,
+                reverse: false,
+                keep_coincident: Some(true),
             },
             BooleanOperation::Intersection => Keep {
                 keep_inside: true,
                 reverse: false,
+                keep_coincident: Some(true),
             },
         }
     }
@@ -457,19 +528,26 @@ impl FirstOperandRule {
 impl SecondOperandRule {
     fn from(operation: BooleanOperation) -> Keep {
         match operation {
+            // A shared stretch is carried by the first operand's copy of it
+            // or by neither, so the second operand never contributes one: two
+            // copies of one curve is not a boundary, it is a seam the chain
+            // cannot walk.
             BooleanOperation::Union => Keep {
                 keep_inside: false,
                 reverse: false,
+                keep_coincident: None,
             },
             BooleanOperation::Intersection => Keep {
                 keep_inside: true,
                 reverse: false,
+                keep_coincident: None,
             },
             // The subtrahend's boundary inside the minuend bounds the result
             // with the material on its other side.
             BooleanOperation::Difference => Keep {
                 keep_inside: true,
                 reverse: true,
+                keep_coincident: None,
             },
         }
     }
@@ -769,6 +847,125 @@ fn evaluate(segment: Segment, parameter: f64) -> Point2 {
     }
 }
 
+/// A stretch two boundary segments share, and whether they run along it the
+/// same way.
+#[derive(Clone, Copy, Debug)]
+struct Overlap {
+    ends: [Point2; 2],
+    same_way: bool,
+}
+
+/// Where two segments lie on one carrier and overlap along it.
+///
+/// This is the contact the transverse pipeline has no answer for: not a
+/// crossing at a point but a shared stretch, where which side the material
+/// lies on is the whole question. Finding it is the first half of answering
+/// it; the classifier does the rest.
+fn carrier_overlap(first: Segment, second: Segment, tolerances: Tolerances) -> Option<Overlap> {
+    match (first, second) {
+        (Segment::Line { start: p0, end: p1 }, Segment::Line { start: q0, end: q1 }) => {
+            let direction = Point2::new(p1.x - p0.x, p1.y - p0.y);
+            let length = direction.x.hypot(direction.y);
+            let span = (q1.x - q0.x).hypot(q1.y - q0.y);
+            if length <= tolerances.minimum || span <= tolerances.minimum {
+                return None;
+            }
+            let unit = Point2::new(direction.x / length, direction.y / length);
+            let scale = length.max(span).max(1.0);
+            let across =
+                |point: Point2| (point.x - p0.x).mul_add(unit.y, -((point.y - p0.y) * unit.x));
+            if across(q0).abs() > tolerances.agreement * scale
+                || across(q1).abs() > tolerances.agreement * scale
+            {
+                return None;
+            }
+            let along = |point: Point2| (point.x - p0.x).mul_add(unit.x, (point.y - p0.y) * unit.y);
+            let (a, b) = (along(q0), along(q1));
+            let low = a.min(b).max(0.0);
+            let high = a.max(b).min(length);
+            if high - low <= tolerances.minimum {
+                return None;
+            }
+            Some(Overlap {
+                ends: [
+                    Point2::new(unit.x.mul_add(low, p0.x), unit.y.mul_add(low, p0.y)),
+                    Point2::new(unit.x.mul_add(high, p0.x), unit.y.mul_add(high, p0.y)),
+                ],
+                same_way: b > a,
+            })
+        }
+        (
+            Segment::Arc {
+                center: c1,
+                radius: r1,
+                start_angle: a1,
+                sweep: s1,
+                ..
+            },
+            Segment::Arc {
+                center: c2,
+                radius: r2,
+                start_angle: a2,
+                sweep: s2,
+                ..
+            },
+        ) => {
+            let scale = r1.max(r2).max(1.0);
+            if (c1.x - c2.x).hypot(c1.y - c2.y) > tolerances.agreement * scale
+                || (r1 - r2).abs() > tolerances.agreement * scale
+            {
+                return None;
+            }
+            // Both spans as increasing intervals, the second brought onto the
+            // first's branch so the two can be compared at all.
+            let (low1, high1) = if s1 >= 0.0 {
+                (a1, a1 + s1)
+            } else {
+                (a1 + s1, a1)
+            };
+            let (mut low2, mut high2) = if s2 >= 0.0 {
+                (a2, a2 + s2)
+            } else {
+                (a2 + s2, a2)
+            };
+            let turn = std::f64::consts::TAU;
+            while low2 < low1 - turn / 2.0 {
+                low2 += turn;
+                high2 += turn;
+            }
+            while low2 > low1 + turn / 2.0 {
+                low2 -= turn;
+                high2 -= turn;
+            }
+            let low = low1.max(low2);
+            let high = high1.min(high2);
+            if (high - low) * r1 <= tolerances.minimum {
+                return None;
+            }
+            let at = |angle: f64| {
+                Point2::new(r1.mul_add(angle.cos(), c1.x), r1.mul_add(angle.sin(), c1.y))
+            };
+            Some(Overlap {
+                ends: [at(low), at(high)],
+                same_way: (s1 >= 0.0) == (s2 >= 0.0),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a piece lies along any of these boundary loops, and which way.
+fn coincidence_with(
+    piece: Segment,
+    loops: &[Vec<Segment>],
+    tolerances: Tolerances,
+) -> Option<Overlap> {
+    loops
+        .iter()
+        .flatten()
+        .find_map(|boundary| carrier_overlap(piece, *boundary, tolerances))
+}
+
 /// All transverse crossings of one segment pair, or `Unsupported` when the
 /// pair touches tangentially or shares a carrier.
 fn segment_crossings(
@@ -786,9 +983,24 @@ fn segment_crossings(
         if first_place == Placement::Outside || second_place == Placement::Outside {
             continue;
         }
-        if first_place == Placement::Sliver || second_place == Placement::Sliver {
-            return Err(ProfileBooleanError::Unsupported);
-        }
+        // A crossing closer to an end than the smallest feature the policy
+        // admits *is* that end. Splitting there would make the sliver the
+        // check is named for, and refusing would turn a vertex the operands
+        // already share into a reason to give up — which is what a tangency
+        // landing on a region's own corner looks like. Snapping is what both
+        // avoid: the vertex is already there, so nothing needs cutting.
+        let settle = |placement: Placement, segment: Segment| match placement {
+            Placement::Sliver => {
+                if parameter_of(segment, point) < 0.5 {
+                    Placement::StartVertex
+                } else {
+                    Placement::EndVertex
+                }
+            }
+            other => other,
+        };
+        let first_place = settle(first_place, first);
+        let second_place = settle(second_place, second);
         // Resolve the shared point: an endpoint hit adopts the segment's own
         // vertex bit for bit, so both operands chain through one identity.
         let (point, first_interior, second_interior) = match (first_place, second_place) {
@@ -1101,7 +1313,11 @@ fn section_carrier_crossings(
         previous = (fraction, value);
     }
     // Tangential contact: an interior extremum of the signed distance within
-    // the agreement, with no sign change around it, inside both spans.
+    // the agreement, with no sign change around it, inside both spans. As
+    // with a line touching a circle, the boundaries meet and part again
+    // without crossing, so the touch is imprinted rather than refused and
+    // what each side of it means is left to the classifier. Two bands that
+    // spring from one wall meet exactly here.
     let mut values = Vec::with_capacity(SAMPLES + 1);
     for index in 0..=SAMPLES {
         values.push((at(index), signed(chord.point_at(at(index)))));
@@ -1112,7 +1328,20 @@ fn section_carrier_crossings(
             (b.abs() <= a.abs() && b.abs() <= c.abs()) && b.abs() <= tolerances.agreement;
         let sign_change = (a < 0.0) != (c < 0.0);
         if extremum && !sign_change {
-            let touch = chord.point_at(window[1].0);
+            // Settle the touch to the extremum itself rather than to whichever
+            // sample happened to be nearest, so both operands are cut at one
+            // point rather than at two a sample apart.
+            let (mut low, mut high) = (window[0].0, window[2].0);
+            for _ in 0..80 {
+                let third = (high - low) / 3.0;
+                let (left, right) = (low + third, high - third);
+                if signed(chord.point_at(left)).abs() <= signed(chord.point_at(right)).abs() {
+                    high = right;
+                } else {
+                    low = left;
+                }
+            }
+            let touch = chord.point_at(0.5 * (low + high));
             let within = |segment: Segment| {
                 matches!(
                     place(
@@ -1124,7 +1353,7 @@ fn section_carrier_crossings(
                 )
             };
             if within(chord) && within(other) {
-                return Err(ProfileBooleanError::Unsupported);
+                candidates.push(touch);
             }
         }
     }
@@ -1342,6 +1571,7 @@ fn collect_pieces(
     loops: &[Vec<Segment>],
     cuts: &[Vec<Vec<Cut>>],
     other: &[crate::analytic_extrusion::AnalyticLoop],
+    other_boundary: &[Vec<Segment>],
     rule: Keep,
     tolerances: Tolerances,
     pieces: &mut Vec<Piece>,
@@ -1349,13 +1579,23 @@ fn collect_pieces(
     for (loop_index, segments) in loops.iter().enumerate() {
         for (segment_index, segment) in segments.iter().enumerate() {
             for piece in split_segment(*segment, &cuts[loop_index][segment_index], tolerances)? {
-                // Two independent interior samples must agree on the side.
-                let inside = point_in_loops(evaluate(piece, 0.5), other);
-                let confirm = point_in_loops(evaluate(piece, 0.37), other);
-                if inside != confirm {
-                    return Err(ProfileBooleanError::Unsupported);
-                }
-                if inside == rule.keep_inside {
+                // A piece lying along the other operand's boundary is neither
+                // in nor out of it, and sampling either side of it only asks
+                // the same question again. Which way the two run decides it
+                // instead: material on the same side or on opposite sides.
+                let keep =
+                    if let Some(overlap) = coincidence_with(piece, other_boundary, tolerances) {
+                        rule.keep_coincident == Some(overlap.same_way)
+                    } else {
+                        // Two independent interior samples must agree on the side.
+                        let inside = point_in_loops(evaluate(piece, 0.5), other);
+                        let confirm = point_in_loops(evaluate(piece, 0.37), other);
+                        if inside != confirm {
+                            return Err(ProfileBooleanError::Unsupported);
+                        }
+                        inside == rule.keep_inside
+                    };
+                if keep {
                     pieces.push(Piece {
                         segment: if rule.reverse {
                             reverse_segment(piece)
@@ -1723,19 +1963,28 @@ mod tests {
     }
 
     #[test]
-    fn coincident_boundaries_refuse_rather_than_guess() {
+    fn coincident_boundaries_join_along_the_edge_they_share() {
         let first = region(rectangle((0.0, 0.0), (4.0, 4.0)));
         // Shares the whole edge x = 4 — a coincident carrier overlap.
         let second = region(rectangle((4.0, 0.0), (8.0, 4.0)));
-        assert_eq!(
-            profile_boolean(
-                &first,
-                &second,
-                BooleanOperation::Union,
-                PrecisionPolicy::default()
-            )
-            .err(),
-            Some(ProfileBooleanError::Unsupported)
+        let joined = profile_boolean(
+            &first,
+            &second,
+            BooleanOperation::Union,
+            PrecisionPolicy::default(),
+        )
+        .expect("two squares meeting along one edge make one rectangle");
+        assert_eq!(joined.len(), 1, "one region, not two");
+        let outer = &joined[0].outer;
+        let points = outer
+            .iter()
+            .flat_map(|segment| [segment.start(), segment.end()])
+            .collect::<Vec<_>>();
+        let low = points.iter().fold(f64::MAX, |least, p| least.min(p.x));
+        let high = points.iter().fold(f64::MIN, |most, p| most.max(p.x));
+        assert!(
+            (low - 0.0).abs() < 1.0e-9 && (high - 8.0).abs() < 1.0e-9,
+            "the union spans both squares: {low} to {high}"
         );
     }
 

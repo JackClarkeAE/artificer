@@ -179,6 +179,45 @@ fn face_region(
         .collect()
 }
 
+/// Section pieces with any curve that arrives twice reduced to one.
+///
+/// Sameness is the whole curve, not its ends. Two crossing bores meet in two
+/// branches that share both endpoints and are not the same curve at all, so
+/// matching on endpoints alone would quietly weld them into one and publish a
+/// solid that is wrong rather than refused. Interior samples are what tell
+/// them apart; the weld distance is the one the chaining itself uses, two
+/// faces reporting one curve by different routes agreeing to the last few bits
+/// rather than to all of them.
+fn without_repeated_pieces(pieces: Vec<Segment>, precision: PrecisionPolicy) -> Vec<Segment> {
+    let scale = pieces
+        .iter()
+        .flat_map(|piece| [piece.start(), piece.end()])
+        .map(|point| point.x.abs().max(point.y.abs()))
+        .fold(1.0_f64, f64::max);
+    let weld = precision.linear_agreement * scale * 32.0;
+    let near = |left: Point2, right: Point2| (left.x - right.x).hypot(left.y - right.y) <= weld;
+    let same = |held: &Segment, piece: &Segment| {
+        let ends_match = (near(held.start(), piece.start()) && near(held.end(), piece.end()))
+            || (near(held.start(), piece.end()) && near(held.end(), piece.start()));
+        if !ends_match {
+            return false;
+        }
+        // Along the curve, both ways round, since one copy may run the other
+        // way: two branches between the same ends part company in between.
+        [0.25_f64, 0.5, 0.75].into_iter().all(|fraction| {
+            near(held.point_at(fraction), piece.point_at(fraction))
+                || near(held.point_at(fraction), piece.point_at(1.0 - fraction))
+        })
+    };
+    let mut kept: Vec<Segment> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if !kept.iter().any(|held| same(held, &piece)) {
+            kept.push(piece);
+        }
+    }
+    kept
+}
+
 /// The other solid's section on this face's carrier, in the face's own
 /// parameter space, as zero or more closed regions.
 fn section_on_face(
@@ -222,6 +261,14 @@ fn section_on_face(
     if pieces.is_empty() {
         return Ok(Vec::new());
     }
+    // Where the other solid touches this carrier tangentially, two of its
+    // faces answer with the same curve: the band that grazes the plane gives
+    // the generator they share, and the flank springing from that same
+    // tangency gives its own edge, which is the very same line. The outline
+    // runs along it once, so the second copy is dropped rather than left to
+    // make the chain ambiguous — a vertex with four ends where a loop needs
+    // two.
+    let pieces = without_repeated_pieces(pieces, precision);
     let loops = match face.surface {
         Surface::Cylinder(cylinder) => {
             close_periodic_sections(pieces, own_region, &cylinder, other, precision)?
