@@ -918,11 +918,15 @@ fn finished_four_by_two_xy_rectangle_extrudes_transactionally_to_exact_native_so
             .query_by_label("Body 1 · native sketch extrusion")
             .is_some()
     );
-    assert!(
-        harness
-            .get_by_role_and_label(Role::Button, "Extrude")
-            .accesskit_node()
-            .is_disabled(),
+    // Extrude stays live because there is now a body whose face it could push
+    // or pull — a tool is not disabled for want of an operand (ADR 0041).
+    // What must not happen is the applied sketch being extruded a second time,
+    // so that is what this checks rather than the button being dead.
+    let bodies_before = harness.state().body_count();
+    click_button(&mut harness, "Extrude");
+    assert_eq!(
+        harness.state().body_count(),
+        bodies_before,
         "the applied sketch revision cannot be extruded twice"
     );
 

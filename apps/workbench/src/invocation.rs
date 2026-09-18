@@ -771,6 +771,26 @@ pub const BODY_BOOLEAN: ToolInvocationSpec = ToolInvocationSpec {
     }],
 };
 
+pub const PUSH_PULL_FACE: &str = "face";
+
+/// Pushing or pulling a face: one planar cap to move.
+///
+/// Extrude serves two operations, and this is the one that acts on a body. Its
+/// face is an operand the user picks, so pressing Extrude in the model
+/// workspace with nothing picked asks for it rather than greying out — which is
+/// the same thing the *sketch* half of Extrude has always done for a profile.
+pub const FACE_PUSH_PULL: ToolInvocationSpec = ToolInvocationSpec {
+    alternatives: &[OperandSchema {
+        roles: &[OperandRoleSpec {
+            id: PUSH_PULL_FACE,
+            prompt: "Pick the face to push or pull",
+            cardinality: Cardinality::Exactly(1),
+            source: OperandSourcePolicy::Symmetric,
+            accepts: accepts_planar_face,
+        }],
+    }],
+};
+
 pub const PROFILE_REGION: &str = "profile";
 
 /// Extruding a sketch: the closed region to raise or cut with.

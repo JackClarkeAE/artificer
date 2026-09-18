@@ -9390,6 +9390,9 @@ impl KernelLabApp {
             return false;
         }
         let Some(support) = self.selected_face_push_pull_support() else {
+            // No usable face is picked, so the tool asks for one rather than
+            // doing nothing. Pressing it is entering it (ADR 0041).
+            self.invoke_tool("Extrude", &invocation::FACE_PUSH_PULL);
             return false;
         };
         let Some(support_body) = self.active_body_id() else {
@@ -29119,6 +29122,39 @@ mod extrusion_workbench_tests {
                 armed.prompt()
             );
         }
+    }
+
+    /// Extrude in the model workspace asks for its face rather than needing one
+    /// picked first. It was the last command still gated on a selection, and it
+    /// lives in its own availability function rather than the preset one, which
+    /// is why it was missed when the presets converted (ADR 0041).
+    #[test]
+    fn extrude_asks_for_a_face_rather_than_needing_one_picked() {
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+
+        assert!(
+            app.command_availability(crate::commands::ModelCommand::Extrude)
+                .is_enabled(),
+            "Extrude must stay available with no face picked"
+        );
+
+        assert!(
+            !app.stage_face_push_pull(),
+            "with no face picked there is nothing to stage yet"
+        );
+        let armed = app.armed_tool.as_ref().unwrap_or_else(|| {
+            panic!(
+                "Extrude should arm and ask for a face, status: {:?}",
+                app.document_status
+            )
+        });
+        assert_eq!(armed.tool, "Extrude");
+        assert!(
+            armed.prompt().contains("Pick the face to push or pull"),
+            "it should say what it wants: {}",
+            armed.prompt()
+        );
     }
 
     /// The singular selection is a view, so it cannot disagree with the

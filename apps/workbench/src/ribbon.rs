@@ -1023,13 +1023,18 @@ impl KernelLabApp {
             .and_then(|index| self.sketches.get(index))
             .is_none_or(|sketch| sketch.consumed);
         let push_pull_support = self.selected_face_push_pull_support();
+        // A face is an operand, and an operand that has not been picked is not
+        // a reason to disable a tool (ADR 0041). Pressing Extrude in the model
+        // workspace with nothing picked asks for the face, exactly as the
+        // sketch half of Extrude has always asked for a profile, so
+        // availability asks only whether there is a body to push a face on.
         let push_pull_enabled = self.pending_operation.is_none()
             && self.history_is_at_end()
             && self.workbench_mode == WorkbenchMode::Model
             && distance_valid
             && active_sketch_consumed
             && !linked_active_body
-            && push_pull_support.is_some();
+            && (push_pull_support.is_some() || self.active_body_id().is_some());
         if sketch_enabled || push_pull_enabled {
             return CommandAvailability::Enabled;
         }
