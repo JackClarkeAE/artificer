@@ -647,11 +647,13 @@ fn a_slot_plate_keeps_its_slot_while_its_box_edges_round() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_corner_left_half_selected_never_enters_the_exact_rung() {
+fn a_corner_left_half_selected_meets_along_its_seam() {
     // Two adjacent edges of the top face: the corner they share has two of
-    // its three edges chosen, and a band that fades out along the third has
-    // no closed form in this vocabulary. The rung refuses it rather than
-    // approximating under its own name; the faceted tier answers and says so.
+    // its three edges chosen. This used to leave the rung nothing to draw and
+    // the faceted tier answered with a caveat. ADR 0043 derived what the two
+    // bands actually do — they stop against each other along one seam, and the
+    // edge left sharp starts a blend's width further along — so the exact rung
+    // owns it and publishes no approximation.
     let size = [40.0, 40.0, 30.0];
     let top = |start: Point3, end: Point3| {
         (start.z - size[2]).abs() < 1.0e-9 && (end.z - size[2]).abs() < 1.0e-9
@@ -666,19 +668,20 @@ fn a_corner_left_half_selected_never_enters_the_exact_rung() {
 
     let outcome =
         finish(&box_body, selection, EdgeFinishKind::Fillet, 4.0).expect("the ladder answers");
-    assert_ne!(
+    assert_eq!(
         outcome.report.rung.as_deref(),
         Some("edge-finish/vertex-blend"),
-        "the exact rung does not own a corner it cannot close"
+        "a mitred corner is the exact rung's to close"
     );
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "EDGE_FINISH_FACETED_APPROXIMATION"),
-        "whatever answers instead says it approximates: {:?}",
+        outcome.report.warnings.is_empty(),
+        "an exact seam carries no caveat: {:?}",
         outcome.report.warnings
+    );
+    close(
+        outcome.snapshot.measures().volume,
+        size[0] * size[1] * size[2] - two_edge_fillet_removed([size[0], size[1]], 4.0),
+        "both bands and the corner they share, removed once",
     );
 }
 
@@ -748,8 +751,6 @@ fn two_edge_fillet_removed(lengths: [f64; 2], radius: f64) -> f64 {
 /// `(0, 0, d)`, the new end of the edge left sharp. No patch closes anything —
 /// the bands simply stop against each other.
 #[test]
-#[ignore = "ADR 0043: the seam is derived and this volume is settled; the third \
-            ending in EndKind is not built yet"]
 fn two_edges_of_a_corner_chamfer_to_their_shared_seam() {
     let size = [40.0, 40.0, 40.0];
     let distance = 4.0;
@@ -767,8 +768,6 @@ fn two_edges_of_a_corner_chamfer_to_their_shared_seam() {
 
 /// And round, meeting along the ellipse two equal crossing cylinders share.
 #[test]
-#[ignore = "ADR 0043: the seam is derived and this volume is settled; the third \
-            ending in EndKind is not built yet"]
 fn two_edges_of_a_corner_fillet_to_their_shared_seam() {
     let size = [40.0, 40.0, 40.0];
     let radius = 4.0;
@@ -781,46 +780,6 @@ fn two_edges_of_a_corner_fillet_to_their_shared_seam() {
         rounded.measures().volume,
         size[0] * size[1] * size[2] - two_edge_fillet_removed([size[0], size[1]], radius),
         "a two-edge fillet removes both bands and the corner they share once",
-    );
-}
-
-/// Until it is built, the refusal must name what is missing rather than claim
-/// the vocabulary cannot draw it — it can, and ADR 0043 derives the curve.
-///
-/// A six-faced body never reaches this: the ladder hands a plain box's faceted
-/// result straight back without validating it, so two edges of a box corner
-/// already finish, approximately and without saying so in the panel. Anything
-/// with a hole in it does reach it, which is why a plate refuses where a block
-/// does not — and why the exact ending is the fix rather than leaning harder
-/// on the tier below.
-#[test]
-fn two_edges_of_a_corner_are_refused_without_blaming_the_vocabulary() {
-    let size = [40.0, 40.0, 40.0];
-    let plate = extruded(
-        PlanarProfile2 {
-            regions: vec![PlanarRegion2 {
-                outer: rectangle(size[0], size[1]),
-                holes: vec![circle((20.0, 20.0), 5.0)],
-            }],
-        },
-        size[2],
-    );
-    assert!(
-        plate.counts().faces > 6,
-        "a holed plate is past the six-face shortcut"
-    );
-    let selection = two_edges_of_the_origin_corner(&plate);
-    assert_eq!(selection.len(), 2, "two edges of the corner, not three");
-
-    let (code, message) = refusal(&plate, selection, EdgeFinishKind::Chamfer, 4.0);
-    assert_eq!(code, "VERTEX_BLEND_CORNER_INCOMPLETE");
-    assert!(
-        message.contains("Select the other edge"),
-        "the refusal names the remedy: {message}"
-    );
-    assert!(
-        !message.contains("no exact patch"),
-        "a corner of two needs no patch at all, only the seam ADR 0043 derives: {message}"
     );
 }
 
@@ -935,19 +894,18 @@ fn a_refusal_on_a_blended_body_comes_back_before_the_user_notices() {
         "six planes, three bands, one octant"
     );
 
-    // The two far top edges, well clear of the blend. They meet at a corner
-    // whose third edge is left out, so no rung can answer and the ladder
-    // runs all the way to the faceted tier.
+    // The horizontal runs beside the blend. Their corners carry it, and a
+    // corner that already carries a blend is still beyond this rung, so no
+    // rung can answer and the ladder runs all the way to the faceted tier.
+    //
+    // A half-chosen corner used to be the unanswerable selection here. It is
+    // answerable now (ADR 0043), so the guard needs one that is not.
     let chain = edges_where(&blended, |start, end| {
-        (start.z - size[2]).abs() < 1.0e-9
-            && (end.z - size[2]).abs() < 1.0e-9
-            && (((start.y - size[1]).abs() < 1.0e-9 && (end.y - size[1]).abs() < 1.0e-9)
-                || ((start.x - size[0]).abs() < 1.0e-9 && (end.x - size[0]).abs() < 1.0e-9))
+        (start.z - end.z).abs() < 1.0e-9 && (start.x - end.x).abs() > 0.5
     });
-    assert_eq!(
-        chain.len(),
-        2,
-        "the two far top edges, meeting at one corner"
+    assert!(
+        chain.len() >= 2,
+        "the straight runs along x, above and below the blend"
     );
 
     let started = Instant::now();

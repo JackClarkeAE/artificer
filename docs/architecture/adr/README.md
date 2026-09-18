@@ -53,7 +53,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0040](0040-a-part-has-a-colour.md) | A part has a colour, and the colour travels | Implemented | — |
 | [0041](0041-tools-and-selections-meet-in-either-order.md) | Tools and selections meet in either order | Implemented | — |
 | [0042](0042-a-sketch-can-measure-against-the-body-it-sits-on.md) | A sketch can measure against the body it sits on | Implemented | 0038, 0041 |
-| [0043](0043-two-edges-of-a-corner-meet-in-a-seam.md) | Two edges of a corner meet in a seam | Accepted, not yet built | 0034 |
+| [0043](0043-two-edges-of-a-corner-meet-in-a-seam.md) | Two edges of a corner meet in a seam | Implemented | 0034 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

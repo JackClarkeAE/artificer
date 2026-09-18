@@ -1,7 +1,6 @@
 # ADR 0043: Two edges of a corner meet in a seam
 
-Status: accepted, not yet built — the geometry below is derived and pinned by
-an oracle test; the plumbing through `vertex_blend` remains.
+Status: implemented
 
 - Date: 2026-09-18
 - Decision owners: Artificer project
@@ -92,9 +91,10 @@ integration to ten digits:
 - a chamfer removes `½d²(Lᴀ + Lʙ) − d³/3`;
 - a fillet removes `r²(1 − π/4)(Lᴀ + Lʙ) − r³(5/3 − π/2)`.
 
-The subtracted term is the corner both bands would otherwise claim twice. The
-tests are ignored until the ending exists, so the number is settled before the
-construction that has to hit it.
+The subtracted term is the corner both bands would otherwise claim twice. Those
+two numbers were written down, and checked against the integrals they came from,
+before the construction that has to hit them existed — so the construction was
+measured against arithmetic rather than against whatever it happened to produce.
 
 ## Consequences
 

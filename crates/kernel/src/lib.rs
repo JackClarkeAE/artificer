@@ -7949,17 +7949,26 @@ mod tests {
                 "regularized finish must retain consolidated B-rep faces"
             );
             let presentation = NativeKernel::debug_scene(&finished.snapshot);
+            // Two perpendicular edges sharing a corner are a mitre now, and the
+            // exact rung owns them (ADR 0043). A subdivided surface is what the
+            // regularized tier leaves behind, so the smooth-seam count is only
+            // a claim about that tier: an exact body's rails are tangent, not
+            // smooth, and there is nothing subdivided for a seam to run
+            // through. Everything below this still holds of both.
+            let regularized = finished.report.rung.as_deref() != Some("edge-finish/vertex-blend");
             if kind == artificer_protocol::EdgeFinishKind::Fillet {
                 let smooth = presentation
                     .edges
                     .iter()
                     .filter(|edge| edge.is_smooth)
                     .count();
-                assert!(smooth > 0, "fillet subdivision edges must be marked smooth");
-                assert!(
-                    smooth < presentation.edges.len(),
-                    "mechanical crease edges must remain selectable"
-                );
+                if regularized {
+                    assert!(smooth > 0, "fillet subdivision edges must be marked smooth");
+                    assert!(
+                        smooth < presentation.edges.len(),
+                        "mechanical crease edges must remain selectable"
+                    );
+                }
                 let transition_rails = finished
                     .snapshot
                     .topology
