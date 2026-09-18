@@ -903,25 +903,25 @@ fn carrier_crossings(
             let across = offset.x.mul_add(unit.y, -(offset.y * unit.x));
             let square = radius.mul_add(radius, -(across * across));
             if square.abs() <= 2.0 * tolerances.agreement * radius {
-                // Tangential contact: refuse only if the touch is within both
-                // spans; a distant graze is no crossing at all.
+                // A line touching the circle at one point. The boundaries do
+                // not cross there, but the touch is still where one operand's
+                // boundary stops being inside the other and starts being
+                // outside — the shadow of a fillet band's tangency with the
+                // wall it rolls against — so it is imprinted like any other
+                // crossing. What each side of it is remains a question for the
+                // interior sample, which is exactly what the classifier asks.
                 let touch = Point2::new(
                     unit.x.mul_add(along, start.x),
                     unit.y.mul_add(along, start.y),
                 );
-                let line = Segment::Line { start, end };
-                let on_line = matches!(
-                    place(parameter_of(line, touch), length, tolerances),
-                    Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
+                // On the circle to the bit, so the arc's own radius checks
+                // downstream see a true carrier point.
+                let angle = (touch.y - center.y).atan2(touch.x - center.x);
+                let touch = Point2::new(
+                    radius.mul_add(angle.cos(), center.x),
+                    radius.mul_add(angle.sin(), center.y),
                 );
-                let on_arc = matches!(
-                    place(parameter_of(arc, touch), segment_length(arc), tolerances),
-                    Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
-                );
-                if on_line && on_arc {
-                    return Err(ProfileBooleanError::Unsupported);
-                }
-                return Ok(Vec::new());
+                return Ok(vec![touch]);
             }
             if square < 0.0 {
                 return Ok(Vec::new());
@@ -976,23 +976,14 @@ fn carrier_crossings(
             if (separation - far).abs() <= tolerances.agreement
                 || (separation - near).abs() <= tolerances.agreement
             {
-                // Tangent circles: refuse if the touch lies within both spans.
+                // Circles touching at one point, inside or outside each
+                // other. As with a line and a circle, the touch is imprinted
+                // and the interior samples either side decide what it means.
+                // The point is on both carriers by construction: the centres
+                // and the touch are collinear.
                 let toward = Point2::new(offset.x / separation, offset.y / separation);
                 let touch = Point2::new(r1.mul_add(toward.x, c1.x), r1.mul_add(toward.y, c1.y));
-                let within = |segment: Segment| {
-                    matches!(
-                        place(
-                            parameter_of(segment, touch),
-                            segment_length(segment),
-                            tolerances
-                        ),
-                        Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
-                    )
-                };
-                if within(first) && within(second) {
-                    return Err(ProfileBooleanError::Unsupported);
-                }
-                return Ok(Vec::new());
+                return Ok(vec![touch]);
             }
             let reach_along = r1
                 .mul_add(r1, -(r2 * r2))

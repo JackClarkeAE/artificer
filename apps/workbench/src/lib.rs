@@ -17215,7 +17215,11 @@ impl KernelLabApp {
             .color(theme::muted()),
         );
         ui.add_space(4.0);
-        let buildable = preset == SolidFeaturePreset::Chamfer;
+        // Both kinds are cut now. Which shapes the kernel can still not reach
+        // — a finish standing apart from a band an earlier feature left — is
+        // not something the panel can tell from the selection, so the refusal
+        // names it rather than the option pretending to know in advance.
+        let buildable = true;
         let apart = ui
             .add_enabled_ui(buildable, |ui| {
                 ui.selectable_label(
@@ -17228,11 +17232,9 @@ impl KernelLabApp {
             self.edge_finish_corner_choice = CornerFinishChoice::Independent;
         }
         ui.label(
-            RichText::new(if buildable {
-                "The bevels meet along a seam and the corner keeps its own point, as though each edge had been bevelled on its own body. The size below is this one's."
-            } else {
-                "Not built for a fillet yet: its band is tangent to the two walls it rolls between, and the Boolean fails closed where two solids touch along a line rather than crossing."
-            })
+            RichText::new(
+                "The two finishes meet along a seam and the corner keeps its own point, as though each edge had been finished on its own body. The size below is this one's.",
+            )
             .small()
             .color(theme::muted()),
         );

@@ -1,8 +1,8 @@
 # ADR 0044: A corner already finished asks before it answers
 
 Status: accepted; joining is implemented, and standing apart is implemented
-for a chamfer. A fillet standing apart is refused by name, for the reason
-recorded below.
+for both kinds where one axis reduces the cut to a prism against a prism.
+Standing apart from a band an earlier feature left is refused by name.
 
 - Date: 2026-09-18
 - Decision owners: Artificer project
@@ -83,37 +83,46 @@ less that band's own removal. So it is built as a Boolean, not as topology
 surgery on faces a previous feature owns — which is what makes it a bounded
 change rather than a second blend engine.
 
-#### What that costs, and what it rules out
+#### How it is cut, and what it still cannot reach
 
-A bevel's removal is a half-space. It crosses every face it meets, the
-analytic Boolean takes it, and the result is right to within a part in a
-thousand million of the body. That is looser than the analytic band's own
-closed form, and the tests say so rather than hiding it: this is a regularized
-Boolean and does not pretend to be an exact patch.
+A bevel's removal is a half-space. A fillet's is the curvilinear triangle
+between the two walls and the band — the corner a rolling ball cannot reach.
+Both are prisms swept along the edge, so a finish standing apart is a prism
+against a prism: ADR 0025's first reduction, and the one that now carries a
+tangential contact.
 
-A fillet's removal is not a half-space, and the obstacle is not the one first
-expected. The seam is fine — a bevel plane meets a cylinder in an ellipse, and
-two crossing equal cylinders meet in a planar ellipse, both of which the curve
-vocabulary already carries. What stops it is **tangency**. A fillet band is
-tangent to the two walls it rolls between; that is what makes it a fillet. Its
-removal solid therefore touches the body along a line rather than crossing it,
-and ADR 0025's Boolean fails closed on tangential contact between operands.
-Every fillet standing apart hits this, whatever is already at the corner, so
-the refusal is not about sizes agreeing.
+That last part is new, and it is the substance of this half. A fillet's band
+*touches* each wall rather than crossing it — that is what makes it a fillet —
+and the regularized 2D Boolean underneath the prism reduction used to refuse
+any tangency, on the grounds that its pipeline classifies pieces by an interior
+sample and a tangency is not a transverse crossing. But the invariant that
+pipeline actually needs is only that no piece crosses the other operand's
+boundary, and at a tangency none does: the boundaries touch and part again. So
+a tangency is now *imprinted* like any other crossing, and which side each
+piece is on stays a question for the sample, which is exactly what the
+classifier is for. Coincident carriers — boundaries that share a stretch rather
+than a point — are a different question and still fail closed.
 
-A bevel standing apart from a corner that was *rounded* fails too, later and
-differently: the cut is made and does not certify. It is refused by name at
-that point rather than published, because a route that cannot prove its own
-answer publishes nothing (ADR 0002).
+The result is exact, not merely close. A cube of side `L` with one edge rounded
+by `r` measures `L³ − r²(1 − π/4)L` to the last bit the closed form carries.
 
-So what ships is: a chamfer standing apart, anywhere its cut plane meets only
-flat faces. Everything else says which of these it ran into and what to do
-instead, which is to join.
+The tangency has to be *exact* to be a tangency at all, which turns out to be
+the delicate part of building the tool. Taking the band's contact with each
+wall as `r/tan(θ/2)` along the face puts it a bit or two off the true foot, and
+a flank plane 4e-16 outside the band does not graze it — it misses, and every
+stage after that is entitled to believe the miss. The contacts are therefore
+taken as the feet of the perpendiculars from the band's own axis, where they
+are exact by construction.
 
-Building the rest needs one of two things, and they are different pieces of
-work: a Boolean that will accept an operand touching the target along a line,
-or a direct construction in `vertex_blend` that re-trims the bands a previous
-feature committed. The first would unlock every remaining case at once.
+What is still not cut is a finish standing apart from a *band*: a corner an
+earlier feature rounded, or a second edge running across the first. There no
+single axis reduces the pair to prisms, so the general analytic engine has to
+answer, and it carries no tangency of its own. Those are refused by name, and
+what they need is the same reasoning carried from the 2D pipeline into the 3D
+one — a larger piece of work, because the section assembly meets its own
+degeneracies there: a chord lying along a face's boundary, one curve arriving
+twice from two faces that share a tangency, and faces that abut rather than
+cross.
 
 ### How a finished corner is recognised
 
@@ -160,9 +169,9 @@ Joining edits a committed feature, so everything after it replays. That is
 already how a sketch or an extrusion is edited, and the history reads better
 for it: one corner, one feature.
 
-The second answer ships for a chamfer and is visible, closed, with its reason
-for a fillet — so the panel never has to pretend the first is the only thing
-anyone could have meant.
+The second answer ships for both kinds on the shapes one axis reduces, and is
+refused by name on the rest — so the panel never has to pretend the first is
+the only thing anyone could have meant.
 
 Nothing here changes what the kernel refuses. The vocabulary is untouched; the
 workbench stopped treating a refusal as the end of the conversation.

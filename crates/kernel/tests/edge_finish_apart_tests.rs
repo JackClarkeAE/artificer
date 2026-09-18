@@ -207,30 +207,6 @@ fn the_third_edge_of_a_finished_corner_stands_apart_from_it() {
     );
 }
 
-#[test]
-fn a_fillet_standing_apart_is_refused_by_name_rather_than_approximated() {
-    let cube = cube();
-    let error = run(
-        &cube,
-        KernelCommand::FinishEdges {
-            target_edges: vec![origin_edge(&cube, 2)],
-            kind: EdgeFinishKind::Fillet,
-            distance: 2.0,
-            standing_apart: true,
-        },
-        "fillet standing apart",
-    )
-    .expect_err("a fillet standing apart is not built yet");
-    assert!(
-        error.contains("EDGE_FINISH_APART_FILLET_UNSUPPORTED"),
-        "the refusal should name itself, and said {error}"
-    );
-    assert!(
-        error.contains("tangent"),
-        "and say what actually stops it, not merely that something does: {error}"
-    );
-}
-
 /// A bevel standing apart still has to be a bevel of something.
 #[test]
 fn standing_apart_refuses_an_edge_that_is_not_between_two_flat_faces() {
@@ -327,6 +303,82 @@ fn a_bevel_standing_apart_from_a_rounded_corner_is_refused_by_name() {
     .expect("two edges of a corner round together");
     let error = bevel_apart(&rounded, origin_edge(&rounded, 2), distance)
         .expect_err("a bevel standing apart from two fillets is not built yet");
+    assert!(
+        error.contains("EDGE_FINISH_APART"),
+        "the refusal should name the route that gave it: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fillets standing apart
+// ---------------------------------------------------------------------------
+
+fn round_apart(body: &Snapshot, edge: EntityRef, radius: f64) -> Result<Snapshot, String> {
+    run(
+        body,
+        KernelCommand::FinishEdges {
+            target_edges: vec![edge],
+            kind: EdgeFinishKind::Fillet,
+            distance: radius,
+            standing_apart: true,
+        },
+        "fillet standing apart",
+    )
+}
+
+/// One edge rounded on its own. The section loses the corner the quarter-disc
+/// cannot reach: `r²(1 − π/4)` of it, swept the length.
+#[test]
+fn one_fillet_standing_apart_is_the_fillet_it_would_have_been_anyway() {
+    let radius = 2.0;
+    let cube = cube();
+    let apart = round_apart(&cube, origin_edge(&cube, 2), radius).expect("one fillet");
+    close(
+        apart.measures().volume,
+        SIDE.powi(3) - radius * radius * (1.0 - std::f64::consts::PI / 4.0) * SIDE,
+        "one fillet standing apart",
+    );
+}
+
+/// Two edges of one corner, rounded one at a time, is not yet cut.
+///
+/// The first band leaves the body a prism about the edge it rounded. The
+/// second edge runs along a different axis, so no single axis reduces the
+/// pair, and the general engine — which has no tangency support of its own —
+/// is what has to answer. It refuses, by name.
+#[test]
+fn a_second_fillet_across_the_first_is_refused_by_name() {
+    let radius = 2.0;
+    let cube = cube();
+    let once = round_apart(&cube, origin_edge(&cube, 0), radius).expect("the first edge rounds");
+    let error = round_apart(&once, origin_edge(&once, 1), radius)
+        .expect_err("a band across the first is not cut yet");
+    assert!(
+        error.contains("EDGE_FINISH_APART"),
+        "the refusal should name the route that gave it: {error}"
+    );
+}
+
+/// A corner that was rounded, taking the third edge beside it, is not yet cut
+/// either — and for the same reason: what the cut has to meet is a band, and
+/// the engine that handles operands this general does not carry tangency.
+#[test]
+fn the_third_edge_of_a_rounded_corner_is_refused_by_name() {
+    let radius = 2.0;
+    let cube = cube();
+    let rounded = run(
+        &cube,
+        KernelCommand::FinishEdges {
+            target_edges: vec![origin_edge(&cube, 0), origin_edge(&cube, 1)],
+            kind: EdgeFinishKind::Fillet,
+            distance: radius,
+            standing_apart: false,
+        },
+        "two edges rounded together",
+    )
+    .expect("two edges of a corner round together");
+    let error = round_apart(&rounded, origin_edge(&rounded, 2), radius)
+        .expect_err("a band beside a seam is not cut yet");
     assert!(
         error.contains("EDGE_FINISH_APART"),
         "the refusal should name the route that gave it: {error}"
