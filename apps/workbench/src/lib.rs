@@ -794,6 +794,7 @@ enum EdgeFinishSelectionSupport {
     MixedBodies,
     CurvedOrPartialEdge,
     MixedRimAndStraight,
+    SeveralRims,
 }
 
 impl EdgeFinishSelectionSupport {
@@ -813,6 +814,7 @@ impl EdgeFinishSelectionSupport {
             Self::MixedBodies => "ONE BODY REQUIRED",
             Self::CurvedOrPartialEdge => "EDGE SET UNSUPPORTED",
             Self::MixedRimAndStraight => "TWO FEATURES, NOT ONE",
+            Self::SeveralRims => "ONE RIM AT A TIME",
         }
     }
 
@@ -834,6 +836,9 @@ impl EdgeFinishSelectionSupport {
             }
             Self::MixedRimAndStraight => {
                 "A round rim and a straight edge finish by different exact routes and cannot share one feature. Finish the rim, then the straight edges, or the other way about."
+            }
+            Self::SeveralRims => {
+                "The exact rim blend finishes one cap rim at a time. Finish this rim, then the next; each becomes its own feature and both can be edited afterwards."
             }
         }
     }
@@ -9932,7 +9937,24 @@ impl KernelLabApp {
                 .iter()
                 .all(|selection| rim_members.contains(&selection.edge.entity.0));
             if carriers_complete && only_rims {
-                return EdgeFinishSelectionSupport::ExactRimBlend;
+                // One rim is an exact rim blend; several are several features.
+                // The exact path takes one cap loop, so promising it for two
+                // bores staged a preview and then handed the user the
+                // regularized path's refusal, which names neither the cause
+                // nor the remedy.
+                let mut rims = BTreeSet::new();
+                for selection in &self.selected_edges {
+                    let key = NativeKernel::rim_loop_group(&body.body.snapshot, selection.edge)
+                        .ok()
+                        .and_then(|group| group.iter().map(|member| member.entity.0).min())
+                        .unwrap_or(selection.edge.entity.0);
+                    rims.insert(key);
+                }
+                return if rims.len() > 1 {
+                    EdgeFinishSelectionSupport::SeveralRims
+                } else {
+                    EdgeFinishSelectionSupport::ExactRimBlend
+                };
             }
             // A round rim and a straight edge in one pick is not a partial
             // arc, and saying so as though it were sends the user hunting for
@@ -30553,6 +30575,149 @@ mod extrusion_workbench_tests {
             EdgeFinishSelectionSupport::ExactRimBlend
         );
         assert!(finish(&mut app, SolidFeaturePreset::Chamfer, 0.3));
+    }
+
+    /// A plate with two circular bores, which is what a sketch of a rectangle
+    /// and two circles extrudes to.
+    fn bored_plate() -> (KernelLabApp, viewport::BodyInstanceKey) {
+        let mut app = KernelLabApp::default();
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.sketch = SketchCanvasState::new(app.selected_origin_plane);
+        for geometry in [
+            SketchGeometry::rectangle(SketchPoint::new(-10.0, -6.0), SketchPoint::new(10.0, 6.0)),
+            SketchGeometry::circle(SketchPoint::new(-5.0, 0.0), SketchPoint::new(-1.0, 0.0)),
+            SketchGeometry::circle(SketchPoint::new(5.0, 0.0), SketchPoint::new(9.0, 0.0)),
+        ] {
+            let entity = app.sketch.stage_geometry(geometry).expect("stages");
+            app.commit_sketch_stroke(entity);
+        }
+        app.sketch.clear_region_selection();
+        assert!(
+            app.sketch
+                .select_region_at_point(SketchPoint::new(0.0, 5.0), false),
+            "the plate is inside the rectangle and outside both bores"
+        );
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let index = app.active_sketch_index.expect("a committed sketch");
+        assert!(app.activate_committed_sketch(index));
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let id = app.active_body_id().expect("the extruded plate");
+        let key = viewport::BodyInstanceKey::new(id.get());
+        (app, key)
+    }
+
+    /// One seed edge on each bore rim at the given height.
+    fn bore_rim_seeds(app: &KernelLabApp, at_top: bool) -> Vec<EntityRef> {
+        let scene = &app.displayed.as_ref().expect("a body").scene;
+        let snapshot = &app.displayed.as_ref().expect("a body").snapshot;
+        let hard = scene.edges.iter().filter(|edge| !edge.is_smooth);
+        let level = scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .flat_map(|edge| edge.endpoints)
+            .fold(if at_top { f64::MIN } else { f64::MAX }, |best, point| {
+                if at_top {
+                    best.max(point.z)
+                } else {
+                    best.min(point.z)
+                }
+            });
+        let mut seeds = Vec::new();
+        let mut seen = BTreeSet::new();
+        for edge in hard {
+            if !edge
+                .endpoints
+                .iter()
+                .all(|point| (point.z - level).abs() < 1.0e-9)
+            {
+                continue;
+            }
+            let group =
+                NativeKernel::carrier_edge_group(snapshot, edge.source_edge).unwrap_or_default();
+            if group.len() <= 1 {
+                continue;
+            }
+            let key = group
+                .iter()
+                .map(|member| member.entity.0)
+                .min()
+                .unwrap_or_default();
+            if seen.insert(key) {
+                seeds.push(edge.source_edge);
+            }
+        }
+        seeds
+    }
+
+    /// A bore's rim rounds the same at the bottom of the plate as at the top.
+    ///
+    /// It did not. The bottom rim is built by mirroring the profile, and the
+    /// mirror named a closed arc's start a full revolution away, so the cap
+    /// p-curve ran that extra turn and the body failed its own orientation
+    /// check. The chamfer's cone survived it; the fillet's torus did not.
+    #[test]
+    fn a_bore_rim_fillets_the_same_at_both_ends_of_the_plate() {
+        let mut removed = Vec::new();
+        for at_top in [true, false] {
+            let (mut app, body) = bored_plate();
+            let before = app.displayed.as_ref().unwrap().snapshot.measures().volume;
+            let seed = bore_rim_seeds(&app, at_top)
+                .first()
+                .copied()
+                .expect("each end of the plate carries two bore rims");
+            app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: seed }, false);
+            assert_eq!(
+                app.edge_finish_selection_support(),
+                EdgeFinishSelectionSupport::ExactRimBlend
+            );
+            app.edge_finish_distance = 0.4;
+            app.stage_preset_feature(SolidFeaturePreset::Fillet);
+            app.confirm_pending_operation();
+            assert_eq!(
+                app.last_error_code(),
+                None,
+                "a bore rim fillets at the {} of the plate: {:?}",
+                if at_top { "top" } else { "bottom" },
+                app.last_error_detail()
+            );
+            let after = app.displayed.as_ref().unwrap().snapshot.measures().volume;
+            removed.push(before - after);
+        }
+        assert!(
+            (removed[0] - removed[1]).abs() <= 1.0e-9,
+            "both ends remove the same material, and removed {removed:?}"
+        );
+        assert!(
+            removed[0] > 0.0,
+            "a fillet removes material from a bore lip"
+        );
+    }
+
+    /// Two bores in one feature is two features. The exact rim blend takes one
+    /// cap loop, and the panel used to promise it for both and then hand back
+    /// the regularized path's refusal, which named neither cause nor remedy.
+    #[test]
+    fn two_bore_rims_in_one_feature_ask_to_be_taken_one_at_a_time() {
+        let (mut app, body) = bored_plate();
+        let seeds = bore_rim_seeds(&app, true);
+        assert_eq!(seeds.len(), 2, "the plate has two bores");
+        for (index, edge) in seeds.iter().enumerate() {
+            app.select_model_edge(
+                viewport::DocumentEdgeSelection { body, edge: *edge },
+                index > 0,
+            );
+        }
+        let support = app.edge_finish_selection_support();
+        assert_eq!(support, EdgeFinishSelectionSupport::SeveralRims);
+        assert!(!support.can_commit());
+        assert!(
+            support.detail().contains("one cap rim at a time"),
+            "the refusal names the remedy, and says {:?}",
+            support.detail()
+        );
     }
 
     #[test]
