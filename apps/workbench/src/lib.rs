@@ -795,13 +795,19 @@ enum EdgeFinishSelectionSupport {
     CurvedOrPartialEdge,
     MixedRimAndStraight,
     SeveralRims,
+    /// The selection reaches a corner an earlier feature already finished.
+    /// Not a refusal: a question with two answers, which the panel asks.
+    CornerAlreadyFinished,
 }
 
 impl EdgeFinishSelectionSupport {
     const fn can_commit(self) -> bool {
         matches!(
             self,
-            Self::ExactParallelSet | Self::ExactRimBlend | Self::RegularizedBlendSet
+            Self::ExactParallelSet
+                | Self::ExactRimBlend
+                | Self::RegularizedBlendSet
+                | Self::CornerAlreadyFinished
         )
     }
 
@@ -815,6 +821,7 @@ impl EdgeFinishSelectionSupport {
             Self::CurvedOrPartialEdge => "EDGE SET UNSUPPORTED",
             Self::MixedRimAndStraight => "TWO FEATURES, NOT ONE",
             Self::SeveralRims => "ONE RIM AT A TIME",
+            Self::CornerAlreadyFinished => "CORNER ALREADY FINISHED",
         }
     }
 
@@ -840,8 +847,41 @@ impl EdgeFinishSelectionSupport {
             Self::SeveralRims => {
                 "The exact rim blend finishes one cap rim at a time. Finish this rim, then the next; each becomes its own feature and both can be edited afterwards."
             }
+            Self::CornerAlreadyFinished => {
+                "This edge runs into a corner an earlier feature already finished. Say whether it joins that finish or stands beside it."
+            }
         }
     }
+}
+
+/// Whether ADR 0044's second answer can be built yet.
+///
+/// Standing a new band beside the ones already at a corner needs the kernel to
+/// trim band against band. The seam is a line wherever a bevel plane is
+/// involved and an ellipse where a cylinder meets a plane; only cylinder
+/// against cylinder needs the two sizes to agree, a different size there being
+/// a quartic this vocabulary does not carry. None of it is cut yet, so the
+/// panel shows the option closed, with the reason, rather than not at all.
+/// Flipping this is what turns it on.
+const INDEPENDENT_CORNER_FINISH_IS_BUILT: bool = false;
+
+/// What to do when a new edge reaches a corner an earlier feature finished.
+///
+/// A corner takes one patch, so a third edge arriving at a corner two others
+/// already rounded is a question, not a fault: the user either meant one
+/// rounded corner or three bands that merely meet there. ADR 0044 says what
+/// each answer builds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CornerFinishChoice {
+    /// Add this edge to the feature that already finished the corner and
+    /// replay it, so one patch closes all three. The corner keeps that
+    /// feature's size, because a rolling-ball patch is a single sphere.
+    #[default]
+    Join,
+    /// Leave the earlier feature as it stands and build this band beside it,
+    /// the two meeting along a seam with the corner's own point surviving —
+    /// what the edges would look like finished on separate bodies.
+    Independent,
 }
 
 /// A plane sketch deferred until its camera flight lands.
@@ -2665,6 +2705,10 @@ pub struct KernelLabApp {
     edge_finish_distance: f64,
     edge_finish_distance_text: String,
     edge_finish_tangent_chain: bool,
+    /// The answer to the question a corner an earlier feature already
+    /// finished asks. It survives one finish so the next takes the same
+    /// answer without being asked again.
+    edge_finish_corner_choice: CornerFinishChoice,
     /// Whether the floating context inspector is showing. It carries the
     /// active tool's options, so it opens with a command and stays until the
     /// user dismisses it.
@@ -2879,6 +2923,7 @@ impl Default for KernelLabApp {
             edge_finish_distance: 0.4,
             edge_finish_distance_text: "0.400".to_owned(),
             edge_finish_tangent_chain: false,
+            edge_finish_corner_choice: CornerFinishChoice::default(),
             model_inspector_open: false,
             interference: None,
             sweep: None,
@@ -5476,10 +5521,32 @@ impl KernelLabApp {
     }
 
     fn persistent_ref_for_current_entity(&self, entity: EntityRef) -> Option<PersistentRef> {
+        self.persistent_ref_for_entity_before(entity, None)
+    }
+
+    /// The same identity, but named by a feature earlier than `before`.
+    ///
+    /// A feature cannot target what it produced itself. Adding an edge to a
+    /// committed finish needs that edge as its input snapshot knew it, so the
+    /// walk passes straight through the feature being edited — and through
+    /// anything after it — and keeps going back to whichever feature owned the
+    /// edge before it was touched.
+    fn persistent_ref_for_entity_before(
+        &self,
+        entity: EntityRef,
+        before: Option<FeatureId>,
+    ) -> Option<PersistentRef> {
         if !matches!(entity.kind, EntityKind::Face | EntityKind::Edge) {
             return None;
         }
         let active_body = self.active_body_id()?;
+        let position = |id: FeatureId| {
+            self.document
+                .features()
+                .iter()
+                .position(|node| node.id == id)
+        };
+        let cutoff = before.and_then(&position);
         let kind = entity.kind;
         let mut candidate = entity;
         for (feature, report) in self.feature_reports.iter().rev() {
@@ -5500,7 +5567,9 @@ impl KernelLabApp {
             else {
                 continue;
             };
-            if let Some(role) = history.role.clone() {
+            let nameable =
+                cutoff.is_none_or(|limit| position(*feature).is_some_and(|at| at < limit));
+            if nameable && let Some(role) = history.role.clone() {
                 return Some(PersistentRef::new(*feature, role, kind));
             }
             let mut inputs = history
@@ -5811,6 +5880,81 @@ impl KernelLabApp {
             .rev()
             .find(|entry| entry.body.snapshot.id() == id)
             .map(|entry| entry.body.snapshot.clone())
+    }
+
+    /// The edge a committed feature's input carried, where the feature has
+    /// left only part of it standing.
+    ///
+    /// A finish does not modify the edge running into the corner it shapes: it
+    /// regenerates a shorter one, whose history names the finish itself as its
+    /// producer and carries no input to walk back through. So the link is made
+    /// where it is still visible — in the geometry. The survivor is straight,
+    /// collinear with what it was cut from, and lies inside it, which names one
+    /// edge of the input and no other.
+    fn edge_before_feature(&self, edge: EntityRef, feature: FeatureId) -> Option<EntityRef> {
+        let active = self.active_body_id()?;
+        let body = self.bodies.iter().find(|body| body.id == active)?;
+        let here = body
+            .body
+            .scene
+            .edges
+            .iter()
+            .find(|candidate| candidate.source_edge == edge)?;
+        let input = self
+            .document
+            .feature(feature)
+            .and_then(|node| node.committed)
+            .map(|commit| commit.input)
+            .and_then(|id| self.archived_snapshot(id))?;
+        let tolerance = input
+            .precision_policy()
+            .unwrap_or_default()
+            .linear_agreement
+            .max(1.0e-9);
+        let span = |from: Point3, to: Point3| [to.x - from.x, to.y - from.y, to.z - from.z];
+        let length = |vector: [f64; 3]| vector[0].hypot(vector[1]).hypot(vector[2]);
+        let run = span(here.endpoints[0], here.endpoints[1]);
+        let reach = length(run);
+        if reach <= tolerance {
+            return None;
+        }
+        let direction = [run[0] / reach, run[1] / reach, run[2] / reach];
+        // On the segment, within tolerance, measured along its own direction.
+        let lies_on = |point: Point3, ends: [Point3; 2]| {
+            let whole = span(ends[0], ends[1]);
+            let extent = length(whole);
+            if extent <= tolerance {
+                return false;
+            }
+            let unit = [whole[0] / extent, whole[1] / extent, whole[2] / extent];
+            let offset = span(ends[0], point);
+            let along = offset[0] * unit[0] + offset[1] * unit[1] + offset[2] * unit[2];
+            let across = [
+                offset[0] - along * unit[0],
+                offset[1] - along * unit[1],
+                offset[2] - along * unit[2],
+            ];
+            length(across) <= tolerance && along >= -tolerance && along <= extent + tolerance
+        };
+        NativeKernel::debug_scene(&input)
+            .edges
+            .iter()
+            .filter(|candidate| {
+                let other = span(candidate.endpoints[0], candidate.endpoints[1]);
+                let extent = length(other);
+                extent > tolerance
+                    && length([
+                        direction[1] * other[2] - direction[2] * other[1],
+                        direction[2] * other[0] - direction[0] * other[2],
+                        direction[0] * other[1] - direction[1] * other[0],
+                    ]) <= tolerance * extent.max(1.0)
+            })
+            .find(|candidate| {
+                here.endpoints
+                    .iter()
+                    .all(|point| lies_on(*point, candidate.endpoints))
+            })
+            .map(|candidate| candidate.source_edge)
     }
 
     fn rebuild_document_from(&mut self, from: FeatureId) -> bool {
@@ -10007,11 +10151,259 @@ impl KernelLabApp {
                 }
             }
         }
+        if !self.edge_finish_features_at_a_finished_corner().is_empty() {
+            return EdgeFinishSelectionSupport::CornerAlreadyFinished;
+        }
         if pristine_prism && all_world_axis_aligned && axes.len() == 1 {
             EdgeFinishSelectionSupport::ExactParallelSet
         } else {
             EdgeFinishSelectionSupport::RegularizedBlendSet
         }
+    }
+
+    /// The committed edge finishes that could own a corner this selection runs
+    /// into, newest first — empty when every corner it reaches is still the
+    /// body's own.
+    ///
+    /// A plain prism corner joins three edges. A fillet or chamfer leaves four
+    /// there: the part of the third edge that survived, the two lines the
+    /// bands lie along, and the seam between them. So a valence above three at
+    /// the end of a selected edge is the mark an earlier finish leaves, and
+    /// counting it costs one pass over the scene — cheap enough for the panel
+    /// to ask on every frame.
+    ///
+    /// Which of those features owns the corner is not decided here. The kernel
+    /// is the judge of that: joining tries them in this order and keeps the
+    /// first that replays, so a wrong guess is refused rather than built.
+    fn edge_finish_features_at_a_finished_corner(&self) -> Vec<FeatureId> {
+        let Some(body_id) = self.active_body_id() else {
+            return Vec::new();
+        };
+        let Some(body) = self.bodies.iter().find(|body| body.id == body_id) else {
+            return Vec::new();
+        };
+        let scene = &body.body.scene;
+        let extent = body.body.snapshot.measures().bounds.map_or(1.0, |bounds| {
+            (bounds.max.x - bounds.min.x)
+                .abs()
+                .max((bounds.max.y - bounds.min.y).abs())
+                .max((bounds.max.z - bounds.min.z).abs())
+                .max(1.0e-9)
+        });
+        // Far below any feature a user draws, far above the last bits two
+        // curves disagree in when each is evaluated up to the vertex they
+        // share. Points are compared by distance rather than by a grid cell:
+        // a drawing's coordinates are round numbers, and round numbers land on
+        // cell boundaries, where two spellings of one vertex fall either side.
+        let quantum = extent * 1.0e-6;
+        let valence = |at: Point3| {
+            scene
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.endpoints.iter().any(|point| {
+                        (point.x - at.x).abs() < quantum
+                            && (point.y - at.y).abs() < quantum
+                            && (point.z - at.z).abs() < quantum
+                    })
+                })
+                .map(|edge| edge.source_edge.entity.0)
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+        let reaches_a_finished_corner = self.selected_edges.iter().any(|selection| {
+            scene
+                .edges
+                .iter()
+                .filter(|edge| edge.source_edge == selection.edge)
+                .flat_map(|edge| edge.endpoints)
+                .any(|point| valence(point) > 3)
+        });
+        // A corner finished one edge at a time keeps its three edges — the
+        // band runs out into the face beside it rather than cutting the third
+        // edge back — so the count above cannot see it and only the kernel
+        // can. Its refusal for this very selection is that answer, so it
+        // counts as the same question being asked.
+        if !reaches_a_finished_corner && !self.edge_finish_was_refused_a_corner() {
+            return Vec::new();
+        }
+        let mut candidates = self
+            .document
+            .features()
+            .iter()
+            .filter(|node| {
+                node.committed.is_some()
+                    && node.outputs.contains(&FeatureOutput::Body(body_id))
+                    && matches!(
+                        &node.action,
+                        ReplayAction::TargetedKernel(targeted)
+                            if matches!(
+                                targeted.command_template(),
+                                KernelCommand::FinishEdge { .. } | KernelCommand::FinishEdges { .. }
+                            )
+                    )
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        candidates.reverse();
+        candidates
+    }
+
+    /// Whether the finish this panel last tried was turned away by a corner.
+    ///
+    /// These four refusals all say the same thing in different words: the
+    /// corner this edge runs into is not one this feature may close on its
+    /// own. That is the question ADR 0044 answers, so it is worth offering the
+    /// answers rather than only the reason.
+    fn edge_finish_was_refused_a_corner(&self) -> bool {
+        const CORNER: [&str; 4] = [
+            "VERTEX_BLEND_CORNER_CURVED",
+            "VERTEX_BLEND_CORNER_INCOMPLETE",
+            "VERTEX_BLEND_CORNER_UNSUPPORTED",
+            "VERTEX_BLEND_RADIUS_MISMATCH",
+        ];
+        let Attempt::Rejected { operation, error } = &self.last_attempt else {
+            return false;
+        };
+        if *operation != SolidFeaturePreset::Chamfer.label()
+            && *operation != SolidFeaturePreset::Fillet.label()
+        {
+            return false;
+        }
+        let named = summarize_rejection(error).code_label();
+        CORNER
+            .iter()
+            .any(|code| error.message.contains(code) || named.contains(code))
+    }
+
+    /// Adds the selected edges to the committed finish that already shaped the
+    /// corner they reach, and replays it, so one patch closes the whole corner.
+    ///
+    /// The corner keeps that feature's size rather than the one in the panel:
+    /// a rolling-ball corner is a single sphere and a bevelled one a single
+    /// triangle, so all the edges meeting there share one distance. The panel
+    /// says as much before the user presses anything.
+    ///
+    /// Candidates are tried newest first and the first that replays is kept.
+    /// The kernel is what decides which feature owns the corner — one that
+    /// does not will refuse the joined set for the very reason the user is
+    /// here — so a wrong guess costs a replay, never a wrong body.
+    fn join_edge_finish_at_corner(&mut self, preset: SolidFeaturePreset) -> bool {
+        let kind = if preset == SolidFeaturePreset::Chamfer {
+            EdgeFinishKind::Chamfer
+        } else {
+            EdgeFinishKind::Fillet
+        };
+        let Some(body_id) = self.active_body_id() else {
+            return false;
+        };
+        let raw = self
+            .selected_edges
+            .iter()
+            .filter(|selection| selection.body.get() == body_id.get())
+            .map(|selection| selection.edge)
+            .collect::<Vec<_>>();
+        let candidates = self.edge_finish_features_at_a_finished_corner();
+        let mut mismatched = false;
+        for candidate in candidates {
+            let Some(ReplayAction::TargetedKernel(existing)) = self
+                .document
+                .feature(candidate)
+                .map(|node| node.action.clone())
+            else {
+                continue;
+            };
+            let (held_kind, distance) = match existing.command_template() {
+                KernelCommand::FinishEdge { kind, distance, .. }
+                | KernelCommand::FinishEdges { kind, distance, .. } => (*kind, *distance),
+                _ => continue,
+            };
+            // A corner takes one patch, so it takes one kind. A fillet cannot
+            // join a chamfer; that selection is two features whatever the
+            // panel offers.
+            if held_kind != kind {
+                mismatched = true;
+                continue;
+            }
+            // As this feature's own input knew them: an edge it has already
+            // shortened is named by whatever produced it before that.
+            let additions = raw
+                .iter()
+                .map(|edge| {
+                    let earlier = self.edge_before_feature(*edge, candidate)?;
+                    self.persistent_ref_for_entity_before(earlier, Some(candidate))
+                        .filter(|found| found.kind == EntityKind::Edge)
+                })
+                .collect::<Option<Vec<_>>>();
+            let Some(additions) = additions else {
+                continue;
+            };
+            let mut targets = existing.targets().cloned().collect::<Vec<_>>();
+            let held = targets.len();
+            for addition in &additions {
+                if !targets.contains(addition) {
+                    targets.push(addition.clone());
+                }
+            }
+            if targets.len() == held {
+                continue;
+            }
+            let template = KernelCommand::FinishEdges {
+                target_edges: raw.clone(),
+                kind,
+                distance,
+            };
+            let Ok(joined) = TargetedKernel::new_many(template, targets) else {
+                continue;
+            };
+            // Everything the replay touches, kept so a refusal leaves the
+            // document exactly as the user left it rather than half-joined.
+            let document = self.document.clone();
+            let bodies = self.bodies.clone();
+            let displayed = self.displayed.clone();
+            let reports = self.feature_reports.clone();
+            let status = self.document_status.clone();
+            if self
+                .document
+                .replace_feature_action(candidate, ReplayAction::TargetedKernel(joined))
+                .is_err()
+            {
+                self.document = document;
+                continue;
+            }
+            self.move_history_cursor(self.document.features().len());
+            if self.rebuild_document_from(candidate) {
+                self.selected_history_feature = Some(candidate);
+                self.selected_edges.clear();
+                self.pending_operation = None;
+                self.last_attempt = Attempt::Accepted {
+                    operation: preset.label(),
+                };
+                self.edge_finish_distance = distance;
+                self.edge_finish_distance_text = self.length_unit().format_value(distance);
+                self.document_status = Some(format!(
+                    "Joined to {} — the corner closes at {}",
+                    self.document.feature(candidate).map_or_else(
+                        || "the earlier finish".to_owned(),
+                        |node| node.label.clone()
+                    ),
+                    self.length_unit().format_value(distance)
+                ));
+                return true;
+            }
+            self.document = document;
+            self.bodies = bodies;
+            self.displayed = displayed;
+            self.feature_reports = reports;
+            self.document_status = status;
+        }
+        self.document_status = Some(if mismatched {
+            "That corner carries a finish of the other kind, and one corner takes one kind. Keep this one independent, or change the earlier feature.".to_owned()
+        } else {
+            "No committed finish at that corner would take this edge. Keep it independent instead."
+                .to_owned()
+        });
+        false
     }
 
     fn confirm_pending_operation(&mut self) -> bool {
@@ -12672,6 +13064,24 @@ impl KernelLabApp {
             }
             workbench.body.snapshot.clone()
         };
+        // A finish whose edge runs into a corner an earlier one already shaped
+        // is the question ADR 0044 asks, and the panel has the answer by now.
+        // Joining is not a new feature at all — it grows the one that owns the
+        // corner — so it leaves before a command is ever built.
+        if matches!(
+            preset,
+            SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
+        ) && self.edge_finish_selection_support()
+            == EdgeFinishSelectionSupport::CornerAlreadyFinished
+        {
+            match self.edge_finish_corner_choice {
+                CornerFinishChoice::Join => {
+                    self.join_edge_finish_at_corner(preset);
+                    return;
+                }
+                CornerFinishChoice::Independent => {}
+            }
+        }
         let command = match preset {
             // The preset is still a fixed tube, but it now travels the
             // general revolve: a section rectangle beside an axis in its own
@@ -16711,6 +17121,117 @@ impl KernelLabApp {
         None
     }
 
+    /// The finish that owns the corner this selection reaches: its name, its
+    /// kind, and the size a joined corner would take.
+    fn edge_finish_corner_owner(
+        &self,
+        preset: SolidFeaturePreset,
+    ) -> Option<(String, EdgeFinishKind, f64)> {
+        let wanted = if preset == SolidFeaturePreset::Chamfer {
+            EdgeFinishKind::Chamfer
+        } else {
+            EdgeFinishKind::Fillet
+        };
+        let mut other_kind = None;
+        for candidate in self.edge_finish_features_at_a_finished_corner() {
+            let Some(node) = self.document.feature(candidate) else {
+                continue;
+            };
+            let ReplayAction::TargetedKernel(existing) = &node.action else {
+                continue;
+            };
+            let (kind, distance) = match existing.command_template() {
+                KernelCommand::FinishEdge { kind, distance, .. }
+                | KernelCommand::FinishEdges { kind, distance, .. } => (*kind, *distance),
+                _ => continue,
+            };
+            if kind == wanted {
+                return Some((node.label.clone(), kind, distance));
+            }
+            other_kind.get_or_insert((node.label.clone(), kind, distance));
+        }
+        other_kind
+    }
+
+    /// The two answers a corner an earlier feature already finished asks for.
+    ///
+    /// They sit above the size, because which one the user means changes what
+    /// the size is for: joining takes the corner's own size and the field
+    /// below stops driving it, while standing apart keeps the typed one.
+    fn edge_finish_corner_options(&mut self, ui: &mut egui::Ui, preset: SolidFeaturePreset) {
+        let unit = self.length_unit();
+        let owner = self.edge_finish_corner_owner(preset);
+        let wanted = if preset == SolidFeaturePreset::Chamfer {
+            EdgeFinishKind::Chamfer
+        } else {
+            EdgeFinishKind::Fillet
+        };
+        let joinable = owner
+            .as_ref()
+            .is_some_and(|(_, kind, _)| *kind == wanted)
+            .then(|| owner.clone())
+            .flatten();
+        ui.add_space(6.0);
+        let join = ui
+            .add_enabled_ui(joinable.is_some(), |ui| {
+                ui.selectable_label(
+                    self.edge_finish_corner_choice == CornerFinishChoice::Join,
+                    RichText::new(if preset == SolidFeaturePreset::Chamfer {
+                        "Join this chamfer to the others"
+                    } else {
+                        "Join this fillet to the others"
+                    })
+                    .strong(),
+                )
+            })
+            .inner;
+        if join.clicked() {
+            self.edge_finish_corner_choice = CornerFinishChoice::Join;
+        }
+        ui.label(
+            RichText::new(match &joinable {
+                Some((label, _, distance)) => format!(
+                    "One patch closes the corner, at {}'s own {} — the size below stops driving it.",
+                    label,
+                    unit.format_value(*distance)
+                ),
+                None => {
+                    "That corner carries a finish of the other kind, and one corner takes one kind."
+                        .to_owned()
+                }
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        ui.add_space(4.0);
+        let apart = ui
+            .add_enabled_ui(INDEPENDENT_CORNER_FINISH_IS_BUILT, |ui| {
+                ui.selectable_label(
+                    self.edge_finish_corner_choice == CornerFinishChoice::Independent,
+                    RichText::new("Keep independent").strong(),
+                )
+            })
+            .inner;
+        if apart.clicked() {
+            self.edge_finish_corner_choice = CornerFinishChoice::Independent;
+        }
+        ui.label(
+            RichText::new(if INDEPENDENT_CORNER_FINISH_IS_BUILT {
+                "The bands meet along a seam and the corner keeps its own point, as though each edge had been finished on its own body."
+            } else {
+                "Not built yet: the bands would meet along a seam with the corner's point surviving, which the kernel cannot yet cut."
+            })
+            .small()
+            .color(theme::muted()),
+        );
+        if !INDEPENDENT_CORNER_FINISH_IS_BUILT
+            && self.edge_finish_corner_choice == CornerFinishChoice::Independent
+        {
+            self.edge_finish_corner_choice = CornerFinishChoice::Join;
+        }
+        ui.add_space(2.0);
+    }
+
     fn edge_finish_editor(&mut self, context: &egui::Context) {
         let Some(PendingOperation::PresetFeature { preset, .. }) = self.pending_operation else {
             return;
@@ -16761,6 +17282,9 @@ impl KernelLabApp {
                         .small()
                         .color(if support.can_commit() { theme::muted() } else { theme::bad() }),
                 );
+                if support == EdgeFinishSelectionSupport::CornerAlreadyFinished {
+                    self.edge_finish_corner_options(ui, preset);
+                }
                 // A refused commit leaves this window open with its picks, so
                 // the reason belongs here, beside the value to change — not in
                 // a status string that only a hover ever reveals.
@@ -30443,6 +30967,208 @@ mod extrusion_workbench_tests {
         assert!(finish(&mut app, SolidFeaturePreset::Fillet, 0.3));
     }
 
+    /// The corner of the bootstrap block, as a point.
+    fn block_corner(app: &KernelLabApp) -> [f64; 3] {
+        app.displayed
+            .as_ref()
+            .expect("the bootstrap body")
+            .scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .flat_map(|edge| edge.endpoints)
+            .fold([f64::MIN; 3], |most, point| {
+                [
+                    most[0].max(point.x),
+                    most[1].max(point.y),
+                    most[2].max(point.z),
+                ]
+            })
+    }
+
+    /// The edge that starts at `anchor` and runs towards `corner`.
+    ///
+    /// Three edges meet at any prism vertex, so starting there is not enough
+    /// to name one; the one wanted is whichever gets closest to the corner at
+    /// its other end.
+    fn edge_from_towards(app: &KernelLabApp, anchor: [f64; 3], corner: [f64; 3]) -> EntityRef {
+        let span = |point: &artificer_protocol::Point3, to: [f64; 3]| {
+            (point.x - to[0])
+                .hypot(point.y - to[1])
+                .hypot(point.z - to[2])
+        };
+        app.displayed
+            .as_ref()
+            .expect("a body")
+            .scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .filter(|edge| {
+                edge.endpoints
+                    .iter()
+                    .any(|point| span(point, anchor) < 1.0e-9)
+            })
+            .min_by(|left, right| {
+                let reach = |edge: &&artificer_kernel::DebugEdge| {
+                    edge.endpoints
+                        .iter()
+                        .map(|point| span(point, corner))
+                        .fold(f64::INFINITY, f64::min)
+                };
+                reach(left).total_cmp(&reach(right))
+            })
+            .map(|edge| edge.source_edge)
+            .expect("the corner still offers an edge")
+    }
+
+    /// Stages and confirms without insisting on a preview.
+    ///
+    /// A selection that reaches a finished corner has no live preview to show:
+    /// joining replays the feature that owns the corner, which is the whole
+    /// document's work, not a frame's.
+    fn finish_unpreviewed(
+        app: &mut KernelLabApp,
+        preset: SolidFeaturePreset,
+        distance: f64,
+    ) -> bool {
+        app.edge_finish_distance = distance;
+        app.stage_preset_feature(preset);
+        app.confirm_pending_operation();
+        app.last_error_code().is_none()
+    }
+
+    /// The end of an edge furthest from a given point.
+    fn far_end(app: &KernelLabApp, edge: EntityRef, from: [f64; 3]) -> [f64; 3] {
+        app.displayed
+            .as_ref()
+            .expect("a body")
+            .scene
+            .edges
+            .iter()
+            .filter(|candidate| candidate.source_edge == edge)
+            .flat_map(|candidate| candidate.endpoints)
+            .map(|point| [point.x, point.y, point.z])
+            .max_by(|left, right| {
+                let span = |point: &[f64; 3]| {
+                    (point[0] - from[0])
+                        .hypot(point[1] - from[1])
+                        .hypot(point[2] - from[2])
+                };
+                span(left).total_cmp(&span(right))
+            })
+            .expect("the edge has ends")
+    }
+
+    /// Two edges of the block's corner, finished together, leaving the third.
+    ///
+    /// The third is found by the end of it the finish never touched: near the
+    /// corner the scene now holds bands, seams and tangency lines as well, and
+    /// any of those would answer a search that only asks what is close to
+    /// where the corner stood.
+    fn corner_with_two_edges_finished(
+        preset: SolidFeaturePreset,
+        distance: f64,
+    ) -> (KernelLabApp, viewport::BodyInstanceKey, EntityRef) {
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().unwrap().get());
+        let corner = block_corner(&app);
+        let edges = block_corner_edges(&app);
+        assert_eq!(edges.len(), 3, "a block corner joins three edges");
+        let anchor = far_end(&app, edges[2], corner);
+        pick_all(&mut app, body, &edges[..2]);
+        assert!(
+            finish(&mut app, preset, distance),
+            "{preset:?}: two edges of a corner finish together along their seam"
+        );
+        let third = edge_from_towards(&app, anchor, corner);
+        (app, body, third)
+    }
+
+    /// The third edge of a corner two others already finished is a question,
+    /// not a refusal: ADR 0044 gives it two answers and the panel asks which.
+    #[test]
+    fn a_third_edge_at_a_finished_corner_asks_which_finish_it_belongs_to() {
+        for preset in [SolidFeaturePreset::Chamfer, SolidFeaturePreset::Fillet] {
+            let (mut app, body, third) = corner_with_two_edges_finished(preset, 0.3);
+            pick_all(&mut app, body, &[third]);
+            assert_eq!(
+                app.edge_finish_selection_support(),
+                EdgeFinishSelectionSupport::CornerAlreadyFinished,
+                "{preset:?}: the panel should ask rather than refuse"
+            );
+            let (_, kind, size) = app
+                .edge_finish_corner_owner(preset)
+                .expect("{preset:?}: the finish that owns the corner is named");
+            assert_eq!(
+                kind,
+                if preset == SolidFeaturePreset::Chamfer {
+                    EdgeFinishKind::Chamfer
+                } else {
+                    EdgeFinishKind::Fillet
+                },
+                "{preset:?}: a corner takes one kind"
+            );
+            assert!(
+                (size - 0.3).abs() < 1.0e-9,
+                "{preset:?}: joining takes the corner's own size, and it is {size}"
+            );
+        }
+    }
+
+    /// Joining grows the feature that owns the corner rather than adding one,
+    /// and what comes out is the whole-corner patch — the same body the three
+    /// edges would have made had they been chosen together in the first place.
+    #[test]
+    fn joining_the_third_edge_closes_the_corner_in_one_patch() {
+        for preset in [SolidFeaturePreset::Chamfer, SolidFeaturePreset::Fillet] {
+            let mut together = KernelLabApp::default();
+            let body = viewport::BodyInstanceKey::new(together.active_body_id().unwrap().get());
+            let edges = block_corner_edges(&together);
+            pick_all(&mut together, body, &edges);
+            assert!(finish(&mut together, preset, 0.3));
+            let whole = together
+                .displayed
+                .as_ref()
+                .expect("the finished body")
+                .snapshot
+                .measures()
+                .volume;
+
+            let (mut app, body, third) = corner_with_two_edges_finished(preset, 0.3);
+            let features = app.document.features().len();
+            pick_all(&mut app, body, &[third]);
+            app.edge_finish_corner_choice = CornerFinishChoice::Join;
+            assert!(
+                finish_unpreviewed(&mut app, preset, 0.3),
+                "{preset:?}: joining should replay the feature that owns the corner"
+            );
+            assert_eq!(
+                app.document.features().len(),
+                features,
+                "{preset:?}: joining grows a feature, it does not add one"
+            );
+            assert!(
+                app.document_status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("Joined to")),
+                "{preset:?}: a join says which feature it joined, and said {:?}",
+                app.document_status
+            );
+            let joined = app
+                .displayed
+                .as_ref()
+                .expect("the rebuilt body")
+                .snapshot
+                .measures()
+                .volume;
+            assert!(
+                (joined - whole).abs() < 1.0e-6,
+                "{preset:?}: a joined corner is the whole-corner patch — {joined} against {whole}"
+            );
+        }
+    }
+
     /// The same three edges taken one at a time are refused, and the refusal
     /// names the corner rather than leaving the user to guess.
     ///
@@ -30520,6 +31246,89 @@ mod extrusion_workbench_tests {
                 "{preset:?}: a refused finish leaves its panel open to explain itself"
             );
         }
+    }
+
+    /// And that refusal is where the panel starts offering the way out rather
+    /// than only the reason.
+    ///
+    /// A corner finished one edge at a time keeps its three edges — the band
+    /// runs out into the face beside it — so nothing in the shape of the body
+    /// says the corner is spoken for, and only the kernel's own refusal does.
+    /// ADR 0044 turns it into the same question: join, or stand apart. Joining
+    /// here gives the corner the two edges it now has, which is the seam of
+    /// ADR 0043.
+    #[test]
+    fn a_corner_refusal_offers_to_join_the_finish_that_caused_it() {
+        let preset = SolidFeaturePreset::Fillet;
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().unwrap().get());
+        let corner = block_corner(&app);
+        let edges = block_corner_edges(&app);
+        let second_anchor = far_end(&app, edges[1], corner);
+
+        pick_all(&mut app, body, &edges[..1]);
+        assert!(
+            finish(&mut app, preset, 0.3),
+            "one edge finishes on its own"
+        );
+
+        let second = edge_from_towards(&app, second_anchor, corner);
+        pick_all(&mut app, body, &[second]);
+        assert!(
+            !finish(&mut app, preset, 0.3),
+            "the second edge of a rounded corner cannot be taken alone"
+        );
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::CornerAlreadyFinished,
+            "the refusal turns the panel into the question, not a dead end"
+        );
+
+        let features = app.document.features().len();
+        app.edge_finish_corner_choice = CornerFinishChoice::Join;
+        pick_all(&mut app, body, &[second]);
+        assert!(
+            finish_unpreviewed(&mut app, preset, 0.3),
+            "joining the second edge to the feature that rounded the first"
+        );
+        assert_eq!(
+            app.document.features().len(),
+            features,
+            "joining grows a feature, it does not add one"
+        );
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("Joined to")),
+            "a join says which feature it joined, and said {:?}",
+            app.document_status
+        );
+
+        // What the same two edges chosen together produce, which is what the
+        // corner should now look like.
+        let mut together = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(together.active_body_id().unwrap().get());
+        let pair = block_corner_edges(&together);
+        pick_all(&mut together, body, &pair[..2]);
+        assert!(finish(&mut together, preset, 0.3));
+        let expected = together
+            .displayed
+            .as_ref()
+            .expect("the finished body")
+            .snapshot
+            .measures()
+            .volume;
+        let joined = app
+            .displayed
+            .as_ref()
+            .expect("the rebuilt body")
+            .snapshot
+            .measures()
+            .volume;
+        assert!(
+            (joined - expected).abs() < 1.0e-6,
+            "a joined pair is the pair taken together — {joined} against {expected}"
+        );
     }
 
     /// A prism whose walls meet at 120 degrees, not 90. One vertical edge.
