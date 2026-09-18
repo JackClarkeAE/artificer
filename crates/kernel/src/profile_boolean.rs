@@ -1021,8 +1021,17 @@ fn segment_crossings(
                 let vertex = second.end();
                 (vertex, Some(parameter_of(first, vertex)), None)
             }
-            // Vertex-on-vertex contact: legal only when the two vertices are
-            // the same bits, in which case neither side needs a split.
+            // Vertex-on-vertex contact: neither side needs a split, whichever
+            // end each is, so the only question is whether the two ends are
+            // the same point. Agreement decides that, not identical bits.
+            // Bits were too strict to be a rule about geometry: two ends that
+            // are the same corner reached by different arithmetic — one
+            // computed from a carrier, one refined from a touch — agree to the
+            // last few bits and not to all of them, and which machine is
+            // running decides how many. That is how one platform came to cut a
+            // shape another refused. Ends this close are welded into one point
+            // by the sew stage regardless, so accepting exactly what it will
+            // weld is what keeps the two stages telling the same story.
             (
                 Placement::StartVertex | Placement::EndVertex,
                 Placement::StartVertex | Placement::EndVertex,
@@ -1037,8 +1046,12 @@ fn segment_crossings(
                 } else {
                     second.end()
                 };
-                if first_vertex.x.to_bits() == second_vertex.x.to_bits()
-                    && first_vertex.y.to_bits() == second_vertex.y.to_bits()
+                let scale = [first_vertex, second_vertex]
+                    .into_iter()
+                    .map(|point| point.x.abs().max(point.y.abs()))
+                    .fold(1.0_f64, f64::max);
+                if (first_vertex.x - second_vertex.x).hypot(first_vertex.y - second_vertex.y)
+                    <= tolerances.agreement * scale
                 {
                     (first_vertex, None, None)
                 } else {
@@ -1322,39 +1335,51 @@ fn section_carrier_crossings(
     for index in 0..=SAMPLES {
         values.push((at(index), signed(chord.point_at(at(index)))));
     }
+    // How near a touch has to be to count, against the size of what is being
+    // measured rather than against a bare number.
+    let reach = tolerances.agreement
+        * [chord.start(), chord.end(), other.start(), other.end()]
+            .into_iter()
+            .map(|point| point.x.abs().max(point.y.abs()))
+            .fold(1.0_f64, f64::max);
     for window in values.windows(3) {
         let (a, b, c) = (window[0].1, window[1].1, window[2].1);
-        let extremum =
-            (b.abs() <= a.abs() && b.abs() <= c.abs()) && b.abs() <= tolerances.agreement;
-        let sign_change = (a < 0.0) != (c < 0.0);
-        if extremum && !sign_change {
-            // Settle the touch to the extremum itself rather than to whichever
-            // sample happened to be nearest, so both operands are cut at one
-            // point rather than at two a sample apart.
-            let (mut low, mut high) = (window[0].0, window[2].0);
-            for _ in 0..80 {
-                let third = (high - low) / 3.0;
-                let (left, right) = (low + third, high - third);
-                if signed(chord.point_at(left)).abs() <= signed(chord.point_at(right)).abs() {
-                    high = right;
-                } else {
-                    low = left;
-                }
+        if b.abs() > a.abs() || b.abs() > c.abs() || (a < 0.0) != (c < 0.0) {
+            continue;
+        }
+        // Whether this dip reaches the other carrier is a question about the
+        // curve, not about where the samples happened to fall: a sample lands
+        // wherever the grid puts it, and how near zero it comes there depends
+        // on the last bits of a sine — which the platform's own library
+        // decides. Two machines would then disagree about whether two shapes
+        // touch. So the extremum is found first and *it* is what the reach is
+        // measured against; the samples only say where to look.
+        let (mut low, mut high) = (window[0].0, window[2].0);
+        for _ in 0..80 {
+            let third = (high - low) / 3.0;
+            let (left, right) = (low + third, high - third);
+            if signed(chord.point_at(left)).abs() <= signed(chord.point_at(right)).abs() {
+                high = right;
+            } else {
+                low = left;
             }
-            let touch = chord.point_at(0.5 * (low + high));
-            let within = |segment: Segment| {
-                matches!(
-                    place(
-                        parameter_of(segment, touch),
-                        segment_length(segment),
-                        tolerances
-                    ),
-                    Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
-                )
-            };
-            if within(chord) && within(other) {
-                candidates.push(touch);
-            }
+        }
+        let touch = chord.point_at(0.5 * (low + high));
+        if signed(touch).abs() > reach {
+            continue;
+        }
+        let within = |segment: Segment| {
+            matches!(
+                place(
+                    parameter_of(segment, touch),
+                    segment_length(segment),
+                    tolerances
+                ),
+                Placement::Interior(_) | Placement::StartVertex | Placement::EndVertex
+            )
+        };
+        if within(chord) && within(other) {
+            candidates.push(touch);
         }
     }
     candidates.dedup_by(|a, b| (a.x - b.x).hypot(a.y - b.y) <= tolerances.agreement);

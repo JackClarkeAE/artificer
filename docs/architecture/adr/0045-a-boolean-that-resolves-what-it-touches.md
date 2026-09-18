@@ -82,7 +82,36 @@ give up. Snapping to the vertex avoids both, and needs no cut at all — which
 is what a tangency landing exactly on a region's own corner looks like, and
 what two bands springing from one wall produce.
 
+### A decision about shapes may not turn on the last bit
+
+Two rules in the pipeline decided geometry by arithmetic that the platform
+gets to choose, and both had to go.
+
+A tangency was recognised when a *sample* of the signed distance came within
+the agreement. Whether any sample lands that near the touch depends on where
+the fixed grid falls and on the last bits of a sine — which the C library
+decides, and glibc and the MSVC runtime decide differently. The extremum is
+now found by refinement first, and *it* is what the reach is measured against;
+the samples only say where to look.
+
+Vertex-on-vertex contact was legal only when the two vertices were identical
+bit for bit. But two ends that are the same corner reached by different
+arithmetic — one computed from a carrier, one refined from a touch — agree to
+the last few bits and not to all of them, and how many depends on the machine.
+Agreement decides it now, which is what `Tolerances::agreement` is defined to
+mean, and it is exactly what the sew stage will weld into one point anyway, so
+the two stages tell the same story.
+
+Both were found the same way and neither would have been found by a single
+case. A fillet cut at one radius passed; the same cut swept across forty radii
+refused twelve of them, scattered, with nothing geometric separating the
+twelve from the rest. Scattered failures across a smooth parameter are the
+signature of a decision resting on arithmetic rather than on shape, and the
+sweep is now a test, because that signature is invisible to any one example.
+
 ### What still fails closed
+
+
 
 Contacts of no width that would weld two solids at a seam. A cylinder kissing
 a plate along one line is not a solid and still refuses: the change is about

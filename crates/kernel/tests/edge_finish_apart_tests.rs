@@ -440,6 +440,55 @@ fn the_third_edge_of_a_rounded_corner_stands_apart_from_it() {
     );
 }
 
+/// The same corner at forty sizes, two bands and three.
+///
+/// Where two bands touch is found by sampling a curve and refining, and the
+/// size of the fillet moves that touch around — relative to the sample grid,
+/// and relative to the vertices it lands near. A rule that turned on a sample
+/// falling close enough, or on two ends agreeing to the last bit, would cut
+/// some of these and refuse others with nothing geometric to separate them.
+/// That is not a domain limit but arithmetic showing through, and it is how
+/// one machine came to disagree with another about whether two shapes touch.
+#[test]
+fn a_corner_stood_apart_cuts_at_every_size() {
+    let mut trouble = Vec::new();
+    for step in 1..=40 {
+        let radius = f64::from(step) * 0.1;
+        for bands in [2_usize, 3] {
+            let mut body = cube();
+            let mut refused = None;
+            for axis in 0..bands {
+                let edge = origin_edge(&body, axis);
+                match round_apart(&body, edge, radius) {
+                    Ok(next) => body = next,
+                    Err(error) => {
+                        refused = Some(format!("{radius:.1}, {bands} bands, axis {axis}: {error}"));
+                        break;
+                    }
+                }
+            }
+            match refused {
+                Some(reason) => trouble.push(reason),
+                None => {
+                    let want = SIDE.powi(3) - bands_removed(bands, radius, SIDE);
+                    if (body.measures().volume - want).abs() > 1.0e-6 {
+                        trouble.push(format!(
+                            "{radius:.1}, {bands} bands: volume {} wanted {want}",
+                            body.measures().volume
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        trouble.is_empty(),
+        "{} of 80 corners refused or drifted:\n{}",
+        trouble.len(),
+        trouble.join("\n")
+    );
+}
+
 /// Three edges of one corner, each stood apart from the others, in every
 /// order. The answer cannot depend on which was taken first.
 #[test]
