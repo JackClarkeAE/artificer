@@ -27466,6 +27466,84 @@ mod extrusion_workbench_tests {
         assert_close(middle.point.v, edge_midpoint.v);
     }
 
+    /// The reported case, end to end: a circle drawn on a face of the solid,
+    /// dimensioned to an edge of that same face.
+    ///
+    /// The edge belongs to the body, not to the sketch, so until it is brought
+    /// into the sketch frame there is nothing for the solver to measure
+    /// against — and the tool would silently drop the first pick and arm the
+    /// edge's own length instead. Naming the edge is what projects it.
+    #[test]
+    fn a_sketch_circle_can_be_dimensioned_to_an_edge_of_the_face_it_sits_on() {
+        let mut app = KernelLabApp::default();
+        let body = app.displayed.as_ref().expect("bootstrap body");
+        let face = body
+            .scene
+            .triangles
+            .iter()
+            .find(|triangle| triangle.role == FaceRole::PositiveZ)
+            .expect("positive Z face")
+            .source_face;
+        let support = NativeKernel::planar_face_support(&body.snapshot, face)
+            .expect("selected face supports a sketch");
+        let corner = SketchPoint::new(support.boundary[0].x, support.boundary[0].y);
+        let next = SketchPoint::new(support.boundary[1].x, support.boundary[1].y);
+        let edge_midpoint = SketchPoint::new(
+            f64::midpoint(corner.u, next.u),
+            f64::midpoint(corner.v, next.v),
+        );
+        // A small circle at the middle of the face, clear of every edge.
+        let centre = SketchPoint::new(
+            f64::midpoint(corner.u, support.boundary[2].x),
+            f64::midpoint(corner.v, support.boundary[2].y),
+        );
+        select_test_face(&mut app, face);
+        assert!(!app.start_face_sketch_camera_transition(support));
+        let curves = app.face_sketch_snap_curves().to_vec();
+        app.sketch.set_support_curves(&curves);
+
+        app.sketch
+            .stage_geometry(crate::sketch::SketchGeometry::circle(
+                centre,
+                SketchPoint::new(centre.u + 0.25, centre.v),
+            ))
+            .expect("the circle should stage");
+        app.sketch
+            .commit_pending()
+            .expect("the circle should commit");
+
+        assert!(app.sketch.set_exact_tool(ToolVariant::Dimension));
+        assert!(
+            app.sketch.name_dimension_operand(centre, 0.1),
+            "the circle's centre is a point the tool can name"
+        );
+        assert!(
+            app.sketch.name_dimension_operand(edge_midpoint, 0.1),
+            "and so is the edge of the face it was drawn on"
+        );
+
+        let dimensions = app.sketch.point_to_point_dimensions();
+        assert_eq!(
+            dimensions.len(),
+            1,
+            "the centre and the face's edge are one dimension"
+        );
+        let expected = (centre.u - corner.u).hypot(centre.v - corner.v);
+        let across = expected.min((centre.u - edge_midpoint.u).hypot(centre.v - edge_midpoint.v));
+        assert!(
+            (dimensions[0].value - across).abs() <= 1.0e-6,
+            "the dimension should hold the offset from that edge ({across}), and holds {}",
+            dimensions[0].value
+        );
+        assert!(
+            app.sketch
+                .entities()
+                .iter()
+                .any(|entity| entity.role == crate::sketch::SketchEntityRole::Reference),
+            "the edge should now be reference geometry the sketch owns"
+        );
+    }
+
     #[test]
     fn a_drilled_hole_offers_its_exact_centre_to_the_sketch_that_follows_it() {
         let app = KernelLabApp::default();

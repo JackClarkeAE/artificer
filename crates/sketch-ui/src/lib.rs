@@ -1286,20 +1286,27 @@ impl SketchDimensionKind {
     }
 }
 
-/// What a dimension-tool click that landed on a point did.
+/// What a dimension-tool click that landed on an object did.
 #[derive(Clone, Copy, Debug, Default)]
 struct DimensionPointPick {
-    /// The click was about a point, so it is not also a pick of the object the
-    /// point belongs to.
+    /// The click was the whole answer, so it is not also a pick of the object
+    /// the pointer was over.
     took_click: bool,
     /// The dimension this pick completed, as the entity its edit hangs from.
     staged: Option<SketchEntityId>,
 }
 
 impl DimensionPointPick {
-    const fn took_the_click() -> Self {
+    /// A first pick, which starts a pair without ending the click.
+    ///
+    /// A bare point has no numbers of its own, so naming one is the whole
+    /// gesture. A curve does, and arming them is what "click a line, type 3,
+    /// Enter" has always meant — so that pick is *shared*: remembered here as
+    /// the first half of a possible pair, and passed on to the ordinary path
+    /// that opens the curve's own value box.
+    const fn opened_a_pair(operand: RelationOperand) -> Self {
         Self {
-            took_click: true,
+            took_click: matches!(operand, RelationOperand::Point(_)),
             staged: None,
         }
     }
@@ -2160,6 +2167,14 @@ fn selected_recipe_editor_for(
             Vec::new(),
             "Imported compatibility geometry has no recoverable primitive parameters.",
         ),
+        // A projected edge is the body's shape, borrowed. Editing its numbers
+        // here would let the sketch claim authority it does not have, so it
+        // offers none: to move it, move the body.
+        CoreRecipe::ProjectedEdge { .. } => (
+            "Projected edge",
+            Vec::new(),
+            "This edge belongs to the body. Delete the projection to stop using it.",
+        ),
         // A line stores two points, not a length and a bearing, so those two
         // numbers have to be derived here and turned back into an end point on
         // apply. They are only *drivable* when the end is a literal position:
@@ -2599,6 +2614,7 @@ fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, 
         }
         CoreRecipe::LegacyImportedProfile { .. }
         | CoreRecipe::Point { .. }
+        | CoreRecipe::ProjectedEdge { .. }
         | CoreRecipe::Polyline { .. }
         | CoreRecipe::TwoPointCircle { .. }
         | CoreRecipe::CentreStartEndArc { .. }
@@ -5932,6 +5948,8 @@ impl SketchCanvasState {
             self.trim_hover_fragment = None;
             self.pattern_manipulator = None;
             self.dimension_pick = None;
+            // A half-named pair belongs to the tool that started it.
+            self.clear_relation_acquisition();
             if matches!(
                 variant,
                 ToolVariant::RectangularPattern | ToolVariant::CircularPattern
@@ -6728,6 +6746,17 @@ impl SketchCanvasState {
             return false;
         };
         if !delta_u.is_finite() || !delta_v.is_finite() || (delta_u == 0.0 && delta_v == 0.0) {
+            return false;
+        }
+        // Reference geometry is the body's shape, borrowed. Dragging it would
+        // be the sketch claiming authority over the solid, which it has not
+        // got — its pins would refuse the edit anyway, further downstream and
+        // less clearly.
+        if self
+            .entities
+            .iter()
+            .any(|entity| entity.id == selected && entity.role == SketchEntityRole::Reference)
+        {
             return false;
         }
         let mut any_reshaped = false;
@@ -8875,6 +8904,155 @@ impl SketchCanvasState {
             })
     }
 
+    /// One pick's worth of relation operand, projecting a host-body edge into
+    /// the sketch when that is what the pointer landed on.
+    ///
+    /// A sketch drawn on a face spends most of its life talking about that
+    /// face: "this hole, twelve from that edge". The solver only speaks in
+    /// sketch points, so the edge has to become sketch geometry before it can
+    /// be measured against — and this is where that happens, at the moment of
+    /// the pick, rather than as a separate chore the user has to know about.
+    fn acquire_relation_operand(
+        &mut self,
+        point: SketchPoint,
+        radius: f64,
+    ) -> Option<RelationOperand> {
+        if let Some(operand) = self.relation_operand_hit(point, radius) {
+            return Some(operand);
+        }
+        let segment = self.support_segment_hit(point, radius)?;
+        self.project_support_segment(segment)
+            .map(RelationOperand::Curve)
+    }
+
+    /// The straight host-body edge nearest a pick, in the sketch's own frame.
+    ///
+    /// Support curves are the analytic boundary of the face the sketch sits on;
+    /// snapping has always read them. An arc is skipped because the constraint
+    /// vocabulary has no point-to-arc offset, so offering one would only refuse
+    /// itself a moment later.
+    fn support_segment_hit(&self, point: SketchPoint, radius: f64) -> Option<[SketchPoint; 2]> {
+        let radius = radius.max(PrecisionPolicy::default().modeling_resolution);
+        self.support_curves
+            .iter()
+            .filter_map(|curve| match *curve {
+                SketchContextCurve::Segment { start, end } => Some([start, end]),
+                SketchContextCurve::Arc { .. } => None,
+            })
+            .filter_map(|segment| {
+                let distance = distance_to_segment(point, segment)?;
+                (distance <= radius).then_some((distance, segment))
+            })
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, segment)| segment)
+    }
+
+    /// Brings a host edge into the sketch as pinned reference geometry.
+    ///
+    /// The body's topology is not the sketch's to own, so this is a copy rather
+    /// than a live link, pinned exactly where the edge is. Pinning is the whole
+    /// point: a dimension to a projected edge has to move the sketch, because
+    /// the solid is not the solver's to push around. Picking the same edge
+    /// twice reuses the curve the first pick made rather than stacking copies.
+    fn project_support_segment(&mut self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
+        // A projection is a committed edit, and committing one underneath a
+        // staged edit would leave the gate holding a transaction built against
+        // a definition that no longer exists.
+        if self.pending.is_some() {
+            return None;
+        }
+        if let Some(existing) = self.projected_edge_matching(segment) {
+            return Some(existing);
+        }
+        let [start, end] = segment;
+        let transaction = self
+            .authoring
+            .stage(
+                CoreRecipe::ProjectedEdge {
+                    start: CorePointInput::Position(core_point(start)),
+                    end: CorePointInput::Position(core_point(end)),
+                },
+                "Project body edge",
+            )
+            .ok()?;
+        let projected = transaction.impact().inserted_entities.first().copied()?;
+        self.undo_journal
+            .confirm(
+                &mut self.authoring,
+                transaction,
+                CoreConfirmationSource::GreenTick,
+                PrecisionPolicy::default(),
+            )
+            .ok()?;
+        self.pin_projected_edge(projected);
+        self.reconcile_active_core_entities();
+        self.refresh_profile_analysis();
+        Some(projected)
+    }
+
+    /// Holds a projected edge where the body put it.
+    fn pin_projected_edge(&mut self, entity: CoreEntityId) {
+        let Ok((start, end)) = self.relation_line_points(entity) else {
+            return;
+        };
+        let pins = [start, end]
+            .into_iter()
+            .filter_map(|point| {
+                let position = self.relation_point_position(point)?;
+                Some(CoreConstraintKind::Fixed { point, position })
+            })
+            .collect::<Vec<_>>();
+        if pins.len() != 2 {
+            return;
+        }
+        let Ok(transaction) = self.authoring.stage_constraints(
+            pins,
+            "Pin projected edge",
+            PrecisionPolicy::default(),
+        ) else {
+            return;
+        };
+        let _ = self.undo_journal.confirm(
+            &mut self.authoring,
+            transaction,
+            CoreConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        );
+    }
+
+    /// An existing projection of the same edge, if this one has been picked
+    /// before.
+    fn projected_edge_matching(&self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
+        let tolerance = PrecisionPolicy::default().modeling_resolution;
+        self.authoring
+            .active_entities()
+            .filter(|record| record.role == CoreEntityRole::Reference)
+            .filter(|record| {
+                self.authoring
+                    .operation(record.provenance.operation)
+                    .is_some_and(|operation| {
+                        matches!(operation.recipe, CoreRecipe::ProjectedEdge { .. })
+                    })
+            })
+            .find(|record| {
+                let CoreCurve2::Line { start, end } = record.geometry else {
+                    return false;
+                };
+                let (Some(start), Some(end)) = (
+                    self.relation_point_position(start),
+                    self.relation_point_position(end),
+                ) else {
+                    return false;
+                };
+                let forwards = same_place(start, segment[0], tolerance)
+                    && same_place(end, segment[1], tolerance);
+                let backwards = same_place(start, segment[1], tolerance)
+                    && same_place(end, segment[0], tolerance);
+                forwards || backwards
+            })
+            .map(|record| record.id)
+    }
+
     /// How many operands the active relation still wants, if a relation tool
     /// owns the pointer.
     /// The sketch's single centreline, as the axis a revolve can turn about
@@ -8906,6 +9084,18 @@ impl SketchCanvasState {
         self.relation_operands.len()
     }
 
+    /// Names one object for the Dimension tool, exactly as a canvas click does.
+    ///
+    /// Returns whether the pick landed on something the tool could name. This
+    /// is the programmatic door onto the same gesture the canvas drives, and
+    /// exists so callers above the canvas can rehearse a dimension without
+    /// synthesising pointer events.
+    pub fn name_dimension_operand(&mut self, point: SketchPoint, radius: f64) -> bool {
+        let before = self.relation_operands.len();
+        let pick = self.take_dimension_operand_pick(point, radius);
+        pick.staged.is_some() || self.relation_operands.len() > before
+    }
+
     /// The last refusal, in the solver's own words.
     #[must_use]
     pub fn relation_diagnostic(&self) -> Option<&str> {
@@ -8935,6 +9125,7 @@ impl SketchCanvasState {
                 owner.recipe,
                 CoreRecipe::Line { .. }
                     | CoreRecipe::CentreLine { .. }
+                    | CoreRecipe::ProjectedEdge { .. }
                     | CoreRecipe::Polyline { .. }
             )
         {
@@ -8961,29 +9152,46 @@ impl SketchCanvasState {
             .map(|record| record.evaluated_position)
     }
 
-    /// Takes one pick for a dimension between two points, and stages the
+    /// Takes one pick for a dimension between two objects, and stages the
     /// dimension once both have been named.
     ///
-    /// Returns whether the pick was a point. A pick that was not is nobody's
-    /// business here — it falls through to the tool's ordinary behaviour of
-    /// arming the clicked object's own numbers.
+    /// Picks accumulate. The first names one object — a point, a sketch curve,
+    /// or a host-body edge, which is projected into the sketch as it is named.
+    /// A second click on a different object means the distance between the two:
+    /// point to point, point to line, or line to line, whichever the pair is.
+    ///
+    /// Single-object dimensioning is untouched, because a curve's first pick is
+    /// shared rather than consumed: its own value box arms exactly as before,
+    /// and the pair only forms if a second object follows instead of a typed
+    /// number. Anything that ends the gesture — clicking empty space, changing
+    /// tool, or committing what was typed — forgets the half-made pair, so a
+    /// stale first pick can never ambush the next one.
     ///
     /// The relation this stages is the same one the Distance relation tool
-    /// makes, built by the same code, because "the distance between these two
-    /// points" means one thing however the user asked for it.
-    fn take_dimension_point_pick(&mut self, point: SketchPoint, radius: f64) -> DimensionPointPick {
-        let Some(picked) = self.exact_point_hit(point, radius) else {
+    /// makes, built by the same code, because "the distance between these two"
+    /// means one thing however the user asked for it.
+    fn take_dimension_operand_pick(
+        &mut self,
+        point: SketchPoint,
+        radius: f64,
+    ) -> DimensionPointPick {
+        let Some(operand) = self.acquire_relation_operand(point, radius) else {
+            self.clear_relation_acquisition();
             return DimensionPointPick::default();
         };
-        let operand = RelationOperand::Point(picked);
         if self.relation_operands.contains(&operand) {
-            self.relation_diagnostic = Some("A dimension needs two different points.".to_owned());
-            return DimensionPointPick::took_the_click();
+            // Re-picking the same object re-arms its own numbers, which is what
+            // the tool has always done. Restarting the pair from here is what
+            // keeps that true rather than refusing the click.
+            self.relation_operands.clear();
+            self.relation_operands.push(operand);
+            self.relation_diagnostic = None;
+            return DimensionPointPick::opened_a_pair(operand);
         }
         self.relation_operands.push(operand);
         if self.relation_operands.len() < 2 {
             self.relation_diagnostic = None;
-            return DimensionPointPick::took_the_click();
+            return DimensionPointPick::opened_a_pair(operand);
         }
         let staged = self.stage_relation(ToolVariant::DistanceRelation);
         let constraint = staged.and_then(|_| {
@@ -10136,6 +10344,27 @@ impl SketchCanvasState {
 enum RelationOperand {
     Point(CorePointId),
     Curve(CoreEntityId),
+}
+
+/// The distance from a pick to a straight span, in sketch units.
+///
+/// A degenerate span has no direction to measure across, so it has no answer
+/// rather than a misleading one.
+fn distance_to_segment(point: SketchPoint, [start, end]: [SketchPoint; 2]) -> Option<f64> {
+    let run = (end.u - start.u, end.v - start.v);
+    let length_squared = run.0.mul_add(run.0, run.1 * run.1);
+    if !length_squared.is_finite() || length_squared <= 0.0 {
+        return None;
+    }
+    let offset = (point.u - start.u, point.v - start.v);
+    let along = (offset.0.mul_add(run.0, offset.1 * run.1) / length_squared).clamp(0.0, 1.0);
+    let nearest = (run.0.mul_add(along, start.u), run.1.mul_add(along, start.v));
+    Some((point.u - nearest.0).hypot(point.v - nearest.1))
+}
+
+/// Whether a solved point sits where a projected endpoint does.
+fn same_place(solved: CorePoint2, projected: SketchPoint, tolerance: f64) -> bool {
+    (solved.u - projected.u).hypot(solved.v - projected.v) <= tolerance
 }
 
 /// A circular operand's centre and the way it carries its radius.
@@ -11577,15 +11806,16 @@ pub fn show_with_context(
             match state.tool {
                 SketchTool::Select => {
                     let sketch_pt = state.view.screen_to_sketch(response.rect, position);
-                    // A click that lands on an endpoint, with the dimension
-                    // tool armed, is asking about that point rather than about
-                    // the curve it belongs to. Two of them are a dimension
-                    // between two objects, which is the one thing the tool
-                    // could not do. Endpoint beats curve here exactly as it
-                    // does for a relation and for snapping.
+                    // A click with the dimension tool armed names an object.
+                    // One is that object's own numbers; two are the distance
+                    // between them, which is the one thing the tool could not
+                    // do. Endpoint beats curve here exactly as it does for a
+                    // relation and for snapping, and a curve the sketch does
+                    // not own yet — a host-body edge — is projected as it is
+                    // named.
                     let dimension_point =
                         if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
-                            state.take_dimension_point_pick(
+                            state.take_dimension_operand_pick(
                                 sketch_pt,
                                 f64::from(entity_pick_radius) / state.view.points_per_unit,
                             )
@@ -12566,16 +12796,23 @@ fn paint_entities(
             (sketch_colours().hovered, 2.2)
         } else if entity.role == SketchEntityRole::Construction {
             (sketch_colours().construction, 1.45)
+        } else if entity.role == SketchEntityRole::Reference {
+            // Borrowed from the host body, so it reads in the support's own
+            // colour rather than as a stroke the sketch drew.
+            (sketch_colours().snap_support, 1.45)
         } else if matches!(entity.geometry, SketchGeometry::Point(_)) {
             (sketch_colours().entity.gamma_multiply(0.4), 1.7)
         } else {
             (sketch_colours().entity, 1.7)
         };
         let stroke = Stroke::new(width, color);
-        if entity.role == SketchEntityRole::Construction {
-            paint_dashed_geometry(painter, rect, view, entity.geometry, stroke);
-        } else {
+        // Only a profile stroke is solid. Dashes are what say "this is not a
+        // boundary of the material", which is true of construction and of
+        // borrowed geometry alike.
+        if entity.role == SketchEntityRole::Profile {
             paint_geometry(painter, rect, view, entity.geometry, stroke);
+        } else {
+            paint_dashed_geometry(painter, rect, view, entity.geometry, stroke);
         }
         if Some(entity.id) == selected || Some(entity.id) == hovered {
             for pt in entity.geometry.control_points().iter() {
@@ -20088,12 +20325,12 @@ mod tests {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
 
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
         assert!(
             state.point_to_point_dimensions().is_empty(),
             "one point named is half a dimension, and half a dimension is none"
         );
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
 
         let dimensions = state.point_to_point_dimensions();
         assert_eq!(dimensions.len(), 1, "two points make one dimension");
@@ -20116,10 +20353,313 @@ mod tests {
         assert!(state.set_exact_tool(ToolVariant::Dimension));
         assert!(
             !state
-                .take_dimension_point_pick(SketchPoint::new(-6.0, 2.5), 0.5)
+                .take_dimension_operand_pick(SketchPoint::new(-6.0, 2.5), 0.5)
                 .took_click
         );
         assert!(state.point_to_point_dimensions().is_empty());
+    }
+
+    /// Every relation the staged candidate holds, as the solver names them.
+    fn staged_constraint_kinds(state: &SketchCanvasState) -> Vec<CoreConstraintKind> {
+        state
+            .presented_definition()
+            .constraints()
+            .values()
+            .filter(|record| record.enabled)
+            .map(|record| record.kind.clone())
+            .collect()
+    }
+
+    /// A sketch drawn on a face, with the face's own boundary offered as
+    /// support geometry exactly as the workbench offers it.
+    ///
+    /// The circle sits well inside a four-by-four face, so the pick that names
+    /// its centre and the pick that names the left-hand edge cannot be confused
+    /// for one another.
+    fn circle_on_a_host_face() -> (SketchCanvasState, SketchPoint, SketchPoint) {
+        let mut state = SketchCanvasState::default();
+        let corners = [
+            SketchPoint::new(-4.0, -4.0),
+            SketchPoint::new(4.0, -4.0),
+            SketchPoint::new(4.0, 4.0),
+            SketchPoint::new(-4.0, 4.0),
+        ];
+        let boundary = [
+            SketchContextCurve::segment(corners[0], corners[1]),
+            SketchContextCurve::segment(corners[1], corners[2]),
+            SketchContextCurve::segment(corners[2], corners[3]),
+            SketchContextCurve::segment(corners[3], corners[0]),
+        ];
+        state.set_support_curves(&boundary);
+        state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(1.0, 0.0),
+            ))
+            .expect("the circle should stage");
+        state.commit_pending().expect("the circle should commit");
+        (
+            state,
+            SketchPoint::new(0.0, 0.0),
+            // Squarely on the left-hand edge of the face, away from both of its
+            // corners so the pick can only mean that edge.
+            SketchPoint::new(-4.0, 1.5),
+        )
+    }
+
+    /// The case the tool was asked for and could not do: a point on one side of
+    /// the pair and a line on the other. Two points trilaterate — they leave the
+    /// located point free to mirror across the datum — where an offset from a
+    /// line does not, so this is the relation that actually positions anything.
+    #[test]
+    fn the_dimension_tool_measures_a_point_against_a_line() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(-4.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("the datum line should stage");
+        state
+            .commit_pending()
+            .expect("the datum line should commit");
+        state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 3.0),
+                SketchPoint::new(1.0, 3.0),
+            ))
+            .expect("the circle should stage");
+        state.commit_pending().expect("the circle should commit");
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(0.0, 3.0), 0.5)
+                .took_click
+        );
+        // Mid-span of the line, where no endpoint can be claimed.
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(1.0, 0.0), 0.5)
+                .staged
+                .is_some(),
+            "a point and a line are a complete pair"
+        );
+
+        assert!(
+            staged_constraint_kinds(&state)
+                .iter()
+                .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
+            "the pair should be an offset from the line, not a separation"
+        );
+    }
+
+    /// Naming a curve first has always opened that curve's own value box, and
+    /// still does. The pick is shared rather than consumed: remembered as half a
+    /// pair, and passed on so "click a line, type 3, Enter" is untouched.
+    #[test]
+    fn a_first_curve_pick_is_shared_with_its_own_numbers() {
+        let (mut state, _, _) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+
+        let pick = state.take_dimension_operand_pick(SketchPoint::new(-6.0, 0.0), 0.5);
+        assert!(
+            !pick.took_click,
+            "the curve's own numbers still want this click"
+        );
+        assert!(
+            pick.staged.is_none(),
+            "one object named is half a dimension"
+        );
+        assert_eq!(state.relation_operand_count(), 1, "and the half is kept");
+    }
+
+    /// A click on nothing ends the gesture, so a half-named pair can never
+    /// ambush the next dimension the user places.
+    #[test]
+    fn a_dimension_click_on_empty_space_forgets_a_half_named_pair() {
+        let (mut state, first, _) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert_eq!(state.relation_operand_count(), 1);
+
+        assert!(
+            !state
+                .take_dimension_operand_pick(SketchPoint::new(-6.0, 9.0), 0.5)
+                .took_click
+        );
+        assert_eq!(state.relation_operand_count(), 0);
+    }
+
+    /// So does picking up a different tool.
+    #[test]
+    fn changing_tool_forgets_a_half_named_pair() {
+        let (mut state, first, _) = two_separate_lines();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert_eq!(state.relation_operand_count(), 1);
+
+        assert!(state.set_exact_tool(ToolVariant::Select));
+        assert_eq!(state.relation_operand_count(), 0);
+    }
+
+    /// The reported case: a circle drawn on a face of a solid, dimensioned to an
+    /// edge of that face. The edge belongs to the body, so the sketch has
+    /// nothing to measure against until the edge is brought into the sketch
+    /// frame — which naming it is what does.
+    #[test]
+    fn a_host_body_edge_is_projected_when_a_dimension_names_it() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        let pick = state.take_dimension_operand_pick(edge, 0.5);
+        assert!(
+            pick.staged.is_some(),
+            "the centre and the face's edge are a complete pair"
+        );
+
+        assert!(
+            state
+                .entities()
+                .iter()
+                .any(|entity| entity.role == SketchEntityRole::Reference),
+            "the edge should now be reference geometry the sketch owns"
+        );
+        let dimensions = state.point_to_point_dimensions();
+        assert_eq!(dimensions.len(), 1, "one dimension, to the projected edge");
+        assert!(
+            (dimensions[0].value - 4.0).abs() <= 1.0e-6,
+            "the centre is four from that edge, and the dimension holds {}",
+            dimensions[0].value
+        );
+        assert!(
+            staged_constraint_kinds(&state)
+                .iter()
+                .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
+            "measuring to an edge is an offset, not a separation"
+        );
+    }
+
+    /// A projection is reference geometry, never a material boundary — so it
+    /// cannot quietly become part of the profile that gets extruded.
+    #[test]
+    fn a_projected_edge_is_never_profile_geometry() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        assert!(
+            state
+                .take_dimension_operand_pick(edge, 0.5)
+                .staged
+                .is_some()
+        );
+
+        let projected = state
+            .entities()
+            .iter()
+            .find(|entity| entity.role == SketchEntityRole::Reference)
+            .expect("the projection should exist");
+        assert_ne!(projected.role, SketchEntityRole::Profile);
+        assert_ne!(
+            projected.role,
+            SketchEntityRole::Construction,
+            "construction geometry is a candidate revolve axis; a borrowed edge is not"
+        );
+    }
+
+    /// Naming the same edge twice is one edge. Stacking a second copy on top of
+    /// the first would leave the sketch quietly full of duplicates, each pinned
+    /// to the same place.
+    #[test]
+    fn projecting_the_same_host_edge_twice_reuses_one_reference_curve() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        assert!(
+            state
+                .take_dimension_operand_pick(edge, 0.5)
+                .staged
+                .is_some()
+        );
+        state.commit_pending().expect("the dimension should commit");
+
+        let after_first = state
+            .entities()
+            .iter()
+            .filter(|entity| entity.role == SketchEntityRole::Reference)
+            .count();
+        assert_eq!(after_first, 1);
+
+        // A second dimension, from the same edge to the other side of the
+        // circle, naming the edge a little further along its span.
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-4.0, -2.5), 0.5)
+                .staged
+                .is_none()
+        );
+        let after_second = state
+            .entities()
+            .iter()
+            .filter(|entity| entity.role == SketchEntityRole::Reference)
+            .count();
+        assert_eq!(after_second, 1, "the same edge is still one edge");
+    }
+
+    /// The point of pinning: a dimension to a borrowed edge moves the sketch,
+    /// because the solid is not the solver's to push around.
+    #[test]
+    fn a_dimension_to_a_projected_edge_moves_the_sketch_not_the_edge() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        let constraint = state
+            .take_dimension_operand_pick(edge, 0.5)
+            .staged
+            .and_then(|_| {
+                state
+                    .point_to_point_dimensions()
+                    .last()
+                    .map(|d| d.constraint)
+            })
+            .expect("the dimension should stage");
+        state.commit_pending().expect("the dimension should commit");
+
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("2".to_owned());
+        assert!(
+            state.accept_relation_dimension_edit().is_some(),
+            "two is a reachable offset from that edge"
+        );
+        state.commit_pending().expect("the retype should commit");
+
+        let projected = state
+            .entities()
+            .iter()
+            .find(|entity| entity.role == SketchEntityRole::Reference)
+            .copied()
+            .expect("the projection should still exist");
+        let SketchGeometry::Segment { start, end } = projected.geometry else {
+            panic!("a projected edge is a segment");
+        };
+        assert!(
+            (start.u + 4.0).abs() <= 1.0e-6 && (end.u + 4.0).abs() <= 1.0e-6,
+            "the edge should not have moved, and sits at {start:?}..{end:?}"
+        );
+        let circle = state
+            .entities()
+            .iter()
+            .find(|entity| matches!(entity.geometry, SketchGeometry::Circle { .. }))
+            .copied()
+            .expect("the circle should still exist");
+        let SketchGeometry::Circle { center, .. } = circle.geometry else {
+            unreachable!("the circle was just matched as one")
+        };
+        assert!(
+            (center.u + 2.0).abs() <= 1.0e-6,
+            "the circle should have moved to two from the edge, and sits at {center:?}"
+        );
     }
 
     /// Placing a dimension and giving it a value is one act. The value is open
@@ -20128,8 +20668,8 @@ mod tests {
     fn a_placed_dimension_opens_for_typing_straight_away() {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
 
         let (constraint, text, error) = state
             .relation_dimension_editor()
@@ -20145,8 +20685,8 @@ mod tests {
     fn retyping_a_dimension_moves_the_far_object() {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
         state.commit_pending().expect("the dimension should commit");
 
         let constraint = state.point_to_point_dimensions()[0].constraint;
@@ -20184,8 +20724,8 @@ mod tests {
     fn a_dimension_refuses_text_that_is_not_a_length() {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
         state.commit_pending().expect("the dimension should commit");
 
         let constraint = state.point_to_point_dimensions()[0].constraint;
@@ -20210,8 +20750,8 @@ mod tests {
     fn a_dimension_the_sketch_cannot_hold_is_refused_by_the_solver() {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
         state.commit_pending().expect("the dimension should commit");
 
         // Pin both ends: their separation is now a fact, and no other value
@@ -20250,8 +20790,8 @@ mod tests {
     fn a_dimension_is_drawn_between_the_two_points_it_measures() {
         let (mut state, first, second) = two_separate_lines();
         assert!(state.set_exact_tool(ToolVariant::Dimension));
-        assert!(state.take_dimension_point_pick(first, 0.5).took_click);
-        assert!(state.take_dimension_point_pick(second, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
 
         let canvas = Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0));
         let layouts = point_to_point_dimension_layouts(&state, canvas);
