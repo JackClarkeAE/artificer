@@ -778,16 +778,21 @@ fn read_end(
             false,
         ));
     }
-    // Three of three is a corner patch and one of three is a run-out; two of
-    // three would have to fade the band out along the third edge, which this
-    // vocabulary cannot draw.
+    // Three of three is a corner patch and one of three is a run-out. Two of
+    // three is a seam: the bands meet along one curve — an ellipse under a
+    // fillet, where two equal crossing cylinders meet, and a line under a
+    // chamfer — running from the shared face's new corner to the new end of
+    // the edge left sharp, which trims back by exactly the blend size. The
+    // vocabulary carries both curves; what it does not yet carry is a third
+    // ending in `EndKind` to build them from. ADR 0043 derives the seam and
+    // pins the volume it must produce.
     if unselected > 0 && incident.len() - unselected > 1 {
         return Err(refuse(
             "VERTEX_BLEND_CORNER_INCOMPLETE",
             format!(
                 "A corner of this selection has {unselected} of its {} edges left out, and this \
-                 release has no exact patch for a corner blended only part way. Select the other \
-                 edge or edges at that corner as well, or blend it in a later feature.",
+                 release closes a corner only with all of them. Select the other edge or edges at \
+                 that corner as well, or blend it in a later feature.",
                 incident.len()
             ),
             false,
