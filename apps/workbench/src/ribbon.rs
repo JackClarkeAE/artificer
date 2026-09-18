@@ -701,7 +701,7 @@ impl KernelLabApp {
     /// Which sketch the Create group would open, which decides both its name
     /// and whether it is available at all.
     fn sketch_entry_action(&self) -> SketchEntryAction {
-        if self.selected_face.is_some() {
+        if self.selected_face().is_some() {
             return SketchEntryAction::OnSelectedFace;
         }
         let starts_new_origin_sketch = !self.sketch.entities().is_empty()
@@ -760,7 +760,7 @@ impl KernelLabApp {
                 if let Some(blocked) = free(self) {
                     return blocked;
                 }
-                if self.selected_face.is_some() && self.active_component_instance().is_some() {
+                if self.selected_face().is_some() && self.active_component_instance().is_some() {
                     return CommandAvailability::disabled(
                         "Library components are immutable occurrences. Edit the source part or create an independent workspace sketch.",
                     );
@@ -950,7 +950,7 @@ impl KernelLabApp {
             SolidFeaturePreset::Revolve => true,
             SolidFeaturePreset::Hole
             | SolidFeaturePreset::Rib
-            | SolidFeaturePreset::HolePattern => self.selected_face.is_some(),
+            | SolidFeaturePreset::HolePattern => self.selected_face().is_some(),
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
             // A shell with no face selected hollows the body closed, so a
@@ -1022,11 +1022,11 @@ impl KernelLabApp {
             "Move the history marker to the end before creating another feature.".to_owned()
         } else if !distance_valid {
             "Enter a finite, non-zero extrusion distance.".to_owned()
-        } else if linked_sketch_support || (self.selected_face.is_some() && linked_active_body) {
+        } else if linked_sketch_support || (self.selected_face().is_some() && linked_active_body) {
             "Library component geometry is immutable in this workspace; edit its source definition or place another component.".to_owned()
-        } else if self.selected_face.is_some() && push_pull_support.is_none() {
+        } else if self.selected_face().is_some() && push_pull_support.is_none() {
             "Direct push/pull requires one unholed planar extrusion cap.".to_owned()
-        } else if self.selected_face.is_some() && !active_sketch_consumed {
+        } else if self.selected_face().is_some() && !active_sketch_consumed {
             "Finish or consume the active sketch before pushing the selected face.".to_owned()
         } else if already_extruded {
             "Select an eligible face to push/pull, or create another sketch.".to_owned()

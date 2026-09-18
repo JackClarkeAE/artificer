@@ -2556,9 +2556,15 @@ pub struct KernelLabApp {
     request_serial: u64,
     edge_overlay: bool,
     model_display_mode: viewport::ModelDisplayMode,
-    selected_face: Option<EntityRef>,
-    selected_edge: Option<viewport::DocumentEdgeSelection>,
-    selected_vertex: Option<viewport::DocumentVertexSelection>,
+    /// Picked geometry, in click order, one collection per kind.
+    ///
+    /// These are the only authority. There used to be a singular field beside
+    /// each of them, kept in sync by hand, and the two drifted apart in both
+    /// directions: a push-pull remapped `selected_face` and left
+    /// `selected_faces` holding the pre-operation reference, while finishing a
+    /// sketch cleared the singular and left the plural populated. The singular
+    /// form is now a view — see [`Self::selected_face`] and its siblings — so
+    /// there is nothing left to keep in sync (ADR 0041).
     selected_faces: Vec<viewport::DocumentFaceSelection>,
     selected_edges: Vec<viewport::DocumentEdgeSelection>,
     selected_vertices: Vec<viewport::DocumentVertexSelection>,
@@ -2785,9 +2791,6 @@ impl Default for KernelLabApp {
             request_serial: 0,
             edge_overlay: true,
             model_display_mode: viewport::ModelDisplayMode::ShadedEdges,
-            selected_face: None,
-            selected_edge: None,
-            selected_vertex: None,
             selected_faces: Vec::new(),
             selected_edges: Vec::new(),
             selected_vertices: Vec::new(),
@@ -3600,14 +3603,21 @@ impl KernelLabApp {
         self.model_display_mode.is_shaded()
     }
 
+    /// The most recently picked face, with the occurrence it belongs to.
+    ///
+    /// A view over [`Self::selected_faces`] rather than a field beside it, and
+    /// it carries a `DocumentFaceSelection` rather than a bare `EntityRef`
+    /// because an `EntityRef` is `{snapshot, entity, kind}` and names no
+    /// occurrence: with two instances of one part in an assembly it cannot say
+    /// which face was clicked (ADR 0041).
     #[must_use]
-    pub const fn selected_face(&self) -> Option<EntityRef> {
-        self.selected_face
+    pub fn selected_face(&self) -> Option<viewport::DocumentFaceSelection> {
+        self.selected_faces.last().copied()
     }
 
     #[must_use]
     pub fn selected_face_role(&self) -> Option<FaceRole> {
-        let selected = self.selected_face?;
+        let selected = self.selected_face()?.face;
         self.displayed
             .as_ref()?
             .scene
@@ -5026,7 +5036,7 @@ impl KernelLabApp {
         self.face_sketch_context = None;
         self.pending_face_sketch = None;
         self.pending_operation = None;
-        self.selected_face = None;
+        self.selected_faces.clear();
         self.leave_sketch_mode();
         self.active_tool = ActiveTool::Select;
         self.clear_transform_preview();
@@ -5308,17 +5318,13 @@ impl KernelLabApp {
                         .any(|triangle| triangle.source_face == selection.face)
             })
         });
-        if let Some(selection) = self.selected_faces.last() {
-            self.selected_face = Some(selection.face);
-        }
         if self
-            .selected_edge
+            .selected_edge()
             .is_some_and(|selection| !current_edges.contains(&selection))
         {
-            self.selected_edge = None;
+            self.selected_edges.clear();
         }
-        self.selected_edge = self.selected_edges.last().copied();
-        if self.selected_vertex.is_some_and(|selection| {
+        if self.selected_vertex().is_some_and(|selection| {
             !self.bodies.iter().any(|body| {
                 body.id.get() == selection.body.get()
                     && body
@@ -5329,7 +5335,7 @@ impl KernelLabApp {
                         .any(|vertex| vertex.source_vertex == selection.vertex)
             })
         }) {
-            self.selected_vertex = None;
+            self.selected_vertices.clear();
         }
         self.selected_vertices.retain(|selection| {
             self.bodies.iter().any(|body| {
@@ -5342,7 +5348,6 @@ impl KernelLabApp {
                         .any(|vertex| vertex.source_vertex == selection.vertex)
             })
         });
-        self.selected_vertex = self.selected_vertices.last().copied();
     }
 
     fn committed_world_bounds_for_body(&self, body: &WorkbenchBody) -> Option<Aabb3> {
@@ -5771,7 +5776,7 @@ impl KernelLabApp {
             .active_sketch_index
             .and_then(|index| self.sketches.get(index))
             .and_then(|sketch| sketch.consumed.then_some(sketch.revision));
-        self.selected_face = None;
+        self.selected_faces.clear();
         self.history_scrub_position = self.document.history_position();
         self.sync_feature_preview_from_document();
     }
@@ -6383,10 +6388,38 @@ impl KernelLabApp {
         self.clear_transform_preview();
     }
 
+    /// Replaces the picked face with the same face on the rebuilt body, which
+    /// is what a push-pull leaves behind.
+    ///
+    /// It writes the collection rather than a field beside it. The old code
+    /// remapped a singular `selected_face` and left `selected_faces` holding
+    /// the reference from before the operation, so the two disagreed about
+    /// which face was picked until something else cleared them (ADR 0041).
+    fn set_selected_face_reference(&mut self, face: Option<EntityRef>) {
+        let body = self.selected_faces.last().map(|selection| selection.body);
+        self.selected_faces.clear();
+        if let (Some(face), Some(body)) = (face, body) {
+            self.selected_faces
+                .push(viewport::DocumentFaceSelection { body, face });
+        }
+    }
+
+    /// The most recently picked edge.
+    #[must_use]
+    fn selected_edge(&self) -> Option<viewport::DocumentEdgeSelection> {
+        self.selected_edges.last().copied()
+    }
+
+    /// The most recently picked vertex.
+    #[must_use]
+    fn selected_vertex(&self) -> Option<viewport::DocumentVertexSelection> {
+        self.selected_vertices.last().copied()
+    }
+
     fn clear_model_entity_selection(&mut self) {
-        self.selected_face = None;
-        self.selected_edge = None;
-        self.selected_vertex = None;
+        self.selected_faces.clear();
+        self.selected_edges.clear();
+        self.selected_vertices.clear();
         self.selected_faces.clear();
         self.selected_edges.clear();
         self.selected_vertices.clear();
@@ -6407,9 +6440,6 @@ impl KernelLabApp {
         } else {
             self.selected_faces.push(selection);
         }
-        self.selected_face = self.selected_faces.last().map(|selection| selection.face);
-        self.selected_edge = self.selected_edges.last().copied();
-        self.selected_vertex = self.selected_vertices.last().copied();
     }
 
     fn select_model_edge(&mut self, selection: viewport::DocumentEdgeSelection, additive: bool) {
@@ -6456,9 +6486,6 @@ impl KernelLabApp {
                 }
             }
         }
-        self.selected_edge = self.selected_edges.last().copied();
-        self.selected_face = self.selected_faces.last().map(|selection| selection.face);
-        self.selected_vertex = self.selected_vertices.last().copied();
     }
 
     fn select_model_vertex(
@@ -6475,9 +6502,6 @@ impl KernelLabApp {
         } else {
             self.selected_vertices.push(selection);
         }
-        self.selected_vertex = self.selected_vertices.last().copied();
-        self.selected_face = self.selected_faces.last().map(|selection| selection.face);
-        self.selected_edge = self.selected_edges.last().copied();
     }
 
     fn set_body_visibility(&mut self, index: usize, visible: bool) {
@@ -6497,9 +6521,6 @@ impl KernelLabApp {
                 .retain(|selection| selection.body.get() != body_id.get());
             self.selected_vertices
                 .retain(|selection| selection.body.get() != body_id.get());
-            self.selected_face = self.selected_faces.last().map(|selection| selection.face);
-            self.selected_edge = self.selected_edges.last().copied();
-            self.selected_vertex = self.selected_vertices.last().copied();
         }
     }
 
@@ -7281,7 +7302,7 @@ impl KernelLabApp {
             4.0
         };
         self.extruded_sketch_revision = None;
-        self.selected_face = None;
+        self.selected_faces.clear();
         self.face_sketch_context = None;
         self.leave_sketch_mode();
         self.sketch_finish_issue = None;
@@ -7306,7 +7327,7 @@ impl KernelLabApp {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
-        self.selected_face = None;
+        self.selected_faces.clear();
         self.sketch = SketchCanvasState::new(self.selected_origin_plane);
         self.active_sketch_tool = ToolVariant::Select;
         self.sketch_support = SketchSupport::Origin {
@@ -7497,7 +7518,7 @@ impl KernelLabApp {
         self.pending_face_sketch = None;
         self.clear_transform_preview();
         self.pending_operation = None;
-        self.selected_face = None;
+        self.selected_faces.clear();
         self.leave_sketch_mode();
         self.active_tool = ActiveTool::Select;
         self.model_body_kind = ModelBodyKind::SketchExtrusion;
@@ -7614,7 +7635,7 @@ impl KernelLabApp {
                 ) {
                     self.pending_operation = None;
                 }
-                self.selected_face = None;
+                self.selected_faces.clear();
                 self.last_attempt = Attempt::Accepted {
                     operation: "Cuboid committed",
                 };
@@ -7983,7 +8004,7 @@ impl KernelLabApp {
             return;
         }
         self.forget_picked_ribbon_tab();
-        if self.selected_face.is_some() && self.active_component_instance().is_some() {
+        if self.selected_face().is_some() && self.active_component_instance().is_some() {
             self.document_status = Some(
                 "Library component faces are read-only in this workspace; edit the source part or start an origin-plane sketch"
                     .into(),
@@ -8003,7 +8024,7 @@ impl KernelLabApp {
         // in-place edit of the finished one — which is how a second profile
         // used to land inside the first sketch and rewrite it.
         let active_canvas_is_committed = self.sketch_finished;
-        if let Some(selected_face) = self.selected_face {
+        if let Some(selected_face) = self.selected_face().map(|selection| selection.face) {
             let already_on_selected_face = matches!(
                 &self.sketch_support,
                 SketchSupport::PlanarFace { face, .. } if *face == selected_face
@@ -8227,7 +8248,7 @@ impl KernelLabApp {
     /// Recomputed rather than captured: the answer is measured in the display
     /// transform and the motion phase, and a captured one goes stale in both.
     fn selected_face_camera_target(&self) -> Option<(PlanarFrame3, Point3, f64)> {
-        let face = self.selected_face?;
+        let face = self.selected_face()?.face;
         let body = self.displayed.as_ref()?;
         let support = NativeKernel::planar_face_support(&body.snapshot, face).ok()?;
         self.face_support_camera_target(&support)
@@ -9198,7 +9219,7 @@ impl KernelLabApp {
     }
 
     fn selected_face_push_pull_support(&self) -> Option<PlanarFaceSupport> {
-        let face = self.selected_face?;
+        let face = self.selected_face()?.face;
         let body = self.displayed.as_ref()?;
         let support = NativeKernel::planar_face_support(&body.snapshot, face).ok()?;
         (support.inner_boundaries.is_empty() && support.boundary.len() >= 3).then_some(support)
@@ -10507,7 +10528,7 @@ impl KernelLabApp {
                 }
                 self.clear_transform_preview();
                 self.pending_operation = None;
-                self.selected_face = None;
+                self.selected_faces.clear();
                 // The extents belonged to the extrusion that just committed,
                 // and the recipe carries them now. Leaving them set handed the
                 // next extrusion a face it never asked for, which then
@@ -10795,7 +10816,7 @@ impl KernelLabApp {
                 }
                 self.clear_transform_preview();
                 self.pending_operation = None;
-                self.selected_face = remapped_selection;
+                self.set_selected_face_reference(remapped_selection);
                 self.sketch_extrusion_issue = None;
                 self.model_body_kind = ModelBodyKind::PushedPulled;
                 self.sync_active_body_record();
@@ -10914,7 +10935,8 @@ impl KernelLabApp {
                     return;
                 };
                 let feature_id = appended.feature;
-                let remapped_selection = self.selected_face.and_then(|selected| {
+                let remapped_selection = self.selected_face().and_then(|selection| {
+                    let selected = selection.face;
                     outcome
                         .report
                         .history
@@ -10943,7 +10965,7 @@ impl KernelLabApp {
                 });
                 self.face_sketch_context = None;
                 self.body_pivot = Some(next_pivot);
-                self.selected_face = remapped_selection;
+                self.set_selected_face_reference(remapped_selection);
                 self.clear_transform_preview();
                 self.sync_active_body_record();
                 self.archive_displayed_body();
@@ -12174,7 +12196,7 @@ impl KernelLabApp {
         {
             return (plane.frame, plane.name.clone());
         }
-        if let Some(face_ref) = self.selected_face
+        if let Some(face_ref) = self.selected_face().map(|selection| selection.face)
             && let Some(index) = self.active_body_index()
             && let Ok(support) =
                 NativeKernel::planar_face_support(&self.bodies[index].body.snapshot, face_ref)
@@ -12243,7 +12265,7 @@ impl KernelLabApp {
             preset,
             SolidFeaturePreset::Hole | SolidFeaturePreset::Rib | SolidFeaturePreset::HolePattern
         ) {
-            let Some(face) = self.selected_face else {
+            let Some(face) = self.selected_face().map(|selection| selection.face) else {
                 self.document_status =
                     Some("Select a planar face for Hole, Rib or Hole pattern".to_owned());
                 return;
@@ -12293,12 +12315,12 @@ impl KernelLabApp {
         } else if preset == SolidFeaturePreset::Shell {
             // The selected face is the one the shell opens. With none
             // selected the body hollows closed, around a void.
-            self.document_status = Some(if self.selected_face.is_some() {
+            self.document_status = Some(if self.selected_face().is_some() {
                 "Shell staged, open at the selected face".to_owned()
             } else {
                 "Shell staged closed · select a face first to open one".to_owned()
             });
-            (self.selected_face, None)
+            (self.selected_face().map(|selection| selection.face), None)
         } else if preset == SolidFeaturePreset::Mirror {
             let (plane_frame, plane_name) = self.browser_mirror_plane();
             let target_count = self.browser_selected_body_indices().len().max(1);
@@ -12391,7 +12413,6 @@ impl KernelLabApp {
                 }
             }
         }
-        self.selected_edge = self.selected_edges.last().copied();
     }
 
     fn execute_preset_feature(
@@ -12738,7 +12759,7 @@ impl KernelLabApp {
         self.pending_operation = None;
         self.history_scrub_position = self.document.history_position();
         self.selected_history_feature = Some(appended.feature);
-        self.selected_face = None;
+        self.selected_faces.clear();
         if matches!(
             preset,
             SolidFeaturePreset::Chamfer | SolidFeaturePreset::Fillet
@@ -13079,8 +13100,8 @@ impl KernelLabApp {
             });
         };
         let faces = self
-            .selected_face
-            .map(|face| viewport::tangent_face_group(scene, face))
+            .selected_face()
+            .map(|selection| viewport::tangent_face_group(scene, selection.face))
             .unwrap_or_default();
         for triangle in &scene.triangles {
             if faces.contains(&triangle.source_face) {
@@ -13139,16 +13160,16 @@ impl KernelLabApp {
     /// is the same kernel answer "Normal to face" needs, so the two items can
     /// never disagree about whether this face is flat.
     fn face_sketch_available(&self) -> bool {
-        self.selected_face.is_some()
+        self.selected_face().is_some()
             && self.pending_operation.is_none()
             && self.history_is_at_end()
             && self.active_component_instance().is_none()
             && self.active_document_sketch_is_available()
             && self
-                .selected_face
+                .selected_face()
                 .zip(self.displayed.as_ref())
-                .is_some_and(|(face, body)| {
-                    NativeKernel::planar_face_support(&body.snapshot, face).is_ok()
+                .is_some_and(|(selection, body)| {
+                    NativeKernel::planar_face_support(&body.snapshot, selection.face).is_ok()
                 })
     }
 
@@ -15805,9 +15826,9 @@ impl KernelLabApp {
         if !self.measured_edge_geometry().is_empty() || self.measured_face_area().is_some() {
             return Some(ContextualSubject::Measurement);
         }
-        if self.selected_face.is_some()
-            || self.selected_edge.is_some()
-            || self.selected_vertex.is_some()
+        if self.selected_face().is_some()
+            || self.selected_edge().is_some()
+            || self.selected_vertex().is_some()
         {
             return Some(ContextualSubject::Selection);
         }
@@ -16609,7 +16630,7 @@ impl KernelLabApp {
         self.workbench_mode == WorkbenchMode::Model
             && self.pending_operation.is_none()
             && self.sketch.entities().is_empty()
-            && self.selected_face.is_some()
+            && self.selected_face().is_some()
     }
 
     /// Whether the chamfer/fillet editor is on screen. Same slot, same reason.
@@ -17387,9 +17408,9 @@ impl KernelLabApp {
                 }
 
                 if shows(ContextualSubject::Selection)
-                    && (self.selected_face.is_some()
-                        || self.selected_edge.is_some()
-                        || self.selected_vertex.is_some())
+                    && (self.selected_face().is_some()
+                        || self.selected_edge().is_some()
+                        || self.selected_vertex().is_some())
                 {
                     card(ui, "selection_properties", "SELECTION", &mut |ui| {
                         // Name/value rows, with the sentence explaining what the
@@ -17417,19 +17438,19 @@ impl KernelLabApp {
                                 ),
                             );
                         }
-                        let (kind, id, detail) = if let Some(face) = self.selected_face {
+                        let (kind, id, detail) = if let Some(face) = self.selected_face() {
                             (
                                 "Face",
-                                face.entity.to_string(),
+                                face.face.entity.to_string(),
                                 "Faces can host sketches, push/pull operations, and face-based features.",
                             )
-                        } else if let Some(edge) = self.selected_edge {
+                        } else if let Some(edge) = self.selected_edge() {
                             (
                                 "Edge",
                                 edge.edge.entity.to_string(),
                                 "This edge can be used by Chamfer or Fillet.",
                             )
-                        } else if let Some(vertex) = self.selected_vertex {
+                        } else if let Some(vertex) = self.selected_vertex() {
                             (
                                 "Vertex",
                                 vertex.vertex.entity.to_string(),
@@ -17484,7 +17505,7 @@ impl KernelLabApp {
 
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
-                    && ((self.sketch.entities().is_empty() && self.selected_face.is_some())
+                    && ((self.sketch.entities().is_empty() && self.selected_face().is_some())
                         || matches!(
                             self.pending_operation,
                             Some(PendingOperation::PushPullFace { .. })
@@ -18232,9 +18253,9 @@ impl KernelLabApp {
                 theme::muted()
             },
         );
-        if let Some(face) = self.selected_face {
+        if let Some(face) = self.selected_face() {
             ui.label(
-                RichText::new(format!("Face #{} · exact boundary", face.entity))
+                RichText::new(format!("Face #{} · exact boundary", face.face.entity))
                     .small()
                     .color(theme::muted()),
             );
@@ -19272,9 +19293,7 @@ impl KernelLabApp {
             .active_body_id()
             .map(|body| viewport::BodyInstanceKey::new(body.get()));
         let face_pick_armed = self.extrusion_face_pick_armed();
-        let selected = self.selected_face.and_then(|face| {
-            active_body.map(|body| viewport::DocumentFaceSelection { body, face })
-        });
+        let selected = self.selected_face();
         let measurement = self.current_measurement_annotation();
         let available = ui.available_size();
         let viewport_size =
@@ -19412,8 +19431,8 @@ impl KernelLabApp {
                         self.edge_overlay,
                         self.model_display_mode,
                         selected,
-                        self.selected_edge,
-                        self.selected_vertex,
+                        self.selected_edge(),
+                        self.selected_vertex(),
                         &self.selected_faces,
                         &self.selected_edges,
                         &self.selected_vertices,
@@ -19752,12 +19771,12 @@ impl KernelLabApp {
             self.selected_faces.len() + self.selected_edges.len() + self.selected_vertices.len();
         let selected = if selection_count > 1 {
             format!("Model · {selection_count} selected")
-        } else if let Some(vertex) = self.selected_vertex {
+        } else if let Some(vertex) = self.selected_vertex() {
             format!("Model · Vertex #{}", vertex.vertex.entity)
-        } else if let Some(edge) = self.selected_edge {
+        } else if let Some(edge) = self.selected_edge() {
             format!("Model · Edge #{}", edge.edge.entity)
         } else {
-            self.selected_face.map_or_else(
+            self.selected_face().map_or_else(
                 || {
                     let solid_count = self
                         .active_body_index()
@@ -19768,7 +19787,7 @@ impl KernelLabApp {
                         browser_body_object_name(self.active_body_ordinal, solid_count)
                     )
                 },
-                |face| format!("Model · Face #{}", face.entity),
+                |face| format!("Model · Face #{}", face.face.entity),
             )
         };
         // Keep the breadcrumb beside the view cube. Centering it over the
@@ -19787,7 +19806,7 @@ impl KernelLabApp {
             "model_canvas_breadcrumb",
             title_rect,
             &selected,
-            if selection_count > 0 || self.selected_face.is_some() {
+            if selection_count > 0 || self.selected_face().is_some() {
                 theme::accent()
             } else {
                 theme::text()
@@ -22853,6 +22872,36 @@ fn build_planar_profile_extrusion_command(
     }
 }
 
+/// Picks one face on the active body, the way a viewport click would.
+///
+/// Tests used to assign a singular `selected_face` directly. There is no such
+/// field now: a pick is an entry in `selected_faces`, carrying the occurrence
+/// it belongs to (ADR 0041).
+#[cfg(test)]
+fn select_test_face(app: &mut KernelLabApp, face: EntityRef) {
+    let body = app.active_body_id().map_or_else(
+        || viewport::BodyInstanceKey::new(1),
+        |id| viewport::BodyInstanceKey::new(id.get()),
+    );
+    app.selected_faces.clear();
+    app.selected_faces
+        .push(viewport::DocumentFaceSelection { body, face });
+}
+
+/// Picks the first face the displayed body offers, which is what a test that
+/// merely needs "some face selected" is asking for.
+#[cfg(test)]
+fn select_first_test_face(app: &mut KernelLabApp) {
+    let face = app
+        .displayed
+        .as_ref()
+        .and_then(|displayed| displayed.scene.triangles.first())
+        .map(|triangle| triangle.source_face);
+    if let Some(face) = face {
+        select_test_face(app, face);
+    }
+}
+
 /// Appends one standalone 2×2×2 cuboid base body, for unit tests that need a
 /// second all-planar body to select and operate on.
 #[cfg(test)]
@@ -25017,7 +25066,7 @@ mod extrusion_workbench_tests {
                 ]
             },
         );
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         assert!(!app.start_face_sketch_camera_transition(support));
         app.sketch
             .stage_geometry(SketchGeometry::rectangle(
@@ -25134,7 +25183,7 @@ mod extrusion_workbench_tests {
                 ]
             },
         );
-        app.selected_face = Some(face);
+        select_test_face(app, face);
         assert!(!app.start_face_sketch_camera_transition(support));
         app.sketch
             .stage_geometry(SketchGeometry::rectangle(
@@ -26829,7 +26878,7 @@ mod extrusion_workbench_tests {
             .expect("analytic cap supports an exact sketch frame");
         assert!(!support.linear_profile_extrusion_supported);
 
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         app.animate_face_camera_transitions = false;
         assert!(!app.start_face_sketch_camera_transition(support));
         replace_finished_face_geometry(
@@ -26936,7 +26985,7 @@ mod extrusion_workbench_tests {
         let center = point((u_min + u_max) * 0.5, (v_min + v_max) * 0.5);
         let radius = (u_max - u_min).min(v_max - v_min) * 0.125;
 
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         app.animate_face_camera_transitions = false;
         assert!(!app.start_face_sketch_camera_transition(support));
         replace_finished_face_geometry(
@@ -27001,7 +27050,7 @@ mod extrusion_workbench_tests {
         let center = point((u_min + u_max) * 0.5, (v_min + v_max) * 0.5);
         let hole_radius = (u_max - u_min).min(v_max - v_min) * 0.125;
 
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         app.animate_face_camera_transitions = false;
         assert!(!app.start_face_sketch_camera_transition(support));
         replace_finished_face_geometry(
@@ -27047,7 +27096,7 @@ mod extrusion_workbench_tests {
                 .find(|triangle| triangle.role == FaceRole::PositiveZ)
                 .expect("positive Z face")
                 .source_face;
-            app.selected_face = Some(face);
+            select_test_face(&mut app, face);
             app.set_extrusion_distance_intent(distance);
 
             assert!(app.stage_face_push_pull());
@@ -27073,7 +27122,7 @@ mod extrusion_workbench_tests {
             );
             assert_eq!(app.feature_preview.entries.last().unwrap().kind, kind);
             assert_eq!(app.model_body_kind, ModelBodyKind::PushedPulled);
-            assert!(app.selected_face.is_some());
+            assert!(app.selected_face().is_some());
             assert!(app.pending_operation.is_none());
             assert!(app.move_history_cursor(2));
             assert_eq!(app.displayed_snapshot_id(), original);
@@ -27097,14 +27146,17 @@ mod extrusion_workbench_tests {
             .expect("positive Z face")
             .source_face;
         let original = app.displayed_snapshot_id();
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         app.set_extrusion_distance_intent(-5.0);
 
         assert!(app.stage_face_push_pull());
         assert!(app.confirm_pending_operation());
 
         assert_eq!(app.displayed_snapshot_id(), original);
-        assert_eq!(app.selected_face, Some(face));
+        assert_eq!(
+            app.selected_face().map(|selection| selection.face),
+            Some(face)
+        );
         assert_eq!(app.extrusion_distance, -5.0);
         assert_eq!(app.extrusion_mode, ExtrusionMode::Cut);
         assert!(matches!(
@@ -27188,7 +27240,7 @@ mod extrusion_workbench_tests {
             f64::midpoint(corner.u, next.u),
             f64::midpoint(corner.v, next.v),
         );
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         assert!(!app.start_face_sketch_camera_transition(support));
 
         let curves = app.face_sketch_snap_curves().to_vec();
@@ -28095,11 +28147,7 @@ mod extrusion_workbench_tests {
             (SolidFeaturePreset::Rib, true),
         ] {
             let mut app = KernelLabApp::default();
-            app.selected_face = app
-                .displayed
-                .as_ref()
-                .and_then(|displayed| displayed.scene.triangles.first())
-                .map(|triangle| triangle.source_face);
+            select_first_test_face(&mut app);
             app.stage_preset_feature(preset);
             assert!(app.confirm_pending_operation());
             let volume = app.displayed_measures().unwrap().volume;
@@ -28368,11 +28416,7 @@ mod extrusion_workbench_tests {
     fn the_ribbon_shells_the_active_body_open_at_the_selected_face() {
         let mut app = KernelLabApp::default();
         let before = app.displayed_measures().unwrap().volume;
-        app.selected_face = app
-            .displayed
-            .as_ref()
-            .and_then(|displayed| displayed.scene.triangles.first())
-            .map(|triangle| triangle.source_face);
+        select_first_test_face(&mut app);
         app.stage_preset_feature(SolidFeaturePreset::Shell);
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
         let after = app.displayed_measures().unwrap();
@@ -28406,7 +28450,7 @@ mod extrusion_workbench_tests {
     fn the_ribbon_shells_a_body_closed_when_no_face_is_selected() {
         let mut app = KernelLabApp::default();
         let before = app.displayed_measures().unwrap().volume;
-        app.selected_face = None;
+        app.selected_faces.clear();
         app.stage_preset_feature(SolidFeaturePreset::Shell);
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
         let displayed = app.displayed.as_ref().expect("a body");
@@ -28422,11 +28466,7 @@ mod extrusion_workbench_tests {
     fn the_ribbon_cuts_a_ring_of_holes_on_the_selected_face() {
         let mut app = KernelLabApp::default();
         let before = app.displayed_measures().unwrap().volume;
-        app.selected_face = app
-            .displayed
-            .as_ref()
-            .and_then(|displayed| displayed.scene.triangles.first())
-            .map(|triangle| triangle.source_face);
+        select_first_test_face(&mut app);
         app.stage_preset_feature(SolidFeaturePreset::HolePattern);
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
         let displayed = app.displayed.as_ref().expect("a body");
@@ -28454,11 +28494,7 @@ mod extrusion_workbench_tests {
         // one afterwards has to replay the branch below it into a genuinely
         // different solid.
         let mut app = KernelLabApp::default();
-        app.selected_face = app
-            .displayed
-            .as_ref()
-            .and_then(|displayed| displayed.scene.triangles.first())
-            .map(|triangle| triangle.source_face);
+        select_first_test_face(&mut app);
         app.stage_preset_feature(SolidFeaturePreset::Hole);
         assert!(app.confirm_pending_operation());
         let feature = app.selected_history_feature.expect("the hole is selected");
@@ -28514,11 +28550,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn a_feature_dimension_that_makes_no_sense_is_refused_without_touching_the_model() {
         let mut app = KernelLabApp::default();
-        app.selected_face = app
-            .displayed
-            .as_ref()
-            .and_then(|displayed| displayed.scene.triangles.first())
-            .map(|triangle| triangle.source_face);
+        select_first_test_face(&mut app);
         app.stage_preset_feature(SolidFeaturePreset::Hole);
         assert!(app.confirm_pending_operation());
         let feature = app.selected_history_feature.expect("the hole is selected");
@@ -28591,6 +28623,41 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// The singular selection is a view, so it cannot disagree with the
+    /// collection it reads. It used to be a field kept in sync by hand, and the
+    /// two drifted apart in both directions (ADR 0041).
+    #[test]
+    fn the_singular_selection_is_a_view_and_cannot_fall_out_of_step() {
+        let mut app = KernelLabApp::default();
+        assert_eq!(app.selected_face(), None);
+        assert_eq!(app.selected_edge(), None);
+
+        select_first_test_face(&mut app);
+        let picked = app.selected_face().expect("a face is picked");
+        assert_eq!(app.selected_faces.last().copied(), Some(picked));
+
+        // Clearing the collection clears the view. The old singular field
+        // survived this and went on naming a face nothing else believed in.
+        app.selected_faces.clear();
+        assert_eq!(app.selected_face(), None);
+    }
+
+    /// A picked face names the occurrence it belongs to. An `EntityRef` alone
+    /// is `{snapshot, entity, kind}` and cannot, so with two instances of one
+    /// part it could not say which face was clicked (ADR 0041).
+    #[test]
+    fn a_picked_face_carries_the_occurrence_it_belongs_to() {
+        let mut app = KernelLabApp::default();
+        let body = app.active_body_id().expect("default active body");
+        select_first_test_face(&mut app);
+        let picked = app.selected_face().expect("a face is picked");
+        assert_eq!(
+            picked.body.get(),
+            body.get(),
+            "the pick should name the body it came from"
+        );
+    }
+
     #[test]
     fn selected_edge_stages_exact_chamfer_and_fillet_with_persistent_history() {
         for preset in [SolidFeaturePreset::Chamfer, SolidFeaturePreset::Fillet] {
@@ -28606,7 +28673,7 @@ mod extrusion_workbench_tests {
                 body: viewport::BodyInstanceKey::new(body.get()),
                 edge,
             };
-            app.selected_edge = Some(selection);
+            app.selected_edges.clear();
             app.selected_edges.push(selection);
 
             app.stage_preset_feature(preset);
@@ -28634,7 +28701,7 @@ mod extrusion_workbench_tests {
                 panic!("edge finish must be a persistent targeted action")
             };
             assert_eq!(targeted.target().kind, EntityKind::Edge);
-            assert!(app.selected_edge.is_none());
+            assert!(app.selected_edge().is_none());
             assert!(app.selected_edges.is_empty());
 
             let json = app.native_document_json().expect("serialize edge finish");
@@ -28800,7 +28867,6 @@ mod extrusion_workbench_tests {
                 edge: edge.source_edge,
             })
             .collect();
-        app.selected_edge = app.selected_edges.last().copied();
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
         assert!(app.confirm_pending_operation());
         let ReplayAction::TargetedKernel(targeted) =
@@ -28936,7 +29002,6 @@ mod extrusion_workbench_tests {
             body,
             edge: edge.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         // A radius larger than the cuboid cannot be blended.
         app.edge_finish_distance = 1.0e6;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
@@ -28968,7 +29033,6 @@ mod extrusion_workbench_tests {
             body,
             edge: edge.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.2;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
 
@@ -29047,7 +29111,6 @@ mod extrusion_workbench_tests {
             })
             .collect();
         assert_eq!(app.selected_edges.len(), 3);
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.25;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
@@ -29124,7 +29187,6 @@ mod extrusion_workbench_tests {
             "the top perimeter contributes one U chain"
         );
         app.selected_edges = u_edges;
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.25;
         app.stage_preset_feature(SolidFeaturePreset::Chamfer);
 
@@ -29175,7 +29237,6 @@ mod extrusion_workbench_tests {
             body,
             edge: source.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.3;
         app.stage_preset_feature(SolidFeaturePreset::Chamfer);
         assert!(app.confirm_pending_operation());
@@ -29217,7 +29278,6 @@ mod extrusion_workbench_tests {
             body,
             edge: rail.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.1;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
         let preview = app
@@ -29248,7 +29308,6 @@ mod extrusion_workbench_tests {
             body,
             edge: edge.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.2;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
 
@@ -29323,7 +29382,6 @@ mod extrusion_workbench_tests {
                 edge: perpendicular.source_edge,
             },
         ];
-        app.selected_edge = app.selected_edges.last().copied();
         assert_eq!(
             app.edge_finish_selection_support(),
             EdgeFinishSelectionSupport::RegularizedBlendSet
@@ -29358,7 +29416,6 @@ mod extrusion_workbench_tests {
             body,
             edge: next_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         assert_eq!(
             app.edge_finish_selection_support(),
             EdgeFinishSelectionSupport::RegularizedBlendSet
@@ -29395,7 +29452,6 @@ mod extrusion_workbench_tests {
             body,
             edge: first.source_edge,
         }];
-        app.selected_edge = app.selected_edges.last().copied();
         app.edge_finish_distance = 0.2;
         app.stage_preset_feature(SolidFeaturePreset::Fillet);
         assert!(app.pending_operation.is_some());
@@ -29404,7 +29460,6 @@ mod extrusion_workbench_tests {
             body,
             edge: perpendicular.source_edge,
         });
-        app.selected_edge = app.selected_edges.last().copied();
         assert!(app.current_edge_finish_preview().is_some());
         assert!(app.confirm_pending_operation());
         assert!(app.pending_operation.is_none());
@@ -29631,7 +29686,7 @@ mod circle_extrude_repro {
             .expect("the default body has faces")
             .source_face;
         assert!(!app.frame_selection(), "nothing selected frames nothing");
-        app.selected_face = Some(face);
+        select_test_face(&mut app, face);
         let selection = app
             .selection_world_bounds()
             .expect("a selected face has bounds");
