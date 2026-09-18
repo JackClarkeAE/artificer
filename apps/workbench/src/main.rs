@@ -1,3 +1,13 @@
+// A release build is a desktop application, and a desktop application does not
+// come with a console attached. Windows gives every console-subsystem binary
+// one whether it writes to it or not, so Artificer launched with a black
+// terminal sitting behind it that never showed anything worth reading.
+//
+// Debug builds keep theirs: that window is where a developer's `dbg!`, panic
+// messages, and wgpu's backend chatter go, and losing it would cost more than
+// the tidiness is worth.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use artificer_workbench::documents::WorkbenchShell;
 
 fn main() -> eframe::Result<()> {

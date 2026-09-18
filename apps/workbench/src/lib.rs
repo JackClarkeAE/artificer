@@ -793,6 +793,7 @@ enum EdgeFinishSelectionSupport {
     Empty,
     MixedBodies,
     CurvedOrPartialEdge,
+    MixedRimAndStraight,
 }
 
 impl EdgeFinishSelectionSupport {
@@ -811,6 +812,7 @@ impl EdgeFinishSelectionSupport {
             Self::Empty => "SELECT EDGES",
             Self::MixedBodies => "ONE BODY REQUIRED",
             Self::CurvedOrPartialEdge => "EDGE SET UNSUPPORTED",
+            Self::MixedRimAndStraight => "TWO FEATURES, NOT ONE",
         }
     }
 
@@ -829,6 +831,9 @@ impl EdgeFinishSelectionSupport {
             Self::MixedBodies => "Every edge in one finish feature must belong to the active body.",
             Self::CurvedOrPartialEdge => {
                 "Only complete cap rims and straight prism edges support finishes; partial arcs and other curved carriers remain gated."
+            }
+            Self::MixedRimAndStraight => {
+                "A round rim and a straight edge finish by different exact routes and cannot share one feature. Finish the rim, then the straight edges, or the other way about."
             }
         }
     }
@@ -9926,8 +9931,20 @@ impl KernelLabApp {
                 .selected_edges
                 .iter()
                 .all(|selection| rim_members.contains(&selection.edge.entity.0));
-            return if carriers_complete && only_rims {
-                EdgeFinishSelectionSupport::ExactRimBlend
+            if carriers_complete && only_rims {
+                return EdgeFinishSelectionSupport::ExactRimBlend;
+            }
+            // A round rim and a straight edge in one pick is not a partial
+            // arc, and saying so as though it were sends the user hunting for
+            // a selection fault that is not there. The two travel different
+            // kernel paths — an exact rim blend, and a regularized prism
+            // blend — so they are two features, and that is what to say.
+            let has_straight = self
+                .selected_edges
+                .iter()
+                .any(|selection| !rim_members.contains(&selection.edge.entity.0));
+            return if has_straight {
+                EdgeFinishSelectionSupport::MixedRimAndStraight
             } else {
                 EdgeFinishSelectionSupport::CurvedOrPartialEdge
             };
@@ -30116,6 +30133,156 @@ mod extrusion_workbench_tests {
         assert_eq!(
             app.edge_finish_selection_support(),
             EdgeFinishSelectionSupport::RegularizedBlendSet
+        );
+    }
+
+    /// A body carrying both a round rim and straight edges, which is what any
+    /// sketch with a circle and a rectangle extrudes to.
+    fn circle_and_box_body() -> (KernelLabApp, viewport::BodyInstanceKey) {
+        let mut app = KernelLabApp::default();
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.sketch = SketchCanvasState::new(app.selected_origin_plane);
+        for geometry in [
+            SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(2.0, 0.0)),
+            SketchGeometry::rectangle(SketchPoint::new(6.0, -2.0), SketchPoint::new(10.0, 2.0)),
+        ] {
+            let entity = app.sketch.stage_geometry(geometry).expect("stages");
+            app.commit_sketch_stroke(entity);
+        }
+        app.sketch.clear_region_selection();
+        assert!(
+            app.sketch
+                .select_region_at_point(SketchPoint::new(0.0, 0.0), false)
+        );
+        assert!(
+            app.sketch
+                .select_region_at_point(SketchPoint::new(8.0, 0.0), true)
+        );
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let sketch_index = app.active_sketch_index.expect("committed sketch");
+        assert!(app.activate_committed_sketch(sketch_index));
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let body_id = app.active_body_id().expect("extruded body");
+        let body = viewport::BodyInstanceKey::new(body_id.get());
+        (app, body)
+    }
+
+    /// One round rim and one straight edge, picked the way the viewport picks
+    /// them.
+    fn a_rim_and_a_straight_edge(app: &KernelLabApp) -> (EntityRef, EntityRef) {
+        let scene = &app.displayed.as_ref().expect("a body").scene;
+        let snapshot = &app.displayed.as_ref().expect("a body").snapshot;
+        let mut rim = None;
+        let mut straight = None;
+        for edge in scene.edges.iter().filter(|edge| !edge.is_smooth) {
+            let group =
+                NativeKernel::carrier_edge_group(snapshot, edge.source_edge).unwrap_or_default();
+            if group.len() > 1 {
+                rim.get_or_insert(edge.source_edge);
+            } else {
+                straight.get_or_insert(edge.source_edge);
+            }
+        }
+        (
+            rim.expect("the cylinder contributes a round rim"),
+            straight.expect("the box contributes straight edges"),
+        )
+    }
+
+    /// A whole round rim finishes exactly, on its own.
+    #[test]
+    fn a_round_rim_on_its_own_is_an_exact_rim_blend() {
+        let (mut app, body) = circle_and_box_body();
+        let (rim, _) = a_rim_and_a_straight_edge(&app);
+        app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+        app.apply_tangent_edge_chain();
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::ExactRimBlend
+        );
+    }
+
+    /// A straight edge on its own finishes too.
+    #[test]
+    fn a_straight_edge_on_its_own_is_a_regularized_blend() {
+        let (mut app, body) = circle_and_box_body();
+        let (_, straight) = a_rim_and_a_straight_edge(&app);
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body,
+                edge: straight,
+            },
+            false,
+        );
+        app.apply_tangent_edge_chain();
+        assert!(
+            app.edge_finish_selection_support().can_commit(),
+            "a straight prism edge is finishable on its own"
+        );
+    }
+
+    /// Shift-clicking both is refused — the two travel different exact kernel
+    /// routes and cannot share one feature.
+    ///
+    /// This is the first test of a *refusal*: every other assertion on this
+    /// gate picks a selection it is known to accept, so nothing said what it
+    /// rejects or why. The point here is the message. It used to read "partial
+    /// arcs and other curved carriers remain gated", which describes a
+    /// selection fault that is not present and sent the user hunting for one,
+    /// while the preview sat on screen showing the fillet they had asked for.
+    #[test]
+    fn a_round_rim_and_a_straight_edge_together_say_they_are_two_features() {
+        let (mut app, body) = circle_and_box_body();
+        let (rim, straight) = a_rim_and_a_straight_edge(&app);
+        app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+        app.apply_tangent_edge_chain();
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body,
+                edge: straight,
+            },
+            true,
+        );
+        app.apply_tangent_edge_chain();
+
+        let support = app.edge_finish_selection_support();
+        assert_eq!(support, EdgeFinishSelectionSupport::MixedRimAndStraight);
+        assert!(!support.can_commit());
+        assert!(
+            support.detail().contains("cannot share one feature"),
+            "the refusal must name the real reason, and says {:?}",
+            support.detail()
+        );
+    }
+
+    /// The preview stages and draws even when the selection cannot commit.
+    ///
+    /// That is deliberate — seeing the blend is how you judge the radius — but
+    /// it is also why a refusal has to explain itself: the picture says yes
+    /// while the panel says no, and only the words reconcile them.
+    #[test]
+    fn a_refused_edge_set_still_previews_and_still_explains_itself() {
+        let (mut app, body) = circle_and_box_body();
+        let (rim, straight) = a_rim_and_a_straight_edge(&app);
+        app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body,
+                edge: straight,
+            },
+            true,
+        );
+        app.edge_finish_distance = 0.2;
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+
+        assert!(app.pending_operation.is_some(), "the preview stages");
+        assert!(app.current_edge_finish_preview().is_some(), "and draws");
+        let status = app.document_status.clone().expect("a status line");
+        assert!(
+            status.contains("cannot share one feature"),
+            "the status must say why it will not commit, and says {status:?}"
         );
     }
 
