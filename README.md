@@ -25,6 +25,18 @@
 
 ---
 
+## What is new in 0.99.6
+
+The Boolean engine used to draw its domain around crossings that pass clean
+through, and fail closed on everything else. Two of those "everything else"
+cases turn out to be things you do constantly, and both are answered now.
+
+- **A finish standing apart works against a corner that was already rounded.** Not just against a flat one. Take two edges of a corner as a joined blend, then round the third beside them rather than into them, and it cuts — landing exactly on the union of three quarter-round prisms, whichever order the three are taken in. What made this possible is that a *tangency* is now imprinted like any other crossing rather than refused. A band touches the walls it rolls between; that is what makes it a band, not an accident. The pipeline only ever needed each piece of boundary to be wholly inside or wholly outside the other shape, and at a touch it is — the two meet and part without either passing through.
+- **Two solids that meet on a whole face union into one solid.** Previously a shared face was a coincident boundary and the engine declined to guess which side the material was on. It now reads that from which way each boundary runs — material lies to the left of an oriented loop, so two stretches either run together or against each other, and that settles it. Two boxes sharing a face become one box, with the shared face gone from the result.
+- **Patterned copies that overlap merge**, instead of refusing. A box stepped along its own length is now one continuous run of material.
+- **An interference study can say how much two parts overlap** when they share a face plane, rather than only that they interfere.
+- **Contacts of no width still refuse, deliberately.** A cylinder touching a plate along a single line would weld two solids at a seam with no thickness, which is not a solid at all. This release is about contacts that bound material, not about admitting results that cannot be manufactured.
+
 ## What is new in 0.99.5
 
 A release about one word in the Boolean engine: tangency. A fillet's band
