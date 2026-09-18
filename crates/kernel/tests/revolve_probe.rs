@@ -254,6 +254,7 @@ fn a_revolved_shaft_still_takes_a_rim_fillet() {
             target_edges: rim,
             kind: EdgeFinishKind::Fillet,
             distance: 1.0,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&shaft, &request, &CancellationToken::new())

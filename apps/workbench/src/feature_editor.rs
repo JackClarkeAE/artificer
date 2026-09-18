@@ -466,6 +466,7 @@ mod tests {
                 target_edges: vec![edge()],
                 kind: EdgeFinishKind::Fillet,
                 distance: 1.0,
+                standing_apart: false,
             },
             KernelCommand::MakeCuboid {
                 origin: Point3::new(0.0, 0.0, 0.0),

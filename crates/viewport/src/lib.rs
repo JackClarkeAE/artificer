@@ -4303,6 +4303,93 @@ fn paint_edge_finish_handle(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where the profile sits at each end of every frame.
+///
+/// A frame is one tessellation chord with the inward basis its own two
+/// triangles give it. Sweeping that basis straight along the chord is exact
+/// for a straight edge and wrong for every other: on a rim the basis turns
+/// from chord to chord, so each band ended where the next one did not begin
+/// and the preview drew a ring of loose quads with wedges of nothing between
+/// them. The model underneath was exact the whole time; only the picture was
+/// torn, which is worse than an honest absence because it reads as a broken
+/// part.
+///
+/// Chords that meet at a point share one basis here — the average of the ones
+/// meeting there — so consecutive bands start where the last finished and the
+/// strip closes around the rim. It is the mitre a swept band needs, computed
+/// where the chords already tell us they are neighbours.
+fn joined_frame_bases(frames: &[EdgeFinishLiveFrame]) -> Vec<[[Vector3; 2]; 2]> {
+    let mut joined = frames
+        .iter()
+        .map(|frame| [frame.inward, frame.inward])
+        .collect::<Vec<_>>();
+    let extent = frames
+        .iter()
+        .flat_map(|frame| frame.endpoints)
+        .fold(0.0_f64, |most, point| {
+            most.max(point.x.abs())
+                .max(point.y.abs())
+                .max(point.z.abs())
+        })
+        .max(1.0);
+    // Chords of one edge share their vertices exactly; two edges meeting at a
+    // seam share them to within the tessellator's own rounding.
+    let quantum = extent * 1.0e-9;
+    let key =
+        |point: Point3| [point.x, point.y, point.z].map(|value| (value / quantum).round() as i64);
+
+    let mut meeting: BTreeMap<[i64; 3], Vec<(usize, usize)>> = BTreeMap::new();
+    for (index, frame) in frames.iter().enumerate() {
+        for end in 0..2 {
+            meeting
+                .entry(key(frame.endpoints[end]))
+                .or_default()
+                .push((index, end));
+        }
+    }
+
+    for members in meeting.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let reference = frames[members[0].0].inward;
+        let mut along = reference[0];
+        let mut across = reference[1];
+        for (index, _) in members.iter().skip(1) {
+            let [first, second] = frames[*index].inward;
+            // Which of the neighbour's two directions answers to which of
+            // ours is not given by their order: both are "inward", and the
+            // pairing that agrees more is the one that means the same thing.
+            let straight = dot_product(first, reference[0]) + dot_product(second, reference[1]);
+            let crossed = dot_product(second, reference[0]) + dot_product(first, reference[1]);
+            let (first, second) = if crossed > straight {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            along = add_vectors(along, first);
+            across = add_vectors(across, second);
+        }
+        let (Some(along), Some(across)) = (normalized_vector(along), normalized_vector(across))
+        else {
+            continue;
+        };
+        // Averaging two nearly-perpendicular pairs leaves them only nearly
+        // perpendicular, and the profile is built on the assumption that they
+        // are. One Gram-Schmidt step restores it.
+        let Some(across) = normalized_vector(add_vectors(
+            across,
+            scale_vector(along, -dot_product(across, along)),
+        )) else {
+            continue;
+        };
+        for (index, end) in members {
+            joined[*index][*end] = [along, across];
+        }
+    }
+    joined
+}
+
 fn paint_live_edge_finish_surfaces(
     painter: &egui::Painter,
     frames: &[EdgeFinishLiveFrame],
@@ -4320,41 +4407,47 @@ fn paint_live_edge_finish_surfaces(
         EdgeFinishKind::Fillet => Color32::from_rgb(82, 224, 174),
     };
     let fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 188);
+    let joined = joined_frame_bases(frames);
     let mut mesh = Mesh::default();
     let mut rails = Vec::<[Pos2; 2]>::new();
-    for frame in frames {
-        let [u, v] = frame.inward;
-        let point = |u_distance: f64, v_distance: f64| {
-            offset_point(
-                frame.endpoints[0],
-                add_vectors(scale_vector(u, u_distance), scale_vector(v, v_distance)),
-            )
-        };
-        let profile = match kind {
-            EdgeFinishKind::Chamfer => vec![point(distance, 0.0), point(0.0, distance)],
-            EdgeFinishKind::Fillet => {
-                const LIVE_ARC_SEGMENTS: usize = 16;
-                (0..=LIVE_ARC_SEGMENTS)
-                    .map(|step| {
-                        let angle =
-                            std::f64::consts::FRAC_PI_2 * step as f64 / LIVE_ARC_SEGMENTS as f64;
-                        point(
-                            distance * (1.0 - angle.sin()),
-                            distance * (1.0 - angle.cos()),
-                        )
-                    })
-                    .collect()
+    let projected =
+        |point: Point3| projection.camera_point(presentation.project_point(point, view));
+    for (frame, ends) in frames.iter().zip(&joined) {
+        let profile = |origin: Point3, basis: [Vector3; 2]| -> Vec<Point3> {
+            let [u, v] = basis;
+            let point = |u_distance: f64, v_distance: f64| {
+                offset_point(
+                    origin,
+                    add_vectors(scale_vector(u, u_distance), scale_vector(v, v_distance)),
+                )
+            };
+            match kind {
+                EdgeFinishKind::Chamfer => vec![point(distance, 0.0), point(0.0, distance)],
+                EdgeFinishKind::Fillet => {
+                    const LIVE_ARC_SEGMENTS: usize = 16;
+                    (0..=LIVE_ARC_SEGMENTS)
+                        .map(|step| {
+                            let angle = std::f64::consts::FRAC_PI_2 * step as f64
+                                / LIVE_ARC_SEGMENTS as f64;
+                            point(
+                                distance * (1.0 - angle.sin()),
+                                distance * (1.0 - angle.cos()),
+                            )
+                        })
+                        .collect()
+                }
             }
         };
-        let sweep = vector_between(frame.endpoints[0], frame.endpoints[1]);
-        let projected =
-            |point: Point3| projection.camera_point(presentation.project_point(point, view));
-        for pair in profile.windows(2) {
+        // Each end carries its own basis, so the band turns with the edge
+        // instead of being dragged along one chord's idea of inward.
+        let opening = profile(frame.endpoints[0], ends[0]);
+        let closing = profile(frame.endpoints[1], ends[1]);
+        for step in 0..opening.len().saturating_sub(1) {
             let quad = [
-                pair[0],
-                pair[1],
-                offset_point(pair[1], sweep),
-                offset_point(pair[0], sweep),
+                opening[step],
+                opening[step + 1],
+                closing[step + 1],
+                closing[step],
             ]
             .map(projected);
             let first = mesh.vertices.len() as u32;
@@ -4364,9 +4457,13 @@ fn paint_live_edge_finish_surfaces(
             mesh.add_triangle(first, first + 1, first + 2);
             mesh.add_triangle(first, first + 2, first + 3);
         }
-        if let (Some(first), Some(last)) = (profile.first(), profile.last()) {
-            rails.push([projected(*first), projected(offset_point(*first, sweep))]);
-            rails.push([projected(*last), projected(offset_point(*last, sweep))]);
+        for rail in [
+            (opening.first(), closing.first()),
+            (opening.last(), closing.last()),
+        ] {
+            if let (Some(from), Some(to)) = rail {
+                rails.push([projected(*from), projected(*to)]);
+            }
         }
     }
     if !mesh.vertices.is_empty() {
@@ -7715,6 +7812,92 @@ mod tests {
             assert_eq!(frame.endpoints, edge.endpoints);
             assert!(dot_product(frame.inward[0], frame.inward[1]).abs() <= 1.0e-4);
         }
+    }
+
+    /// Chords that meet share the basis the band is built on, so consecutive
+    /// bands meet too.
+    ///
+    /// A frame's basis comes from its own two triangles, and on a curved rim
+    /// that basis turns from chord to chord. Sweeping each chord with its own
+    /// basis left every band ending where the next did not begin — a ring of
+    /// loose quads with wedges of nothing between them, over a model that was
+    /// exact all along.
+    #[test]
+    fn frames_that_meet_agree_on_the_basis_their_bands_are_built_on() {
+        // A fan of chords turning through a quarter turn, as a rim's
+        // tessellation gives them: each chord's own inward radial differs from
+        // the next, while the axial inward is common to all.
+        const STEPS: usize = 8;
+        let radius = 4.0_f64;
+        let point_at = |step: usize| {
+            let angle = std::f64::consts::FRAC_PI_2 * step as f64 / STEPS as f64;
+            Point3::new(radius * angle.cos(), radius * angle.sin(), 0.0)
+        };
+        let frames = (0..STEPS)
+            .map(|step| {
+                let (from, to) = (point_at(step), point_at(step + 1));
+                let midpoint = Point3::new(
+                    (from.x + to.x) * 0.5,
+                    (from.y + to.y) * 0.5,
+                    (from.z + to.z) * 0.5,
+                );
+                // Inward radial for this chord, and the common axial.
+                let radial = normalized_vector(Vector3::new(-midpoint.x, -midpoint.y, 0.0))
+                    .expect("a chord away from the axis has a radial direction");
+                EdgeFinishLiveFrame {
+                    endpoints: [from, to],
+                    inward: [radial, Vector3::new(0.0, 0.0, -1.0)],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let joined = joined_frame_bases(&frames);
+        assert_eq!(joined.len(), frames.len());
+
+        for step in 0..frames.len() - 1 {
+            let closing = joined[step][1];
+            let opening = joined[step + 1][0];
+            for axis in 0..2 {
+                let agreement = dot_product(closing[axis], opening[axis]);
+                assert!(
+                    agreement >= 1.0 - 1.0e-12,
+                    "chords {step} and {} must share their basis at the point they \
+                     meet, and axis {axis} agrees only to {agreement}",
+                    step + 1
+                );
+            }
+        }
+
+        // The shared basis is still a basis: unit, and perpendicular.
+        for ends in &joined {
+            for basis in ends {
+                for axis in basis {
+                    let length = vector_length(*axis);
+                    assert!((length - 1.0).abs() <= 1.0e-12, "unit, not {length}");
+                }
+                let square = dot_product(basis[0], basis[1]);
+                assert!(square.abs() <= 1.0e-12, "perpendicular, not {square}");
+            }
+        }
+
+        // And it really did move: a chord's own basis is not what it ends up
+        // using, or there would have been nothing to fix.
+        let turned = (0..frames.len())
+            .any(|step| dot_product(joined[step][0][0], frames[step].inward[0]) < 1.0 - 1.0e-9);
+        assert!(turned, "the averaged basis differs from the per-chord one");
+    }
+
+    /// A lone chord keeps its own basis: there is nothing to average with, and
+    /// a straight edge was never the case that was wrong.
+    #[test]
+    fn a_lone_chord_keeps_the_basis_its_own_faces_gave_it() {
+        let frame = EdgeFinishLiveFrame {
+            endpoints: [Point3::new(0.0, 0.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            inward: [Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)],
+        };
+        let joined = joined_frame_bases(std::slice::from_ref(&frame));
+        assert_eq!(joined[0][0], frame.inward);
+        assert_eq!(joined[0][1], frame.inward);
     }
 
     #[test]

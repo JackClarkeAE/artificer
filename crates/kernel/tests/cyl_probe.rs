@@ -376,6 +376,7 @@ fn both_rim_fillets_stay_exact_and_centered() {
             target_edges: vec![rim_at(0.0), rim_at(100.0)],
             kind: artificer_protocol::EdgeFinishKind::Fillet,
             distance: 10.0,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base.snapshot, &fillet, &CancellationToken::new())
@@ -496,6 +497,7 @@ fn both_rim_chamfers_cut_exact_cone_bands() {
             target_edges: vec![rim_at(0.0), rim_at(100.0)],
             kind: artificer_protocol::EdgeFinishKind::Chamfer,
             distance: d,
+            standing_apart: false,
         },
     };
     let both = NativeKernel::execute(&base.snapshot, &both, &CancellationToken::new())

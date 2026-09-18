@@ -719,10 +719,19 @@ impl SketchDefinition {
         candidate
             .set_constraint_kind(constraint, restated, precision)
             .map_err(SketchTransactionError::ConstraintRejected)?;
-        // Whatever the caller named, plus whatever the relation is measured
-        // from. A dimension typed against a datum must move the thing being
-        // located and leave the datum where it is.
-        let anchored = held.into_iter().chain(datum).collect::<BTreeSet<_>>();
+        // A separation has no datum: both its ends are equals, so the caller
+        // says which one stays and the other moves, exactly as a line's length
+        // moves its end rather than its start.
+        //
+        // An ordinate does have one, and then the datum is the *only* anchor.
+        // Holding the caller's point as well would pin both sides of the
+        // equation and leave the solver nothing to move, so the relation would
+        // refuse every value but the one it already holds.
+        let anchored = if datum.is_empty() {
+            held.into_iter().collect::<BTreeSet<_>>()
+        } else {
+            datum.into_iter().collect::<BTreeSet<_>>()
+        };
         let after = candidate
             .solve_constraints_anchoring(&anchored, precision)
             .map_err(SketchTransactionError::ConstraintRejected)?;

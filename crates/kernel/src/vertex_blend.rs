@@ -231,6 +231,21 @@ enum EndKind {
         /// selected edge does not border.
         cap: usize,
     },
+    /// Two of the three edges here are selected, so their bands meet along one
+    /// seam and the third edge starts a blend's width further along (ADR 0043).
+    ///
+    /// Nothing closes this end: the seam *is* both bands' boundary, one curve
+    /// carried by two faces, so no patch is added and the corner needs none.
+    Mitre {
+        /// The face both selected edges border, which gains a corner where
+        /// their two tangency lines meet.
+        shared: usize,
+        /// The edge left sharp, which shortens to the seam's far end.
+        sharp: usize,
+        /// The two faces the sharp edge borders. Both meet the seam at the
+        /// same point, so they share one vertex.
+        flanks: [usize; 2],
+    },
 }
 
 impl EndPlan {
@@ -238,19 +253,28 @@ impl EndPlan {
         self.tangency.get(&face).copied()
     }
 
-    /// The three faces of a closed corner, or nothing at a run-out.
+    /// The three faces of a closed corner, or nothing at any other ending.
     const fn corner_faces(&self) -> Option<[usize; 3]> {
         match self.kind {
             EndKind::Corner { faces, .. } => Some(faces),
-            EndKind::Runout { .. } => None,
+            EndKind::Runout { .. } | EndKind::Mitre { .. } => None,
         }
     }
 
-    /// The face a run-out ends in, or nothing at a closed corner.
+    /// The face a run-out ends in, or nothing at any other ending.
     const fn cap_face(&self) -> Option<usize> {
         match self.kind {
-            EndKind::Corner { .. } => None,
+            EndKind::Corner { .. } | EndKind::Mitre { .. } => None,
             EndKind::Runout { cap, .. } => Some(cap),
+        }
+    }
+
+    /// The edge a mitre leaves sharp and the faces beside it, or nothing at
+    /// any other ending.
+    const fn mitred(&self) -> Option<(usize, [usize; 2])> {
+        match self.kind {
+            EndKind::Corner { .. } | EndKind::Runout { .. } => None,
+            EndKind::Mitre { sharp, flanks, .. } => Some((sharp, flanks)),
         }
     }
 }
@@ -406,6 +430,20 @@ impl<'a> Plan<'a> {
         for end in &ends {
             if let Some(faces) = end.corner_faces() {
                 touched.extend(faces);
+                continue;
+            }
+            if let Some((sharp, flanks)) = end.mitred() {
+                // The two bands already mark all three faces touched between
+                // them; what only the ending knows is that the edge it left
+                // sharp now starts at the seam's far end. Either flank names
+                // that point — they share it.
+                let slot = topology.edges[sharp]
+                    .value
+                    .vertices
+                    .iter()
+                    .position(|candidate| candidate.0 == end.vertex)
+                    .ok_or(VertexBlendError::DomainUnsupported)?;
+                moved.insert((sharp, slot), (end.vertex, flanks[0]));
                 continue;
             }
             let Some(cap) = end.cap_face() else { continue };
@@ -651,6 +689,53 @@ impl<'a> Plan<'a> {
     fn end_of(&self, vertex: usize) -> &EndPlan {
         &self.ends[self.ended[&vertex]]
     }
+
+    /// The one curve two bands of a mitred corner meet along (ADR 0043).
+    ///
+    /// Under a chamfer it is the line the two bevel planes share. Under a
+    /// fillet it is where two equal cylinders cross, which is a planar ellipse
+    /// about the ball centre: its minor axis reaches the shared face's new
+    /// corner at the blend radius, and its major axis reaches the sharp edge's
+    /// new start, further off by however far that corner leans. A quarter turn
+    /// carries it from one to the other.
+    fn build_seam(
+        &self,
+        builder: &mut Builder<'_>,
+        end: &EndPlan,
+    ) -> Result<(EdgeKey, VertexKey, VertexKey), VertexBlendError> {
+        let EndKind::Mitre { shared, flanks, .. } = end.kind else {
+            return Err(VertexBlendError::DomainUnsupported);
+        };
+        let near = builder.keys.corner_vertex[&(end.vertex, shared)];
+        let far = builder.keys.corner_vertex[&(end.vertex, flanks[0])];
+        // Stored from the far end, which is where the major axis points, so
+        // the quarter turn runs major-first and the radii keep their names.
+        let key = match self.kind {
+            EdgeFinishKind::Chamfer => builder.line_edge(far, near),
+            EdgeFinishKind::Fillet => {
+                let near_point = end
+                    .tangency_on(shared)
+                    .ok_or(VertexBlendError::DomainUnsupported)?;
+                let far_point = end
+                    .tangency_on(flanks[0])
+                    .ok_or(VertexBlendError::DomainUnsupported)?;
+                let minor =
+                    unit(near_point - end.centre).ok_or(VertexBlendError::DomainUnsupported)?;
+                let reach = far_point - end.centre;
+                let major_radius = reach.length();
+                let major = unit(reach).ok_or(VertexBlendError::DomainUnsupported)?;
+                builder.ellipse_edge(
+                    [far, near],
+                    end.centre,
+                    major,
+                    minor,
+                    major_radius,
+                    self.distance,
+                )
+            }
+        };
+        Ok((key, far, near))
+    }
 }
 
 /// Reads one selected edge, or reports that it is not this rung's to blend.
@@ -778,16 +863,21 @@ fn read_end(
             false,
         ));
     }
-    // Three of three is a corner patch and one of three is a run-out; two of
-    // three would have to fade the band out along the third edge, which this
-    // vocabulary cannot draw.
-    if unselected > 0 && incident.len() - unselected > 1 {
+    // Three of three is a corner patch, one of three is a run-out, and two of
+    // three is a seam the two bands share (ADR 0043). Only a vertex this rung
+    // cannot read at all is left, and the three-edge, three-face check below
+    // is what names that; this one catches a partly chosen corner of some
+    // other shape before the geometry is read.
+    if unselected > 0
+        && incident.len() - unselected > 1
+        && (incident.len() != 3 || faces.len() != 3)
+    {
         return Err(refuse(
             "VERTEX_BLEND_CORNER_INCOMPLETE",
             format!(
                 "A corner of this selection has {unselected} of its {} edges left out, and this \
-                 release has no exact patch for a corner blended only part way. Select the other \
-                 edge or edges at that corner as well, or blend it in a later feature.",
+                 release closes a corner only with all of them. Select the other edge or edges at \
+                 that corner as well, or blend it in a later feature.",
                 incident.len()
             ),
             false,
@@ -830,20 +920,19 @@ fn read_end(
         )
     };
     if unselected > 0 {
+        let frame = RunoutFrame {
+            faces,
+            normals,
+            offsets,
+            angle_tolerance,
+        };
+        if incident.len() - unselected > 1 {
+            return read_mitre(
+                topology, incidence, selected, edges, vertex, kind, distance, frame,
+            );
+        }
         return read_runout(
-            topology,
-            incidence,
-            selected,
-            edges,
-            vertex,
-            kind,
-            distance,
-            RunoutFrame {
-                faces,
-                normals,
-                offsets,
-                angle_tolerance,
-            },
+            topology, incidence, selected, edges, vertex, kind, distance, frame,
         );
     }
     match kind {
@@ -924,6 +1013,161 @@ fn read_end(
             })
         }
     }
+}
+
+/// Two of a corner's three edges, whose bands meet along one seam (ADR 0043).
+///
+/// The seam's two ends are closed forms of the corner's own planes and the
+/// blend size. Its near end is the shared face's new corner, at the blend size
+/// inside both of the other two faces; its far end is the new start of the
+/// edge left sharp, at the blend size inside the shared face. Everything else
+/// the ending needs — which band meets which face where — follows from those
+/// two points, because each band's tangency on the shared face runs to the
+/// near one and on its own flank to the far one.
+#[allow(clippy::too_many_arguments)]
+fn read_mitre(
+    topology: &Topology,
+    incidence: &Incidence,
+    selected: &BTreeMap<usize, usize>,
+    edges: &[EdgePlan],
+    vertex: usize,
+    kind: EdgeFinishKind,
+    distance: f64,
+    frame: RunoutFrame,
+) -> Result<EndPlan, VertexBlendError> {
+    let RunoutFrame {
+        faces,
+        normals,
+        offsets,
+        angle_tolerance,
+    } = frame;
+    let degenerate = || {
+        refuse(
+            "VERTEX_BLEND_CORNER_UNSUPPORTED",
+            "Three faces at one end of this selection are too nearly parallel for two bands to \
+             meet between them."
+                .to_owned(),
+            false,
+        )
+    };
+
+    // The seam's shape is derived for a corner of three mutually square faces
+    // (ADR 0043), where the two band axes cross at the ball centre and the
+    // trace on either band is a pure harmonic of its own azimuth. A corner
+    // that leans — a hexagonal pocket's, where the two walls meet at 120° —
+    // has a seam this rung has not certified, and keeps the answer it had.
+    for first in 0..3 {
+        for second in (first + 1)..3 {
+            if normals[first].dot(normals[second]).abs() > angle_tolerance {
+                return Err(VertexBlendError::DomainUnsupported);
+            }
+        }
+    }
+
+    let incident = &incidence.vertex_edges[vertex];
+    let sharp = *incident
+        .iter()
+        .find(|edge| !selected.contains_key(*edge))
+        .ok_or(VertexBlendError::DomainUnsupported)?;
+    let flank_pair = incidence.edge_faces[sharp].ok_or(VertexBlendError::DomainUnsupported)?;
+    let shared = *faces
+        .iter()
+        .find(|face| !flank_pair.contains(face))
+        .ok_or(VertexBlendError::DomainUnsupported)?;
+    let flanks = flank_pair;
+    let slot_of = |face: usize| {
+        faces
+            .iter()
+            .position(|candidate| *candidate == face)
+            .ok_or(VertexBlendError::DomainUnsupported)
+    };
+    let (shared_slot, flank_slots) = (slot_of(shared)?, [slot_of(flanks[0])?, slot_of(flanks[1])?]);
+
+    // The shared face's new corner: on that face, a blend's width inside both
+    // of the others.
+    let near = intersect_three_planes(
+        [
+            normals[shared_slot],
+            normals[flank_slots[0]],
+            normals[flank_slots[1]],
+        ],
+        [
+            offsets[shared_slot],
+            offsets[flank_slots[0]] - distance,
+            offsets[flank_slots[1]] - distance,
+        ],
+        angle_tolerance,
+    )
+    .ok_or_else(degenerate)?;
+    // The sharp edge's new start: on both its faces, a blend's width inside
+    // the shared one.
+    let far = intersect_three_planes(
+        [
+            normals[flank_slots[0]],
+            normals[flank_slots[1]],
+            normals[shared_slot],
+        ],
+        [
+            offsets[flank_slots[0]],
+            offsets[flank_slots[1]],
+            offsets[shared_slot] - distance,
+        ],
+        angle_tolerance,
+    )
+    .ok_or_else(degenerate)?;
+
+    // A fillet's seam is an arc of the ball's own surface, so the ball centre
+    // is what its geometry is written about; a chamfer needs no ball and keeps
+    // the vertex, exactly as a chamfer corner does.
+    let centre = match kind {
+        EdgeFinishKind::Fillet => intersect_three_planes(
+            normals,
+            [
+                offsets[0] - distance,
+                offsets[1] - distance,
+                offsets[2] - distance,
+            ],
+            angle_tolerance,
+        )
+        .ok_or_else(degenerate)?,
+        EdgeFinishKind::Chamfer => topology.vertices[vertex].value.point,
+    };
+
+    // Every edge beside the seam must be one this rung can shorten, the same
+    // condition a run-out puts on its neighbours.
+    if !matches!(topology.edges[sharp].value.curve, Curve3::Line { .. }) {
+        return Err(refuse(
+            "VERTEX_BLEND_RUNOUT_UNSUPPORTED",
+            "Two edges of one corner of this selection meet beside a curved third edge, which \
+             this release cannot shorten to meet their seam. Select that edge as well, or blend \
+             this corner in a later feature."
+                .to_owned(),
+            false,
+        ));
+    }
+    // Both selected edges have to be ones this vertex actually plans, or the
+    // seam would be written between bands that are not there.
+    for edge in incident {
+        if edge != &sharp && !selected.contains_key(edge) {
+            return Err(VertexBlendError::DomainUnsupported);
+        }
+    }
+    let _ = edges;
+
+    let mut tangency = BTreeMap::new();
+    tangency.insert(shared, near);
+    tangency.insert(flanks[0], far);
+    tangency.insert(flanks[1], far);
+    Ok(EndPlan {
+        vertex,
+        tangency,
+        centre,
+        kind: EndKind::Mitre {
+            shared,
+            sharp,
+            flanks,
+        },
+    })
 }
 
 /// What `read_end` already worked out about the three flat faces at a vertex,
@@ -1191,6 +1435,37 @@ impl Builder<'_> {
         key
     }
 
+    /// An elliptical edge, written `centre + u·(major·cos t) + v·(minor·sin t)`
+    /// over a quarter turn.
+    #[allow(clippy::too_many_arguments)]
+    fn ellipse_edge(
+        &mut self,
+        vertices: [VertexKey; 2],
+        center: Point3,
+        u: Vector3,
+        v: Vector3,
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> EdgeKey {
+        let key = EdgeKey(self.topology.edges.len());
+        let id = self.allocate();
+        self.topology.edges.push(Record {
+            id,
+            value: Edge {
+                vertices,
+                curve: Curve3::Ellipse {
+                    center,
+                    u,
+                    v,
+                    major_radius,
+                    minor_radius,
+                },
+                parameter_range: ParameterRange::new(0.0, std::f64::consts::FRAC_PI_2),
+            },
+        });
+        key
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn arc_edge(
         &mut self,
@@ -1286,8 +1561,20 @@ impl Plan<'_> {
             builder.keys.vertex.insert(index, key);
         }
         for end in &self.ends {
+            // A corner and a run-out meet each face they touch at a different
+            // point; a mitre's two flanks meet the seam at the same one, and
+            // one point is one vertex however many faces name it.
+            let mut placed: Vec<(Point3, VertexKey)> = Vec::new();
             for (face, point) in &end.tangency {
-                let key = builder.vertex(*point);
+                let key = placed
+                    .iter()
+                    .find(|(seen, _)| (*seen - *point).length() <= self.precision.linear_agreement)
+                    .map(|(_, key)| *key)
+                    .unwrap_or_else(|| {
+                        let key = builder.vertex(*point);
+                        placed.push((*point, key));
+                        key
+                    });
                 builder.keys.corner_vertex.insert((end.vertex, *face), key);
             }
         }
@@ -1337,6 +1624,17 @@ impl Plan<'_> {
         // the arc a fillet's ball leaves between the two faces, or the segment
         // a chamfer's bevel leaves there.
         for end in &self.ends {
+            // A mitre closes both its bands with one curve, not one each: the
+            // seam is where they meet, so it is a single edge two faces carry.
+            if end.mitred().is_some() {
+                let seam = self.build_seam(&mut builder, end)?;
+                for edge in &self.incidence.vertex_edges[end.vertex] {
+                    if self.selected.contains_key(edge) {
+                        builder.keys.corner_edge.insert((end.vertex, *edge), seam);
+                    }
+                }
+                continue;
+            }
             for edge in &self.incidence.vertex_edges[end.vertex] {
                 let Some(position) = self.selected.get(edge) else {
                     continue;
@@ -1581,7 +1879,9 @@ impl Builder<'_> {
         plane: Plane,
     ) -> Result<(EdgeKey, Orientation, Curve2, ParameterRange), VertexBlendError> {
         let edge = match end.kind {
-            EndKind::Corner { .. } => return Err(VertexBlendError::DomainUnsupported),
+            EndKind::Corner { .. } | EndKind::Mitre { .. } => {
+                return Err(VertexBlendError::DomainUnsupported);
+            }
             EndKind::Runout { edge, .. } => edge,
         };
         let plan = &self.plan.edges[self.plan.selected[&edge]];
@@ -1658,7 +1958,16 @@ impl Builder<'_> {
                 // normal and its length along the edge from the first corner.
                 let axis = plan.direction;
                 let origin = start.centre;
-                let length = (end.centre - origin).dot(axis);
+                // Where each end meets each face, along the band. A corner and
+                // a run-out both close square across the band, so all four
+                // read `0` or the full length; a mitre does not, because its
+                // seam leans from one face's tangency to the other's.
+                let along = |at: &EndPlan, face: usize| -> Result<f64, VertexBlendError> {
+                    let point = at
+                        .tangency_on(face)
+                        .ok_or(VertexBlendError::DomainUnsupported)?;
+                    Ok((point - origin).dot(axis))
+                };
                 (
                     Surface::Cylinder(Cylinder {
                         origin,
@@ -1669,10 +1978,10 @@ impl Builder<'_> {
                         angular_sign: 1.0,
                     }),
                     [
-                        Point2::new(0.0, length),
-                        Point2::new(0.0, 0.0),
-                        Point2::new(plan.sweep, 0.0),
-                        Point2::new(plan.sweep, length),
+                        Point2::new(0.0, along(end, plan.faces[0])?),
+                        Point2::new(0.0, along(start, plan.faces[0])?),
+                        Point2::new(plan.sweep, along(start, plan.faces[1])?),
+                        Point2::new(plan.sweep, along(end, plan.faces[1])?),
                     ],
                 )
             }
@@ -1707,13 +2016,57 @@ impl Builder<'_> {
         // an outward normal asks for.
         let entering = self.corner_crossing(plan, 0, plan.faces[0])?;
         let leaving = self.corner_crossing(plan, 1, plan.faces[1])?;
+        // A seam leans across the band, so on a cylinder its trace is not the
+        // straight line every square ending leaves. Two equal cylinders whose
+        // axes cross meet in the Steinmetz seam, and on either of them that
+        // seam is a pure harmonic of the azimuth about the point their axes
+        // share — which at a square corner is the ball centre this ending is
+        // already written about (ADR 0043).
+        //
+        // So the trace is `base + (crest − base)·cos(θ − θ_crest)`: `base` is
+        // where the ball centre sits along the band, the crest is at the flank
+        // tangency a whole blend radius off it, and the shared face's tangency
+        // sits at the zero crossing a quarter turn away.
+        let axis = plan.direction;
+        let band_origin = start.centre;
+        let crossing = |at: &EndPlan, from: Point2, to: Point2| -> (Curve2, ParameterRange) {
+            let straight = || Curve2::line_segment([from, to]);
+            if matches!(self.plan.kind, EdgeFinishKind::Chamfer) {
+                return straight();
+            }
+            let Some((_, flanks)) = at.mitred() else {
+                return straight();
+            };
+            // The band meets its flank at azimuth zero or at its full sweep,
+            // depending which of its two faces the seam leans away from.
+            let crest_at_zero = flanks.contains(&plan.faces[0]);
+            let (at_zero, at_sweep) = if from.x <= to.x {
+                (from.y, to.y)
+            } else {
+                (to.y, from.y)
+            };
+            let (phase, crest) = if crest_at_zero {
+                (0.0, at_zero)
+            } else {
+                (plan.sweep, at_sweep)
+            };
+            let base = (at.centre - band_origin).dot(axis);
+            (
+                Curve2::Harmonic {
+                    mean: base,
+                    amplitude: crest - base,
+                    phase,
+                },
+                ParameterRange::new(from.x, to.x),
+            )
+        };
         let uses = vec![
             {
                 let (pcurve, range) = Curve2::line_segment([corners[0], corners[1]]);
                 (forward, Orientation::Reverse, pcurve, range)
             },
             {
-                let (pcurve, range) = Curve2::line_segment([corners[1], corners[2]]);
+                let (pcurve, range) = crossing(start, corners[1], corners[2]);
                 (entering.0, entering.1, pcurve, range)
             },
             {
@@ -1721,7 +2074,7 @@ impl Builder<'_> {
                 (reverse, Orientation::Forward, pcurve, range)
             },
             {
-                let (pcurve, range) = Curve2::line_segment([corners[3], corners[0]]);
+                let (pcurve, range) = crossing(end, corners[3], corners[0]);
                 (leaving.0, leaving.1, pcurve, range)
             },
         ];

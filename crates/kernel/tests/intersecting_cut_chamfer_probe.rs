@@ -162,6 +162,7 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
             target_edges: vec![edge],
             kind: EdgeFinishKind::Chamfer,
             distance,
+            standing_apart: false,
         },
     };
     let outcome = NativeKernel::execute(&slot_cut, &request, &CancellationToken::new())

@@ -271,6 +271,19 @@ pub enum SketchRecipe {
         start: PointInput,
         end: PointInput,
     },
+    /// A straight edge of the host body, brought into the sketch frame so the
+    /// solver can measure against it.
+    ///
+    /// The body's own topology is not the sketch's to own, so this is a copy
+    /// rather than a live link: two endpoints in `(u, v)`, carrying the
+    /// [`Reference`](crate::SketchEntityRole::Reference) role so it is never a
+    /// material boundary and never a revolve axis. The projection is pinned at
+    /// creation, which is what makes the dimension move the sketch rather than
+    /// the edge.
+    ProjectedEdge {
+        start: PointInput,
+        end: PointInput,
+    },
     Polyline {
         vertices: Vec<PointInput>,
         closed: bool,
@@ -424,7 +437,7 @@ impl SketchRecipe {
             | Self::Polyline {
                 construction: true, ..
             } => crate::SketchEntityRole::Construction,
-            Self::Point { .. } => crate::SketchEntityRole::Reference,
+            Self::Point { .. } | Self::ProjectedEdge { .. } => crate::SketchEntityRole::Reference,
             _ => crate::SketchEntityRole::Profile,
         }
     }
@@ -440,7 +453,9 @@ impl SketchRecipe {
         };
         match self {
             Self::LegacyImportedProfile { .. } | Self::Point { .. } => {}
-            Self::Line { start, end } | Self::CentreLine { start, end } => {
+            Self::Line { start, end }
+            | Self::CentreLine { start, end }
+            | Self::ProjectedEdge { start, end } => {
                 push(start);
                 push(end);
             }
@@ -529,12 +544,18 @@ impl SketchRecipe {
                 *slot = position;
                 true
             }
-            (Self::Line { start, .. } | Self::CentreLine { start, .. }, PointOutputRole::Start) => {
-                place(start, position)
-            }
-            (Self::Line { end, .. } | Self::CentreLine { end, .. }, PointOutputRole::End) => {
-                place(end, position)
-            }
+            (
+                Self::Line { start, .. }
+                | Self::CentreLine { start, .. }
+                | Self::ProjectedEdge { start, .. },
+                PointOutputRole::Start,
+            ) => place(start, position),
+            (
+                Self::Line { end, .. }
+                | Self::CentreLine { end, .. }
+                | Self::ProjectedEdge { end, .. },
+                PointOutputRole::End,
+            ) => place(end, position),
             (Self::Polyline { vertices, .. }, PointOutputRole::Vertex(index)) => {
                 nth(vertices, index, position)
             }

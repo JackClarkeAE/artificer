@@ -195,7 +195,9 @@ pub fn evaluate_recipe(
         SketchRecipe::Point { position } => {
             builder.add_derived_point(PointOutputRole::Point, *position)?;
         }
-        SketchRecipe::Line { start, end } | SketchRecipe::CentreLine { start, end } => {
+        SketchRecipe::Line { start, end }
+        | SketchRecipe::CentreLine { start, end }
+        | SketchRecipe::ProjectedEdge { start, end } => {
             let start = builder.bind_input(*start, PointOutputRole::Start)?;
             let end = builder.bind_input(*end, PointOutputRole::End)?;
             builder.add_line(CurveOutputRole::Curve, entity_role, start, end)?;

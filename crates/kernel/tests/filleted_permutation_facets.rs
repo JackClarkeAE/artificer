@@ -252,6 +252,7 @@ fn finish_edges(
             target_edges,
             kind,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())

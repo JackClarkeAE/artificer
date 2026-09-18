@@ -111,6 +111,7 @@ fn filleted_slot() -> Snapshot {
             target_edges: top_rim(&base),
             kind: EdgeFinishKind::Fillet,
             distance: FILLET,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(&base, &request, &CancellationToken::new())

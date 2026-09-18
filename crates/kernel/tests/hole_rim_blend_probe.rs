@@ -132,6 +132,7 @@ fn finish(
             target_edges: targets,
             kind,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
@@ -447,6 +448,164 @@ fn the_bottom_rim_of_a_hole_chamfers_like_the_top() {
         &outcome.snapshot,
         solid - round_hole_chamfer_removed(HOLE_RADIUS, DISTANCE),
     );
+}
+
+/// The bottom rim of a hole rounds exactly as its top does.
+///
+/// Its chamfer has been covered since the rim-blend path landed; its fillet
+/// never was, and every other hole-rim fillet in this file takes the rim at
+/// `HEIGHT`. That gap is the whole reason a bottom-rim fillet could reach a
+/// release building a body whose faces face the wrong way.
+#[test]
+fn the_bottom_rim_of_a_hole_fillets_like_the_top() {
+    let center = (50.0, 50.0);
+    let base = block_with_holes(vec![circle(center, HOLE_RADIUS)], "bottom-rim-fillet-base");
+    let rim = hole_rim(&base, center, HOLE_RADIUS, 0.0);
+    assert_eq!(rim.len(), 2);
+
+    let outcome = finish(
+        &base,
+        rim,
+        EdgeFinishKind::Fillet,
+        DISTANCE,
+        "bottom-rim-fillet",
+    )
+    .expect("the bottom rim of a hole fillets exactly");
+    assert_exact(&outcome);
+    let (cylinders, cones, spheres, tori) = carrier_counts(&outcome.snapshot);
+    assert_eq!((cylinders, cones, spheres, tori), (2, 0, 0, 2));
+    let solid = SIDE * SIDE * HEIGHT - PI * HOLE_RADIUS * HOLE_RADIUS * HEIGHT;
+    assert_volume(
+        &outcome.snapshot,
+        solid - round_hole_fillet_removed(HOLE_RADIUS, DISTANCE),
+    );
+}
+
+/// A bore's bottom rim rounds exactly wherever the profile sits.
+///
+/// The bottom rim is built by mirroring the profile and reusing the top-rim
+/// builder. The mirror line was `y = 0`, and the loop being finished is
+/// identified by centroid and spread — so a profile straddling the origin
+/// reflected onto itself, two loops landed in the same place, and the wrong
+/// one was certified as the target. Every profile drawn around the origin,
+/// which is every profile a user draws, straddled it.
+///
+/// This walks the same plate across the old mirror line. Every position must
+/// give the same solid, because translating a part cannot change what
+/// rounding its bore's rim produces.
+#[test]
+fn a_bore_bottom_rim_fillets_the_same_wherever_the_profile_sits() {
+    const BORE: f64 = 4.0;
+    const FILLET: f64 = 0.4;
+    let expected =
+        24.0 * 20.0 * 4.0 - PI * BORE * BORE * 4.0 - round_hole_fillet_removed(BORE, FILLET);
+    for offset in [-12.0_f64, -10.0, -6.0, -2.0, 0.0, 2.0, 6.0, 10.0, 12.0] {
+        let profile = PlanarProfile2 {
+            regions: vec![PlanarRegion2 {
+                outer: PlanarLoop2 {
+                    curves: rectangle((-12.0, -10.0 + offset), (12.0, 10.0 + offset)),
+                },
+                holes: vec![PlanarLoop2 {
+                    curves: circle((0.0, offset), BORE),
+                }],
+            }],
+        };
+        let request = ExecuteRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("bore-plate"),
+            expected_snapshot: NativeKernel::empty().id(),
+            precision: PrecisionPolicy::default(),
+            command: KernelCommand::ExtrudePlanarProfile {
+                frame: xy_frame(),
+                profile,
+                distance: 4.0,
+            },
+        };
+        let base =
+            NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+                .expect("the plate extrudes")
+                .snapshot;
+        let rim = hole_rim(&base, (0.0, offset), BORE, 0.0);
+        assert_eq!(rim.len(), 2, "at offset {offset}");
+        let outcome = finish(&base, rim, EdgeFinishKind::Fillet, FILLET, "bore-bottom")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the bottom rim must fillet at offset {offset}: {:?}",
+                    error
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code.0.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_exact(&outcome);
+        assert_volume(&outcome.snapshot, expected);
+    }
+}
+
+/// A bore's bottom rim rounds whichever way its loop is wound.
+///
+/// Every hole in this file was written counter-clockwise, and the bottom rim
+/// is built by mirroring the profile. Mirroring negates the end azimuth, and
+/// for a closed circle that azimuth is a full turn from the start — so the
+/// mirrored arc named its start one revolution away, and the cap p-curve built
+/// from it ran that extra revolution and missed its own locus by the whole
+/// circumference. Only one winding put the turn where it showed.
+///
+/// A hole is conventionally wound against its outer boundary, which is what
+/// the sketch compiler emits, so this was the winding every real part had.
+#[test]
+fn a_bore_bottom_rim_fillets_whichever_way_its_loop_is_wound() {
+    const BORE: f64 = 4.0;
+    const FILLET: f64 = 0.4;
+    let expected =
+        24.0 * 20.0 * 4.0 - PI * BORE * BORE * 4.0 - round_hole_fillet_removed(BORE, FILLET);
+    for direction in [ArcDirection::CounterClockwise, ArcDirection::Clockwise] {
+        let profile = PlanarProfile2 {
+            regions: vec![PlanarRegion2 {
+                outer: PlanarLoop2 {
+                    curves: rectangle((-12.0, -10.0), (12.0, 10.0)),
+                },
+                holes: vec![PlanarLoop2 {
+                    curves: vec![PlanarCurve2::Circle {
+                        center: Point2::new(0.0, 0.0),
+                        radius: BORE,
+                        direction,
+                    }],
+                }],
+            }],
+        };
+        let request = ExecuteRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("wound-bore"),
+            expected_snapshot: NativeKernel::empty().id(),
+            precision: PrecisionPolicy::default(),
+            command: KernelCommand::ExtrudePlanarProfile {
+                frame: xy_frame(),
+                profile,
+                distance: 4.0,
+            },
+        };
+        let base =
+            NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+                .expect("the plate extrudes")
+                .snapshot;
+        let rim = hole_rim(&base, (0.0, 0.0), BORE, 0.0);
+        assert_eq!(rim.len(), 2, "with a {direction:?} hole");
+        let outcome = finish(&base, rim, EdgeFinishKind::Fillet, FILLET, "wound-bore")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a {direction:?} hole's bottom rim must fillet: {:?}",
+                    error
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code.0.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_exact(&outcome);
+        assert_volume(&outcome.snapshot, expected);
+    }
 }
 
 #[test]

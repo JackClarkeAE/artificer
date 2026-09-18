@@ -60,23 +60,81 @@ impl PrismProfile {
     /// right-handed and the loops counter-clockwise, so a builder written for
     /// the top rim produces the bottom rim unchanged.
     pub(crate) fn mirrored(&self) -> Self {
+        let axis = self.mirror_axis();
         Self {
             frame: Frame {
-                origin: self.frame.origin + self.frame.normal * self.height,
+                origin: self.frame.origin
+                    + self.frame.normal * self.height
+                    + self.frame.v * (2.0 * axis),
                 u: self.frame.u,
                 v: self.frame.v * -1.0,
                 normal: self.frame.normal * -1.0,
             },
             height: self.height,
-            outer: mirror_loop(&self.outer),
-            holes: self.holes.iter().map(|hole| mirror_loop(hole)).collect(),
+            outer: mirror_loop(&self.outer, axis),
+            holes: self
+                .holes
+                .iter()
+                .map(|hole| mirror_loop(hole, axis))
+                .collect(),
         }
+    }
+
+    /// The line the mirror reflects in, chosen to sit clear of the profile.
+    ///
+    /// Any line does, geometrically: the frame origin above moves to match, so
+    /// the mirrored prism is the same solid in world space whichever line is
+    /// used. What is not free is *overlap*. The loop this blend is the rim of
+    /// is identified by its centroid and spread, and a profile straddling the
+    /// mirror line reflects onto itself — two loops in the same place, and the
+    /// wrong one certified as the target. The line was `y = 0`, so every
+    /// profile drawn around the origin straddled it, which is every profile a
+    /// user draws.
+    ///
+    /// Reflecting past the profile's own far side leaves the copy disjoint
+    /// from the original at any position and any scale.
+    fn mirror_axis(&self) -> f64 {
+        let mut lowest = f64::INFINITY;
+        let mut highest = f64::NEG_INFINITY;
+        for loop_ in self.loops() {
+            for segment in loop_ {
+                for point in [segment.start(), segment.end()] {
+                    lowest = lowest.min(point.y);
+                    highest = highest.max(point.y);
+                }
+                if let Segment::Arc { center, radius, .. } = *segment {
+                    lowest = lowest.min(center.y - radius.abs());
+                    highest = highest.max(center.y + radius.abs());
+                }
+            }
+        }
+        if !lowest.is_finite() || !highest.is_finite() {
+            return 0.0;
+        }
+        // Half the profile's own span clears it whatever the document unit,
+        // where a fixed margin would vanish into the rounding of a large one.
+        highest + (highest - lowest).max(f64::EPSILON) * 0.5
     }
 }
 
-/// Reverses a loop and reflects it in the `x` axis.
-fn mirror_loop(source: &[Segment]) -> Vec<Segment> {
-    let reflect = |point: Point2| Point2::new(point.x, -point.y);
+/// The same azimuth named in `(-π, π]`.
+fn canonical_azimuth(angle: f64) -> f64 {
+    if !angle.is_finite() {
+        return angle;
+    }
+    let turn = std::f64::consts::TAU;
+    let mut wrapped = angle % turn;
+    if wrapped > std::f64::consts::PI {
+        wrapped -= turn;
+    } else if wrapped <= -std::f64::consts::PI {
+        wrapped += turn;
+    }
+    wrapped
+}
+
+/// Reverses a loop and reflects it in the line `y = axis`.
+fn mirror_loop(source: &[Segment], axis: f64) -> Vec<Segment> {
+    let reflect = |point: Point2| Point2::new(point.x, 2.0 * axis - point.y);
     source
         .iter()
         .rev()
@@ -99,7 +157,16 @@ fn mirror_loop(source: &[Segment]) -> Vec<Segment> {
                 radius,
                 // Reflection negates every azimuth and reversal negates the
                 // sweep again, so the arc keeps its convexity.
-                start_angle: -(start_angle + sweep),
+                //
+                // The negated end azimuth can land a full turn away from where
+                // it started: for a closed circle `start_angle + sweep` is
+                // `start_angle ± 2π`, and negating that carries the turn into
+                // the result. An arc is the same arc whichever revolution its
+                // start is named in, but the cap p-curve built from it is not
+                // — it runs the extra revolution and misses its own locus by
+                // the whole circumference. Naming the start once, canonically,
+                // is what stops that.
+                start_angle: canonical_azimuth(-(start_angle + sweep)),
                 sweep,
             },
             Segment::Ellipse { .. } | Segment::Harmonic { .. } => {

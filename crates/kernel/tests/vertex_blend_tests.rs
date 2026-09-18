@@ -181,6 +181,7 @@ fn finish(
             target_edges,
             kind,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
@@ -647,11 +648,13 @@ fn a_slot_plate_keeps_its_slot_while_its_box_edges_round() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_corner_left_half_selected_never_enters_the_exact_rung() {
+fn a_corner_left_half_selected_meets_along_its_seam() {
     // Two adjacent edges of the top face: the corner they share has two of
-    // its three edges chosen, and a band that fades out along the third has
-    // no closed form in this vocabulary. The rung refuses it rather than
-    // approximating under its own name; the faceted tier answers and says so.
+    // its three edges chosen. This used to leave the rung nothing to draw and
+    // the faceted tier answered with a caveat. ADR 0043 derived what the two
+    // bands actually do — they stop against each other along one seam, and the
+    // edge left sharp starts a blend's width further along — so the exact rung
+    // owns it and publishes no approximation.
     let size = [40.0, 40.0, 30.0];
     let top = |start: Point3, end: Point3| {
         (start.z - size[2]).abs() < 1.0e-9 && (end.z - size[2]).abs() < 1.0e-9
@@ -666,19 +669,20 @@ fn a_corner_left_half_selected_never_enters_the_exact_rung() {
 
     let outcome =
         finish(&box_body, selection, EdgeFinishKind::Fillet, 4.0).expect("the ladder answers");
-    assert_ne!(
+    assert_eq!(
         outcome.report.rung.as_deref(),
         Some("edge-finish/vertex-blend"),
-        "the exact rung does not own a corner it cannot close"
+        "a mitred corner is the exact rung's to close"
     );
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "EDGE_FINISH_FACETED_APPROXIMATION"),
-        "whatever answers instead says it approximates: {:?}",
+        outcome.report.warnings.is_empty(),
+        "an exact seam carries no caveat: {:?}",
         outcome.report.warnings
+    );
+    close(
+        outcome.snapshot.measures().volume,
+        size[0] * size[1] * size[2] - two_edge_fillet_removed([size[0], size[1]], 4.0),
+        "both bands and the corner they share, removed once",
     );
 }
 
@@ -700,6 +704,123 @@ fn a_corner_blend_that_would_reach_a_bore_is_refused_by_name() {
     let (code, message) = refusal(&plate, selection, EdgeFinishKind::Fillet, 12.0);
     assert_eq!(code, "VERTEX_BLEND_DISTANCE_INVALID");
     assert!(message.contains("hole or slot"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// Two edges of a corner (ADR 0043)
+// ---------------------------------------------------------------------------
+
+/// The two edges of a cube corner that share one face, leaving the third sharp.
+///
+/// At the origin corner of a cuboid the three edges run along the axes. Taking
+/// the two that lie in `z = 0` leaves the vertical one untouched, which is the
+/// across-and-down selection a user makes without thinking about it.
+fn two_edges_of_the_origin_corner(snapshot: &Snapshot) -> Vec<EntityRef> {
+    edges_where(snapshot, |start, end| {
+        let flat = start.z.abs() < 1.0e-9 && end.z.abs() < 1.0e-9;
+        let touches_origin = |point: Point3| point.x.abs() < 1.0e-9 && point.y.abs() < 1.0e-9;
+        flat && (touches_origin(start) || touches_origin(end))
+    })
+}
+
+/// What a chamfer of two edges meeting at a corner must remove.
+///
+/// Each edge loses a triangular prism of section `½d²`. Over the corner cube
+/// `[0, d]³` both prisms claim the same material, and that region — the points
+/// under both bevels, `y + z ≤ d` and `x + z ≤ d` — has volume
+/// `∫₀ᵈ (d − z)² dz = d³/3`. Numeric integration agrees to ten digits.
+fn two_edge_chamfer_removed(lengths: [f64; 2], distance: f64) -> f64 {
+    0.5 * distance * distance * (lengths[0] + lengths[1]) - distance.powi(3) / 3.0
+}
+
+/// What a fillet of the same two edges must remove.
+///
+/// Each edge loses `r²(1 − π/4)` of section. The shared corner is the part of
+/// `[0, r]³` outside both cylinders; with `w(z) = r − √(r² − (z − r)²)` its
+/// section at height `z` is `w(z)²`, and
+/// `∫₀ʳ w(z)² dz = r³(2 − ⅓ − π/2) = r³(5/3 − π/2)`. Numeric integration
+/// agrees to ten digits.
+fn two_edge_fillet_removed(lengths: [f64; 2], radius: f64) -> f64 {
+    radius * radius * (1.0 - PI / 4.0) * (lengths[0] + lengths[1])
+        - radius.powi(3) * (5.0 / 3.0 - PI / 2.0)
+}
+
+/// Two edges of a corner bevel, meeting along the line their bevel planes
+/// share.
+///
+/// ADR 0043: the seam runs from `(d, d, 0)`, the shared face's new corner, to
+/// `(0, 0, d)`, the new end of the edge left sharp. No patch closes anything —
+/// the bands simply stop against each other.
+#[test]
+fn two_edges_of_a_corner_chamfer_to_their_shared_seam() {
+    let size = [40.0, 40.0, 40.0];
+    let distance = 4.0;
+    let cube = cuboid(size);
+    let selection = two_edges_of_the_origin_corner(&cube);
+    assert_eq!(selection.len(), 2, "two edges of the corner, not three");
+
+    let bevelled = blend(&cube, selection, EdgeFinishKind::Chamfer, distance);
+    close(
+        bevelled.measures().volume,
+        size[0] * size[1] * size[2] - two_edge_chamfer_removed([size[0], size[1]], distance),
+        "a two-edge chamfer removes both prisms and the corner they share once",
+    );
+}
+
+/// And round, meeting along the ellipse two equal crossing cylinders share.
+#[test]
+fn two_edges_of_a_corner_fillet_to_their_shared_seam() {
+    let size = [40.0, 40.0, 40.0];
+    let radius = 4.0;
+    let cube = cuboid(size);
+    let selection = two_edges_of_the_origin_corner(&cube);
+    assert_eq!(selection.len(), 2);
+
+    let rounded = blend(&cube, selection, EdgeFinishKind::Fillet, radius);
+    close(
+        rounded.measures().volume,
+        size[0] * size[1] * size[2] - two_edge_fillet_removed([size[0], size[1]], radius),
+        "a two-edge fillet removes both bands and the corner they share once",
+    );
+}
+
+/// The closed forms above, checked against the integrals they came from, so a
+/// later construction is measured against arithmetic rather than against a
+/// number somebody once read off a screen.
+#[test]
+fn the_two_edge_corner_volumes_agree_with_their_integrals() {
+    const STEPS: usize = 200_000;
+    let radius = 1.7_f64;
+
+    let mut chamfer = 0.0;
+    let mut fillet = 0.0;
+    for step in 0..STEPS {
+        let height = radius * (step as f64 + 0.5) / STEPS as f64;
+        chamfer += (radius - height).powi(2);
+        let inset = radius
+            - (radius * radius - (height - radius).powi(2))
+                .max(0.0)
+                .sqrt();
+        fillet += inset * inset;
+    }
+    chamfer *= radius / STEPS as f64;
+    fillet *= radius / STEPS as f64;
+
+    // The midpoint rule meets a square root at the top of the round corner's
+    // range, so it converges as a power rather than exponentially. Six digits
+    // is far more than enough to tell these closed forms from a wrong one.
+    let agrees = |numeric: f64, closed: f64, what: &str| {
+        assert!(
+            (numeric - closed).abs() <= 1.0e-6 * closed.abs().max(1.0),
+            "{what}: {numeric} is not {closed}"
+        );
+    };
+    agrees(chamfer, radius.powi(3) / 3.0, "the shared bevel corner");
+    agrees(
+        fillet,
+        radius.powi(3) * (5.0 / 3.0 - PI / 2.0),
+        "the shared round corner",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -774,19 +895,18 @@ fn a_refusal_on_a_blended_body_comes_back_before_the_user_notices() {
         "six planes, three bands, one octant"
     );
 
-    // The two far top edges, well clear of the blend. They meet at a corner
-    // whose third edge is left out, so no rung can answer and the ladder
-    // runs all the way to the faceted tier.
+    // The horizontal runs beside the blend. Their corners carry it, and a
+    // corner that already carries a blend is still beyond this rung, so no
+    // rung can answer and the ladder runs all the way to the faceted tier.
+    //
+    // A half-chosen corner used to be the unanswerable selection here. It is
+    // answerable now (ADR 0043), so the guard needs one that is not.
     let chain = edges_where(&blended, |start, end| {
-        (start.z - size[2]).abs() < 1.0e-9
-            && (end.z - size[2]).abs() < 1.0e-9
-            && (((start.y - size[1]).abs() < 1.0e-9 && (end.y - size[1]).abs() < 1.0e-9)
-                || ((start.x - size[0]).abs() < 1.0e-9 && (end.x - size[0]).abs() < 1.0e-9))
+        (start.z - end.z).abs() < 1.0e-9 && (start.x - end.x).abs() > 0.5
     });
-    assert_eq!(
-        chain.len(),
-        2,
-        "the two far top edges, meeting at one corner"
+    assert!(
+        chain.len() >= 2,
+        "the straight runs along x, above and below the blend"
     );
 
     let started = Instant::now();

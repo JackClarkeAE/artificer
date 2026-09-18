@@ -25,6 +25,19 @@
 
 ---
 
+## What is new in 0.99.4
+
+A release about corners: the ones a finish leaves behind, and what happens
+when you come back for the edge you did not take the first time.
+
+- **Two edges of a corner round and bevel in one feature.** Rounding across the top of a part and down the side it meets is the selection a user makes without thinking, and it was refused — the reason given being that the vocabulary could not fade a band out along the third edge. It never had to. The two bands stop against each other along one seam, and the edge left sharp simply starts a blend's width further along. A chamfer's bevel planes meet in a line, a fillet's two equal crossing cylinders in a planar ellipse. Both volumes were written down and checked against their integrals before the construction that had to hit them existed, and both oracles now run. ADR 0043 has the derivation.
+- **A corner that is already finished asks instead of refusing.** Come back for a third edge at a corner two others already shaped and the panel now puts two options above the size. **Join this fillet or chamfer to the others** adds the edge to the feature that owns the corner and replays it, so one patch closes all three and the body is exactly the one the edges chosen together would have made — the tree grows a feature rather than gaining one, and the corner keeps that feature's size, because a rolling-ball corner is a single sphere. **Keep independent** builds the new band beside the others, meeting along a seam with the corner's own point surviving, as though each edge had been finished on its own body. Standing apart is cut for a chamfer; for a fillet the option shows closed with its reason, the band being tangent to the walls it rolls between in a way this release's Boolean will not take. ADR 0044 records both answers and the gap.
+- **A bore's bottom rim rounds again.** Two independent faults in the mirrored profile — a reversed sweep and a mirror line that could fall inside the profile it was reflecting — each produced the same p-curve locus error, so fixing one left the other. Both are fixed, and a rim now rounds the same whichever way its loop is wound.
+- **Selecting two bores at once says so.** A selection mixing a round rim with a straight edge, or holding two rims, used to stage a preview and then hand over a refusal that named neither the cause nor the remedy. Both now say what they are and how to split them.
+- **The edge-finish preview follows the edge it is previewing.** Bands that meet at a shared point now agree on the basis their surfaces are built on, so the preview stops showing a crease where the committed body has none.
+- **A sketch can measure against the body it sits on.** A dimension may now be taken from a point to an edge of the face the sketch was drawn on, and the ordinate's datum may be a side a recipe owns. Where a region cannot be formed the status line says which of the reasons it was rather than going quiet.
+- **No terminal behind the window.** A release build no longer opens a console it never writes to. Debug builds keep theirs, that being where panics and backend chatter go.
+
 ## What is new in 0.99.3
 
 A release about how tools and selections meet, and one picking bug that had

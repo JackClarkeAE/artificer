@@ -328,12 +328,18 @@ fn assert_extrude_enabled(harness: &Harness<'static, KernelLabApp>) {
     );
 }
 
-fn assert_extrude_disabled(harness: &Harness<'static, KernelLabApp>) {
-    assert!(
-        harness
-            .get_by_role_and_label(Role::Button, "Extrude")
-            .accesskit_node()
-            .is_disabled(),
+/// An inactive history sketch must not remain extrudable.
+///
+/// Extrude itself may well be live — there can be a body whose face it could
+/// push or pull, and a tool is not disabled for want of an operand (ADR 0041) —
+/// so what is checked is that pressing it does not build anything from the
+/// sketch that is no longer active.
+fn assert_extrude_disabled(harness: &mut Harness<'static, KernelLabApp>) {
+    let bodies_before = harness.state().body_count();
+    click_button(harness, "Extrude");
+    assert_eq!(
+        harness.state().body_count(),
+        bodies_before,
         "an inactive history sketch must not remain extrudable"
     );
 }
@@ -871,7 +877,7 @@ fn undoing_extrusion_restores_its_sketch_then_undoing_sketch_removes_the_artifac
     activate_button(&mut harness, "Redo history change");
     assert_eq!(harness.state().sketch_count(), 1);
     assert!(!harness.state().sketch_visible(0));
-    assert_extrude_disabled(&harness);
+    assert_extrude_disabled(&mut harness);
 }
 
 #[test]
@@ -889,7 +895,7 @@ fn suppressing_and_restoring_sketch_disables_and_reenables_extrude() {
         SketchExtrusionEligibility::InactiveHistorySketch
     );
     assert!(!harness.state().sketch_visible(0));
-    assert_extrude_disabled(&harness);
+    assert_extrude_disabled(&mut harness);
 
     activate_button(&mut harness, "Restore selected feature");
     assert_eq!(harness.state().document_feature_count(), feature_count);

@@ -48,6 +48,7 @@ fn finish(
             target_edges: targets,
             kind,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
