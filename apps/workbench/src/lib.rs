@@ -30286,6 +30286,275 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// The bootstrap block, and the three edges meeting at one of its corners.
+    fn block_corner_edges(app: &KernelLabApp) -> Vec<EntityRef> {
+        let scene = &app.displayed.as_ref().expect("the bootstrap body").scene;
+        let hard = scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .collect::<Vec<_>>();
+        let corner =
+            hard.iter()
+                .flat_map(|edge| edge.endpoints)
+                .fold([f64::MIN; 3], |most, point| {
+                    [
+                        most[0].max(point.x),
+                        most[1].max(point.y),
+                        most[2].max(point.z),
+                    ]
+                });
+        hard.iter()
+            .filter(|edge| {
+                edge.endpoints.iter().any(|point| {
+                    (point.x - corner[0]).abs() < 1.0e-9
+                        && (point.y - corner[1]).abs() < 1.0e-9
+                        && (point.z - corner[2]).abs() < 1.0e-9
+                })
+            })
+            .map(|edge| edge.source_edge)
+            .collect()
+    }
+
+    /// A prism with `sides` flat walls, so its vertical edges meet at something
+    /// other than a right angle.
+    fn polygon_prism(sides: u16) -> (KernelLabApp, viewport::BodyInstanceKey) {
+        let mut app = KernelLabApp::default();
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.sketch = SketchCanvasState::new(app.selected_origin_plane);
+        let entity = app
+            .sketch
+            .stage_recipe(
+                artificer_sketch::SketchRecipe::OuterDiameterPolygon {
+                    center: artificer_sketch::PointInput::Position(
+                        artificer_sketch::SketchPoint2::new(0.0, 0.0),
+                    ),
+                    outer_diameter: artificer_sketch::SketchValue::Literal(
+                        artificer_sketch::Length::new(8.0).expect("a positive diameter"),
+                    ),
+                    sides: artificer_sketch::SketchValue::Literal(artificer_sketch::Integer::new(
+                        sides,
+                    )),
+                    rotation: artificer_sketch::SketchValue::Literal(
+                        artificer_sketch::Angle::radians(0.0).expect("a finite angle"),
+                    ),
+                },
+                "Polygon",
+            )
+            .expect("the polygon stages");
+        app.commit_sketch_stroke(entity);
+        app.sketch.clear_region_selection();
+        assert!(
+            app.sketch
+                .select_region_at_point(SketchPoint::new(0.0, 0.0), false)
+        );
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let index = app.active_sketch_index.expect("a committed sketch");
+        assert!(app.activate_committed_sketch(index));
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation());
+        let id = app.active_body_id().expect("the extruded prism");
+        let key = viewport::BodyInstanceKey::new(id.get());
+        (app, key)
+    }
+
+    fn vertical_edges(app: &KernelLabApp) -> Vec<EntityRef> {
+        app.displayed
+            .as_ref()
+            .expect("a body")
+            .scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .filter(|edge| {
+                (edge.endpoints[1].z - edge.endpoints[0].z).abs() > 0.5
+                    && (edge.endpoints[1].x - edge.endpoints[0].x).abs() < 1.0e-9
+                    && (edge.endpoints[1].y - edge.endpoints[0].y).abs() < 1.0e-9
+            })
+            .map(|edge| edge.source_edge)
+            .collect()
+    }
+
+    fn pick_all(app: &mut KernelLabApp, body: viewport::BodyInstanceKey, edges: &[EntityRef]) {
+        for (index, edge) in edges.iter().enumerate() {
+            app.select_model_edge(
+                viewport::DocumentEdgeSelection { body, edge: *edge },
+                index > 0,
+            );
+        }
+    }
+
+    fn finish(app: &mut KernelLabApp, preset: SolidFeaturePreset, distance: f64) -> bool {
+        app.apply_tangent_edge_chain();
+        app.edge_finish_distance = distance;
+        app.stage_preset_feature(preset);
+        assert!(app.pending_operation.is_some(), "the finish should stage");
+        assert!(
+            app.current_edge_finish_preview().is_some(),
+            "and should draw its preview"
+        );
+        app.confirm_pending_operation();
+        app.last_error_code().is_none()
+    }
+
+    /// All three edges of a corner, chamfered in one feature. This is the shape
+    /// ADR 0034 was written for: a vertex with all three edges chosen closes
+    /// with a planar triangle.
+    #[test]
+    fn a_whole_corner_chamfers_in_one_feature() {
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().unwrap().get());
+        let edges = block_corner_edges(&app);
+        assert_eq!(edges.len(), 3, "a block corner joins three edges");
+        pick_all(&mut app, body, &edges);
+        assert!(finish(&mut app, SolidFeaturePreset::Chamfer, 0.3));
+    }
+
+    /// And filleted, where the corner closes with a sphere octant.
+    #[test]
+    fn a_whole_corner_fillets_in_one_feature() {
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().unwrap().get());
+        let edges = block_corner_edges(&app);
+        pick_all(&mut app, body, &edges);
+        assert!(finish(&mut app, SolidFeaturePreset::Fillet, 0.3));
+    }
+
+    /// The same three edges taken one at a time are refused, and the refusal
+    /// names the corner rather than leaving the user to guess.
+    ///
+    /// The first lands; the second meets a corner the first one rounded, and
+    /// ADR 0034 closes a corner only where three flat faces meet. This is the
+    /// documented shape of the feature, not a fault — but the user sees a
+    /// correct preview and then a body that did not change, so what matters is
+    /// that the panel stays open and says why.
+    #[test]
+    fn corner_edges_taken_one_at_a_time_are_refused_by_name() {
+        for (preset, expected) in [
+            (SolidFeaturePreset::Chamfer, "VERTEX_BLEND_DISTANCE_INVALID"),
+            (SolidFeaturePreset::Fillet, "VERTEX_BLEND_CORNER_CURVED"),
+        ] {
+            let mut app = KernelLabApp::default();
+            let body = viewport::BodyInstanceKey::new(app.active_body_id().unwrap().get());
+            let edges = block_corner_edges(&app);
+            let corner = app
+                .displayed
+                .as_ref()
+                .unwrap()
+                .scene
+                .edges
+                .iter()
+                .filter(|edge| !edge.is_smooth)
+                .flat_map(|edge| edge.endpoints)
+                .fold([f64::MIN; 3], |most, point| {
+                    [
+                        most[0].max(point.x),
+                        most[1].max(point.y),
+                        most[2].max(point.z),
+                    ]
+                });
+
+            pick_all(&mut app, body, &edges[..1]);
+            assert!(
+                finish(&mut app, preset, 0.3),
+                "the first edge of a corner finishes on its own"
+            );
+
+            // The second edge of the same corner, on the body the first left.
+            // The corner itself has been cut away, so the search is for what
+            // still runs up to where it stood.
+            let next = app
+                .displayed
+                .as_ref()
+                .unwrap()
+                .scene
+                .edges
+                .iter()
+                .filter(|edge| !edge.is_smooth)
+                .find(|edge| {
+                    edge.endpoints.iter().any(|point| {
+                        (point.x - corner[0]).abs() < 0.75
+                            && (point.y - corner[1]).abs() < 0.75
+                            && (point.z - corner[2]).abs() < 0.75
+                    })
+                })
+                .map(|edge| edge.source_edge)
+                .expect("the corner still offers an edge");
+            pick_all(&mut app, body, &[next]);
+            assert!(
+                !finish(&mut app, preset, 0.3),
+                "{preset:?}: the second edge of a rounded corner cannot be taken alone"
+            );
+            let detail = app
+                .last_error_detail()
+                .expect("a refusal carries its diagnostic");
+            assert!(
+                detail.contains(expected),
+                "{preset:?} should refuse with {expected}, and said {detail}"
+            );
+            assert!(
+                app.pending_operation.is_some(),
+                "{preset:?}: a refused finish leaves its panel open to explain itself"
+            );
+        }
+    }
+
+    /// A prism whose walls meet at 120 degrees, not 90. One vertical edge.
+    #[test]
+    fn an_edge_between_walls_that_are_not_square_still_chamfers() {
+        let (mut app, body) = polygon_prism(6);
+        let verticals = vertical_edges(&app);
+        assert!(
+            !verticals.is_empty(),
+            "a hexagonal prism has vertical edges"
+        );
+        pick_all(&mut app, body, &verticals[..1]);
+        assert!(finish(&mut app, SolidFeaturePreset::Chamfer, 0.3));
+    }
+
+    /// Every wall edge of the polygon, chamfered together.
+    #[test]
+    fn every_vertical_edge_of_a_polygon_prism_chamfers_in_one_feature() {
+        let (mut app, body) = polygon_prism(6);
+        let verticals = vertical_edges(&app);
+        assert_eq!(verticals.len(), 6, "a hexagonal prism has six wall edges");
+        pick_all(&mut app, body, &verticals);
+        assert!(finish(&mut app, SolidFeaturePreset::Chamfer, 0.3));
+    }
+
+    /// And its whole top rim, which is the exact rim-blend path.
+    #[test]
+    fn the_whole_rim_of_a_polygon_prism_chamfers_exactly() {
+        let (mut app, body) = polygon_prism(6);
+        let scene = app.displayed.as_ref().unwrap().scene.clone();
+        let top = scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .flat_map(|edge| edge.endpoints)
+            .fold(f64::MIN, |most, point| most.max(point.z));
+        let rim = scene
+            .edges
+            .iter()
+            .filter(|edge| !edge.is_smooth)
+            .filter(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.z - top).abs() < 1.0e-9)
+            })
+            .map(|edge| edge.source_edge)
+            .collect::<Vec<_>>();
+        assert_eq!(rim.len(), 6, "a hexagonal cap rim has six sides");
+        pick_all(&mut app, body, &rim);
+        app.apply_tangent_edge_chain();
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::ExactRimBlend
+        );
+        assert!(finish(&mut app, SolidFeaturePreset::Chamfer, 0.3));
+    }
+
     #[test]
     fn adding_a_perpendicular_edge_to_a_staged_fillet_previews_and_commits() {
         let mut app = KernelLabApp::default();
