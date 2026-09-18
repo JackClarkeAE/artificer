@@ -28950,11 +28950,15 @@ mod extrusion_workbench_tests {
         );
     }
 
-    /// The resolver has to describe the software as it *is* before it is
-    /// allowed to change it. For every preset whose availability turns on the
-    /// selection, the resolver's verdict and today's gate must agree about
-    /// whether the operands are there — with nothing selected and with the
-    /// right thing selected (ADR 0041 stage 2).
+    /// What is left after every face and edge feature converted: the three
+    /// whole-body features, which never needed converting.
+    ///
+    /// A body is not an operand these ask for. It is the workspace's active
+    /// body, which is why their availability never turned on a *selection* and
+    /// why the resolver and the gate agree by construction — with nothing
+    /// picked and with something picked. Started life as stage 2's proof that
+    /// the model described the software as it was; what it proves now is that
+    /// these three were already on the right side of the line (ADR 0041).
     #[test]
     fn the_resolver_agrees_with_todays_availability_about_operands() {
         use crate::invocation::{self, OperandResolution};
@@ -28964,10 +28968,6 @@ mod extrusion_workbench_tests {
         enum Satisfy {
             ActiveBody,
         }
-        // Converted presets are checked by
-        // `a_converted_tool_is_never_disabled_by_an_empty_selection` instead:
-        // their availability no longer turns on the selection at all. What
-        // remains here is whatever has not been converted yet.
         let cases = [
             (
                 SolidFeaturePreset::Shell,
@@ -29027,6 +29027,10 @@ mod extrusion_workbench_tests {
             SolidFeaturePreset::Hole,
             SolidFeaturePreset::Rib,
             SolidFeaturePreset::HolePattern,
+            SolidFeaturePreset::Shell,
+            SolidFeaturePreset::Mirror,
+            SolidFeaturePreset::LinearPattern,
+            SolidFeaturePreset::Revolve,
         ] {
             let mut app = KernelLabApp::default();
 

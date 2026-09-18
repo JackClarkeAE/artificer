@@ -957,10 +957,15 @@ impl KernelLabApp {
             SolidFeaturePreset::Hole
             | SolidFeaturePreset::Rib
             | SolidFeaturePreset::HolePattern => self.active_body_id().is_some(),
+            // Converted (ADR 0041). A body is not an operand these ask for —
+            // it is the workspace's active body, which is why they were never
+            // gated on a *selection* in the first place — so availability is
+            // simply whether this workspace has one to act on. A shell with no
+            // face picked hollows the body closed, and mirror falls back
+            // through construction plane, planar face and origin plane, so
+            // neither has anything left to wait for.
             SolidFeaturePreset::Mirror
             | SolidFeaturePreset::LinearPattern
-            // A shell with no face selected hollows the body closed, so a
-            // body of its own is all it needs.
             | SolidFeaturePreset::Shell => self.active_body_id().is_some(),
             // An empty selection is not a reason to disable a tool (ADR
             // 0041). Pressing Fillet with nothing picked enters Fillet and
