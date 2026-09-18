@@ -9205,6 +9205,33 @@ impl SketchCanvasState {
         }
     }
 
+    /// The endpoints of a straight curve used purely as a *datum*.
+    ///
+    /// The recipe boundary of ADR 0026 stops the solver from reshaping a curve
+    /// whose recipe owns its shape. An ordinate does not reshape it: the line
+    /// is what the measurement is taken *from*, the value is seeded at the
+    /// separation the sketch already has so staging moves nothing, and a retype
+    /// anchors the datum so the located point is what travels. Refusing here
+    /// cost the commonest thing a sketch says -- this hole, so far from that
+    /// side -- for a danger the ordinate does not carry.
+    fn relation_datum_line_points(
+        &self,
+        entity: CoreEntityId,
+    ) -> Result<(CorePointId, CorePointId), String> {
+        let record = self
+            .authoring
+            .entity(entity)
+            .ok_or_else(|| "That curve is no longer part of the sketch.".to_owned())?;
+        match record.geometry {
+            CoreCurve2::Line { start, end } => Ok((start, end)),
+            CoreCurve2::CircularArc { .. }
+            | CoreCurve2::Circle { .. }
+            | CoreCurve2::Bspline { .. } => {
+                Err("An offset is measured from a straight edge.".to_owned())
+            }
+        }
+    }
+
     fn relation_point_position(&self, point: CorePointId) -> Option<CorePoint2> {
         self.authoring
             .point(point)
@@ -9501,9 +9528,12 @@ impl SketchCanvasState {
             (RelationOperand::Point(first), RelationOperand::Point(second)) => Ok((first, second)),
             _ => Err("This relation applies to two endpoints.".to_owned()),
         };
+        // The first line of a pair is the datum and the second is what travels
+        // (`SketchConstraintKind::datum_points`), so only the second has to
+        // clear the recipe boundary of ADR 0026.
         let pair_lines = |first: RelationOperand, second: RelationOperand| match (first, second) {
             (RelationOperand::Curve(first), RelationOperand::Curve(second)) => {
-                let first = self.relation_line_points(first)?;
+                let first = self.relation_datum_line_points(first)?;
                 let second = self.relation_line_points(second)?;
                 Ok((first, second))
             }
@@ -9597,9 +9627,7 @@ impl SketchCanvasState {
                     }
                     (RelationOperand::Point(held), RelationOperand::Curve(edge))
                     | (RelationOperand::Curve(edge), RelationOperand::Point(held)) => {
-                        let (start, end) = self.relation_line_points(edge).map_err(|_| {
-                            "An offset is measured from a straight edge.".to_owned()
-                        })?;
+                        let (start, end) = self.relation_datum_line_points(edge)?;
                         let distance = self.relation_point_offset(held, start, end)?;
                         if distance <= PrecisionPolicy::default().min_feature_size {
                             return Err(
@@ -9658,9 +9686,13 @@ impl SketchCanvasState {
                         return Err("This relation applies to a point and an edge.".to_owned());
                     }
                 };
-                let (start, end) = self
-                    .relation_line_points(edge)
-                    .map_err(|_| "A midpoint is measured on a straight edge.".to_owned())?;
+                let (start, end) = self.relation_datum_line_points(edge).map_err(|reason| {
+                    if reason.contains("straight") {
+                        "A midpoint is measured on a straight edge.".to_owned()
+                    } else {
+                        reason
+                    }
+                })?;
                 let (Some(at), Some(from), Some(to)) = (
                     self.relation_point_position(held),
                     self.relation_point_position(start),
@@ -20797,6 +20829,154 @@ mod tests {
         state.refresh_analytic_regions();
         assert_eq!(state.available_region_count(), 3);
         assert_eq!(state.region_refusal(), None);
+    }
+
+    /// A circle inside a rectangle, which is what almost every real sketch is.
+    fn circle_in_a_rectangle() -> SketchCanvasState {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-10.0, -6.0),
+                SketchPoint::new(10.0, 6.0),
+            ))
+            .expect("the rectangle stages");
+        state.commit_pending().expect("the rectangle commits");
+        state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(-4.0, 0.0),
+                SketchPoint::new(-2.0, 0.0),
+            ))
+            .expect("the circle stages");
+        state.commit_pending().expect("the circle commits");
+        state
+    }
+
+    fn circle_centre_of(state: &SketchCanvasState) -> SketchPoint {
+        state
+            .entities()
+            .iter()
+            .find_map(|entity| match entity.geometry {
+                SketchGeometry::Circle { center, .. } => Some(center),
+                _ => None,
+            })
+            .expect("the sketch has a circle")
+    }
+
+    /// The reported case: a circle's centre dimensioned to a side of the
+    /// rectangle it sits in.
+    ///
+    /// The side belongs to a rectangle recipe, and the recipe boundary of
+    /// ADR 0026 used to refuse every curve a recipe owns. That boundary exists
+    /// to stop the solver reshaping a recipe; an ordinate does not reshape it,
+    /// it measures *from* it. Refusing here cost the commonest thing a sketch
+    /// says — this hole, so far from that side — which is why centre-to-centre
+    /// worked while centre-to-edge did not.
+    #[test]
+    fn a_point_dimensions_to_the_side_of_a_rectangle() {
+        let mut state = circle_in_a_rectangle();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-4.0, 0.0), 0.3)
+                .took_click
+        );
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-10.0, 2.0), 0.3)
+                .staged
+                .is_some(),
+            "the centre and the rectangle's left side are a complete pair, and \
+             the diagnostic says {:?}",
+            state.relation_diagnostic()
+        );
+        let dimensions = state.point_to_point_dimensions();
+        assert_eq!(dimensions.len(), 1);
+        assert!(
+            (dimensions[0].value - 6.0).abs() <= 1.0e-9,
+            "the centre is six from that side, and the dimension holds {}",
+            dimensions[0].value
+        );
+    }
+
+    /// And typing a new value moves the circle, never the rectangle. This is
+    /// what makes the relaxation above safe rather than a hole in ADR 0026:
+    /// the recipe's own shape is still not the solver's to change.
+    #[test]
+    fn retyping_an_offset_from_a_rectangle_moves_the_circle_not_the_rectangle() {
+        let mut state = circle_in_a_rectangle();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-4.0, 0.0), 0.3)
+                .took_click
+        );
+        let constraint = state
+            .take_dimension_operand_pick(SketchPoint::new(-10.0, 2.0), 0.3)
+            .staged
+            .and_then(|_| {
+                state
+                    .point_to_point_dimensions()
+                    .last()
+                    .map(|dimension| dimension.constraint)
+            })
+            .expect("the dimension stages");
+        state.commit_pending().expect("the dimension commits");
+
+        let rectangle_before = state
+            .entities()
+            .iter()
+            .filter(|entity| !matches!(entity.geometry, SketchGeometry::Circle { .. }))
+            .map(|entity| entity.geometry)
+            .collect::<Vec<_>>();
+
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("3".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the retype commits");
+
+        let rectangle_after = state
+            .entities()
+            .iter()
+            .filter(|entity| !matches!(entity.geometry, SketchGeometry::Circle { .. }))
+            .map(|entity| entity.geometry)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rectangle_before, rectangle_after,
+            "the rectangle is the datum and does not move"
+        );
+        let centre = circle_centre_of(&state);
+        assert!(
+            (centre.u + 7.0).abs() <= 1.0e-9,
+            "the circle should sit three from the side at -10, and sits at {centre:?}"
+        );
+    }
+
+    /// A curved edge still has no offset: the refusal that remains says what it
+    /// is about rather than standing in for every other reason.
+    #[test]
+    fn an_offset_from_a_curve_still_refuses_and_says_so() {
+        let mut state = circle_in_a_rectangle();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        // A corner of the rectangle, then the circle's arc — the top of it,
+        // clear of the rim handle, so the pick can only mean the curve.
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-10.0, -6.0), 0.3)
+                .took_click
+        );
+        assert!(
+            state
+                .take_dimension_operand_pick(SketchPoint::new(-4.0, 2.0), 0.3)
+                .staged
+                .is_none()
+        );
+        let diagnostic = state
+            .relation_diagnostic()
+            .expect("a refusal carries its reason");
+        assert!(
+            diagnostic.contains("straight edge"),
+            "the refusal should name the curve, and says {diagnostic:?}"
+        );
     }
 
     /// Placing a dimension and giving it a value is one act. The value is open
