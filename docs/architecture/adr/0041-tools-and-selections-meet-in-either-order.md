@@ -1,7 +1,7 @@
 # ADR 0041: Tools and selections meet in either order
 
-Status: accepted — the contract below is settled and being implemented in the
-stages at the end. Revised after external review; see *What review changed*.
+Status: implemented — every stage below has shipped. Revised after external
+review; see *What review changed*.
 
 - Date: 2026-09-17
 - Decision owners: Artificer project
@@ -273,15 +273,34 @@ Reordered after review. The armed path exists **before** any gate is flipped, so
 no intermediate commit ships a live-but-dead button — which is the very defect
 this ADR removes.
 
-1. **Canonical `SelectionModel`**, per-kind views, body identity on every face.
-2. **`ToolInvocationSpec` + pure resolver**, unused, with a test that its verdict
-   agrees with today's `command_availability`.
-3. **`ArmedTool`, bindings, filtered picker, prompt UI**, unused.
-4. **Fillet and Chamfer**, end to end.
-5. **Hole, Rib, Hole pattern.**
-6. **Shell, Mirror, Pattern.**
-7. **Boolean and Extrude adapters.**
-8. **Sketch relations** onto the shared resolver core.
+1. ✅ **Canonical selection**, per-kind views, body identity on every face. The
+   singular and plural forms were not merely redundant: a push-pull remapped one
+   and left the other holding the pre-operation reference, and finishing a
+   sketch cleared one and left the other populated.
+2. ✅ **`ToolInvocationSpec` + pure resolver**, with the agreement test.
+3. ✅ **`ArmedTool`, bindings, prompt**, unused until stage 4. Taking a pick and
+   waiting for one turned out to be different questions — a fillet wanting "one
+   or more edges" is satisfied by the first and still wants the rest.
+4. ✅ **Fillet and Chamfer**, the first gates to move.
+5. ✅ **Hole, Rib, Hole pattern.**
+6. ✅ **Shell, Mirror, Pattern** — which needed no conversion, because a body is
+   the workspace's active body rather than an operand they ask for.
+7. ✅ **Boolean and Extrude appetites** in the shared vocabulary, keeping their
+   own state machines.
+8. ✅ **Sketch relations**, likewise.
+
+### What is not done
+
+The **filtered picker** is specified and its predicate exists — `ArmedTool`
+answers whether a pick is eligible — but the viewport does not yet mask its hit
+test to it, so an armed tool prompts without narrowing what can be clicked.
+`accepts` is the seam that does it.
+
+Two appetites are **declared but not enforced**: `SKETCH_EXTRUSION` and
+`SKETCH_RELATION` carry `WrongKind` predicates because sketch operands are
+`SketchEntityId`s rather than the model `SelectionItem`s the resolver speaks.
+Widening `SelectionItem` to carry them is what would let those two resolve
+rather than merely describe.
 
 ## What review changed
 

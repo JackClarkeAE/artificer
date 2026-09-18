@@ -790,6 +790,35 @@ pub const SKETCH_EXTRUSION: ToolInvocationSpec = ToolInvocationSpec {
     }],
 };
 
+pub const RELATION_OPERANDS: &str = "operands";
+
+/// A sketch relation's operands: endpoints, whole curves, or a mix.
+///
+/// The sketch toolbar has worked this way since relations existed — arm the
+/// relation, then pick what it applies to — and is the closest thing this
+/// codebase had to a reference implementation before any of this was written.
+/// Recording its appetite here is what lets the sketch and the model say the
+/// same thing about operands; the sketch keeps its own state machine, which
+/// lives inside the sketch-tool state and has a canvas of its own.
+///
+/// Relation operands are symmetric: which endpoint of a coincident pair was
+/// clicked first carries no meaning, and neither does the order two lines were
+/// picked in for a parallel. Where a relation *is* asymmetric — a distance
+/// measured from one end, whose retype holds that end still — the held end is
+/// named explicitly rather than taken from the order, exactly as ADR 0038's
+/// amendment requires.
+pub const SKETCH_RELATION: ToolInvocationSpec = ToolInvocationSpec {
+    alternatives: &[OperandSchema {
+        roles: &[OperandRoleSpec {
+            id: RELATION_OPERANDS,
+            prompt: "Pick the sketch geometry the relation applies to",
+            cardinality: Cardinality::Between(2, 2),
+            source: OperandSourcePolicy::Symmetric,
+            accepts: |_, _, _| OperandEligibility::WrongKind,
+        }],
+    }],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,6 +1148,21 @@ mod tests {
             accepts_boolean_tool(&context, &bindings, SelectionItem::Body(body(2))),
             OperandEligibility::Accept
         ));
+    }
+
+    /// A relation takes exactly two operands and stops asking once it has
+    /// them, which is what "between two and two" says and what the sketch
+    /// toolbar has always done.
+    #[test]
+    fn a_sketch_relation_wants_exactly_two_operands() {
+        let role = &SKETCH_RELATION.alternatives[0].roles[0];
+        assert!(!role.cardinality.satisfied_by(0));
+        assert!(!role.cardinality.satisfied_by(1));
+        assert!(role.cardinality.satisfied_by(2));
+        assert!(
+            !role.cardinality.accepts_more(2),
+            "a third pick starts a new relation rather than joining this one"
+        );
     }
 
     /// Symmetric operands do not care what order they were picked in, which is
