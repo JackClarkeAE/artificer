@@ -1,30 +1,35 @@
 # ADR 0041: Tools and selections meet in either order
 
-Status: proposed — a design for review. Nothing here ships yet.
+Status: accepted — the contract below is settled and being implemented in the
+stages at the end. Revised after external review; see *What review changed*.
 
 - Date: 2026-09-17
 - Decision owners: Artificer project
 
+## The invariant
+
+> **A command must never be disabled merely because one or more of its operands
+> have not yet been selected.**
+
+That is deliberately narrower than "no gating". A command may still be
+unavailable because the history marker is not at the tip, because another
+operation is staged, because the geometry is a library component's and
+immutable, or because the workspace fundamentally cannot execute it. None of
+those is "you have not picked the thing yet".
+
+The regression test that expresses it:
+
+> Changing **only** the current selection must never move a command from
+> available to blocked, when its missing operands are ones the user could pick.
+
 ## Context
 
 Pick a face, then press Extrude. Pick two edges, then press Fillet. That is how
-the workbench works, and it is only half of how people work. The other half —
-press Fillet, then pick the edges — is not available, and the button is greyed
-out until you have guessed what it wanted.
+the workbench works, and it is half of how people work. Press Fillet first and
+the button is dead until you have guessed what it wanted.
 
-This is not one bug in one command. It is the shape of
-`command_availability`, which every ribbon button goes through, and it repeats
-across every tab.
-
-### What happens now, exactly
-
-Two conditions gate nearly everything and are answered once, in the same words:
-a staged operation ("Confirm or cancel the pending operation first.") and a
-history marker that is not at the end ("Move the history marker to the end
-before creating another feature."). Those are real reasons and are not what
-this record is about.
-
-Underneath them, `preset_feature_availability` hard-gates on what is selected:
+Every ribbon button passes through `command_availability`, and underneath the
+two legitimate gates `preset_feature_availability` hard-gates on selection:
 
 | Command | Requires | Says when it has not got it |
 |---|---|---|
@@ -33,238 +38,272 @@ Underneath them, `preset_feature_availability` hard-gates on what is selected:
 | Chamfer, Fillet | `!selected_edges.is_empty()` | "Select at least one edge first." |
 | Revolve | nothing | — |
 
-The button is dead until the condition is met. The tooltip explains the rule,
-which is better than silence, but it is still a door that tells you where the
-key is instead of opening.
+A greyed button teaches nothing about *order*, only about *state*. And the two
+orders are not equivalent in what they can express: tool-first can narrow
+picking to eligible edges and say "pick the edges to round"; selection-first
+cannot, because by the time the tool knows what it wants the picking is over.
 
-### Three places already do it the other way
+### It already exists, three times, three ways
 
-The pattern the user is asking for is not foreign to this codebase. It exists
-three times, built three different ways, and none of them is reusable:
+- **Sketch relations** arm and then collect operands
+  (`SelectionRequirement::RelationOperands`).
+- **Body Booleans** stage with the active body as target, then collect tool
+  bodies into `boolean_tools`.
+- **Extrude** already carries the intent in a comment in its own availability
+  function: *"Extrude is still the right button to press: it hands the canvas
+  to Select and says where to click, instead of greying out behind a tooltip."*
+- **To face** likewise arms a face pick and says what to click.
 
-- **Sketch relations.** `SelectionRequirement::RelationOperands`: arm the
-  relation, then pick its operands on the canvas. This is the cleanest of the
-  three and is the closest thing to a reference implementation.
-- **Body Booleans.** Combine stages `PendingOperation::BooleanBodies` with the
-  active body as target, and the *tool* bodies are picked afterwards, into
-  `boolean_tools`, by `toggle_boolean_tool`. Tool-first for its second operand,
-  selection-first for its first.
-- **Extrude.** Its availability function already carries the intent in a
-  comment: *"With bounded profiles drawn but none picked — or a pick that
-  cannot become a solid — Extrude is still the right button to press: it hands
-  the canvas to Select and says where to click, instead of greying out behind a
-  tooltip."* That is exactly this ADR, implemented once, for one command.
-
-So the decision below is less an invention than a generalisation of something
-the codebase keeps rediscovering.
-
-### Why it matters beyond convenience
-
-A greyed button teaches nothing about *order*, only about *state*. A user who
-has not yet learned that Fillet wants edges finds a dead control and no way in.
-A user who has learned it still pays for the lesson every time they change
-their mind about which edges — deselect, reselect, press again.
-
-And the two orders are not equivalent in what they can express. Tool-first can
-prompt: "pick the edges to round" narrows the viewport's picking to edges and
-says what it is waiting for. Selection-first cannot, because by the time the
-tool knows what it wants, the picking is over.
+Four precedents, no shared code. This is a generalisation of something the
+codebase keeps rediscovering.
 
 ## Decision
 
-### A tool declares an appetite; invocation resolves it
+### 1. Applicability and operand completeness are different questions
 
-Every tool that consumes geometry declares what it eats, rather than each
-command hand-writing a gate:
+`command_availability` currently mixes "this operation cannot happen" with "you
+have not selected its input yet". They split:
 
 ```rust
-/// What a tool consumes, and how much of it.
-struct Appetite {
-    /// In preference order. A tool that can take either edges or a whole face
-    /// lists edges first if that is the reading it prefers.
-    roles: &'static [OperandRole],
-}
+enum Applicability { Available, Blocked(Cow<'static, str>) }
 
-struct OperandRole {
-    name: &'static str,          // "edges to round", "target body", "tool bodies"
-    kinds: &'static [OperandKind], // Face | Edge | Vertex | Body | SketchRegion | SketchCurve | SketchPoint
-    arity: Arity,                // Exactly(1) | AtLeast(1) | Between(1, 2) | Any
-    optional: bool,
+enum OperandResolution {
+    Complete(OperandBindings),
+    NeedsOperands { role: OperandRoleId, prompt: &'static str },
+    InvalidSelection(ResolutionDiagnostics),
 }
 ```
 
-Roles rather than a flat set, because several tools need to tell their operands
-apart. A Boolean's target is not its tools. A two-distance chamfer's first edge
-is not its second. A mirror's body is not its plane.
+**The ribbon consults `Applicability` only. Invocation consults
+`OperandResolution`.** That division is the whole architecture; everything
+below follows from it.
 
-### The two orders are one code path
+`Applicability` must stay cheap. It runs for every ribbon control every frame,
+so it may never enumerate topology. "Are there any fillet-able edges on this
+body?" is not an availability question — press Fillet and be told *"No
+compatible edges exist on this body"* rather than scanning the B-rep sixty
+times a second to decide whether to grey an icon.
 
-This is the part that makes the change tractable rather than a rewrite of every
-command. Invoking a tool is:
+### 2. An appetite describes eligibility, not entity kind
 
+`OperandKind × Arity` is too weak to drive tool-first picking. Hole does not
+want "a face"; it wants *one planar, supported face on an editable body*, which
+`stage_preset_feature` only discovers later via
+`NativeKernel::planar_face_support`. Fillet does not want "edges"; it wants a
+*compatible finish set* on one body — the existing implementation already
+checks body agreement, rim completeness and set compatibility.
+
+An appetite that says `Edge` and lets Fillet rediscover afterwards that it was
+the wrong edge is precisely the class of bug this ADR exists to remove. So a
+role carries a predicate:
+
+```rust
+struct OperandRoleSpec {
+    id: OperandRoleId,
+    prompt: &'static str,
+    cardinality: Cardinality,
+    accepts: fn(&InvocationContext, &OperandBindings, &SelectionItem) -> OperandEligibility,
+    source: OperandSourcePolicy,
+}
+
+enum OperandEligibility {
+    Accept,
+    WrongKind,
+    Incompatible(&'static str),
+    Immutable(&'static str),
+    Stale,
+}
 ```
-invoke(tool):
-    harvest, dropped = partition(current_selection, tool.appetite)
-    if harvest satisfies tool.appetite:
-        stage(tool, harvest)          # what selection-first does today
-    else:
-        arm(tool, harvest)            # keep what fits, wait for the rest
+
+One predicate then drives all five consumers: harvesting preselection, filtering
+the viewport picker, answering whether the appetite is satisfiable, wording the
+prompt, and the final pre-stage validation. Tool-first Hole makes only valid
+planar faces pickable, rather than offering every face and refusing a cylinder
+afterwards.
+
+`accepts` takes the bindings so far, because eligibility is often relative: a
+Boolean tool body is any body *except the target*, and the second edge of a
+two-distance chamfer must share a body with the first.
+
+### 3. Alternatives are not roles
+
+Roles are operands a tool needs *together*; alternatives are different readings
+of the same request. Conflating them cannot express Mirror, whose plane may come
+from a selected construction plane, a planar face, or an origin plane:
+
+```rust
+struct ToolInvocationSpec { alternatives: &'static [OperandSchema] }
+struct OperandSchema  { roles: &'static [OperandRoleSpec] }
 ```
 
-Selection-first and tool-first stop being two behaviours. They are one
-resolution with two outcomes, chosen by whether what is already selected is
-enough. A tool pressed with a full selection stages immediately, exactly as it
-does now; the same tool pressed with nothing selected arms and prompts; pressed
-with a partial selection it arms holding what it already has.
+Alternatives are tried in order; the first whose roles all resolve wins, and the
+readout names which reading was taken.
 
-The user's example resolves without a special case: two lines and a face
-selected, Chamfer pressed, appetite is `Edge × AtLeast(1)` — the two lines are
-harvested, the face is dropped, and because the harvest satisfies the arity it
-stages straight away.
+### 4. One ordered selection, with per-kind views
 
-### Dropping is silent in the result and loud in the readout
+"One ordered set per kind" destroys global order. Clicking Face A, Edge B, Face
+C, Edge D and storing `faces=[A,C]`, `edges=[B,D]` makes `A→B→C→D`
+unrecoverable. So:
 
-"Unsupported features would just be dropped" is right about the geometry and
-wrong about the user. A selection that silently shrinks is how someone chamfers
-two of the three edges they thought they had picked.
+```rust
+enum SelectionItem { Body(..), Face(..), Edge(..), Vertex(..), ConstructionPlane(..),
+                     SketchRegion(..), SketchCurve(..), SketchPoint(..) }
 
-So: dropped operands never block, never warn modally, and never appear in the
-result — and the confirmation readout says what happened, in the same line that
-says what the tool is about to do:
+struct SelectionEntry { item: SelectionItem, sequence: u64, source: SelectionSource }
+struct SelectionModel { ordered: Vec<SelectionEntry> }
+```
 
-> Chamfer · 2 edges · 1 face ignored
+Per-kind collections become **views**, not separate authorities.
 
-The count is the honest part. Naming *which* face was ignored costs a sentence
-nobody reads; saying that one was is what stops a wrong result being accepted.
+This also fixes a live defect rather than merely tidying. The singular field is
+`selected_face: Option<EntityRef>`; the plural is
+`selected_faces: Vec<DocumentFaceSelection>`, and only the latter carries
+`BodyInstanceKey`. `EntityRef` is `{snapshot, entity, kind}` with no occurrence
+identity, so with two occurrences of one part in an assembly the singular
+selection cannot say which one is meant. **A selected face always means body +
+face reference.** The `EntityRef`-only form goes away.
 
-### Armed is a state, and it is not a staged operation
+### 5. Deterministic order may resolve symmetric operands; it must never invent asymmetric ones
 
-A tool waiting for operands must not lock the ribbon. Today
-`pending_operation.is_some()` disables every command, which is right for a
-staged operation awaiting confirmation and wrong for a tool that is merely
-waiting to be told what to work on.
+The current Boolean code carries the lesson already:
 
-So `armed: Option<ArmedTool>` is separate from `pending_operation`, and:
+> *Tools start empty on purpose. Guessing an operand was the old behaviour and
+> it silently picked the wrong body once a third existed.*
 
-- Pressing another tool **replaces** the armed one. Changing your mind is one
-  click, not a cancel and a click.
-- Escape **disarms** and leaves the selection alone. Disarming and clearing are
-  two different intentions and must not share a key.
-- Arming changes no document state, so it needs no undo entry and no
-  confirmation. Nothing has happened yet.
+Resolving roles from selection order contradicts that. For Fillet's edge set,
+order is irrelevant and any deterministic ordering is fine. For Difference,
+which body is the target is semantically load-bearing, and "first selected body"
+is a guess wearing a rule's clothing. Rubber-band selection makes it worse:
+deterministic ordering by document reference is *repeatable*, and repeatably
+choosing an arbitrary target is still wrong.
 
-### The armed tool filters picking and says what it wants
+> Deterministic ordering may resolve **symmetric** operands. It must never
+> invent meaning for **asymmetric** roles.
 
-While armed, the viewport's hit testing is narrowed to the kinds the current
-role accepts, and the status line names the role: "Pick the edges to round".
-This is the capability tool-first has and selection-first cannot: it is
-impossible to pick the wrong kind of thing, rather than merely futile.
+`OperandSourcePolicy` says where a role may come from — the active body, an
+explicit pick, or the general selection. Where an unordered selection cannot
+establish an asymmetric role, the tool arms and asks for that role by name.
 
-When a role is satisfied and the appetite has another, the prompt advances to
-it. When the last required role is satisfied, the tool stages itself and the
-existing confirmation rail takes over unchanged.
+### 6. "Ignored" has three meanings, and only one of them is silent
 
-### An empty selection is no longer a reason to disable a tool
+Dropping a face from a Fillet's selection is right. Dropping an *edge* Fillet
+cannot round is how you ship the wrong part.
 
-This is the rule that replaces the table above. A command is disabled only for
-reasons that arming cannot fix:
+| Class | Meaning | Behaviour |
+|---|---|---|
+| **Extraneous** | wrong kind for every role | ignore; count it in the readout |
+| **Rejected** | right kind, incompatible with this operation | never silently omitted; blocks automatic staging |
+| **Stale** | reference no longer resolves | removed and reported explicitly |
 
-- a staged operation is awaiting confirmation
-- the history marker is not at the end
-- the geometry is immutable (a library component occurrence)
-- **the appetite is unsatisfiable in principle** — Fillet with no body in the
-  document at all has nothing to arm for, and still says so
+So Fillet with a face selected ignores it; Fillet with an unsupported curved
+edge selected does **not** quietly round the other two; Fillet with a deleted
+edge reference drops it and says so.
 
-That last one matters. Arming into a state nothing can ever satisfy is a worse
-dead end than a greyed button, because it looks live.
+The readout carries the tally — `Fillet · 2 edges · 1 ignored` — and while a
+tool is resolving, the viewport also draws accepted operands in the tool
+highlight, rejected ones in a warning treatment, and extraneous ones in ordinary
+selection styling. Ambiguity resolved without a modal.
 
-## Robustness, edge cases and error handling
+### 7. Bindings belong to the tool; the selection belongs to the user
 
-These are the cases that decide whether this is an improvement or a new class
-of bug. They are listed because an outside reviewer should push on them.
+```rust
+struct ArmedTool {
+    tool: ToolId,
+    schema: &'static OperandSchema,
+    bindings: OperandBindings,
+    resolved_at: DocumentRevision,
+}
+```
 
-**Stale operands.** `selected_edges` holds persistent document references. A
-history replay, an undo, or a rebuild can leave a reference that no longer
-resolves. The armed set is therefore re-validated every frame against the
-current document, and anything that stops resolving is dropped with a readout
-line. A tool must never stage against a reference it cannot resolve, and must
-never silently substitute a different one.
+Because the tool never owns the selection, there is nothing to restore:
 
-**Selection is consumed on commit, not on stage.** If a commit left the
-operands selected, the next tool press would silently re-use them. If a cancel
-cleared them, changing your mind would cost the selection. So: staging leaves
-the selection intact, committing clears it, cancelling restores it.
+| Event | `ArmedTool` | `SelectionModel` |
+|---|---|---|
+| Escape | dropped | unchanged |
+| another tool pressed | replaced | unchanged |
+| stage | bindings frozen into `PendingOperation` | unchanged |
+| cancel staged operation | — | unchanged |
+| commit | dropped | **consumed operands removed** |
 
-**Order is preserved.** The harvest keeps click order, because roles are
-assigned in order and several tools care which operand came first. A selection
-made by rubber band, which has no click order, is ordered deterministically by
-document reference so that the same selection always resolves the same way.
+Commit removes what the tool consumed, not the whole selection: after a Fillet
+over edges A and B with face X also selected, X stays selected, because the
+Fillet never consumed it.
 
-**Two selection representations.** There are currently both singular
-(`selected_face`, `selected_edge`, `selected_vertex`) and plural
-(`selected_faces`, `selected_edges`, `selected_vertices`) fields, cleared
-together by `clear_model_entity_selection`. The resolver must read one model,
-not two, or it will harvest from the plural while the viewport writes the
-singular. **Unifying these is a prerequisite, not part of the change.**
+### 8. Armed bindings are revision-invalidated, not revalidated every frame
 
-**Ambiguous appetites.** A tool that accepts either of two readings of the same
-selection — a face *or* its edges — must resolve deterministically and say which
-reading it took. Preference order in `roles` decides, and the readout names it.
+`resolved_at` is a document revision. Re-resolution happens when the document
+revision changes, the history cursor moves, the active body or context changes,
+or visibility/mutability changes eligibility — and once more immediately before
+staging. Not because egui painted another frame. The codebase already has this
+shape in `prune_stale_measured_edges`.
 
-**Partial harvests that cannot complete.** Selecting one edge and pressing a
-tool that needs exactly two arms holding that edge; the prompt says "pick one
-more". If the document contains no second candidate, the tool disarms and
-explains rather than waiting forever.
+### 9. Filter before hit ranking
 
-**Modal conflicts.** Arming while a sketch is open, while a Boolean is staged,
-or while the history marker is back in time must be refused with the existing
-words. Arming is new, but it does not get to bypass gates that exist for other
-reasons.
+An armed tool masks the hit test to eligible candidates and ranks only those. It
+does not hit-test generically, find a face nearest, and reject the click — that
+filter would not actually improve picking. This is the same principle the To
+face work established: what is rendered or picked must not decide what
+modelling entities exist.
 
-**Every dropped operand is a test.** The failure mode this change introduces is
-a tool quietly acting on less than the user believed. So the gate for each
-converted command is a test that a mixed selection produces the right harvest
-*and* the right ignored-count, not merely a result that happens to be correct.
+### 10. Share the resolver; do not force one state machine
 
-## How this would be done
+Sketch relations live in the sketch-tool state machine, Extrude's profile pick
+interacts with sketch mode, and Booleans work on body identities. They should
+share `OperandSchema`, the resolver, eligibility, bindings and diagnostics —
+and keep their own adapters. Sharing semantics matters; forcing every UI state
+into one enum does not.
 
-Sequenced so that each stage is independently reviewable and none of them is a
-flag day.
+## Acceptance
 
-1. **Unify the selection model.** Collapse the singular and plural fields into
-   one ordered set per kind. Pure refactor, no behaviour change, gated by the
-   existing UI tests.
-2. **Introduce `Appetite` and the resolver, unused.** Declare the appetite for
-   every command beside its existing gate, and add a test that the resolver's
-   verdict agrees with what `command_availability` decides today. Still no
-   behaviour change; this is the stage that proves the model describes the
-   software as it is.
-3. **Flip the gates, one family at a time.** Fillet and Chamfer first — they are
-   the clearest case and have the most edges to get wrong. Then Hole, Rib and
-   Hole pattern; then Mirror, Pattern and Shell. Each is its own change with
-   its own tests.
-4. **Build the armed-state UI once**: filtered picking, the role prompt, the
-   ignored-count readout, Escape.
-5. **Retire the three bespoke paths.** Booleans' `boolean_tools`, Extrude's
-   `awaiting_profile_pick`, and relations' `RelationOperands` all become the
-   shared one. This stage removes more code than it adds, and it is the stage
-   that proves the abstraction was the right one — if any of the three will not
-   fit, the model is wrong and stages 1–4 are still individually sound.
+The invariant at the top, plus the one that makes it real. For every converted
+command:
+
+> Preselect the operands, then invoke → **exactly** the same staged intent as
+> invoke, then pick the same operands.
+
+Not "looks the same": the same `PendingOperation`, the same feature arguments,
+the same persistent references. Around that, test mixed preselection, partial
+preselection, stale references and operand permutations. Permutations of
+symmetric operands must give equivalent bindings; permutations must only change
+asymmetric roles where the user explicitly established the order.
+
+## Stages
+
+Reordered after review. The armed path exists **before** any gate is flipped, so
+no intermediate commit ships a live-but-dead button — which is the very defect
+this ADR removes.
+
+1. **Canonical `SelectionModel`**, per-kind views, body identity on every face.
+2. **`ToolInvocationSpec` + pure resolver**, unused, with a test that its verdict
+   agrees with today's `command_availability`.
+3. **`ArmedTool`, bindings, filtered picker, prompt UI**, unused.
+4. **Fillet and Chamfer**, end to end.
+5. **Hole, Rib, Hole pattern.**
+6. **Shell, Mirror, Pattern.**
+7. **Boolean and Extrude adapters.**
+8. **Sketch relations** onto the shared resolver core.
+
+## What review changed
+
+Recorded because the first draft shipped as "proposed" and the differences are
+instructive rather than cosmetic: availability split from operand completeness;
+eligibility predicates instead of kind and arity; alternative schemas made
+explicit; heterogeneous selection order preserved instead of one order per kind;
+asymmetric roles never inferred from arbitrary or rubber-band order; rejected
+operands separated from extraneous ones; bindings made tool-local and
+revision-invalidated instead of revalidated per frame; and the rollout reversed
+so the armed path precedes any gate change.
 
 ## Consequences and limits
 
-**The ribbon gets quieter and less instructive.** Buttons that used to explain
-what to select now simply work, and the explanation moves to the prompt after
-the press. That is better for someone who knows what they want and a change for
-someone learning by hovering.
+The ribbon gets quieter and less instructive: buttons that explained what to
+select now work, and the explanation moves to the prompt after the press.
 
-**Not every tool has an appetite.** Orbit, Frame, Theme and the panel toggles
-consume nothing. They keep their current availability and are outside this
-model rather than bent into it.
+Not every command has an appetite — Orbit, Frame, Theme and the panel toggles
+consume nothing and stay outside this model rather than being bent into it.
 
-**This does not make tools composable.** Arming Fillet and then Chamfer
-replaces the armed tool; it does not queue two operations. Sequencing features
-is the history's job.
+This does not make tools composable: arming Fillet and then Chamfer replaces the
+armed tool rather than queuing two operations. Sequencing is the history's job.
 
-**This does not change what any tool does.** The kernel sees the same operands
-it sees today. Every change here is about how the operands are gathered.
+And it changes what no tool *does*. The kernel sees the operands it sees today;
+all of this is about how they are gathered.
