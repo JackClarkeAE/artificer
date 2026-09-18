@@ -1517,6 +1517,12 @@ pub enum KernelCommand {
         kind: EdgeFinishKind,
         #[serde(with = "finite_f64")]
         distance: f64,
+        /// ADR 0044: build this finish beside whatever already shapes the
+        /// corners it reaches rather than as part of them. Absent from a
+        /// document written before the choice existed, which read as joined
+        /// because that is all there was.
+        #[serde(default)]
+        standing_apart: bool,
     },
 }
 

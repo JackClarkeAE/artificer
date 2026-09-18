@@ -42,6 +42,7 @@ fn finish_request(
             target_edges: targets,
             kind,
             distance: 0.75,
+            standing_apart: false,
         },
     }
 }

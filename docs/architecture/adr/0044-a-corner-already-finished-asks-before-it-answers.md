@@ -1,8 +1,8 @@
 # ADR 0044: A corner already finished asks before it answers
 
-Status: accepted; joining is implemented, standing apart is specified and
-gated — the panel offers it only where the kernel can cut it, which is
-nowhere yet.
+Status: accepted; joining is implemented, and standing apart is implemented
+for a chamfer. A fillet standing apart is refused by name, for the reason
+recorded below.
 
 - Date: 2026-09-18
 - Decision owners: Artificer project
@@ -67,31 +67,53 @@ The earlier feature is left as it stands and the new band is built beside it,
 the two meeting along a seam, with the corner's own point surviving where all
 of them meet. This is the shape a user means by "as though they were extruded
 separately", and it is genuinely different from the joined corner — not a
-worse approximation of it.
+worse approximation of it. Three bevels off one corner of a cube of side `L`,
+taken one at a time, leave
 
-Whether that seam is drawable depends on what meets what:
+```text
+L³ − (3·½d²L − d³ + d³/4)
+```
 
-| new band | against | seam | drawable |
-|---|---|---|---|
-| chamfer | chamfers | plane ∩ plane → line | always |
-| chamfer | fillets | plane ∩ cylinder → ellipse | always |
-| fillet | chamfers | cylinder ∩ plane → ellipse | always |
-| fillet | fillets, same size | crossing equal cylinders → planar ellipse | always |
-| fillet | fillets, different size | crossing unequal cylinders → quartic | **no** |
+where the joined answer's corner patch removes more: the `d³/4` those three
+planes leave behind, meeting at `(d/2, d/2, d/2)`, is exactly the material a
+patch would have taken.
 
-Four of the five are curves the vocabulary already carries. The fifth is not,
-and per ADR 0002 that case is refused by name — an independent fillet there
-must match the size already on the corner, or join it — rather than
-approximated into a curve the validator would be right to reject.
+Stated as a solid rather than as a patch, standing apart is simply the body
+less that band's own removal. So it is built as a Boolean, not as topology
+surgery on faces a previous feature owns — which is what makes it a bounded
+change rather than a second blend engine.
 
-Under a fillet at one size the three bands meet at a point of their own, a
-third of the way in from the vertex along each axis: for radius `r` on a
-square corner the triple point is at `r(1 − 1/√2)` on all three, and for a
-chamfer of setback `d` the three bevel planes meet at `d/2`. Those points are
-what the joined corner removes and the independent one keeps.
+#### What that costs, and what it rules out
 
-None of this is built. The panel shows the option greyed with that reason, so
-the choice is visible and honest rather than absent.
+A bevel's removal is a half-space. It crosses every face it meets, the
+analytic Boolean takes it, and the result is right to within a part in a
+thousand million of the body. That is looser than the analytic band's own
+closed form, and the tests say so rather than hiding it: this is a regularized
+Boolean and does not pretend to be an exact patch.
+
+A fillet's removal is not a half-space, and the obstacle is not the one first
+expected. The seam is fine — a bevel plane meets a cylinder in an ellipse, and
+two crossing equal cylinders meet in a planar ellipse, both of which the curve
+vocabulary already carries. What stops it is **tangency**. A fillet band is
+tangent to the two walls it rolls between; that is what makes it a fillet. Its
+removal solid therefore touches the body along a line rather than crossing it,
+and ADR 0025's Boolean fails closed on tangential contact between operands.
+Every fillet standing apart hits this, whatever is already at the corner, so
+the refusal is not about sizes agreeing.
+
+A bevel standing apart from a corner that was *rounded* fails too, later and
+differently: the cut is made and does not certify. It is refused by name at
+that point rather than published, because a route that cannot prove its own
+answer publishes nothing (ADR 0002).
+
+So what ships is: a chamfer standing apart, anywhere its cut plane meets only
+flat faces. Everything else says which of these it ran into and what to do
+instead, which is to join.
+
+Building the rest needs one of two things, and they are different pieces of
+work: a Boolean that will accept an operand touching the target along a line,
+or a direct construction in `vertex_blend` that re-trims the bands a previous
+feature committed. The first would unlock every remaining case at once.
 
 ### How a finished corner is recognised
 
@@ -138,8 +160,9 @@ Joining edits a committed feature, so everything after it replays. That is
 already how a sketch or an extrusion is edited, and the history reads better
 for it: one corner, one feature.
 
-The second answer is written down and visible before it is built, so the panel
-never has to pretend the first is the only thing anyone could have meant.
+The second answer ships for a chamfer and is visible, closed, with its reason
+for a fillet — so the panel never has to pretend the first is the only thing
+anyone could have meant.
 
 Nothing here changes what the kernel refuses. The vocabulary is untouched; the
 workbench stopped treating a refusal as the end of the conversation.

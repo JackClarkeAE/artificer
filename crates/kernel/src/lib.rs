@@ -11,6 +11,7 @@ mod corner_blend;
 mod cuboid;
 mod describe;
 mod edge_finish;
+mod edge_finish_apart;
 mod exact_face_feature;
 mod extrusion;
 mod face_feature;
@@ -1534,35 +1535,62 @@ impl NativeKernel {
                 target_edges,
                 kind,
                 distance,
+                standing_apart,
             } => {
-                let analytic = edge_finish::build_edge_finishes(
-                    input.id,
-                    &input.topology,
-                    target_edges,
-                    *kind,
-                    *distance,
-                    request.precision,
-                );
-                let topology = match analytic {
-                    Ok(topology) => {
-                        rung = "edge-finish/analytic";
-                        topology
-                    }
-                    Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
-                        let (topology, certified_by) = regularized_edge_finish(
-                            input,
-                            target_edges,
-                            *kind,
-                            *distance,
-                            request.precision,
-                            &mut warnings,
-                        )?;
-                        rung = certified_by;
-                        topology
-                    }
-                    Err(reason) => return Err(edge_finish_error(input.id, reason, true)),
-                };
-                (topology, HistoryMode::RegularizedFaceFeature)
+                // ADR 0044: a finish told to stand apart is one cut per edge
+                // against the body as it is, not a corner this feature owns.
+                // It never falls back — the whole point is which shape the
+                // user asked for, so a route that cannot make it refuses.
+                if *standing_apart {
+                    let built = edge_finish_apart::build_edge_finishes_apart(
+                        input.id,
+                        &input.topology,
+                        target_edges,
+                        *kind,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|refusal| {
+                        error(
+                            KernelErrorCode::Unsupported,
+                            KernelStage::Construction,
+                            input.id,
+                            format!("{}: {}", refusal.code, refusal.message),
+                            Vec::new(),
+                        )
+                    })?;
+                    rung = "edge-finish/standing-apart";
+                    (built, HistoryMode::RegularizedFaceFeature)
+                } else {
+                    let analytic = edge_finish::build_edge_finishes(
+                        input.id,
+                        &input.topology,
+                        target_edges,
+                        *kind,
+                        *distance,
+                        request.precision,
+                    );
+                    let topology = match analytic {
+                        Ok(topology) => {
+                            rung = "edge-finish/analytic";
+                            topology
+                        }
+                        Err(edge_finish::EdgeFinishError::DomainUnsupported) => {
+                            let (topology, certified_by) = regularized_edge_finish(
+                                input,
+                                target_edges,
+                                *kind,
+                                *distance,
+                                request.precision,
+                                &mut warnings,
+                            )?;
+                            rung = certified_by;
+                            topology
+                        }
+                        Err(reason) => return Err(edge_finish_error(input.id, reason, true)),
+                    };
+                    (topology, HistoryMode::RegularizedFaceFeature)
+                }
             }
         };
 
@@ -7780,6 +7808,7 @@ mod tests {
                     target_edges,
                     kind,
                     distance: 0.25,
+                    standing_apart: false,
                 },
             };
             let finished =
@@ -7930,6 +7959,7 @@ mod tests {
                     target_edges: targets.expect("perpendicular cuboid edge pair"),
                     kind,
                     distance: 0.25,
+                    standing_apart: false,
                 },
                 request_id: RequestId::new(format!("perpendicular-edge-set-{kind:?}")),
                 ..request(base.snapshot.id())
@@ -8050,6 +8080,7 @@ mod tests {
                 target_edges: targets,
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
+                standing_apart: false,
             },
             request_id: RequestId::new("trihedral-fillet-presentation"),
             ..request(base.snapshot.id())
@@ -8108,6 +8139,7 @@ mod tests {
                 target_edges: fillet_targets,
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
+                standing_apart: false,
             },
             request_id: RequestId::new("half-corner-fillet-before-u-chamfer"),
             ..request(base.snapshot.id())
@@ -8143,6 +8175,7 @@ mod tests {
                 target_edges: targets,
                 kind: artificer_protocol::EdgeFinishKind::Chamfer,
                 distance: 0.25,
+                standing_apart: false,
             },
             request_id: RequestId::new("connected-u-chamfer-after-trihedral-fillet"),
             ..request(filleted.snapshot.id())
@@ -8272,6 +8305,7 @@ mod tests {
                 target_edges: targets,
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
+                standing_apart: false,
             },
             request_id: RequestId::new("exact-corner-patch-base"),
             ..request(base.snapshot.id())
@@ -8438,6 +8472,7 @@ mod tests {
                 target_edges: vec![first.source_edge, second.source_edge],
                 kind: artificer_protocol::EdgeFinishKind::Fillet,
                 distance: 0.25,
+                standing_apart: false,
             },
             request_id: RequestId::new("regularized-fillet-for-successor"),
             ..request(base.snapshot.id())
@@ -8463,6 +8498,7 @@ mod tests {
                 target_edges,
                 kind: artificer_protocol::EdgeFinishKind::Chamfer,
                 distance: 0.1,
+                standing_apart: false,
             },
             request_id: RequestId::new("logical-successor-chamfer"),
             ..request(filleted.snapshot.id())
@@ -8518,6 +8554,7 @@ mod tests {
                 target_edges,
                 kind: artificer_protocol::EdgeFinishKind::Chamfer,
                 distance: 0.2,
+                standing_apart: false,
             },
             request_id: RequestId::new("transformed-three-edge-chamfer"),
             ..request(transformed.snapshot.id())

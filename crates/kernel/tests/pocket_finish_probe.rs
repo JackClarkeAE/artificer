@@ -123,6 +123,7 @@ fn chamfer_set(
             target_edges: targets,
             kind: EdgeFinishKind::Chamfer,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())

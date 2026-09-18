@@ -152,8 +152,17 @@ impl TargetedKernel {
                 },
             });
         }
-        if matches!(self.command_template, KernelCommand::FinishEdges { .. })
-            && self.additional_targets.is_empty()
+        // One edge is normally spelled with the singular command, and this is
+        // what keeps the representation canonical. A finish standing apart is
+        // the exception: the singular command carries no way to say so, so a
+        // set of one is the only spelling it has (ADR 0044).
+        if matches!(
+            self.command_template,
+            KernelCommand::FinishEdges {
+                standing_apart: false,
+                ..
+            }
+        ) && self.additional_targets.is_empty()
         {
             return Err(TargetedKernelError::TargetSetRequired);
         }

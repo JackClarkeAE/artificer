@@ -81,6 +81,7 @@ fn try_fillet(
             target_edges: targets,
             kind: EdgeFinishKind::Fillet,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(base, &request, &CancellationToken::new())

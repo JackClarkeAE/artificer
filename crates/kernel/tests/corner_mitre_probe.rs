@@ -68,6 +68,7 @@ fn every_mitre_between_three_corner_chamfers_presents_as_a_rail() {
             target_edges: targets,
             kind: EdgeFinishKind::Chamfer,
             distance: DISTANCE,
+            standing_apart: false,
         },
     };
     let chamfered = NativeKernel::execute(&cuboid, &request, &CancellationToken::new())

@@ -142,6 +142,7 @@ fn finish(
             target_edges: targets,
             kind: EdgeFinishKind::Chamfer,
             distance,
+            standing_apart: false,
         },
     };
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
@@ -347,6 +348,7 @@ fn a_box_top_rim_fillets_with_sphere_corners() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &request, &CancellationToken::new())
@@ -402,6 +404,7 @@ fn a_hexagon_rim_fillets_with_obtuse_sphere_corners() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &request, &CancellationToken::new())
@@ -451,6 +454,7 @@ fn an_oversized_rim_fillet_rejects_transactionally() {
                 target_edges: rim_loop(&base),
                 kind: EdgeFinishKind::Fillet,
                 distance: bad,
+                standing_apart: false,
             },
         };
         assert!(
@@ -527,6 +531,7 @@ fn a_stadium_rim_fillets_with_torus_bands_and_no_corners() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &finish_request, &CancellationToken::new())
@@ -652,6 +657,7 @@ fn a_box_bottom_rim_fillets_as_the_mirror_of_its_top_rim() {
             target_edges: rim_loop_at(&base, 0.0),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &request, &CancellationToken::new())
@@ -760,6 +766,7 @@ fn a_half_disc_rim_fillets_across_sharp_line_arc_junctions() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &finish_request, &CancellationToken::new())
@@ -947,6 +954,7 @@ fn a_concave_arc_rim_fillets_with_a_grown_torus_band() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &finish_request, &CancellationToken::new())
@@ -1290,6 +1298,7 @@ fn a_box_rim_fillet_reports_its_exact_centre_of_mass() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &request, &CancellationToken::new())
@@ -1347,6 +1356,7 @@ fn a_stadium_rim_fillet_reports_its_exact_centre_of_mass() {
             target_edges: rim_loop(&base),
             kind: EdgeFinishKind::Fillet,
             distance: fillet,
+            standing_apart: false,
         },
     };
     let filleted = NativeKernel::execute(&base, &finish_request, &CancellationToken::new())

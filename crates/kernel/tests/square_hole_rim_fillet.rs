@@ -115,6 +115,7 @@ fn a_fillet_round_a_square_hole_is_exact_with_elliptical_mitres() {
             target_edges: hole_rim(&plate),
             kind: EdgeFinishKind::Fillet,
             distance: FILLET,
+            standing_apart: false,
         },
     );
     assert!(NativeKernel::validate(&filleted, ValidationProfile::Solid).valid);
@@ -170,6 +171,7 @@ fn a_chamfer_round_the_same_hole_still_mitres_on_straight_lines() {
             target_edges: hole_rim(&plate),
             kind: EdgeFinishKind::Chamfer,
             distance: FILLET,
+            standing_apart: false,
         },
     );
     assert!(NativeKernel::validate(&chamfered, ValidationProfile::Solid).valid);
@@ -232,6 +234,7 @@ fn an_l_shaped_rim_fillets_its_reflex_corner_as_well_as_its_convex_ones() {
             target_edges: rim,
             kind: EdgeFinishKind::Fillet,
             distance: FILLET,
+            standing_apart: false,
         },
     );
     assert!(NativeKernel::validate(&filleted, ValidationProfile::Solid).valid);

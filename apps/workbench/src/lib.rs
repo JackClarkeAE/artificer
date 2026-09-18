@@ -480,6 +480,10 @@ struct AsyncEdgeFinishPreviewIntent {
     target_edges: Vec<EntityRef>,
     kind: EdgeFinishKind,
     distance: f64,
+    /// ADR 0044: cut beside whatever already shapes the corners this reaches.
+    /// Standing apart previews properly — it is one cut against the body as it
+    /// stands — where joining cannot, that being a replay of the whole branch.
+    standing_apart: bool,
 }
 
 struct AsyncSketchExtrusionCommit {
@@ -853,17 +857,6 @@ impl EdgeFinishSelectionSupport {
         }
     }
 }
-
-/// Whether ADR 0044's second answer can be built yet.
-///
-/// Standing a new band beside the ones already at a corner needs the kernel to
-/// trim band against band. The seam is a line wherever a bevel plane is
-/// involved and an ellipse where a cylinder meets a plane; only cylinder
-/// against cylinder needs the two sizes to agree, a different size there being
-/// a quartic this vocabulary does not carry. None of it is cut yet, so the
-/// panel shows the option closed, with the reason, rather than not at all.
-/// Flipping this is what turns it on.
-const INDEPENDENT_CORNER_FINISH_IS_BUILT: bool = false;
 
 /// What to do when a new edge reaches a corner an earlier feature finished.
 ///
@@ -9932,6 +9925,7 @@ impl KernelLabApp {
             target_edges,
             kind,
             distance: self.edge_finish_distance,
+            standing_apart: self.edge_finish_stands_apart(),
         };
 
         if let Some(scheduler) = self.feature_preview_scheduler.clone() {
@@ -10276,6 +10270,18 @@ impl KernelLabApp {
             .any(|code| error.message.contains(code) || named.contains(code))
     }
 
+    /// Whether this finish is to be cut beside the corner rather than into it.
+    ///
+    /// Only where the question was actually asked: a selection that reaches no
+    /// finished corner is an ordinary finish, and routing it through the
+    /// standing-apart cut would trade an exact analytic band for a Boolean
+    /// that merely agrees with it.
+    fn edge_finish_stands_apart(&self) -> bool {
+        self.edge_finish_corner_choice == CornerFinishChoice::Independent
+            && self.edge_finish_selection_support()
+                == EdgeFinishSelectionSupport::CornerAlreadyFinished
+    }
+
     /// Adds the selected edges to the committed finish that already shaped the
     /// corner they reach, and replays it, so one patch closes the whole corner.
     ///
@@ -10352,6 +10358,7 @@ impl KernelLabApp {
                 target_edges: raw.clone(),
                 kind,
                 distance,
+                standing_apart: false,
             };
             let Ok(joined) = TargetedKernel::new_many(template, targets) else {
                 continue;
@@ -13233,7 +13240,10 @@ impl KernelLabApp {
                     .filter(|selection| body.is_some_and(|body| selection.body.get() == body.get()))
                     .map(|selection| selection.edge)
                     .collect::<Vec<_>>();
-                if targets.len() <= 1 {
+                // Standing apart is its own route and always says so, even
+                // for a single edge: the singular command has no way to.
+                let apart = self.edge_finish_stands_apart();
+                if targets.len() <= 1 && !apart {
                     KernelCommand::FinishEdge {
                         target_edge: targets
                             .first()
@@ -13248,6 +13258,7 @@ impl KernelLabApp {
                         target_edges: targets,
                         kind,
                         distance: self.edge_finish_distance,
+                        standing_apart: apart,
                     }
                 }
             }
@@ -17204,8 +17215,9 @@ impl KernelLabApp {
             .color(theme::muted()),
         );
         ui.add_space(4.0);
+        let buildable = preset == SolidFeaturePreset::Chamfer;
         let apart = ui
-            .add_enabled_ui(INDEPENDENT_CORNER_FINISH_IS_BUILT, |ui| {
+            .add_enabled_ui(buildable, |ui| {
                 ui.selectable_label(
                     self.edge_finish_corner_choice == CornerFinishChoice::Independent,
                     RichText::new("Keep independent").strong(),
@@ -17216,17 +17228,15 @@ impl KernelLabApp {
             self.edge_finish_corner_choice = CornerFinishChoice::Independent;
         }
         ui.label(
-            RichText::new(if INDEPENDENT_CORNER_FINISH_IS_BUILT {
-                "The bands meet along a seam and the corner keeps its own point, as though each edge had been finished on its own body."
+            RichText::new(if buildable {
+                "The bevels meet along a seam and the corner keeps its own point, as though each edge had been bevelled on its own body. The size below is this one's."
             } else {
-                "Not built yet: the bands would meet along a seam with the corner's point surviving, which the kernel cannot yet cut."
+                "Not built for a fillet yet: its band is tangent to the two walls it rolls between, and the Boolean fails closed where two solids touch along a line rather than crossing."
             })
             .small()
             .color(theme::muted()),
         );
-        if !INDEPENDENT_CORNER_FINISH_IS_BUILT
-            && self.edge_finish_corner_choice == CornerFinishChoice::Independent
-        {
+        if !buildable && self.edge_finish_corner_choice == CornerFinishChoice::Independent {
             self.edge_finish_corner_choice = CornerFinishChoice::Join;
         }
         ui.add_space(2.0);
@@ -22847,7 +22857,7 @@ fn build_exact_edge_finish_preview(
     {
         return None;
     }
-    let command = if intent.target_edges.len() == 1 {
+    let command = if intent.target_edges.len() == 1 && !intent.standing_apart {
         KernelCommand::FinishEdge {
             target_edge: intent.target_edges[0],
             kind: intent.kind,
@@ -22858,6 +22868,7 @@ fn build_exact_edge_finish_preview(
             target_edges: intent.target_edges.clone(),
             kind: intent.kind,
             distance: intent.distance,
+            standing_apart: intent.standing_apart,
         }
     };
     let precision = input.precision_policy().unwrap_or_default();
@@ -31167,6 +31178,76 @@ mod extrusion_workbench_tests {
                 "{preset:?}: a joined corner is the whole-corner patch — {joined} against {whole}"
             );
         }
+    }
+
+    /// Standing apart is the other answer, and for a chamfer the kernel now
+    /// cuts it: three bevel planes meeting at a point of their own rather than
+    /// one patch closing the corner (ADR 0044).
+    #[test]
+    fn keeping_the_third_edge_independent_leaves_the_corner_its_own_point() {
+        let preset = SolidFeaturePreset::Chamfer;
+        let (mut app, body, third) = corner_with_two_edges_finished(preset, 0.3);
+        let before = app
+            .displayed
+            .as_ref()
+            .expect("the mitred body")
+            .snapshot
+            .measures()
+            .volume;
+        let features = app.document.features().len();
+
+        pick_all(&mut app, body, &[third]);
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::CornerAlreadyFinished
+        );
+        app.edge_finish_corner_choice = CornerFinishChoice::Independent;
+        assert!(
+            app.edge_finish_stands_apart(),
+            "the choice should reach the command"
+        );
+        assert!(
+            finish(&mut app, preset, 0.3),
+            "a bevel standing apart is cut, and previews on the way"
+        );
+        assert_eq!(
+            app.document.features().len(),
+            features + 1,
+            "standing apart is its own feature, unlike joining"
+        );
+
+        // The third bevel takes its own prism less what the first two already
+        // claimed of the corner: ½d²L for the edge, and the two wedges of d³/3
+        // it shares with them, plus the d³/4 all three share, counted back.
+        let after = app
+            .displayed
+            .as_ref()
+            .expect("the cut body")
+            .snapshot
+            .measures()
+            .volume;
+        assert!(
+            after < before,
+            "standing apart still removes material: {after} against {before}"
+        );
+
+        // And it is not the joined answer, which is the whole point of asking.
+        let mut joined = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(joined.active_body_id().unwrap().get());
+        let edges = block_corner_edges(&joined);
+        pick_all(&mut joined, body, &edges);
+        assert!(finish(&mut joined, preset, 0.3));
+        let patched = joined
+            .displayed
+            .as_ref()
+            .expect("the whole corner")
+            .snapshot
+            .measures()
+            .volume;
+        assert!(
+            (after - patched).abs() > 1.0e-6,
+            "standing apart and joining should differ: {after} against {patched}"
+        );
     }
 
     /// The same three edges taken one at a time are refused, and the refusal

@@ -58,6 +58,7 @@ fn finish(snapshot: &Snapshot, kind: EdgeFinishKind) -> Snapshot {
             target_edges: vec![front_top_edge(snapshot)],
             kind,
             distance: 3.0,
+            standing_apart: false,
         },
     )
 }

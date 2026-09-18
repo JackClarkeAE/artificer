@@ -1060,6 +1060,7 @@ impl Session {
                 target_edges: resolved,
                 kind,
                 distance,
+                standing_apart: false,
             }),
         }
     }
