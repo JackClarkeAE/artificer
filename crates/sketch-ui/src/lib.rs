@@ -23,7 +23,8 @@ use artificer_protocol::{
 };
 use artificer_sketch::{
     Angle as CoreAngle, ArrangementCell as CoreArrangementCell,
-    ArrangementLimits as CoreArrangementLimits, ArrangementLoop as CoreArrangementLoop,
+    ArrangementDiagnostic as CoreArrangementDiagnostic, ArrangementLimits as CoreArrangementLimits,
+    ArrangementLoop as CoreArrangementLoop,
     CircularPatternDistribution as CoreCircularPatternDistribution,
     ConfirmationSource as CoreConfirmationSource, CurveDirection as CoreCurveDirection,
     CurveIntersections as CoreCurveIntersections, EvaluatedCurve2 as CoreEvaluatedCurve2,
@@ -4992,7 +4993,7 @@ impl CertifiedProfileStatus {
                 winding: ProfileWinding::Clockwise,
             } => "PROFILE CLOSED · CLOCKWISE (REVERSED)",
             Self::SelfIntersecting => "PROFILE SELF-INTERSECTING",
-            Self::Invalid => "PROFILE sketch_colours().invalid",
+            Self::Invalid => "PROFILE INVALID",
             Self::Indeterminate => "PROFILE INDETERMINATE",
             Self::ClosedAnalyticCircle => "PROFILE CLOSED · ANALYTIC CIRCLE",
             Self::ClosedAnalyticCurves => "PROFILE CLOSED · ANALYTIC CURVES",
@@ -5004,9 +5005,7 @@ impl CertifiedProfileStatus {
             Self::TooManyLoops { .. } => "PROFILE LOOP LIMIT EXCEEDED",
             Self::TooManyRegions { .. } => "PROFILE REGION LIMIT EXCEEDED",
             Self::LinearLoopTooLarge { .. } => "LINEAR LOOP LIMIT EXCEEDED",
-            Self::CurvesNeedCertification => {
-                "PROFILE CURVES · CERTIFICATION sketch_colours().pending"
-            }
+            Self::CurvesNeedCertification => "PROFILE CURVES · CERTIFICATION PENDING",
             Self::MultipleProfiles => "PROFILE MULTI-LOOP · AMBIGUOUS",
         }
     }
@@ -6122,6 +6121,67 @@ impl SketchCanvasState {
             .arrangement
             .as_ref()
             .map_or(0, |arrangement| arrangement.cells.len())
+    }
+
+    /// What the arrangement refused to work out, in the user's terms.
+    ///
+    /// ADR 0002 lets an algorithm answer "indeterminate" rather than invent
+    /// topology, and near a tangency that is the honest answer: whether a line
+    /// misses a circle, touches it, or cuts it cannot be certified when the
+    /// separation is within modelling resolution. What the user must not get is
+    /// what they got before this existed — the two curves dropped from the
+    /// arrangement, every region that depended on them gone, and nothing said.
+    /// A region that will not appear has a reason, and the reason belongs on
+    /// screen next to the sketch that is missing it.
+    #[must_use]
+    pub fn region_refusal(&self) -> Option<String> {
+        let arrangement = self.analytic_regions.arrangement.as_ref()?;
+        let mut indeterminate = 0_usize;
+        let mut overlapping = 0_usize;
+        let mut invalid = 0_usize;
+        let mut limits = false;
+        for diagnostic in &arrangement.diagnostics {
+            match diagnostic {
+                CoreArrangementDiagnostic::IndeterminateIntersection { .. } => indeterminate += 1,
+                CoreArrangementDiagnostic::CoincidentOrOverlapping { .. } => overlapping += 1,
+                CoreArrangementDiagnostic::InvalidCurve { .. }
+                | CoreArrangementDiagnostic::DuplicateEntity { .. } => invalid += 1,
+                CoreArrangementDiagnostic::CurveLimitExceeded { .. }
+                | CoreArrangementDiagnostic::EventLimitExceeded { .. }
+                | CoreArrangementDiagnostic::FragmentLimitExceeded { .. } => limits = true,
+                // A kissing junction, a zero-area cycle, or an ambiguous
+                // junction order degrade the arrangement locally without
+                // costing the user a region, so they are not worth a line in
+                // the status bar.
+                CoreArrangementDiagnostic::KissingJunction { .. }
+                | CoreArrangementDiagnostic::ZeroAreaCycle
+                | CoreArrangementDiagnostic::AmbiguousJunctionOrder => {}
+            }
+        }
+        if limits {
+            return Some("SKETCH TOO LARGE TO WORK OUT REGIONS".to_owned());
+        }
+        if indeterminate > 0 {
+            // Naming the remedy matters more than naming the curves: an exact
+            // tangency is what the arrangement can certify, and a relation is
+            // how the user states one.
+            return Some(format!(
+                "{indeterminate} NEAR-TANGENT CROSSING{} DROPPED · ADD A TANGENT OR COINCIDENT RELATION, OR MOVE THE CURVE CLEAR",
+                if indeterminate == 1 { "" } else { "S" }
+            ));
+        }
+        if overlapping > 0 {
+            return Some(format!(
+                "{overlapping} OVERLAPPING CURVE PAIR{} DROPPED · TRIM OR DELETE THE DUPLICATE",
+                if overlapping == 1 { "" } else { "S" }
+            ));
+        }
+        (invalid > 0).then(|| {
+            format!(
+                "{invalid} CURVE{} COULD NOT BE READ",
+                if invalid == 1 { "" } else { "S" }
+            )
+        })
     }
 
     /// Stable, deterministic signatures of the selected exact arrangement
@@ -13359,6 +13419,15 @@ fn paint_overlay(
         .pointer_preview
         .map_or("Snap: inactive", |snap| snap.kind.label());
     let profile_label = state.certified_profile_status().label();
+    // The profile status describes the shape; a refusal describes what the
+    // sketch could not work out about it, and only the second one is
+    // actionable. "PROFILE SELF-INTERSECTING" is perfectly true of a circle
+    // crossing a rectangle and still leaves a user staring at regions that
+    // will not appear, with nothing to do about it.
+    let refusal = state
+        .region_refusal()
+        .map(|refusal| format!(" · {refusal}"))
+        .unwrap_or_default();
     // Second line under the instruction, not the bottom edge. Three things want
     // the bottom-left corner — the projection chip, this line, and the floating
     // confirmation chip that became the sketch's only tick and cross when the
@@ -13367,7 +13436,7 @@ fn paint_overlay(
     painter.text(
         rect.left_top() + Vec2::new(13.0, 28.0),
         Align2::LEFT_TOP,
-        format!("{snap_label} · {profile_label}"),
+        format!("{snap_label} · {profile_label}{refusal}"),
         FontId::monospace(10.0),
         sketch_colours().overlay_text,
     );
@@ -20660,6 +20729,74 @@ mod tests {
             (center.u + 2.0).abs() <= 1.0e-6,
             "the circle should have moved to two from the edge, and sits at {center:?}"
         );
+    }
+
+    /// A sketch whose regions were dropped has to say so. Silence reads as
+    /// "this shape has no regions", which is a different and much more
+    /// confusing claim than "I could not work out one crossing".
+    #[test]
+    fn a_refused_crossing_is_named_in_the_status_line() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("circle stages");
+        state.commit_pending().expect("circle commits");
+        // Corners a hair inside the circle, which is what dragging a rectangle
+        // onto its edge produces when no relation says they belong together.
+        let half_width = 4.0 - 1.0e-7;
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-half_width, 0.0),
+                SketchPoint::new(half_width, -8.0),
+            ))
+            .expect("rectangle stages");
+        state.commit_pending().expect("rectangle commits");
+
+        state.refresh_analytic_regions();
+        assert_eq!(
+            state.available_region_count(),
+            0,
+            "the refused crossing costs every region it bounded"
+        );
+        let refusal = state
+            .region_refusal()
+            .expect("a sketch that lost its regions must say why");
+        assert!(
+            refusal.contains("NEAR-TANGENT"),
+            "the message should name what happened, and says {refusal:?}"
+        );
+        assert!(
+            refusal.contains("TANGENT OR COINCIDENT RELATION"),
+            "and what to do about it, but says {refusal:?}"
+        );
+    }
+
+    /// An exactly tangent rectangle is certifiable, so it keeps its regions and
+    /// has nothing to confess.
+    #[test]
+    fn an_exact_tangency_needs_no_refusal() {
+        let mut state = SketchCanvasState::default();
+        state
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(4.0, 0.0),
+            ))
+            .expect("circle stages");
+        state.commit_pending().expect("circle commits");
+        state
+            .stage_geometry(SketchGeometry::rectangle(
+                SketchPoint::new(-4.0, 0.0),
+                SketchPoint::new(4.0, -8.0),
+            ))
+            .expect("rectangle stages");
+        state.commit_pending().expect("rectangle commits");
+
+        state.refresh_analytic_regions();
+        assert_eq!(state.available_region_count(), 3);
+        assert_eq!(state.region_refusal(), None);
     }
 
     /// Placing a dimension and giving it a value is one act. The value is open

@@ -7433,16 +7433,29 @@ impl KernelLabApp {
         self.sketch_finished = true;
         self.selected_origin_plane = sketch_plane_for_frame(self.sketch_support.frame());
         if !already_active {
-            self.sketch = match record.portable_payload.as_ref() {
-                Some(payload) => {
-                    match Self::hydrate_sketch_canvas(self.selected_origin_plane, payload) {
-                        Ok(Some(canvas)) => canvas,
-                        Ok(None) => SketchCanvasState::new(self.selected_origin_plane),
-                        Err(_) => return false,
+            // Rebuilding the canvas resets its local undo journal, which is the
+            // only record of the strokes that built this sketch. Keeping the
+            // live canvas when it already holds this very sketch is what lets
+            // a user reopen their work and still step back through it, rather
+            // than finding both arrows dead the moment they return.
+            let live_canvas_holds_this_sketch = record
+                .portable_payload
+                .as_ref()
+                .and_then(|payload| payload.authoring())
+                .is_some_and(|authoring| authoring == self.sketch.authoring())
+                && !self.sketch.has_pending_edit();
+            if !live_canvas_holds_this_sketch {
+                self.sketch = match record.portable_payload.as_ref() {
+                    Some(payload) => {
+                        match Self::hydrate_sketch_canvas(self.selected_origin_plane, payload) {
+                            Ok(Some(canvas)) => canvas,
+                            Ok(None) => SketchCanvasState::new(self.selected_origin_plane),
+                            Err(_) => return false,
+                        }
                     }
-                }
-                None => SketchCanvasState::new(self.selected_origin_plane),
-            };
+                    None => SketchCanvasState::new(self.selected_origin_plane),
+                };
+            }
             self.active_sketch_tool = ToolVariant::Select;
         }
         self.extrusion_mode = if self.sketch_support.body().is_some() {
@@ -7459,7 +7472,17 @@ impl KernelLabApp {
         self.extruded_sketch_revision = None;
         self.selected_faces.clear();
         self.face_sketch_context = None;
-        self.leave_sketch_mode();
+        // Activating a sketch says *which* sketch, not *which workspace*. It
+        // used to say both, so selecting the sketch you were drawing threw you
+        // out into the model view, and the explicit edit action below had to
+        // put you back — which it only manages if nothing refuses first. A
+        // user in the sketch workspace who picks a sketch stays in the sketch
+        // workspace, now editing that one.
+        if self.workbench_mode == WorkbenchMode::Sketch {
+            self.forget_picked_ribbon_tab();
+        } else {
+            self.leave_sketch_mode();
+        }
         self.sketch_finish_issue = None;
         self.sketch_extrusion_issue = None;
         self.selected_history_feature = record.feature;
@@ -27760,6 +27783,68 @@ mod extrusion_workbench_tests {
             app.pending_operation,
             Some(PendingOperation::ExtrudeSketch { .. })
         ));
+    }
+
+    /// Reopening a sketch you were just working on must not cost you its
+    /// history. Rebuilding the canvas from the document resets the sketch's
+    /// local undo journal, so a user who stepped out and back found both
+    /// arrows dead with no way to step back through the strokes they had just
+    /// made.
+    #[test]
+    fn reopening_a_sketch_keeps_the_strokes_that_built_it_undoable() {
+        let mut app = active_rectangle_app();
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let sketch_index = app.active_sketch_index.expect("committed sketch record");
+        assert!(
+            app.sketch.can_undo_local(),
+            "the sketch has strokes behind it before anything is reopened"
+        );
+
+        // Leave the sketch the way selecting another one does, then come back.
+        app.active_sketch_index = None;
+        app.edit_committed_sketch(sketch_index);
+
+        assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
+        assert!(
+            app.sketch.can_undo_local(),
+            "reopening the sketch you were drawing keeps its own history"
+        );
+    }
+
+    /// Picking a sketch says which sketch, not which workspace. It used to say
+    /// both, so selecting the sketch you were drawing threw you out into the
+    /// model view and you had to click Sketch again to get back.
+    #[test]
+    fn selecting_a_sketch_from_the_sketch_workspace_stays_in_it() {
+        let mut app = active_rectangle_app();
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let sketch_index = app.active_sketch_index.expect("committed sketch record");
+
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.active_sketch_index = None;
+        assert!(app.activate_committed_sketch(sketch_index));
+        assert_eq!(
+            app.workbench_mode,
+            WorkbenchMode::Sketch,
+            "a user in the sketch workspace who picks a sketch stays there"
+        );
+    }
+
+    /// From the model workspace, picking a sketch is a selection and nothing
+    /// more: it must not drag the user into the sketch editor uninvited.
+    #[test]
+    fn selecting_a_sketch_from_the_model_workspace_stays_in_it() {
+        let mut app = active_rectangle_app();
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        let sketch_index = app.active_sketch_index.expect("committed sketch record");
+
+        app.workbench_mode = WorkbenchMode::Model;
+        app.active_sketch_index = None;
+        assert!(app.activate_committed_sketch(sketch_index));
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
     }
 
     #[test]
