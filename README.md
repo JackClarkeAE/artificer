@@ -25,6 +25,17 @@
 
 ---
 
+## What is new in 0.99.5
+
+A release about one word in the Boolean engine: tangency. A fillet's band
+touches the walls it rolls between rather than crossing them, and that touch
+is now something the engine can cut rather than something it refuses.
+
+- **A finish can stand apart from a corner as a fillet, not only as a chamfer.** The regularized Boolean underneath used to refuse every tangential contact, on the grounds that it classifies each piece of a boundary by an interior sample and a tangency is not a transverse crossing. But the invariant that pipeline actually needs is only that no piece *crosses* the other operand's boundary, and at a tangency none does: the boundaries touch and part again. A tangency is now imprinted like any other crossing, and which side each piece lies on stays a question for the sample, which is what the classifier is for. Boundaries that share a stretch rather than a point are a different question and still fail closed. The result is exact rather than close: a cube of side `L` with one edge rounded by `r` measures `L³ − r²(1 − π/4)L` to the last digit the closed form carries.
+- **A tangency is only a tangency if it is exact.** Taking the band's contact with each wall as `r/tan(θ/2)` along the face lands a bit or two off the true foot, and a flank plane four ten-thousandths of a millionth of a millionth outside the band does not graze it — it misses, and every stage after that is entitled to believe the miss. The contacts are now taken as the feet of the perpendiculars from the band's own axis, where they are exact by construction. This was the whole difference between a fillet that cuts and one that is refused.
+- **The cut goes through the engine's front door.** Standing a finish apart is a prism against a prism, which is the reduction that carries it; the code had been reaching past the dispatch into the general engine, which takes a route that refuses the shape.
+- **What is still refused says so by name.** A finish standing apart from a *band* — a corner an earlier feature rounded, or a second edge running across the first — has no single axis that reduces it to prisms, so the general engine has to answer it and carries no tangency of its own. ADR 0044 records the reasoning and what that route would need.
+
 ## What is new in 0.99.4
 
 A release about corners: the ones a finish leaves behind, and what happens
