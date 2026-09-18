@@ -25,6 +25,17 @@
 
 ---
 
+## What is new in 0.99.7
+
+A correctness fix for 0.99.6. Two decisions inside the Boolean engine turned
+on arithmetic the platform gets to choose rather than on the shapes
+themselves, so the same model could cut on one machine and be refused on
+another — which is what happened: the Windows build refused corners the Linux
+build cut.
+
+- **A finish standing apart now cuts at every size, on every platform.** Whether two bands *touch* was decided by how near a sampled point came to the other surface. Where those samples fall is fixed, but how near they come depends on the last bits of a sine — and the maths library that supplies it differs between Windows and Linux. The touch is now located exactly, by refining to it, and only then measured. Likewise, two corners meeting at a point had to match to the last bit to count as the same corner; they now count when they agree to within the document's own precision, which is what that setting means and what the later stages already assume.
+- **Found by sweeping, not by example.** One fillet at one radius passed. The same cut swept across forty radii refused twelve of them, scattered, with nothing about the shapes separating the twelve from the rest. Scattered failures across a smooth range are the fingerprint of a decision resting on arithmetic instead of geometry. That sweep — eighty corners, two bands and three, checked against the closed form — is now part of the test suite, because no single example can show it.
+
 ## What is new in 0.99.6
 
 The Boolean engine used to draw its domain around crossings that pass clean
