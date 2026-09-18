@@ -9,6 +9,18 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const CONFIRM_OPERATION: &str = "Confirm operation";
 const CANCEL_OPERATION: &str = "Cancel operation";
 
@@ -116,7 +128,7 @@ fn canvas_sketch_point(harness: &Harness<'static, KernelLabApp>, point: SketchPo
 
 fn prepare_active_one_by_one_face_rectangle(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
-    click_button(harness, "Positive Z face");
+    activate_face(harness, "Positive Z face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::PositiveZ)
@@ -425,7 +437,7 @@ fn selected_face_add_and_cut_preview_then_publish_only_through_global_confirmati
 
         let committed_sketch_support = harness.state().sketch_support_label();
         let committed_sketch_entities = harness.state().sketch_entity_count();
-        click_button(&mut harness, "Feature end face");
+        activate_face(&mut harness, "Feature end face");
         click_button(&mut harness, "Sketch 1 feature");
         assert_eq!(
             harness.state().workbench_mode(),
@@ -482,7 +494,7 @@ fn selected_face_extrudes_directly_and_signed_distance_switches_to_cut() {
         .expect("bootstrap cuboid snapshot");
     let attempts = harness.state().transaction_attempt_count();
 
-    click_button(&mut harness, "Positive Z face");
+    activate_face(&mut harness, "Positive Z face");
     let extrude = harness.get_by_role_and_label(Role::Button, "Extrude");
     assert!(
         !extrude.accesskit_node().is_disabled(),
@@ -540,7 +552,7 @@ fn repeated_face_add_cut_add_chain_uses_the_ribbon_and_global_confirmation() {
     );
     assert_measures(&harness, 24.0, 52.0, 2.0, 4.0);
 
-    click_button(&mut harness, "Positive Z face");
+    activate_face(&mut harness, "Positive Z face");
     click_button(&mut harness, "Sketch on selected face");
     finish_centered_face_rectangle(&mut harness, "1", "1");
 

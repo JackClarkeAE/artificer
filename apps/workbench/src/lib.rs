@@ -6407,7 +6407,7 @@ impl KernelLabApp {
 
     /// The most recently picked edge.
     #[must_use]
-    fn selected_edge(&self) -> Option<viewport::DocumentEdgeSelection> {
+    pub fn selected_edge(&self) -> Option<viewport::DocumentEdgeSelection> {
         self.selected_edges.last().copied()
     }
 

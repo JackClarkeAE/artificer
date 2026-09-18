@@ -9,6 +9,18 @@ use artificer_workbench::{KernelLabApp, WorkbenchMode, sketch::SketchPoint};
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable as _};
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const NORMAL_TO_FACE: &str = "Normal to face";
 const SKETCH_ON_FACE: &str = "Sketch on this face";
 const ZOOM_TO_SELECTION: &str = "Zoom to selection";
@@ -238,7 +250,7 @@ fn a_staged_operation_owns_the_canvas_and_suppresses_the_menu() {
     create_extruded_body(&mut harness);
 
     // With a face selected, Extrude stages a push/pull on it.
-    click_button(&mut harness, "Extrusion top face");
+    activate_face(&mut harness, "Extrusion top face");
     click_button(&mut harness, "Extrude");
     assert!(harness.state().operation_confirmation_pending());
     right_click_button(&mut harness, "Extrusion top face");
@@ -304,7 +316,7 @@ fn ribbon_tab_snapshots() {
         .build_eframe(|creation_context| KernelLabApp::new_paused(creation_context));
 
     create_extruded_body(&mut harness);
-    click_button(&mut harness, "Extrusion top face");
+    activate_face(&mut harness, "Extrusion top face");
     harness.remove_cursor();
     harness.run();
     harness.snapshot("workbench_ribbon_model_tab_1280");

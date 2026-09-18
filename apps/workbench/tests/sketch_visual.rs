@@ -10,6 +10,18 @@ use egui_kittest::{
     kittest::{NodeT as _, Queryable as _},
 };
 
+/// Activates a named face target the way assistive technology does.
+///
+/// Clicking its label's pixel is no longer the same thing: an edge highlighted
+/// under that pixel takes the click, because what is highlighted is what a
+/// click picks. Naming the face is what these tests mean.
+fn activate_face(harness: &mut Harness<'static, KernelLabApp>, label: &str) {
+    harness
+        .get_by_role_and_label(Role::Button, label)
+        .click_accesskit();
+    harness.run();
+}
+
 const CONFIRM_OPERATION: &str = "Confirm operation";
 const IMAGE_WIDTH: usize = 1280;
 
@@ -120,7 +132,7 @@ fn enter_xy_sketch(harness: &mut Harness<'static, KernelLabApp>) {
 
 fn enter_positive_z_face_sketch(harness: &mut Harness<'static, KernelLabApp>) {
     harness.run();
-    click_button(harness, "Positive Z face");
+    activate_face(harness, "Positive Z face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::PositiveZ)
@@ -760,7 +772,7 @@ fn workbench_selected_face_cut_snapshots() {
 fn workbench_selected_face_push_pull_preview_snapshot() {
     let mut harness = harness();
     harness.run();
-    click_button(&mut harness, "Positive Z face");
+    activate_face(&mut harness, "Positive Z face");
     click_button(&mut harness, "Extrude");
     set_extrusion_distance(&mut harness, "-1");
 
@@ -802,7 +814,7 @@ fn workbench_committed_xy_extrusion_snapshot() {
     assert!((centroid.y - 1.0).abs() <= 1.0e-9);
     assert!((centroid.z - 1.5).abs() <= 1.0e-9);
 
-    click_button(&mut harness, "Extrusion top face");
+    activate_face(&mut harness, "Extrusion top face");
     assert_eq!(
         harness.state().selected_face_role(),
         Some(FaceRole::ExtrusionTop)

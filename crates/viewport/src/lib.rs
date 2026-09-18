@@ -1908,8 +1908,19 @@ fn show_document_impl(
     // Boolean candidates can have thousands of vertices; suppressing their
     // per-pointer occlusion tests during orbit removes work that cannot yield
     // a selection until the gesture ends anyway.
+    // Taken from the pointer rather than from the canvas's own hover. The
+    // per-face semantic rects are invisible 24 pt boxes for assistive
+    // technology, and they win egui's hit test against the canvas, so asking
+    // the canvas whether it was hovered answered "no" wherever one sat. An
+    // edge under the pointer there was neither highlighted nor clickable, and
+    // which places those were moved with the camera, because label positions
+    // do.
     let hover_position = (!feature_interaction.handle_hovered && !orbiting)
-        .then(|| canvas.hover_pos())
+        .then(|| {
+            ui.ctx()
+                .pointer_hover_pos()
+                .filter(|position| canvas.rect.contains(*position))
+        })
         .flatten();
     // Camera manipulation keeps the same semantic boundary edges visible, but
     // omits exact per-segment hidden-line splitting until release.  The old
@@ -2504,11 +2515,21 @@ fn show_document_impl(
             let hit_rect = Rect::from_center_size(face.label_position, Vec2::splat(24.0))
                 .intersect(canvas.rect);
             if hit_rect.is_positive() && hit_rect.is_finite() {
+                // While an edge or vertex is highlighted under the pointer,
+                // this box stops sensing clicks so the canvas can resolve the
+                // pick geometrically — what is highlighted is what a click
+                // takes. It stays in the accessibility tree throughout, so
+                // naming the face still selects it.
+                let pointer_over_geometry = hovered_vertex.is_some() || hovered_edge.is_some();
                 let response = ui.interact(
                     hit_rect,
                     ui.id()
                         .with(("source-face", source.body.get(), source.face.entity.0)),
-                    Sense::click(),
+                    if pointer_over_geometry {
+                        Sense::hover()
+                    } else {
+                        Sense::click()
+                    },
                 );
                 let label = format!("{} face", role_label(face.role));
                 response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, &label));
