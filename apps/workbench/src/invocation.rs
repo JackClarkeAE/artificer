@@ -715,6 +715,81 @@ impl ArmedTool {
     }
 }
 
+/// The body a Boolean cuts or joins into.
+fn accepts_boolean_target(
+    context: &dyn InvocationContext,
+    _bindings: &OperandBindings,
+    item: SelectionItem,
+) -> OperandEligibility {
+    accepts_editable_body(context, _bindings, item)
+}
+
+/// Any body except the target.
+fn accepts_boolean_tool(
+    context: &dyn InvocationContext,
+    bindings: &OperandBindings,
+    item: SelectionItem,
+) -> OperandEligibility {
+    let SelectionItem::Body(body) = item else {
+        return OperandEligibility::WrongKind;
+    };
+    if bindings.get(BOOLEAN_TARGET).contains(&item) {
+        return OperandEligibility::Incompatible("the target body cannot also be a tool");
+    }
+    accepts_editable_body(context, bindings, SelectionItem::Body(body))
+}
+
+pub const BOOLEAN_TARGET: &str = "target";
+pub const BOOLEAN_TOOLS: &str = "tools";
+
+/// A body Boolean: the body being cut or joined into, and the bodies doing it.
+///
+/// The two roles are asymmetric and are sourced accordingly. The target comes
+/// from the active body or an explicit pick, never from whatever happens to be
+/// first in the selection; the tools come only from picks made while the
+/// operation is staged. The workbench's own Boolean code carries the reason in
+/// a comment — guessing an operand silently picked the wrong body once a third
+/// existed — and this is that lesson written as a rule the resolver enforces.
+pub const BODY_BOOLEAN: ToolInvocationSpec = ToolInvocationSpec {
+    alternatives: &[OperandSchema {
+        roles: &[
+            OperandRoleSpec {
+                id: BOOLEAN_TARGET,
+                prompt: "Pick the body to cut into",
+                cardinality: Cardinality::Exactly(1),
+                source: OperandSourcePolicy::ActiveOrExplicit,
+                accepts: accepts_boolean_target,
+            },
+            OperandRoleSpec {
+                id: BOOLEAN_TOOLS,
+                prompt: "Pick the bodies to cut with",
+                cardinality: Cardinality::AtLeast(1),
+                source: OperandSourcePolicy::ExplicitOnly,
+                accepts: accepts_boolean_tool,
+            },
+        ],
+    }],
+};
+
+pub const PROFILE_REGION: &str = "profile";
+
+/// Extruding a sketch: the closed region to raise or cut with.
+///
+/// Extrude already behaves this way — its availability function says so in a
+/// comment, that it hands the canvas to Select and says where to click rather
+/// than greying out — so this records the appetite that behaviour implies.
+pub const SKETCH_EXTRUSION: ToolInvocationSpec = ToolInvocationSpec {
+    alternatives: &[OperandSchema {
+        roles: &[OperandRoleSpec {
+            id: PROFILE_REGION,
+            prompt: "Pick the profile to extrude",
+            cardinality: Cardinality::AtLeast(1),
+            source: OperandSourcePolicy::ExplicitOnly,
+            accepts: |_, _, _| OperandEligibility::WrongKind,
+        }],
+    }],
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1063,62 @@ mod tests {
         );
         assert!(armed.accepts(&context, edge(1, 10)));
         assert!(!armed.accepts(&context, face(1, 20)));
+    }
+
+    /// The rule the Boolean code learned the hard way: a target is never taken
+    /// from whatever happens to be first in the selection.
+    #[test]
+    fn a_boolean_target_is_never_inferred_from_selection_order() {
+        // Two bodies selected and no active body. A resolver that harvested in
+        // order would call the first one the target and silently cut the wrong
+        // one once a third existed.
+        let context = Fake::default();
+        let resolution = resolve(
+            &context,
+            &BODY_BOOLEAN,
+            &[SelectionItem::Body(body(7)), SelectionItem::Body(body(8))],
+        );
+        let OperandResolution::NeedsOperands { role, .. } = resolution else {
+            panic!("an asymmetric role must be asked for, not guessed: {resolution:?}");
+        };
+        assert_eq!(role, BOOLEAN_TARGET);
+    }
+
+    /// With an active body the target is known, and the tools are still asked
+    /// for rather than taken from the selection.
+    #[test]
+    fn a_boolean_takes_its_target_from_the_active_body_and_asks_for_tools() {
+        let context = Fake {
+            active: Some(body(1)),
+            ..Fake::default()
+        };
+        let resolution = resolve(&context, &BODY_BOOLEAN, &[SelectionItem::Body(body(2))]);
+        let OperandResolution::NeedsOperands { role, bindings, .. } = resolution else {
+            panic!("the tools are still outstanding: {resolution:?}");
+        };
+        assert_eq!(role, BOOLEAN_TOOLS);
+        assert_eq!(
+            bindings.get(BOOLEAN_TARGET),
+            &[SelectionItem::Body(body(1))],
+            "the target is the active body, not the selected one"
+        );
+    }
+
+    /// The target cannot also be a tool, and saying so is a rejection with a
+    /// reason rather than a silent omission.
+    #[test]
+    fn a_booleans_target_cannot_also_be_one_of_its_tools() {
+        let context = Fake::default();
+        let mut bindings = OperandBindings::default();
+        bindings.push(BOOLEAN_TARGET, SelectionItem::Body(body(1)));
+        assert!(matches!(
+            accepts_boolean_tool(&context, &bindings, SelectionItem::Body(body(1))),
+            OperandEligibility::Incompatible(_)
+        ));
+        assert!(matches!(
+            accepts_boolean_tool(&context, &bindings, SelectionItem::Body(body(2))),
+            OperandEligibility::Accept
+        ));
     }
 
     /// Symmetric operands do not care what order they were picked in, which is
