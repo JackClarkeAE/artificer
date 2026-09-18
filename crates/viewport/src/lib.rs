@@ -8857,6 +8857,149 @@ mod tests {
         );
     }
 
+    /// Every edge of a cuboid must be pickable at the angle people actually
+    /// work at.
+    ///
+    /// From an isometric view the top face's four edges each sit on the
+    /// boundary between two faces, and the two nearest the camera lie right
+    /// where the top face meets the two walls below it. Reported: at some
+    /// angles the near top edge could not be clicked at all — the face was
+    /// picked instead.
+    #[test]
+    fn every_top_edge_of_a_cuboid_is_pickable_from_an_isometric_view() {
+        let (scene, bounds, pivot) = cuboid_scene_fixture();
+        let key = BodyInstanceKey::new(1);
+        let bodies = [DocumentBodyInstance::new(key, &scene, Some(bounds), pivot)];
+        let mut view = ViewState::default();
+        view.frame(bounds);
+        // The standard isometric station point.
+        view.yaw = std::f64::consts::FRAC_PI_4;
+        view.pitch = 35.264_f64.to_radians();
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0)),
+        )
+        .expect("projection");
+        let triangles = project_document_triangles(
+            &bodies,
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+        );
+        let keys = visible_triangle_edge_keys_by_body(&triangles);
+        let cache = prepare_edge_frame_cache(
+            &bodies,
+            Some(key),
+            DisplayTransform::default(),
+            view,
+            0.0,
+            projection,
+            &keys,
+            &triangles,
+        );
+
+        // The top edges are the four whose endpoints both sit at max Z.
+        let top_edges: Vec<_> = scene
+            .edges
+            .iter()
+            .filter(|edge| {
+                let [a, b] = edge.endpoints;
+                (a.z - bounds.max.z).abs() <= 1.0e-9 && (b.z - bounds.max.z).abs() <= 1.0e-9
+            })
+            .collect();
+        assert_eq!(top_edges.len(), 4, "a cuboid top is bounded by four edges");
+
+        let drawn = &cache.by_body[&key];
+        for edge in &top_edges {
+            let projected = drawn
+                .iter()
+                .find(|candidate| candidate.source == edge.source_edge)
+                .unwrap_or_else(|| panic!("edge {:?} should be in the frame", edge.source_edge));
+            assert!(
+                projected.visible && !projected.visible_intervals.is_empty(),
+                "top edge {:?} is not pickable from an isometric view: visible={}, intervals={:?}",
+                edge.source_edge,
+                projected.visible,
+                projected.visible_intervals
+            );
+            // Along its whole length, not merely at the midpoint: the reported
+            // failure was that one edge could not be hit at all, and a single
+            // sample in the middle would not have caught an edge that is only
+            // reachable in places.
+            for step in 1_i32..=9 {
+                let parameter = step as f32 / 10.0;
+                let position = lerp_pos(projected.screen, parameter);
+                let picked = edge_at_position(&cache, position);
+                assert_eq!(
+                    picked.map(|selection| selection.edge),
+                    Some(edge.source_edge),
+                    "clicking top edge {:?} at t={parameter} should pick it",
+                    edge.source_edge
+                );
+            }
+        }
+    }
+
+    /// The same, swept around the camera. "Certain angles" was the whole shape
+    /// of the report, so one station point proves very little.
+    #[test]
+    fn every_cuboid_edge_stays_pickable_all_the_way_around_the_camera() {
+        let (scene, bounds, pivot) = cuboid_scene_fixture();
+        let key = BodyInstanceKey::new(1);
+        let bodies = [DocumentBodyInstance::new(key, &scene, Some(bounds), pivot)];
+        for yaw_step in 0..8 {
+            for pitch_degrees in [15.0_f64, 35.264, 55.0] {
+                let mut view = ViewState::default();
+                view.frame(bounds);
+                view.yaw = f64::from(yaw_step) * std::f64::consts::FRAC_PI_4;
+                view.pitch = pitch_degrees.to_radians();
+                let projection = projection_for_view(
+                    view,
+                    Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0)),
+                )
+                .expect("projection");
+                let triangles = project_document_triangles(
+                    &bodies,
+                    Some(key),
+                    DisplayTransform::default(),
+                    view,
+                    0.0,
+                    projection,
+                );
+                let keys = visible_triangle_edge_keys_by_body(&triangles);
+                let cache = prepare_edge_frame_cache(
+                    &bodies,
+                    Some(key),
+                    DisplayTransform::default(),
+                    view,
+                    0.0,
+                    projection,
+                    &keys,
+                    &triangles,
+                );
+                // Every edge the frame says is drawable must also be clickable
+                // somewhere along itself. An edge that is painted and cannot be
+                // hit is the exact complaint.
+                for projected in &cache.by_body[&key] {
+                    if projected.smooth || !projected.visible {
+                        continue;
+                    }
+                    let Some([start, end]) = projected.visible_intervals.first().copied() else {
+                        continue;
+                    };
+                    let middle = lerp_pos(projected.screen, f32::midpoint(start, end));
+                    assert!(
+                        edge_at_position(&cache, middle).is_some(),
+                        "a painted edge must be clickable at yaw step {yaw_step}, pitch {pitch_degrees}: {:?}",
+                        projected.source
+                    );
+                }
+            }
+        }
+    }
+
     fn cuboid_scene_fixture() -> (DebugScene, Aabb3, Point3) {
         let input = NativeKernel::empty();
         let request = ExecuteRequest {
