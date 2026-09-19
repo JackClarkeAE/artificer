@@ -2668,6 +2668,10 @@ pub struct KernelLabApp {
     extrusion_symmetric: bool,
     /// Where each side ends: at its distance, or at a picked face.
     extrusion_extents: [ExtrusionExtentIntent; 2],
+    /// Why a side could not end at a face, shown under its row until the
+    /// side is changed again. A refusal that only reaches the status line
+    /// reads as a button that did nothing.
+    extrusion_extent_notes: [Option<String>; 2],
     extrusion_mode: ExtrusionMode,
     /// When false, signed face distance retains the convenient Add/Cut
     /// inference. Clicking an operation in Properties turns this on so the
@@ -2889,6 +2893,7 @@ impl Default for KernelLabApp {
             extrusion_second_distance: None,
             extrusion_symmetric: false,
             extrusion_extents: [ExtrusionExtentIntent::Distance; 2],
+            extrusion_extent_notes: [None, None],
             extrusion_mode: ExtrusionMode::NewBody,
             extrusion_mode_explicit: false,
             extruded_sketch_revision: None,
@@ -9362,15 +9367,34 @@ impl KernelLabApp {
     /// become choosing a different one behind the user's back later.
     fn arm_extrusion_face_pick(&mut self, side: usize) {
         self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
+        self.extrusion_extent_notes[side] = None;
         let targets = self.remembered_extrusion_targets(side);
         match targets.len() {
             0 => {
+                // Nothing ahead. Say so where the click was made, and say
+                // what *is* there: an Add pushed out from a wall has no face
+                // in front of it, and the faces the user was thinking of are
+                // usually the ones behind, which a Cut would reach.
                 self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
-                self.document_status = Some(
-                    "No face of this design is parallel to the sketch plane on that side, \
-                     so there is nothing for this side to end at"
-                        .to_owned(),
-                );
+                let behind = self.extrusion_targets_behind(side).len();
+                let note = if behind == 0 {
+                    "No face of this design is parallel to the sketch plane, ahead of this side \
+                     or behind it, so it can only end at a distance."
+                        .to_owned()
+                } else {
+                    format!(
+                        "No face lies ahead of this side, so it ends at a distance. {behind} \
+                         parallel {} behind it — switch the operation to Cut (or the distance's \
+                         sign) to end there.",
+                        if behind == 1 {
+                            "face lies"
+                        } else {
+                            "faces lie"
+                        }
+                    )
+                };
+                self.document_status = Some(note.clone());
+                self.extrusion_extent_notes[side] = Some(note);
             }
             1 => {
                 let only = &targets[0];
@@ -9422,6 +9446,27 @@ impl KernelLabApp {
             reversed,
             targets: targets.clone(),
         });
+        targets
+    }
+
+    /// Why a side is not ending at a face, if it was asked to and could not.
+    #[must_use]
+    pub fn extrusion_extent_note(&self, side: usize) -> Option<&str> {
+        self.extrusion_extent_notes
+            .get(side)
+            .and_then(|note| note.as_deref())
+    }
+
+    /// The faces this side would reach if the sweep ran the other way.
+    ///
+    /// Direction is the signed distance's, so the question is asked by
+    /// flipping the sign for the length of one call and putting it back.
+    /// This never touches the memo, which is keyed on the real sign.
+    fn extrusion_targets_behind(&mut self, side: usize) -> Vec<ExtrusionTarget> {
+        let distance = self.extrusion_distance;
+        self.extrusion_distance = if distance == 0.0 { -1.0 } else { -distance };
+        let targets = self.extrusion_targets(side);
+        self.extrusion_distance = distance;
         targets
     }
 
@@ -18542,6 +18587,12 @@ impl KernelLabApp {
                 } else {
                     "End this side at a typed distance."
                 });
+                // Asking for a distance ends the explanation of why a face
+                // was not to be had, whether or not the side was already at
+                // one: the note was about that ask, and this is a new one.
+                if response.clicked() && !wants_face {
+                    self.extrusion_extent_notes[side] = None;
+                }
                 if response.clicked() && to_face != wants_face {
                     if wants_face {
                         self.arm_extrusion_face_pick(side);
@@ -18552,6 +18603,9 @@ impl KernelLabApp {
                 }
             }
         });
+        if let Some(note) = &self.extrusion_extent_notes[side] {
+            ui.label(RichText::new(note.as_str()).small().color(theme::warn()));
+        }
         match self.extrusion_extents[side] {
             ExtrusionExtentIntent::Distance => {
                 changed |= self.extrusion_distance_field(ui, side, unit);

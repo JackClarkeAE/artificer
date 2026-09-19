@@ -1163,3 +1163,55 @@ fn a_side_ends_at_the_face_that_is_clicked() {
         harness.state().extrusion_distance()
     );
 }
+
+/// A side asked to end at a face when nothing lies ahead of it says so where
+/// the click was made, and says what does lie behind.
+///
+/// This is the click that looked dead: an Add pushed out from the top of a
+/// block has no face in front of it, so the side snapped straight back to a
+/// distance and the only explanation went to the status line. The button
+/// still snaps back — there is nothing to end at — but the row now carries
+/// the reason, and points at the faces a Cut would reach.
+#[test]
+fn to_face_with_nothing_ahead_explains_itself_on_the_row() {
+    let mut harness = harness();
+    block_two_tall(&mut harness);
+
+    activate_face(&mut harness, "Extrusion top face");
+    click_button(&mut harness, "Sketch on selected face");
+    for _ in 0..18 {
+        harness.step();
+    }
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(-0.5, -0.5));
+    click_sketch_point(&mut harness, SketchPoint::new(0.5, 0.5));
+    click_button(&mut harness, "Extrude");
+    // Upward, away from the block: nothing is ahead.
+    set_extrusion_distance(&mut harness, "1");
+    harness.run();
+    assert!(
+        harness.state().extrusion_targets(0).is_empty(),
+        "an add off the top of a block has no face ahead of it"
+    );
+
+    click_revealed_button(&mut harness, "To face");
+    harness.run();
+    assert!(
+        !harness.state().extrusion_side_ends_at_a_face(0),
+        "with nothing ahead the side stays at a distance"
+    );
+    let note = harness
+        .state()
+        .extrusion_extent_note(0)
+        .expect("the row explains why the side is not ending at a face");
+    assert!(
+        note.contains("No face lies ahead") && note.contains("behind"),
+        "the note names what is behind: {note}"
+    );
+    assert!(note.contains("Cut"), "and how to reach it: {note}");
+
+    // Choosing a distance again clears the explanation: it was about that ask.
+    click_revealed_button(&mut harness, "Distance");
+    harness.run();
+    assert_eq!(harness.state().extrusion_extent_note(0), None);
+}
