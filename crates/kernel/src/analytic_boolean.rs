@@ -31,12 +31,17 @@ use crate::sew::{SewError, SewFace, ray_directions, ray_face_crossings, sew_shel
 use crate::surface_intersection::{IntersectionCurve, SurfaceIntersection, intersect};
 use crate::topology::{Cylinder, Face, Plane, Point2, Point3, Surface, Topology, Vector3};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AnalyticBooleanError {
-    /// The operand pair leaves the engine's domain: an out-of-matrix carrier
-    /// pair, a tangential or coincident contact, or a face class the sewing
+    /// The operand pair leaves the engine's domain: a tangential or
+    /// coincident contact it cannot classify, or a face class the sewing
     /// vocabulary cannot carry.
     DomainUnsupported,
+    /// Two faces that could meet lie on carriers whose intersection is
+    /// outside the curve vocabulary — two bores of unequal radius crossing,
+    /// say. The pair is named so the refusal can be; boxed, because a
+    /// surface is large and every other variant is a word.
+    CarrierPair(Box<[Surface; 2]>),
     /// The operation succeeded and produced no material.
     EmptyResult,
 }
@@ -463,8 +468,13 @@ fn coincident_overlays(
         if faces_apart(own_extent, other, &other_face.value, precision) {
             continue;
         }
-        let outcome = intersect(face.surface, other_face.value.surface, precision)
-            .map_err(|_| AnalyticBooleanError::DomainUnsupported)?;
+        let outcome =
+            intersect(face.surface, other_face.value.surface, precision).map_err(|_| {
+                AnalyticBooleanError::CarrierPair(Box::new([
+                    face.surface,
+                    other_face.value.surface,
+                ]))
+            })?;
         if !matches!(outcome, SurfaceIntersection::Coincident) {
             continue;
         }
@@ -526,7 +536,12 @@ fn section_on_face(
         let outcome = match intersect(face.surface, other_face.value.surface, precision) {
             Ok(outcome) => outcome,
             Err(_) if faces_apart(own_extent, other, &other_face.value, precision) => continue,
-            Err(_) => return Err(AnalyticBooleanError::DomainUnsupported),
+            Err(_) => {
+                return Err(AnalyticBooleanError::CarrierPair(Box::new([
+                    face.surface,
+                    other_face.value.surface,
+                ])));
+            }
         };
         let curves = match outcome {
             SurfaceIntersection::Empty => continue,
@@ -1934,7 +1949,7 @@ fn on_coincident_face(
     None
 }
 
-fn point_in_solid(topology: &Topology, point: Point3) -> Option<bool> {
+pub(crate) fn point_in_solid(topology: &Topology, point: Point3) -> Option<bool> {
     for direction in ray_directions() {
         let mut crossings = 0_usize;
         let mut degenerate = false;

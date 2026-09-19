@@ -147,6 +147,86 @@ pub(crate) fn build_edge_finishes_apart(
 /// anywhere on the bevel line. Making it larger than that does not buy
 /// accuracy — the regularized Boolean's arithmetic, not the tool's size, is
 /// what the last digits come from.
+/// Whether every selected edge, carried on past each of its ends, leaves the
+/// body at once.
+///
+/// The removal tool is oversized at both ends so that nothing but its bevel
+/// side meets the body, which is right where the edge's line runs out into
+/// air — a box edge, a gable's slope — and wrong where it runs on into
+/// material, as a pocket's rim does at every corner: there the oversize would
+/// cut a groove across whatever lies beyond. A point a finish's width past
+/// each end, set into the wedge the finish would take, says which. This is
+/// what lets the ladder take the stand-apart construction unasked for a
+/// corner the owned blend cannot write, and refuse it where it would cut
+/// more than the finish.
+pub(crate) fn edges_run_out_of_the_body(
+    topology: &Topology,
+    targets: &[EntityRef],
+    distance: f64,
+) -> bool {
+    targets.iter().all(|target| {
+        let Some(edge) = topology
+            .edges
+            .iter()
+            .position(|edge| edge.id.get() == target.entity.0)
+        else {
+            return false;
+        };
+        let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
+            return false;
+        };
+        let along = difference(endpoints[1], endpoints[0]);
+        let length = magnitude(along);
+        if length <= f64::EPSILON {
+            return false;
+        }
+        let along = scale(along, 1.0 / length);
+        let Some(faces) = faces_of_edge(topology, edge) else {
+            return false;
+        };
+        let [Some(first), Some(second)] =
+            faces.map(|face| topology.faces[face].value.surface.as_plane())
+        else {
+            return false;
+        };
+        let into = |normal: Vector3, other: Vector3| {
+            let across = cross(normal, along);
+            let span = magnitude(across);
+            if span <= f64::EPSILON {
+                return None;
+            }
+            let across = scale(across, 1.0 / span);
+            Some(if dot(across, other) < 0.0 {
+                across
+            } else {
+                scale(across, -1.0)
+            })
+        };
+        let (Some(out_first), Some(out_second)) = (
+            into(first.normal, second.normal),
+            into(second.normal, first.normal),
+        ) else {
+            return false;
+        };
+        let sum = Vector3::new(
+            out_first.x + out_second.x,
+            out_first.y + out_second.y,
+            out_first.z + out_second.z,
+        );
+        let span = magnitude(sum);
+        if span <= f64::EPSILON {
+            return false;
+        }
+        let inward = scale(sum, distance * 0.25 / span);
+        [(endpoints[0], -distance), (endpoints[1], distance)]
+            .into_iter()
+            .all(|(end, step)| {
+                let probe = offset(offset(end, scale(along, step)), inward);
+                crate::analytic_boolean::point_in_solid(topology, probe) == Some(false)
+            })
+    })
+}
+
 fn body_reach(topology: &Topology, distance: f64) -> f64 {
     let mut low = [f64::INFINITY; 3];
     let mut high = [f64::NEG_INFINITY; 3];

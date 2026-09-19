@@ -20,6 +20,7 @@ mod faceted_boolean;
 // (ADR 0023 frontier, milestone B). It is complete and unit-tested; the band,
 // sphere-corner, and ledge assembly that consumes it is still to come.
 mod analytic_boolean;
+mod hole_rim_blend;
 #[allow(dead_code)]
 mod loft;
 mod loop_offset;
@@ -891,76 +892,92 @@ impl NativeKernel {
                         )
                         .ok()
                         .map(|tool| build_analytic_extrusion(&tool));
-                        let exact = analytic_tool.as_ref().and_then(|tool| {
-                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, tool)
-                                .then(|| {
-                                    analytic_boolean::build_analytic_boolean(
-                                        &input.topology,
-                                        tool,
-                                        BooleanOperation::Difference,
-                                        request.precision,
-                                    )
-                                    .ok()
-                                })
-                                .flatten()
-                        });
-                        if let Some(topology) = exact {
-                            // The faces are the engine's own records, matched
-                            // back to history the way every regularized
-                            // Boolean's are.
-                            rung = "face-feature/analytic-boolean";
-                            (topology, None, true)
-                        } else {
-                            rung = "face-feature/faceted";
-                            // Crossing curved voids use the faceted Boolean tier.
-                            // The ordinary display tessellation may contain
-                            // thousands of triangles for a single circle and is
-                            // an unsuitable Boolean operand (two crossed bores
-                            // previously caused explosive BSP fragmentation).
-                            // Bound this construction mesh independently; the
-                            // immutable analytic predecessor remains untouched.
-                            let mut boolean_input = input.clone();
-                            let mut boolean_precision = request.precision;
-                            boolean_precision.max_subdivisions =
-                                boolean_precision.max_subdivisions.min(4);
-                            boolean_input.precision = Some(boolean_precision);
-                            let scene = NativeKernel::authoritative_scene(&boolean_input);
-                            let topology = faceted_boolean::subtract_crossing_profile(
-                                &scene,
-                                *frame,
-                                profile,
-                                plane.normal / normal_length * -1.0,
-                                *distance,
-                                // NOTE: this is deliberately the request's budget,
-                                // not the clamped `boolean_precision` above, even
-                                // though the comment on that clamp reads as though
-                                // both meshes should share it. Handing the cutter
-                                // the clamped budget halves the fragmentation
-                                // (2959 -> 1551 faces) but drops one bore's panel
-                                // fan below the eight-normal threshold in
-                                // `presentation_prismatic_feature_roles`, so its
-                                // seams stop being recognised as one logical
-                                // cylinder and are drawn as creases instead. Change
-                                // it together with the coplanar merge that removes
-                                // the fan altogether, not before.
+                        let exact = match analytic_tool.as_ref() {
+                            None => Err(ExactRouteDecline::Tool),
+                            Some(tool)
+                                if !analytic_boolean::operands_in_engine_vocabulary(
+                                    &input.topology,
+                                    tool,
+                                ) =>
+                            {
+                                Err(ExactRouteDecline::Vocabulary)
+                            }
+                            Some(tool) => analytic_boolean::build_analytic_boolean(
+                                &input.topology,
+                                tool,
+                                BooleanOperation::Difference,
                                 request.precision,
                             )
-                            .map_err(|reason| planar_profile_input_error(input.id, reason))?;
-                            certify_faceted_candidate(input.id, &topology, request.precision)?;
-                            certify_faceted_change(
-                                input.id,
-                                &input.topology,
-                                &topology,
-                                *operation,
-                                request.precision,
-                            )?;
-                            // The result is a tessellation, not a certified solid.
-                            // Say so: every other report this kernel publishes means
-                            // "exact", so a caller with no way to tell the
-                            // difference will quote this body's volume as though it
-                            // were.
-                            warnings.push(faceted_cut_warning());
-                            (topology, None, true)
+                            .map_err(ExactRouteDecline::from_engine),
+                        };
+                        match exact {
+                            Ok(topology) => {
+                                // The faces are the engine's own records,
+                                // matched back to history the way every
+                                // regularized Boolean's are.
+                                rung = "face-feature/analytic-boolean";
+                                (topology, None, true)
+                            }
+                            Err(decline) => {
+                                rung = "face-feature/faceted";
+                                // Crossing curved voids use the faceted Boolean tier.
+                                // The ordinary display tessellation may contain
+                                // thousands of triangles for a single circle and is
+                                // an unsuitable Boolean operand (two crossed bores
+                                // previously caused explosive BSP fragmentation).
+                                // Bound this construction mesh independently; the
+                                // immutable analytic predecessor remains untouched.
+                                let mut boolean_input = input.clone();
+                                let mut boolean_precision = request.precision;
+                                boolean_precision.max_subdivisions =
+                                    boolean_precision.max_subdivisions.min(4);
+                                boolean_input.precision = Some(boolean_precision);
+                                let scene = NativeKernel::authoritative_scene(&boolean_input);
+                                let topology = faceted_boolean::subtract_crossing_profile(
+                                    &scene,
+                                    *frame,
+                                    profile,
+                                    plane.normal / normal_length * -1.0,
+                                    *distance,
+                                    // NOTE: this is deliberately the request's budget,
+                                    // not the clamped `boolean_precision` above, even
+                                    // though the comment on that clamp reads as though
+                                    // both meshes should share it. Handing the cutter
+                                    // the clamped budget halves the fragmentation
+                                    // (2959 -> 1551 faces) but drops one bore's panel
+                                    // fan below the eight-normal threshold in
+                                    // `presentation_prismatic_feature_roles`, so its
+                                    // seams stop being recognised as one logical
+                                    // cylinder and are drawn as creases instead. Change
+                                    // it together with the coplanar merge that removes
+                                    // the fan altogether, not before.
+                                    request.precision,
+                                )
+                                .map_err(|reason| {
+                                    with_exact_route_decline(
+                                        planar_profile_input_error(input.id, reason),
+                                        decline,
+                                    )
+                                })?;
+                                certify_faceted_candidate(input.id, &topology, request.precision)
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
+                                certify_faceted_change(
+                                    input.id,
+                                    &input.topology,
+                                    &topology,
+                                    *operation,
+                                    request.precision,
+                                )
+                                .map_err(|error| with_exact_route_decline(error, decline))?;
+                                // The result is a tessellation, not a certified solid.
+                                // Say so: every other report this kernel publishes means
+                                // "exact", so a caller with no way to tell the
+                                // difference will quote this body's volume as though it
+                                // were — and say why the exact route stood aside.
+                                warnings.push(faceted_cut_warning());
+                                warnings.push(decline.diagnostic(DiagnosticSeverity::Warning));
+                                (topology, None, true)
+                            }
                         }
                     }
                     Err(PlanarProfileInputError::FaceFeature(
@@ -1041,10 +1058,11 @@ impl NativeKernel {
                         // would poke out again under any part of the profile
                         // that hangs over the face's edge, and publish that
                         // sliver as material.
-                        let analytic = || -> Option<Topology> {
+                        let analytic = || -> Result<Topology, ExactRouteDecline> {
                             let overshoot = match operation {
-                                FaceExtrusionOperation::Cut => (*distance * 0.01)
-                                    .max(request.precision.min_feature_size * 8.0),
+                                FaceExtrusionOperation::Cut => {
+                                    (*distance * 0.01).max(request.precision.min_feature_size * 8.0)
+                                }
                                 FaceExtrusionOperation::Add => 0.0,
                             };
                             let tool = validate_analytic_profile_extrusion(
@@ -1053,26 +1071,30 @@ impl NativeKernel {
                                 *distance + overshoot,
                                 request.precision,
                             )
-                            .ok()
-                            .map(|tool| build_analytic_extrusion(&tool))?;
-                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool)
-                                .then(|| {
-                                    analytic_boolean::build_analytic_boolean(
-                                        &input.topology,
-                                        &tool,
-                                        boolean_operation,
-                                        request.precision,
-                                    )
-                                    .ok()
-                                })
-                                .flatten()
-                                // An add whose profile misses the face has no
-                                // interface, and the union of two solids that
-                                // never meet is two solids, not a boss.
-                                .filter(|topology| {
-                                    *operation == FaceExtrusionOperation::Cut
-                                        || topology.solids.len() == 1
-                                })
+                            .map(|tool| build_analytic_extrusion(&tool))
+                            .map_err(|_| ExactRouteDecline::Tool)?;
+                            if !analytic_boolean::operands_in_engine_vocabulary(
+                                &input.topology,
+                                &tool,
+                            ) {
+                                return Err(ExactRouteDecline::Vocabulary);
+                            }
+                            let topology = analytic_boolean::build_analytic_boolean(
+                                &input.topology,
+                                &tool,
+                                boolean_operation,
+                                request.precision,
+                            )
+                            .map_err(ExactRouteDecline::from_engine)?;
+                            // An add whose profile misses the face has no
+                            // interface, and the union of two solids that
+                            // never meet is two solids, not a boss.
+                            if *operation == FaceExtrusionOperation::Add
+                                && topology.solids.len() != 1
+                            {
+                                return Err(ExactRouteDecline::Empty);
+                            }
+                            Ok(topology)
                         };
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
@@ -1091,11 +1113,11 @@ impl NativeKernel {
                                 topology
                             }
                             Err(_) => match analytic() {
-                                Some(topology) => {
+                                Ok(topology) => {
                                     rung = "face-feature/analytic-boolean";
                                     topology
                                 }
-                                None if *operation == FaceExtrusionOperation::Cut => {
+                                Err(decline) if *operation == FaceExtrusionOperation::Cut => {
                                     rung = "face-feature/faceted";
                                     let mut boolean_input = input.clone();
                                     let mut boolean_precision = request.precision;
@@ -1112,29 +1134,38 @@ impl NativeKernel {
                                         request.precision,
                                     )
                                     .map_err(|reason| {
-                                        planar_profile_input_error(input.id, reason)
+                                        with_exact_route_decline(
+                                            planar_profile_input_error(input.id, reason),
+                                            decline,
+                                        )
                                     })?;
                                     certify_faceted_candidate(
                                         input.id,
                                         &topology,
                                         request.precision,
-                                    )?;
+                                    )
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
                                     certify_faceted_change(
                                         input.id,
                                         &input.topology,
                                         &topology,
                                         *operation,
                                         request.precision,
-                                    )?;
+                                    )
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
                                     warnings.push(faceted_cut_warning());
+                                    warnings.push(decline.diagnostic(DiagnosticSeverity::Warning));
                                     topology
                                 }
-                                None => {
-                                    return Err(planar_profile_input_error(
-                                        input.id,
-                                        PlanarProfileInputError::FaceFeature(
-                                            FaceFeatureInputError::ProfileOutsideFace,
+                                Err(decline) => {
+                                    return Err(with_exact_route_decline(
+                                        planar_profile_input_error(
+                                            input.id,
+                                            PlanarProfileInputError::FaceFeature(
+                                                FaceFeatureInputError::ProfileOutsideFace,
+                                            ),
                                         ),
+                                        decline,
                                     ));
                                 }
                             },
@@ -1811,6 +1842,28 @@ impl NativeKernel {
                                     "BOOLEAN_EMPTY_OR_UNRESOLVED_RESULT",
                                     KernelStage::Construction,
                                     "The selected operation produced no publishable closed component.",
+                                )],
+                            ));
+                        }
+                        Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)) => {
+                            let [first, second] = *pair;
+                            // The engine names the pair the two faces actually
+                            // bring together, which a scan of every carrier
+                            // pair cannot: a pair the faces never bring
+                            // together is no refusal at all.
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_SURFACE_PAIR_UNSUPPORTED",
+                                    KernelStage::Construction,
+                                    &format!(
+                                        "The {} and {} carriers meet in a curve outside this kernel's line and circle vocabulary.",
+                                        surface_intersection::surface_name(first),
+                                        surface_intersection::surface_name(second)
+                                    ),
                                 )],
                             ));
                         }
@@ -3182,6 +3235,84 @@ fn presentation_edge_classification(
     }
 }
 
+/// Why the exact route declined a face feature, kept so that whatever tier
+/// answers instead — or refuses — can say what it was standing in for.
+#[derive(Clone, Copy, Debug)]
+enum ExactRouteDecline {
+    /// The body or the tool carries a face class the engine cannot sew.
+    Vocabulary,
+    /// Two faces that meet lie on carriers outside the intersection matrix,
+    /// named by class.
+    CarrierPair {
+        first: &'static str,
+        second: &'static str,
+    },
+    /// A contact the engine does not classify.
+    Contact,
+    /// The exact result was empty.
+    Empty,
+    /// The prism tool itself could not be built from the profile.
+    Tool,
+}
+
+impl ExactRouteDecline {
+    fn from_engine(error: analytic_boolean::AnalyticBooleanError) -> Self {
+        match error {
+            analytic_boolean::AnalyticBooleanError::CarrierPair(pair) => Self::CarrierPair {
+                first: surface_intersection::surface_name(pair[0]),
+                second: surface_intersection::surface_name(pair[1]),
+            },
+            analytic_boolean::AnalyticBooleanError::DomainUnsupported => Self::Contact,
+            analytic_boolean::AnalyticBooleanError::EmptyResult => Self::Empty,
+        }
+    }
+
+    fn sentence(self) -> String {
+        match self {
+            Self::Vocabulary => {
+                "the body carries a face class — a torus, a cone or a sphere — that \
+                                 the exact engine cannot sew"
+                    .to_owned()
+            }
+            Self::CarrierPair { first, second } => format!(
+                "the {first} and {second} carriers meet in a curve outside this kernel's line and \
+                 circle vocabulary"
+            ),
+            Self::Contact => "the operands meet tangentially or share geometry the exact engine \
+                              does not classify"
+                .to_owned(),
+            Self::Empty => "the exact operation produced no material".to_owned(),
+            Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
+        }
+    }
+
+    /// The diagnostic every report of this feature carries: a warning beside
+    /// an approximation, an error beside a refusal. The code is the same
+    /// either way, because the fact it states is.
+    fn diagnostic(self, severity: DiagnosticSeverity) -> ProtocolDiagnostic {
+        let mut diagnostic = simple_diagnostic(
+            "FACE_FEATURE_EXACT_ROUTE_DECLINED",
+            KernelStage::Construction,
+            &format!(
+                "The exact route declined this feature first: {}.",
+                self.sentence()
+            ),
+        );
+        diagnostic.severity = severity;
+        diagnostic
+    }
+}
+
+/// A faceted-tier refusal with the exact route's reason in front of it: a
+/// message about tessellation for a problem that was about vocabulary is
+/// the wrong message.
+fn with_exact_route_decline(mut error: KernelError, decline: ExactRouteDecline) -> KernelError {
+    error
+        .diagnostics
+        .insert(0, decline.diagnostic(DiagnosticSeverity::Error));
+    error
+}
+
 fn faceted_cut_warning() -> ProtocolDiagnostic {
     approximation_warning(
         "FACE_FEATURE_FACETED_APPROXIMATION",
@@ -3353,12 +3484,45 @@ fn regularized_edge_finish(
         ) => {}
     }
 
+    // The rim of a hole through any wall: a torus or cone band built in
+    // place between the grown hole and the sunk bore ring, one closed edge
+    // with no corners to close.
+    match hole_rim_blend::build_hole_rim_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology)
+            if validator::validate(&topology, precision.linear_agreement)
+                .diagnostics
+                .is_empty() =>
+        {
+            return Ok((topology, "edge-finish/hole-rim-blend"));
+        }
+        Ok(_) => {}
+        Err(hole_rim_blend::HoleRimBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "HOLE_RIM_DISTANCE_INVALID",
+                "The rim finish must fit within the wall around the hole and the depth of the bore.",
+            ));
+        }
+        Err(
+            hole_rim_blend::HoleRimBlendError::TargetInvalid
+            | hole_rim_blend::HoleRimBlendError::DomainUnsupported,
+        ) => {}
+    }
+
     // The last exact rung: convex edges between planar faces, with a sphere or
     // a triangle closing every corner the selection completes. Its refusals
     // are its own, and a refusal it is certain of stops the ladder rather than
     // spending the faceted tier's seconds to reach the same answer with a
     // vaguer sentence.
     let mut owned_refusal = None;
+    let mut declined_silently = false;
     match vertex_blend::build_vertex_blend(
         input.id,
         &input.topology,
@@ -3368,13 +3532,36 @@ fn regularized_edge_finish(
         precision,
     ) {
         Ok(topology) => return Ok((topology, "edge-finish/vertex-blend")),
-        Err(vertex_blend::VertexBlendError::DomainUnsupported) => {}
+        Err(vertex_blend::VertexBlendError::DomainUnsupported) => declined_silently = true,
         Err(vertex_blend::VertexBlendError::Refused(refusal)) => {
             if refusal.certain {
                 return Err(vertex_blend_error(input.id, &refusal));
             }
             owned_refusal = Some(refusal);
         }
+    }
+
+    // A corner the owned blend cannot write — two edges meeting where the
+    // faces lean, as at the apex of a gable — is still exact as the shape
+    // ADR 0044 made for a finish standing apart: each edge's removal cut
+    // from the body as it is, the bands meeting along whatever seam the
+    // general engine finds. Where the owned blend would have answered, the
+    // two shapes coincide, so this is the same finish by another route
+    // rather than a different finish; and it is exact, which the tier below
+    // is not. It is taken only where the owned blend had nothing to say: a
+    // refusal it *named* — a corner an earlier feature finished, which ADR
+    // 0044 answers with a question — stands. And it is taken only where the
+    // removal tools' oversize runs out into air rather than on into
+    // material, which a pocket's rim does not.
+    if declined_silently
+        && edge_finish_apart::edges_run_out_of_the_body(&input.topology, targets, distance)
+        && let Ok(topology) =
+            edge_finish_apart::build_edge_finishes_apart(input, targets, kind, distance, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, "edge-finish/standing-apart"));
     }
 
     let scene = NativeKernel::authoritative_scene(input);
