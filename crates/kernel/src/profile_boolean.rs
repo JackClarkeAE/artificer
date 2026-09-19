@@ -950,6 +950,33 @@ fn carrier_overlap(first: Segment, second: Segment, tolerances: Tolerances) -> O
                 same_way: (s1 >= 0.0) == (s2 >= 0.0),
             })
         }
+        // Two section chords on one cylinder along the same oblique trace:
+        // the edge where a bore meets a wall that a tool's own wall then
+        // continues. The carrier is a graph over the azimuth, so the shared
+        // stretch is the overlap of the two azimuth spans.
+        (
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start: p0,
+                end: p1,
+            },
+            Segment::Harmonic {
+                start: q0, end: q1, ..
+            },
+        ) if harmonics_share_carrier(first, second, tolerances) => {
+            let low = p0.x.min(p1.x).max(q0.x.min(q1.x));
+            let high = p0.x.max(p1.x).min(q0.x.max(q1.x));
+            if high - low <= tolerances.minimum {
+                return None;
+            }
+            let at = |x: f64| Point2::new(x, amplitude.mul_add((x - phase).cos(), mean));
+            Some(Overlap {
+                ends: [at(low), at(high)],
+                same_way: (p1.x >= p0.x) == (q1.x >= q0.x),
+            })
+        }
         _ => None,
     }
 }
@@ -1439,13 +1466,19 @@ fn arc_spans_overlap(first: Segment, second: Segment) -> bool {
     else {
         return false;
     };
+    // Strictly inside the span: an end that lands on the other arc's start
+    // or end is a vertex the two share, not a stretch they share. Two halves
+    // of one circle split at the same points do exactly that, and reading
+    // the shared vertex as an overlap refused the pair the coincidence rule
+    // exists to resolve.
     let inside = |angle: f64, start: f64, sweep: f64| {
         let progress = if sweep >= 0.0 {
             (angle - start).rem_euclid(std::f64::consts::TAU)
         } else {
             (start - angle).rem_euclid(std::f64::consts::TAU)
         };
-        progress < sweep.abs()
+        let ends = 1.0e-9;
+        progress > ends && progress < sweep.abs() - ends
     };
     inside(b_start, a_start, a_sweep)
         || inside(b_start + b_sweep, a_start, a_sweep)
@@ -1572,7 +1605,10 @@ fn sub_segment(
 /// holes need no distinction here. The loops are pre-wrapped once per
 /// operand: classification samples every piece, and cloning the segment
 /// lists per sample would dominate the whole stage.
-fn point_in_loops(point: Point2, loops: &[crate::analytic_extrusion::AnalyticLoop]) -> bool {
+pub(crate) fn point_in_loops(
+    point: Point2,
+    loops: &[crate::analytic_extrusion::AnalyticLoop],
+) -> bool {
     let mut inside = false;
     for profile_loop in loops {
         if crate::analytic_extrusion::point_inside_loop(point, profile_loop) {
@@ -1582,7 +1618,7 @@ fn point_in_loops(point: Point2, loops: &[crate::analytic_extrusion::AnalyticLoo
     inside
 }
 
-fn wrap_loops(loops: &[Vec<Segment>]) -> Vec<crate::analytic_extrusion::AnalyticLoop> {
+pub(crate) fn wrap_loops(loops: &[Vec<Segment>]) -> Vec<crate::analytic_extrusion::AnalyticLoop> {
     loops
         .iter()
         .map(|segments| crate::analytic_extrusion::AnalyticLoop {

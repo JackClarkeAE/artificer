@@ -24,8 +24,8 @@ use artificer_protocol::{BooleanOperation, PrecisionPolicy};
 
 use crate::analytic_extrusion::Segment;
 use crate::profile_boolean::{
-    ProfileBooleanError, ProfileRegion, chain_welded_segments, chord_region_pieces,
-    profile_boolean_multi, welded,
+    ProfileBooleanError, ProfileRegion, chain_welded_segments, chord_region_pieces, point_in_loops,
+    profile_boolean_multi, welded, wrap_loops,
 };
 use crate::sew::{SewError, SewFace, ray_directions, ray_face_crossings, sew_shells};
 use crate::surface_intersection::{IntersectionCurve, SurfaceIntersection, intersect};
@@ -108,44 +108,109 @@ fn collect_operand_pieces(
     for face in &own.faces {
         let region = face_region(own, &face.value)?;
         let section = section_on_face(&face.value, &region, other, precision)?;
-        let kept: Vec<Vec<Vec<Segment>>> = if section.is_empty() {
-            // Untouched face: wholesale in-or-out of the other solid.
-            let inside = face_sample_inside(own, &face.value, &region, other, precision)?;
-            let keep = match operation_2d {
-                BooleanOperation::Difference => !inside,
-                BooleanOperation::Intersection => inside,
-                BooleanOperation::Union => unreachable!("no 2D union rule exists"),
-            };
-            if keep {
-                vec![region.to_vec()]
-            } else {
-                Vec::new()
+        let overlays = coincident_overlays(&face.value, &region, other, precision)?;
+        let own_region = ProfileRegion {
+            outer: region[0].clone(),
+            holes: region[1..].to_vec(),
+        };
+
+        // Where the other solid has a face on this same carrier, the two
+        // overlap in area, and no sample can say which side of a skin the
+        // skin itself is on. That overlap is answered by the operand table
+        // (below); what is classified in the ordinary way is the rest of the
+        // face, with the overlaps taken out of it first.
+        let mut rest = vec![own_region.clone()];
+        for overlay in &overlays {
+            let mut remaining = Vec::new();
+            for piece in &rest {
+                match profile_boolean_multi(
+                    std::slice::from_ref(piece),
+                    std::slice::from_ref(&overlay.region),
+                    BooleanOperation::Difference,
+                    precision,
+                ) {
+                    Ok(regions) => remaining.extend(regions),
+                    Err(ProfileBooleanError::EmptyResult) => {}
+                    Err(ProfileBooleanError::Unsupported) => {
+                        return Err(AnalyticBooleanError::DomainUnsupported);
+                    }
+                }
             }
-        } else {
-            let own_region = ProfileRegion {
-                outer: region[0].clone(),
-                holes: region[1..].to_vec(),
+            rest = remaining;
+        }
+
+        let mut kept: Vec<Vec<Vec<Segment>>> = Vec::new();
+        for piece in rest {
+            let piece_loops = {
+                let mut loops = vec![piece.outer.clone()];
+                loops.extend(piece.holes.iter().cloned());
+                loops
             };
-            match profile_boolean_multi(
-                std::slice::from_ref(&own_region),
-                &section,
-                operation_2d,
-                precision,
-            ) {
-                Ok(regions) => regions
-                    .into_iter()
-                    .map(|region| {
+            if section.is_empty() {
+                // Untouched face: wholesale in-or-out of the other solid.
+                let inside = face_sample_inside(own, &face.value, &piece_loops, other, precision)?;
+                let keep = match operation_2d {
+                    BooleanOperation::Difference => !inside,
+                    BooleanOperation::Intersection => inside,
+                    BooleanOperation::Union => unreachable!("no 2D union rule exists"),
+                };
+                if keep {
+                    kept.push(piece_loops);
+                }
+            } else {
+                match profile_boolean_multi(
+                    std::slice::from_ref(&piece),
+                    &section,
+                    operation_2d,
+                    precision,
+                ) {
+                    Ok(regions) => kept.extend(regions.into_iter().map(|region| {
                         let mut loops = vec![region.outer];
                         loops.extend(region.holes);
                         loops
-                    })
-                    .collect(),
-                Err(ProfileBooleanError::EmptyResult) => Vec::new(),
-                Err(ProfileBooleanError::Unsupported) => {
-                    return Err(AnalyticBooleanError::DomainUnsupported);
+                    })),
+                    Err(ProfileBooleanError::EmptyResult) => {}
+                    Err(ProfileBooleanError::Unsupported) => {
+                        return Err(AnalyticBooleanError::DomainUnsupported);
+                    }
                 }
             }
-        };
+        }
+
+        // The overlaps themselves. Two faces on one carrier are the same
+        // skin twice, so the result carries it once or not at all, and the
+        // first operand is the one that carries it: the second never does.
+        // Which of "once" and "not at all" is the standard directed rule —
+        // a difference keeps the skin where the two materials lie on
+        // opposite sides of it, a union or an intersection where they lie
+        // on the same side.
+        if side == OperandSide::Target {
+            for overlay in &overlays {
+                let keep = match operation {
+                    BooleanOperation::Difference => !overlay.same_side,
+                    BooleanOperation::Union | BooleanOperation::Intersection => overlay.same_side,
+                };
+                if !keep {
+                    continue;
+                }
+                match profile_boolean_multi(
+                    std::slice::from_ref(&own_region),
+                    std::slice::from_ref(&overlay.region),
+                    BooleanOperation::Intersection,
+                    precision,
+                ) {
+                    Ok(regions) => kept.extend(regions.into_iter().map(|region| {
+                        let mut loops = vec![region.outer];
+                        loops.extend(region.holes);
+                        loops
+                    })),
+                    Err(ProfileBooleanError::EmptyResult) => {}
+                    Err(ProfileBooleanError::Unsupported) => {
+                        return Err(AnalyticBooleanError::DomainUnsupported);
+                    }
+                }
+            }
+        }
         for loops in kept {
             let piece = SewFace {
                 surface: face.value.surface,
@@ -218,6 +283,231 @@ fn without_repeated_pieces(pieces: Vec<Segment>, precision: PrecisionPolicy) -> 
     kept
 }
 
+/// A box in model space that a face cannot leave.
+///
+/// The intersection matrix answers for *carriers*, which are unbounded, and
+/// refuses a pair it cannot trace — two bores of unequal radius crossing,
+/// say — whether or not the two bounded faces ever come near each other. A
+/// boss on one end of a block is nowhere near the bore through the other
+/// end, and a refusal about their carriers is not a refusal about the
+/// Boolean. The extent is a superset of the face, so a pair it separates is
+/// a pair the faces separate: a plane face's parameter box mapped to the
+/// plane, a cylinder face's whole drum over its height range. Faces on a
+/// carrier the engine does not carry have no extent, and gate nothing.
+#[derive(Clone, Copy, Debug)]
+struct FaceExtent {
+    min: Point3,
+    max: Point3,
+}
+
+fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
+    let mut low = Point2::new(f64::INFINITY, f64::INFINITY);
+    let mut high = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut include = |point: Point2| {
+        low = Point2::new(low.x.min(point.x), low.y.min(point.y));
+        high = Point2::new(high.x.max(point.x), high.y.max(point.y));
+    };
+    for segment in region.iter().flatten() {
+        include(segment.start());
+        include(segment.end());
+        match *segment {
+            Segment::Line { .. } => {}
+            Segment::Arc {
+                center,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            } => {
+                // The arc bulges past its chord wherever it passes a
+                // cardinal direction; those are the only interior extremes.
+                for quarter in 0..4 {
+                    let angle = f64::from(quarter) * std::f64::consts::FRAC_PI_2;
+                    let ahead = if sweep >= 0.0 {
+                        (angle - start_angle).rem_euclid(std::f64::consts::TAU)
+                    } else {
+                        (start_angle - angle).rem_euclid(std::f64::consts::TAU)
+                    };
+                    if ahead <= sweep.abs() {
+                        include(Point2::new(
+                            radius.mul_add(angle.cos(), center.x),
+                            radius.mul_add(angle.sin(), center.y),
+                        ));
+                    }
+                }
+            }
+            Segment::Ellipse {
+                center,
+                major,
+                minor,
+                ..
+            } => {
+                let reach = major.abs() + minor.abs();
+                include(Point2::new(center.x - reach, center.y - reach));
+                include(Point2::new(center.x + reach, center.y + reach));
+            }
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                start,
+                end,
+                ..
+            } => {
+                include(Point2::new(start.x, mean - amplitude.abs()));
+                include(Point2::new(end.x, mean + amplitude.abs()));
+            }
+        }
+    }
+    if !(low.x.is_finite() && low.y.is_finite() && high.x.is_finite() && high.y.is_finite()) {
+        return None;
+    }
+    let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut grow = |point: Point3| {
+        min = Point3::new(min.x.min(point.x), min.y.min(point.y), min.z.min(point.z));
+        max = Point3::new(max.x.max(point.x), max.y.max(point.y), max.z.max(point.z));
+    };
+    match face.surface {
+        Surface::Plane(plane) => {
+            for corner in [
+                Point2::new(low.x, low.y),
+                Point2::new(high.x, low.y),
+                Point2::new(low.x, high.y),
+                Point2::new(high.x, high.y),
+            ] {
+                grow(plane.evaluate(corner));
+            }
+        }
+        Surface::Cylinder(cylinder) => {
+            // The whole drum between the lowest and highest height the face
+            // reaches: along each model axis the circle reaches
+            // `radius·√(uᵢ² + vᵢ²)` either side of the axis line.
+            let radius = cylinder.radius.abs();
+            let reach = Vector3::new(
+                radius * cylinder.radial_u.x.hypot(cylinder.radial_v.x),
+                radius * cylinder.radial_u.y.hypot(cylinder.radial_v.y),
+                radius * cylinder.radial_u.z.hypot(cylinder.radial_v.z),
+            );
+            for height in [low.y, high.y] {
+                let on_axis = cylinder.origin + cylinder.axis * height;
+                grow(Point3::new(
+                    on_axis.x - reach.x,
+                    on_axis.y - reach.y,
+                    on_axis.z - reach.z,
+                ));
+                grow(Point3::new(
+                    on_axis.x + reach.x,
+                    on_axis.y + reach.y,
+                    on_axis.z + reach.z,
+                ));
+            }
+        }
+        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => return None,
+    }
+    Some(FaceExtent { min, max })
+}
+
+/// Whether two faces can be told apart by their extents alone, so that a
+/// carrier pair the intersection matrix refuses is one the Boolean never
+/// needs. Unknown extents keep the refusal.
+fn faces_apart(
+    own: Option<FaceExtent>,
+    other: &Topology,
+    other_face: &Face,
+    precision: PrecisionPolicy,
+) -> bool {
+    let (Some(own), Ok(region)) = (own, face_region(other, other_face)) else {
+        return false;
+    };
+    let Some(other) = face_extent(other_face, &region) else {
+        return false;
+    };
+    let scale = [own.min, own.max, other.min, other.max]
+        .iter()
+        .map(|point| point.x.abs().max(point.y.abs()).max(point.z.abs()))
+        .fold(1.0_f64, f64::max);
+    let margin = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
+    own.max.x + margin < other.min.x
+        || other.max.x + margin < own.min.x
+        || own.max.y + margin < other.min.y
+        || other.max.y + margin < own.min.y
+        || own.max.z + margin < other.min.z
+        || other.max.z + margin < own.min.z
+}
+
+/// One face of the other solid lying on this face's own carrier, as a region
+/// in this face's parameter space, and whether the two materials lie on the
+/// same side of that carrier.
+struct CoincidentOverlay {
+    region: ProfileRegion,
+    same_side: bool,
+}
+
+/// Every face of the other solid that lies on this face's carrier.
+///
+/// Two boxes meeting on a whole face, a boss whose bore wall continues the
+/// hole it surrounds, a counterbore widening a hole: in each the two solids
+/// share a piece of skin, and the shared piece is neither inside the other
+/// solid nor outside it. It is carried through in this face's own parameter
+/// space, oriented by whether the two faces look the same way — which is
+/// what the operand table needs to keep it once or drop it.
+fn coincident_overlays(
+    face: &Face,
+    own_region: &[Vec<Segment>],
+    other: &Topology,
+    precision: PrecisionPolicy,
+) -> Result<Vec<CoincidentOverlay>, AnalyticBooleanError> {
+    let own_extent = face_extent(face, own_region);
+    let mut overlays = Vec::new();
+    for other_face in &other.faces {
+        if faces_apart(own_extent, other, &other_face.value, precision) {
+            continue;
+        }
+        let outcome = intersect(face.surface, other_face.value.surface, precision)
+            .map_err(|_| AnalyticBooleanError::DomainUnsupported)?;
+        if !matches!(outcome, SurfaceIntersection::Coincident) {
+            continue;
+        }
+        let window = azimuth_window(own_region);
+        let loops = face_region(other, &other_face.value)?
+            .into_iter()
+            .map(|segments| {
+                reparameterize_loop(&other_face.value.surface, &segments, &face.surface, window)
+                    .ok_or(AnalyticBooleanError::DomainUnsupported)
+                    .and_then(|segments| {
+                        welded(&segments, precision)
+                            .map_err(|_| AnalyticBooleanError::DomainUnsupported)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((outer, holes)) = loops.split_first() else {
+            continue;
+        };
+        // Both faces looked at from one point of the shared carrier: the
+        // materials lie on the same side exactly when the outward normals
+        // agree.
+        let probe = match other_face.value.surface {
+            Surface::Plane(plane) => plane.evaluate(outer[0].start()),
+            Surface::Cylinder(cylinder) => cylinder.evaluate(outer[0].start()),
+            _ => return Err(AnalyticBooleanError::DomainUnsupported),
+        };
+        let (Some(own_normal), Some(other_normal)) = (
+            face.surface.outward_normal_at(probe),
+            other_face.value.surface.outward_normal_at(probe),
+        ) else {
+            return Err(AnalyticBooleanError::DomainUnsupported);
+        };
+        overlays.push(CoincidentOverlay {
+            region: ProfileRegion {
+                outer: outer.clone(),
+                holes: holes.to_vec(),
+            },
+            same_side: own_normal.dot(other_normal) > 0.0,
+        });
+    }
+    Ok(overlays)
+}
+
 /// The other solid's section on this face's carrier, in the face's own
 /// parameter space, as zero or more closed regions.
 fn section_on_face(
@@ -226,16 +516,25 @@ fn section_on_face(
     other: &Topology,
     precision: PrecisionPolicy,
 ) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+    let own_extent = face_extent(face, own_region);
     let mut pieces: Vec<Segment> = Vec::new();
     for other_face in &other.faces {
-        let outcome = intersect(face.surface, other_face.value.surface, precision)
-            .map_err(|_| AnalyticBooleanError::DomainUnsupported)?;
+        // The section is closed by pieces from every face the carrier
+        // crosses, near this face or not, so a pair the matrix answers is
+        // always taken. Only a pair it refuses is asked whether the two
+        // faces could meet at all.
+        let outcome = match intersect(face.surface, other_face.value.surface, precision) {
+            Ok(outcome) => outcome,
+            Err(_) if faces_apart(own_extent, other, &other_face.value, precision) => continue,
+            Err(_) => return Err(AnalyticBooleanError::DomainUnsupported),
+        };
         let curves = match outcome {
             SurfaceIntersection::Empty => continue,
-            // Coincident carriers are tangential contact: fail closed.
-            SurfaceIntersection::Coincident => {
-                return Err(AnalyticBooleanError::DomainUnsupported);
-            }
+            // A face on this very carrier contributes no crossing curve: it
+            // overlaps this face in area, and `coincident_overlays` answers
+            // for that overlap by the operand table rather than by a sample
+            // that would land on the other solid's own skin.
+            SurfaceIntersection::Coincident => continue,
             SurfaceIntersection::Curves(curves) => curves,
         };
         let other_region = face_region(other, &other_face.value)?;
@@ -723,11 +1022,18 @@ fn close_periodic_sections(
     let lowest = &open[0];
     let probe = lowest[lowest.len() / 2].point_at(0.5);
     let step = (v_max - v_min).max(1.0) * 1.0e-3;
-    let above_lowest = point_in_solid(
-        other,
-        cylinder.evaluate(Point2::new(probe.x, probe.y + step)),
-    )
-    .ok_or(AnalyticBooleanError::DomainUnsupported)?;
+    let probe_point = cylinder.evaluate(Point2::new(probe.x, probe.y + step));
+    // A section is a closure: where the other solid has a face on this very
+    // carrier, the probe lies on that skin, and a ray's parity there is a
+    // coin toss. The skin counts as covered, and only a probe off every
+    // coincident face is asked of the solid's interior.
+    let above_lowest =
+        match on_coincident_face(&Surface::Cylinder(*cylinder), other, probe_point, precision) {
+            Some(covered) => covered,
+            None => {
+                point_in_solid(other, probe_point).ok_or(AnalyticBooleanError::DomainUnsupported)?
+            }
+        };
     let left = open
         .iter()
         .map(|chain| chain[0].start().x)
@@ -1056,6 +1362,61 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
     }
 }
 
+/// The azimuth span a region occupies, for placing another loop on the same
+/// branch of a periodic face.
+fn azimuth_window(region: &[Vec<Segment>]) -> Option<(f64, f64)> {
+    let (low, high) = region
+        .iter()
+        .flatten()
+        .flat_map(|segment| [segment.start().x, segment.end().x])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), x| {
+            (low.min(x), high.max(x))
+        });
+    (low.is_finite() && high.is_finite()).then_some((low, high))
+}
+
+/// A whole loop re-expressed on another face.
+///
+/// Segment by segment, the mapping lands each end on whichever branch the
+/// arctangent returns, and a loop that crosses the seam comes back torn:
+/// one piece ending at `π`, the next starting at `−π`. The loop is
+/// continuous, so each piece is carried by whole turns onto the branch the
+/// previous piece ended on, and the finished loop is brought by whole turns
+/// onto the window the receiving face's own region uses — the branch on
+/// which the two regions can be compared at all.
+fn reparameterize_loop(
+    from: &Surface,
+    segments: &[Segment],
+    to: &Surface,
+    window: Option<(f64, f64)>,
+) -> Option<Vec<Segment>> {
+    let tau = std::f64::consts::TAU;
+    let periodic = matches!(to, Surface::Cylinder(_));
+    let mut mapped: Vec<Segment> = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut piece = reparameterize(from, *segment, to)?;
+        if periodic && let Some(previous) = mapped.last() {
+            let turns = ((previous.end().x - piece.start().x) / tau).round();
+            if turns != 0.0 {
+                piece = piece.translated(Point2::new(-turns * tau, 0.0));
+            }
+        }
+        mapped.push(piece);
+    }
+    if periodic
+        && let Some((low, high)) = window
+        && let Some((own_low, own_high)) = azimuth_window(std::slice::from_ref(&mapped))
+    {
+        let turns = (((low + high) - (own_low + own_high)) / (2.0 * tau)).round();
+        if turns != 0.0 {
+            for piece in &mut mapped {
+                *piece = piece.translated(Point2::new(-turns * tau, 0.0));
+            }
+        }
+    }
+    Some(mapped)
+}
+
 /// Re-expresses a chord piece from one face's parameter space into another's
 /// through world coordinates.
 fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segment> {
@@ -1188,11 +1549,32 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                 // A straight piece on the source face lands on a cylinder
                 // only as a generator (constant angle) or a ring chord
                 // (constant height); both stay lines in parameter space.
-                Segment::Line { start, end } => {
+                line @ Segment::Line { start, end } => {
                     let a = local(world(start)?);
                     let b = local(world(end)?);
-                    if (a.x - b.x).abs() <= 1.0e-9 || (a.y - b.y).abs() <= 1.0e-9 {
-                        Some(Segment::Line { start: a, end: b })
+                    let tau = std::f64::consts::TAU;
+                    let nearest =
+                        |value: f64, target: f64| value + ((target - value) / tau).round() * tau;
+                    // A generator's two ends are one azimuth, which the
+                    // arctangent may hand back as `π` for one end and `−π`
+                    // for the other when the generator lies on the seam;
+                    // the azimuth is the same and the first end's branch is
+                    // kept.
+                    let bx = nearest(b.x, a.x);
+                    if (a.x - bx).abs() <= 1.0e-9 {
+                        Some(Segment::Line {
+                            start: a,
+                            end: Point2::new(a.x, b.y),
+                        })
+                    } else if (a.y - b.y).abs() <= 1.0e-9 {
+                        // A ring chord: the branch is the one its midpoint
+                        // lies on, as for an arc below.
+                        let middle = nearest(local(world(line.point_at(0.5))?).x, a.x);
+                        let bx = nearest(b.x, a.x + 2.0 * (middle - a.x));
+                        Some(Segment::Line {
+                            start: a,
+                            end: Point2::new(bx, b.y),
+                        })
                     } else {
                         None
                     }
@@ -1493,6 +1875,65 @@ fn face_sample_inside(
 
 /// Exact parity ray cast against a whole topology, retrying awkward
 /// directions before giving up.
+/// A point's parameters on a surface, for a point that lies on it.
+fn surface_local(surface: &Surface, point: Point3) -> Option<Point2> {
+    match surface {
+        Surface::Plane(plane) => Some(Point2::new(
+            (point - plane.origin).dot(plane.u),
+            (point - plane.origin).dot(plane.v),
+        )),
+        Surface::Cylinder(cylinder) => {
+            let axis = cylinder.axis / cylinder.axis.length();
+            let offset = point - cylinder.origin;
+            let height = offset.dot(axis);
+            let radial = offset - axis * height;
+            let angle = radial
+                .dot(cylinder.radial_v)
+                .atan2(radial.dot(cylinder.radial_u));
+            Some(Point2::new(cylinder.angular_sign * angle, height))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a point of `carrier` lies on a face of `other` that shares that
+/// carrier: `Some(true)` on such a face, `None` otherwise — off every such
+/// face the point may still be inside the solid, which is the interior's
+/// question and not the skin's.
+fn on_coincident_face(
+    carrier: &Surface,
+    other: &Topology,
+    point: Point3,
+    precision: PrecisionPolicy,
+) -> Option<bool> {
+    let tau = std::f64::consts::TAU;
+    for other_face in &other.faces {
+        if !matches!(
+            intersect(*carrier, other_face.value.surface, precision),
+            Ok(SurfaceIntersection::Coincident)
+        ) {
+            continue;
+        }
+        let Ok(region) = face_region(other, &other_face.value) else {
+            continue;
+        };
+        let Some(mut local) = surface_local(&other_face.value.surface, point) else {
+            continue;
+        };
+        // On a periodic face the azimuth is asked on the face's own branch.
+        if let (Surface::Cylinder(_), Some((low, high))) =
+            (other_face.value.surface, azimuth_window(&region))
+        {
+            let turns = (((low + high) / 2.0 - local.x) / tau).round();
+            local = Point2::new(local.x + turns * tau, local.y);
+        }
+        if point_in_loops(local, &wrap_loops(&region)) {
+            return Some(true);
+        }
+    }
+    None
+}
+
 fn point_in_solid(topology: &Topology, point: Point3) -> Option<bool> {
     for direction in ray_directions() {
         let mut crossings = 0_usize;

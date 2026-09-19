@@ -1,3 +1,4 @@
+use crate::EvaluatedCurve2;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -246,6 +247,10 @@ impl SketchIdHighWaterMarks {
 }
 
 /// Persisted exact sketch intent plus deterministic, checked evaluated caches.
+/// The first entity id an arrangement gives a support curve. Authored ids
+/// count up from one and never reach here.
+pub const SUPPORT_CURVE_ENTITY_BASE: u64 = 1 << 62;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SketchDefinition {
     pub(crate) points: BTreeMap<SketchPointId, SketchPointRecord>,
@@ -255,6 +260,15 @@ pub struct SketchDefinition {
     pub(crate) constraints: BTreeMap<SketchConstraintId, SketchConstraintRecord>,
     pub(crate) allocator: SketchIdHighWaterMarks,
     pub(crate) revision: SketchRevision,
+    /// The boundary of the face this sketch was drawn on — its outline and
+    /// the rims of its holes — as curves the sketch can close regions
+    /// against. A sketch on a face spends most of its life talking about
+    /// that face, and "the face minus what I drew" is the commonest region
+    /// there is. These are context, not authoring: they carry no ids the
+    /// user can pick, take no part in the revision, and travel with the
+    /// definition so a replay closes exactly the regions the canvas did.
+    #[serde(default)]
+    pub(crate) support_curves: Vec<EvaluatedCurve2>,
 }
 
 impl Default for SketchDefinition {
@@ -267,6 +281,7 @@ impl SketchDefinition {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            support_curves: Vec::new(),
             points: BTreeMap::new(),
             operations: Vec::new(),
             entities: BTreeMap::new(),
@@ -567,9 +582,59 @@ impl SketchDefinition {
     /// Produces exact profile-only inputs for the planar arrangement in stable
     /// entity-ID order. Construction/reference geometry and visibility state do
     /// not alter material topology.
+    /// Replaces the face boundary this sketch closes regions against.
+    /// Returns whether anything changed. The revision is untouched: the
+    /// boundary is the body's, not an edit of the sketch.
+    pub fn set_support_curves(&mut self, curves: Vec<EvaluatedCurve2>) -> bool {
+        if self.support_curves == curves {
+            return false;
+        }
+        self.support_curves = curves;
+        true
+    }
+
+    #[must_use]
+    pub fn support_curves(&self) -> &[EvaluatedCurve2] {
+        &self.support_curves
+    }
+
+    /// The entity id the `index`th support curve takes in an arrangement.
+    ///
+    /// Support curves are not entities and have none of their own, but a
+    /// fragment key names its source, and a region's signature has to be
+    /// the same on every rebuild. Ids from the top of the range are what
+    /// no authored entity will ever be allocated.
+    #[must_use]
+    pub const fn support_curve_entity(index: usize) -> SketchEntityId {
+        // The base is far above zero, so the only way this is `None` is an
+        // index past the top of the range, which no face has edges enough
+        // to reach.
+        match SketchEntityId::new(SUPPORT_CURVE_ENTITY_BASE + index as u64) {
+            Some(entity) => entity,
+            None => panic!("support curve index overflows the entity id range"),
+        }
+    }
+
+    /// Whether an arrangement entity id names a support curve rather than
+    /// an authored entity.
+    #[must_use]
+    pub const fn is_support_curve_entity(entity: SketchEntityId) -> bool {
+        entity.get() >= SUPPORT_CURVE_ENTITY_BASE
+    }
+
     pub fn arrangement_inputs(
         &self,
     ) -> Result<Vec<crate::ArrangementInputCurve>, SketchValidationError> {
+        let support = self
+            .support_curves
+            .iter()
+            .enumerate()
+            .map(|(index, curve)| crate::ArrangementInputCurve {
+                entity: Self::support_curve_entity(index),
+                curve: curve.clone(),
+                start_point: None,
+                end_point: None,
+            });
         self.active_entities()
             .filter(|entity| entity.role == SketchEntityRole::Profile)
             .map(|entity| {
@@ -592,6 +657,7 @@ impl SketchDefinition {
                     end_point,
                 })
             })
+            .chain(support.map(Ok))
             .collect()
     }
 

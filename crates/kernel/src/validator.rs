@@ -1096,21 +1096,29 @@ fn pcurve_locus_error(
                 minor_radius,
             },
         ) => {
-            // Same centre, same axes (mapped through the plane), same radii,
-            // same parameter: an affine map of a circle is checked the way a
-            // circle is, with the sampled and tangent errors tying the
-            // parameterization.
+            // Same centre, same axes (mapped through the plane), same radii:
+            // an affine map of a circle is checked the way a circle is, with
+            // the sampled and tangent errors tying the parameterization.
+            //
+            // The two descriptions may run the ellipse opposite ways round,
+            // or start half a turn apart — the plane's section chord and the
+            // cylinder's harmonic each write the same locus in their own
+            // frame. Either axis may then be reversed, and the parameter
+            // relation is `s = ±t + δ` with the sign the product of the two
+            // axis signs; the sampled and tangent errors settle `δ`.
             let mapped_center = plane.evaluate(pcenter);
             let mapped_u = plane.u * pu.x + plane.v * pu.y;
             let mapped_v = plane.u * pv.x + plane.v * pv.y;
+            let u_sign = if mapped_u.dot(u) >= 0.0 { 1.0 } else { -1.0 };
+            let v_sign = if mapped_v.dot(v) >= 0.0 { 1.0 } else { -1.0 };
             let scale = major_radius.max(pmajor);
             mapped_center
                 .distance(center)
                 .max((pmajor - major_radius).abs())
                 .max((pminor - minor_radius).abs())
-                .max((mapped_u - u).length() * scale)
-                .max((mapped_v - v).length() * scale)
-                .max((pcurve_delta - edge_delta).abs() * scale)
+                .max((mapped_u - u * u_sign).length() * scale)
+                .max((mapped_v - v * v_sign).length() * scale)
+                .max((pcurve_delta * u_sign * v_sign - edge_delta).abs() * scale)
                 .max(tangent_error)
                 .max(sampled_error)
         }
@@ -2991,10 +2999,15 @@ pub(crate) fn face_parameter_area_and_moment(
                 minor_radius,
             } = coedge.pcurve
             {
-                // The exact contour terms of the elliptical arc, `∮x dy`,
-                // `∮½x² dy` and `−∮½y² dx`, integrate in closed form as
-                // trigonometric polynomials of the parameter; the chord's
-                // share, counted above, comes off again.
+                // The exact contour terms of the elliptical arc integrate in
+                // closed form as trigonometric polynomials of the parameter,
+                // and the chord's share, counted above, comes off again. They
+                // are taken in the same symmetric form the chords use —
+                // `½∮(x dy − y dx)` and `⅓∮x(x dy − y dx)` — because the
+                // several forms of Green's theorem agree only around a closed
+                // chain, and an arc beside straight edges is not one: the
+                // `∮x dy` form counted the chamfer face between two bands at
+                // half again its area.
                 let center = Point2::new(center.x - anchor.x, center.y - anchor.y);
                 let x = TrigPoly::constant(center.x)
                     .plus(&TrigPoly::cosine().scaled(major_radius * u.x))
@@ -3009,9 +3022,10 @@ pub(crate) fn face_parameter_area_and_moment(
                     .scaled(-major_radius * u.y)
                     .plus(&TrigPoly::cosine().scaled(minor_radius * v.y));
                 let (from, to) = (coedge.parameter_range.start, coedge.parameter_range.end);
-                let exact_area = x.times(&dy).integrate(from, to);
-                let exact_moment_x = x.power(2).times(&dy).scaled(0.5).integrate(from, to);
-                let exact_moment_y = y.power(2).times(&dx).scaled(-0.5).integrate(from, to);
+                let turn = x.times(&dy).plus(&y.times(&dx).scaled(-1.0));
+                let exact_area = turn.scaled(0.5).integrate(from, to);
+                let exact_moment_x = x.times(&turn).scaled(1.0 / 3.0).integrate(from, to);
+                let exact_moment_y = y.times(&turn).scaled(1.0 / 3.0).integrate(from, to);
                 area += exact_area - chord_area;
                 moment.x += exact_moment_x - chord_cross * (start.x + end.x) / 6.0;
                 moment.y += exact_moment_y - chord_cross * (start.y + end.y) / 6.0;

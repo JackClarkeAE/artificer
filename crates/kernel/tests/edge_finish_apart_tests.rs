@@ -87,6 +87,21 @@ fn bevel_apart(body: &Snapshot, edge: EntityRef, distance: f64) -> Result<Snapsh
     )
 }
 
+/// The volume of the display tessellation, by the divergence theorem over
+/// its triangles: an independent witness to the exact measure.
+fn tessellated_volume(snapshot: &Snapshot) -> f64 {
+    NativeKernel::debug_scene(snapshot)
+        .triangles
+        .iter()
+        .map(|triangle| {
+            let [a, b, c] = triangle.vertices;
+            (a.x * (b.y * c.z - b.z * c.y) - a.y * (b.x * c.z - b.z * c.x)
+                + a.z * (b.x * c.y - b.y * c.x))
+                / 6.0
+        })
+        .sum()
+}
+
 fn close(measured: f64, expected: f64, what: &str) {
     // Standing apart is a regularized Boolean, not the analytic band, and it
     // does not pretend otherwise: each cut imprints its plane on the faces it
@@ -312,11 +327,23 @@ fn a_bevel_standing_apart_from_a_rounded_corner() {
     .expect("two edges of a corner round together");
     let before = rounded.measures().volume;
     match bevel_apart(&rounded, origin_edge(&rounded, 2), size) {
-        Ok(apart) => assert!(
-            apart.measures().volume < before,
-            "the bevel removes material: {} against {before}",
-            apart.measures().volume
-        ),
+        Ok(apart) => {
+            let volume = apart.measures().volume;
+            assert!(
+                volume < before,
+                "the bevel removes material: {volume} against {before}"
+            );
+            // The bevel plane meets the bands in two elliptical arcs that
+            // end on straight edges, and the exact measure once counted
+            // that face at half again its area — a wrong volume published
+            // as exact. The tessellation is the other witness, and the two
+            // have to agree to the tessellation's own error.
+            let tessellated = tessellated_volume(&apart);
+            assert!(
+                ((volume - tessellated) / tessellated).abs() < 1.0e-3,
+                "the exact volume {volume} agrees with the tessellated {tessellated}"
+            );
+        }
         Err(error) => assert!(
             error.contains("EDGE_FINISH_APART"),
             "a refusal should name the route that gave it: {error}"

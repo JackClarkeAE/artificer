@@ -231,6 +231,35 @@ pub struct ArrangementCell {
     pub signed_area: f64,
 }
 
+impl ArrangementCell {
+    fn boundary_keys(&self) -> impl Iterator<Item = &FragmentKey> {
+        self.outer
+            .fragment_keys
+            .iter()
+            .chain(self.holes.iter().flat_map(|hole| hole.fragment_keys.iter()))
+    }
+
+    /// Whether any of this cell's boundary is a support curve — the face's
+    /// own outline or a hole's rim — rather than a stroke of the sketch. Such
+    /// a cell is closed by what was already there, which is why it can be
+    /// picked, and why it is never picked unasked.
+    #[must_use]
+    pub fn touches_support(&self) -> bool {
+        self.boundary_keys()
+            .any(|key| crate::SketchDefinition::is_support_curve_entity(key.source_entity))
+    }
+
+    /// Whether every piece of this cell's boundary is a support curve: the
+    /// host's own face with nothing drawn across it, which is not a region of
+    /// the sketch at all.
+    #[must_use]
+    pub fn is_support_only(&self) -> bool {
+        let mut keys = self.boundary_keys().peekable();
+        keys.peek().is_some()
+            && keys.all(|key| crate::SketchDefinition::is_support_curve_entity(key.source_entity))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SketchArrangement {
     pub junctions: Vec<ArrangementJunction>,

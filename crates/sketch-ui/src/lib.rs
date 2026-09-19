@@ -347,6 +347,51 @@ pub enum SketchContextCurve {
 const FULL_TURN_EPSILON: f64 = 1.0e-9;
 
 impl SketchContextCurve {
+    /// This curve as the core evaluates one, or `None` for a span too short
+    /// to bound anything.
+    #[must_use]
+    pub fn evaluated(&self) -> Option<CoreEvaluatedCurve2> {
+        match *self {
+            Self::Segment { start, end } => ((end.u - start.u).hypot(end.v - start.v)
+                > f64::EPSILON)
+                .then(|| CoreEvaluatedCurve2::Line {
+                    start: core_point(start),
+                    end: core_point(end),
+                }),
+            Self::Arc {
+                center,
+                radius,
+                start,
+                end,
+                ..
+            } => {
+                let sweep = end - start;
+                if radius <= f64::EPSILON || sweep.abs() <= f64::EPSILON {
+                    return None;
+                }
+                let direction = if sweep >= 0.0 {
+                    CoreCurveDirection::CounterClockwise
+                } else {
+                    CoreCurveDirection::Clockwise
+                };
+                if sweep.abs() >= std::f64::consts::TAU - 1.0e-9 {
+                    return Some(CoreEvaluatedCurve2::Circle {
+                        center: core_point(center),
+                        radius,
+                        direction,
+                    });
+                }
+                let [first, last] = self.endpoints()?;
+                Some(CoreEvaluatedCurve2::CircularArc {
+                    center: core_point(center),
+                    start: core_point(first),
+                    end: core_point(last),
+                    direction,
+                })
+            }
+        }
+    }
+
     #[must_use]
     pub const fn segment(start: SketchPoint, end: SketchPoint) -> Self {
         Self::Segment { start, end }
@@ -6054,6 +6099,19 @@ impl SketchCanvasState {
             .copied()
             .filter(|curve| curve.is_finite())
             .collect();
+        // The face's boundary closes regions too: the face minus what was
+        // drawn is a region a user can pick and extrude, and the sketch's
+        // own definition carries the boundary so a replay closes the same
+        // regions the canvas did.
+        let evaluated = self
+            .support_curves
+            .iter()
+            .filter_map(SketchContextCurve::evaluated)
+            .collect::<Vec<_>>();
+        if self.authoring.set_support_curves(evaluated) {
+            self.analytic_regions.revision = None;
+            self.refresh_analytic_regions();
+        }
     }
 
     #[must_use]
@@ -6275,7 +6333,7 @@ impl SketchCanvasState {
         let old_selected = std::mem::take(&mut self.analytic_regions.selected);
         let old_anchors = std::mem::take(&mut self.analytic_regions.selection_anchors);
         let precision = PrecisionPolicy::default();
-        let arrangement = self
+        let mut arrangement = self
             .authoring
             .arrangement_inputs()
             .ok()
@@ -6283,6 +6341,12 @@ impl SketchCanvasState {
             .unwrap_or_else(|| {
                 build_arrangement(&[], &precision, CoreArrangementLimits::default())
             });
+        // The face's outline and its hole rims close regions alongside the
+        // strokes, so "the face minus what was drawn" is a region that can be
+        // picked. A cell bounded by support curves alone is the host's own
+        // face with nothing drawn across it, and is not a region of the
+        // sketch at all.
+        arrangement.cells.retain(|cell| !cell.is_support_only());
         let boundary_tolerance = precision
             .linear_agreement
             .max(precision.modeling_resolution);
@@ -6308,9 +6372,28 @@ impl SketchCanvasState {
             }
         }
         let mut explicit = self.analytic_regions.explicit && !selected.is_empty();
+        // One region closed by strokes alone is what the user drew, and is
+        // taken unasked. A region the face's own boundary helps close is
+        // offered, never assumed: a rectangle on a face makes two cells, the
+        // rectangle and the face around it, and the rectangle is the one
+        // meant.
+        let drawn = arrangement
+            .cells
+            .iter()
+            .filter(|cell| !cell.touches_support())
+            .count();
+        let sole = if drawn == 1 {
+            arrangement
+                .cells
+                .iter()
+                .find(|cell| !cell.touches_support())
+        } else if arrangement.cells.len() == 1 {
+            arrangement.cells.first()
+        } else {
+            None
+        };
         if selected.is_empty()
-            && arrangement.cells.len() == 1
-            && let Some(cell) = arrangement.cells.first()
+            && let Some(cell) = sole
         {
             selected.insert(cell.signature.clone());
             if let Some(anchor) = arrangement.cell_interior_sample(cell, &precision) {
@@ -20768,6 +20851,101 @@ mod tests {
                 .iter()
                 .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
             "measuring to an edge is an offset"
+        );
+    }
+
+    /// A sketch on a face offers the face itself, minus what was drawn, as a
+    /// region: the boundary the sketch sits on closes regions too. A circle
+    /// on a rectangular face is two regions — the disc, and the face around
+    /// it — where it used to be one, with the second unpickable although it
+    /// was plainly enclosed.
+    #[test]
+    fn a_face_sketch_offers_the_face_around_what_is_drawn() {
+        let (state, _, _) = circle_on_a_host_face();
+        assert_eq!(
+            state.available_region_count(),
+            2,
+            "the disc and the face around it"
+        );
+        let arrangement = state
+            .analytic_regions
+            .arrangement
+            .as_ref()
+            .expect("regions are built");
+        let mut areas = arrangement
+            .cells
+            .iter()
+            .map(|cell| cell.signed_area.abs())
+            .collect::<Vec<_>>();
+        areas.sort_by(f64::total_cmp);
+        let disc = std::f64::consts::PI;
+        assert!((areas[0] - disc).abs() < 1.0e-9, "the disc: {}", areas[0]);
+        assert!(
+            (areas[1] - (64.0 - disc)).abs() < 1.0e-9,
+            "the eight-by-eight face minus the disc: {}",
+            areas[1]
+        );
+    }
+
+    /// Of the two, the disc is what was drawn and is taken unasked; the face
+    /// around it is closed by the face's own boundary, and is offered — a
+    /// click takes it — but never assumed. A rectangle on a face used to be
+    /// one region and extruded straight away; it still does.
+    #[test]
+    fn what_was_drawn_is_taken_unasked_and_the_face_around_it_is_offered() {
+        let (mut state, _, _) = circle_on_a_host_face();
+        let disc = std::f64::consts::PI;
+        let selected_area = |state: &SketchCanvasState| -> f64 {
+            let arrangement = state
+                .analytic_regions
+                .arrangement
+                .as_ref()
+                .expect("regions are built");
+            state
+                .analytic_regions
+                .selected
+                .iter()
+                .filter_map(|signature| arrangement.cell(signature))
+                .map(|cell| cell.signed_area.abs())
+                .sum()
+        };
+        assert_eq!(state.selected_region_count(), 1, "the disc is taken");
+        assert!(
+            (selected_area(&state) - disc).abs() < 1.0e-9,
+            "the disc, not the face around it: {}",
+            selected_area(&state)
+        );
+        assert!(
+            state.select_region_at_point(SketchPoint::new(3.0, 3.0), false),
+            "the face around the disc can be picked"
+        );
+        assert_eq!(state.selected_region_count(), 1);
+        assert!(
+            (selected_area(&state) - (64.0 - disc)).abs() < 1.0e-9,
+            "the face minus the disc: {}",
+            selected_area(&state)
+        );
+    }
+
+    /// The boundary is context, not a stroke: nothing appears among the
+    /// sketch's entities, nothing can be picked as geometry, and the
+    /// revision does not move.
+    #[test]
+    fn the_face_boundary_is_not_a_stroke_of_the_sketch() {
+        let (state, _, _) = circle_on_a_host_face();
+        assert_eq!(state.entities().len(), 1, "only the circle was drawn");
+        let mut plain = SketchCanvasState::default();
+        plain
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(1.0, 0.0),
+            ))
+            .expect("the circle should stage");
+        plain.commit_pending().expect("the circle should commit");
+        assert_eq!(
+            state.authoring().revision(),
+            plain.authoring().revision(),
+            "the face's boundary is not an edit"
         );
     }
 

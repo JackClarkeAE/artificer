@@ -568,7 +568,7 @@ impl NativeKernel {
         // arm names its own; a ladder with several rungs names the one that
         // answered. The report carries it so a consumer can tell an exact
         // construction from the faceted tier without parsing prose.
-        let mut rung: &'static str = "";
+        let rung: &'static str;
         let (topology, history_mode) = match &request.command {
             KernelCommand::MakeCuboid {
                 origin,
@@ -947,6 +947,13 @@ impl NativeKernel {
                             )
                             .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                             certify_faceted_candidate(input.id, &topology, request.precision)?;
+                            certify_faceted_change(
+                                input.id,
+                                &input.topology,
+                                &topology,
+                                *operation,
+                                request.precision,
+                            )?;
                             // The result is a tessellation, not a certified solid.
                             // Say so: every other report this kernel publishes means
                             // "exact", so a caller with no way to tell the
@@ -1025,23 +1032,23 @@ impl NativeKernel {
                         };
                         // Past the prism reductions, the general analytic
                         // engine carries any body of planes and cylinders —
-                        // one already bored at an angle, say. Its tool
+                        // one already bored at an angle, say. A cut's tool
                         // overshoots the face so no cap lies on the face's
-                        // own plane; the overshoot lies outside the body for
-                        // a cut and inside it for an add, and changes nothing.
+                        // own plane; the overshoot lies outside the body and
+                        // removes nothing. An add's tool stands exactly on
+                        // the face: its cap is a coincident face the engine
+                        // resolves (ADR 0045), and an overshoot into the body
+                        // would poke out again under any part of the profile
+                        // that hangs over the face's edge, and publish that
+                        // sliver as material.
                         let analytic = || -> Option<Topology> {
-                            let overshoot =
-                                (*distance * 0.01).max(request.precision.min_feature_size * 8.0);
-                            let analytic_origin = match operation {
-                                FaceExtrusionOperation::Cut => tool_origin,
-                                FaceExtrusionOperation::Add => ProtocolPoint3::new(
-                                    tool_origin.x - unit.x * overshoot,
-                                    tool_origin.y - unit.y * overshoot,
-                                    tool_origin.z - unit.z * overshoot,
-                                ),
+                            let overshoot = match operation {
+                                FaceExtrusionOperation::Cut => (*distance * 0.01)
+                                    .max(request.precision.min_feature_size * 8.0),
+                                FaceExtrusionOperation::Add => 0.0,
                             };
                             let tool = validate_analytic_profile_extrusion(
-                                PlanarFrame3::new(analytic_origin, frame.u, frame.v),
+                                PlanarFrame3::new(tool_origin, frame.u, frame.v),
                                 profile,
                                 *distance + overshoot,
                                 request.precision,
@@ -1059,6 +1066,13 @@ impl NativeKernel {
                                     .ok()
                                 })
                                 .flatten()
+                                // An add whose profile misses the face has no
+                                // interface, and the union of two solids that
+                                // never meet is two solids, not a boss.
+                                .filter(|topology| {
+                                    *operation == FaceExtrusionOperation::Cut
+                                        || topology.solids.len() == 1
+                                })
                         };
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
@@ -1066,47 +1080,64 @@ impl NativeKernel {
                             boolean_operation,
                             request.precision,
                         );
-                        // An add whose profile misses the face has no
-                        // interface, and stays a refusal; only a cut goes on
-                        // to the general engine.
-                        let analytic_cut = || -> Option<Topology> {
-                            (*operation == FaceExtrusionOperation::Cut)
-                                .then(analytic)
-                                .flatten()
-                        };
+                        // Both operations go on to the general engine. A cut
+                        // is the difference it certifies; an add is the union
+                        // — which since ADR 0045 resolves a boss whose rim
+                        // coincides with the face's own boundary or a hole's,
+                        // the commonest boss there is.
                         let topology = match prism {
-                            Ok(topology) => topology,
-                            Err(_) if analytic_cut().is_some() => {
-                                analytic_cut().expect("checked above")
-                            }
-                            Err(_) if *operation == FaceExtrusionOperation::Cut => {
-                                let mut boolean_input = input.clone();
-                                let mut boolean_precision = request.precision;
-                                boolean_precision.max_subdivisions =
-                                    boolean_precision.max_subdivisions.min(4);
-                                boolean_input.precision = Some(boolean_precision);
-                                let scene = NativeKernel::authoritative_scene(&boolean_input);
-                                let topology = faceted_boolean::subtract_crossing_profile(
-                                    &scene,
-                                    *frame,
-                                    profile,
-                                    Vector3::new(-unit.x, -unit.y, -unit.z),
-                                    *distance,
-                                    request.precision,
-                                )
-                                .map_err(|reason| planar_profile_input_error(input.id, reason))?;
-                                certify_faceted_candidate(input.id, &topology, request.precision)?;
-                                warnings.push(faceted_cut_warning());
+                            Ok(topology) => {
+                                rung = "face-feature/exact-prism";
                                 topology
                             }
-                            Err(_) => {
-                                return Err(planar_profile_input_error(
-                                    input.id,
-                                    PlanarProfileInputError::FaceFeature(
-                                        FaceFeatureInputError::ProfileOutsideFace,
-                                    ),
-                                ));
-                            }
+                            Err(_) => match analytic() {
+                                Some(topology) => {
+                                    rung = "face-feature/analytic-boolean";
+                                    topology
+                                }
+                                None if *operation == FaceExtrusionOperation::Cut => {
+                                    rung = "face-feature/faceted";
+                                    let mut boolean_input = input.clone();
+                                    let mut boolean_precision = request.precision;
+                                    boolean_precision.max_subdivisions =
+                                        boolean_precision.max_subdivisions.min(4);
+                                    boolean_input.precision = Some(boolean_precision);
+                                    let scene = NativeKernel::authoritative_scene(&boolean_input);
+                                    let topology = faceted_boolean::subtract_crossing_profile(
+                                        &scene,
+                                        *frame,
+                                        profile,
+                                        Vector3::new(-unit.x, -unit.y, -unit.z),
+                                        *distance,
+                                        request.precision,
+                                    )
+                                    .map_err(|reason| {
+                                        planar_profile_input_error(input.id, reason)
+                                    })?;
+                                    certify_faceted_candidate(
+                                        input.id,
+                                        &topology,
+                                        request.precision,
+                                    )?;
+                                    certify_faceted_change(
+                                        input.id,
+                                        &input.topology,
+                                        &topology,
+                                        *operation,
+                                        request.precision,
+                                    )?;
+                                    warnings.push(faceted_cut_warning());
+                                    topology
+                                }
+                                None => {
+                                    return Err(planar_profile_input_error(
+                                        input.id,
+                                        PlanarProfileInputError::FaceFeature(
+                                            FaceFeatureInputError::ProfileOutsideFace,
+                                        ),
+                                    ));
+                                }
+                            },
                         };
                         (topology, None, true)
                     }
@@ -3174,6 +3205,53 @@ fn certify_faceted_candidate(
     if validation.diagnostics.is_empty() {
         return Ok(());
     }
+    faceted_candidate_refusal(snapshot, validation)
+}
+
+/// A faceted candidate that is closed but cannot be the answer: a cut that
+/// left the body with more material than it started with, or an add that
+/// left it with less. Closedness is what the validator certifies, and a
+/// tessellated rebuild can be perfectly closed around the wrong material —
+/// which is a wrong answer published as an approximation, the one failure a
+/// kernel must not have. Volume is the cheapest invariant that catches it.
+fn certify_faceted_change(
+    snapshot: SnapshotId,
+    before: &Topology,
+    after: &Topology,
+    operation: FaceExtrusionOperation,
+    precision: PrecisionPolicy,
+) -> Result<(), KernelError> {
+    let was = validator::calculate_measures(before).signed_volume.abs();
+    let is = validator::calculate_measures(after).signed_volume.abs();
+    let slack = precision.approximation_budget.max(1.0e-9) * was.max(1.0);
+    let (wrong_way, verb, direction) = match operation {
+        FaceExtrusionOperation::Cut => (is > was + slack, "cut", "more"),
+        FaceExtrusionOperation::Add => (is < was - slack, "add", "less"),
+    };
+    if !wrong_way {
+        return Ok(());
+    }
+    let message = format!(
+        "The tessellated rebuild closed, but a {verb} left the body with {direction} material \
+         ({was:.6} before, {is:.6} after), which no {verb} can. Nothing is published."
+    );
+    Err(error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Construction,
+        snapshot,
+        "the faceted rebuild is closed but is not this operation",
+        vec![simple_diagnostic(
+            "FACE_FEATURE_FACETED_UNRESOLVED",
+            KernelStage::Construction,
+            &message,
+        )],
+    ))
+}
+
+fn faceted_candidate_refusal(
+    snapshot: SnapshotId,
+    validation: validator::ValidationReport,
+) -> Result<(), KernelError> {
     let mut diagnostics = vec![simple_diagnostic(
         "FACE_FEATURE_FACETED_UNRESOLVED",
         KernelStage::Construction,
@@ -8732,7 +8810,10 @@ mod tests {
             turned_drill.snapshot.measures().volume
         );
         // Two cylinders on skew axes meet in a curve no vocabulary here
-        // names, and the refusal says which carriers those are.
+        // names, and the refusal says which carriers those are. The
+        // cylinders must genuinely meet: a pair whose carriers the matrix
+        // refuses but whose faces never come near each other is no refusal
+        // at all, so this one runs along y through the upright's height.
         let skew = NativeKernel::execute(
             &NativeKernel::empty(),
             &ExecuteRequest {
@@ -8743,8 +8824,8 @@ mod tests {
                 command: KernelCommand::MakeRevolvedAnnulus {
                     frame: PlanarFrame3::new(
                         ProtocolPoint3::new(0.0, -5.0, 5.0),
-                        ProtocolVector3::new(1.0, 0.0, 0.0),
                         ProtocolVector3::new(0.0, 0.0, 1.0),
+                        ProtocolVector3::new(1.0, 0.0, 0.0),
                     ),
                     inner_radius: 0.0,
                     outer_radius: 1.5,
