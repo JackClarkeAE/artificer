@@ -21931,6 +21931,15 @@ fn view_cube_orbit_ring(
     } else {
         y_axis.coordinates[1].atan2(x_axis.coordinates[1])
     };
+    // Edge-on, the ring is a line through the cube and says nothing; it
+    // fades in as world Z turns toward the viewer and the ellipse opens.
+    let facing = view
+        .project_direction(Vector3::new(0.0, 0.0, 1.0))
+        .depth
+        .abs() as f32;
+    let visibility = ((facing - VIEW_CUBE_RING_EDGE_ON_FACING)
+        / (VIEW_CUBE_RING_FULL_FACING - VIEW_CUBE_RING_EDGE_ON_FACING))
+        .clamp(0.0, 1.0);
     let mut side_arrows = [-1.0_f64, 1.0].map(|sign| {
         let azimuth = nearest_azimuth + sign * VIEW_CUBE_SIDE_ARROW_AZIMUTH;
         let point = ring_point(azimuth, VIEW_CUBE_SIDE_ARROW_RADIUS);
@@ -21951,20 +21960,27 @@ fn view_cube_orbit_ring(
         } else {
             direction.normalized()
         };
+        // What the arrow says is "turn that way", which is a screen-horizontal
+        // intention whatever the ring is doing. Edge-on, the tangent already
+        // is horizontal. As the ring opens into a circle the tangent at ±θ
+        // from the nearest point tilts by θ, and read literally it sends the
+        // camera up a slope that is not there — from straight above, the
+        // arrows leaned thirty degrees. So the tangent is leaned back toward
+        // horizontal as the ring opens, by the ring's own openness, and the
+        // ring itself is left to show the travel.
+        let toward = (position.x - cube_center.x).signum();
+        let horizontal = egui::vec2(if toward == 0.0 { sign as f32 } else { toward }, 0.0);
+        let leaned = direction * (1.0 - visibility) + horizontal * visibility;
+        let direction = if leaned.length_sq() < 1.0e-4 {
+            horizontal
+        } else {
+            leaned.normalized()
+        };
         (position, direction)
     });
     if side_arrows[0].0.x > side_arrows[1].0.x {
         side_arrows.swap(0, 1);
     }
-    // Edge-on, the ring is a line through the cube and says nothing; it
-    // fades in as world Z turns toward the viewer and the ellipse opens.
-    let facing = view
-        .project_direction(Vector3::new(0.0, 0.0, 1.0))
-        .depth
-        .abs() as f32;
-    let visibility = ((facing - VIEW_CUBE_RING_EDGE_ON_FACING)
-        / (VIEW_CUBE_RING_FULL_FACING - VIEW_CUBE_RING_EDGE_ON_FACING))
-        .clamp(0.0, 1.0);
     ViewCubeOrbitRing {
         near,
         far,
@@ -25224,12 +25240,21 @@ mod view_cube_ring_tests {
                 offset.length() > radius && offset.length() < radius + 12.0,
                 "the arrows sit just outside the ring: {offset:?}"
             );
-            let radial = offset.normalized();
-            assert!(
-                radial.dot(direction).abs() < 0.05,
-                "the arrows run along the ring"
-            );
         }
+        // The ring is open, so its tangent at the arrows leans; the arrows
+        // do not follow it. "Turn left" is a horizontal intention from any
+        // angle, and from straight above a tilted arrow only reads as a
+        // mistake.
+        assert!(
+            left.1.x < -0.99 && left.1.y.abs() < 0.05,
+            "left points left: {:?}",
+            left.1
+        );
+        assert!(
+            right.1.x > 0.99 && right.1.y.abs() < 0.05,
+            "right points right: {:?}",
+            right.1
+        );
     }
 
     #[test]
