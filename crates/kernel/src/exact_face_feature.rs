@@ -281,7 +281,9 @@ fn project_segment(segment: Segment, frame: Frame, plane: Plane, height: f64) ->
                 sweep,
             }
         }
-        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other,
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }) => {
+            other
+        }
     }
 }
 
@@ -1479,7 +1481,7 @@ fn cap_pcurve_from_edge(edge: Edge, plane: Plane, reverse: bool) -> (Curve2, Par
         // An ellipse never bounds a planar cap in this vocabulary: it is the
         // seam of two cylinders. Should one arrive here, the chord keeps the
         // loop closed and the validator's locus check names the mismatch.
-        Curve3::Ellipse { .. } => {
+        Curve3::Ellipse { .. } | Curve3::Trace { .. } => {
             let endpoints = edge.endpoints();
             Curve2::line_segment(if reverse {
                 [plane.project(endpoints[1]), plane.project(endpoints[0])]
@@ -1524,7 +1526,7 @@ fn push_boundary_edge(
             },
             parameter_range: ParameterRange::new(start_angle, start_angle + sweep),
         },
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
             unreachable!("planar profiles carry lines and arcs only")
         }
     };
@@ -1582,7 +1584,7 @@ fn push_feature_side(
                 Curve2::line_segment([Point2::new(start, distance), Point2::new(start, 0.0)]),
             )
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
             unreachable!("planar profiles carry lines and arcs only")
         }
     };

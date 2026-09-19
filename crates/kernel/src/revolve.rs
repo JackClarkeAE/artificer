@@ -197,7 +197,7 @@ pub(crate) fn validate_revolve(
                 start_angle: start_angle - phase,
                 sweep,
             },
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                 unreachable!("revolve profiles carry lines and arcs only")
             }
         };

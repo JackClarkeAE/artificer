@@ -9,6 +9,7 @@ pub mod api;
 pub mod brep;
 mod corner_blend;
 mod cuboid;
+mod cylinder_trace;
 mod describe;
 mod edge_finish;
 mod edge_finish_apart;
@@ -1867,6 +1868,21 @@ impl NativeKernel {
                                 )],
                             ));
                         }
+                        Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_TRACE_NOT_CLOSED",
+                                    KernelStage::Construction,
+                                    "The two cylinders meet in a space quartic, which this kernel \
+                                     carries exactly; the section it leaves on one of the faces is \
+                                     a shape the boundary closure does not assemble yet.",
+                                )],
+                            ));
+                        }
                         Err(analytic_boolean::AnalyticBooleanError::DomainUnsupported) => {
                             // An out-of-matrix carrier pair is a vocabulary
                             // limit and says so; anything else the engine
@@ -3249,6 +3265,9 @@ enum ExactRouteDecline {
     },
     /// A contact the engine does not classify.
     Contact,
+    /// The curve two cylinders share is carried, but the section it leaves
+    /// on one of the faces is not assembled into a boundary yet.
+    TraceUnclosed,
     /// The exact result was empty.
     Empty,
     /// The prism tool itself could not be built from the profile.
@@ -3262,6 +3281,7 @@ impl ExactRouteDecline {
                 first: surface_intersection::surface_name(pair[0]),
                 second: surface_intersection::surface_name(pair[1]),
             },
+            analytic_boolean::AnalyticBooleanError::TraceUnclosed => Self::TraceUnclosed,
             analytic_boolean::AnalyticBooleanError::DomainUnsupported => Self::Contact,
             analytic_boolean::AnalyticBooleanError::EmptyResult => Self::Empty,
         }
@@ -3280,6 +3300,10 @@ impl ExactRouteDecline {
             ),
             Self::Contact => "the operands meet tangentially or share geometry the exact engine \
                               does not classify"
+                .to_owned(),
+            Self::TraceUnclosed => "the two cylinders meet in a space quartic, which this kernel \
+                                    now carries exactly, but the section it leaves on one of the \
+                                    faces is a shape the boundary closure does not assemble yet"
                 .to_owned(),
             Self::Empty => "the exact operation produced no material".to_owned(),
             Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
@@ -3949,6 +3973,12 @@ fn chord_deviations(
             Curve3::Circle { radius, .. } => sagitta(radius, sweep),
             // The semi-major axis bounds the sagitta of every chord.
             Curve3::Ellipse { major_radius, .. } => sagitta(major_radius, sweep),
+            // A trace bends no more tightly than the tighter of the two
+            // cylinders it runs on, so their smaller radius bounds its
+            // sagitta the way a semi-major axis bounds an ellipse's.
+            Curve3::Trace { host, other, .. } => {
+                sagitta(host.radius.abs().min(other.radius.abs()), sweep)
+            }
         }
     };
     topology
@@ -4042,6 +4072,12 @@ fn sampled_edge_segments(
             budget,
             precision,
         ),
+        Curve3::Trace { host, other, .. } => arc_subdivisions(
+            host.radius.abs().min(other.radius.abs()),
+            edge.parameter_range.end - edge.parameter_range.start,
+            budget,
+            precision,
+        ),
     };
     (0..subdivisions)
         .map(|index| {
@@ -4112,6 +4148,12 @@ fn sampled_loop_polygon(
             Curve3::Ellipse { major_radius, .. } => {
                 arc_subdivisions(major_radius, range.end - range.start, budget, precision)
             }
+            Curve3::Trace { host, other, .. } => arc_subdivisions(
+                host.radius.abs().min(other.radius.abs()),
+                range.end - range.start,
+                budget,
+                precision,
+            ),
         };
         // Sample in the edge's own forward parameterization and reverse the
         // resulting points, rather than reversing the interval and sampling
@@ -4207,6 +4249,8 @@ fn face_frame_loop_curves(
                     end,
                 }
             }
+            // Nor for a trace, which is not planar at all.
+            Curve3::Trace { .. } => return None,
         };
         if curve.is_finite() {
             curves.push(curve);
@@ -4654,6 +4698,42 @@ fn tessellate_harmonic_cylinder_face(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Trace { .. } => {
+                    // Where the piece crosses this azimuth. On the face that
+                    // holds the parameter the abscissa is the parameter and
+                    // the crossing is direct; on the other it is not, so the
+                    // crossings are bracketed on a sampling and bisected.
+                    const SAMPLES: usize = 96;
+                    let at = |fraction: f64| {
+                        coedge
+                            .pcurve
+                            .evaluate((range.end - range.start).mul_add(fraction, range.start))
+                    };
+                    let mut previous = at(0.0);
+                    if (previous.x - theta).abs() <= tolerance {
+                        note(previous.y);
+                    }
+                    for step in 1..=SAMPLES {
+                        let fraction = step as f64 / SAMPLES as f64;
+                        let current = at(fraction);
+                        if (previous.x - theta) * (current.x - theta) < 0.0 {
+                            let (mut low, mut high) = ((fraction - 1.0 / SAMPLES as f64), fraction);
+                            let below = previous.x < theta;
+                            for _ in 0..60 {
+                                let middle = 0.5 * (low + high);
+                                if (at(middle).x < theta) == below {
+                                    low = middle;
+                                } else {
+                                    high = middle;
+                                }
+                            }
+                            note(at(0.5 * (low + high)).y);
+                        } else if (current.x - theta).abs() <= tolerance {
+                            note(current.y);
+                        }
+                        previous = current;
+                    }
+                }
             }
         }
         (low.is_finite() && high.is_finite() && high >= low).then_some((low, high))
@@ -5909,6 +5989,19 @@ fn validate_transform_candidate(
                 center.x.abs() + major_radius + minor_radius,
                 center.y.abs() + major_radius + minor_radius,
             ],
+            // The two carriers and the branch are what make this curve the
+            // one it is, so they are what the digest sees.
+            Curve2::Trace {
+                host,
+                other,
+                branch,
+                ..
+            } => vec![
+                host.radius.abs() + other.radius.abs(),
+                host.origin.x.abs() + host.origin.y.abs() + host.origin.z.abs(),
+                other.origin.x.abs() + other.origin.y.abs() + other.origin.z.abs(),
+                branch,
+            ],
         };
         endpoints.into_iter().chain(carrier)
     });
@@ -5940,6 +6033,7 @@ fn validate_transform_candidate(
                 endpoints[0].distance(endpoints[1])
             }
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => edge.value.length(),
+            Curve3::Trace { .. } => edge.value.length(),
         };
         shortest = shortest.min(represented);
     }
@@ -5982,6 +6076,7 @@ fn validate_transform_candidate(
                     endpoints[0].distance(endpoints[1])
                 }
                 Curve3::Circle { .. } | Curve3::Ellipse { .. } => after.value.length(),
+                Curve3::Trace { .. } => after.value.length(),
             };
             (represented - expected).abs()
         })
@@ -8996,11 +9091,10 @@ mod tests {
             "turned drill volume {} should equal {expected}",
             turned_drill.snapshot.measures().volume
         );
-        // Two cylinders on skew axes meet in a curve no vocabulary here
-        // names, and the refusal says which carriers those are. The
-        // cylinders must genuinely meet: a pair whose carriers the matrix
-        // refuses but whose faces never come near each other is no refusal
-        // at all, so this one runs along y through the upright's height.
+        // Two cylinders on skew axes meet in a space quartic. Since ADR 0047
+        // the matrix names that curve rather than refusing it, so what the
+        // refusal reports now is the step that is still missing — closing the
+        // section it leaves into a face boundary — and not the vocabulary.
         let skew = NativeKernel::execute(
             &NativeKernel::empty(),
             &ExecuteRequest {
@@ -9032,17 +9126,19 @@ mod tests {
         .expect_err("skew cylinders meet in a quartic");
         assert!(
             refused.diagnostics.iter().any(|diagnostic| {
-                diagnostic.code.as_str() == "BOOLEAN_SURFACE_PAIR_UNSUPPORTED"
+                matches!(
+                    diagnostic.code.as_str(),
+                    "BOOLEAN_TRACE_NOT_CLOSED" | "BOOLEAN_CONTACT_UNSUPPORTED"
+                )
             }),
             "unexpected refusal: {refused:?}"
         );
-        // The refusal names the pair rather than the whole operand.
+        // And it names what it is about rather than the whole operand.
         assert!(
-            refused
-                .diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic.message.matches("cylinder").count() >= 2 }),
-            "the refusal should name the carrier pair: {refused:?}"
+            refused.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("cylinder") || diagnostic.message.contains("quartic")
+            }),
+            "the refusal should name the geometry it is about: {refused:?}"
         );
     }
 

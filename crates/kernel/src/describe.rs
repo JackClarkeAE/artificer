@@ -113,6 +113,15 @@ pub enum EdgeGeometry {
         end: ProtocolPoint3,
         sweep_degrees: f64,
     },
+    /// Where two cylinders meet that no line, circle or ellipse describes
+    /// (ADR 0047): a space quartic, reported by its ends and the two radii
+    /// that generate it rather than by a frame it does not have.
+    SurfaceTrace {
+        start: ProtocolPoint3,
+        end: ProtocolPoint3,
+        host_radius: f64,
+        other_radius: f64,
+    },
 }
 
 impl EdgeGeometry {
@@ -123,6 +132,7 @@ impl EdgeGeometry {
             Self::Line { .. } => "line",
             Self::CircularArc { .. } => "circle",
             Self::EllipticalArc { .. } => "ellipse",
+            Self::SurfaceTrace { .. } => "trace",
         }
     }
 }
@@ -321,6 +331,12 @@ impl NativeKernel {
                 end: protocol_point(end),
                 sweep_degrees,
             },
+            Curve3::Trace { host, other, .. } => EdgeGeometry::SurfaceTrace {
+                start: protocol_point(start),
+                end: protocol_point(end),
+                host_radius: host.radius,
+                other_radius: other.radius,
+            },
         };
         let midpoint = edge_record.curve.evaluate((range.start + range.end) * 0.5);
         let length = edge_record.length();
@@ -353,6 +369,17 @@ impl NativeKernel {
                 number(major_radius),
                 number(minor_radius),
                 number(sweep_degrees),
+                point_text(midpoint)
+            ),
+            EdgeGeometry::SurfaceTrace {
+                host_radius,
+                other_radius,
+                ..
+            } => format!(
+                "where two cylinders meet, radii {} and {}, length {}, midpoint {}",
+                number(host_radius),
+                number(other_radius),
+                number(length),
                 point_text(midpoint)
             ),
         };

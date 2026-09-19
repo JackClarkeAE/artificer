@@ -19,39 +19,30 @@ through the part, crossing both bores. Refused:
 into a closed solid`, with Euler / face-loop / orientation / pcurve
 diagnostics (image 21).
 
-**Looked at.** The crossing-cut path in `crates/kernel/src/lib.rs`
-(~1036–1098): prism reduction → `analytic_cut` → faceted
-`subtract_crossing_profile` → `certify_faceted_candidate`;
-`crates/kernel/src/surface_intersection.rs` (~520 and the domain table at ~20).
+**Where it stands.** Both halves of this entry have moved, and one is done.
 
-**Lead.** The analytic engine refused first and the faceted tier is what
-failed loudly. Cylinder–cylinder intersection is exact only for coaxial,
-parallel, or *equal-radius crossing* axes (P5); `surface_intersection.rs:520`
-says the rest plainly: "Unequal radii, or skew axes: a genuine space quartic"
-— refused by name. The slot's end-cylinders have the slot's half-width as
-radius, not the bore's, and because the slot is cut from a sloped face its
-axis is tilted to the bores, so the axes are skew as well. Both conditions
-hold; the analytic route returns `None`.
+*Diagnostics — done.* The exact route's reason travels with every outcome as
+`FACE_FEATURE_EXACT_ROUTE_DECLINED`, and the engine names what it met.
 
-Two defects here, one of diagnostics and one of domain. The diagnostics
-half has landed: the engine names the carrier pair the faces bring together
-(`AnalyticBooleanError::CarrierPair`), and every face-feature outcome that
-the exact route stood aside from carries
-`FACE_FEATURE_EXACT_ROUTE_DECLINED` with that reason — a warning beside an
-approximation, the first diagnostic of a refusal. What remains is the
-domain half.
+*Domain — the curve is in, the closure is not.* ADR 0047 put the general
+cylinder–cylinder trace into the vocabulary: on either cylinder's azimuth it
+is the root of a quadratic whose coefficients are trigonometric polynomials,
+so it is exact, and it is now carried by `Curve3::Trace`, `Curve2::Trace` and
+`Segment::Trace` through tessellation, transforms, measures, the digest and
+the validator. The intersection matrix produces it instead of refusing, and
+cylinders that simply miss now answer `Empty` rather than "unsupported".
 
-*Domain.* The general cylinder–cylinder trace is algebraic in one cylinder's
-azimuth for any radii and any axes — on cylinder A, height is a closed-form
-function of θ. The engine already carries a sampled analytic section chord
-(`Harmonic`, with refinement) for the equal-radius case. Generalising that
-chord to the full trace — sampled and refined exactly as harmonics are now,
-with the tangency and coincidence handling of ADR 0045 — is the robust route,
-and it removes the equal-radius and crossing-axes restrictions together
-rather than adding another special case. The faceted tier is the wrong
-fallback for this shape and should not be the one that speaks.
+What is left is the last step: assembling the section a trace leaves on a
+face into a face boundary. On a half-cylinder face a trace can enter and
+leave by the same seam — a bite out of the face's edge — which a plane
+section never does; that case is closed along the seam, and others remain.
+`close_periodic_sections` in `analytic_boolean.rs` is where this lives, and
+it reports `BOOLEAN_TRACE_NOT_CLOSED` rather than guessing. Until it is
+finished these cuts still reach the faceted tier and are labelled
+approximations, exactly as before — no behaviour has regressed; the reason
+given is simply the true one now.
 
-Since entry 8 landed, a carrier pair the intersection matrix refuses is only
-a refusal when the two *faces* could meet (`faces_apart` in
-`analytic_boolean.rs`); the slot's end-cylinders do meet the bores, so this
-entry stands on the domain half.
+The reproducer to work against is
+`crates/kernel/tests/exact_route_decline.rs`: two bores of unequal radius
+crossing. Dumping the pieces that reach `close_periodic_sections` for the
+wider bore's half-face shows the shapes that need closing.

@@ -405,7 +405,7 @@ fn curve(segment: Segment, start: Point2, end: Point2) -> Option<PlanarCurve2> {
                 })
             }
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => None,
     }
 }
 
@@ -645,7 +645,7 @@ fn reversed(segment: Segment) -> Option<Segment> {
             start_angle: start_angle + sweep,
             sweep: -sweep,
         }),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => None,
     }
 }
 

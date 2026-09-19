@@ -61,6 +61,17 @@ pub(crate) fn mirror_topology(
     for edge in &mut output.edges {
         match &mut edge.value.curve {
             Curve3::Line { endpoints } => *endpoints = endpoints.map(reflect_point),
+            Curve3::Trace { host, other, .. } => {
+                // Every frame vector reflects and the angular sign stays, so
+                // the same parameter names the reflected point and the edge's
+                // own range needs no change.
+                for cylinder in [host, other] {
+                    cylinder.origin = reflect_point(cylinder.origin);
+                    cylinder.axis = reflect_vector(cylinder.axis);
+                    cylinder.radial_u = reflect_vector(cylinder.radial_u);
+                    cylinder.radial_v = reflect_vector(cylinder.radial_v);
+                }
+            }
             Curve3::Circle { center, u, v, .. } | Curve3::Ellipse { center, u, v, .. } => {
                 *center = reflect_point(*center);
                 *u = reflect_vector(*u);
@@ -187,6 +198,13 @@ pub(crate) fn reverse_face_loops(
                     };
                     coedge.parameter_range = ParameterRange::new(range.end, range.start);
                 }
+                // Reflecting a trace means reflecting the two carriers it is
+                // written on, in step with the face's own surface, and the
+                // two callers of this walk reflect their surfaces
+                // differently. Refusing by name beats guessing the handedness
+                // and publishing a body that is not the mirror of the one
+                // asked for.
+                Curve2::Trace { .. } => return Err(MirrorError::UnsupportedPcurve),
                 Curve2::Harmonic {
                     mean,
                     amplitude,

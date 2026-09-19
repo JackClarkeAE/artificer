@@ -1328,7 +1328,7 @@ fn sampled_loop(profile_loop: &AnalyticLoop, precision: PrecisionPolicy) -> Vec<
                     });
                 }
             }
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                 for step in 0..16 {
                     points.push(SampledLoopPoint {
                         point: segment.point_at(f64::from(step) / 16.0),

@@ -44,6 +44,12 @@ pub(crate) enum AnalyticBooleanError {
     CarrierPair(Box<[Surface; 2]>),
     /// The operation succeeded and produced no material.
     EmptyResult,
+    /// The faces meet along the curve two cylinders share (ADR 0047), and
+    /// the section it leaves on one of them is a shape this closure does not
+    /// assemble yet: a chain that enters and leaves the face by the same
+    /// edge, or one that ends inside the window. The curve is exact and
+    /// carried; what is missing is the step that turns it into a boundary.
+    TraceUnclosed,
 }
 
 /// Runs the general analytic Boolean over two validated solids.
@@ -54,6 +60,14 @@ pub(crate) fn build_analytic_boolean(
     precision: PrecisionPolicy,
 ) -> Result<Topology, AnalyticBooleanError> {
     let mut pieces = Vec::new();
+    let named = |error: AnalyticBooleanError| match error {
+        AnalyticBooleanError::DomainUnsupported
+            if operands_share_a_trace(target, tool, precision) =>
+        {
+            AnalyticBooleanError::TraceUnclosed
+        }
+        other => other,
+    };
     collect_operand_pieces(
         target,
         tool,
@@ -61,7 +75,8 @@ pub(crate) fn build_analytic_boolean(
         OperandSide::Target,
         precision,
         &mut pieces,
-    )?;
+    )
+    .map_err(named)?;
     collect_operand_pieces(
         tool,
         target,
@@ -69,12 +84,38 @@ pub(crate) fn build_analytic_boolean(
         OperandSide::Tool,
         precision,
         &mut pieces,
-    )?;
+    )
+    .map_err(named)?;
     if pieces.is_empty() {
         return Err(AnalyticBooleanError::EmptyResult);
     }
-    sew_shells(&pieces, precision).map_err(|error| match error {
-        SewError::Inconsistent | SewError::Degenerate => AnalyticBooleanError::DomainUnsupported,
+    sew_shells(&pieces, precision).map_err(|error| {
+        named(match error {
+            SewError::Inconsistent | SewError::Degenerate => {
+                AnalyticBooleanError::DomainUnsupported
+            }
+        })
+    })
+}
+
+/// Whether any face of one solid meets a face of the other along the curve
+/// two cylinders share.
+///
+/// A failure anywhere in the engine is reported against that curve when the
+/// operands have one, because it is the part of this pair the engine has
+/// only just learned to carry, and saying "tangential or coincident" of a
+/// quartic sends the reader looking for the wrong thing.
+fn operands_share_a_trace(target: &Topology, tool: &Topology, precision: PrecisionPolicy) -> bool {
+    target.faces.iter().any(|face| {
+        tool.faces.iter().any(|other| {
+            matches!(
+                intersect(face.value.surface, other.value.surface, precision),
+                Ok(SurfaceIntersection::Curves(ref curves))
+                    if curves
+                        .iter()
+                        .any(|curve| matches!(curve, IntersectionCurve::Trace(_)))
+            )
+        })
     })
 }
 
@@ -360,6 +401,14 @@ fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
             } => {
                 include(Point2::new(start.x, mean - amplitude.abs()));
                 include(Point2::new(end.x, mean + amplitude.abs()));
+            }
+            // A trace has no closed-form extreme, and the extent only has to
+            // contain the piece, so it is sampled: a box a little large still
+            // separates the faces it is asked about.
+            Segment::Trace { .. } => {
+                for step in 0..=32 {
+                    include(segment.point_at(f64::from(step) / 32.0));
+                }
             }
         }
     }
@@ -891,6 +940,39 @@ fn close_periodic_sections(
     if !u_min.is_finite() || !u_max.is_finite() {
         return Err(AnalyticBooleanError::DomainUnsupported);
     }
+    // A trace can run across this face's seam without ever leaving the face
+    // it was trimmed against, so a piece may straddle the window's edge. The
+    // seam is a boundary of this face, and a piece that crosses it is two
+    // pieces: one here, one on the face across it. A plane section never
+    // needs this — its trace runs the whole period — so only a trace is cut.
+    let mut pieces = pieces;
+    for seam in [u_min, u_max] {
+        let mut split = Vec::with_capacity(pieces.len());
+        for piece in pieces {
+            let (low, high) = (
+                piece.start().x.min(piece.end().x),
+                piece.start().x.max(piece.end().x),
+            );
+            if !matches!(piece, Segment::Trace { .. })
+                || seam <= low + 1.0e-9
+                || seam >= high - 1.0e-9
+            {
+                split.push(piece);
+                continue;
+            }
+            match (
+                piece.trace_to_abscissa(seam, false),
+                piece.trace_to_abscissa(seam, true),
+            ) {
+                (Some(before), Some(after)) => {
+                    split.push(before);
+                    split.push(after);
+                }
+                _ => split.push(piece),
+            }
+        }
+        pieces = split;
+    }
     // Every piece into the face's own angular window, by whole turns, and
     // pieces that only touch the window at a seam, or never enter it, are
     // left out: they belong to the face across the seam, or to a far cap's
@@ -969,8 +1051,30 @@ fn close_periodic_sections(
         }
         let first = chain[0].start();
         let last = chain[chain.len() - 1].end();
+        // A chain that leaves one seam and returns to it takes a bite out of
+        // the face's edge rather than crossing the face. A plane section
+        // never does this — its trace runs the whole period — but the curve
+        // of two cylinders does whenever the narrower one reaches the seam
+        // without passing it. The bite closes along the seam itself, which
+        // is a boundary the face already has.
+        let same_seam =
+            |seam: f64| (first.x - seam).abs() <= margin && (last.x - seam).abs() <= margin;
+        if same_seam(u_min) || same_seam(u_max) {
+            chain.push(Segment::Line {
+                start: last,
+                end: first,
+            });
+            loops.push(chain);
+            continue;
+        }
         if first.x > u_min + margin || last.x < u_max - margin {
-            return Err(AnalyticBooleanError::DomainUnsupported);
+            return Err(
+                if chain.iter().any(|p| matches!(p, Segment::Trace { .. })) {
+                    AnalyticBooleanError::TraceUnclosed
+                } else {
+                    AnalyticBooleanError::DomainUnsupported
+                },
+            );
         }
         open.push(chain);
     }
@@ -1019,6 +1123,7 @@ fn close_periodic_sections(
                     end: Point2::new(to_x, end.y),
                 }
             }),
+            trace @ Segment::Trace { .. } => trace.trace_to_abscissa(to_x, at_start),
             _ => None,
         }
     };
@@ -1373,6 +1478,53 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
                 },
             ])
         }
+        (Surface::Cylinder(cylinder), IntersectionCurve::Trace(trace)) => {
+            // The curve exists only between its branch points, where the
+            // discriminant is positive, so the turn is cut there first and
+            // each surviving span becomes one piece. A face's own window may
+            // sit on any whole turn, so each piece is offered on the three
+            // branches a bounded window can reach, exactly as a ring chord is.
+            let on_other = same_cylinder(cylinder, &trace.other);
+            if !on_other && !same_cylinder(cylinder, &trace.host) {
+                return None;
+            }
+            let tau = std::f64::consts::TAU;
+            let interior = trace.branch_points(-tau, tau);
+            let mut cuts = vec![-tau];
+            cuts.extend(interior.iter().copied());
+            cuts.push(tau);
+            let mut pieces = Vec::new();
+            for (index, window) in cuts.windows(2).enumerate() {
+                let (from, to) = (window[0], window[1]);
+                let (from_is_branch, to_is_branch) = (index > 0, index + 2 < cuts.len());
+                if to - from <= 1.0e-9 {
+                    continue;
+                }
+                let inside = trace.height_at(0.5 * (from + to)).is_some();
+                if !inside {
+                    continue;
+                }
+                for turns in [-1.0, 0.0, 1.0] {
+                    let shift = Point2::new(turns * tau, 0.0);
+                    let piece = Segment::Trace {
+                        host: trace.host,
+                        other: trace.other,
+                        branch: trace.branch,
+                        on_other,
+                        shift,
+                        from,
+                        to,
+                        start: Point2::new(0.0, 0.0),
+                        end: Point2::new(0.0, 0.0),
+                    };
+                    let start = trace.endpoint(from, from_is_branch, on_other);
+                    let end = trace.endpoint(to, to_is_branch, on_other);
+                    let place = |point: Point2| Point2::new(point.x + shift.x, point.y + shift.y);
+                    pieces.push(piece.with_endpoints(place(start), place(end)));
+                }
+            }
+            (!pieces.is_empty()).then_some(pieces)
+        }
         _ => None,
     }
 }
@@ -1547,6 +1699,10 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                     })
                 }
                 Segment::Ellipse { .. } => None,
+                // Two cylinders meet in a plane curve only where they meet
+                // in a circle or an ellipse, which the matrix names as such;
+                // a trace piece that reached here would not be planar.
+                Segment::Trace { .. } => None,
             }
         }
         Surface::Cylinder(cylinder) => {
@@ -1593,6 +1749,36 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                     } else {
                         None
                     }
+                }
+                // The piece already carries both cylinders, so handing it to
+                // the other face is a change of which one it is read in, not
+                // a change of curve. The parameter stays the host's azimuth
+                // either way, which is what keeps the two faces' uses of the
+                // edge welded.
+                Segment::Trace {
+                    host,
+                    other,
+                    branch,
+                    from,
+                    to,
+                    ..
+                } => {
+                    let on_other = same_cylinder(cylinder, &other);
+                    if !on_other && !same_cylinder(cylinder, &host) {
+                        return None;
+                    }
+                    let carried = Segment::Trace {
+                        host,
+                        other,
+                        branch,
+                        on_other,
+                        shift: Point2::new(0.0, 0.0),
+                        from,
+                        to,
+                        start: Point2::new(0.0, 0.0),
+                        end: Point2::new(0.0, 0.0),
+                    };
+                    Some(carried.with_endpoints(carried.point_at(0.0), carried.point_at(1.0)))
                 }
                 arc @ Segment::Arc { start, end, .. } => {
                     // A circular arc lies on the cylinder only as a ring arc:
@@ -2005,6 +2191,22 @@ fn mirror_sew_face(piece: SewFace) -> Result<SewFace, AnalyticBooleanError> {
     })
 }
 
+/// Whether two cylinder records describe the same carrier, to the agreement
+/// the rest of the engine uses rather than to the last bit.
+fn same_cylinder(left: &Cylinder, right: &Cylinder) -> bool {
+    let scale = left.radius.abs().max(right.radius.abs()).max(1.0);
+    let tolerance = scale * 1.0e-9;
+    let (Some(left_axis), Some(right_axis)) = (
+        (left.axis.length() > f64::EPSILON).then(|| left.axis / left.axis.length()),
+        (right.axis.length() > f64::EPSILON).then(|| right.axis / right.axis.length()),
+    ) else {
+        return false;
+    };
+    (left.radius - right.radius).abs() <= tolerance
+        && left_axis.cross(right_axis).length() <= 1.0e-9
+        && (right.origin - left.origin).cross(left_axis).length() <= tolerance
+}
+
 fn mirror_segment(segment: Segment, mirror: fn(Point2) -> Point2) -> Segment {
     match segment {
         Segment::Line { start, end } => Segment::Line {
@@ -2076,6 +2278,37 @@ fn mirror_segment(segment: Segment, mirror: fn(Point2) -> Point2) -> Segment {
                 mean,
                 amplitude,
                 phase: -phase,
+                start: mirror(end),
+                end: mirror(start),
+            }
+        }
+        // Mirroring the azimuth is exactly reversing the carriers' angular
+        // sense: `radial(−x)` is what `radial(x)` becomes when the sign
+        // flips, so the curve mirrors in parameter space with no reflection
+        // of the carriers themselves.
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from,
+            to,
+            start,
+            end,
+        } => {
+            let flip = |mut cylinder: crate::topology::Cylinder| {
+                cylinder.angular_sign = -cylinder.angular_sign;
+                cylinder
+            };
+            Segment::Trace {
+                host: flip(host),
+                other: flip(other),
+                branch,
+                on_other,
+                shift: Point2::new(-shift.x, shift.y),
+                from: -to,
+                to: -from,
                 start: mirror(end),
                 end: mirror(start),
             }

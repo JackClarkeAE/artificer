@@ -549,6 +549,18 @@ impl BodyWriter<'_> {
                 self.file
                     .entity(format!("CIRCLE('',#{placement},{})", real(radius.abs())))
             }
+            // AP242 carries an intersection curve only as a surface curve
+            // with an approximating spline beside its two pcurves, which is
+            // a representation this exporter does not build yet. Refusing
+            // names the gap; writing a spline and calling it the edge would
+            // export a body that is not the one modelled.
+            Curve3::Trace { .. } => {
+                return Err(
+                    "this body has an edge where two cylinders meet in a space quartic, which \
+                     this STEP exporter cannot yet write"
+                        .to_owned(),
+                );
+            }
             Curve3::Ellipse {
                 center,
                 u,

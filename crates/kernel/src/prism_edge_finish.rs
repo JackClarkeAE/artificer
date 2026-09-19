@@ -169,7 +169,7 @@ fn mirror_loop(source: &[Segment], axis: f64) -> Vec<Segment> {
                 start_angle: canonical_azimuth(-(start_angle + sweep)),
                 sweep,
             },
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                 unreachable!("planar profiles carry lines and arcs only")
             }
         })
@@ -607,7 +607,7 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                             ArcDirection::Clockwise
                         },
                     },
-                    Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                         unreachable!("planar profiles carry lines and arcs only")
                     }
                 }

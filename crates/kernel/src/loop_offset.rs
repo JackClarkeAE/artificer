@@ -316,7 +316,9 @@ fn offset_carrier(
                 end: scale_about(center, end, scale),
             })
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(LoopOffsetError::Degenerate),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            Err(LoopOffsetError::Degenerate)
+        }
     }
 }
 
@@ -348,7 +350,9 @@ fn start_direction(segment: Segment) -> Result<Vector, LoopOffsetError> {
             .ok_or(LoopOffsetError::Degenerate)?
             .left_normal()
             .scaled(sweep.signum())),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(LoopOffsetError::Degenerate),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            Err(LoopOffsetError::Degenerate)
+        }
     }
 }
 
@@ -364,7 +368,9 @@ fn end_direction(segment: Segment) -> Result<Vector, LoopOffsetError> {
             .ok_or(LoopOffsetError::Degenerate)?
             .left_normal()
             .scaled(sweep.signum())),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => Err(LoopOffsetError::Degenerate),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            Err(LoopOffsetError::Degenerate)
+        }
     }
 }
 

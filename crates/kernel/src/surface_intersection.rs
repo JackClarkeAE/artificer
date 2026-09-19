@@ -24,6 +24,7 @@
 
 use artificer_protocol::PrecisionPolicy;
 
+use crate::cylinder_trace::CylinderTrace;
 use crate::topology::{Cone, Cylinder, Plane, Point3, Sphere, Surface, Torus, Vector3};
 
 /// One exact curve where two surfaces meet.
@@ -58,6 +59,14 @@ pub(crate) enum IntersectionCurve {
         seam_angle: f64,
         azimuth_rate: f64,
     },
+    /// Where two cylinders meet that are none of coaxial, parallel, or of
+    /// equal radius on crossing axes: a space quartic, carried as the
+    /// quadratic root of [`crate::cylinder_trace`] (ADR 0047).
+    ///
+    /// The host is chosen canonically from the pair, so asking either way
+    /// round names the same curve over the same parameter — which is what
+    /// lets the two faces it separates agree on every point of it.
+    Trace(crate::cylinder_trace::CylinderTrace),
 }
 
 /// What two surface carriers share.
@@ -517,8 +526,42 @@ fn cylinder_cylinder(first: Cylinder, second: Cylinder, tolerances: Tolerances) 
         {
             return crossed;
         }
-        // Unequal radii, or skew axes: a genuine space quartic.
-        return Err(IntersectionError::Unsupported);
+        // Unequal radii, or skew axes. The curve is a space quartic, and
+        // also a closed form: on either cylinder's azimuth it is the root of
+        // a quadratic in the height whose coefficients are trigonometric
+        // polynomials (ADR 0047). Both roots are real where the two meet.
+        //
+        // The host is picked by the same canonical axis order the crossing
+        // case uses, so `intersect(a, b)` and `intersect(b, a)` name one
+        // curve with one parameter.
+        let (host, other) = if axis_order(axis) <= axis_order(other) {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let trace = crate::cylinder_trace::CylinderTrace {
+            host,
+            other,
+            branch: 1.0,
+        };
+        let Some(peak) = trace.peak_discriminant() else {
+            return Err(IntersectionError::Unsupported);
+        };
+        // Cylinders that never reach each other share no curve at all, and
+        // ones that only graze share a line of tangency rather than a pair
+        // of branches: both are empty for a matrix that hands back curves to
+        // imprint, exactly as two circles that miss are.
+        let floor = (tolerances.linear * first.radius.max(second.radius)).powi(2);
+        if peak <= floor {
+            return Ok(SurfaceIntersection::Empty);
+        }
+        return Ok(SurfaceIntersection::Curves(vec![
+            IntersectionCurve::Trace(trace),
+            IntersectionCurve::Trace(CylinderTrace {
+                branch: -1.0,
+                ..trace
+            }),
+        ]));
     }
     if first.radius <= 0.0 || second.radius <= 0.0 {
         return Err(IntersectionError::Indeterminate);
@@ -891,9 +934,55 @@ mod tests {
         }
     }
 
+    /// How far a point sits off a carrier.
+    fn residual_on(surface: Surface, point: Point3) -> f64 {
+        match surface {
+            Surface::Plane(plane) => (point - plane.origin).dot(plane.normal).abs(),
+            Surface::Cylinder(cylinder) => {
+                let offset = point - cylinder.origin;
+                let across = offset - cylinder.axis * offset.dot(cylinder.axis);
+                (across.length() - cylinder.radius).abs()
+            }
+            Surface::Cone(cone) => {
+                let offset = point - cone.origin;
+                let height = offset.dot(cone.axis);
+                let across = offset - cone.axis * height;
+                (across.length() - cone.ring_radius(height)).abs()
+            }
+            Surface::Sphere(sphere) => ((point - sphere.origin).length() - sphere.radius).abs(),
+            Surface::Torus(torus) => {
+                let offset = point - torus.origin;
+                let height = offset.dot(torus.axis);
+                let across = offset - torus.axis * height;
+                let ring = across.length() - torus.major_radius;
+                (ring.hypot(height) - torus.minor_radius).abs()
+            }
+        }
+    }
+
     /// Every returned curve must actually lie on both carriers, sampled at
     /// enough parameters to catch a wrong centre, radius, or direction.
     fn assert_on(surface: Surface, curve: IntersectionCurve) {
+        // A trace is defined only between its branch points, and clamping
+        // past them is an endpoint rather than a point of the curve, so it
+        // is sampled over its own domain.
+        if let IntersectionCurve::Trace(trace) = curve {
+            let mut sampled = 0;
+            for step in 0..256 {
+                let azimuth = std::f64::consts::TAU * f64::from(step) / 256.0;
+                let Some(point) = trace.point_at(azimuth) else {
+                    continue;
+                };
+                sampled += 1;
+                assert!(
+                    residual_on(surface, point).abs() < 1.0e-9,
+                    "sample at {azimuth} is {} off the carrier",
+                    residual_on(surface, point)
+                );
+            }
+            assert!(sampled > 16, "the trace should exist over part of the turn");
+            return;
+        }
         for step in 0..8 {
             let parameter = f64::from(step) * 0.7 - 2.0;
             let point = match curve {
@@ -916,6 +1005,10 @@ mod tests {
                         + u * (major_radius * parameter.cos())
                         + v * (minor_radius * parameter.sin())
                 }
+                // A trace is a graph over its host's azimuth, defined only
+                // between its branch points, so it is sampled on its own
+                // terms rather than over this shared parameter sweep.
+                IntersectionCurve::Trace(trace) => trace.point_clamped(parameter),
             };
             let residual = match surface {
                 Surface::Plane(plane) => (point - plane.origin).dot(plane.normal).abs(),
@@ -1088,7 +1181,7 @@ mod tests {
             intersect(first, upright_cylinder([20.0, 0.0, 0.0], 5.0), precision()),
             Ok(SurfaceIntersection::Empty)
         );
-        // Crossing axes give a space quartic.
+        // Crossing axes give a space quartic, which the matrix now names.
         let crossing = Surface::Cylinder(Cylinder {
             origin: Point3::new(0.0, 0.0, 0.0),
             axis: Vector3::new(1.0, 0.0, 0.0),
@@ -1097,10 +1190,11 @@ mod tests {
             radius: 3.0,
             angular_sign: 1.0,
         });
-        assert_eq!(
-            intersect(first, crossing, precision()),
-            Err(IntersectionError::Unsupported)
-        );
+        let found = curves(intersect(first, crossing, precision()));
+        assert_eq!(found.len(), 2);
+        for curve in found {
+            assert!(matches!(curve, IntersectionCurve::Trace(_)));
+        }
     }
 
     /// A cylinder about an arbitrary axis, with an orthonormal radial frame.
@@ -1198,20 +1292,41 @@ mod tests {
     /// and skew axes leave the factorisation with no origin, so both are
     /// genuine quartics rather than cases this vocabulary is hiding.
     #[test]
-    fn unequal_or_skew_crossing_cylinders_are_still_refused_by_name() {
+    /// The pair ADR 0025 called a genuine space quartic. It is one, and it is
+    /// also closed form, so the matrix names it rather than refusing it: two
+    /// branches, each exactly on both carriers.
+    fn unequal_or_skew_crossing_cylinders_meet_in_a_trace() {
         let upright = upright_cylinder([0.0, 0.0, 0.0], 5.0);
         let unequal = cylinder_about([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 3.0);
-        assert_eq!(
-            intersect(upright, unequal, precision()),
-            Err(IntersectionError::Unsupported)
-        );
+        let found = curves(intersect(upright, unequal, precision()));
+        assert_eq!(found.len(), 2, "one branch either side");
+        for curve in found {
+            assert!(matches!(curve, IntersectionCurve::Trace(_)));
+            assert_on(upright, curve);
+            assert_on(unequal, curve);
+        }
         // Equal radii, but the axes pass by one another rather than meeting:
-        // this one runs along x at a height of 7 and four to the side, so it
-        // never touches the upright's axis.
-        let skew = cylinder_about([0.0, 4.0, 7.0], [1.0, 0.0, 0.0], 5.0);
+        // this one runs along x at a height of 3 and two to the side, so it
+        // never touches the upright's axis and the Steinmetz form does not
+        // apply — the general trace still does.
+        let skew = cylinder_about([0.0, 2.0, 3.0], [1.0, 0.0, 0.0], 5.0);
+        let found = curves(intersect(upright, skew, precision()));
+        assert_eq!(found.len(), 2);
+        for curve in found {
+            assert_on(upright, curve);
+            assert_on(skew, curve);
+        }
+    }
+
+    #[test]
+    /// Cylinders that never reach one another share no curve, and say so as
+    /// emptiness rather than as a limit of the vocabulary.
+    fn cylinders_that_miss_are_empty_rather_than_refused() {
+        let upright = upright_cylinder([0.0, 0.0, 0.0], 5.0);
+        let far = cylinder_about([0.0, 40.0, 7.0], [1.0, 0.0, 0.0], 3.0);
         assert_eq!(
-            intersect(upright, skew, precision()),
-            Err(IntersectionError::Unsupported)
+            intersect(upright, far, precision()),
+            Ok(SurfaceIntersection::Empty)
         );
     }
 

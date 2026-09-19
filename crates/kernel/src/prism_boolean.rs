@@ -224,7 +224,9 @@ fn prism_boolean_along(
                 sweep,
             }
         }
-        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other,
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }) => {
+            other
+        }
     };
     let map_loop = |segments: &[Segment]| segments.iter().map(map_segment).collect::<Vec<_>>();
 
@@ -470,7 +472,7 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                         ArcDirection::Clockwise
                     },
                 },
-                Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                     unreachable!("planar profiles carry lines and arcs only")
                 }
             })
@@ -824,6 +826,12 @@ fn reverse_face_orientation(
                         };
                         coedge.parameter_range = ParameterRange::new(range.end, range.start);
                     }
+                    // A prism reduction never builds one, and reversing a
+                    // body that already carries one belongs to the general
+                    // engine rather than here.
+                    Curve2::Trace { .. } => {
+                        return Err(PrismBooleanError::DomainUnsupported);
+                    }
                     Curve2::Harmonic {
                         mean,
                         amplitude,
@@ -1105,6 +1113,7 @@ fn glue_layers(
                     },
                     ParameterRange::new(start.x, end.x),
                 ),
+                Segment::Trace { .. } => return Err(PrismBooleanError::DomainUnsupported),
             };
             let coedge_key = CoedgeKey(merged.coedges.len());
             merged.coedges.push(Record {

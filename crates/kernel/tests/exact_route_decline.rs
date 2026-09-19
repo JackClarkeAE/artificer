@@ -1,11 +1,13 @@
 //! When the exact route stands aside, the report says why.
 //!
 //! A slot or a bore cut across a bore of a different radius meets it in a
-//! space quartic, which the curve vocabulary does not carry. The faceted tier
-//! then answers or refuses, and either way the user used to read a message
-//! about tessellation for a problem that was about vocabulary. The exact
-//! route's own reason now travels with the outcome: a warning beside an
-//! approximation, the first diagnostic of a refusal.
+//! space quartic. The faceted tier answers or refuses, and either way the
+//! user used to read a message about tessellation for a problem that was
+//! about the exact route. That route's own reason now travels with the
+//! outcome: a warning beside an approximation, the first diagnostic of a
+//! refusal. Since ADR 0047 the reason is no longer that the curve cannot be
+//! named — it is named and carried — but that the section it leaves has not
+//! been closed into a boundary yet.
 
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
@@ -134,8 +136,8 @@ fn a_crossing_bore_of_another_radius_says_why_the_exact_route_declined() {
                 .expect("an approximation says why the exact route stood aside");
             assert_eq!(decline.severity, DiagnosticSeverity::Warning);
             assert!(
-                decline.message.contains("cylinder and cylinder"),
-                "the pair is named: {}",
+                decline.message.contains("space quartic"),
+                "the curve is named: {}",
                 decline.message
             );
             assert!(
@@ -152,8 +154,8 @@ fn a_crossing_bore_of_another_radius_says_why_the_exact_route_declined() {
                 .expect("a refusal says why the exact route stood aside");
             assert_eq!(decline.severity, DiagnosticSeverity::Error);
             assert!(
-                decline.message.contains("cylinder and cylinder"),
-                "the pair is named: {}",
+                decline.message.contains("space quartic"),
+                "the curve is named: {}",
                 decline.message
             );
             assert_eq!(

@@ -349,9 +349,9 @@ pub(crate) fn chain_welded_segments(
                     start_angle,
                     sweep,
                 },
-                other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
-                    other.with_endpoints(start, end)
-                }
+                other @ (Segment::Ellipse { .. }
+                | Segment::Harmonic { .. }
+                | Segment::Trace { .. }) => other.with_endpoints(start, end),
             }
         })
         .collect();
@@ -586,6 +586,7 @@ fn reverse_segment(segment: Segment) -> Segment {
             sweep: -sweep,
         },
         other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
+        trace @ Segment::Trace { .. } => trace.reversed(),
     }
 }
 
@@ -647,6 +648,7 @@ fn weld_loop(
             other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
                 other.with_endpoints(expected, other.end())
             }
+            trace @ Segment::Trace { .. } => trace.with_endpoints(expected, trace.end()),
         };
     }
     Ok(segments)
@@ -766,7 +768,9 @@ fn segment_length(segment: Segment) -> f64 {
     match segment {
         Segment::Line { start, end } => (end.x - start.x).hypot(end.y - start.y),
         Segment::Arc { radius, sweep, .. } => radius * sweep.abs(),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.length(),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            segment.length()
+        }
     }
 }
 
@@ -804,7 +808,56 @@ fn parameter_of(segment: Segment, point: Point2) -> f64 {
             arc_fraction(across.atan2(along), start_angle, sweep)
         }
         Segment::Harmonic { start, end, .. } => (point.x - start.x) / (end.x - start.x),
+        Segment::Trace {
+            on_other,
+            shift,
+            from,
+            to,
+            ..
+        } => {
+            if on_other {
+                // The abscissa on the other face is that face's own azimuth,
+                // not the walk's parameter, so the fraction is found by
+                // bisection on the parameter that reaches this point.
+                trace_fraction_of(segment, point)
+            } else {
+                (point.x - shift.x - from) / (to - from)
+            }
+        }
     }
+}
+
+/// The fraction of a trace piece's walk that reaches `point`.
+///
+/// On the face that does not hold the parameter there is no closed-form
+/// inverse — the abscissa is that face's azimuth, a transcendental function
+/// of the walk — so the fraction is bracketed on a sampling and bisected on
+/// the distance, which is smooth and single-minimum over one piece.
+fn trace_fraction_of(segment: Segment, point: Point2) -> f64 {
+    const SAMPLES: usize = 64;
+    let distance = |fraction: f64| {
+        let at = segment.point_at(fraction);
+        (at.x - point.x).hypot(at.y - point.y)
+    };
+    let mut best = (0.0, distance(0.0));
+    for index in 1..=SAMPLES {
+        let fraction = index as f64 / SAMPLES as f64;
+        let value = distance(fraction);
+        if value < best.1 {
+            best = (fraction, value);
+        }
+    }
+    let step = 1.0 / SAMPLES as f64;
+    let (mut low, mut high) = ((best.0 - step).max(0.0), (best.0 + step).min(1.0));
+    for _ in 0..60 {
+        let third = (high - low) / 3.0;
+        if distance(low + third) <= distance(high - third) {
+            high -= third;
+        } else {
+            low += third;
+        }
+    }
+    0.5 * (low + high)
 }
 
 /// The fraction of the sweep at which `angle` sits, in [0, 1) measured from
@@ -844,6 +897,7 @@ fn evaluate(segment: Segment, parameter: f64) -> Point2 {
             )
         }
         Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.point_at(parameter),
+        trace @ Segment::Trace { .. } => trace.point_at(parameter),
     }
 }
 
@@ -1314,6 +1368,28 @@ fn section_carrier_crossings(
                 phase,
                 ..
             } => point.y - (mean + amplitude * (point.x - phase).cos()),
+            Segment::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                ..
+            } => {
+                // The carrier's own equation, read in whichever face's
+                // parameters this piece is written in.
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                let trace = if on_other {
+                    trace.flipped(branch)
+                } else {
+                    trace
+                };
+                trace.implicit_at(Point2::new(point.x - shift.x, point.y - shift.y))
+            }
         }
     };
     // The chord's whole carrier is not bounded for a harmonic, so sample the
@@ -1597,6 +1673,26 @@ fn sub_segment(
             sweep: sweep * (end_parameter - start_parameter),
         },
         section @ Segment::Harmonic { .. } => section.with_endpoints(start, end),
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from,
+            to,
+            ..
+        } => Segment::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from: (to - from).mul_add(start_parameter, from),
+            to: (to - from).mul_add(end_parameter, from),
+            start,
+            end,
+        },
     }
 }
 

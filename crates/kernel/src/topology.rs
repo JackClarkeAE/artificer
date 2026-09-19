@@ -276,6 +276,17 @@ pub(crate) enum Curve3 {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// Where two cylinders meet that are not coaxial, parallel, or of equal
+    /// radius on crossing axes: a space quartic, closed form as a quadratic
+    /// root over `host`'s azimuth (ADR 0047, [`crate::cylinder_trace`]).
+    ///
+    /// The parameter is `host`'s azimuth throughout, on both faces the curve
+    /// separates, so the two read the same point at the same parameter.
+    Trace {
+        host: Cylinder,
+        other: Cylinder,
+        branch: f64,
+    },
 }
 
 impl Curve3 {
@@ -321,6 +332,16 @@ impl Curve3 {
                 let parameter = parameter.rem_euclid(std::f64::consts::TAU);
                 center + u * (major_radius * parameter.cos()) + v * (minor_radius * parameter.sin())
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .point_clamped(parameter),
         }
     }
 
@@ -337,6 +358,16 @@ impl Curve3 {
                 minor_radius,
                 ..
             } => u * (-major_radius * parameter.sin()) + v * (minor_radius * parameter.cos()),
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .tangent_clamped(parameter),
         }
     }
 
@@ -362,6 +393,11 @@ impl Curve3 {
                     && major_radius.is_finite()
                     && minor_radius.is_finite()
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => host.is_finite() && other.is_finite() && branch.is_finite(),
         }
     }
 }
@@ -513,6 +549,17 @@ impl Edge {
                 self.parameter_range.end,
             )
             .abs(),
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .arc_length(self.parameter_range.start, self.parameter_range.end)
+            .abs(),
         }
     }
 
@@ -555,6 +602,22 @@ pub(crate) enum Curve2 {
         v: Vector2,
         major_radius: f64,
         minor_radius: f64,
+    },
+    /// The trace of [`Curve3::Trace`] in one of the two faces it separates,
+    /// read over `host`'s azimuth whichever face this is.
+    ///
+    /// On the host's own face that is the graph `(x, y(x))` itself. On the
+    /// other's it is the same point mapped into that face's coordinates.
+    /// Both faces share one parameter, which is what lets the sewer weld
+    /// their two uses of the edge; `shift` carries the result onto the
+    /// azimuth branch a face's own window sits on, and is a whole turn
+    /// wherever it is not zero.
+    Trace {
+        host: Cylinder,
+        other: Cylinder,
+        branch: f64,
+        on_other: bool,
+        shift: Point2,
     },
 }
 
@@ -608,6 +671,28 @@ impl Curve2 {
                     center.y + major_radius * cos * u.y + minor_radius * sin * v.y,
                 )
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+            } => {
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                // `shift` places the result in this face's own parameter
+                // window; the walk's parameter is the host's azimuth either
+                // way, and is not shifted with it.
+                let point = if on_other {
+                    trace.on_other(parameter, 0.0)
+                } else {
+                    Point2::new(parameter, trace.height_clamped(parameter))
+                };
+                Point2::new(point.x + shift.x, point.y + shift.y)
+            }
         }
     }
 
@@ -636,6 +721,26 @@ impl Curve2 {
                     -major_radius * sin * u.x + minor_radius * cos * v.x,
                     -major_radius * sin * u.y + minor_radius * cos * v.y,
                 )
+            }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+            } => {
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                let _ = shift;
+                if on_other {
+                    let rate = trace.on_other_rate(parameter);
+                    Vector2::new(rate.x, rate.y)
+                } else {
+                    Vector2::new(1.0, trace.slope_at(parameter).unwrap_or(0.0))
+                }
             }
         }
     }
@@ -667,6 +772,13 @@ impl Curve2 {
                     && major_radius.is_finite()
                     && minor_radius.is_finite()
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                shift,
+                ..
+            } => host.is_finite() && other.is_finite() && branch.is_finite() && shift.is_finite(),
         }
     }
 }

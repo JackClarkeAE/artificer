@@ -530,7 +530,7 @@ fn segment_distance(segment: Segment, point: Point2) -> f64 {
                 to_start.min(to_end)
             }
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => (0..=64)
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => (0..=64)
             .map(|step| {
                 let sample = segment.point_at(f64::from(step) / 64.0);
                 (point.x - sample.x).hypot(point.y - sample.y)
@@ -674,6 +674,26 @@ fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, Paramete
                 ParameterRange::new(section.angle_at(start.x), section.angle_at(end.x)),
             ))
         }
+        // The trace already names its own carriers, so the edge's curve is
+        // that curve over the very parameter both faces walk it with.
+        (
+            Surface::Cylinder(_),
+            Segment::Trace {
+                host,
+                other,
+                branch,
+                from,
+                to,
+                ..
+            },
+        ) => Some((
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            },
+            ParameterRange::new(from, to),
+        )),
         _ => None,
     }
 }
@@ -728,6 +748,25 @@ fn segment_pcurve(segment: Segment) -> (Curve2, ParameterRange) {
                 phase,
             },
             ParameterRange::new(start.x, end.x),
+        ),
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from,
+            to,
+            ..
+        } => (
+            Curve2::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+            },
+            ParameterRange::new(from, to),
         ),
     }
 }

@@ -36,6 +36,12 @@ impl Frame {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a trace carries the two cylinders that define it, and boxing \
+              would put a heap allocation on the 2D Boolean's hottest path \
+              and cost the type its Copy"
+)]
 pub(crate) enum Segment {
     Line {
         start: Point2,
@@ -73,6 +79,138 @@ pub(crate) enum Segment {
         start: Point2,
         end: Point2,
     },
+    /// A piece of the curve two cylinders share that is not a line, a circle
+    /// or an ellipse (ADR 0047): the quadratic root of
+    /// [`crate::cylinder_trace`], walked from azimuth `from` to `to` of its
+    /// host, and read in whichever of the two faces this piece belongs to.
+    ///
+    /// Both faces walk the same parameter — the host's azimuth — so the two
+    /// sides of the edge agree point for point, which is what the sewer's
+    /// weld needs. `shift` moves the result into this face's own parameter
+    /// window and is a whole turn wherever it is not zero.
+    Trace {
+        host: Cylinder,
+        other: Cylinder,
+        branch: f64,
+        on_other: bool,
+        shift: Point2,
+        from: f64,
+        to: f64,
+        start: Point2,
+        end: Point2,
+    },
+}
+
+impl Segment {
+    /// The curve and framing behind a trace piece, for the arms below.
+    pub(crate) fn trace_pcurve(self) -> Option<(Curve2, f64, f64)> {
+        match self {
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                from,
+                to,
+                ..
+            } => Some((
+                Curve2::Trace {
+                    host,
+                    other,
+                    branch,
+                    on_other,
+                    shift,
+                },
+                from,
+                to,
+            )),
+            _ => None,
+        }
+    }
+
+    /// A trace piece's point at a fraction of its own walk.
+    fn trace_point(self, fraction: f64) -> Option<Point2> {
+        let (curve, from, to) = self.trace_pcurve()?;
+        Some(curve.evaluate((to - from).mul_add(fraction, from)))
+    }
+
+    /// The same trace piece with one end carried to a given abscissa.
+    ///
+    /// On the face that holds the parameter the abscissa is the parameter,
+    /// so the new end is read straight off. On the other it is not, and the
+    /// parameter that reaches the abscissa is found by Newton steps on the
+    /// abscissa's own rate — which converges at once here, because this is
+    /// only ever asked to carry an end onto a seam it already reaches to
+    /// within the window's margin.
+    pub(crate) fn trace_to_abscissa(self, abscissa: f64, at_start: bool) -> Option<Self> {
+        let Self::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from,
+            to,
+            start,
+            end,
+        } = self
+        else {
+            return None;
+        };
+        let parameter = if on_other {
+            let mut parameter = if at_start { from } else { to };
+            for _ in 0..8 {
+                let here = Curve2::Trace {
+                    host,
+                    other,
+                    branch,
+                    on_other,
+                    shift,
+                };
+                let rate = here.derivative(parameter).x;
+                if !rate.is_finite() || rate.abs() <= f64::EPSILON {
+                    return None;
+                }
+                parameter += (abscissa - here.evaluate(parameter).x) / rate;
+            }
+            parameter
+        } else {
+            abscissa - shift.x
+        };
+        if !parameter.is_finite() {
+            return None;
+        }
+        let (from, to) = if at_start {
+            (parameter, to)
+        } else {
+            (from, parameter)
+        };
+        let carried = Self::Trace {
+            host,
+            other,
+            branch,
+            on_other,
+            shift,
+            from,
+            to,
+            start,
+            end,
+        };
+        Some(if at_start {
+            carried.with_endpoints(carried.point_at(0.0), end)
+        } else {
+            carried.with_endpoints(start, carried.point_at(1.0))
+        })
+    }
+
+    /// `d(point)/d(fraction)` for a trace piece.
+    fn trace_rate(self, fraction: f64) -> Option<(f64, f64)> {
+        let (curve, from, to) = self.trace_pcurve()?;
+        let span = to - from;
+        let rate = curve.derivative(span.mul_add(fraction, from));
+        Some((rate.x * span, rate.y * span))
+    }
 }
 
 impl Segment {
@@ -81,7 +219,8 @@ impl Segment {
             Self::Line { start, .. }
             | Self::Arc { start, .. }
             | Self::Ellipse { start, .. }
-            | Self::Harmonic { start, .. } => start,
+            | Self::Harmonic { start, .. }
+            | Self::Trace { start, .. } => start,
         }
     }
 
@@ -90,7 +229,8 @@ impl Segment {
             Self::Line { end, .. }
             | Self::Arc { end, .. }
             | Self::Ellipse { end, .. }
-            | Self::Harmonic { end, .. } => end,
+            | Self::Harmonic { end, .. }
+            | Self::Trace { end, .. } => end,
         }
     }
 
@@ -139,6 +279,26 @@ impl Segment {
                 mean,
                 amplitude,
                 phase,
+                start,
+                end,
+            },
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                from,
+                to,
+                ..
+            } => Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                from,
+                to,
                 start,
                 end,
             },
@@ -199,6 +359,27 @@ impl Segment {
                 start: end,
                 end: start,
             },
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                from,
+                to,
+                start,
+                end,
+            } => Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+                from: to,
+                to: from,
+                start: end,
+                end: start,
+            },
         }
     }
 
@@ -252,13 +433,19 @@ impl Segment {
                 let u = (end.x - start.x).mul_add(fraction, start.x);
                 Point2::new(u, mean + amplitude * (u - phase).cos())
             }
+            trace @ Self::Trace { .. } => {
+                trace.trace_point(fraction).unwrap_or_else(|| trace.start())
+            }
         }
     }
 
     /// Whether the segment's parameter runs the ellipse or harmonic carrier
     /// backwards, which only matters to consumers that snap onto the carrier.
     pub(crate) fn is_section_chord(self) -> bool {
-        matches!(self, Self::Ellipse { .. } | Self::Harmonic { .. })
+        matches!(
+            self,
+            Self::Ellipse { .. } | Self::Harmonic { .. } | Self::Trace { .. }
+        )
     }
 
     /// Whether two consecutive exact profile pieces sweep the same logical
@@ -336,6 +523,21 @@ impl Segment {
                     + amplitude * ((end.x - phase).sin() - (start.x - phase).sin());
                 0.5 * (end.x * end.y - start.x * start.y) - integral
             }
+            trace @ Self::Trace { .. } => {
+                // `½∮(x dy − y dx)` over the piece's own walk. The trace has
+                // no elementary antiderivative, so it is integrated the way
+                // ADR 0026 already integrates an ellipse's arc length.
+                let moment = |fraction: f64| {
+                    let Some(point) = trace.trace_point(fraction) else {
+                        return 0.0;
+                    };
+                    let Some((rate_x, rate_y)) = trace.trace_rate(fraction) else {
+                        return 0.0;
+                    };
+                    0.5 * point.x.mul_add(rate_y, -(point.y * rate_x))
+                };
+                crate::cylinder_trace::integrate(0.0, 1.0, &moment)
+            }
         }
     }
 
@@ -352,6 +554,11 @@ impl Segment {
                     (b.x - a.x).hypot(b.y - a.y)
                 })
                 .sum(),
+            trace @ Self::Trace { .. } => {
+                let speed =
+                    |fraction: f64| trace.trace_rate(fraction).map_or(0.0, |(x, y)| x.hypot(y));
+                crate::cylinder_trace::integrate(0.0, 1.0, &speed)
+            }
         }
     }
 
@@ -408,6 +615,29 @@ impl Segment {
                 mean: mean - anchor.y,
                 amplitude,
                 phase: phase - anchor.x,
+                start: shift(start),
+                end: shift(end),
+            },
+            // The whole piece moves in parameter space, curve and window
+            // together, so the locus it names is unchanged.
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift: was,
+                from,
+                to,
+                start,
+                end,
+            } => Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift: shift(was),
+                from,
+                to,
                 start: shift(start),
                 end: shift(end),
             },
@@ -616,6 +846,7 @@ pub(crate) fn reversed_loop(profile_loop: AnalyticLoop) -> AnalyticLoop {
                 sweep: -sweep,
             },
             other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
+            trace @ Segment::Trace { .. } => trace.reversed(),
         })
         .collect();
     AnalyticLoop {
@@ -927,6 +1158,12 @@ fn point_segment_distance(point: Point2, segment: Segment) -> f64 {
         Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
             sampled_point_distance(point, segment)
         }
+        trace @ Segment::Trace { .. } => (0..=64)
+            .map(|index| {
+                let at = trace.point_at(f64::from(index) / 64.0);
+                (point.x - at.x).hypot(point.y - at.y)
+            })
+            .fold(f64::INFINITY, f64::min),
     }
 }
 
@@ -949,7 +1186,7 @@ pub(crate) fn topology_loop_segments(
             match coedge.pcurve {
                 // Section traces are never planar profile pieces; the
                 // analytic Boolean reads them through `topology_loop_chords`.
-                Curve2::Harmonic { .. } | Curve2::Ellipse { .. } => None,
+                Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
                 Curve2::Line { .. } => Some(Segment::Line { start, end }),
                 Curve2::Circle {
                     center,
@@ -1035,6 +1272,23 @@ pub(crate) fn topology_loop_chords(topology: &Topology, loop_key: LoopKey) -> Op
                 Curve2::Line { .. } | Curve2::Circle { .. } => {
                     topology_loop_segments_one(coedge, start, end)
                 }
+                Curve2::Trace {
+                    host,
+                    other,
+                    branch,
+                    on_other,
+                    shift,
+                } => Some(Segment::Trace {
+                    host,
+                    other,
+                    branch,
+                    on_other,
+                    shift,
+                    from: range.start,
+                    to: range.end,
+                    start,
+                    end,
+                }),
             }
         })
         .collect()
@@ -1068,7 +1322,7 @@ fn topology_loop_segments_one(
                     * determinant.signum(),
             })
         }
-        Curve2::Harmonic { .. } | Curve2::Ellipse { .. } => None,
+        Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
     }
 }
 
@@ -1116,6 +1370,33 @@ fn section_turning_fractions(segment: Segment) -> Vec<f64> {
             }
         }
         Segment::Line { .. } | Segment::Arc { .. } => {}
+        trace @ Segment::Trace { .. } => {
+            // The ordinate of a trace turns where its rate changes sign.
+            // There is no closed form for those fractions, so they are
+            // bracketed on a sampling fine enough that the curve cannot turn
+            // twice between neighbours, then bisected to precision.
+            const SAMPLES: usize = 64;
+            let rate = |fraction: f64| trace.trace_rate(fraction).map_or(0.0, |(_, y)| y);
+            let mut previous = (0.0, rate(0.0));
+            for index in 1..=SAMPLES {
+                let fraction = index as f64 / SAMPLES as f64;
+                let current = (fraction, rate(fraction));
+                if (previous.1 < 0.0) != (current.1 < 0.0) {
+                    let (mut low, mut high) = (previous.0, current.0);
+                    let low_sign = previous.1 < 0.0;
+                    for _ in 0..60 {
+                        let middle = 0.5 * (low + high);
+                        if (rate(middle) < 0.0) == low_sign {
+                            low = middle;
+                        } else {
+                            high = middle;
+                        }
+                    }
+                    keep(0.5 * (low + high));
+                }
+                previous = current;
+            }
+        }
     }
     fractions.sort_by(f64::total_cmp);
     fractions.dedup_by(|a, b| (*a - *b).abs() <= 1.0e-12);
@@ -1285,8 +1566,8 @@ pub(crate) fn segment_clearance(first: Segment, second: Segment) -> f64 {
             }
         }
         (Segment::Line { .. }, Segment::Line { .. }) => {}
-        (Segment::Ellipse { .. } | Segment::Harmonic { .. }, _)
-        | (_, Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {}
+        (Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }, _)
+        | (_, Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }) => {}
     }
     minimum
 }
@@ -1366,7 +1647,9 @@ pub(crate) fn point_inside_loop(point: Point2, profile_loop: &AnalyticLoop) -> b
                     }
                 }
             }
-            section @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
+            section @ (Segment::Ellipse { .. }
+            | Segment::Harmonic { .. }
+            | Segment::Trace { .. }) => {
                 crossings += section_ray_crossings(point, section);
             }
         }
@@ -1956,7 +2239,7 @@ pub(crate) fn push_boundary_edge(
             },
             parameter_range: ParameterRange::new(start_angle, start_angle + sweep),
         },
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
             unreachable!("planar profiles carry lines and arcs only")
         }
     };
@@ -2015,7 +2298,7 @@ pub(crate) fn cap_pcurve(segment: Segment, swap: bool, reverse: bool) -> (Curve2
                 if reverse { range.reversed() } else { range },
             )
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
             unreachable!("planar profiles carry lines and arcs only")
         }
     }
@@ -2130,7 +2413,7 @@ fn push_side_face(
                 ]),
             )
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
             unreachable!("planar profiles carry lines and arcs only")
         }
     };

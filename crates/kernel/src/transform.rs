@@ -6,7 +6,7 @@
 
 use artificer_protocol::{RotationQuaternion, SimilarityTransform3};
 
-use crate::topology::{Curve2, Curve3, Plane, Point3, Surface, Topology, Vector3};
+use crate::topology::{Curve2, Curve3, Cylinder, Plane, Point3, Surface, Topology, Vector3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransformInputError {
@@ -78,6 +78,17 @@ impl Similarity {
 
 /// Clones and transforms all authoritative geometric representations while
 /// retaining incidence, ordering, orientation, and snapshot-local numeric IDs.
+/// A cylinder under a similarity: the frame rides along and the radius
+/// scales with it.
+fn transform_cylinder(mut cylinder: Cylinder, transform: Similarity) -> Cylinder {
+    cylinder.origin = transform.transform_point(cylinder.origin);
+    cylinder.axis = transform.transform_vector(cylinder.axis);
+    cylinder.radial_u = transform.transform_vector(cylinder.radial_u);
+    cylinder.radial_v = transform.transform_vector(cylinder.radial_v);
+    cylinder.radius *= transform.scale;
+    cylinder
+}
+
 pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Topology {
     let mut output = input.clone();
 
@@ -86,6 +97,11 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
     }
     for edge in &mut output.edges {
         match &mut edge.value.curve {
+            Curve3::Trace { host, other, .. } => {
+                for cylinder in [host, other] {
+                    *cylinder = transform_cylinder(*cylinder, transform);
+                }
+            }
             Curve3::Line { endpoints } => {
                 *endpoints = endpoints.map(|point| transform.transform_point(point));
             }
@@ -146,6 +162,14 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
     }
     for (index, coedge) in output.coedges.iter_mut().enumerate() {
         match &mut coedge.value.pcurve {
+            // A similarity leaves both parameters of a cylinder alone — the
+            // azimuth is an angle and the height scales with the axis it is
+            // measured in — so only the carriers move.
+            Curve2::Trace { host, other, .. } => {
+                for cylinder in [host, other] {
+                    *cylinder = transform_cylinder(*cylinder, transform);
+                }
+            }
             Curve2::Line { endpoints } => match pcurve_owner[index] {
                 PcurveOwner::Cylindrical => {
                     for endpoint in endpoints {
@@ -194,13 +218,8 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 transform.transform_vector(plane.u),
                 transform.transform_vector(plane.v),
             )),
-            Surface::Cylinder(mut cylinder) => {
-                cylinder.origin = transform.transform_point(cylinder.origin);
-                cylinder.axis = transform.transform_vector(cylinder.axis);
-                cylinder.radial_u = transform.transform_vector(cylinder.radial_u);
-                cylinder.radial_v = transform.transform_vector(cylinder.radial_v);
-                cylinder.radius *= transform.scale;
-                Surface::Cylinder(cylinder)
+            Surface::Cylinder(cylinder) => {
+                Surface::Cylinder(transform_cylinder(cylinder, transform))
             }
             Surface::Torus(mut torus) => {
                 torus.origin = transform.transform_point(torus.origin);

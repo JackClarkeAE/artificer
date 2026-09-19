@@ -251,6 +251,20 @@ fn validate_geometry(
                 })
                 // The major axis is the first one by construction.
                 .max((minor_radius - major_radius).max(0.0)),
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => {
+                // A trace has no frame of its own to be degenerate: its two
+                // carriers are validated where they are surfaces, and the one
+                // thing this curve needs beyond them is a branch it can read.
+                if host.is_finite() && other.is_finite() && (branch.abs() - 1.0).abs() <= 1.0e-12 {
+                    0.0
+                } else {
+                    linear_tolerance
+                }
+            }
         };
         if !curve_frame_error.is_finite() || curve_frame_error > linear_tolerance {
             diagnostics.push(
@@ -1122,6 +1136,14 @@ fn pcurve_locus_error(
                 .max(tangent_error)
                 .max(sampled_error)
         }
+        (Surface::Cylinder(_), Curve2::Trace { .. }, Curve3::Trace { .. }) => {
+            // Both descriptions of a trace run over the host's azimuth by
+            // construction — that is what lets the two faces either side of
+            // it agree point for point — so the sampled and tangent errors
+            // already compare like with like, and there is no further
+            // invariant to check. A quartic has no frame to compare.
+            sampled_error.max(tangent_error)
+        }
         _ => f64::INFINITY,
     };
 
@@ -1194,6 +1216,17 @@ fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
                 let frame_determinant = u.x * v.y - u.y * v.x;
                 0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
                     + major_radius * minor_radius * frame_determinant * sweep)
+            }
+            Curve2::Trace { .. } => {
+                // `½∮(x dy − y dx)` over the piece, integrated as ADR 0026
+                // already integrates the elliptic arc length beside it.
+                let moment = |parameter: f64| {
+                    let point = coedge.pcurve.evaluate(parameter);
+                    let rate = coedge.pcurve.derivative(parameter);
+                    0.5 * point.x.mul_add(rate.y, -(point.y * rate.x))
+                };
+                let range = coedge.parameter_range;
+                crate::cylinder_trace::integrate(range.start, range.end, &moment)
             }
         };
         area += contribution;
@@ -2173,6 +2206,18 @@ impl TrigPoly {
         Self(vec![(value, 0, 0)])
     }
 
+    /// The polynomial's value at one angle, for the integrands that are
+    /// sampled rather than integrated term by term.
+    fn evaluate(&self, angle: f64) -> f64 {
+        let (sin, cos) = angle.sin_cos();
+        self.0
+            .iter()
+            .map(|(coefficient, cosines, sines)| {
+                coefficient * cos.powi(*cosines as i32) * sin.powi(*sines as i32)
+            })
+            .sum()
+    }
+
     fn cosine() -> Self {
         Self(vec![(1.0, 1, 0)])
     }
@@ -2297,6 +2342,19 @@ fn cylinder_region_integral(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Trace { .. } => {
+                    // The same Green's term as a harmonic's, for a boundary
+                    // whose ordinate has no closed form: the integrand is
+                    // read pointwise and the abscissa's own rate carries
+                    // `dx` when the piece is written on the other face.
+                    let integrand = |parameter: f64| {
+                        let point = coedge.pcurve.evaluate(parameter);
+                        let rate = coedge.pcurve.derivative(parameter);
+                        -weight.evaluate(point.x) * point.y.powi(power as i32 + 1) * rate.x
+                            / f64::from(power + 1)
+                    };
+                    crate::cylinder_trace::integrate(range.start, range.end, &integrand)
+                }
             };
         }
     }
@@ -2457,9 +2515,10 @@ fn face_parameter_polar_moment(topology: &Topology, face: &Face) -> Option<f64> 
             let coedge = topology.coedge(*coedge_key)?.value;
             let range = coedge.parameter_range;
             total += match coedge.pcurve {
-                // Harmonics live on cylinders and cones; the polar moment is a
-                // planar quantity, so a face carrying one is outside this form.
-                Curve2::Harmonic { .. } => return None,
+                // Harmonics and traces live on cylinders and cones; the polar
+                // moment is a planar quantity, so a face carrying one is
+                // outside this form.
+                Curve2::Harmonic { .. } | Curve2::Trace { .. } => return None,
                 Curve2::Line { .. } => {
                     let from = coedge.pcurve.evaluate(range.start);
                     let to = coedge.pcurve.evaluate(range.end);
@@ -3086,6 +3145,23 @@ fn calculate_bounds(topology: &Topology) -> Option<Bounds3> {
                 minor_radius,
                 ..
             } => (u, v, major_radius, minor_radius),
+            // A trace has no closed-form extreme, so it is sampled; the
+            // bound only has to contain the curve.
+            Curve3::Trace { .. } => {
+                let range = edge.value.parameter_range;
+                for step in 0..=64 {
+                    let point = edge.value.curve.evaluate(
+                        (range.end - range.start).mul_add(f64::from(step) / 64.0, range.start),
+                    );
+                    min.x = min.x.min(point.x);
+                    min.y = min.y.min(point.y);
+                    min.z = min.z.min(point.z);
+                    max.x = max.x.max(point.x);
+                    max.y = max.y.max(point.y);
+                    max.z = max.z.max(point.z);
+                }
+                continue;
+            }
             Curve3::Line { .. } => continue,
         };
         for (u_component, v_component) in [(u.x, v.x), (u.y, v.y), (u.z, v.z)] {
