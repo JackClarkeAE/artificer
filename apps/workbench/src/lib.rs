@@ -6916,7 +6916,14 @@ impl KernelLabApp {
                 let selectable_regions = sketch.overlay_regions.clone();
                 if let Some(payload) = &sketch.portable_payload {
                     if let Some(authoring) = payload.authoring() {
-                        for entity in authoring.active_entities().filter(|entity| entity.visible) {
+                        // A host edge projected into the sketch to be measured
+                        // against is borrowed from the body, which is already
+                        // drawing it. Painting the copy in the sketch's colour
+                        // put a line on the model that nobody drew.
+                        for entity in authoring.active_entities().filter(|entity| {
+                            entity.visible
+                                && entity.role != artificer_sketch::SketchEntityRole::Reference
+                        }) {
                             let Ok(curve) = authoring.evaluated_curve(entity.id) else {
                                 continue;
                             };
@@ -28495,6 +28502,30 @@ mod extrusion_workbench_tests {
         assert_eq!(
             app.sketch_extrusion_eligibility(),
             SketchExtrusionEligibility::SketchNotFinished
+        );
+    }
+
+    /// A host edge projected into a sketch for a dimension is the body's
+    /// line, not the sketch's. The model overlay used to paint it in the
+    /// sketch colour, which put a line on the body that nobody drew.
+    #[test]
+    fn the_model_overlay_leaves_projected_reference_edges_to_the_body() {
+        let mut app = active_rectangle_app();
+        assert!(
+            app.sketch
+                .project_host_edge([point(0.0, -3.0), point(4.0, -3.0)])
+                .is_some(),
+            "a host edge is brought in as the dimension tool would"
+        );
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+
+        let overlays = app.visible_sketch_overlays();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(
+            overlays[0].segment_count(),
+            4,
+            "the rectangle's four sides and nothing borrowed from the body"
         );
     }
 

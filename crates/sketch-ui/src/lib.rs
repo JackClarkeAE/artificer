@@ -9007,6 +9007,14 @@ impl SketchCanvasState {
             .map(|(_, segment)| segment)
     }
 
+    /// Brings a straight host-body edge into the sketch as pinned reference
+    /// geometry, as naming it for a dimension does. The entity it returns is
+    /// the sketch's own copy, never drawn as a stroke and never part of a
+    /// profile.
+    pub fn project_host_edge(&mut self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
+        self.project_support_segment(segment)
+    }
+
     /// Brings a host edge into the sketch as pinned reference geometry.
     ///
     /// The body's topology is not the sketch's to own, so this is a copy rather
@@ -9017,33 +9025,60 @@ impl SketchCanvasState {
     fn project_support_segment(&mut self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
         // A projection is a committed edit, and committing one underneath a
         // staged edit would leave the gate holding a transaction built against
-        // a definition that no longer exists.
+        // a definition that no longer exists. A stroke still at the gate is
+        // one the user has plainly moved past — they are measuring from it —
+        // so it is confirmed first rather than silently blocking the pick,
+        // which is how "dimension to the face's edge" came to do nothing at
+        // all: the circle just drawn was still pending, and nothing said so.
         if self.pending.is_some() {
-            return None;
+            // Confirming ends the gesture as far as the canvas is concerned
+            // and forgets the half-named pair; this pair is the reason for
+            // the confirmation, so it is kept across it.
+            let named = std::mem::take(&mut self.relation_operands);
+            let committed = self.commit_pending();
+            self.relation_operands = named;
+            if let Err(error) = committed {
+                self.relation_diagnostic = Some(format!(
+                    "The body's edge cannot be brought into the sketch while this edit is \
+                     staged: {error:?}. Confirm or cancel it first."
+                ));
+                return None;
+            }
         }
         if let Some(existing) = self.projected_edge_matching(segment) {
             return Some(existing);
         }
         let [start, end] = segment;
-        let transaction = self
-            .authoring
-            .stage(
-                CoreRecipe::ProjectedEdge {
-                    start: CorePointInput::Position(core_point(start)),
-                    end: CorePointInput::Position(core_point(end)),
-                },
-                "Project body edge",
-            )
-            .ok()?;
-        let projected = transaction.impact().inserted_entities.first().copied()?;
-        self.undo_journal
+        let Ok(transaction) = self.authoring.stage(
+            CoreRecipe::ProjectedEdge {
+                start: CorePointInput::Position(core_point(start)),
+                end: CorePointInput::Position(core_point(end)),
+            },
+            "Project body edge",
+        ) else {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        };
+        let Some(projected) = transaction.impact().inserted_entities.first().copied() else {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        };
+        if self
+            .undo_journal
             .confirm(
                 &mut self.authoring,
                 transaction,
                 CoreConfirmationSource::GreenTick,
                 PrecisionPolicy::default(),
             )
-            .ok()?;
+            .is_err()
+        {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        }
         self.pin_projected_edge(projected);
         self.reconcile_active_core_entities();
         self.refresh_profile_analysis();
@@ -9279,6 +9314,21 @@ impl SketchCanvasState {
         if self.relation_operands.len() < 2 {
             self.relation_diagnostic = None;
             return DimensionPointPick::opened_a_pair(operand);
+        }
+        // The pair is complete. A stroke still at the gate goes through it
+        // now, so the relation can be staged against a settled definition.
+        if self.pending.is_some() {
+            let named = std::mem::take(&mut self.relation_operands);
+            let committed = self.commit_pending();
+            self.relation_operands = named;
+            if let Err(error) = committed {
+                self.relation_diagnostic = Some(format!(
+                    "The dimension cannot be placed while this edit is staged: {error:?}. \
+                     Confirm or cancel it first."
+                ));
+                self.clear_relation_acquisition();
+                return DimensionPointPick::default();
+            }
         }
         let staged = self.stage_relation(ToolVariant::DistanceRelation);
         let constraint = staged.and_then(|_| {
@@ -11905,15 +11955,20 @@ pub fn show_with_context(
                     // relation and for snapping, and a curve the sketch does
                     // not own yet — a host-body edge — is projected as it is
                     // named.
-                    let dimension_point =
-                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
-                            state.take_dimension_operand_pick(
-                                sketch_pt,
-                                f64::from(entity_pick_radius) / state.view.points_per_unit,
-                            )
-                        } else {
-                            DimensionPointPick::default()
-                        };
+                    // An edit still at the gate does not stop a dimension
+                    // from naming committed geometry: a click that completes
+                    // the pair confirms that edit on its way, since reaching
+                    // for a measurement is moving past the stroke. Dropping
+                    // the click instead is how "dimension to the face's edge"
+                    // came to do nothing at all.
+                    let dimension_point = if state.exact_tool == ToolVariant::Dimension {
+                        state.take_dimension_operand_pick(
+                            sketch_pt,
+                            f64::from(entity_pick_radius) / state.view.points_per_unit,
+                        )
+                    } else {
+                        DimensionPointPick::default()
+                    };
                     let took_dimension_point = dimension_point.took_click;
                     draft_changed |= took_dimension_point;
                     pending_created = pending_created.or(dimension_point.staged);
@@ -20639,6 +20694,80 @@ mod tests {
                 .iter()
                 .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
             "measuring to an edge is an offset, not a separation"
+        );
+    }
+
+    /// Projecting a host edge is a committed edit, and a stroke still at the
+    /// confirmation gate used to block it — silently, so a dimension to the
+    /// face's edge simply never appeared. Reaching for the edge is moving
+    /// past the stroke: the stroke is confirmed and the projection made.
+    #[test]
+    fn a_pending_stroke_is_confirmed_when_a_host_edge_is_projected_past_it() {
+        let (mut state, _, _) = circle_on_a_host_face();
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(2.0, -3.0),
+                SketchPoint::new(3.0, -3.0),
+            ))
+            .expect("a stroke stages");
+        assert!(state.has_pending_edit(), "and waits at the gate");
+        let before = state.entities().len();
+
+        let projected =
+            state.project_host_edge([SketchPoint::new(-4.0, -4.0), SketchPoint::new(-4.0, 4.0)]);
+        assert!(
+            projected.is_some(),
+            "the edge is projected: {:?}",
+            state.relation_diagnostic
+        );
+        assert!(
+            !state.has_pending_edit(),
+            "the stroke that was at the gate went through it"
+        );
+        assert_eq!(
+            state.entities().len(),
+            before + 2,
+            "the confirmed stroke and the projected edge both exist now"
+        );
+        assert!(
+            state
+                .entities()
+                .iter()
+                .any(|entity| entity.role == SketchEntityRole::Reference),
+            "the edge is reference geometry the sketch owns"
+        );
+        assert_eq!(state.relation_diagnostic, None, "nothing to complain about");
+    }
+
+    /// The reported order: a circle confirmed, another stroke drawn and left
+    /// at the gate, then the dimension tool — the circle's centre, the face's
+    /// edge. The pending stroke used to make the second click do nothing.
+    #[test]
+    fn a_dimension_to_a_host_edge_is_placed_with_a_stroke_still_at_the_gate() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        // Something arrives at the gate with the tool already in hand — an
+        // armed value box does this — and is still there at the second pick.
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(2.0, -3.0),
+                SketchPoint::new(3.0, -3.0),
+            ))
+            .expect("a stroke stages");
+        assert!(state.has_pending_edit(), "and waits at the gate");
+
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        let pick = state.take_dimension_operand_pick(edge, 0.5);
+        assert!(
+            pick.staged.is_some(),
+            "the centre and the face's edge are a complete pair: {:?}",
+            state.relation_diagnostic
+        );
+        assert!(
+            staged_constraint_kinds(&state)
+                .iter()
+                .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
+            "measuring to an edge is an offset"
         );
     }
 
