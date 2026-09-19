@@ -2499,6 +2499,15 @@ struct RecipeParameterField {
 }
 
 /// State for the native Artificer workbench and kernel lab.
+/// The command to run again once an armed tool has what it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmedResume {
+    /// Extrude in the model workspace, pushing or pulling a face.
+    PushPull,
+    /// One of the solid feature presets.
+    Preset(SolidFeaturePreset),
+}
+
 pub struct KernelLabApp {
     document: ModelDocument,
     document_path: PathBuf,
@@ -2623,6 +2632,9 @@ pub struct KernelLabApp {
     /// first command to take it; flipping a gate before the path exists would
     /// ship a live button with nothing behind it.
     armed_tool: Option<invocation::ArmedTool>,
+    /// How to carry on once an armed tool has its operands: the command that
+    /// armed it, run again against the selection the pick just joined.
+    armed_resume: Option<ArmedResume>,
     /// Tool bodies picked while a Boolean is staged, in click order. Empty
     /// outside a staged Boolean; the target is never a member.
     boolean_tools: Vec<BodyId>,
@@ -2858,6 +2870,7 @@ impl Default for KernelLabApp {
             measured_edges: Vec::new(),
             measured_face: None,
             armed_tool: None,
+            armed_resume: None,
             boolean_tools: Vec::new(),
             staged_revolve: None,
             active_tool: ActiveTool::Select,
@@ -6640,6 +6653,28 @@ impl KernelLabApp {
                 .is_some_and(|displayed| !displayed.scene.edges.is_empty())
     }
 
+    /// Which command to run again when the armed tool's operands arrive.
+    ///
+    /// The selection stays the one source of truth: a pick made while a tool
+    /// waits joins the selection, and the command that armed the tool is run
+    /// once more against it, exactly as if the operands had been picked first
+    /// (ADR 0041 stage 4).
+    fn resume_armed_tool(&mut self) {
+        let Some(resume) = self.armed_resume.take() else {
+            return;
+        };
+        self.armed_tool = None;
+        match resume {
+            ArmedResume::PushPull => {
+                self.stage_face_push_pull();
+            }
+            ArmedResume::Preset(preset) => self.stage_preset_feature(preset),
+        }
+        if let Some(prompt) = self.armed_tool_prompt() {
+            self.document_status = Some(prompt);
+        }
+    }
+
     /// Presses a tool: stages straight away when the selection already
     /// satisfies it, and otherwise arms it holding whatever fits.
     ///
@@ -6674,6 +6709,7 @@ impl KernelLabApp {
             invocation::OperandResolution::Complete { .. }
             | invocation::OperandResolution::InvalidSelection(_) => {
                 self.armed_tool = None;
+                self.armed_resume = None;
             }
         }
         resolution
@@ -6684,7 +6720,6 @@ impl KernelLabApp {
     /// Disarming and clearing the selection are different intentions and must
     /// not share a key: the tool never owned the selection, so there is
     /// nothing here to restore.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn disarm_tool(&mut self) -> bool {
         self.armed_tool.take().is_some()
     }
@@ -6693,7 +6728,6 @@ impl KernelLabApp {
     ///
     /// Returns whether the tool took it, so the ordinary selection paths can
     /// leave the click alone when it did.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn offer_to_armed_tool(&mut self, item: invocation::SelectionItem) -> bool {
         let revision = self.document_revision();
         let Some(mut armed) = self.armed_tool.take() else {
@@ -6709,7 +6743,6 @@ impl KernelLabApp {
     /// Whether the armed tool could use this pick, which is what narrows the
     /// viewport's hit test while one is waiting.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn armed_tool_accepts(&self, item: invocation::SelectionItem) -> bool {
         self.armed_tool
             .as_ref()
@@ -6718,7 +6751,6 @@ impl KernelLabApp {
 
     /// What the status line says while a tool waits for operands.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn armed_tool_prompt(&self) -> Option<String> {
         self.armed_tool.as_ref().map(invocation::ArmedTool::prompt)
     }
@@ -6736,6 +6768,17 @@ impl KernelLabApp {
         // A side of the extrusion waiting for a face takes this click and
         // nothing else does: the pick is what the user is in the middle of.
         if self.adopt_extrusion_extent_face(selection.face) {
+            return;
+        }
+        // A tool waiting for a face takes it next. The pick joins the
+        // selection rather than replacing it — the tool asked for more, not
+        // for different — and the command that armed the tool runs again.
+        let item = invocation::SelectionItem::Face(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            if !self.selected_faces.contains(&selection) {
+                self.selected_faces.push(selection);
+            }
+            self.resume_armed_tool();
             return;
         }
         if !additive {
@@ -6776,6 +6819,19 @@ impl KernelLabApp {
                 edge,
             })
             .collect::<Vec<_>>();
+        // A tool waiting for edges takes the click, and takes the whole
+        // logical edge with it: a rim picked for a fillet is the rim, not the
+        // semicircle under the pointer.
+        let item = invocation::SelectionItem::Edge(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            for candidate in selections {
+                if !self.selected_edges.contains(&candidate) {
+                    self.selected_edges.push(candidate);
+                }
+            }
+            self.resume_armed_tool();
+            return;
+        }
         if !additive {
             self.clear_model_entity_selection();
         }
@@ -6800,6 +6856,14 @@ impl KernelLabApp {
         selection: viewport::DocumentVertexSelection,
         additive: bool,
     ) {
+        let item = invocation::SelectionItem::Vertex(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            if !self.selected_vertices.contains(&selection) {
+                self.selected_vertices.push(selection);
+            }
+            self.resume_armed_tool();
+            return;
+        }
         if !additive {
             self.clear_model_entity_selection();
         }
@@ -9608,6 +9672,7 @@ impl KernelLabApp {
             // No usable face is picked, so the tool asks for one rather than
             // doing nothing. Pressing it is entering it (ADR 0041).
             self.invoke_tool("Extrude", &invocation::FACE_PUSH_PULL);
+            self.armed_resume = self.armed_tool.is_some().then_some(ArmedResume::PushPull);
             return false;
         };
         let Some(support_body) = self.active_body_id() else {
@@ -12938,6 +13003,10 @@ impl KernelLabApp {
                     _ => "Hole pattern",
                 };
                 self.invoke_tool(tool, &invocation::PLANAR_FACE_FEATURE);
+                self.armed_resume = self
+                    .armed_tool
+                    .is_some()
+                    .then_some(ArmedResume::Preset(preset));
                 return;
             };
             let support =
@@ -12971,6 +13040,10 @@ impl KernelLabApp {
                     "Chamfer"
                 };
                 self.invoke_tool(tool, &invocation::EDGE_FINISH);
+                self.armed_resume = self
+                    .armed_tool
+                    .is_some()
+                    .then_some(ArmedResume::Preset(preset));
                 return;
             }
             let support = self.edge_finish_selection_support();
@@ -21477,6 +21550,13 @@ impl eframe::App for KernelLabApp {
             }
             _ => {}
         }
+        // With nothing pending, a bare Escape drops a tool that is waiting
+        // for operands. The selection is left exactly as it was: the tool
+        // never owned it (ADR 0041).
+        if cancel_pending && operation_at_frame_start.is_none() && self.disarm_tool() {
+            self.armed_resume = None;
+            self.document_status = Some("Tool disarmed · the selection is kept".to_owned());
+        }
         cancel_pending = (cancel_pending
             && operation_at_frame_start.is_some()
             && self.pending_operation == operation_at_frame_start)
@@ -25288,7 +25368,7 @@ mod view_cube_ring_tests {
             left.0.x < center().x && right.0.x > center().x,
             "{left:?} {right:?}"
         );
-        for (position, direction) in [left, right] {
+        for (position, _) in [left, right] {
             let offset = position - center();
             assert!(
                 offset.length() > radius && offset.length() < radius + 12.0,
@@ -29908,6 +29988,153 @@ mod extrusion_workbench_tests {
                 armed.prompt()
             );
         }
+    }
+
+    /// A fillet pressed first stages from the edges clicked after it: the
+    /// clicks join the selection and the tool runs again against it, which
+    /// is the same path a preselection takes (ADR 0041 stage 4).
+    #[test]
+    fn a_fillet_pressed_first_stages_from_the_edges_clicked_after_it() {
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(app.armed_tool.is_some(), "nothing picked: the tool arms");
+        assert!(app.pending_operation.is_none());
+
+        let body = app.active_body_id().expect("default active body");
+        let edge = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.edges.first())
+            .expect("a body edge")
+            .source_edge;
+        // The click is not additive — Shift was not held — and yet the pick
+        // must join rather than replace, because the tool asked for it.
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                edge,
+            },
+            false,
+        );
+        assert!(
+            app.selected_edges.iter().any(|picked| picked.edge == edge),
+            "the picked edge is in the selection"
+        );
+        assert!(
+            app.pending_operation.is_some(),
+            "one edge satisfies a finish, so the click staged it: {:?}",
+            app.document_status
+        );
+        assert!(app.armed_tool.is_none(), "a staged tool is no longer armed");
+        assert!(app.armed_resume.is_none());
+    }
+
+    /// Extrude pressed first pushes the face clicked after it.
+    #[test]
+    fn extrude_pressed_first_pushes_the_face_clicked_after_it() {
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.workbench_mode = WorkbenchMode::Model;
+        app.extrusion_distance = 1.0;
+        assert!(
+            !app.stage_face_push_pull(),
+            "no face picked: nothing stages"
+        );
+        assert_eq!(
+            app.armed_tool.as_ref().map(|armed| armed.tool),
+            Some("Extrude")
+        );
+
+        let body = app.active_body_id().expect("default active body");
+        let face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| {
+                displayed
+                    .scene
+                    .triangles
+                    .iter()
+                    .find(|triangle| triangle.role == FaceRole::PositiveZ)
+            })
+            .expect("a planar cap")
+            .source_face;
+        app.select_model_face(
+            viewport::DocumentFaceSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                face,
+            },
+            false,
+        );
+        assert!(
+            matches!(
+                app.pending_operation,
+                Some(PendingOperation::PushPullFace { target_face, .. }) if target_face == face
+            ),
+            "the clicked face is the one being pushed: {:?} / {:?}",
+            app.pending_operation,
+            app.document_status
+        );
+        assert!(app.armed_tool.is_none());
+    }
+
+    /// From the model workspace, Extrude with a finished but unused sketch
+    /// opens that sketch and asks for its profile, instead of greying out.
+    #[test]
+    fn extrude_from_the_model_workspace_opens_an_unused_sketch_for_its_profile() {
+        // Two circles, as in the report: two profiles, so one has to be
+        // picked before anything can be extruded.
+        let mut app = KernelLabApp::default();
+        for centre in [-6.0, 6.0] {
+            app.sketch
+                .stage_geometry(SketchGeometry::circle(
+                    SketchPoint::new(centre, 0.0),
+                    SketchPoint::new(centre + 3.0, 0.0),
+                ))
+                .expect("circle");
+            app.sketch.commit_pending().expect("commit");
+        }
+        app.sketch_revision = 1;
+        app.feature_preview.commit_sketch_revision(1);
+        app.sketch_finished = false;
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        app.enter_model_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+        // Finishing stages a preview of its own; the report is about coming
+        // back to the sketch later, with nothing pending.
+        app.cancel_pending_operation();
+        app.clear_model_entity_selection();
+        app.sketch.clear_region_selection();
+        assert!(
+            app.unconsumed_active_sketch_index().is_some(),
+            "the finished sketch is active and unused"
+        );
+        assert!(
+            app.sketch_extrusion_eligibility().wants_profile_pick(),
+            "two profiles: one has to be chosen: {:?} / regions selected {}",
+            app.sketch_extrusion_eligibility(),
+            app.selected_sketch_region_count()
+        );
+
+        let availability = app.command_availability(crate::commands::ModelCommand::Extrude);
+        assert!(
+            availability.is_enabled(),
+            "an unused sketch is what Extrude is for: {}",
+            match &availability {
+                crate::ribbon::CommandAvailability::Enabled => String::new(),
+                crate::ribbon::CommandAvailability::Disabled(reason) => reason.to_string(),
+            }
+        );
+        let context = egui::Context::default();
+        app.run_command(crate::commands::ModelCommand::Extrude, &context);
+        assert_eq!(
+            app.workbench_mode,
+            WorkbenchMode::Sketch,
+            "the sketch opened for its profile to be picked: {:?}",
+            app.document_status
+        );
     }
 
     /// A face feature pressed with nothing picked enters it and asks for a

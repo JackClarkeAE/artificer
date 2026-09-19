@@ -995,6 +995,13 @@ impl KernelLabApp {
     /// Extrude is the one command that serves two operations — extruding the
     /// active sketch and pushing the selected face — so its reasons stay
     /// enumerated in the order the user is most likely to have hit them.
+    /// The active sketch, when it is finished and no feature has used it yet.
+    pub(crate) fn unconsumed_active_sketch_index(&self) -> Option<usize> {
+        let index = self.active_sketch_index?;
+        let sketch = self.sketches.get(index)?;
+        (!sketch.consumed).then_some(index)
+    }
+
     fn extrude_availability(&self) -> CommandAvailability {
         let linked_sketch_support = self
             .sketch_support
@@ -1010,8 +1017,10 @@ impl KernelLabApp {
         // become a solid — Extrude is still the right button to press: it
         // hands the canvas to Select and says where to click, instead of
         // greying out behind a tooltip.
-        let awaiting_profile_pick =
-            self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick();
+        let awaiting_profile_pick = eligibility.wants_profile_pick()
+            && (self.workbench_mode == WorkbenchMode::Sketch
+                || (self.selected_face().is_none()
+                    && self.unconsumed_active_sketch_index().is_some()));
         let sketch_enabled = self.pending_operation.is_none()
             && self.history_is_at_end()
             && !already_extruded
@@ -1061,7 +1070,7 @@ impl KernelLabApp {
         })
     }
 
-    fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
+    pub(crate) fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
         match command {
             ModelCommand::NewSketch => {
                 if self.sketch_entry_action() == SketchEntryAction::New {
@@ -1081,6 +1090,22 @@ impl KernelLabApp {
                 if self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick()
                 {
                     self.begin_profile_pick_for_extrusion(eligibility);
+                    return;
+                }
+                // From the model workspace, a sketch that is finished but not
+                // yet used is what Extrude is for, and its profile is picked
+                // on its own canvas: open it there and ask. A picked face
+                // still means push/pull; an unused sketch is the fallback
+                // that used to grey the button instead (ADR 0041).
+                if self.workbench_mode == WorkbenchMode::Model
+                    && eligibility.wants_profile_pick()
+                    && self.selected_face_push_pull_support().is_none()
+                    && let Some(index) = self.unconsumed_active_sketch_index()
+                {
+                    self.edit_committed_sketch(index);
+                    if self.workbench_mode == WorkbenchMode::Sketch {
+                        self.begin_profile_pick_for_extrusion(eligibility);
+                    }
                     return;
                 }
                 let staged = if eligibility.can_stage()
