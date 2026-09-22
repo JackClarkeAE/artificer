@@ -9,6 +9,7 @@
 
 pub mod assembly;
 pub mod components;
+pub mod datum;
 pub mod kinematics;
 pub mod parameterized;
 pub mod parameters;
@@ -31,6 +32,11 @@ pub use components::{
     CanonicalQuaternion, ComponentContentDigest, ComponentDefinitionRef,
     ComponentDefinitionRevision, ComponentError, ComponentInstanceDraft, ComponentInstanceRecord,
     ComponentTranslation, RigidComponentPose,
+};
+pub use datum::{
+    CURRENT_DATUM_PLANE_RECIPE_VERSION, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef,
+    DatumPlaneBase, DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, OriginPlane,
+    ResolvedDatumPlane,
 };
 pub use parameterized::{
     KernelParameterBinding, KernelReplayTemplate, KernelScalarTarget,
@@ -59,14 +65,19 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 ///
 /// Version 4 introduced portable sketch payloads and typed parameterized
 /// kernel recipes. Version 5 adds the persistent assembly joint forest.
-/// Version 6 adds authoritative editable sketch-operation graphs.
-pub const CURRENT_DOCUMENT_VERSION: u32 = 6;
+/// Version 6 adds authoritative editable sketch-operation graphs. Version 7
+/// makes a construction plane a recipe rather than a marker (ADR 0048).
+pub const CURRENT_DOCUMENT_VERSION: u32 = 7;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
 /// First native schema with a persistent assembly hierarchy and joint graph.
 pub const ASSEMBLY_JOINT_DOCUMENT_VERSION: u32 = 5;
 /// First native schema that requires an authoritative editable sketch graph.
 pub const EDITABLE_SKETCH_DOCUMENT_VERSION: u32 = 6;
+/// First native schema whose construction planes carry their own recipe.
+/// Older files hold plane markers, which the workbench migrates from the
+/// frames its workspace envelope kept for them.
+pub const DATUM_PLANE_DOCUMENT_VERSION: u32 = 7;
 /// Oldest native document schema this version can migrate in memory.
 pub const MIN_SUPPORTED_DOCUMENT_VERSION: u32 = 1;
 /// Hard ceiling for one document's ordered feature timeline.
@@ -198,9 +209,19 @@ pub enum ReplayAction {
     SketchRegionExtrusion(SketchRegionExtrusion),
     /// Two-snapshot native Boolean resolved by the replay coordinator.
     Boolean(BooleanFeatureRecipe),
+    /// A construction plane. It runs no kernel command; replay resolves where
+    /// its base now puts it (ADR 0048).
+    DatumPlane(DatumPlaneRecipe),
 }
 
 impl ReplayAction {
+    /// Whether this action records a document fact without running the
+    /// kernel, so its feature's input and output snapshots are the same.
+    #[must_use]
+    pub const fn is_document_only(&self) -> bool {
+        matches!(self, Self::Marker | Self::DatumPlane(_))
+    }
+
     /// Resolves typed scalar bindings into an ordinary replay action.
     ///
     /// Marker and already-concrete actions are cloned unchanged. A successful
@@ -216,7 +237,8 @@ impl ReplayAction {
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::SketchRegionExtrusion(_)
-            | Self::Boolean(_) => Ok(self.clone()),
+            | Self::Boolean(_)
+            | Self::DatumPlane(_) => Ok(self.clone()),
         }
     }
 
@@ -227,13 +249,36 @@ impl ReplayAction {
         document: &ModelDocument,
         precision: artificer_protocol::PrecisionPolicy,
     ) -> Result<Self, SketchRegionResolveError> {
+        self.resolve_sketch_regions_with_planes(document, precision, &BTreeMap::new())
+    }
+
+    /// Resolves as [`Self::resolve_sketch_regions`] does, reading a sketch on
+    /// a construction plane in the frame `planes` holds for that plane. A
+    /// rebuild passes the planes it has resolved so far.
+    pub fn resolve_sketch_regions_with_planes(
+        &self,
+        document: &ModelDocument,
+        precision: artificer_protocol::PrecisionPolicy,
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> Result<Self, SketchRegionResolveError> {
         match self {
-            Self::SketchRegionExtrusion(recipe) => recipe.resolve(document, precision),
+            Self::SketchRegionExtrusion(recipe) => {
+                let frame = document
+                    .sketch(recipe.sketch)
+                    .and_then(|record| {
+                        document.sketch_payload(recipe.sketch, record.geometry_revision)
+                    })
+                    .and_then(|payload| payload.support.plane())
+                    .and_then(|plane| planes.get(&plane))
+                    .map(|plane| plane.frame);
+                recipe.resolve_in_frame(document, precision, frame)
+            }
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::ParameterizedKernel(_)
-            | Self::Boolean(_) => Ok(self.clone()),
+            | Self::Boolean(_)
+            | Self::DatumPlane(_) => Ok(self.clone()),
         }
     }
 }
@@ -999,6 +1044,194 @@ impl ModelDocument {
         self.state.features.iter().find(|feature| feature.id == id)
     }
 
+    /// Whether `id` is a construction plane, whatever its recipe form.
+    #[must_use]
+    pub fn is_datum_plane(&self, id: FeatureId) -> bool {
+        self.feature(id)
+            .is_some_and(|feature| feature.kind == FeatureKind::DatumPlane)
+    }
+
+    /// A construction plane's recipe, when it has one. Planes from version 6
+    /// files are markers until the workbench migrates them.
+    #[must_use]
+    pub fn datum_plane(&self, id: FeatureId) -> Option<&DatumPlaneRecipe> {
+        self.feature(id).and_then(|feature| match &feature.action {
+            ReplayAction::DatumPlane(recipe) if feature.kind == FeatureKind::DatumPlane => {
+                Some(recipe)
+            }
+            _ => None,
+        })
+    }
+
+    /// The features that depend on `id` directly.
+    #[must_use]
+    pub fn dependents_of(&self, id: FeatureId) -> Vec<FeatureId> {
+        self.state
+            .features
+            .iter()
+            .filter(|feature| feature.dependencies.contains(&id))
+            .map(|feature| feature.id)
+            .collect()
+    }
+
+    /// The frame a sketch is drawn in, as the document now stands: a sketch
+    /// on a construction plane is in that plane's last resolved frame, and
+    /// every other sketch is in its payload's.
+    #[must_use]
+    pub fn sketch_frame(&self, id: SketchId) -> Option<artificer_protocol::PlanarFrame3> {
+        let record = self.sketch(id)?;
+        let payload = self.sketch_payload(id, record.geometry_revision)?;
+        Some(
+            payload
+                .support
+                .plane()
+                .and_then(|plane| self.datum_plane(plane))
+                .map_or(payload.frame, |recipe| recipe.frame),
+        )
+    }
+
+    /// Shows or hides a construction plane. Visibility is part of the recipe,
+    /// so this is an undoable edit that saving picks up; it moves nothing, so
+    /// it dirties no rebuild.
+    pub fn set_datum_plane_visible(
+        &mut self,
+        id: FeatureId,
+        visible: bool,
+    ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        let ReplayAction::DatumPlane(recipe) = &feature.action else {
+            return Err(DocumentError::NotADatumPlane(id));
+        };
+        if recipe.visible == visible {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        if let ReplayAction::DatumPlane(recipe) = &mut self.state.features[index].action {
+            recipe.visible = visible;
+        }
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces the frames cached in construction-plane recipes, and in the
+    /// payloads of the sketches drawn on them, with the ones a replay just
+    /// resolved. Nothing is rebuilt: the frames are the ones the rebuild
+    /// already used. One undo checkpoint covers the whole refresh.
+    pub fn refresh_datum_plane_frames(
+        &mut self,
+        resolved: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> bool {
+        let changed = |recipe: &DatumPlaneRecipe, plane: &ResolvedDatumPlane| {
+            recipe.frame != plane.frame || recipe.half_extent != plane.half_extent
+        };
+        let planes_changed = self.state.features.iter().any(|feature| {
+            matches!(&feature.action, ReplayAction::DatumPlane(recipe)
+                if resolved.get(&feature.id).is_some_and(|plane| changed(recipe, plane)))
+        });
+        let sketches_changed = self.state.features.iter().any(|feature| {
+            feature.sketch_payload.as_ref().is_some_and(|payload| {
+                payload
+                    .support
+                    .plane()
+                    .and_then(|plane| resolved.get(&plane))
+                    .is_some_and(|plane| payload.frame != plane.frame)
+            })
+        });
+        if !planes_changed && !sketches_changed {
+            return false;
+        }
+        for feature in &mut self.state.features {
+            if let ReplayAction::DatumPlane(recipe) = &mut feature.action
+                && let Some(plane) = resolved.get(&feature.id)
+            {
+                recipe.frame = plane.frame;
+                recipe.half_extent = plane.half_extent;
+            }
+            if let Some(payload) = feature.sketch_payload.as_mut()
+                && let Some(plane) = payload
+                    .support
+                    .plane()
+                    .and_then(|plane| resolved.get(&plane))
+            {
+                payload.frame = plane.frame;
+            }
+        }
+        // The frames are what the committed rebuild used, so this is the same
+        // edit rather than a new one: it shares the rebuild's revision bump.
+        self.bump_revision();
+        true
+    }
+
+    /// Gives construction planes loaded as version 6 markers the recipes the
+    /// workbench rebuilt for them from its workspace envelope (ADR 0048).
+    ///
+    /// This is part of loading, not an edit: it takes no undo checkpoint and
+    /// dirties nothing, because the planes are where they already were. A
+    /// recipe for a feature that is not a plane marker is ignored, and one
+    /// that does not validate is refused before anything changes.
+    pub fn adopt_legacy_datum_planes(
+        &mut self,
+        recipes: BTreeMap<FeatureId, DatumPlaneRecipe>,
+    ) -> Result<usize, DocumentError> {
+        for recipe in recipes.values() {
+            recipe.validate()?;
+            if !recipe.base.bodies().is_empty()
+                || matches!(recipe.base, DatumPlaneBase::Plane { .. })
+            {
+                return Err(DocumentError::InvalidDatumPlaneFeature);
+            }
+        }
+        let mut adopted = 0;
+        for feature in &mut self.state.features {
+            if feature.kind == FeatureKind::DatumPlane
+                && feature.action == ReplayAction::Marker
+                && let Some(recipe) = recipes.get(&feature.id)
+            {
+                feature.action = ReplayAction::DatumPlane(recipe.clone());
+                adopted += 1;
+            }
+        }
+        Ok(adopted)
+    }
+
+    /// Deletes a construction plane that nothing depends on.
+    ///
+    /// This is the history's only deletion, and it is deliberately narrow: a
+    /// plane produces no body and no snapshot, so removing one that nothing
+    /// is built on cannot change any result. A plane something depends on is
+    /// refused with the first dependent's identity.
+    pub fn remove_datum_plane(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.kind != FeatureKind::DatumPlane {
+            return Err(DocumentError::NotADatumPlane(id));
+        }
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        if let Some(dependent) = self.dependents_of(id).first().copied() {
+            return Err(DocumentError::FeatureInUse {
+                feature: id,
+                dependent,
+            });
+        }
+        let previous = self.state.clone();
+        if self.state.history_cursor == HistoryCursor::After(id) {
+            self.state.history_cursor = match index.checked_sub(1) {
+                Some(before) => HistoryCursor::After(self.state.features[before].id),
+                None => HistoryCursor::Start,
+            };
+        }
+        let removed = self.state.features.remove(index);
+        reconcile_active_object_state(&mut self.state);
+        self.finish_user_edit(previous);
+        Ok(removed)
+    }
+
     #[must_use]
     pub fn body(&self, id: BodyId) -> Option<&BodyRecord> {
         self.state.bodies.iter().find(|body| body.id == id)
@@ -1076,7 +1309,13 @@ impl ModelDocument {
                     }
                 }
             }
-            SketchSupportRecipe::Origin | SketchSupportRecipe::PlanarFace { .. } => {
+            SketchSupportRecipe::DatumPlane { plane }
+                if record.support_body.is_none()
+                    && feature.dependencies.contains(plane)
+                    && self.is_datum_plane(*plane) => {}
+            SketchSupportRecipe::Origin
+            | SketchSupportRecipe::PlanarFace { .. }
+            | SketchSupportRecipe::DatumPlane { .. } => {
                 return Err(DocumentError::SketchSupportMismatch);
             }
         }
@@ -1174,6 +1413,14 @@ impl ModelDocument {
             return Err(DocumentError::HistoryCursorNotAtEnd);
         }
         validate_replay_action(&draft.action)?;
+        validate_action_kind(draft.kind, &draft.action)?;
+        // A new plane always carries its recipe; only planes loaded from
+        // version 6 files are markers, and those are migrated on load.
+        if draft.kind == FeatureKind::DatumPlane
+            && (!matches!(draft.action, ReplayAction::DatumPlane(_)) || !draft.outputs.is_empty())
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
         validate_label(&draft.label)?;
         validate_reference_count("inputs", draft.inputs.len())?;
         validate_reference_count("parameter inputs", draft.parameter_inputs.len())?;
@@ -1355,7 +1602,7 @@ impl ModelDocument {
         let primary_branch = boolean_recipe
             .map(|recipe| recipe.target)
             .or_else(|| existing_branches.first().copied());
-        if draft.action != ReplayAction::Marker
+        if !draft.action.is_document_only()
             && let Some(body) = primary_branch
             && !draft.outputs.contains(&OutputDraft::ModifyBody(body))
         {
@@ -1371,7 +1618,7 @@ impl ModelDocument {
             }) {
                 return Err(DocumentError::UnavailableDependency(dependency));
             }
-            if draft.action == ReplayAction::Marker && committed.input != committed.output {
+            if draft.action.is_document_only() && committed.input != committed.output {
                 return Err(DocumentError::MarkerChangedSnapshot);
             }
             let expected_input = if let Some(body) = primary_branch {
@@ -1596,6 +1843,7 @@ impl ModelDocument {
         if self.state.features[index].state.read_only {
             return Err(DocumentError::ReadOnlyFeature(id));
         }
+        validate_action_kind(self.state.features[index].kind, &action)?;
         validate_action_parameter_inputs(
             &action,
             &self.state.features[index].parameter_inputs,
@@ -1607,6 +1855,93 @@ impl ModelDocument {
         }
         let previous = self.state.clone();
         self.state.features[index].action = action;
+        self.mark_branch_dirty(index);
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces a feature's action together with the other features it names
+    /// as inputs — an extrusion that now ends at a plane, or no longer does.
+    ///
+    /// Only feature inputs may change here. A body or sketch input names the
+    /// state its producer left, which is fixed by the feature's place in the
+    /// history; a feature input names the feature itself, which must come
+    /// earlier. Dependencies follow the inputs that were added or dropped.
+    pub fn replace_feature_action_and_inputs(
+        &mut self,
+        id: FeatureId,
+        action: ReplayAction,
+        inputs: Vec<FeatureInput>,
+    ) -> Result<bool, DocumentError> {
+        validate_replay_action(&action)?;
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        validate_action_kind(feature.kind, &action)?;
+        validate_reference_count("inputs", inputs.len())?;
+        ensure_unique(inputs.iter().copied(), "feature inputs")?;
+        let is_feature = |input: &&FeatureInput| matches!(input, FeatureInput::Feature(_));
+        let old_others = feature
+            .inputs
+            .iter()
+            .filter(|input| !is_feature(input))
+            .collect::<BTreeSet<_>>();
+        let new_others = inputs
+            .iter()
+            .filter(|input| !is_feature(input))
+            .collect::<BTreeSet<_>>();
+        if old_others != new_others {
+            return Err(DocumentError::InvalidArchive(
+                "only feature inputs can change after a feature is made",
+            ));
+        }
+        let positions = self.feature_positions();
+        let named = |inputs: &[FeatureInput]| {
+            inputs
+                .iter()
+                .filter_map(|input| match input {
+                    FeatureInput::Feature(feature) => Some(*feature),
+                    FeatureInput::Body(_) | FeatureInput::Sketch(_) => None,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let before = named(&feature.inputs);
+        let after = named(&inputs);
+        for added in after.difference(&before) {
+            match positions.get(added) {
+                None => return Err(DocumentError::UnknownFeature(*added)),
+                Some(position) if *position >= index => {
+                    return Err(DocumentError::FeatureBeyondHistoryCursor(*added));
+                }
+                Some(_) => {}
+            }
+        }
+        validate_action_parameter_inputs(
+            &action,
+            &feature.parameter_inputs,
+            &self.state.parameters,
+        )?;
+        validate_action_feature_inputs(&action, &inputs)?;
+        if feature.action == action && feature.inputs == inputs {
+            return Ok(false);
+        }
+        let mut dependencies = feature
+            .dependencies
+            .iter()
+            .copied()
+            .filter(|dependency| !before.contains(dependency) || after.contains(dependency))
+            .chain(after.iter().copied())
+            .collect::<Vec<_>>();
+        dependencies
+            .sort_by_key(|dependency| positions.get(dependency).copied().unwrap_or(usize::MAX));
+        dependencies.dedup();
+        let previous = self.state.clone();
+        let node = &mut self.state.features[index];
+        node.action = action;
+        node.inputs = inputs;
+        node.dependencies = dependencies;
         self.mark_branch_dirty(index);
         self.finish_user_edit(previous);
         Ok(true)
@@ -2292,6 +2627,14 @@ impl ModelDocument {
                 return Err(DocumentError::SketchSupportMismatch);
             }
             SketchSupportRecipe::Origin => {}
+            SketchSupportRecipe::DatumPlane { plane } => {
+                if !branches.is_empty()
+                    || !self.is_datum_plane(*plane)
+                    || !draft.inputs.contains(&FeatureInput::Feature(*plane))
+                {
+                    return Err(DocumentError::SketchSupportMismatch);
+                }
+            }
             SketchSupportRecipe::PlanarFace { body, face } => {
                 if self.body(*body).is_none() {
                     return Err(DocumentError::UnknownBody(*body));
@@ -2529,7 +2872,7 @@ impl RebuildTransaction {
             .ok_or(DocumentError::RebuildAlreadyComplete)?;
         let expected = next_step.feature;
         let branches = next_step.branches.clone();
-        let marker = next_step.action == ReplayAction::Marker;
+        let marker = next_step.action.is_document_only();
         if feature != expected {
             return Err(DocumentError::RebuildOutOfOrder {
                 expected,
@@ -2651,6 +2994,19 @@ pub enum DocumentError {
     SketchPayload(#[from] SketchPayloadError),
     #[error(transparent)]
     SketchRegionRecipe(#[from] SketchRegionRecipeError),
+    #[error(transparent)]
+    DatumPlane(#[from] DatumPlaneError),
+    #[error("a construction plane must be a construction-plane feature with a plane recipe")]
+    InvalidDatumPlaneFeature,
+    #[error("{0} is not a construction plane")]
+    NotADatumPlane(FeatureId),
+    #[error("an extrusion's end plane {0} must be declared as a feature input")]
+    EndPlaneMustBeInput(FeatureId),
+    #[error("{dependent} depends on {feature}")]
+    FeatureInUse {
+        feature: FeatureId,
+        dependent: FeatureId,
+    },
     #[error("new sketch features require an exact portable sketch payload")]
     SketchPayloadRequired,
     #[error("only sketch features may carry a portable sketch payload")]
@@ -2792,11 +3148,19 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
         ReplayAction::Boolean(recipe) if recipe.target == recipe.tool => {
             Err(DocumentError::InvalidBooleanFeature)
         }
+        ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::Marker
         | ReplayAction::Kernel(_)
         | ReplayAction::TargetedKernel(_)
         | ReplayAction::Boolean(_) => Ok(()),
     }
+}
+
+fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), DocumentError> {
+    if matches!(action, ReplayAction::DatumPlane(_)) && kind != FeatureKind::DatumPlane {
+        return Err(DocumentError::InvalidDatumPlaneFeature);
+    }
+    Ok(())
 }
 
 fn validate_action_parameter_inputs(
@@ -2814,16 +3178,40 @@ fn validate_action_feature_inputs(
     action: &ReplayAction,
     feature_inputs: &[FeatureInput],
 ) -> Result<(), DocumentError> {
-    if let ReplayAction::SketchRegionExtrusion(recipe) = action
-        && !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch))
-    {
-        return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+    if let ReplayAction::SketchRegionExtrusion(recipe) = action {
+        if !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch)) {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+        }
+        // A side that ends at a plane is measured to it on every replay, so
+        // the plane is an input: moving it rebuilds the extrusion.
+        if let Some(plane) = recipe
+            .end_planes()
+            .find(|plane| !feature_inputs.contains(&FeatureInput::Feature(*plane)))
+        {
+            return Err(DocumentError::EndPlaneMustBeInput(plane));
+        }
     }
     if let ReplayAction::Boolean(recipe) = action
         && (!feature_inputs.contains(&FeatureInput::Body(recipe.target))
             || !feature_inputs.contains(&FeatureInput::Body(recipe.tool)))
     {
         return Err(DocumentError::InvalidBooleanFeature);
+    }
+    // A plane reads the body its base names as it stands at the plane's place
+    // in the history, so that body is its branch; a plane on another plane
+    // reads that plane. A midplane across two bodies takes the first as its
+    // branch and depends on the second, because one feature has one branch.
+    if let ReplayAction::DatumPlane(recipe) = action {
+        if let Some(body) = recipe.base.bodies().first()
+            && !feature_inputs.contains(&FeatureInput::Body(*body))
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
+        if let DatumPlaneBase::Plane { plane } = recipe.base
+            && !feature_inputs.contains(&FeatureInput::Feature(plane))
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
     }
     Ok(())
 }
@@ -3063,6 +3451,19 @@ fn validate_loaded_sketch_payload(
             if !branches.is_empty() || sketch_record.support_body.is_some() {
                 return Err(DocumentError::InvalidArchive(
                     "an origin sketch payload is attached to a body branch",
+                ));
+            }
+        }
+        SketchSupportRecipe::DatumPlane { plane } => {
+            if !branches.is_empty()
+                || sketch_record.support_body.is_some()
+                || !feature.dependencies.contains(plane)
+                || positions
+                    .get(plane)
+                    .is_none_or(|plane_index| *plane_index >= feature_index)
+            {
+                return Err(DocumentError::InvalidArchive(
+                    "a construction-plane sketch must follow and depend on its plane",
                 ));
             }
         }
@@ -3408,6 +3809,9 @@ fn validate_loaded_state(
                 "a feature references a missing parameter",
             ));
         }
+        validate_action_kind(feature.kind, &feature.action).map_err(|_| {
+            DocumentError::InvalidArchive("a plane recipe is on a feature that is not a plane")
+        })?;
         validate_replay_action(&feature.action).map_err(|error| match error {
             DocumentError::PersistentTargetRequired => DocumentError::InvalidArchive(
                 "raw entity-targeting commands require a persistent target recipe",
@@ -3571,7 +3975,7 @@ fn validate_loaded_state(
                 "a sketch support body does not match its creating feature branch",
             ));
         }
-        if feature.action != ReplayAction::Marker
+        if !feature.action.is_document_only()
             && let Some(body) = branches.first().copied()
             && !feature.outputs.contains(&FeatureOutput::Body(body))
         {
@@ -3580,7 +3984,7 @@ fn validate_loaded_state(
             ));
         }
         if let Some(commit) = feature.committed {
-            if feature.action == ReplayAction::Marker && commit.input != commit.output {
+            if feature.action.is_document_only() && commit.input != commit.output {
                 return Err(DocumentError::MarkerChangedSnapshot);
             }
             let mut association_is_attached = true;

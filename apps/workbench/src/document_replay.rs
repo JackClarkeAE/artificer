@@ -336,7 +336,10 @@ pub fn hydrate_model_document(
                 error,
             })?;
         let (association, report, output_snapshot) = match action {
-            ReplayAction::Marker => (
+            // A plane runs nothing on load: a saved document's planes are
+            // where its recipes last resolved them, and the sketches drawn on
+            // them were replayed in those frames above.
+            ReplayAction::Marker | ReplayAction::DatumPlane(_) => (
                 SnapshotAssociation::new(input.id(), input.id(), input.semantic_digest()),
                 None,
                 None,
@@ -541,7 +544,7 @@ fn replay_input(
         }
         return Ok(inputs[0]);
     }
-    if !matches!(feature.action, ReplayAction::Marker) {
+    if !feature.action.is_document_only() {
         return Err(DocumentHydrationError::KernelActionWithoutBody {
             feature: feature.id,
         });

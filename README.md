@@ -25,6 +25,10 @@
 
 ---
 
+## What is new since 0.99.7
+
+- **A construction plane is a feature you can place, move and edit.** The Plane command puts a plane on whatever is picked — a face, two parallel faces, a straight edge, an origin or construction plane — and draws it there before anything is committed. An arrow drags it off its base and, on a plane through an edge, an arc turns it about the edge; the card on the right carries the same Offset and Angle as typed fields, and a Flip. Confirmed, it is a chip in the history like any other feature: right-click to edit it where it was made, rename it, suppress it, or delete it when nothing is built on it. It is linked, not copied: a plane on a face follows the face when the body under it is rebuilt, a sketch on a plane moves with the plane and so does everything extruded from it, and a side of an extrusion can end at a plane and follows it too. Planes from older files open where they were. ADR 0048 records the design.
+
 ## What is new in 0.99.7
 
 A correctness fix for 0.99.6. Two decisions inside the Boolean engine turned

@@ -66,8 +66,11 @@ enum BrowserContextCommand {
     HideSketch,
     ShowSketch,
     SelectPlane,
+    EditPlane,
+    RenamePlane,
     HidePlane,
     ShowPlane,
+    DeletePlane,
 }
 
 impl BrowserContextCommand {
@@ -88,8 +91,11 @@ impl BrowserContextCommand {
             Self::HideSketch => "Hide this sketch",
             Self::ShowSketch => "Show this sketch",
             Self::SelectPlane => "Select this plane",
+            Self::EditPlane => "Edit this plane",
+            Self::RenamePlane => "Rename…",
             Self::HidePlane => "Hide this plane",
             Self::ShowPlane => "Show this plane",
+            Self::DeletePlane => "Delete this plane",
         }
     }
 }
@@ -454,13 +460,8 @@ impl KernelLabApp {
                                 });
                             }
                         });
-                        if let Some((id, visible)) = visibility_change
-                            && let Some(plane) = self
-                                .construction_planes
-                                .iter_mut()
-                                .find(|plane| plane.id == id)
-                        {
-                            plane.visible = visible;
+                        if let Some((id, visible)) = visibility_change {
+                            self.set_construction_plane_visible(id, visible);
                         }
                         if let Some(id) = selected_plane {
                             self.selected_construction_plane = Some(id);
@@ -914,11 +915,16 @@ impl KernelLabApp {
                 if self.selected_construction_plane != Some(id) {
                     commands.push(BrowserContextCommand::SelectPlane);
                 }
+                if self.feature_has_an_editor(plane.feature) {
+                    commands.push(BrowserContextCommand::EditPlane);
+                }
+                commands.push(BrowserContextCommand::RenamePlane);
                 commands.push(if plane.visible {
                     BrowserContextCommand::HidePlane
                 } else {
                     BrowserContextCommand::ShowPlane
                 });
+                commands.push(BrowserContextCommand::DeletePlane);
             }
             BrowserContextTarget::OriginPlane(plane) => {
                 let has_other_plane_sketch =
@@ -1084,13 +1090,26 @@ impl KernelLabApp {
                 BrowserContextTarget::Body(_) | BrowserContextTarget::Sketch(_) => {}
             },
             BrowserContextCommand::HidePlane | BrowserContextCommand::ShowPlane => {
-                if let BrowserContextTarget::ConstructionPlane(id) = target
-                    && let Some(plane) = self
-                        .construction_planes
-                        .iter_mut()
-                        .find(|plane| plane.id == id)
-                {
-                    plane.visible = command == BrowserContextCommand::ShowPlane;
+                if let BrowserContextTarget::ConstructionPlane(id) = target {
+                    self.set_construction_plane_visible(
+                        id,
+                        command == BrowserContextCommand::ShowPlane,
+                    );
+                }
+            }
+            BrowserContextCommand::EditPlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.begin_plane_edit(feature);
+                }
+            }
+            BrowserContextCommand::RenamePlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.begin_feature_rename(feature);
+                }
+            }
+            BrowserContextCommand::DeletePlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.delete_construction_plane(feature);
                 }
             }
         }
@@ -1100,10 +1119,7 @@ impl KernelLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConstructionPlane, ConstructionPlaneSource};
-    use artificer_protocol::{
-        EntityId, EntityKind, EntityRef, PlanarFrame3, Point3, SnapshotId, Vector3,
-    };
+    use artificer_protocol::Point3;
 
     /// A default document plus one standalone cuboid, so body selection has
     /// two all-planar bodies to work with.
@@ -1118,30 +1134,24 @@ mod tests {
         app.browser_selected_bodies.iter().copied().collect()
     }
 
-    /// A synthetic offset plane parallel to YZ at `x`, active at every
-    /// history stop because it belongs to no feature.
-    fn offset_yz_plane(app: &KernelLabApp, id: u64, x: f64) -> ConstructionPlane {
-        ConstructionPlane {
-            id,
-            name: format!("Offset {id}"),
-            feature: None,
-            frame: PlanarFrame3::new(
-                Point3::new(x, 0.0, 0.0),
-                Vector3::new(0.0, 1.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-            ),
-            half_u: 10.0,
-            half_v: 10.0,
-            visible: true,
-            source: ConstructionPlaneSource::OnFace {
-                body: app.bodies[0].id,
-                face: EntityRef {
-                    snapshot: SnapshotId::ZERO,
-                    entity: EntityId(1),
-                    kind: EntityKind::Face,
-                },
-            },
-        }
+    /// A construction plane parallel to YZ at `x`, made the way a user makes
+    /// one: the YZ origin plane picked, the Plane command, an offset typed,
+    /// and the tick. Returns the plane's Browser identity.
+    fn offset_yz_plane(app: &mut KernelLabApp, x: f64) -> u64 {
+        app.clear_model_entity_selection();
+        app.selected_construction_plane = None;
+        app.selected_origin_plane = SketchPlane::YZ;
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(x);
+        assert!(app.confirm_pending_operation());
+        let plane = app
+            .construction_planes
+            .last()
+            .expect("the plane was committed");
+        assert!((plane.frame.origin.x - x).abs() < 1.0e-12);
+        let id = plane.id;
+        app.selected_construction_plane = None;
+        id
     }
 
     #[test]
@@ -1219,25 +1229,42 @@ mod tests {
             vec![BrowserContextCommand::SelectPlane],
         );
 
-        // Construction planes offer selection and their visibility flip.
-        let plane = offset_yz_plane(&app, 7, 5.0);
-        app.construction_planes.push(plane);
+        // Construction planes offer selection, their editor, a new name,
+        // their visibility flip and deletion (ADR 0048).
+        let plane = offset_yz_plane(&mut app, 5.0);
         assert_eq!(
-            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(7)),
+            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(plane)),
             vec![
                 BrowserContextCommand::SelectPlane,
+                BrowserContextCommand::EditPlane,
+                BrowserContextCommand::RenamePlane,
                 BrowserContextCommand::HidePlane,
+                BrowserContextCommand::DeletePlane,
             ],
         );
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(7),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
-        assert_eq!(app.selected_construction_plane, Some(7));
+        assert_eq!(app.selected_construction_plane, Some(plane));
         assert_eq!(
-            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(7)),
-            vec![BrowserContextCommand::HidePlane],
+            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(plane)),
+            vec![
+                BrowserContextCommand::EditPlane,
+                BrowserContextCommand::RenamePlane,
+                BrowserContextCommand::HidePlane,
+                BrowserContextCommand::DeletePlane,
+            ],
         );
+        // Hiding is a document edit: the plane stays hidden through a
+        // runtime restore, and the document has something to save.
+        let saved = app.document.revision();
+        app.run_browser_context_command(
+            BrowserContextCommand::HidePlane,
+            BrowserContextTarget::ConstructionPlane(plane),
+        );
+        assert!(app.document.revision() > saved);
+        assert!(!app.construction_planes.last().unwrap().visible);
     }
 
     #[test]
@@ -1273,11 +1300,10 @@ mod tests {
     #[test]
     fn mirror_commits_across_the_selected_construction_plane() {
         let mut app = KernelLabApp::default();
-        let plane = offset_yz_plane(&app, 11, 5.0);
-        app.construction_planes.push(plane);
+        let plane = offset_yz_plane(&mut app, 5.0);
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(11),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
         let before = app.displayed_measures().unwrap().centroid.unwrap().x;
         app.stage_preset_feature(SolidFeaturePreset::Mirror);
@@ -1297,11 +1323,10 @@ mod tests {
         let mut app = app_with_two_bodies();
         let first = app.bodies[0].ordinal;
         let second = app.bodies[1].ordinal;
-        let plane = offset_yz_plane(&app, 21, 5.0);
-        app.construction_planes.push(plane);
+        let plane = offset_yz_plane(&mut app, 5.0);
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(21),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
         app.browser_body_row_clicked(0, first, egui::Modifiers::NONE);
         app.browser_body_row_clicked(1, second, egui::Modifiers::COMMAND);

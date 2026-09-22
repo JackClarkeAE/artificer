@@ -20,7 +20,7 @@ use thiserror::Error;
 use crate::persistent::{
     CURRENT_PERSISTENT_REF_VERSION, MAX_PERSISTENT_LINEAGE_DEPTH, PersistentRef, TargetedKernel,
 };
-use crate::{ModelDocument, ReplayAction, SketchId};
+use crate::{FeatureId, ModelDocument, ReplayAction, SketchId};
 
 /// Schema written for newly-created sketch-region replay recipes.
 pub const CURRENT_SKETCH_REGION_RECIPE_VERSION: u32 = 1;
@@ -252,6 +252,13 @@ pub struct SketchRegionExtrusion {
     /// The second side's face, as `up_to_face` is the first side's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_up_to_face: Option<PersistentRef>,
+    /// The first side ends at this construction plane (ADR 0048). A side ends
+    /// at a face or at a plane, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to_plane: Option<FeatureId>,
+    /// The second side's plane, as `up_to_plane` is the first side's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_up_to_plane: Option<FeatureId>,
 }
 
 fn is_zero(value: &f64) -> bool {
@@ -312,6 +319,8 @@ impl SketchRegionExtrusion {
             second_distance: None,
             up_to_face: None,
             second_up_to_face: None,
+            up_to_plane: None,
+            second_up_to_plane: None,
         };
         recipe.validate()?;
         Ok(recipe)
@@ -342,10 +351,33 @@ impl SketchRegionExtrusion {
         Ok(self)
     }
 
-    /// Whether a side ends at a face, which replay measures before resolving.
+    /// Ends a side at a construction plane rather than at a distance.
+    pub fn with_up_to_planes(
+        mut self,
+        first: Option<FeatureId>,
+        second: Option<FeatureId>,
+    ) -> Result<Self, SketchRegionRecipeError> {
+        self.up_to_plane = first;
+        self.second_up_to_plane = second;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether a side ends at a face or a plane, which replay measures
+    /// before resolving.
     #[must_use]
     pub const fn ends_at_a_face(&self) -> bool {
-        self.up_to_face.is_some() || self.second_up_to_face.is_some()
+        self.up_to_face.is_some()
+            || self.second_up_to_face.is_some()
+            || self.up_to_plane.is_some()
+            || self.second_up_to_plane.is_some()
+    }
+
+    /// The construction planes this recipe ends at, which it depends on.
+    pub fn end_planes(&self) -> impl Iterator<Item = FeatureId> {
+        [self.up_to_plane, self.second_up_to_plane]
+            .into_iter()
+            .flatten()
     }
 
     /// The recipe with the lengths a replay measured to its faces. A side
@@ -424,8 +456,16 @@ impl SketchRegionExtrusion {
             if self.draft_degrees != 0.0 {
                 return Err(SketchRegionRecipeError::InvalidDraft);
             }
-        } else if self.second_up_to_face.is_some() {
+        } else if self.second_up_to_face.is_some() || self.second_up_to_plane.is_some() {
             return Err(SketchRegionRecipeError::SecondFaceWithoutSecondSide);
+        }
+        if (self.up_to_face.is_some() && self.up_to_plane.is_some())
+            || (self.second_up_to_face.is_some() && self.second_up_to_plane.is_some())
+        {
+            return Err(SketchRegionRecipeError::FaceAndPlaneOnOneSide);
+        }
+        if self.end_planes().any(|plane| plane.get() == 0) {
+            return Err(SketchRegionRecipeError::InvalidPlaneTarget);
         }
         for face in [&self.up_to_face, &self.second_up_to_face]
             .into_iter()
@@ -448,6 +488,19 @@ impl SketchRegionExtrusion {
         &self,
         document: &ModelDocument,
         precision: PrecisionPolicy,
+    ) -> Result<ReplayAction, SketchRegionResolveError> {
+        self.resolve_in_frame(document, precision, None)
+    }
+
+    /// Resolves as [`Self::resolve`] does, with the sketch placed in `frame`
+    /// when one is given. A rebuild passes the frame it has just resolved for
+    /// a construction plane, which the document's cache does not hold yet;
+    /// without one, the sketch sits where the document last placed it.
+    pub fn resolve_in_frame(
+        &self,
+        document: &ModelDocument,
+        precision: PrecisionPolicy,
+        frame: Option<PlanarFrame3>,
     ) -> Result<ReplayAction, SketchRegionResolveError> {
         self.validate()
             .map_err(SketchRegionResolveError::InvalidRecipe)?;
@@ -516,10 +569,13 @@ impl SketchRegionExtrusion {
             SketchRegionExtrusionTarget::NewBody => None,
             SketchRegionExtrusionTarget::PlanarFace { operation, .. } => Some(*operation),
         };
+        let placed = frame
+            .or_else(|| document.sketch_frame(self.sketch))
+            .unwrap_or(payload.frame);
         let (frame, profile) = if extrusion_frame_is_reversed(operation, self.distance) {
-            reversed_extrusion_direction(payload.frame, compiled.profile)
+            reversed_extrusion_direction(placed, compiled.profile)
         } else {
-            (payload.frame, compiled.profile)
+            (placed, compiled.profile)
         };
         let distance = self.distance.abs();
         // A second side starts the sweep behind the plane: the frame moves
@@ -598,6 +654,10 @@ pub enum SketchRegionRecipeError {
     TwoSidedFaceFeature,
     #[error("a second-side face needs a second side")]
     SecondFaceWithoutSecondSide,
+    #[error("a side ends at a face or at a plane, not both")]
+    FaceAndPlaneOnOneSide,
+    #[error("a side's end plane must name a construction-plane feature")]
+    InvalidPlaneTarget,
     #[error("persistent face lineage exceeds the depth limit of {limit}")]
     FaceLineageTooDeep { limit: usize },
 }
@@ -1093,6 +1153,240 @@ mod tests {
                 signature: missing_signature,
             }) if missing_sketch == sketch && missing_signature == signature
         ));
+    }
+
+    /// A document with a construction plane 10 above XY and a rectangle
+    /// sketched on it, as the workbench builds one (ADR 0048).
+    fn document_with_plane_sketch() -> (ModelDocument, crate::FeatureId, SketchId, RegionSignature)
+    {
+        use crate::datum::{DatumPlaneBase, DatumPlaneRecipe, OriginPlane, ResolvedDatumPlane};
+        let marker = SnapshotAssociation::new(
+            SnapshotId::ZERO,
+            SnapshotId::ZERO,
+            SemanticDigest::new([0; 32]),
+        );
+        let mut recipe = DatumPlaneRecipe::new(
+            DatumPlaneBase::Origin {
+                plane: OriginPlane::Xy,
+            },
+            ResolvedDatumPlane {
+                frame: crate::datum::offset_along_normal(OriginPlane::Xy.frame(), 10.0),
+                half_extent: [25.0, 25.0],
+            },
+        );
+        recipe.offset = 10.0;
+        let mut document = ModelDocument::default();
+        let plane = document
+            .append_feature(
+                FeatureDraft::new(
+                    FeatureKind::DatumPlane,
+                    "Plane 1",
+                    ReplayAction::DatumPlane(recipe.clone()),
+                )
+                .with_commit(marker),
+            )
+            .unwrap()
+            .feature;
+        let definition = rectangle(2.0, 3.0);
+        let (regions, profile) = selected_profile(&definition);
+        let payload = SketchPayload::from_authoring(
+            recipe.frame,
+            definition,
+            Some(profile),
+            SketchSupportRecipe::DatumPlane { plane },
+        )
+        .unwrap();
+        let sketch = document
+            .append_feature(
+                FeatureDraft::new(FeatureKind::Sketch, "Sketch", ReplayAction::Marker)
+                    .with_input(FeatureInput::Feature(plane))
+                    .with_sketch_payload(payload)
+                    .with_output(OutputDraft::CreateSketch {
+                        label: "Sketch 1".into(),
+                        geometry_revision: 1,
+                    })
+                    .with_commit(marker),
+            )
+            .unwrap()
+            .created_sketches[0];
+        (document, plane, sketch, regions[0].clone())
+    }
+
+    fn extruded_origin(action: ReplayAction) -> Point3 {
+        match action {
+            ReplayAction::Kernel(KernelCommand::ExtrudePlanarProfile { frame, .. }) => frame.origin,
+            other => panic!("a new-body region recipe resolves to a profile extrusion: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sketch_on_a_plane_is_replayed_where_the_plane_now_is() {
+        let (document, plane, sketch, signature) = document_with_plane_sketch();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], 5.0).unwrap();
+        let action = ReplayAction::SketchRegionExtrusion(recipe);
+        // Without a live frame the sketch sits on the plane's cached frame.
+        let cached = action
+            .resolve_sketch_regions(&document, PrecisionPolicy::default())
+            .unwrap();
+        assert!((extruded_origin(cached).z - 10.0).abs() < 1.0e-12);
+        // A rebuild that has just resolved the plane higher up passes that
+        // frame, and the extrusion follows it before any cache is refreshed.
+        let moved = crate::datum::ResolvedDatumPlane {
+            frame: crate::datum::offset_along_normal(crate::datum::OriginPlane::Xy.frame(), 30.0),
+            half_extent: [25.0, 25.0],
+        };
+        let live = action
+            .resolve_sketch_regions_with_planes(
+                &document,
+                PrecisionPolicy::default(),
+                &std::collections::BTreeMap::from([(plane, moved)]),
+            )
+            .unwrap();
+        assert!((extruded_origin(live).z - 30.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn refreshing_plane_frames_moves_the_plane_and_its_sketches_together() {
+        let (mut document, plane, sketch, _) = document_with_plane_sketch();
+        let moved = crate::datum::ResolvedDatumPlane {
+            frame: crate::datum::offset_along_normal(crate::datum::OriginPlane::Xy.frame(), -4.0),
+            half_extent: [30.0, 30.0],
+        };
+        let resolved = std::collections::BTreeMap::from([(plane, moved)]);
+        assert!(document.refresh_datum_plane_frames(&resolved));
+        assert_eq!(document.datum_plane(plane).unwrap().frame, moved.frame);
+        assert_eq!(document.sketch_frame(sketch), Some(moved.frame));
+        let record = document.sketch(sketch).unwrap();
+        assert_eq!(
+            document
+                .sketch_payload(sketch, record.geometry_revision)
+                .unwrap()
+                .frame,
+            moved.frame
+        );
+        // A second refresh with the same frames changes nothing.
+        assert!(!document.refresh_datum_plane_frames(&resolved));
+    }
+
+    #[test]
+    fn a_plane_something_is_built_on_cannot_be_deleted() {
+        let (mut document, plane, sketch, _) = document_with_plane_sketch();
+        let sketch_feature = document.sketch(sketch).unwrap().created_by;
+        assert_eq!(
+            document.remove_datum_plane(plane).unwrap_err(),
+            crate::DocumentError::FeatureInUse {
+                feature: plane,
+                dependent: sketch_feature,
+            }
+        );
+        assert!(document.feature(plane).is_some());
+    }
+
+    #[test]
+    fn an_unused_plane_is_deleted_and_the_deletion_undoes() {
+        use crate::datum::{DatumPlaneBase, DatumPlaneRecipe, OriginPlane, ResolvedDatumPlane};
+        let mut document = ModelDocument::default();
+        let plane = document
+            .append_feature(FeatureDraft::new(
+                FeatureKind::DatumPlane,
+                "Plane 1",
+                ReplayAction::DatumPlane(DatumPlaneRecipe::new(
+                    DatumPlaneBase::Origin {
+                        plane: OriginPlane::Yz,
+                    },
+                    ResolvedDatumPlane {
+                        frame: OriginPlane::Yz.frame(),
+                        half_extent: [25.0, 25.0],
+                    },
+                )),
+            ))
+            .unwrap()
+            .feature;
+        assert!(document.set_datum_plane_visible(plane, false).unwrap());
+        assert!(!document.datum_plane(plane).unwrap().visible);
+        assert_eq!(
+            document.feature(plane).unwrap().state.rebuild,
+            RebuildState::Dirty,
+            "a plane appended without a commit is dirty; hiding it does not change that"
+        );
+        document.remove_datum_plane(plane).unwrap();
+        assert!(document.feature(plane).is_none());
+        assert!(document.undo());
+        assert!(document.feature(plane).is_some());
+    }
+
+    #[test]
+    fn a_side_that_ends_at_a_plane_names_the_plane_as_an_input() {
+        let (mut document, plane, sketch, signature) = document_with_plane_sketch();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], 5.0)
+            .unwrap()
+            .with_up_to_planes(Some(plane), None)
+            .unwrap();
+        let missing_input = document.append_feature(
+            FeatureDraft::new(
+                FeatureKind::Extrude,
+                "Extrude",
+                ReplayAction::SketchRegionExtrusion(recipe.clone()),
+            )
+            .with_input(FeatureInput::Sketch(sketch))
+            .with_output(OutputDraft::CreateBody {
+                label: "Body 1".into(),
+            }),
+        );
+        assert_eq!(
+            missing_input.unwrap_err(),
+            crate::DocumentError::EndPlaneMustBeInput(plane)
+        );
+        let extrusion = document
+            .append_feature(
+                FeatureDraft::new(
+                    FeatureKind::Extrude,
+                    "Extrude",
+                    ReplayAction::SketchRegionExtrusion(recipe.clone()),
+                )
+                .with_input(FeatureInput::Sketch(sketch))
+                .with_input(FeatureInput::Feature(plane))
+                .with_output(OutputDraft::CreateBody {
+                    label: "Body 1".into(),
+                }),
+            )
+            .unwrap()
+            .feature;
+        assert!(
+            document
+                .feature(extrusion)
+                .unwrap()
+                .dependencies
+                .contains(&plane)
+        );
+        // Going back to a distance drops the plane input and its dependency.
+        let mut plain = recipe;
+        plain.up_to_plane = None;
+        document
+            .replace_feature_action_and_inputs(
+                extrusion,
+                ReplayAction::SketchRegionExtrusion(plain),
+                vec![FeatureInput::Sketch(sketch)],
+            )
+            .unwrap();
+        let node = document.feature(extrusion).unwrap();
+        assert!(!node.inputs.contains(&FeatureInput::Feature(plane)));
+        assert!(!node.dependencies.contains(&plane));
+        assert_eq!(
+            SketchRegionExtrusion::new_body(sketch, vec![], 1.0).unwrap_err(),
+            SketchRegionRecipeError::EmptySelection
+        );
+    }
+
+    #[test]
+    fn a_plane_document_round_trips_through_the_native_envelope() {
+        let (document, plane, sketch, _) = document_with_plane_sketch();
+        let native = document.to_native();
+        assert_eq!(native.version(), crate::CURRENT_DOCUMENT_VERSION);
+        let json = serde_json::to_string(&native).unwrap();
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(restored.datum_plane(plane), document.datum_plane(plane));
+        assert_eq!(restored.sketch_frame(sketch), document.sketch_frame(sketch));
     }
 }
 

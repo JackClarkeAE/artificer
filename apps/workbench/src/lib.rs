@@ -53,15 +53,16 @@ use artificer_model::persistent::{
 use artificer_model::{
     BodyId, BooleanFeatureRecipe, ComponentContentDigest, ComponentDefinitionRef,
     ComponentDefinitionRevision, ComponentInstanceDraft, ComponentInstanceId,
-    ComponentInstanceRecord, FeatureDraft, FeatureId, FeatureInput, FeatureKind, FeatureOutput,
-    JointAxis, JointDraft, JointKind, JointOrigin, JointParent, ModelDocument, OutputDraft,
-    ParameterBinding, ParameterExposure, ParameterId, ParameterMetadata, ParameterOverrides,
-    ParameterSpec, ParameterType, ParameterUnit, ParameterValue, QuantityKind, RebuildState,
-    ReplayAction, ReplayDisposition, RigidComponentPose, SketchId, SketchPayload,
-    SketchRegionExtrusion, SketchRegionExtrusionTarget, SketchRegionRecipeError,
-    SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
-    frame_moved_along_normal, plane_height_above_frame, reflected_profile_across_u,
-    reversed_extrusion_direction,
+    ComponentInstanceRecord, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef, DatumPlaneBase,
+    DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, FeatureDraft, FeatureId, FeatureInput,
+    FeatureKind, FeatureOutput, JointAxis, JointDraft, JointKind, JointOrigin, JointParent,
+    ModelDocument, OutputDraft, ParameterBinding, ParameterExposure, ParameterId,
+    ParameterMetadata, ParameterOverrides, ParameterSpec, ParameterType, ParameterUnit,
+    ParameterValue, QuantityKind, RebuildState, ReplayAction, ReplayDisposition,
+    ResolvedDatumPlane, RigidComponentPose, SketchId, SketchPayload, SketchRegionExtrusion,
+    SketchRegionExtrusionTarget, SketchRegionRecipeError, SketchSupportRecipe, SnapshotAssociation,
+    extrusion_frame_is_reversed, frame_moved_along_normal, plane_height_above_frame,
+    reflected_profile_across_u, reversed_extrusion_direction,
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
@@ -200,8 +201,10 @@ struct ArtificerWorkspaceFile {
     format: String,
     version: u32,
     settings: DocumentSettings,
-    #[serde(default)]
-    construction_planes: Vec<ConstructionPlane>,
+    /// Planes as files before version 7 documents kept them. Read once to
+    /// migrate them into the document (ADR 0048), and never written again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    construction_planes: Vec<LegacyConstructionPlane>,
     #[serde(default)]
     materials: Vec<BodyMaterial>,
     #[serde(default)]
@@ -229,11 +232,33 @@ struct BodyColour {
     rgb: [u8; 3],
 }
 
-/// One document-owned datum plane. Geometry is stored explicitly so the plane
-/// remains available even while its source face is absent at a history stop;
-/// `source` retains the creation intent for future associative remapping.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// A construction plane as the workbench shows it.
+///
+/// The document owns the plane: its feature's recipe is the definition and
+/// holds the frame last resolved (ADR 0048). This is the runtime view of it,
+/// rebuilt from the document whenever the runtime is, so it can never drift
+/// from what was saved. `id` is the plane's feature number, which is what the
+/// viewport and the Browser use to name it.
+#[derive(Clone, Debug, PartialEq)]
 struct ConstructionPlane {
+    id: u64,
+    name: String,
+    feature: FeatureId,
+    frame: PlanarFrame3,
+    half_u: f64,
+    half_v: f64,
+    visible: bool,
+    /// What the plane is built from, for the Browser and the card.
+    description: String,
+    /// The plane's base did not resolve at the last rebuild, so it stands
+    /// where it last was.
+    stale: bool,
+}
+
+/// A plane as a version 6 workspace envelope stored it: a frame beside a
+/// marker feature. Read only to migrate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct LegacyConstructionPlane {
     id: u64,
     name: String,
     #[serde(default)]
@@ -242,28 +267,79 @@ struct ConstructionPlane {
     half_u: f64,
     half_v: f64,
     visible: bool,
-    source: ConstructionPlaneSource,
+    #[serde(default)]
+    source: serde_json::Value,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ConstructionPlaneSource {
-    OnFace {
+/// What a staged plane is being built from, in the terms of the body on
+/// screen. Committing turns the face and edge handles into persistent
+/// references; until then they are this snapshot's own.
+#[derive(Clone, Debug, PartialEq)]
+enum StagedPlaneBase {
+    Origin(artificer_model::OriginPlane),
+    Face {
         body: BodyId,
         face: EntityRef,
     },
-    BetweenFaces {
-        first_body: BodyId,
-        first_face: EntityRef,
-        second_body: BodyId,
-        second_face: EntityRef,
+    Plane(FeatureId),
+    Midplane {
+        first: (BodyId, EntityRef),
+        second: (BodyId, EntityRef),
     },
-    FromOrigin {
-        plane_index: u8,
+    Edge {
+        body: BodyId,
+        edge: EntityRef,
+        face: EntityRef,
     },
-    FromPlane {
-        id: u64,
-    },
+    /// Reopened from a recipe: the base stays exactly what the recipe says,
+    /// and only the offset, angle and flip are edited.
+    Recipe(artificer_model::DatumPlaneBase),
+}
+
+/// The plane editor's working state while a plane is staged.
+#[derive(Clone, Debug, PartialEq)]
+struct StagedPlane {
+    base: StagedPlaneBase,
+    /// The base resolved against the model on screen, before the offset.
+    base_plane: artificer_model::ResolvedDatumPlane,
+    /// For a plane through an edge, the edge and face it turns about.
+    edge: Option<artificer_model::DatumEdgeGeometry>,
+    offset: f64,
+    angle_degrees: f64,
+    flip: bool,
+}
+
+impl StagedPlane {
+    /// Where the staged plane is now: the base, turned about the edge when it
+    /// has one, then moved by the offset and flipped.
+    fn resolved(&self) -> artificer_model::ResolvedDatumPlane {
+        let base = self
+            .edge
+            .and_then(|edge| artificer_model::datum::edge_plane(edge, self.angle_degrees).ok())
+            .unwrap_or(self.base_plane);
+        artificer_model::datum::place_on_base(base, self.offset, self.flip)
+    }
+
+    fn takes_an_angle(&self) -> bool {
+        self.edge.is_some()
+    }
+
+    fn describe(&self) -> String {
+        match &self.base {
+            StagedPlaneBase::Origin(plane) => format!("On the {}", plane.label()),
+            StagedPlaneBase::Face { .. } => "On the selected face".to_owned(),
+            StagedPlaneBase::Plane(plane) => format!("On construction plane {plane}"),
+            StagedPlaneBase::Midplane { .. } => "Halfway between the two faces".to_owned(),
+            StagedPlaneBase::Edge { .. } => "Through the selected edge".to_owned(),
+            StagedPlaneBase::Recipe(base) => {
+                let text = base.describe();
+                let mut characters = text.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(characters).collect()
+                })
+            }
+        }
+    }
 }
 
 /// Top-level presentation mode of the Artificer workbench.
@@ -398,11 +474,11 @@ enum PendingOperation {
         ordinal: u32,
         kind: QuantityKind,
     },
-    CreateConstructionPlane {
-        frame: PlanarFrame3,
-        half_u: f64,
-        half_v: f64,
-        source: ConstructionPlaneSource,
+    /// A plane in its editor. The working values are not `Copy`, so they live
+    /// in `staged_plane` beside the operation, as a Boolean's tools do.
+    StagePlane {
+        /// The committed plane this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
     },
     /// The tool bodies are picked interactively while this is staged and live
     /// in `boolean_tools`, the same way an edge finish collects `selected_edges`.
@@ -444,6 +520,8 @@ enum PendingOperation {
         second_distance: Option<f64>,
         /// The faces each side ends at, when it ends at a face.
         up_to_faces: [Option<EntityRef>; 2],
+        /// The construction planes each side ends at, when it ends at one.
+        up_to_planes: [Option<FeatureId>; 2],
         /// For an Add or Cut from a sketch on a plane rather than a face:
         /// the body the swept solid is combined with once it exists.
         boolean_target: Option<BodyId>,
@@ -535,12 +613,8 @@ impl PendingOperation {
                 QuantityKind::Angle => "Add angle variable",
                 QuantityKind::Scalar => "Add factor variable",
             },
-            Self::CreateConstructionPlane { source, .. } => match source {
-                ConstructionPlaneSource::OnFace { .. } => "Create plane on face",
-                ConstructionPlaneSource::BetweenFaces { .. } => "Create midplane",
-                ConstructionPlaneSource::FromOrigin { .. } => "Create origin datum plane",
-                ConstructionPlaneSource::FromPlane { .. } => "Create construction plane",
-            },
+            Self::StagePlane { editing: None } => "Create construction plane",
+            Self::StagePlane { editing: Some(_) } => "Edit construction plane",
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
                 BooleanOperation::Difference => "Subtract bodies",
@@ -596,20 +670,12 @@ impl PendingOperation {
                 "Delete the variable; a variable a feature or expression still uses is refused"
             }
             Self::AddUserParameter { .. } => "Create one named, reusable variable in this document",
-            Self::CreateConstructionPlane { source, .. } => match source {
-                ConstructionPlaneSource::OnFace { .. } => {
-                    "Commit a datum plane coincident with the selected planar face"
-                }
-                ConstructionPlaneSource::BetweenFaces { .. } => {
-                    "Commit a datum plane halfway between two parallel planar faces"
-                }
-                ConstructionPlaneSource::FromOrigin { .. } => {
-                    "Commit a datum plane on the selected origin plane"
-                }
-                ConstructionPlaneSource::FromPlane { .. } => {
-                    "Commit a datum plane on the selected construction plane"
-                }
-            },
+            Self::StagePlane { editing: None } => {
+                "Drag the arrow or type an offset, then confirm to add the plane to the history"
+            }
+            Self::StagePlane { editing: Some(_) } => {
+                "Confirm to rewrite the plane and replay everything built on it"
+            }
             Self::BooleanBodies { .. } => {
                 "Click the tool bodies to combine with the target, then confirm to publish a validated successor"
             }
@@ -677,11 +743,10 @@ impl PendingOperation {
                 object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
                 object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
-            Self::CreateConstructionPlane { source, .. } => {
-                object.insert(
-                    "plane_source".to_owned(),
-                    serde_json::json!(format!("{source:?}")),
-                );
+            Self::StagePlane { editing } => {
+                if let Some(feature) = editing {
+                    object.insert("editing".to_owned(), serde_json::json!(feature.get()));
+                }
             }
             Self::BooleanBodies {
                 target,
@@ -968,6 +1033,7 @@ pub struct ExtrusionRecord {
     mode: ExtrusionMode,
     second_distance: Option<f64>,
     up_to_faces: [Option<PersistentRef>; 2],
+    up_to_planes: [Option<FeatureId>; 2],
 }
 
 /// Where one side of an extrusion ends.
@@ -981,13 +1047,22 @@ pub enum ExtrusionExtentIntent {
     /// At this face, parallel to the sketch plane; the side's distance is
     /// the length measured to it.
     ToFace(EntityRef),
+    /// At this construction plane, parallel to the sketch plane (ADR 0048).
+    ToPlane(FeatureId),
 }
 
 impl ExtrusionExtentIntent {
     const fn face(self) -> Option<EntityRef> {
         match self {
             Self::ToFace(face) => Some(face),
-            Self::Distance | Self::PickingFace => None,
+            Self::Distance | Self::PickingFace | Self::ToPlane(_) => None,
+        }
+    }
+
+    const fn plane(self) -> Option<FeatureId> {
+        match self {
+            Self::ToPlane(plane) => Some(plane),
+            Self::Distance | Self::PickingFace | Self::ToFace(_) => None,
         }
     }
 }
@@ -1262,6 +1337,9 @@ fn model_segments_share_tangent_endpoint(first: [Point3; 2], second: [Point3; 2]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FeaturePreviewKind {
     Origin,
+    /// A construction plane: a chip of its own, named by its feature, with
+    /// the same right-click menu as any other feature (ADR 0048).
+    Plane,
     BaseBody,
     Component,
     Sketch,
@@ -1280,6 +1358,8 @@ struct FeaturePreviewEntry {
     finished: bool,
     /// Stable lineage colour/group for related sketch and solid features.
     group: u64,
+    /// The feature's own name, for chips the user can rename.
+    name: Option<String>,
 }
 
 impl FeaturePreviewEntry {
@@ -1290,12 +1370,17 @@ impl FeaturePreviewEntry {
             revision: 0,
             finished: true,
             group: 0,
+            name: None,
         }
     }
 
     fn label(&self) -> String {
         match self.kind {
             FeaturePreviewKind::Origin => "Origin".to_owned(),
+            FeaturePreviewKind::Plane => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Plane {}", self.ordinal)),
             FeaturePreviewKind::BaseBody => "Base body".to_owned(),
             FeaturePreviewKind::Component => format!("Component {}", self.ordinal),
             FeaturePreviewKind::Sketch => {
@@ -1387,6 +1472,7 @@ impl FeaturePreviewState {
                 .max()
                 .unwrap_or(0)
                 .saturating_add(1),
+            name: None,
         });
         self.active_sketch = Some(self.entries.len() - 1);
     }
@@ -1438,6 +1524,7 @@ impl FeaturePreviewState {
                     || self.entries.last().map_or(0, |entry| entry.group),
                     |entry| entry.group,
                 ),
+            name: None,
         });
     }
 
@@ -2058,16 +2145,24 @@ struct TimelineContextMenu {
 enum TimelineContextCommand {
     /// Reopen the 3D editor the feature was made in.
     Edit,
+    /// Reopen a construction plane's editor (ADR 0048).
+    EditPlane,
+    Rename,
     Suppress,
     Restore,
+    /// Delete a construction plane nothing is built on.
+    DeletePlane,
 }
 
 impl TimelineContextCommand {
     const fn label(self) -> &'static str {
         match self {
             Self::Edit => "Edit this extrusion",
+            Self::EditPlane => "Edit this plane",
+            Self::Rename => "Rename…",
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
+            Self::DeletePlane => "Delete this plane",
         }
     }
 }
@@ -2519,9 +2614,16 @@ pub struct KernelLabApp {
     /// closing its own), drained by the shell every frame.
     shell_requests: Vec<documents::ShellRequest>,
     document_settings: DocumentSettings,
+    /// The document's construction planes, as the runtime shows them.
     construction_planes: Vec<ConstructionPlane>,
-    next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
+    /// The plane editor's working values while `StagePlane` is pending.
+    staged_plane: Option<StagedPlane>,
+    /// A plane being renamed from the history or the Browser, and its text.
+    plane_rename: Option<(FeatureId, String)>,
+    /// Planes whose base did not resolve at the last rebuild; each stands on
+    /// the frame it last resolved to until its base comes back.
+    stale_planes: BTreeSet<FeatureId>,
     document_properties_open: bool,
     pending_export: Option<PendingExport>,
     /// The document's revision the last time it was saved or loaded. The
@@ -2819,8 +2921,10 @@ impl Default for KernelLabApp {
             shell_requests: Vec::new(),
             document_settings: DocumentSettings::default(),
             construction_planes: Vec::new(),
-            next_construction_plane_id: 1,
             selected_construction_plane: None,
+            staged_plane: None,
+            plane_rename: None,
+            stale_planes: BTreeSet::new(),
             document_properties_open: false,
             pending_export: None,
             saved_revision: 0,
@@ -3444,7 +3548,7 @@ impl KernelLabApp {
                 navigation: self.navigation_preference,
                 ..self.document_settings
             },
-            construction_planes: self.construction_planes.clone(),
+            construction_planes: Vec::new(),
             document: self.document.clone(),
         })
         .map_err(|error| error.to_string())
@@ -3579,14 +3683,7 @@ impl KernelLabApp {
         // only so older builds keep reading, and adopting it here would let
         // every opened document overwrite how the user's mouse behaves.
         self.document_settings.navigation = self.navigation_preference;
-        self.construction_planes = workspace.construction_planes;
-        self.next_construction_plane_id = self
-            .construction_planes
-            .iter()
-            .map(|plane| plane.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        self.adopt_legacy_construction_planes(&workspace.construction_planes)?;
         self.selected_construction_plane = None;
         // Restore material assignments by stable key. A key this build does
         // not carry leaves that body unassigned rather than substituting a
@@ -3690,6 +3787,23 @@ impl KernelLabApp {
     #[must_use]
     pub fn selected_face(&self) -> Option<viewport::DocumentFaceSelection> {
         self.selected_faces.last().copied()
+    }
+
+    /// The staged plane's offset from its base, while the plane editor is
+    /// open.
+    #[must_use]
+    pub fn staged_plane_offset(&self) -> Option<f64> {
+        self.staged_plane.as_ref().map(|staged| staged.offset)
+    }
+
+    /// The names of the construction planes the model shows, in history
+    /// order.
+    #[must_use]
+    pub fn construction_plane_names(&self) -> Vec<String> {
+        self.construction_planes
+            .iter()
+            .map(|plane| plane.name.clone())
+            .collect()
     }
 
     #[must_use]
@@ -4235,6 +4349,119 @@ impl KernelLabApp {
         }
     }
 
+    /// Gives the plane markers of a version 6 file the recipes its envelope
+    /// kept frames for. Their snapshot-local sources cannot be named after
+    /// the fact, so each becomes a fixed plane where it stood (ADR 0048).
+    fn adopt_legacy_construction_planes(
+        &mut self,
+        legacy: &[LegacyConstructionPlane],
+    ) -> Result<(), String> {
+        let recipes = legacy
+            .iter()
+            .filter_map(|plane| {
+                let feature = plane.feature?;
+                let frame = artificer_model::datum::orthonormal_frame(plane.frame)?;
+                let mut recipe = DatumPlaneRecipe::new(
+                    DatumPlaneBase::Fixed { frame },
+                    ResolvedDatumPlane {
+                        frame,
+                        half_extent: [plane.half_u, plane.half_v],
+                    },
+                );
+                recipe.visible = plane.visible;
+                Some((feature, recipe))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if recipes.is_empty() {
+            return Ok(());
+        }
+        self.document
+            .adopt_legacy_datum_planes(recipes)
+            .map_err(|error| {
+                format!("Artificer workspace planes could not be migrated: {error}")
+            })?;
+        self.restore_runtime_from_document();
+        Ok(())
+    }
+
+    /// Rebuilds the runtime planes from the document's plane features.
+    ///
+    /// A plane is shown when it is inside the history cursor, not suppressed,
+    /// and committed; the frame is the one its recipe last resolved to. The
+    /// sketches drawn on a plane take that frame too, so what the viewport
+    /// draws is what replay used.
+    fn sync_construction_planes_from_document(&mut self) {
+        let mut planes = Vec::new();
+        for feature in self.document.features() {
+            let ReplayAction::DatumPlane(recipe) = &feature.action else {
+                continue;
+            };
+            if feature.kind != FeatureKind::DatumPlane
+                || !self.document.feature_is_active(feature.id).unwrap_or(false)
+                || feature.state.suppressed
+                || feature.committed.is_none()
+            {
+                continue;
+            }
+            let stale = self.stale_planes.contains(&feature.id);
+            let mut description = recipe.base.describe();
+            if let Some(first) = description.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            planes.push(ConstructionPlane {
+                id: feature.id.get(),
+                name: feature.label.clone(),
+                feature: feature.id,
+                frame: recipe.frame,
+                half_u: recipe.half_extent[0],
+                half_v: recipe.half_extent[1],
+                visible: recipe.visible,
+                description,
+                stale,
+            });
+        }
+        self.construction_planes = planes;
+        if self
+            .selected_construction_plane
+            .is_some_and(|id| !self.construction_planes.iter().any(|plane| plane.id == id))
+        {
+            self.selected_construction_plane = None;
+        }
+        let frame_of = |plane: u64| {
+            self.construction_planes
+                .iter()
+                .find(|candidate| candidate.id == plane)
+                .map(|candidate| candidate.frame)
+        };
+        let sketch_frames = self
+            .sketches
+            .iter()
+            .map(|sketch| match &sketch.support {
+                SketchSupport::ConstructionPlane { id: Some(id), .. } => frame_of(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (sketch, frame) in self.sketches.iter_mut().zip(sketch_frames) {
+            if let (Some(frame), SketchSupport::ConstructionPlane { frame: held, .. }) =
+                (frame, &mut sketch.support)
+            {
+                **held = frame;
+            }
+        }
+        if let SketchSupport::ConstructionPlane {
+            id: Some(id),
+            frame,
+        } = &mut self.sketch_support
+            && let Some(current) = self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+                .map(|plane| plane.frame)
+        {
+            **frame = current;
+        }
+    }
+
     fn rebind_construction_plane_sketch_supports(&mut self) {
         let resolve = |frame: PlanarFrame3| {
             self.construction_planes
@@ -4494,7 +4721,7 @@ impl KernelLabApp {
                 | PendingOperation::SetParameterBindingEntry { .. }
                 | PendingOperation::RemoveParameter { .. }
                 | PendingOperation::AddUserParameter { .. }
-                | PendingOperation::CreateConstructionPlane { .. }
+                | PendingOperation::StagePlane { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
                 | PendingOperation::SketchEdit { .. }
@@ -4612,8 +4839,9 @@ impl KernelLabApp {
         self.body_archive.clear();
         self.bootstrap_body = None;
         self.construction_planes.clear();
-        self.next_construction_plane_id = 1;
         self.selected_construction_plane = None;
+        self.staged_plane = None;
+        self.plane_rename = None;
         self.displayed = None;
         self.bodies.clear();
         self.sketches.clear();
@@ -4914,6 +5142,17 @@ impl KernelLabApp {
                         SketchSupport::Origin { plane }
                     }
                 }
+                Some(SketchSupportRecipe::DatumPlane { plane }) => {
+                    SketchSupport::ConstructionPlane {
+                        id: Some(plane.get()),
+                        frame: Box::new(document.sketch_frame(record.id).unwrap_or_else(|| {
+                            payload
+                                .as_ref()
+                                .expect("the support came from a payload")
+                                .frame
+                        })),
+                    }
+                }
                 Some(SketchSupportRecipe::PlanarFace { body, face }) => {
                     let head = hydrated.branch_heads.get(body).copied().ok_or_else(|| {
                         format!("sketch {} support body {} is unavailable", record.id, body)
@@ -5127,6 +5366,8 @@ impl KernelLabApp {
             .active_features()
             .last()
             .map(|feature| feature.id);
+        self.stale_planes.clear();
+        self.sync_construction_planes_from_document();
         self.sync_feature_preview_from_document();
         self.frame_visible_document();
         self.last_attempt = Attempt::Accepted {
@@ -5506,7 +5747,7 @@ impl KernelLabApp {
         let mut active = Vec::new();
         let mut missing = Vec::new();
         for node in self.document.features() {
-            if node.action == ReplayAction::Marker {
+            if node.action.is_document_only() {
                 continue;
             }
             let Some(association) = node.committed else {
@@ -5547,10 +5788,20 @@ impl KernelLabApp {
         entity: EntityRef,
         before: Option<FeatureId>,
     ) -> Option<PersistentRef> {
+        self.persistent_ref_for_entity_in(entity, before, self.active_body_id()?)
+    }
+
+    /// The same identity, named through the history of `body` rather than of
+    /// the active body: a plane between faces of two bodies names both.
+    fn persistent_ref_for_entity_in(
+        &self,
+        entity: EntityRef,
+        before: Option<FeatureId>,
+        active_body: BodyId,
+    ) -> Option<PersistentRef> {
         if !matches!(entity.kind, EntityKind::Face | EntityKind::Edge) {
             return None;
         }
-        let active_body = self.active_body_id()?;
         let position = |id: FeatureId| {
             self.document
                 .features()
@@ -5654,7 +5905,7 @@ impl KernelLabApp {
         for feature in self.document.features() {
             let kind = match feature.kind {
                 FeatureKind::Origin => FeaturePreviewKind::Origin,
-                FeatureKind::DatumPlane => FeaturePreviewKind::Origin,
+                FeatureKind::DatumPlane => FeaturePreviewKind::Plane,
                 FeatureKind::BaseBody if feature.component_instance.is_some() => {
                     FeaturePreviewKind::Component
                 }
@@ -5705,7 +5956,7 @@ impl KernelLabApp {
                 }
                 _ => None,
             };
-            let group = if matches!(kind, FeaturePreviewKind::Origin) {
+            let group = if matches!(kind, FeaturePreviewKind::Origin | FeaturePreviewKind::Plane) {
                 0
             } else if matches!(kind, FeaturePreviewKind::Sketch) {
                 feature.id.get()
@@ -5738,6 +5989,15 @@ impl KernelLabApp {
                 revision,
                 finished: kind == FeaturePreviewKind::Sketch,
                 group,
+                // A plane whose base did not resolve stands where it last
+                // was, and its chip says so (ADR 0048).
+                name: (kind == FeaturePreviewKind::Plane).then(|| {
+                    if self.stale_planes.contains(&feature.id) {
+                        format!("{} · held", feature.label)
+                    } else {
+                        feature.label.clone()
+                    }
+                }),
             });
         }
         self.feature_preview = FeaturePreviewState {
@@ -5879,6 +6139,7 @@ impl KernelLabApp {
             .and_then(|sketch| sketch.consumed.then_some(sketch.revision));
         self.selected_faces.clear();
         self.history_scrub_position = self.document.history_position();
+        self.sync_construction_planes_from_document();
         self.sync_feature_preview_from_document();
     }
 
@@ -6022,6 +6283,11 @@ impl KernelLabApp {
         // Sides that end at a face and could not be measured again. The
         // rebuild still succeeds, so nothing else would ever mention them.
         let mut lost_targets = Vec::<String>::new();
+        // Planes resolved so far in this rebuild, which the sketches drawn on
+        // them and the sides that end at them read before the document's
+        // cached frames are refreshed (ADR 0048).
+        let mut plane_frames = BTreeMap::<FeatureId, ResolvedDatumPlane>::new();
+        let mut stale_planes = BTreeSet::<FeatureId>::new();
 
         while let Some(step) = transaction.next_executable_step().cloned() {
             debug_assert_eq!(step.disposition, ReplayDisposition::Execute);
@@ -6070,8 +6336,13 @@ impl KernelLabApp {
             // A side that ends at a face is measured against the body as it
             // now stands, before the regions resolve: that is what makes it
             // follow the face instead of freezing the length it first had.
-            let (action, lost_here) =
-                self.remeasured_sketch_region_extents(action, &reports, &input, &rebuilt_bodies);
+            let (action, lost_here) = self.remeasured_sketch_region_extents(
+                action,
+                &reports,
+                &input,
+                &rebuilt_bodies,
+                &plane_frames,
+            );
             for (side, reason) in lost_here {
                 let label = self
                     .document
@@ -6083,9 +6354,36 @@ impl KernelLabApp {
                     reason.describe()
                 ));
             }
-            let action = match action.resolve_sketch_regions(
+            // A plane is placed again against the bodies as they now stand.
+            // A base that no longer resolves leaves the plane where it last
+            // was, and says so; the rebuild does not fail for it.
+            if let ReplayAction::DatumPlane(recipe) = &action {
+                let resolver = ModelPlaneResolver::new(
+                    &self.document,
+                    &reports,
+                    std::iter::once(&input)
+                        .chain(rebuilt_bodies.iter().rev().map(|body| &body.body.snapshot))
+                        .chain(self.bodies.iter().map(|body| &body.body.snapshot)),
+                    &plane_frames,
+                );
+                let placed = match recipe.resolve(&resolver) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        let label = self
+                            .document
+                            .feature(feature)
+                            .map_or_else(|| "A plane".to_owned(), |node| node.label.clone());
+                        lost_targets.push(format!("{label} stayed where it was because {error}"));
+                        stale_planes.insert(feature);
+                        recipe.cached()
+                    }
+                };
+                plane_frames.insert(feature, placed);
+            }
+            let action = match action.resolve_sketch_regions_with_planes(
                 &self.document,
                 input.precision_policy().unwrap_or_default(),
+                &plane_frames,
             ) {
                 Ok(action) => action,
                 Err(error) => {
@@ -6102,7 +6400,7 @@ impl KernelLabApp {
                 Boolean(artificer_model::BooleanFeatureRecipe),
             }
             let dispatch = match action {
-                ReplayAction::Marker => RebuildDispatch::Marker,
+                ReplayAction::Marker | ReplayAction::DatumPlane(_) => RebuildDispatch::Marker,
                 ReplayAction::Kernel(command) => RebuildDispatch::Command(command),
                 ReplayAction::TargetedKernel(targeted) => {
                     let ordered = self
@@ -6291,6 +6589,16 @@ impl KernelLabApp {
         if let Err(error) = self.document.commit_rebuild(transaction) {
             self.document_status = Some(format!("Rebuild commit rejected: {error}"));
             return false;
+        }
+        // The frames the rebuild placed its planes at become the planes'
+        // cached frames, and the frames of the sketches drawn on them.
+        self.document.refresh_datum_plane_frames(&plane_frames);
+        for plane in plane_frames.keys() {
+            if stale_planes.contains(plane) {
+                self.stale_planes.insert(*plane);
+            } else {
+                self.stale_planes.remove(plane);
+            }
         }
         for rebuilt in rebuilt_bodies {
             if !self
@@ -7001,21 +7309,20 @@ impl KernelLabApp {
                 )
             })
             .collect::<Vec<_>>();
-        if let Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            ..
-        }) = self.pending_operation
+        if let (Some(placed), Some(handles)) =
+            (self.staged_plane_preview(), self.staged_plane_handles())
         {
-            planes.push(reference_plane_overlay(
-                frame,
-                half_u,
-                half_v,
-                false,
-                None,
-                "Plane preview",
-            ));
+            planes.push(
+                reference_plane_overlay(
+                    placed.frame,
+                    placed.half_extent[0],
+                    placed.half_extent[1],
+                    false,
+                    None,
+                    &self.staged_plane_label(),
+                )
+                .with_datum_handles(handles),
+            );
         }
         planes.extend(self.section_plane_overlay());
         // A genuinely blank document still presents its three usable origin
@@ -7053,14 +7360,12 @@ impl KernelLabApp {
                 plane.half_v,
             ));
         }
-        if let Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            ..
-        }) = self.pending_operation
-        {
-            points.extend(reference_plane_corners(frame, half_u, half_v));
+        if let Some(staged) = self.staged_plane_preview() {
+            points.extend(reference_plane_corners(
+                staged.frame,
+                staged.half_extent[0],
+                staged.half_extent[1],
+            ));
         }
         if self.origin_reference_planes_visible() {
             for plane in SketchPlane::ALL {
@@ -7117,9 +7422,9 @@ impl KernelLabApp {
     }
 
     fn construction_plane_is_active(&self, plane: &ConstructionPlane) -> bool {
-        plane
-            .feature
-            .is_none_or(|feature| self.document.feature_is_active(feature).unwrap_or(false))
+        self.document
+            .feature_is_active(plane.feature)
+            .unwrap_or(false)
     }
 
     fn sync_active_sketch_record(&mut self) {
@@ -7203,10 +7508,25 @@ impl KernelLabApp {
             .validate(PrecisionPolicy::default())
             .map_err(|error| format!("the editable sketch graph is invalid: {error}"))?;
         let profile = self.current_canvas_profile_payload();
+        // A sketch on a construction plane names the plane and depends on
+        // it, so it moves with the plane (ADR 0048). One on a plane that is
+        // not a feature — a legacy copy of a frame — keeps its frame alone.
+        let support_plane = match &self.sketch_support {
+            SketchSupport::ConstructionPlane { id: Some(id), .. } => self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+                .map(|plane| plane.feature),
+            _ => None,
+        };
         let support = match &self.sketch_support {
+            SketchSupport::ConstructionPlane { .. } if support_plane.is_some() => {
+                SketchSupportRecipe::DatumPlane {
+                    plane: support_plane.expect("checked just above"),
+                }
+            }
             SketchSupport::Origin { .. } | SketchSupport::ConstructionPlane { .. } => {
-                // The exact frame is carried by the payload. The workspace
-                // envelope owns the datum-plane identity and provenance.
+                // The exact frame is carried by the payload.
                 SketchSupportRecipe::Origin
             }
             SketchSupport::PlanarFace { body, face, .. } => {
@@ -7280,6 +7600,9 @@ impl KernelLabApp {
         )
         .with_sketch_payload(payload)
         .with_commit(sketch_commit);
+        if let Some(plane) = support_plane {
+            draft = draft.with_input(FeatureInput::Feature(plane));
+        }
         draft = if let Some(body) = self.sketch_support.body() {
             draft
                 .with_output(OutputDraft::CreateSketch {
@@ -7352,7 +7675,9 @@ impl KernelLabApp {
                 Some(second) => recipe.with_second_side(second)?,
                 None => recipe,
             };
-            recipe.with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())
+            recipe
+                .with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())?
+                .with_up_to_planes(record.up_to_planes[0], record.up_to_planes[1])
         };
         // A feature on a face grows from that face and has no second side, but
         // its one side may still end at a face the user picked. Dropping that
@@ -7360,7 +7685,9 @@ impl KernelLabApp {
         // so it stopped following the face it was told to reach.
         let with_front_face =
             |recipe: SketchRegionExtrusion| -> Result<_, SketchRegionRecipeError> {
-                recipe.with_up_to_faces(record.up_to_faces[0].clone(), None)
+                recipe
+                    .with_up_to_faces(record.up_to_faces[0].clone(), None)?
+                    .with_up_to_planes(record.up_to_planes[0], None)
             };
         let kind = match mode {
             ExtrusionMode::NewBody => FeatureKind::Extrude,
@@ -7502,12 +7829,24 @@ impl KernelLabApp {
             .collect::<Vec<_>>();
         target_producers.sort_unstable();
         target_producers.dedup();
-        eprintln!(
-            "TRACE append up_to_faces {:?} producers {target_producers:?}",
-            record.up_to_faces
-        );
         for producer in target_producers {
             draft = draft.with_dependency(producer);
+        }
+        // A side that ends at a plane names the plane as an input: moving
+        // the plane rebuilds the extrusion, and the plane cannot be deleted
+        // from under it.
+        let mut end_planes = record
+            .up_to_planes
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        if mode != ExtrusionMode::NewBody {
+            end_planes.truncate(1);
+        }
+        end_planes.dedup();
+        for plane in end_planes {
+            draft = draft.with_input(FeatureInput::Feature(plane));
         }
         match mode {
             ExtrusionMode::NewBody => {
@@ -8156,198 +8495,512 @@ impl KernelLabApp {
         }
     }
 
+    /// Stages a construction plane on what is picked (ADR 0048).
+    ///
+    /// A face gives a plane on the face; two parallel faces give their
+    /// midplane; a straight edge gives a plane through it, lying on the face
+    /// picked with it or on the planar face beside it; a construction plane
+    /// or an origin plane gives a plane on top of it. The plane is drawn where
+    /// it will go and moved with its handles or the card's fields until it is
+    /// confirmed.
     fn stage_construction_plane(&mut self) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
-        if self.selected_faces.is_empty() {
-            if let Some(id) = self.selected_construction_plane
-                && let Some(plane) = self
-                    .construction_planes
-                    .iter()
-                    .find(|p| p.id == id)
-                    .cloned()
-            {
-                self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-                    frame: plane.frame,
-                    half_u: plane.half_u,
-                    half_v: plane.half_v,
-                    source: ConstructionPlaneSource::FromPlane { id: plane.id },
-                });
-                self.document_status =
-                    Some("Construction plane staged · confirm with Enter or the green tick".into());
-                return;
-            }
-            let plane = self.selected_origin_plane;
-            let frame = sketch_plane_frame(plane);
-            let plane_index = match plane {
-                SketchPlane::XY => 0,
-                SketchPlane::YZ => 1,
-                SketchPlane::XZ => 2,
-            };
-            self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-                frame,
-                half_u: ORIGIN_PLANE_HALF_EXTENT_MM,
-                half_v: ORIGIN_PLANE_HALF_EXTENT_MM,
-                source: ConstructionPlaneSource::FromOrigin { plane_index },
-            });
-            self.document_status = Some(format!(
-                "{} construction plane staged · confirm with Enter or the green tick",
-                origin_plane_label(plane)
-            ));
-            return;
-        }
-        if self.selected_faces.len() > 2 {
-            self.document_status = Some(
-                "Select one planar face for a coincident plane, or two parallel planar faces for a midplane"
-                    .into(),
-            );
-            return;
-        }
-        let supports = self
-            .selected_faces
-            .iter()
-            .map(|selection| {
-                let body = self
-                    .bodies
-                    .iter()
-                    .find(|body| body.id.get() == selection.body.get())
-                    .ok_or_else(|| "the selected face body is no longer available".to_owned())?;
-                let support =
-                    NativeKernel::planar_face_support(&body.body.snapshot, selection.face)
-                        .map_err(|error| format!("the selected face is not planar: {error}"))?;
-                let (frame, half_u, half_v) = centered_plane_frame(&support)?;
-                Ok((body.id, selection.face, frame, half_u, half_v))
-            })
-            .collect::<Result<Vec<_>, String>>();
-        let supports = match supports {
-            Ok(supports) => supports,
+        let staged = match self.staged_plane_from_selection() {
+            Ok(staged) => staged,
             Err(error) => {
                 self.document_status = Some(format!("Plane creation rejected: {error}"));
                 return;
             }
         };
-        let (frame, half_u, half_v, source) = match supports.as_slice() {
-            [(body, face, frame, half_u, half_v)] => (
-                *frame,
-                *half_u,
-                *half_v,
-                ConstructionPlaneSource::OnFace {
-                    body: *body,
-                    face: *face,
-                },
-            ),
-            [first, second] => {
-                let Some(first_normal) = frame_normal(first.2) else {
-                    self.document_status =
-                        Some("Plane creation rejected: invalid first face frame".into());
-                    return;
-                };
-                let Some(second_normal) = frame_normal(second.2) else {
-                    self.document_status =
-                        Some("Plane creation rejected: invalid second face frame".into());
-                    return;
-                };
-                if dot_vector(first_normal, second_normal).abs() < 1.0 - 1.0e-8 {
-                    self.document_status = Some(
-                        "Plane creation rejected: the two selected faces must be parallel".into(),
-                    );
-                    return;
-                }
-                let separation = dot_vector(
-                    Vector3::new(
-                        second.2.origin.x - first.2.origin.x,
-                        second.2.origin.y - first.2.origin.y,
-                        second.2.origin.z - first.2.origin.z,
-                    ),
-                    first_normal,
-                );
-                let origin = Point3::new(
-                    first.2.origin.x + 0.5 * separation * first_normal.x,
-                    first.2.origin.y + 0.5 * separation * first_normal.y,
-                    first.2.origin.z + 0.5 * separation * first_normal.z,
-                );
-                (
-                    PlanarFrame3::new(origin, first.2.u, first.2.v),
-                    first.3.max(second.3),
-                    first.4.max(second.4),
-                    ConstructionPlaneSource::BetweenFaces {
-                        first_body: first.0,
-                        first_face: first.1,
-                        second_body: second.0,
-                        second_face: second.1,
-                    },
-                )
-            }
-            _ => unreachable!("the selection count was bounded above"),
-        };
-        self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            source,
-        });
-        self.document_status = Some(if supports.len() == 1 {
-            "Coincident plane staged · confirm with Enter or the green tick".into()
-        } else {
-            "Midplane staged · confirm with Enter or the green tick".into()
-        });
+        let description = staged.describe();
+        self.begin_plane_editor(staged, None);
+        self.document_status = Some(format!(
+            "{description} · drag the arrow or type an offset, then confirm with Enter or the green tick"
+        ));
     }
 
-    fn commit_construction_plane(
-        &mut self,
-        frame: PlanarFrame3,
-        half_u: f64,
-        half_v: f64,
-        source: ConstructionPlaneSource,
-    ) {
-        let id = self.next_construction_plane_id;
-        self.next_construction_plane_id = id.saturating_add(1);
-        self.construction_planes.push(ConstructionPlane {
-            id,
-            name: format!("Plane {id}"),
-            feature: None,
-            frame,
-            half_u,
-            half_v,
-            visible: true,
-            source,
-        });
-        let association = self.displayed.as_ref().map_or_else(
-            || {
-                SnapshotAssociation::new(
-                    self.empty_snapshot.id(),
-                    self.empty_snapshot.id(),
-                    self.empty_snapshot.semantic_digest(),
-                )
-            },
-            |displayed| {
-                SnapshotAssociation::new(
-                    displayed.snapshot.id(),
-                    displayed.snapshot.id(),
-                    displayed.snapshot.semantic_digest(),
-                )
-            },
-        );
-        if let Ok(appended) = self.document.append_feature(
-            FeatureDraft::new(
-                FeatureKind::DatumPlane,
-                format!("Plane {id}"),
-                ReplayAction::Marker,
-            )
-            .with_commit(association),
-        ) {
-            if let Some(plane) = self.construction_planes.last_mut() {
-                plane.feature = Some(appended.feature);
-            }
-            self.selected_history_feature = Some(appended.feature);
-            self.history_scrub_position = self.document.history_position();
-            self.sync_feature_preview_from_document();
-        }
-        self.selected_construction_plane = Some(id);
+    /// Opens the plane editor on `staged`.
+    fn begin_plane_editor(&mut self, staged: StagedPlane, editing: Option<FeatureId>) {
+        self.staged_plane = Some(staged);
+        self.pending_operation = Some(PendingOperation::StagePlane { editing });
         self.clear_model_entity_selection();
+    }
+
+    /// Reads what the user has picked as the base of a new plane.
+    fn staged_plane_from_selection(&self) -> Result<StagedPlane, String> {
+        let body_of = |key: viewport::BodyInstanceKey| {
+            self.bodies
+                .iter()
+                .find(|body| body.id.get() == key.get())
+                .ok_or_else(|| "the selected body is no longer available".to_owned())
+        };
+        let staged = |base, base_plane, edge| StagedPlane {
+            base,
+            base_plane,
+            edge,
+            offset: 0.0,
+            angle_degrees: 0.0,
+            flip: false,
+        };
+        if let Some(edge) = self
+            .selected_edges
+            .first()
+            .copied()
+            .or_else(|| self.selected_edge())
+        {
+            let body = body_of(edge.body)?;
+            // The face the plane starts on: the one picked with the edge, or
+            // else the one planar face beside the edge.
+            let face = match self.selected_faces.first() {
+                Some(face) if face.body == edge.body => face.face,
+                Some(_) => return Err("pick the edge and a face of the same body".to_owned()),
+                None => planar_faces_beside_edge(&body.body, edge.edge)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "the edge has no flat face beside it to turn from".to_owned())?,
+            };
+            let geometry = datum_edge_geometry(&body.body.snapshot, edge.edge, face)
+                .map_err(|error| error.to_string())?;
+            let base_plane = artificer_model::datum::edge_plane(geometry, 0.0)
+                .map_err(|error| error.to_string())?;
+            return Ok(staged(
+                StagedPlaneBase::Edge {
+                    body: body.id,
+                    edge: edge.edge,
+                    face,
+                },
+                base_plane,
+                Some(geometry),
+            ));
+        }
+        match self.selected_faces.as_slice() {
+            [] => {}
+            [face] => {
+                let body = body_of(face.body)?;
+                let geometry = datum_face_geometry(&body.body.snapshot, face.face)
+                    .map_err(|error| format!("the selected face cannot carry a plane: {error}"))?;
+                return Ok(staged(
+                    StagedPlaneBase::Face {
+                        body: body.id,
+                        face: face.face,
+                    },
+                    ResolvedDatumPlane {
+                        frame: geometry.frame,
+                        half_extent: geometry.half_extent,
+                    },
+                    None,
+                ));
+            }
+            [first, second] => {
+                let first_body = body_of(first.body)?;
+                let second_body = body_of(second.body)?;
+                let first_geometry = datum_face_geometry(&first_body.body.snapshot, first.face)
+                    .map_err(|error| format!("the first face cannot carry a plane: {error}"))?;
+                let second_geometry = datum_face_geometry(&second_body.body.snapshot, second.face)
+                    .map_err(|error| format!("the second face cannot carry a plane: {error}"))?;
+                let base_plane = artificer_model::datum::midplane(first_geometry, second_geometry)
+                    .map_err(|error| error.to_string())?;
+                return Ok(staged(
+                    StagedPlaneBase::Midplane {
+                        first: (first_body.id, first.face),
+                        second: (second_body.id, second.face),
+                    },
+                    base_plane,
+                    None,
+                ));
+            }
+            _ => {
+                return Err(
+                    "select one planar face, two parallel planar faces, or a straight edge"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(id) = self.selected_construction_plane
+            && let Some(plane) = self.construction_planes.iter().find(|plane| plane.id == id)
+        {
+            return Ok(staged(
+                StagedPlaneBase::Plane(plane.feature),
+                ResolvedDatumPlane {
+                    frame: plane.frame,
+                    half_extent: [plane.half_u, plane.half_v],
+                },
+                None,
+            ));
+        }
+        let origin = origin_plane_for_sketch_plane(self.selected_origin_plane);
+        Ok(staged(
+            StagedPlaneBase::Origin(origin),
+            ResolvedDatumPlane {
+                frame: origin.frame(),
+                half_extent: [artificer_model::datum::ORIGIN_DATUM_HALF_EXTENT; 2],
+            },
+            None,
+        ))
+    }
+
+    /// Where the staged plane would go, while one is staged.
+    fn staged_plane_preview(&self) -> Option<ResolvedDatumPlane> {
+        matches!(
+            self.pending_operation,
+            Some(PendingOperation::StagePlane { .. })
+        )
+        .then(|| self.staged_plane.as_ref().map(StagedPlane::resolved))
+        .flatten()
+    }
+
+    /// The staged plane's arrow and, through an edge, its turning arc.
+    fn staged_plane_handles(&self) -> Option<viewport::DatumPlaneHandles> {
+        let staged = self.staged_plane.as_ref()?;
+        // The arrow stands on the plane's own base: the turned plane for one
+        // through an edge, so the offset always runs square to the card.
+        let base = staged
+            .edge
+            .and_then(|edge| artificer_model::datum::edge_plane(edge, staged.angle_degrees).ok())
+            .unwrap_or(staged.base_plane);
+        let normal = frame_normal(base.frame)?;
+        let reach = base.half_extent[0].max(base.half_extent[1]);
+        let turn = staged.edge.map(|edge| viewport::DatumTurnHandle {
+            hinge: Point3::new(
+                0.5 * (edge.start.x + edge.end.x),
+                0.5 * (edge.start.y + edge.end.y),
+                0.5 * (edge.start.z + edge.end.z),
+            ),
+            zero: edge.into_face,
+            up: edge.face_normal,
+            // The card hangs off the edge and is twice its half-extent deep;
+            // the knob sits three quarters of the way out, on the card but
+            // near enough the hinge to stay on screen as the card lifts.
+            radius: 1.5 * base.half_extent[1],
+            angle_degrees: staged.angle_degrees,
+        });
+        Some(viewport::DatumPlaneHandles {
+            anchor: base.frame.origin,
+            normal,
+            offset: staged.offset,
+            arrow_length: (0.45 * reach).max(1.0),
+            turn,
+        })
+    }
+
+    fn staged_plane_label(&self) -> String {
+        match self.pending_operation {
+            Some(PendingOperation::StagePlane {
+                editing: Some(feature),
+            }) => self
+                .document
+                .feature(feature)
+                .map_or_else(|| "Plane".to_owned(), |node| node.label.clone()),
+            _ => format!("Plane {}", self.next_plane_ordinal()),
+        }
+    }
+
+    /// The number the next plane's name takes: one more than any plane in
+    /// the document, so names are never reused within a document.
+    fn next_plane_ordinal(&self) -> u32 {
+        self.document
+            .features()
+            .iter()
+            .filter(|feature| feature.kind == FeatureKind::DatumPlane)
+            .filter_map(|feature| {
+                feature
+                    .label
+                    .strip_prefix("Plane ")
+                    .and_then(|number| number.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Moves the staged plane's offset, as the arrow and the Offset field do.
+    fn set_staged_plane_offset(&mut self, offset: f64) {
+        if !offset.is_finite() || offset.abs() > artificer_model::datum::MAX_DATUM_OFFSET {
+            return;
+        }
+        if let Some(staged) = self.staged_plane.as_mut() {
+            staged.offset = offset;
+        }
+    }
+
+    /// Turns the staged plane about its edge, as the arc and the Angle field
+    /// do. Only a plane through an edge turns.
+    fn set_staged_plane_angle(&mut self, angle_degrees: f64) {
+        if !angle_degrees.is_finite() {
+            return;
+        }
+        // Keep the angle in (−180, 180]: a full turn is the same plane.
+        let wrapped = (angle_degrees + 180.0).rem_euclid(360.0) - 180.0;
+        let wrapped = if wrapped == -180.0 { 180.0 } else { wrapped };
+        if let Some(staged) = self.staged_plane.as_mut()
+            && staged.takes_an_angle()
+        {
+            staged.angle_degrees = wrapped;
+        }
+    }
+
+    fn set_staged_plane_flip(&mut self, flip: bool) {
+        if let Some(staged) = self.staged_plane.as_mut() {
+            staged.flip = flip;
+        }
+    }
+
+    /// Turns the staged base into a recipe base whose face and edge are named
+    /// by persistent reference. A base whose faces cannot be named — a face of
+    /// a library component, say — is refused rather than quietly fixed.
+    fn staged_plane_recipe_base(&self, base: &StagedPlaneBase) -> Result<DatumPlaneBase, String> {
+        let name = |entity: EntityRef, body: BodyId| {
+            self.persistent_ref_for_entity_in(entity, None, body).ok_or_else(|| {
+                "the picked geometry has no unique history to follow; pick it on the body's latest state"
+                    .to_owned()
+            })
+        };
+        Ok(match base {
+            StagedPlaneBase::Origin(plane) => DatumPlaneBase::Origin { plane: *plane },
+            StagedPlaneBase::Face { body, face } => DatumPlaneBase::Face(DatumFaceRef {
+                body: *body,
+                face: name(*face, *body)?,
+            }),
+            StagedPlaneBase::Plane(plane) => DatumPlaneBase::Plane { plane: *plane },
+            StagedPlaneBase::Midplane { first, second } => DatumPlaneBase::Midplane {
+                first: DatumFaceRef {
+                    body: first.0,
+                    face: name(first.1, first.0)?,
+                },
+                second: DatumFaceRef {
+                    body: second.0,
+                    face: name(second.1, second.0)?,
+                },
+            },
+            StagedPlaneBase::Edge { body, edge, face } => DatumPlaneBase::Edge {
+                body: *body,
+                edge: name(*edge, *body)?,
+                face: name(*face, *body)?,
+            },
+            StagedPlaneBase::Recipe(base) => base.clone(),
+        })
+    }
+
+    /// The inputs a plane with this base declares: the body it reads, and
+    /// the plane it stands on. A midplane across two bodies takes the first
+    /// as its branch and depends on the second body's latest feature.
+    fn plane_feature_inputs(&self, base: &DatumPlaneBase) -> (Vec<FeatureInput>, Vec<FeatureId>) {
+        let mut inputs = Vec::new();
+        let mut dependencies = Vec::new();
+        let bodies = base.bodies();
+        if let Some(first) = bodies.first() {
+            inputs.push(FeatureInput::Body(*first));
+        }
+        for other in bodies.iter().skip(1) {
+            if let Some(record) = self.document.body(*other) {
+                dependencies.push(record.last_feature);
+            }
+        }
+        if let DatumPlaneBase::Plane { plane } = base {
+            inputs.push(FeatureInput::Feature(*plane));
+        }
+        (inputs, dependencies)
+    }
+
+    /// Confirms the plane editor: a new plane is appended to the history, and
+    /// an edited one has its recipe rewritten in place and everything built
+    /// on it replayed.
+    fn commit_staged_plane(&mut self, editing: Option<FeatureId>) {
+        let Some(staged) = self.staged_plane.clone() else {
+            self.pending_operation = None;
+            return;
+        };
+        let base = match self.staged_plane_recipe_base(&staged.base) {
+            Ok(base) => base,
+            Err(error) => {
+                self.document_status = Some(format!("Plane rejected: {error}"));
+                return;
+            }
+        };
+        let placed = staged.resolved();
+        let mut recipe = DatumPlaneRecipe::new(base, placed);
+        recipe.offset = staged.offset;
+        recipe.angle_degrees = if recipe.base.takes_an_angle() {
+            staged.angle_degrees
+        } else {
+            0.0
+        };
+        recipe.flip = staged.flip;
+        if let Err(error) = recipe.validate() {
+            self.document_status = Some(format!("Plane rejected: {error}"));
+            return;
+        }
+        if let Some(feature) = editing {
+            self.apply_plane_edit(feature, recipe);
+            return;
+        }
+        let (inputs, dependencies) = self.plane_feature_inputs(&recipe.base);
+        let branch_snapshot = inputs.iter().find_map(|input| match input {
+            FeatureInput::Body(body) => self
+                .bodies
+                .iter()
+                .find(|candidate| candidate.id == *body)
+                .map(|candidate| &candidate.body.snapshot),
+            FeatureInput::Feature(_) | FeatureInput::Sketch(_) => None,
+        });
+        let association = branch_snapshot
+            .or_else(|| self.displayed.as_ref().map(|displayed| &displayed.snapshot))
+            .map_or_else(
+                || {
+                    SnapshotAssociation::new(
+                        self.empty_snapshot.id(),
+                        self.empty_snapshot.id(),
+                        self.empty_snapshot.semantic_digest(),
+                    )
+                },
+                |snapshot| {
+                    SnapshotAssociation::new(
+                        snapshot.id(),
+                        snapshot.id(),
+                        snapshot.semantic_digest(),
+                    )
+                },
+            );
+        let label = format!("Plane {}", self.next_plane_ordinal());
+        let mut draft = FeatureDraft::new(
+            FeatureKind::DatumPlane,
+            label.clone(),
+            ReplayAction::DatumPlane(recipe),
+        )
+        .with_commit(association);
+        for input in inputs {
+            draft = draft.with_input(input);
+        }
+        for dependency in dependencies {
+            draft = draft.with_dependency(dependency);
+        }
+        match self.document.append_feature(draft) {
+            Ok(appended) => {
+                self.staged_plane = None;
+                self.pending_operation = None;
+                self.selected_history_feature = Some(appended.feature);
+                self.history_scrub_position = self.document.history_position();
+                self.sync_construction_planes_from_document();
+                self.sync_feature_preview_from_document();
+                self.selected_construction_plane = Some(appended.feature.get());
+                self.document_status = Some(format!("{label} committed and ready for sketching"));
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Plane rejected: {error}"));
+            }
+        }
+    }
+
+    /// Reopens a committed plane in its editor (ADR 0048).
+    ///
+    /// As with an extrusion (ADR 0036), the history rolls back to just before
+    /// the plane, so what is on screen is what the plane was placed against,
+    /// and confirming rewrites the recipe in its slot and replays what
+    /// follows.
+    pub(crate) fn begin_plane_edit(&mut self, feature: FeatureId) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        let Some(index) = self
+            .document
+            .features()
+            .iter()
+            .position(|node| node.id == feature)
+        else {
+            return false;
+        };
+        let Some(recipe) = self.document.datum_plane(feature).cloned() else {
+            self.document_status = Some("That feature is not a construction plane".to_owned());
+            return false;
+        };
+        if !self.move_history_cursor(index) {
+            return false;
+        }
+        // The base as the rolled-back model resolves it; a base that no
+        // longer resolves opens on the plane's last frame, fixed there.
+        let reports = self.feature_reports.clone();
+        let resolved_planes = self
+            .construction_planes
+            .iter()
+            .map(|plane| {
+                (
+                    plane.feature,
+                    ResolvedDatumPlane {
+                        frame: plane.frame,
+                        half_extent: [plane.half_u, plane.half_v],
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let resolver = ModelPlaneResolver::new(
+            &self.document,
+            &reports,
+            self.bodies.iter().map(|body| &body.body.snapshot),
+            &resolved_planes,
+        );
+        let edge = match &recipe.base {
+            DatumPlaneBase::Edge { body, edge, face } => resolver.edge(*body, edge, face).ok(),
+            _ => None,
+        };
+        let base_plane = recipe.base_plane(&resolver);
+        let lost = base_plane.is_err();
+        let base_plane = base_plane.unwrap_or_else(|_| {
+            let unflipped = if recipe.flip {
+                artificer_model::datum::flipped(recipe.frame)
+            } else {
+                recipe.frame
+            };
+            ResolvedDatumPlane {
+                frame: artificer_model::datum::offset_along_normal(unflipped, -recipe.offset),
+                half_extent: recipe.half_extent,
+            }
+        });
+        let staged = StagedPlane {
+            base: StagedPlaneBase::Recipe(recipe.base.clone()),
+            base_plane,
+            edge: if lost { None } else { edge },
+            offset: recipe.offset,
+            angle_degrees: recipe.angle_degrees,
+            flip: recipe.flip,
+        };
+        self.begin_plane_editor(staged, Some(feature));
+        let label = self
+            .document
+            .feature(feature)
+            .map_or_else(|| "this plane".to_owned(), |node| node.label.clone());
+        self.document_status = Some(if lost {
+            format!(
+                "Editing {label} · its base no longer resolves, so it moves from where it last was"
+            )
+        } else {
+            format!("Editing {label} · confirm to rewrite it and replay what is built on it")
+        });
+        true
+    }
+
+    /// Rewrites an edited plane's recipe and replays everything after it.
+    fn apply_plane_edit(&mut self, feature: FeatureId, recipe: DatumPlaneRecipe) {
+        self.staged_plane = None;
         self.pending_operation = None;
-        self.document_status = Some(format!("Plane {id} committed and ready for sketching"));
+        match self
+            .document
+            .replace_feature_action(feature, ReplayAction::DatumPlane(recipe))
+        {
+            Ok(_) => {
+                self.move_history_cursor(self.document.features().len());
+                self.selected_history_feature = Some(feature);
+                if self.rebuild_document_from(feature) {
+                    self.document_status =
+                        Some("Plane moved; everything built on it rebuilt".to_owned());
+                }
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Plane edit rejected: {error}"));
+                self.move_history_cursor(self.document.features().len());
+            }
+        }
     }
 
     fn begin_construction_plane_sketch(&mut self, id: u64) {
@@ -9092,6 +9745,7 @@ impl KernelLabApp {
             .extrusion_second_distance
             .filter(|_| target_face.is_none());
         let up_to_faces = self.extrusion_extents.map(ExtrusionExtentIntent::face);
+        let up_to_planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
         // Extrusion owns pointer interaction until it is confirmed or
         // cancelled. Do not leave a transform drag tool armed behind the
         // feature preview, where its presentation-only change would be lost
@@ -9127,6 +9781,7 @@ impl KernelLabApp {
             mode,
             second_distance,
             up_to_faces,
+            up_to_planes,
             boolean_target,
             editing_feature: None,
         });
@@ -9173,6 +9828,7 @@ impl KernelLabApp {
         reports: &[(FeatureId, OperationReport)],
         input: &Snapshot,
         rebuilt: &[ArchivedBody],
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
     ) -> (ReplayAction, Vec<(usize, LostExtentTarget)>) {
         let ReplayAction::SketchRegionExtrusion(recipe) = &action else {
             return (action, Vec::new());
@@ -9180,6 +9836,12 @@ impl KernelLabApp {
         if !recipe.ends_at_a_face() {
             return (action, Vec::new());
         }
+        let plane_frame = |plane: FeatureId| {
+            planes
+                .get(&plane)
+                .map(|plane| plane.frame)
+                .or_else(|| self.document.datum_plane(plane).map(|recipe| recipe.frame))
+        };
         let Some(frame) = self
             .document
             .sketch(recipe.sketch)
@@ -9187,7 +9849,13 @@ impl KernelLabApp {
                 self.document
                     .sketch_payload(recipe.sketch, record.geometry_revision)
             })
-            .map(|payload| payload.frame)
+            .map(|payload| {
+                payload
+                    .support
+                    .plane()
+                    .and_then(plane_frame)
+                    .unwrap_or(payload.frame)
+            })
         else {
             return (action, vec![(0, LostExtentTarget::SketchGone)]);
         };
@@ -9276,6 +9944,38 @@ impl KernelLabApp {
             };
         let first = side_of(recipe.up_to_face.as_ref(), 0);
         let second = side_of(recipe.second_up_to_face.as_ref(), 1);
+        // A side that ends at a construction plane is measured to where the
+        // plane now is, by the same rule as a face's plane.
+        let to_plane =
+            |plane: Option<FeatureId>, side: usize| -> Result<Option<f64>, LostExtentTarget> {
+                let Some(plane) = plane else {
+                    return Ok(None);
+                };
+                let target = plane_frame(plane).ok_or(LostExtentTarget::Missing)?;
+                let normal = frame_normal(target).ok_or(LostExtentTarget::NoLongerAPlane)?;
+                let height = plane_height_above_frame(frame, target.origin, normal, 1.0e-6)
+                    .ok_or(LostExtentTarget::NoLongerParallel)?;
+                let forward = if recipe.distance < 0.0 { -1.0 } else { 1.0 };
+                let along = if side == 0 {
+                    height * forward
+                } else {
+                    -height * forward
+                };
+                if along > PrecisionPolicy::default().min_feature_size {
+                    Ok(Some(along))
+                } else {
+                    Err(LostExtentTarget::NoLongerAhead)
+                }
+            };
+        let mut plane_side = |plane: Option<FeatureId>, side: usize| match to_plane(plane, side) {
+            Ok(measured) => measured,
+            Err(reason) => {
+                lost.push((side, reason));
+                None
+            }
+        };
+        let first = first.or_else(|| plane_side(recipe.up_to_plane, 0));
+        let second = second.or_else(|| plane_side(recipe.second_up_to_plane, 1));
         (
             ReplayAction::SketchRegionExtrusion(
                 recipe.clone().with_measured_distances(first, second),
@@ -9373,10 +10073,12 @@ impl KernelLabApp {
     /// the direction or the body it measures against may have moved.
     fn remeasure_extrusion_extents(&mut self) {
         for side in 0..self.extrusion_extents.len() {
-            let Some(face) = self.extrusion_extents[side].face() else {
-                continue;
+            let measured = match self.extrusion_extents[side] {
+                ExtrusionExtentIntent::ToFace(face) => self.measure_extent_to_face(face, side),
+                ExtrusionExtentIntent::ToPlane(plane) => self.measure_extent_to_plane(plane, side),
+                ExtrusionExtentIntent::Distance | ExtrusionExtentIntent::PickingFace => continue,
             };
-            match self.measure_extent_to_face(face, side) {
+            match measured {
                 Ok(distance) => self.set_extrusion_side_distance(side, distance),
                 Err(reason) => {
                     self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
@@ -9440,6 +10142,28 @@ impl KernelLabApp {
         self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
         self.extrusion_extent_notes[side] = None;
         let targets = self.remembered_extrusion_targets(side);
+        // Construction planes are destinations too. With any on offer the
+        // side stays armed and the list names them beside the faces.
+        let planes = self.extrusion_plane_targets(side);
+        if !planes.is_empty() {
+            if targets.is_empty() && planes.len() == 1 {
+                let (plane, name, _) = planes[0].clone();
+                self.adopt_extrusion_extent_plane(side, plane);
+                if self.extrusion_extents[side] == ExtrusionExtentIntent::ToPlane(plane) {
+                    self.document_status = Some(format!(
+                        "Side {} ends at the only place it can reach · {name}",
+                        side + 1
+                    ));
+                }
+                return;
+            }
+            self.document_status = Some(format!(
+                "{} places could end side {} · choose one in the panel",
+                targets.len() + planes.len(),
+                side + 1
+            ));
+            return;
+        }
         match targets.len() {
             0 => {
                 // Nothing ahead. Say so where the click was made, and say
@@ -9659,6 +10383,77 @@ impl KernelLabApp {
         Ok(along)
     }
 
+    /// How far a side sweeps to end at a construction plane: by the same
+    /// rule as a face's plane, which is all a construction plane is.
+    fn measure_extent_to_plane(&self, plane: FeatureId, side: usize) -> Result<f64, &'static str> {
+        let target = self
+            .construction_planes
+            .iter()
+            .find(|candidate| candidate.feature == plane)
+            .ok_or("that plane is not in the design at this point in history")?;
+        let normal = frame_normal(target.frame).ok_or("that plane has no usable normal")?;
+        let height = plane_height_above_frame(
+            self.sketch_support.frame(),
+            target.frame.origin,
+            normal,
+            1.0e-6,
+        )
+        .ok_or("that plane is not parallel to the sketch plane")?;
+        let forward = if self.extrusion_distance < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let along = if side == 0 {
+            height * forward
+        } else {
+            -height * forward
+        };
+        if along <= PrecisionPolicy::default().min_feature_size {
+            return Err("that plane lies on the other side of the sketch plane from this side");
+        }
+        Ok(along)
+    }
+
+    /// The construction planes this side could end at, nearest first, with
+    /// the length to each.
+    fn extrusion_plane_targets(&self, side: usize) -> Vec<(FeatureId, String, f64)> {
+        let mut targets = self
+            .construction_planes
+            .iter()
+            .filter(|plane| {
+                // A sketch cannot end at the plane it is drawn on.
+                !matches!(
+                    self.sketch_support,
+                    SketchSupport::ConstructionPlane { id: Some(id), .. } if id == plane.id
+                )
+            })
+            .filter_map(|plane| {
+                self.measure_extent_to_plane(plane.feature, side)
+                    .ok()
+                    .map(|reach| (plane.feature, plane.name.clone(), reach))
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|first, second| first.2.total_cmp(&second.2));
+        targets
+    }
+
+    /// Ends a side at a construction plane, measuring the length to it.
+    fn adopt_extrusion_extent_plane(&mut self, side: usize, plane: FeatureId) {
+        match self.measure_extent_to_plane(plane, side) {
+            Ok(distance) => {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::ToPlane(plane);
+                self.extrusion_extent_notes[side] = None;
+                self.set_extrusion_side_distance(side, distance);
+                self.sync_pending_sketch_extrusion_inputs();
+            }
+            Err(reason) => {
+                self.document_status =
+                    Some(format!("Side {} cannot end there: {reason}", side + 1));
+            }
+        }
+    }
+
     fn selected_face_push_pull_support(&self) -> Option<PlanarFaceSupport> {
         let face = self.selected_face()?.face;
         let body = self.displayed.as_ref()?;
@@ -9713,6 +10508,7 @@ impl KernelLabApp {
         let wanted_second = self.extrusion_second_distance;
         let wanted_draft = self.extrusion_draft_degrees;
         let wanted_up_to = self.extrusion_extents.map(ExtrusionExtentIntent::face);
+        let wanted_planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
         match self.pending_operation.as_mut() {
             Some(PendingOperation::ExtrudeSketch {
                 distance,
@@ -9721,12 +10517,14 @@ impl KernelLabApp {
                 target_face,
                 second_distance,
                 up_to_faces,
+                up_to_planes,
                 boolean_target,
                 ..
             }) => {
                 *distance = wanted_distance;
                 *second_distance = wanted_second.filter(|_| target_face.is_none());
                 *up_to_faces = wanted_up_to;
+                *up_to_planes = wanted_planes;
                 // A draft needs one side to lean from.
                 *draft_degrees = if target_face.is_none() && second_distance.is_none() {
                     wanted_draft
@@ -10700,12 +11498,7 @@ impl KernelLabApp {
                     }
                 }
             }
-            PendingOperation::CreateConstructionPlane {
-                frame,
-                half_u,
-                half_v,
-                source,
-            } => self.commit_construction_plane(frame, half_u, half_v, source),
+            PendingOperation::StagePlane { editing } => self.commit_staged_plane(editing),
             PendingOperation::BooleanBodies {
                 target,
                 operation,
@@ -10881,8 +11674,17 @@ impl KernelLabApp {
             PendingOperation::SetParameterLiteral { .. }
             | PendingOperation::AddUserLengthParameter { .. }
             | PendingOperation::RemoveParameter { .. }
-            | PendingOperation::AddUserParameter { .. }
-            | PendingOperation::CreateConstructionPlane { .. } => self.pending_operation = None,
+            | PendingOperation::AddUserParameter { .. } => self.pending_operation = None,
+            PendingOperation::StagePlane { editing } => {
+                self.staged_plane = None;
+                self.pending_operation = None;
+                if editing.is_some() {
+                    // Editing rolled the history back to just before the
+                    // plane; abandoning puts the whole model back.
+                    self.move_history_cursor(self.document.features().len());
+                    self.document_status = Some("Plane edit abandoned".to_owned());
+                }
+            }
             PendingOperation::SetParameterBindingEntry { .. } => {
                 self.staged_parameter_binding = None;
                 self.pending_operation = None;
@@ -10945,6 +11747,7 @@ impl KernelLabApp {
             mode,
             second_distance,
             up_to_faces: _,
+            up_to_planes: _,
             boolean_target,
             editing_feature: _,
         } = pending
@@ -11179,6 +11982,7 @@ impl KernelLabApp {
             boolean_target,
             second_distance,
             up_to_faces,
+            up_to_planes,
             ..
         } = pending
         else {
@@ -11215,6 +12019,7 @@ impl KernelLabApp {
                     up_to_faces: up_to_faces.map(|face| {
                         face.and_then(|face| self.persistent_ref_for_current_face(face))
                     }),
+                    up_to_planes,
                 };
                 let feature_binding = self.append_extrusion_to_document(
                     &mut next_document,
@@ -15535,15 +16340,24 @@ impl KernelLabApp {
             return Vec::new();
         };
         let mut commands = Vec::new();
+        let plane = self.document.datum_plane(feature).is_some();
         if self.feature_has_an_editor(feature) {
-            commands.push(TimelineContextCommand::Edit);
+            commands.push(if plane {
+                TimelineContextCommand::EditPlane
+            } else {
+                TimelineContextCommand::Edit
+            });
         }
         if !node.state.read_only {
+            commands.push(TimelineContextCommand::Rename);
             commands.push(if node.state.suppressed {
                 TimelineContextCommand::Restore
             } else {
                 TimelineContextCommand::Suppress
             });
+            if node.kind == FeatureKind::DatumPlane {
+                commands.push(TimelineContextCommand::DeletePlane);
+            }
         }
         commands
     }
@@ -15557,9 +16371,157 @@ impl KernelLabApp {
             TimelineContextCommand::Edit => {
                 self.begin_extrusion_edit(feature);
             }
+            TimelineContextCommand::EditPlane => {
+                self.begin_plane_edit(feature);
+            }
+            TimelineContextCommand::Rename => self.begin_feature_rename(feature),
             TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
                 self.toggle_feature_suppression(feature);
             }
+            TimelineContextCommand::DeletePlane => {
+                self.delete_construction_plane(feature);
+            }
+        }
+    }
+
+    /// Shows or hides a construction plane. Visibility is part of the plane's
+    /// recipe, so it is an undoable edit and the document offers to save it.
+    pub(crate) fn set_construction_plane_visible(&mut self, id: u64, visible: bool) {
+        let Some(feature) = self
+            .construction_planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .map(|plane| plane.feature)
+        else {
+            return;
+        };
+        match self.document.set_datum_plane_visible(feature, visible) {
+            Ok(_) => self.sync_construction_planes_from_document(),
+            Err(error) => {
+                self.document_status = Some(format!("Plane visibility unchanged: {error}"))
+            }
+        }
+    }
+
+    /// The plane feature a Browser row names.
+    pub(crate) fn construction_plane_feature(
+        &self,
+        target: browser::BrowserContextTarget,
+    ) -> Option<FeatureId> {
+        let browser::BrowserContextTarget::ConstructionPlane(id) = target else {
+            return None;
+        };
+        self.construction_planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .map(|plane| plane.feature)
+    }
+
+    /// Opens the rename box on a feature, seeded with its name.
+    pub(crate) fn begin_feature_rename(&mut self, feature: FeatureId) {
+        if let Some(node) = self.document.feature(feature) {
+            self.plane_rename = Some((feature, node.label.clone()));
+        }
+    }
+
+    /// Renames a feature: the history chip and, for a plane, its card in the
+    /// viewport and its Browser row all read the new name.
+    fn apply_feature_rename(&mut self, feature: FeatureId, label: &str) {
+        let label = label.trim();
+        if label.is_empty() {
+            self.document_status = Some("A name cannot be empty".to_owned());
+            return;
+        }
+        match self.document.rename_feature(feature, label) {
+            Ok(_) => {
+                self.sync_construction_planes_from_document();
+                self.sync_feature_preview_from_document();
+                self.document_status = Some(format!("Renamed to {label}"));
+            }
+            Err(error) => self.document_status = Some(format!("Rename rejected: {error}")),
+        }
+    }
+
+    /// Deletes a construction plane nothing depends on. A plane something is
+    /// built on is refused by the name of what is built on it.
+    pub(crate) fn delete_construction_plane(&mut self, feature: FeatureId) {
+        if self.pending_operation.is_some() {
+            return;
+        }
+        let name = self
+            .document
+            .feature(feature)
+            .map_or_else(|| "The plane".to_owned(), |node| node.label.clone());
+        match self.document.remove_datum_plane(feature) {
+            Ok(_) => {
+                if self.selected_construction_plane == Some(feature.get()) {
+                    self.selected_construction_plane = None;
+                }
+                if self.selected_history_feature == Some(feature) {
+                    self.selected_history_feature = None;
+                }
+                self.stale_planes.remove(&feature);
+                self.history_scrub_position = self.document.history_position();
+                self.sync_construction_planes_from_document();
+                self.sync_feature_preview_from_document();
+                self.document_status = Some(format!("{name} deleted"));
+            }
+            Err(artificer_model::DocumentError::FeatureInUse { dependent, .. }) => {
+                let dependent = self
+                    .document
+                    .feature(dependent)
+                    .map_or_else(|| dependent.to_string(), |node| node.label.clone());
+                self.document_status = Some(format!(
+                    "{name} cannot be deleted: {dependent} is built on it. Delete or move that first."
+                ));
+            }
+            Err(error) => self.document_status = Some(format!("Delete rejected: {error}")),
+        }
+    }
+
+    /// The small box a feature is renamed in: Enter or Rename applies it,
+    /// Escape or Cancel leaves the name as it was.
+    pub(crate) fn show_feature_rename_box(&mut self, context: &egui::Context) {
+        let Some((feature, mut text)) = self.plane_rename.clone() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Rename")
+            .id(egui::Id::new("feature_rename_box"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .show(context, |ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(220.0)
+                        .hint_text("Name"),
+                );
+                field.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Feature name")
+                });
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                ui.horizontal(|ui| {
+                    apply |= ui.button("Rename").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if apply {
+            self.plane_rename = None;
+            self.apply_feature_rename(feature, &text);
+        } else if cancel {
+            self.plane_rename = None;
+        } else {
+            self.plane_rename = Some((feature, text));
         }
     }
 
@@ -15609,8 +16571,10 @@ impl KernelLabApp {
             .iter()
             .find(|node| node.id == feature)
             .is_some_and(|node| {
-                matches!(node.action, ReplayAction::SketchRegionExtrusion(_))
-                    && !node.state.read_only
+                matches!(
+                    node.action,
+                    ReplayAction::SketchRegionExtrusion(_) | ReplayAction::DatumPlane(_)
+                ) && !node.state.read_only
             })
     }
 
@@ -15741,6 +16705,23 @@ impl KernelLabApp {
                 }
             }
         });
+        for (side, plane) in [recipe.up_to_plane, recipe.second_up_to_plane]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(plane) = plane else {
+                continue;
+            };
+            if self
+                .construction_planes
+                .iter()
+                .any(|candidate| candidate.feature == plane)
+            {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::ToPlane(plane);
+            } else {
+                lost_a_face = true;
+            }
+        }
         // The recipe's length is the last one measured, and the face may have
         // moved since without the recipe being rewritten: replay measures
         // again on every rebuild. Measuring again here is what makes the
@@ -15786,6 +16767,7 @@ impl KernelLabApp {
             mode: self.extrusion_mode,
             second_distance: self.extrusion_second_distance,
             up_to_faces: self.extrusion_extents.map(ExtrusionExtentIntent::face),
+            up_to_planes: self.extrusion_extents.map(ExtrusionExtentIntent::plane),
             boolean_target,
             editing_feature: Some(feature),
         });
@@ -15837,6 +16819,9 @@ impl KernelLabApp {
         edited.second_up_to_face = faces[1]
             .clone()
             .filter(|_| edited.second_distance.is_some());
+        let planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
+        edited.up_to_plane = planes[0];
+        edited.second_up_to_plane = planes[1].filter(|_| edited.second_distance.is_some());
         // The regions the canvas has picked are what the user just looked at.
         // An empty selection means the editor never re-resolved them, so the
         // recipe keeps the set it already had rather than losing its profile.
@@ -15851,10 +16836,32 @@ impl KernelLabApp {
 
         self.pending_operation = None;
         self.reset_extrusion_extents();
-        match self
+        // The planes a side ends at are inputs, so the input list follows
+        // the edit: a plane newly ended at joins it, one let go of leaves.
+        let inputs = self
             .document
-            .replace_feature_action(feature, ReplayAction::SketchRegionExtrusion(edited))
-        {
+            .feature(feature)
+            .map(|node| {
+                node.inputs
+                    .iter()
+                    .copied()
+                    .filter(|input| {
+                        !matches!(input, FeatureInput::Feature(id) if self.document.is_datum_plane(*id))
+                    })
+                    .chain(edited.end_planes().map(FeatureInput::Feature))
+                    .fold(Vec::new(), |mut inputs, input| {
+                        if !inputs.contains(&input) {
+                            inputs.push(input);
+                        }
+                        inputs
+                    })
+            })
+            .unwrap_or_default();
+        match self.document.replace_feature_action_and_inputs(
+            feature,
+            ReplayAction::SketchRegionExtrusion(edited),
+            inputs,
+        ) {
             Ok(_) => {
                 self.move_history_cursor(self.document.features().len());
                 self.selected_history_feature = Some(feature);
@@ -18411,9 +19418,19 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StagePlane { .. }))
+                {
+                    card(ui, "construction_plane", "CONSTRUCTION PLANE", &mut |ui| {
+                        self.plane_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
+                    && !matches!(self.pending_operation, Some(PendingOperation::StagePlane { .. }))
                 {
                     card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
                         self.extrusion_controls(ui);
@@ -18693,16 +19710,29 @@ impl KernelLabApp {
             ExtrusionExtentIntent::PickingFace => {
                 changed |= self.extrusion_target_chooser(ui, side, unit);
             }
-            ExtrusionExtentIntent::ToFace(face) => {
+            extent @ (ExtrusionExtentIntent::ToFace(_) | ExtrusionExtentIntent::ToPlane(_)) => {
                 let distance = if side == 0 {
                     self.extrusion_distance.abs()
                 } else {
                     self.extrusion_second_distance.unwrap_or_default()
                 };
-                let ends_at = self.extrusion_extent_face_summary(face).map_or_else(
-                    || format!("Face #{}", face.entity),
-                    |summary| format!("Ends at {summary}"),
-                );
+                let ends_at = match extent {
+                    ExtrusionExtentIntent::ToFace(face) => {
+                        self.extrusion_extent_face_summary(face).map_or_else(
+                            || format!("Face #{}", face.entity),
+                            |summary| format!("Ends at {summary}"),
+                        )
+                    }
+                    ExtrusionExtentIntent::ToPlane(plane) => {
+                        self.document.feature(plane).map_or_else(
+                            || "Ends at a plane".to_owned(),
+                            |node| format!("Ends at {}", node.label),
+                        )
+                    }
+                    ExtrusionExtentIntent::Distance | ExtrusionExtentIntent::PickingFace => {
+                        String::new()
+                    }
+                };
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("{ends_at} · {}", unit.format(distance)))
@@ -18740,7 +19770,8 @@ impl KernelLabApp {
         unit: units::LengthUnit,
     ) -> bool {
         let targets = self.remembered_extrusion_targets(side);
-        if targets.is_empty() {
+        let planes = self.extrusion_plane_targets(side);
+        if targets.is_empty() && planes.is_empty() {
             ui.label(
                 RichText::new("Nothing on this side is parallel to the sketch plane")
                     .small()
@@ -18781,8 +19812,30 @@ impl KernelLabApp {
                 chosen = Some(target.face);
             }
         }
+        let mut chosen_plane = None;
+        for (plane, name, reach) in &planes {
+            let response = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("{} · {name}", unit.format(*reach))).small(),
+                    )
+                    .wrap()
+                    .corner_radius(3),
+                )
+                .on_hover_text(format!(
+                    "Sweeps {} to construction plane {name}; the length follows the plane when it moves",
+                    unit.format(*reach)
+                ));
+            if response.clicked() {
+                chosen_plane = Some(*plane);
+            }
+        }
         if let Some(face) = chosen {
             self.adopt_extrusion_extent_face(face);
+            return true;
+        }
+        if let Some(plane) = chosen_plane {
+            self.adopt_extrusion_extent_plane(side, plane);
             return true;
         }
         false
@@ -18853,6 +19906,93 @@ impl KernelLabApp {
             self.extrusion_symmetric = false;
             self.extrusion_extents[1] = ExtrusionExtentIntent::Distance;
         }
+    }
+
+    /// The plane editor's typed half (ADR 0048): what the plane is built
+    /// from, its offset, its angle when it turns about an edge, and which way
+    /// it faces. The arrow and the arc drive the same values.
+    fn plane_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(staged) = self.staged_plane.clone() else {
+            return;
+        };
+        let editing = matches!(
+            self.pending_operation,
+            Some(PendingOperation::StagePlane { editing: Some(_) })
+        );
+        status_line(
+            ui,
+            if editing {
+                "EDITING PLANE"
+            } else {
+                "PLANE PREVIEW"
+            },
+            theme::warn(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} · {}",
+                self.staged_plane_label(),
+                staged.describe()
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+        let unit = self.length_unit();
+        let mut offset = staged.offset;
+        let response = ui
+            .add(
+                unit.drag_value(&mut offset)
+                    .speed(0.1)
+                    .range(
+                        -artificer_model::datum::MAX_DATUM_OFFSET
+                            ..=artificer_model::datum::MAX_DATUM_OFFSET,
+                    )
+                    .prefix("Offset "),
+            )
+            .on_hover_text(
+                "How far the plane stands from what it is built on, along that surface's normal. Drag the arrow in the viewport, or type a length.",
+            );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "Plane offset")
+        });
+        if response.changed() {
+            self.set_staged_plane_offset(offset);
+        }
+        if staged.takes_an_angle() {
+            let mut angle = staged.angle_degrees;
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut angle)
+                        .speed(0.5)
+                        .range(-180.0..=180.0)
+                        .max_decimals(2)
+                        .prefix("Angle ")
+                        .suffix("°"),
+                )
+                .on_hover_text(
+                    "How far the plane turns about the edge, from the face it starts on. Positive lifts it off the face. Drag the arc in the viewport, or type an angle.",
+                );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "Plane angle")
+            });
+            if response.changed() {
+                self.set_staged_plane_angle(angle);
+            }
+        }
+        let mut flip = staged.flip;
+        let response = ui
+            .checkbox(&mut flip, "Flip normal")
+            .on_hover_text(
+                "Face the other way. The plane stays where it is; what is sketched on it looks at it from the other side.",
+            );
+        if response.changed() {
+            self.set_staged_plane_flip(flip);
+        }
+        ui.label(
+            RichText::new("Enter or the tick confirms · Escape abandons")
+                .small()
+                .color(theme::muted()),
+        );
     }
 
     fn extrusion_controls(&mut self, ui: &mut egui::Ui) {
@@ -20385,6 +21525,15 @@ impl KernelLabApp {
                         self.sync_pending_sketch_extrusion_inputs();
                         self.sketch_extrusion_issue = None;
                     }
+                    match output.datum_drag {
+                        Some(viewport::DatumHandleDrag::Offset { offset, .. }) => {
+                            self.set_staged_plane_offset(offset);
+                        }
+                        Some(viewport::DatumHandleDrag::Angle { angle_degrees, .. }) => {
+                            self.set_staged_plane_angle(angle_degrees);
+                        }
+                        None => {}
+                    }
                     if let Some(delta) = output.edge_finish_distance_delta {
                         self.edge_finish_distance =
                             (self.edge_finish_distance + delta).clamp(0.001, 10_000.0);
@@ -21110,7 +22259,9 @@ impl KernelLabApp {
             let selected_model_entry = entries.iter().rposition(|entry| {
                 !matches!(
                     entry.kind,
-                    FeaturePreviewKind::Origin | FeaturePreviewKind::Sketch
+                    FeaturePreviewKind::Origin
+                        | FeaturePreviewKind::Sketch
+                        | FeaturePreviewKind::Plane
                 )
             });
             let mut requested_mode = None;
@@ -21180,7 +22331,13 @@ impl KernelLabApp {
                                     &accessible_label,
                                 )
                             });
-                            let response = if sketch_entry {
+                            let response = if entry.kind == FeaturePreviewKind::Plane {
+                                response.on_hover_text(if entry.label().ends_with(" · held") {
+                                    "Construction plane · what it was built on no longer resolves, so it stands where it last was. Right-click to edit it."
+                                } else {
+                                    "Construction plane · right-click to edit, rename, suppress or delete it"
+                                })
+                            } else if sketch_entry {
                                 response.on_hover_text(if !active_sketch_support_current {
                                     "Historical face sketch; replay-safe, but direct geometry editing is not enabled yet."
                                 } else if entry.finished {
@@ -21266,6 +22423,11 @@ impl KernelLabApp {
             }
             if let Some(feature) = selected_feature {
                 self.selected_history_feature = Some(feature);
+                // A plane's chip picks the plane itself, so the viewport shows
+                // which card it is and Sketch opens on it.
+                if self.document.is_datum_plane(feature) {
+                    self.selected_construction_plane = Some(feature.get());
+                }
                 self.show_properties_tab();
             }
             match requested_mode {
@@ -21532,6 +22694,7 @@ impl eframe::App for KernelLabApp {
         self.show_model_context_menu(ui.ctx());
         self.show_browser_context_menu(ui.ctx());
         self.show_timeline_context_menu(ui.ctx());
+        self.show_feature_rename_box(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.export_window(ui.ctx());
@@ -24761,6 +25924,261 @@ fn centered_plane_frame(support: &PlanarFaceSupport) -> Result<(PlanarFrame3, f6
     Ok((PlanarFrame3::new(origin, u, v), half_u, half_v))
 }
 
+/// The document origin plane a sketch plane names.
+const fn origin_plane_for_sketch_plane(plane: SketchPlane) -> artificer_model::OriginPlane {
+    match plane {
+        SketchPlane::XY => artificer_model::OriginPlane::Xy,
+        SketchPlane::YZ => artificer_model::OriginPlane::Yz,
+        SketchPlane::XZ => artificer_model::OriginPlane::Xz,
+    }
+}
+
+/// The planar faces an edge bounds, in the order the display scene names
+/// them.
+fn planar_faces_beside_edge(body: &DisplayedBody, edge: EntityRef) -> Vec<EntityRef> {
+    let mut faces = Vec::new();
+    for candidate in body
+        .scene
+        .edges
+        .iter()
+        .filter(|candidate| candidate.source_edge == edge)
+    {
+        for face in candidate.incident_faces.into_iter().flatten() {
+            if !faces.contains(&face)
+                && NativeKernel::planar_face_support(&body.snapshot, face).is_ok()
+            {
+                faces.push(face);
+            }
+        }
+    }
+    faces
+}
+
+/// A planar face as a construction plane sees it: the face's frame with its
+/// outward normal, centred on the face and sized to it.
+fn datum_face_geometry(
+    snapshot: &Snapshot,
+    face: EntityRef,
+) -> Result<DatumFaceGeometry, DatumPlaneError> {
+    let support = NativeKernel::planar_face_support(snapshot, face)
+        .map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    let (frame, half_u, half_v) =
+        centered_plane_frame(&support).map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    Ok(DatumFaceGeometry {
+        frame,
+        half_extent: [half_u, half_v],
+    })
+}
+
+/// A straight edge and the planar face it is turned from, with the direction
+/// from the edge into that face.
+///
+/// The direction is found by asking which side of the edge the face is on,
+/// a hair away from the edge's middle. A face is not always convex, so its
+/// middle is not always on the inside of every edge; the boundary is.
+fn datum_edge_geometry(
+    snapshot: &Snapshot,
+    edge: EntityRef,
+    face: EntityRef,
+) -> Result<DatumEdgeGeometry, DatumPlaneError> {
+    let ends = NativeKernel::straight_edge_ends(snapshot, edge)
+        .map_err(|_| DatumPlaneError::EdgeMissing)?
+        .ok_or(DatumPlaneError::EdgeNotStraight)?;
+    let support = NativeKernel::planar_face_support(snapshot, face)
+        .map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    let normal = frame_normal(support.frame).ok_or(DatumPlaneError::FaceNotPlanar)?;
+    let along = Vector3::new(
+        ends[1].x - ends[0].x,
+        ends[1].y - ends[0].y,
+        ends[1].z - ends[0].z,
+    );
+    let length = vector_length(along).unwrap_or(0.0);
+    if length <= 1.0e-9 {
+        return Err(DatumPlaneError::EdgeMissing);
+    }
+    let across =
+        normalized_vector(cross_vector(normal, along)).ok_or(DatumPlaneError::EdgeNotOnFace)?;
+    let middle = Point3::new(
+        0.5 * (ends[0].x + ends[1].x),
+        0.5 * (ends[0].y + ends[1].y),
+        0.5 * (ends[0].z + ends[1].z),
+    );
+    let step = (length * 1.0e-3).max(1.0e-4);
+    let inside = |sign: f64| {
+        let point = Point3::new(
+            middle.x + sign * step * across.x,
+            middle.y + sign * step * across.y,
+            middle.z + sign * step * across.z,
+        );
+        point_in_face_support(&support, point)
+    };
+    let into_face = match (inside(1.0), inside(-1.0)) {
+        (true, false) => across,
+        (false, true) => Vector3::new(-across.x, -across.y, -across.z),
+        // Both or neither: the edge is not on this face's boundary in any way
+        // that says which side the face is on.
+        _ => return Err(DatumPlaneError::EdgeNotOnFace),
+    };
+    Ok(DatumEdgeGeometry {
+        start: ends[0],
+        end: ends[1],
+        face_normal: normal,
+        into_face,
+    })
+}
+
+/// Whether a point in a face's plane lies inside the face's outer boundary
+/// and outside every hole in it.
+fn point_in_face_support(support: &PlanarFaceSupport, point: Point3) -> bool {
+    let frame = support.frame;
+    let offset = Vector3::new(
+        point.x - frame.origin.x,
+        point.y - frame.origin.y,
+        point.z - frame.origin.z,
+    );
+    let uu = dot_vector(frame.u, frame.u);
+    let uv = dot_vector(frame.u, frame.v);
+    let vv = dot_vector(frame.v, frame.v);
+    let determinant = uu * vv - uv * uv;
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return false;
+    }
+    let pu = dot_vector(offset, frame.u);
+    let pv = dot_vector(offset, frame.v);
+    let x = (pu * vv - pv * uv) / determinant;
+    let y = (pv * uu - pu * uv) / determinant;
+    let contains = |polygon: &[ProtocolPoint2]| {
+        let mut inside = false;
+        let mut previous = polygon.last().copied();
+        for current in polygon.iter().copied() {
+            if let Some(prior) = previous
+                && (current.y > y) != (prior.y > y)
+            {
+                let crossing =
+                    prior.x + (y - prior.y) * (current.x - prior.x) / (current.y - prior.y);
+                if x < crossing {
+                    inside = !inside;
+                }
+            }
+            previous = Some(current);
+        }
+        inside
+    };
+    contains(&support.boundary) && !support.inner_boundaries.iter().any(|hole| contains(hole))
+}
+
+/// Resolves plane recipes against a rebuild's reports and bodies.
+///
+/// A persistent reference names one producing feature, whose faces live in
+/// one body, so at most one of the searched snapshots can answer; the search
+/// is for which body holds the answer, never for a face that will do instead.
+struct ModelPlaneResolver<'a> {
+    document: &'a ModelDocument,
+    ordered: Vec<FeatureOperationReport<'a>>,
+    snapshots: Vec<&'a Snapshot>,
+    planes: &'a BTreeMap<FeatureId, ResolvedDatumPlane>,
+}
+
+impl<'a> ModelPlaneResolver<'a> {
+    fn new(
+        document: &'a ModelDocument,
+        reports: &'a [(FeatureId, OperationReport)],
+        snapshots: impl IntoIterator<Item = &'a Snapshot>,
+        planes: &'a BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> Self {
+        let ordered = document
+            .features()
+            .iter()
+            .filter_map(|node| {
+                reports
+                    .iter()
+                    .find(|(feature, _)| *feature == node.id)
+                    .map(|(feature, report)| FeatureOperationReport::new(*feature, report))
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        let snapshots = snapshots
+            .into_iter()
+            .filter(|snapshot| seen.insert(snapshot.id()))
+            .collect();
+        Self {
+            document,
+            ordered,
+            snapshots,
+            planes,
+        }
+    }
+
+    fn find(
+        &self,
+        reference: &PersistentRef,
+        within: Option<SnapshotId>,
+    ) -> Result<(EntityRef, &'a Snapshot), PersistentMissingOrAmbiguous> {
+        let mut ambiguous = false;
+        for snapshot in &self.snapshots {
+            if within.is_some_and(|within| within != snapshot.id()) {
+                continue;
+            }
+            match resolve_persistent_ref(reference, &self.ordered, snapshot.id()) {
+                PersistentResolution::Resolved(entity) => return Ok((entity, *snapshot)),
+                PersistentResolution::Ambiguous(_) => ambiguous = true,
+                PersistentResolution::Missing(_) => {}
+            }
+        }
+        Err(if ambiguous {
+            PersistentMissingOrAmbiguous::Ambiguous
+        } else {
+            PersistentMissingOrAmbiguous::Missing
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistentMissingOrAmbiguous {
+    Missing,
+    Ambiguous,
+}
+
+impl DatumPlaneResolver for ModelPlaneResolver<'_> {
+    fn face(&self, face: &DatumFaceRef) -> Result<DatumFaceGeometry, DatumPlaneError> {
+        let (entity, snapshot) = self.find(&face.face, None).map_err(|reason| match reason {
+            PersistentMissingOrAmbiguous::Missing => DatumPlaneError::FaceMissing,
+            PersistentMissingOrAmbiguous::Ambiguous => DatumPlaneError::FaceAmbiguous,
+        })?;
+        datum_face_geometry(snapshot, entity)
+    }
+
+    fn edge(
+        &self,
+        _body: BodyId,
+        edge: &PersistentRef,
+        face: &PersistentRef,
+    ) -> Result<DatumEdgeGeometry, DatumPlaneError> {
+        let (edge, snapshot) = self
+            .find(edge, None)
+            .map_err(|_| DatumPlaneError::EdgeMissing)?;
+        let (face, _) = self
+            .find(face, Some(snapshot.id()))
+            .map_err(|reason| match reason {
+                PersistentMissingOrAmbiguous::Missing => DatumPlaneError::FaceMissing,
+                PersistentMissingOrAmbiguous::Ambiguous => DatumPlaneError::FaceAmbiguous,
+            })?;
+        datum_edge_geometry(snapshot, edge, face)
+    }
+
+    fn plane(&self, plane: FeatureId) -> Result<ResolvedDatumPlane, DatumPlaneError> {
+        self.planes
+            .get(&plane)
+            .copied()
+            .or_else(|| {
+                self.document
+                    .datum_plane(plane)
+                    .map(DatumPlaneRecipe::cached)
+            })
+            .ok_or(DatumPlaneError::UnknownPlane(plane))
+    }
+}
+
 fn reference_plane_corners(frame: PlanarFrame3, half_u: f64, half_v: f64) -> [Point3; 4] {
     [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(su, sv)| {
         Point3::new(
@@ -24804,7 +26222,7 @@ fn bounds_for_points(points: &[Point3]) -> Option<Aabb3> {
     Some(Aabb3::new(min, max))
 }
 
-fn validate_construction_planes(planes: &[ConstructionPlane]) -> Result<(), String> {
+fn validate_construction_planes(planes: &[LegacyConstructionPlane]) -> Result<(), String> {
     let mut ids = BTreeSet::new();
     for plane in planes {
         if plane.id == 0 || !ids.insert(plane.id) {
@@ -25634,10 +27052,11 @@ mod extrusion_workbench_tests {
         app.stage_construction_plane();
         assert!(matches!(
             app.pending_operation,
-            Some(PendingOperation::CreateConstructionPlane {
-                source: ConstructionPlaneSource::OnFace { .. },
-                ..
-            })
+            Some(PendingOperation::StagePlane { editing: None })
+        ));
+        assert!(matches!(
+            app.staged_plane.as_ref().map(|staged| &staged.base),
+            Some(StagedPlaneBase::Face { .. })
         ));
         assert!(app.confirm_pending_operation());
         assert_eq!(app.construction_planes.len(), 1);
@@ -25650,11 +27069,8 @@ mod extrusion_workbench_tests {
         app.select_model_face(top, true);
         app.stage_construction_plane();
         assert!(matches!(
-            app.pending_operation,
-            Some(PendingOperation::CreateConstructionPlane {
-                source: ConstructionPlaneSource::BetweenFaces { .. },
-                ..
-            })
+            app.staged_plane.as_ref().map(|staged| &staged.base),
+            Some(StagedPlaneBase::Midplane { .. })
         ));
         assert!(app.confirm_pending_operation());
         let midplane = app.construction_planes.last().unwrap();
@@ -27499,6 +28915,7 @@ mod extrusion_workbench_tests {
             mode,
             second_distance: None,
             up_to_faces: [None, None],
+            up_to_planes: [None, None],
             boolean_target: None,
             editing_feature: None,
         };
@@ -32737,18 +34154,29 @@ mod rejection_summary_tests {
             "a blank document has nothing to lose"
         );
         let before = app.document_revision();
-        // The smallest edit a document takes: one more marker feature.
+        // The smallest edit a document takes: one construction plane.
         let empty = SnapshotAssociation::new(
             app.empty_snapshot.id(),
             app.empty_snapshot.id(),
             app.empty_snapshot.semantic_digest(),
         );
+        let origin = artificer_model::OriginPlane::Xy;
         app.document
             .append_feature(
-                FeatureDraft::new(FeatureKind::DatumPlane, "Plane", ReplayAction::Marker)
-                    .with_commit(empty),
+                FeatureDraft::new(
+                    FeatureKind::DatumPlane,
+                    "Plane",
+                    ReplayAction::DatumPlane(DatumPlaneRecipe::new(
+                        DatumPlaneBase::Origin { plane: origin },
+                        ResolvedDatumPlane {
+                            frame: origin.frame(),
+                            half_extent: [25.0, 25.0],
+                        },
+                    )),
+                )
+                .with_commit(empty),
             )
-            .expect("a marker feature is a valid edit");
+            .expect("a plane is a valid edit");
         assert!(app.document_revision() > before);
         assert!(app.is_document_dirty());
         app.mark_document_saved();
@@ -32938,6 +34366,457 @@ mod view_cube_flight_tests {
             app.face_camera_transition,
             Some(flight),
             "a drag does not cancel the sketch's flight either"
+        );
+    }
+}
+
+/// Construction planes as a user meets them (ADR 0048): placed with an
+/// offset or an angle, kept in the history, edited there, followed by what is
+/// built on them, and a place an extrusion can end.
+#[cfg(test)]
+mod construction_plane_tests {
+    use super::*;
+
+    fn point(u: f64, v: f64) -> SketchPoint {
+        SketchPoint::new(u, v)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "actual={actual:.15}, expected={expected:.15}"
+        );
+    }
+
+    /// The bootstrap body's face whose facets point along `normal`.
+    fn face_facing(app: &KernelLabApp, normal: Vector3) -> viewport::DocumentFaceSelection {
+        let body = app.active_body_id().expect("a body is on screen");
+        let displayed = app.displayed.as_ref().expect("a body is displayed");
+        let face = displayed
+            .scene
+            .triangles
+            .iter()
+            .find(|triangle| {
+                let [a, b, c] = triangle.vertices;
+                let facet = cross_vector(
+                    Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                    Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+                );
+                normalized_vector(facet).is_some_and(|unit| dot_vector(unit, normal) > 0.999)
+            })
+            .expect("a face points that way")
+            .source_face;
+        viewport::DocumentFaceSelection {
+            body: viewport::BodyInstanceKey::new(body.get()),
+            face,
+        }
+    }
+
+    /// A plane on an origin plane, offset along its normal, committed.
+    fn origin_plane(app: &mut KernelLabApp, plane: SketchPlane, offset: f64) -> ConstructionPlane {
+        app.clear_model_entity_selection();
+        app.selected_construction_plane = None;
+        app.selected_origin_plane = plane;
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(offset);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.construction_planes
+            .last()
+            .cloned()
+            .expect("the plane was committed")
+    }
+
+    /// A rectangle drawn on whatever the sketch support now is.
+    fn draw_rectangle(app: &mut KernelLabApp, from: (f64, f64), to: (f64, f64)) {
+        app.sketch
+            .stage_geometry(SketchGeometry::rectangle(
+                point(from.0, from.1),
+                point(to.0, to.1),
+            ))
+            .expect("rectangle stages");
+        app.sketch.commit_pending().expect("rectangle commits");
+        app.sketch_revision = app.sketch_revision.saturating_add(1);
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+    }
+
+    fn body_created_by(app: &KernelLabApp, feature: FeatureId) -> &WorkbenchBody {
+        let body = app
+            .document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+            .and_then(|node| {
+                node.outputs.iter().find_map(|output| match output {
+                    FeatureOutput::Body(body) => Some(*body),
+                    FeatureOutput::Sketch { .. } => None,
+                })
+            })
+            .expect("the feature made a body");
+        app.bodies
+            .iter()
+            .find(|candidate| candidate.id == body)
+            .expect("the body is on screen")
+    }
+
+    #[test]
+    fn an_offset_plane_is_a_recipe_in_the_history_with_its_own_chip() {
+        let mut app = KernelLabApp::default();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        app.select_model_face(top, false);
+        app.stage_construction_plane();
+        // The staged plane is drawn on the face with an arrow to move it.
+        let handles = app
+            .staged_plane_handles()
+            .expect("a staged plane has handles");
+        assert!(handles.turn.is_none(), "a face plane does not turn");
+        assert_close(handles.anchor.z, 4.0);
+        app.set_staged_plane_offset(3.0);
+        let preview = app.staged_plane_preview().expect("the plane is previewed");
+        assert_close(preview.frame.origin.z, 7.0);
+        assert!(app.confirm_pending_operation());
+
+        let plane = app.construction_planes.last().expect("committed").clone();
+        assert_close(plane.frame.origin.z, 7.0);
+        let recipe = app.document.datum_plane(plane.feature).expect("a recipe");
+        assert!(matches!(recipe.base, DatumPlaneBase::Face(_)));
+        assert_close(recipe.offset, 3.0);
+        // It is in the history as a plane of its own, and its chip offers
+        // the editor, a name, suppression and deletion.
+        let entry = app
+            .feature_preview
+            .entries
+            .iter()
+            .find(|entry| entry.kind == FeaturePreviewKind::Plane)
+            .expect("a plane chip");
+        assert_eq!(entry.label(), plane.name);
+        assert_eq!(
+            app.timeline_context_commands(plane.feature),
+            vec![
+                TimelineContextCommand::EditPlane,
+                TimelineContextCommand::Rename,
+                TimelineContextCommand::Suppress,
+                TimelineContextCommand::DeletePlane,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plane_through_an_edge_turns_about_it() {
+        let mut app = KernelLabApp::default();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        let body = app.active_body_id().expect("a body");
+        let displayed = app.displayed.as_ref().expect("displayed");
+        // An edge of the top face along x at y = 0.
+        let edge = displayed
+            .scene
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.z - 4.0).abs() < 1.0e-9 && point.y.abs() < 1.0e-9)
+            })
+            .expect("the top face's front edge")
+            .source_edge;
+        app.selected_edges = vec![viewport::DocumentEdgeSelection {
+            body: viewport::BodyInstanceKey::new(body.get()),
+            edge,
+        }];
+        app.selected_faces = vec![top];
+        app.stage_construction_plane();
+        let handles = app.staged_plane_handles().expect("handles");
+        assert!(handles.turn.is_some(), "an edge plane has a turning arc");
+        app.set_staged_plane_angle(90.0);
+        let preview = app.staged_plane_preview().expect("previewed");
+        // Upright on the front edge: facing −Y, standing above the face.
+        let normal = frame_normal(preview.frame).expect("normal");
+        assert!((normal.y + 1.0).abs() < 1.0e-9, "{normal:?}");
+        assert!(preview.frame.origin.y.abs() < 1.0e-9);
+        assert!(preview.frame.origin.z > 4.0);
+        // A full turn and a half is the same plane as a half turn back.
+        app.set_staged_plane_angle(450.0);
+        assert_close(app.staged_plane.as_ref().unwrap().angle_degrees, 90.0);
+        assert!(app.confirm_pending_operation());
+        let plane = app.construction_planes.last().expect("committed");
+        let recipe = app.document.datum_plane(plane.feature).expect("recipe");
+        assert!(matches!(recipe.base, DatumPlaneBase::Edge { .. }));
+        assert_close(recipe.angle_degrees, 90.0);
+    }
+
+    #[test]
+    fn a_sketch_on_a_plane_and_its_extrusion_move_with_the_plane() {
+        let mut app = KernelLabApp::default();
+        let plane = origin_plane(&mut app, SketchPlane::XY, 10.0);
+        app.selected_construction_plane = Some(plane.id);
+        app.begin_construction_plane_sketch(plane.id);
+        if let Some(PendingPlaneSketch::Construction(id)) = app.pending_plane_sketch.take() {
+            app.open_construction_plane_sketch(id);
+        }
+        draw_rectangle(&mut app, (0.0, 0.0), (2.0, 2.0));
+        app.set_extrusion_distance_intent(2.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion")
+            .id;
+        let sketch = app
+            .document
+            .sketches()
+            .last()
+            .expect("the sketch is in the document")
+            .id;
+        let payload = app
+            .document
+            .sketch_payload(
+                sketch,
+                app.document.sketch(sketch).unwrap().geometry_revision,
+            )
+            .unwrap();
+        assert_eq!(
+            payload.support,
+            SketchSupportRecipe::DatumPlane {
+                plane: plane.feature
+            }
+        );
+        let centroid = body_created_by(&app, extrusion)
+            .body
+            .snapshot
+            .measures()
+            .centroid
+            .unwrap();
+        assert_close(centroid.z, 11.0);
+
+        // Moving the plane from the history moves the sketch and the body.
+        app.enter_model_mode();
+        assert!(app.begin_plane_edit(plane.feature));
+        assert!(matches!(
+            app.pending_operation,
+            Some(PendingOperation::StagePlane { editing: Some(_) })
+        ));
+        app.set_staged_plane_offset(20.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let centroid = body_created_by(&app, extrusion)
+            .body
+            .snapshot
+            .measures()
+            .centroid
+            .unwrap();
+        assert_close(centroid.z, 21.0);
+        assert_close(app.document.sketch_frame(sketch).unwrap().origin.z, 20.0);
+        assert_eq!(
+            app.document.features().len(),
+            app.document.history_position(),
+            "the edit returns the history to its end"
+        );
+    }
+
+    #[test]
+    fn a_side_that_ends_at_a_plane_follows_the_plane() {
+        let mut app = KernelLabApp::default();
+        let plane = origin_plane(&mut app, SketchPlane::XY, 9.0);
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (5.0, 5.0), (7.0, 7.0));
+        app.set_extrusion_distance_intent(1.0);
+        assert_eq!(app.extrusion_plane_targets(0).len(), 1);
+        app.adopt_extrusion_extent_plane(0, plane.feature);
+        assert_eq!(
+            app.extrusion_extents[0],
+            ExtrusionExtentIntent::ToPlane(plane.feature)
+        );
+        assert_close(app.extrusion_distance, 9.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion");
+        assert!(
+            extrusion
+                .inputs
+                .contains(&FeatureInput::Feature(plane.feature))
+        );
+        let ReplayAction::SketchRegionExtrusion(recipe) = &extrusion.action else {
+            panic!("a region extrusion");
+        };
+        assert_eq!(recipe.up_to_plane, Some(plane.feature));
+        let extrusion = extrusion.id;
+        assert_close(
+            body_created_by(&app, extrusion)
+                .body
+                .snapshot
+                .measures()
+                .volume,
+            4.0 * 9.0,
+        );
+
+        // Lowering the plane shortens the extrusion on the rebuild.
+        app.enter_model_mode();
+        assert!(app.begin_plane_edit(plane.feature));
+        app.set_staged_plane_offset(5.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_close(
+            body_created_by(&app, extrusion)
+                .body
+                .snapshot
+                .measures()
+                .volume,
+            4.0 * 5.0,
+        );
+        // And the plane cannot be deleted from under it.
+        app.delete_construction_plane(plane.feature);
+        assert!(app.document.feature(plane.feature).is_some());
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("is built on it")),
+            "{:?}",
+            app.document_status
+        );
+    }
+
+    #[test]
+    fn a_face_plane_follows_the_face_when_the_body_under_it_changes() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (10.0, 0.0), (14.0, 2.0));
+        app.set_extrusion_distance_intent(6.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion")
+            .id;
+        app.enter_model_mode();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        app.select_model_face(top, false);
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(1.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let plane = app.construction_planes.last().expect("plane").clone();
+        assert_close(plane.frame.origin.z, 7.0);
+
+        // A taller extrusion carries its top face, and the plane on it, up.
+        assert!(app.begin_extrusion_edit(extrusion));
+        app.set_extrusion_distance_intent(10.0);
+        app.sync_pending_sketch_extrusion_inputs();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let moved = app
+            .construction_planes
+            .iter()
+            .find(|candidate| candidate.feature == plane.feature)
+            .expect("the plane is still here");
+        assert_close(moved.frame.origin.z, 11.0);
+        assert!(!moved.stale);
+    }
+
+    #[test]
+    fn an_unused_plane_deletes_and_a_suppressed_one_is_not_drawn() {
+        let mut app = KernelLabApp::default();
+        let kept = origin_plane(&mut app, SketchPlane::YZ, 3.0);
+        let gone = origin_plane(&mut app, SketchPlane::XZ, -2.0);
+        app.delete_construction_plane(gone.feature);
+        assert!(app.document.feature(gone.feature).is_none());
+        assert!(
+            app.construction_planes
+                .iter()
+                .all(|plane| plane.feature != gone.feature)
+        );
+        assert!(app.toggle_feature_suppression(kept.feature));
+        assert!(
+            app.construction_planes
+                .iter()
+                .all(|plane| plane.feature != kept.feature),
+            "a suppressed plane is not drawn"
+        );
+        // Undo brings the suppression back off, and the plane with it.
+        assert!(app.document.undo());
+        app.restore_runtime_from_document();
+        assert!(
+            app.construction_planes
+                .iter()
+                .any(|plane| plane.feature == kept.feature)
+        );
+    }
+
+    #[test]
+    fn a_plane_is_renamed_and_the_name_is_saved() {
+        let mut source = KernelLabApp::default();
+        let plane = origin_plane(&mut source, SketchPlane::XY, 4.0);
+        source.apply_feature_rename(plane.feature, "Datum A");
+        assert_eq!(source.construction_planes.last().unwrap().name, "Datum A");
+        assert!(
+            source
+                .feature_preview
+                .entries
+                .iter()
+                .any(|entry| entry.label() == "Datum A")
+        );
+        source.set_construction_plane_visible(plane.id, false);
+        let json = source.workspace_document_json().unwrap();
+        let mut restored = KernelLabApp::default();
+        restored.load_workspace_json(&json).unwrap();
+        assert_eq!(restored.construction_planes, source.construction_planes);
+        assert!(!restored.construction_planes.last().unwrap().visible);
+    }
+
+    #[test]
+    fn a_version_six_plane_migrates_to_a_fixed_recipe_where_it_stood() {
+        let mut source = KernelLabApp::default();
+        let plane = origin_plane(&mut source, SketchPlane::XY, 6.0);
+        // Rewrite the saved file into the shape a version 6 build wrote: a
+        // marker in the history, and the frame in the workspace envelope.
+        let json = source.workspace_document_json().unwrap();
+        let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        value["document"]["version"] = serde_json::json!(6);
+        let features = value["document"]["state"]["features"]
+            .as_array_mut()
+            .expect("features");
+        let node = features
+            .iter_mut()
+            .find(|node| node["id"] == serde_json::json!(plane.feature.get()))
+            .expect("the plane feature");
+        node["action"] = serde_json::json!({"type": "marker"});
+        value["construction_planes"] = serde_json::json!([{
+            "id": 1,
+            "name": plane.name,
+            "feature": plane.feature.get(),
+            "frame": plane.frame,
+            "half_u": plane.half_u,
+            "half_v": plane.half_v,
+            "visible": true,
+            "source": {"kind": "from_origin", "plane_index": 0}
+        }]);
+        let legacy = serde_json::to_string(&value).unwrap();
+        let mut restored = KernelLabApp::default();
+        restored
+            .load_workspace_json(&legacy)
+            .expect("a version 6 workspace loads");
+        let migrated = restored
+            .construction_planes
+            .last()
+            .expect("the plane migrated");
+        assert_close(migrated.frame.origin.z, 6.0);
+        let recipe = restored
+            .document
+            .datum_plane(migrated.feature)
+            .expect("a recipe now");
+        assert!(matches!(recipe.base, DatumPlaneBase::Fixed { .. }));
+        assert!(
+            !restored.is_document_dirty(),
+            "migrating on load is not an edit"
         );
     }
 }

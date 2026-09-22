@@ -29,8 +29,8 @@ use crate::theme::{self, ribbon_group};
 use artificer_model::QuantityKind;
 
 use crate::{
-    KernelLabApp, SketchPlane, SolidFeaturePreset, WorkbenchMode, origin_plane_label,
-    shell_button_activated, viewport,
+    KernelLabApp, SketchPlane, SketchSupport, SolidFeaturePreset, WorkbenchMode,
+    origin_plane_label, shell_button_activated, viewport,
 };
 
 /// Whether a command can run right now, and in plain words why not when it
@@ -644,6 +644,7 @@ impl KernelLabApp {
         match descriptor.command {
             ModelCommand::NewSketch => match self.sketch_entry_action() {
                 SketchEntryAction::OnSelectedFace => "On face",
+                SketchEntryAction::OnSelectedPlane => "On plane",
                 SketchEntryAction::New => "New sketch",
                 SketchEntryAction::Create => "Sketch",
                 SketchEntryAction::Edit => "Edit sketch",
@@ -661,6 +662,7 @@ impl KernelLabApp {
         match descriptor.command {
             ModelCommand::NewSketch => match self.sketch_entry_action() {
                 SketchEntryAction::OnSelectedFace => "Sketch on selected face",
+                SketchEntryAction::OnSelectedPlane => "Sketch on selected plane",
                 SketchEntryAction::New => "New sketch",
                 SketchEntryAction::Create => "Create sketch",
                 SketchEntryAction::Edit => "Edit sketch",
@@ -704,6 +706,20 @@ impl KernelLabApp {
         if self.selected_face().is_some() {
             return SketchEntryAction::OnSelectedFace;
         }
+        // A selected construction plane is where the next sketch goes,
+        // however many sketches already exist (ADR 0048). Carrying on with
+        // the sketch already open on that plane is the one exception.
+        if let Some(id) = self.selected_construction_plane {
+            let open_on_it = matches!(
+                self.sketch_support,
+                SketchSupport::ConstructionPlane { id: Some(active), .. } if active == id
+            ) && !self.sketch.entities().is_empty()
+                && !self.sketch_finished
+                && self.sketch_support_is_current();
+            if !open_on_it {
+                return SketchEntryAction::OnSelectedPlane;
+            }
+        }
         let starts_new_origin_sketch = !self.sketch.entities().is_empty()
             && (self.sketch_finished
                 || self.extruded_sketch_revision == Some(self.sketch_revision)
@@ -721,6 +737,7 @@ impl KernelLabApp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SketchEntryAction {
     OnSelectedFace,
+    OnSelectedPlane,
     New,
     Create,
     Edit,
@@ -768,6 +785,7 @@ impl KernelLabApp {
                 let action = self.sketch_entry_action();
                 if !self.sketch_support_is_current()
                     && action != SketchEntryAction::OnSelectedFace
+                    && action != SketchEntryAction::OnSelectedPlane
                     && action != SketchEntryAction::New
                 {
                     return CommandAvailability::disabled(
@@ -1072,13 +1090,21 @@ impl KernelLabApp {
 
     pub(crate) fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
         match command {
-            ModelCommand::NewSketch => {
-                if self.sketch_entry_action() == SketchEntryAction::New {
-                    self.begin_new_origin_sketch();
-                } else {
-                    self.enter_sketch_mode();
+            ModelCommand::NewSketch => match self.sketch_entry_action() {
+                SketchEntryAction::New => self.begin_new_origin_sketch(),
+                SketchEntryAction::OnSelectedPlane => {
+                    if let Some(id) = self.selected_construction_plane
+                        && self.pending_operation.is_none()
+                        && self.history_is_at_end()
+                    {
+                        self.forget_picked_ribbon_tab();
+                        self.begin_construction_plane_sketch(id);
+                    }
                 }
-            }
+                SketchEntryAction::OnSelectedFace
+                | SketchEntryAction::Create
+                | SketchEntryAction::Edit => self.enter_sketch_mode(),
+            },
             // The library is where a part is chosen and its parameters set,
             // so the command opens it rather than duplicating that panel: an
             // insertion still goes through the same confirmation gate every

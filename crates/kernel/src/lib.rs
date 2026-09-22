@@ -2307,6 +2307,23 @@ impl NativeKernel {
         Ok(snapshot.topology.edges[record].value.length())
     }
 
+    /// Returns the two ends of one authoritative straight B-rep edge, in the
+    /// edge's own direction, or `None` when the edge is curved.
+    ///
+    /// A construction plane turned about an edge (ADR 0048) needs the line
+    /// itself, which the display scene only approximates.
+    pub fn straight_edge_ends(
+        snapshot: &Snapshot,
+        edge: EntityRef,
+    ) -> Result<Option<[ProtocolPoint3; 2]>, KernelError> {
+        let record = resolve_measure_entity(snapshot, edge, EntityKind::Edge, "edge")?;
+        let edge = snapshot.topology.edges[record].value;
+        if !matches!(edge.curve, topology::Curve3::Line { .. }) {
+            return Ok(None);
+        }
+        Ok(Some(edge.endpoints().map(protocol_point)))
+    }
+
     /// Returns the exact model-space area of one authoritative B-rep face.
     pub fn face_area(snapshot: &Snapshot, face: EntityRef) -> Result<f64, KernelError> {
         let record = resolve_measure_entity(snapshot, face, EntityKind::Face, "face")?;

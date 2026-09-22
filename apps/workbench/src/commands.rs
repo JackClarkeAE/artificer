@@ -312,7 +312,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         CommandSize::Large,
         "Plane",
         "Plane",
-        "Create a construction plane from the selected faces.",
+        "Place a construction plane on a face, halfway between two faces, through an edge at an angle, or offset from a plane. Drag its arrow or type the offset, then confirm.",
         None,
     ),
     command(

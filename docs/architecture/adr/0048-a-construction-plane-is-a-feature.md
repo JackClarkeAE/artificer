@@ -1,8 +1,9 @@
 # ADR 0048: A construction plane is a feature
 
-Status: accepted — planes are document features with a recipe, placed with a
-live preview and handles, edited from the history, followed by the sketches
-built on them, and usable wherever a face's plane is.
+Status: implemented in the workbench — planes are document features with a
+recipe, placed with a live preview and handles, edited from the history,
+followed by the sketches built on them, and usable wherever a face's plane is.
+The script forms of `plane(...)` arrive with the loft work (ADR 0049).
 
 - Date: 2026-09-22
 - Decision owners: Artificer project

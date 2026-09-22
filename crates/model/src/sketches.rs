@@ -8,10 +8,10 @@ use artificer_sketch::SketchDefinition;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::BodyId;
 use crate::persistent::{
     CURRENT_PERSISTENT_REF_VERSION, MAX_PERSISTENT_LINEAGE_DEPTH, PersistentRef,
 };
+use crate::{BodyId, FeatureId};
 
 /// Version of the authoring-side precision/validation contract persisted with
 /// editable sketches. This is independent of the native document version.
@@ -120,12 +120,22 @@ pub enum SketchSupportRecipe {
         /// Document-level face identity; never a snapshot-local entity handle.
         face: PersistentRef,
     },
+    /// A construction plane (ADR 0048). The payload frame is the plane's frame
+    /// when the sketch was last replayed; replay reads the plane's current
+    /// one, so the sketch moves with the plane.
+    DatumPlane { plane: FeatureId },
 }
 
 impl SketchSupportRecipe {
     fn validate(&self) -> Result<(), SketchPayloadError> {
         match self {
             Self::Origin => Ok(()),
+            Self::DatumPlane { plane } => {
+                if plane.get() == 0 {
+                    return Err(SketchPayloadError::InvalidSupportPlane);
+                }
+                Ok(())
+            }
             Self::PlanarFace { body, face } => {
                 if body.get() == 0 {
                     return Err(SketchPayloadError::InvalidSupportBody);
@@ -142,8 +152,17 @@ impl SketchSupportRecipe {
     #[must_use]
     pub const fn body(&self) -> Option<BodyId> {
         match self {
-            Self::Origin => None,
+            Self::Origin | Self::DatumPlane { .. } => None,
             Self::PlanarFace { body, .. } => Some(*body),
+        }
+    }
+
+    /// The construction plane carrying this support, if it is plane-hosted.
+    #[must_use]
+    pub const fn plane(&self) -> Option<FeatureId> {
+        match self {
+            Self::DatumPlane { plane } => Some(*plane),
+            Self::Origin | Self::PlanarFace { .. } => None,
         }
     }
 
@@ -151,7 +170,7 @@ impl SketchSupportRecipe {
     #[must_use]
     pub const fn face(&self) -> Option<&PersistentRef> {
         match self {
-            Self::Origin => None,
+            Self::Origin | Self::DatumPlane { .. } => None,
             Self::PlanarFace { face, .. } => Some(face),
         }
     }
@@ -186,6 +205,8 @@ pub enum SketchPayloadError {
     InvalidSupportBody,
     #[error("a planar-face sketch support must target a face")]
     PlanarFaceTargetRequired,
+    #[error("a construction-plane sketch support must name a plane feature")]
+    InvalidSupportPlane,
     #[error(
         "unsupported persistent-reference version {found}; this build supports {CURRENT_PERSISTENT_REF_VERSION}"
     )]
