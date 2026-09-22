@@ -66,6 +66,9 @@ are stable, slash-separated paths:
 | `extrusion/polygon`, `extrusion/linear-profile`, `extrusion/analytic-profile` | A new body from a sketch; the last two carry arcs and circles exactly. |
 | `revolve/full-turn` | A revolved section. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
+| `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise. |
+| `loft/boolean-prism`, `loft/boolean-analytic` | A loft added to or cut from the body, exactly, by the prism reduction or the general engine: every wall came out a plane, a cylinder or a cone. |
+| `loft/faceted` | A loft added to or cut from the body on the faceted tier, because a wall is ruled and the exact engines do not carry it. Carries `LOFT_FACETED_APPROXIMATION` and the reason, `LOFT_EXACT_ROUTE_DECLINED`. |
 | `face-feature/exact-prism` | An add or cut on a face that the exact prism path owns. |
 | `face-feature/analytic-boolean` | A cut that crossed earlier geometry, rebuilt exactly by the analytic Boolean engine. |
 | `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier. |
@@ -90,7 +93,9 @@ digest is a function of that geometry alone.
 Every face in `body.faces` carries its carrier with the numbers that define
 it (`surface`: `plane` with `origin`; `cylinder` with
 `origin`, `axis`, `radius`; `cone` with `apex`, `axis`, `half_angle_degrees`;
-`sphere`; `torus`), an exact `area`, a `centre` (the area centroid of a
+`sphere`; `torus`; `ruled` with `first_rail` and `second_rail`, each a
+`line`, `circular_arc` or `elliptical_arc` with its `start` and `end`), an
+exact `area`, a `centre` (the area centroid of a
 planar face; a point at the parametric centre of a curved one), the outward
 `normal` there, the number of `loops` (one, plus one per hole), a one-line
 `summary`, and its `names`. Edges carry their curve (`line`, `circular_arc`,

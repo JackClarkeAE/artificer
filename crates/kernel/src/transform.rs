@@ -6,6 +6,7 @@
 
 use artificer_protocol::{RotationQuaternion, SimilarityTransform3};
 
+use crate::ruled::{RailCurve, RuledRail};
 use crate::topology::{Curve2, Curve3, Cylinder, Plane, Point3, Surface, Topology, Vector3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +77,6 @@ impl Similarity {
     }
 }
 
-/// Clones and transforms all authoritative geometric representations while
-/// retaining incidence, ordering, orientation, and snapshot-local numeric IDs.
 /// A cylinder under a similarity: the frame rides along and the radius
 /// scales with it.
 fn transform_cylinder(mut cylinder: Cylinder, transform: Similarity) -> Cylinder {
@@ -89,6 +88,43 @@ fn transform_cylinder(mut cylinder: Cylinder, transform: Similarity) -> Cylinder
     cylinder
 }
 
+/// A rail under a similarity: the same curve, moved and scaled, over the same
+/// parameter range, so the same `u` names the image of the same point.
+fn transform_rail(mut rail: RuledRail, transform: Similarity) -> RuledRail {
+    rail.curve = match rail.curve {
+        RailCurve::Line { endpoints } => RailCurve::Line {
+            endpoints: endpoints.map(|point| transform.transform_point(point)),
+        },
+        RailCurve::Circle {
+            center,
+            u,
+            v,
+            radius,
+        } => RailCurve::Circle {
+            center: transform.transform_point(center),
+            u: transform.transform_vector(u),
+            v: transform.transform_vector(v),
+            radius: radius * transform.scale,
+        },
+        RailCurve::Ellipse {
+            center,
+            u,
+            v,
+            major_radius,
+            minor_radius,
+        } => RailCurve::Ellipse {
+            center: transform.transform_point(center),
+            u: transform.transform_vector(u),
+            v: transform.transform_vector(v),
+            major_radius: major_radius * transform.scale,
+            minor_radius: minor_radius * transform.scale,
+        },
+    };
+    rail
+}
+
+/// Clones and transforms all authoritative geometric representations while
+/// retaining incidence, ordering, orientation, and snapshot-local numeric IDs.
 pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Topology {
     let mut output = input.clone();
 
@@ -137,6 +173,8 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
         Planar,
         Cylindrical,
         /// Both torus parameters are angles; a similarity leaves them fixed.
+        /// A ruled surface's two are fractions of its rails and rungs, and
+        /// a similarity leaves those fixed too.
         Toroidal,
     }
     let mut pcurve_owner = vec![PcurveOwner::Planar; input.coedges.len()];
@@ -149,6 +187,7 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
             // Both sphere parameters are angles, so a similarity leaves them
             // fixed, exactly as for a torus.
             Surface::Sphere(_) => PcurveOwner::Toroidal,
+            Surface::Ruled(_) => PcurveOwner::Toroidal,
         };
         for loop_key in face.value.loops() {
             if let Some(loop_record) = input.loop_record(loop_key) {
@@ -247,6 +286,10 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 // Both the ring radius and the axial parameter scale, so the
                 // slope (their ratio) is invariant under a similarity.
                 Surface::Cone(cone)
+            }
+            Surface::Ruled(mut ruled) => {
+                ruled.rails = ruled.rails.map(|rail| transform_rail(rail, transform));
+                Surface::Ruled(ruled)
             }
         };
     }

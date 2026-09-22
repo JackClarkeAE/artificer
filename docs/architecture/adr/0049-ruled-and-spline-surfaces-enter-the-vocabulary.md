@@ -1,7 +1,8 @@
 # ADR 0049: Ruled and spline surfaces enter the vocabulary
 
-Status: accepted — K-A, the ruled surface and a loft between two planar
-sections, is built next; K-B and K-C are the plan.
+Status: accepted — K-A is implemented: the ruled surface is a carrier of the
+kernel, and a loft between two planar sections is exact through the kernel,
+the protocol and `.art` scripting. K-B and K-C are the plan.
 
 - Date: 2026-09-22
 - Decision owners: Artificer project

@@ -1000,6 +1000,9 @@ pub(crate) enum Surface {
     /// it; the builder that emits one is still to come.
     #[allow(dead_code)]
     Sphere(Sphere),
+    /// The straight lines between two exact rails (ADR 0049): the wall of a
+    /// loft between unlike sections, where no elementary carrier is exact.
+    Ruled(crate::ruled::RuledSurface),
 }
 
 impl Surface {
@@ -1010,6 +1013,7 @@ impl Surface {
             Self::Torus(torus) => torus.evaluate(point),
             Self::Cone(cone) => cone.evaluate(point),
             Self::Sphere(sphere) => sphere.evaluate(point),
+            Self::Ruled(ruled) => ruled.evaluate(point),
         }
     }
 
@@ -1020,6 +1024,7 @@ impl Surface {
             Self::Torus(torus) => torus.is_finite(),
             Self::Cone(cone) => cone.is_finite(),
             Self::Sphere(sphere) => sphere.is_finite(),
+            Self::Ruled(ruled) => ruled.is_finite(),
         }
     }
 
@@ -1072,6 +1077,12 @@ impl Surface {
                     frame_orientation(sphere.radial_u, sphere.radial_v, axis, sphere.angular_sign)?;
                 unit_vector(point - sphere.origin).map(|normal| normal * sign)
             }
+            // A ruled surface has no closed-form normal in the point alone:
+            // the point is inverted to its parameters first. Callers that
+            // already hold the parameters use `RuledSurface::unit_normal`.
+            Self::Ruled(ruled) => ruled
+                .invert(point, None)
+                .and_then(|parameters| ruled.unit_normal(parameters)),
         }
     }
 
@@ -1115,20 +1126,29 @@ impl Surface {
                     + sphere.axis * (sphere.radius * point.y.cos());
                 azimuthal * tangent.x + meridian * tangent.y
             }
+            Self::Ruled(ruled) => ruled.map_tangent(point, tangent),
         }
     }
 
     pub(crate) const fn as_plane(self) -> Option<Plane> {
         match self {
             Self::Plane(plane) => Some(plane),
-            Self::Cylinder(_) | Self::Torus(_) | Self::Cone(_) | Self::Sphere(_) => None,
+            Self::Cylinder(_)
+            | Self::Torus(_)
+            | Self::Cone(_)
+            | Self::Sphere(_)
+            | Self::Ruled(_) => None,
         }
     }
 
     pub(crate) fn as_plane_mut(&mut self) -> Option<&mut Plane> {
         match self {
             Self::Plane(plane) => Some(plane),
-            Self::Cylinder(_) | Self::Torus(_) | Self::Cone(_) | Self::Sphere(_) => None,
+            Self::Cylinder(_)
+            | Self::Torus(_)
+            | Self::Cone(_)
+            | Self::Sphere(_)
+            | Self::Ruled(_) => None,
         }
     }
 }

@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use artificer_protocol::{EntityKind, EntityRef, Point2, Point3, Tier, Vector3};
+use artificer_protocol::{EntityKind, EntityRef, PlanarFrame3, Point2, Point3, Tier, Vector3};
 
 use crate::api::commands::{ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane};
 use crate::api::debug::{ApiError, ApiErrorCode};
@@ -202,6 +202,7 @@ impl Writer<'_> {
                     SketchPlane::XZ => "\"XZ\"".to_owned(),
                     SketchPlane::YZ => "\"YZ\"".to_owned(),
                     SketchPlane::OnFace { face } => self.selector(face)?,
+                    SketchPlane::Frame { frame } => plane_text(*frame),
                 };
                 let entities = entities
                     .iter()
@@ -269,6 +270,20 @@ impl Writer<'_> {
                 let _ = write!(call, ", label: {})", quoted(&label));
                 call
             }
+            ApiCommand::Loft {
+                sections,
+                operation,
+                ..
+            } => format!(
+                "loft(sections: [{}], operation: {}, label: {})",
+                sections
+                    .iter()
+                    .map(|section| self.step_ident(&section.0))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", "),
+                operation_text(*operation),
+                quoted(&label)
+            ),
             ApiCommand::Revolve {
                 sketch,
                 regions,
@@ -654,6 +669,41 @@ fn axis_word(direction: Vector3) -> Option<&'static str> {
         }
         _ => return None,
     })
+}
+
+/// A plane as the script spells it: one of the world planes moved along the
+/// side it faces where it is one, and its origin and two axes, exactly as
+/// held, otherwise.
+fn plane_text(frame: PlanarFrame3) -> String {
+    for name in ["XY", "XZ", "YZ"] {
+        let Some(world) = crate::api::scripting::world_plane_frame(name) else {
+            continue;
+        };
+        if world.u != frame.u || world.v != frame.v {
+            continue;
+        }
+        let normal = Vector3::new(
+            frame.u.y * frame.v.z - frame.u.z * frame.v.y,
+            frame.u.z * frame.v.x - frame.u.x * frame.v.z,
+            frame.u.x * frame.v.y - frame.u.y * frame.v.x,
+        );
+        let offset =
+            frame.origin.x * normal.x + frame.origin.y * normal.y + frame.origin.z * normal.z;
+        let moved = Point3::new(normal.x * offset, normal.y * offset, normal.z * offset);
+        if moved == frame.origin {
+            return if offset == 0.0 {
+                format!("plane(from: \"{name}\")")
+            } else {
+                format!("plane(from: \"{name}\", offset: {})", number(offset))
+            };
+        }
+    }
+    format!(
+        "plane(origin: {}, x_axis: {}, y_axis: {})",
+        point3(frame.origin),
+        vector3(frame.u),
+        vector3(frame.v)
+    )
 }
 
 fn regions_text(regions: &[u32]) -> String {

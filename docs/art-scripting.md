@@ -191,7 +191,7 @@ let profile = sketch(on: "XY", label: "profile", entities: [
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
+| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, a `plane(...)`, or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
 | `entities` | yes | An array of `line`, `circle`, `arc`, `rect`. |
 | `label` | no | Step label. |
 
@@ -200,6 +200,29 @@ the origin at the world origin: `"XY"` maps `[x, y]` to world `(x, y, 0)`;
 `"XZ"` maps `[x, z]` to `(x, 0, z)`; `"YZ"` maps `[y, z]` to `(0, y, z)`. On
 a face, the origin is the **centre of the face** and the axes are the face's
 own; a circle at `[0, 0]` is centred on the face.
+
+### Planes: `plane(...)`
+
+A sketch can sit on any plane in space, not only the three world planes and
+the body's faces. `plane(...)` names one:
+
+```art
+let raised = plane(from: "XY", offset: 30);            // XY lifted 30 along +Z
+let tilted = plane(origin: [0, 0, 40], normal: [0, 1, 1], x_axis: [1, 0, 0]);
+let exact = plane(origin: [0, 0, 40], x_axis: [1, 0, 0], y_axis: [0, 0.6, 0.8]);
+let top = sketch(on: tilted, entities: [circle(radius: 8)], label: "top");
+```
+
+| Form | Meaning |
+|---|---|
+| `plane(from: "XY", offset: d)` | A world plane moved `d` along the side its sketches face: +Z for `"XY"`, −Y for `"XZ"`, +X for `"YZ"`. `offset` defaults to 0. |
+| `plane(origin: [x, y, z], normal: [x, y, z], x_axis: [x, y, z])` | Faces `normal`; the sketch's `x` runs along `x_axis` turned into the plane, and its `y` is `normal × x`. `origin` defaults to the world origin. |
+| `plane(origin: [...], x_axis: [...], y_axis: [...])` | The two axes as given; the plane faces `x_axis × y_axis`. This is how a decompiled script writes a plane back exactly. |
+
+The sketch's 2D coordinates are the plane's own `x` and `y`, from its
+origin. Planes placed by the body's faces and edges — offset from a face,
+through an edge at an angle — come through the same `on:` and are added
+separately.
 
 **Regions.** Closed loops become regions. A loop inside another loop is a
 hole in it, so the sketch above is a plate with a hole. Intersecting loops
@@ -226,7 +249,7 @@ chain end to end into a closed loop; a loop may close along the revolve axis.
 let base = extrude(sketch: profile, distance: 6, label: "base");
 extrude(sketch: pocket, distance: 3, operation: "cut", label: "pocket_cut");
 let boss = extrude(sketch: boss_profile, distance: 12, operation: "add", label: "boss");
-let frustum = extrude(sketch: square, distance: 10, draft: 5, label: "frustum");
+let frustum = extrude(sketch: square, distance: 10, draft: -5, label: "frustum");
 ```
 
 | Argument | Required | Meaning |
@@ -234,12 +257,59 @@ let frustum = extrude(sketch: square, distance: 10, draft: 5, label: "frustum");
 | `sketch` | yes | The sketch step. |
 | `distance` | yes | Extrusion length along the sketch plane's normal. |
 | `operation` | no | `"new"` (default), `"add"` (also `"join"`, `"union"`), `"cut"` (also `"subtract"`). |
-| `draft` | no | Draft angle in degrees; the section shrinks toward the far end. New bodies only. |
+| `draft` | no | Draft angle in degrees. Positive leans the walls outward, so the section grows toward the far end; negative leans them inward, as the `frustum` above does. New bodies only. |
 | `regions` | no | Which regions to extrude, by index, when a sketch has several. Default: all. |
 
 `"add"` and `"cut"` need a sketch drawn **on a face** of the current body
 (`sketch(on: faces(">Z"), ...)`). A sketch on a world plane can only make a
 new body; join it with `union` afterwards if that is what you want.
+
+### `loft`
+
+```art
+let base = sketch(on: plane(from: "XY"), entities: [rect(width: 60, height: 60)], label: "base");
+let spigot = sketch(on: plane(from: "XY", offset: 80), entities: [circle(diameter: 40)], label: "spigot");
+let duct = loft(sections: [base, spigot], label: "duct");
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `sections` | yes | Two sketches, each on a plane of its own. |
+| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`. |
+| `label` | no | Step label. |
+
+The body runs from the first section to the second. The two sketches may be
+on any two planes that are not the same plane — parallel, offset sideways,
+tilted, or not parallel at all — as long as neither section reaches through
+the other's plane. Each sketch must be one region: an outer loop of lines,
+arcs and circles, with holes if both sections have the same number of them.
+
+**How the sections pair up.** Corners pair with corners. With as many
+segments on both sides they pair in order, starting wherever makes the
+straight rungs between the sections shortest. With different numbers each
+side is split, exactly, where the other has a corner, at the same fraction of
+the way round: a square to a circle rules each side of the square to a
+quarter of the circle, the circle cut where it comes nearest the square's
+first corner. Two circles pair at equal angles. Holes pair with the hole in
+the other section whose centre is nearest.
+
+**What the walls are.** Two straight edges in one plane make a flat wall,
+and two arcs about one axis make a cone or a cylinder, so a frustum or a
+tapered boss is built from the same exact surfaces an extrusion is. Every
+other wall is a ruled surface — the straight lines between its two edges —
+which is exact and measured exactly (ADR 0049). The Boolean engines do not
+carry ruled walls yet: an `"add"` or `"cut"` loft whose walls are all flat,
+conical or cylindrical is exact; one with ruled walls is built on the
+faceted tier and says so (rung `loft/faceted`, tier `approximate`).
+
+A loft is refused by name when its rungs or walls would cross
+(`LOFT_RUNGS_CROSS`), a wall would pinch to a point (`LOFT_WALL_DEGENERATE`),
+the sections share a plane (`LOFT_SECTIONS_COPLANAR`), one reaches through
+the other's plane (`LOFT_SECTION_CROSSES_PLANE`), or their holes do not pair
+(`LOFT_HOLE_COUNT_MISMATCH`). A loft through three or more sections needs a
+surface that stays smooth across the middle ones, a B-spline surface, and is
+refused (`LOFT_MULTI_SECTION_UNSUPPORTED`) until those arrive; so is a
+section drawn with a spline.
 
 ### `revolve`
 
@@ -752,8 +822,10 @@ For an agent, the rules that make this reliable:
 
 ## 13. Not in 0.3
 
-Partial revolves, sweeps and lofts between arbitrary sections, concave
-fillets between a boss and its plate, text as sketch geometry from a
+Partial revolves, sweeps, lofts through more than two sections (they need
+B-spline surfaces, which ADR 0049 plans), splines as sketch entities,
+exact Booleans with a loft's ruled walls (they fall to the faceted tier),
+concave fillets between a boss and its plate, text as sketch geometry from a
 script, and threads. A script builds parts; joints and occurrences belong
 to a document, so a mechanism is assembled in the workbench and analysed
 through section 18 rather than written here. `shell` covers prisms and

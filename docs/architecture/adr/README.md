@@ -58,7 +58,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0045](0045-a-boolean-that-resolves-what-it-touches.md) | A Boolean that resolves what it touches | Implemented | 0025, 0044 |
 | [0046](0046-a-hole-rim-is-one-closed-edge.md) | A hole rim is one closed edge | Implemented | 0023, 0034 |
 | [0047](0047-the-curve-two-cylinders-share.md) | The curve two cylinders share | Implemented | 0025, 0026, 0045 |
-| [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md) | Ruled and spline surfaces enter the vocabulary | Accepted | 0025, 0045, 0047; supersedes 0026's splines row |
+| [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md) | Ruled and spline surfaces enter the vocabulary | Accepted (K-A implemented) | 0025, 0045, 0047; supersedes 0026's splines row |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

@@ -7,9 +7,12 @@
 //! curve-on-surface, which STEP permits when the 3D curves are exact. The
 //! one curve STEP has no entity for, the quartic where two cylinders meet
 //! (ADR 0047), is an `intersection_curve` naming the two cylinders, with a
-//! cubic spline within a tenth of the file's accuracy as its 3D curve. Two
-//! half faces per revolved carrier and their seam edges are ordinary
-//! topology. Cavities are `brep_with_voids`.
+//! cubic spline within a tenth of the file's accuracy as its 3D curve. The one
+//! surface STEP has no entity for, the ruled wall of a loft (ADR 0049), is a
+//! `b_spline_surface_with_knots`: exactly, where both rails are lines, and
+//! otherwise within that same tenth, bounded by its rails, which are exact
+//! edges like any other. Two half faces per revolved carrier and their seam
+//! edges are ordinary topology. Cavities are `brep_with_voids`.
 //!
 //! Every surface is written so that its STEP normal is the direction the
 //! kernel's own parameterisation calls outward; where the kernel's face is
@@ -21,6 +24,7 @@ use std::fmt::Write as _;
 use artificer_protocol::{KernelError, KernelErrorCode, KernelStage};
 
 use crate::cylinder_trace::CylinderTrace;
+use crate::ruled::RailCurve;
 use crate::topology::{
     Curve3, EdgeKey, Orientation, Point3, Surface, Topology, Vector3, VertexKey, frame_orientation,
 };
@@ -735,6 +739,57 @@ impl BodyWriter<'_> {
                         real(torus.minor_radius.abs())
                     )),
                     sign > 0.0,
+                )
+            }
+            // STEP has no surface ruled between two arbitrary curves. Between
+            // two lines the surface is a bilinear patch, which is exactly a
+            // B-spline surface of degree one by one. Otherwise the two rails
+            // are fitted with cubics on one knot vector and the surface
+            // written as degree three by one: it is linear in `v`, as the
+            // ruled surface is, so it strays from it by no more than the
+            // worse of the two fits. The surface's own parameterisation is
+            // the kernel's, so its normal is the kernel's outward one.
+            Surface::Ruled(ruled) => {
+                let both_lines = ruled
+                    .rails
+                    .iter()
+                    .all(|rail| matches!(rail.curve, RailCurve::Line { .. }));
+                let (degree, rows, knots) = if both_lines {
+                    (
+                        1,
+                        [
+                            vec![ruled.rails[0].point(0.0), ruled.rails[0].point(1.0)],
+                            vec![ruled.rails[1].point(0.0), ruled.rails[1].point(1.0)],
+                        ],
+                        vec![(0.0, 2), (1.0, 2)],
+                    )
+                } else {
+                    let splines = ruled.rail_splines(SPLINE_TOLERANCE).ok_or(
+                        "a ruled face could not be fitted with a spline surface within the \
+                         file's accuracy",
+                    )?;
+                    (3, splines.rows, splines.knots)
+                };
+                let mut columns = Vec::with_capacity(rows[0].len());
+                for (low, high) in rows[0].iter().zip(&rows[1]) {
+                    let low = self.point(*low);
+                    let high = self.point(*high);
+                    columns.push(format!("(#{low},#{high})"));
+                }
+                let multiplicities: Vec<String> = knots
+                    .iter()
+                    .map(|(_, multiplicity)| multiplicity.to_string())
+                    .collect();
+                let values: Vec<String> = knots.iter().map(|(knot, _)| real(*knot)).collect();
+                (
+                    self.file.entity(format!(
+                        "B_SPLINE_SURFACE_WITH_KNOTS('ruled surface',{degree},1,({}),\
+                         .UNSPECIFIED.,.F.,.F.,.F.,({}),(2,2),({}),(0.,1.),.UNSPECIFIED.)",
+                        columns.join(","),
+                        multiplicities.join(","),
+                        values.join(",")
+                    )),
+                    true,
                 )
             }
         })

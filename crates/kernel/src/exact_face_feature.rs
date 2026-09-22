@@ -574,7 +574,9 @@ fn sweep_contacts_source(
                 }
                 // A blend band cannot be split or rebuilt by the local
                 // prismatic rewrite; any potential contact rejects.
-                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => true,
+                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => {
+                    true
+                }
                 Surface::Cylinder(cylinder) => {
                     let Some(axis) = robust_unit(cylinder.axis) else {
                         return true;

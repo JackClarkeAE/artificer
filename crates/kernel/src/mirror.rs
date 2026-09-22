@@ -10,10 +10,12 @@
 //! `radial_v`, which traces the same reflected surface with the same
 //! parameters, and each face is then reversed by the kernel's own
 //! convention, the one the Boolean engine uses: a plane swaps its axes, a
-//! revolved carrier negates its angular sign, the pcurves go through the
-//! matching in-plane mirror, and every loop walks the other way. Edges and
+//! revolved carrier negates its angular sign, a ruled carrier walks its rails
+//! the other way, the pcurves go through the matching in-plane mirror, and
+//! every loop walks the other way. Edges and
 //! vertices keep their identities, so history maps one to one.
 
+use crate::ruled::RailCurve;
 use crate::topology::{
     Curve2, Curve3, Cylinder, ParameterRange, Plane, Point2, Point3, Surface, Topology, Vector2,
     Vector3,
@@ -128,6 +130,45 @@ pub(crate) fn mirror_topology(
                     sphere.radial_u = reflect_vector(sphere.radial_u);
                     sphere.radial_v = reflect_vector(sphere.radial_v) * -1.0;
                     |point: Point2| Point2::new(-point.x, point.y)
+                }
+                // Each rail reflects as the edges do, so the same `u` names
+                // the reflected point; the normal `∂u × ∂v` then points into
+                // the material, and walking `u` the other way along both
+                // rails is the reversal that turns it out again.
+                Surface::Ruled(ruled) => {
+                    for rail in &mut ruled.rails {
+                        rail.curve = match rail.curve {
+                            RailCurve::Line { endpoints } => RailCurve::Line {
+                                endpoints: endpoints.map(reflect_point),
+                            },
+                            RailCurve::Circle {
+                                center,
+                                u,
+                                v,
+                                radius,
+                            } => RailCurve::Circle {
+                                center: reflect_point(center),
+                                u: reflect_vector(u),
+                                v: reflect_vector(v),
+                                radius,
+                            },
+                            RailCurve::Ellipse {
+                                center,
+                                u,
+                                v,
+                                major_radius,
+                                minor_radius,
+                            } => RailCurve::Ellipse {
+                                center: reflect_point(center),
+                                u: reflect_vector(u),
+                                v: reflect_vector(v),
+                                major_radius,
+                                minor_radius,
+                            },
+                        };
+                    }
+                    *ruled = ruled.reversed_u();
+                    |point: Point2| Point2::new(1.0 - point.x, point.y)
                 }
             }
         };

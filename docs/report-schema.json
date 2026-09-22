@@ -398,11 +398,24 @@
         "LINEAR_PATTERN_DOMAIN_UNSUPPORTED",
         "HOLE_RIM_DISTANCE_INVALID",
         "LOFT_CORNER_NOT_TANGENT",
+        "LOFT_EXACT_ROUTE_DECLINED",
+        "LOFT_FACETED_APPROXIMATION",
+        "LOFT_FACETED_UNRESOLVED",
+        "LOFT_HOLE_COUNT_MISMATCH",
+        "LOFT_MULTI_SECTION_UNSUPPORTED",
         "LOFT_OFFSET_NON_FINITE",
+        "LOFT_RUNGS_CROSS",
+        "LOFT_SECTIONS_COPLANAR",
         "LOFT_SECTION_COLLAPSES",
         "LOFT_SECTION_COORDINATE_LIMIT",
+        "LOFT_SECTION_CROSSES_PLANE",
         "LOFT_SECTION_DEGENERATE",
+        "LOFT_SECTION_REGIONS_UNSUPPORTED",
         "LOFT_SECTION_SELF_INTERSECTS",
+        "LOFT_SECTION_SPLINE_UNSUPPORTED",
+        "LOFT_TARGET_EMPTY",
+        "LOFT_TOO_FEW_SECTIONS",
+        "LOFT_WALL_DEGENERATE",
         "LOOP_NOT_CLOSED",
         "LOOP_TOO_SHORT",
         "LOOP_USE_COUNT",
@@ -483,6 +496,7 @@
         "make_cylinder",
         "sketch",
         "extrude",
+        "loft",
         "revolve",
         "push_pull",
         "drill_hole",
@@ -775,8 +789,55 @@
             "minor_radius"
           ],
           "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "ruled"
+            },
+            "first_rail": {
+              "$ref": "#/$defs/rail"
+            },
+            "second_rail": {
+              "$ref": "#/$defs/rail"
+            }
+          },
+          "required": [
+            "surface",
+            "first_rail",
+            "second_rail"
+          ],
+          "additionalProperties": true,
+          "description": "The straight lines between two exact rails (ADR 0049): the wall of a loft between unlike sections. Reported by its rails, each walked in the direction the rulings pair them."
         }
       ]
+    },
+    "rail": {
+      "type": "object",
+      "properties": {
+        "curve": {
+          "type": "string",
+          "enum": [
+            "line",
+            "circular_arc",
+            "elliptical_arc"
+          ]
+        },
+        "start": {
+          "$ref": "#/$defs/point"
+        },
+        "end": {
+          "$ref": "#/$defs/point"
+        }
+      },
+      "required": [
+        "curve",
+        "start",
+        "end"
+      ],
+      "additionalProperties": false,
+      "description": "One rail of a ruled face."
     },
     "face": {
       "type": "object",
@@ -791,7 +852,8 @@
             "cylinder",
             "cone",
             "sphere",
-            "torus"
+            "torus",
+            "ruled"
           ]
         },
         "origin": {
@@ -820,6 +882,12 @@
         },
         "minor_radius": {
           "type": "number"
+        },
+        "first_rail": {
+          "$ref": "#/$defs/rail"
+        },
+        "second_rail": {
+          "$ref": "#/$defs/rail"
         },
         "area": {
           "type": "number",
@@ -959,6 +1027,10 @@
           "minimum": 0
         },
         "tori": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ruled": {
           "type": "integer",
           "minimum": 0
         }

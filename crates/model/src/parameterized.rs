@@ -369,6 +369,9 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         // A drafted loft's distance and offset drive each other through the
         // draft angle; binding one alone would silently change the angle.
         | KernelCommand::LoftPlanarProfileOffset { .. }
+        // A loft between sections carries its lengths in the sections'
+        // frames and profiles, not as a scalar of its own.
+        | KernelCommand::LoftPlanarSections { .. }
         | KernelCommand::DrillHole { .. }
         | KernelCommand::AddRib { .. }
         | KernelCommand::MirrorSnapshot { .. }
