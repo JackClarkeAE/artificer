@@ -4,7 +4,10 @@
 //! five carrier surfaces become the five STEP elementary surfaces; lines,
 //! circles and ellipses become `line`, `circle` and `ellipse`; every coedge
 //! is an `oriented_edge` over an `edge_curve` with an exact 3D curve and no
-//! curve-on-surface, which STEP permits when the 3D curves are exact. Two
+//! curve-on-surface, which STEP permits when the 3D curves are exact. The
+//! one curve STEP has no entity for, the quartic where two cylinders meet
+//! (ADR 0047), is an `intersection_curve` naming the two cylinders, with a
+//! cubic spline within a tenth of the file's accuracy as its 3D curve. Two
 //! half faces per revolved carrier and their seam edges are ordinary
 //! topology. Cavities are `brep_with_voids`.
 //!
@@ -17,6 +20,7 @@ use std::fmt::Write as _;
 
 use artificer_protocol::{KernelError, KernelErrorCode, KernelStage};
 
+use crate::cylinder_trace::CylinderTrace;
 use crate::topology::{
     Curve3, EdgeKey, Orientation, Point3, Surface, Topology, Vector3, VertexKey, frame_orientation,
 };
@@ -24,6 +28,12 @@ use crate::{DebugTriangle, NativeKernel, Snapshot, error};
 
 /// The AP214 schema identifier the file claims.
 const SCHEMA: &str = "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }";
+
+/// How far, in millimetres, the spline written beside an intersection curve
+/// may stray from the curve: a tenth of the confusion accuracy the file
+/// declares, so a reader that takes the spline takes a curve the file itself
+/// cannot tell from the exact one.
+const SPLINE_TOLERANCE: f64 = 1.0e-7;
 
 /// One body in an exported file: its geometry, its name, where it sits and
 /// what colour it is shown in.
@@ -525,6 +535,9 @@ impl BodyWriter<'_> {
         let start = self.vertex(start)?;
         let end = self.vertex(end)?;
         let range = edge.value.parameter_range;
+        // The edge runs from its first vertex to its second; the curve's
+        // parameter agrees with that unless the range runs backwards.
+        let mut same_sense = range.end >= range.start;
         let curve = match edge.value.curve {
             Curve3::Line { endpoints } => {
                 let direction = endpoints[1] - endpoints[0];
@@ -549,17 +562,52 @@ impl BodyWriter<'_> {
                 self.file
                     .entity(format!("CIRCLE('',#{placement},{})", real(radius.abs())))
             }
-            // AP242 carries an intersection curve only as a surface curve
-            // with an approximating spline beside its two pcurves, which is
-            // a representation this exporter does not build yet. Refusing
-            // names the gap; writing a spline and calling it the edge would
-            // export a body that is not the one modelled.
-            Curve3::Trace { .. } => {
-                return Err(
-                    "this body has an edge where two cylinders meet in a space quartic, which \
-                     this STEP exporter cannot yet write"
-                        .to_owned(),
-                );
+            // STEP has no entity for the quartic two cylinders share. It has
+            // `intersection_curve`, which says the edge *is* where two named
+            // surfaces meet and carries a 3D curve beside them for readers
+            // that want one; that is written here, the 3D curve a cubic
+            // spline a tenth of the file's own confusion accuracy from the
+            // curve. The spline runs the way the edge does whichever way the
+            // parameter runs.
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => {
+                let spline = CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                }
+                .spline(range.start, range.end, SPLINE_TOLERANCE)
+                .ok_or(
+                    "an edge where two cylinders meet could not be fitted with a spline within \
+                     the file's accuracy",
+                )?;
+                let points: Vec<u64> = spline
+                    .control_points
+                    .iter()
+                    .map(|point| self.point(*point))
+                    .collect();
+                let multiplicities: Vec<String> = spline
+                    .knots
+                    .iter()
+                    .map(|(_, multiplicity)| multiplicity.to_string())
+                    .collect();
+                let knots: Vec<String> = spline.knots.iter().map(|(knot, _)| real(*knot)).collect();
+                let curve = self.file.entity(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',3,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),\
+                     .UNSPECIFIED.)",
+                    ids(&points),
+                    multiplicities.join(","),
+                    knots.join(",")
+                ));
+                let (host, _) = self.surface(Surface::Cylinder(host))?;
+                let (other, _) = self.surface(Surface::Cylinder(other))?;
+                same_sense = true;
+                self.file.entity(format!(
+                    "INTERSECTION_CURVE('',#{curve},(#{host},#{other}),.CURVE_3D.)"
+                ))
             }
             Curve3::Ellipse {
                 center,
@@ -578,11 +626,9 @@ impl BodyWriter<'_> {
                 ))
             }
         };
-        // The edge runs from its first vertex to its second; the curve's
-        // parameter agrees with that unless the range runs backwards.
         let id = self.file.entity(format!(
             "EDGE_CURVE('',#{start},#{end},#{curve},{})",
-            flag(range.end >= range.start)
+            flag(same_sense)
         ));
         self.edges.insert(key, id);
         Ok(id)

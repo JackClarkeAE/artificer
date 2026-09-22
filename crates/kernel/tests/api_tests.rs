@@ -1079,6 +1079,7 @@ fn the_shipped_examples_compile_and_run() {
         "examples/bearing_mount.art",
         "examples/filleted_cube.art",
         "examples/three_holes_and_cut.art",
+        "examples/blend_then_drill.art",
         "examples/flanged_hub.art",
         "examples/filleted_flange.art",
         "examples/standoff_plate.art",

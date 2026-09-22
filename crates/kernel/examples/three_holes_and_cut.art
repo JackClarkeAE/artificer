@@ -3,8 +3,9 @@
 //
 // Hole centres are given in the target face's own frame, whose origin is
 // the face centre. The side cut is a round bore drilled from the -Y face;
-// where it crosses the two front holes the kernel answers from its faceted
-// tier and labels the result as an approximation.
+// where it crosses the two front holes it meets each in the space quartic
+// two cylinders of different radii share, which the kernel carries exactly
+// (ADR 0047), so every step of this part is exact.
 
 param hole_diameter: f64 = 16.0;
 param cut_diameter: f64 = 20.0;

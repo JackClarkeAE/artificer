@@ -742,8 +742,10 @@ For an agent, the rules that make this reliable:
 - Pick selector points that stay on the face or edge you mean after every
   earlier step has run. `faces(">Z")` means the highest upward face.
 - For a fillet on a round rim, name both half-circle edges.
-- Keep cuts inside the face you drill from; a cut that runs into other
-  features may fall to the faceted tier and take much longer.
+- Cuts may cross each other freely where they meet flat faces and round
+  bores or slots — of any radius, on any axis — and stay exact. A cut that
+  runs into a blend's rounded band may fall to the faceted tier and take
+  much longer; drill before you fillet.
 - Angles are degrees, everywhere.
 - Test with `cargo run -p artificer-api-server -- run part.art`; the output
   names the failing step and why.

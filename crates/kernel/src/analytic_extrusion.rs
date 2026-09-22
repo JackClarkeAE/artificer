@@ -36,12 +36,6 @@ impl Frame {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a trace carries the two cylinders that define it, and boxing \
-              would put a heap allocation on the 2D Boolean's hottest path \
-              and cost the type its Copy"
-)]
 pub(crate) enum Segment {
     Line {
         start: Point2,
@@ -81,18 +75,18 @@ pub(crate) enum Segment {
     },
     /// A piece of the curve two cylinders share that is not a line, a circle
     /// or an ellipse (ADR 0047): the quadratic root of
-    /// [`crate::cylinder_trace`], walked from azimuth `from` to `to` of its
-    /// host, and read in whichever of the two faces this piece belongs to.
+    /// [`crate::cylinder_trace`] as a graph over the azimuth of `host` — the
+    /// cylinder of the face this piece lies on — from `from` to `to`, moved
+    /// by `shift`.
     ///
-    /// Both faces walk the same parameter — the host's azimuth — so the two
-    /// sides of the edge agree point for point, which is what the sewer's
-    /// weld needs. `shift` moves the result into this face's own parameter
-    /// window and is a whole turn wherever it is not zero.
+    /// Every 2D stage reads a trace this way, on its own face's azimuth,
+    /// where it is a plain graph with an exact implicit form. The two faces
+    /// either side of the curve read it over different azimuths here; the
+    /// sewer is what puts both onto the one parameter an edge needs.
     Trace {
         host: Cylinder,
         other: Cylinder,
         branch: f64,
-        on_other: bool,
         shift: Point2,
         from: f64,
         to: f64,
@@ -109,7 +103,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift,
                 from,
                 to,
@@ -119,7 +112,7 @@ impl Segment {
                     host,
                     other,
                     branch,
-                    on_other,
+                    on_other: false,
                     shift,
                 },
                 from,
@@ -135,20 +128,13 @@ impl Segment {
         Some(curve.evaluate((to - from).mul_add(fraction, from)))
     }
 
-    /// The same trace piece with one end carried to a given abscissa.
-    ///
-    /// On the face that holds the parameter the abscissa is the parameter,
-    /// so the new end is read straight off. On the other it is not, and the
-    /// parameter that reaches the abscissa is found by Newton steps on the
-    /// abscissa's own rate — which converges at once here, because this is
-    /// only ever asked to carry an end onto a seam it already reaches to
-    /// within the window's margin.
+    /// The same trace piece with one end carried to a given abscissa, which
+    /// on the piece's own face is its parameter moved by the shift.
     pub(crate) fn trace_to_abscissa(self, abscissa: f64, at_start: bool) -> Option<Self> {
         let Self::Trace {
             host,
             other,
             branch,
-            on_other,
             shift,
             from,
             to,
@@ -158,26 +144,7 @@ impl Segment {
         else {
             return None;
         };
-        let parameter = if on_other {
-            let mut parameter = if at_start { from } else { to };
-            for _ in 0..8 {
-                let here = Curve2::Trace {
-                    host,
-                    other,
-                    branch,
-                    on_other,
-                    shift,
-                };
-                let rate = here.derivative(parameter).x;
-                if !rate.is_finite() || rate.abs() <= f64::EPSILON {
-                    return None;
-                }
-                parameter += (abscissa - here.evaluate(parameter).x) / rate;
-            }
-            parameter
-        } else {
-            abscissa - shift.x
-        };
+        let parameter = abscissa - shift.x;
         if !parameter.is_finite() {
             return None;
         }
@@ -190,17 +157,29 @@ impl Segment {
             host,
             other,
             branch,
-            on_other,
             shift,
             from,
             to,
             start,
             end,
         };
+        // The carried end lands on the abscissa itself, not on whatever the
+        // parameter's round trip gives back, so a cut made there meets the
+        // line it was cut against exactly.
+        let height = |x: f64| {
+            crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .height_clamped(x)
+                + shift.y
+        };
+        let landed = Point2::new(abscissa, height(parameter));
         Some(if at_start {
-            carried.with_endpoints(carried.point_at(0.0), end)
+            carried.with_endpoints(landed, end)
         } else {
-            carried.with_endpoints(start, carried.point_at(1.0))
+            carried.with_endpoints(start, landed)
         })
     }
 
@@ -286,7 +265,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift,
                 from,
                 to,
@@ -295,7 +273,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift,
                 from,
                 to,
@@ -363,7 +340,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift,
                 from,
                 to,
@@ -373,7 +349,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift,
                 from: to,
                 to: from,
@@ -624,7 +599,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift: was,
                 from,
                 to,
@@ -634,7 +608,6 @@ impl Segment {
                 host,
                 other,
                 branch,
-                on_other,
                 shift: shift(was),
                 from,
                 to,
@@ -1278,17 +1251,45 @@ pub(crate) fn topology_loop_chords(topology: &Topology, loop_key: LoopKey) -> Op
                     branch,
                     on_other,
                     shift,
-                } => Some(Segment::Trace {
-                    host,
-                    other,
-                    branch,
-                    on_other,
-                    shift,
-                    from: range.start,
-                    to: range.end,
-                    start,
-                    end,
-                }),
+                } => {
+                    if !on_other {
+                        return Some(Segment::Trace {
+                            host,
+                            other,
+                            branch,
+                            shift,
+                            from: range.start,
+                            to: range.end,
+                            start,
+                            end,
+                        });
+                    }
+                    // Stored on the face that does not hold the edge's
+                    // parameter: read it back over this face's own azimuth,
+                    // which is how every 2D stage reads a trace, and onto the
+                    // window its stored ends sit on.
+                    let trace = crate::cylinder_trace::CylinderTrace {
+                        host,
+                        other,
+                        branch,
+                    };
+                    let ends = [
+                        trace.point_clamped(range.start),
+                        trace.point_clamped(range.end),
+                    ];
+                    let (own, arc) = trace.read_on(other, range.start, range.end, ends)?;
+                    let turns = ((start.x - arc.start.x) / std::f64::consts::TAU).round();
+                    Some(Segment::Trace {
+                        host: own.host,
+                        other: own.other,
+                        branch: own.branch,
+                        shift: Point2::new(turns * std::f64::consts::TAU, shift.y),
+                        from: arc.from,
+                        to: arc.to,
+                        start,
+                        end,
+                    })
+                }
             }
         })
         .collect()

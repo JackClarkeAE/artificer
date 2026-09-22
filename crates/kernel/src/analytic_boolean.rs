@@ -23,9 +23,10 @@
 use artificer_protocol::{BooleanOperation, PrecisionPolicy};
 
 use crate::analytic_extrusion::Segment;
+use crate::cylinder_trace::{CylinderTrace, cylinder_local, same_carrier};
 use crate::profile_boolean::{
-    ProfileBooleanError, ProfileRegion, chain_welded_segments, chord_region_pieces, point_in_loops,
-    profile_boolean_multi, welded, wrap_loops,
+    ProfileBooleanError, ProfileRegion, chain_welded_segments, chord_region_pieces,
+    profile_boolean_multi, split_at_mutual_crossings, weld_aligned, welded,
 };
 use crate::sew::{SewError, SewFace, ray_directions, ray_face_crossings, sew_shells};
 use crate::surface_intersection::{IntersectionCurve, SurfaceIntersection, intersect};
@@ -44,11 +45,11 @@ pub(crate) enum AnalyticBooleanError {
     CarrierPair(Box<[Surface; 2]>),
     /// The operation succeeded and produced no material.
     EmptyResult,
-    /// The faces meet along the curve two cylinders share (ADR 0047), and
-    /// the section it leaves on one of them is a shape this closure does not
-    /// assemble yet: a chain that enters and leaves the face by the same
-    /// edge, or one that ends inside the window. The curve is exact and
-    /// carried; what is missing is the step that turns it into a boundary.
+    /// A section that includes the curve two cylinders share (ADR 0047) did
+    /// not close on a cylinder face: one of its curves ends inside the
+    /// window, or an edge generator is crossed an odd number of times. Both
+    /// mean a face of the other solid did not report the piece that
+    /// continues a curve, and the closure refuses rather than guess it.
     TraceUnclosed,
 }
 
@@ -60,14 +61,6 @@ pub(crate) fn build_analytic_boolean(
     precision: PrecisionPolicy,
 ) -> Result<Topology, AnalyticBooleanError> {
     let mut pieces = Vec::new();
-    let named = |error: AnalyticBooleanError| match error {
-        AnalyticBooleanError::DomainUnsupported
-            if operands_share_a_trace(target, tool, precision) =>
-        {
-            AnalyticBooleanError::TraceUnclosed
-        }
-        other => other,
-    };
     collect_operand_pieces(
         target,
         tool,
@@ -75,8 +68,7 @@ pub(crate) fn build_analytic_boolean(
         OperandSide::Target,
         precision,
         &mut pieces,
-    )
-    .map_err(named)?;
+    )?;
     collect_operand_pieces(
         tool,
         target,
@@ -84,38 +76,12 @@ pub(crate) fn build_analytic_boolean(
         OperandSide::Tool,
         precision,
         &mut pieces,
-    )
-    .map_err(named)?;
+    )?;
     if pieces.is_empty() {
         return Err(AnalyticBooleanError::EmptyResult);
     }
-    sew_shells(&pieces, precision).map_err(|error| {
-        named(match error {
-            SewError::Inconsistent | SewError::Degenerate => {
-                AnalyticBooleanError::DomainUnsupported
-            }
-        })
-    })
-}
-
-/// Whether any face of one solid meets a face of the other along the curve
-/// two cylinders share.
-///
-/// A failure anywhere in the engine is reported against that curve when the
-/// operands have one, because it is the part of this pair the engine has
-/// only just learned to carry, and saying "tangential or coincident" of a
-/// quartic sends the reader looking for the wrong thing.
-fn operands_share_a_trace(target: &Topology, tool: &Topology, precision: PrecisionPolicy) -> bool {
-    target.faces.iter().any(|face| {
-        tool.faces.iter().any(|other| {
-            matches!(
-                intersect(face.value.surface, other.value.surface, precision),
-                Ok(SurfaceIntersection::Curves(ref curves))
-                    if curves
-                        .iter()
-                        .any(|curve| matches!(curve, IntersectionCurve::Trace(_)))
-            )
-        })
+    sew_shells(&pieces, precision).map_err(|error| match error {
+        SewError::Inconsistent | SewError::Degenerate => AnalyticBooleanError::DomainUnsupported,
     })
 }
 
@@ -632,26 +598,28 @@ fn section_on_face(
     // make the chain ambiguous — a vertex with four ends where a loop needs
     // two.
     let pieces = without_repeated_pieces(pieces, precision);
-    let loops = match face.surface {
-        Surface::Cylinder(cylinder) => {
-            close_periodic_sections(pieces, own_region, &cylinder, other, precision)?
-        }
-        _ => chain_welded_segments(pieces, precision)
-            .map_err(|_| AnalyticBooleanError::DomainUnsupported)?,
-    };
-    nest_section_loops(loops)
+    match face.surface {
+        Surface::Cylinder(_) => close_periodic_sections(pieces, own_region, precision),
+        _ => nest_section_loops(
+            chain_welded_segments(pieces, precision)
+                .map_err(|_| AnalyticBooleanError::DomainUnsupported)?,
+        ),
+    }
 }
 
-/// Closes the sections on a periodic face.
-///
-/// A plane through a whole cylinder leaves a trace that runs the full turn
-/// of the azimuth and never meets itself in parameter space: it enters the
-/// face's window at one seam and leaves at the other, one period on. Such a
-/// chain is closed round the outside of the window, on whichever side the
-/// other solid's material lies, so the face's 2D Boolean sees a region
-/// rather than a cut line. Chains that already close are kept as they are.
-/// Walks welded section pieces into oriented chains, each either closed or
-/// running from one loose end to another.
+/// A piece walked one way: halfedge `2·index` is piece `index` forward and
+/// `2·index + 1` the same piece reversed.
+fn halfedge_segment(welded: &[Segment], halfedge: usize) -> Segment {
+    let piece = welded[halfedge / 2];
+    if halfedge.is_multiple_of(2) {
+        piece
+    } else {
+        piece.reversed()
+    }
+}
+
+/// The face-boundary walk over welded pieces: every halfedge in exactly one
+/// cycle, each cycle keeping the cell it bounds on its left.
 ///
 /// The walk is over *directed* halfedges with a fixed successor, not over
 /// pieces with a "take whichever is still unused" continuation. That
@@ -672,17 +640,9 @@ fn section_on_face(
 /// the way back: that is the standard face-boundary walk, it keeps the
 /// material the chain bounds on one side, and every halfedge lies in exactly
 /// one cycle however the pieces were listed.
-fn trace_section_chains(welded: &[Segment]) -> Vec<Vec<Segment>> {
-    // A halfedge is a piece walked one way: `2·index` forward, `+1` reversed.
+fn halfedge_cycles(welded: &[Segment]) -> Vec<Vec<usize>> {
     let count = welded.len();
-    let oriented = |halfedge: usize| -> Segment {
-        let piece = welded[halfedge / 2];
-        if halfedge.is_multiple_of(2) {
-            piece
-        } else {
-            piece.reversed()
-        }
-    };
+    let oriented = |halfedge: usize| halfedge_segment(welded, halfedge);
     let twin = |halfedge: usize| halfedge ^ 1;
     let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
     // The direction a halfedge sets off in from its own origin.
@@ -756,343 +716,48 @@ fn trace_section_chains(welded: &[Segment]) -> Vec<Vec<Segment>> {
         cycles.push(cycle);
     }
 
-    // A cycle that walks a halfedge and then its twin is going out along a
-    // dangling run and coming back: that is an open chain, and the turn-backs
-    // are where to cut it. A cycle with no turn-back is closed.
-    let mut runs: Vec<Vec<usize>> = Vec::new();
-    let mut rings: Vec<Vec<usize>> = Vec::new();
-    for cycle in cycles {
-        let length = cycle.len();
-        let turns_back = |position: usize| cycle[position] == twin(cycle[(position + 1) % length]);
-        let Some(cut) = (0..length).find(|position| turns_back(*position)) else {
-            rings.push(cycle);
-            continue;
-        };
-        // Start just after a turn-back, so the runs between turn-backs are
-        // whole. A cycle whose walk happened to begin in the middle of a
-        // dangling run would otherwise hand back that run's two halves as
-        // though they were separate chains.
-        let mut ordered = cycle;
-        ordered.rotate_left(cut + 1);
-        let mut run: Vec<usize> = Vec::new();
-        for position in 0..length {
-            run.push(ordered[position]);
-            if ordered[position] == twin(ordered[(position + 1) % length]) {
-                runs.push(std::mem::take(&mut run));
-            }
-        }
-        if !run.is_empty() {
-            runs.push(run);
-        }
-    }
-
-    let mut chains: Vec<Vec<Segment>> = Vec::new();
-    // A face boundary walks a dangling run once in each direction, because
-    // there is no other face on the far side of it to walk it back. The run is
-    // one chain, not two, so the return journey is dropped. Which of the pair
-    // survives is then settled by the geometry rather than by which was walked
-    // first: an open chain has no material side to hold it one way round, and
-    // left to right is the way the periodic window is stitched.
-    let mut kept: Vec<Vec<usize>> = Vec::new();
-    for run in runs {
-        let back: Vec<usize> = run.iter().rev().map(|halfedge| twin(*halfedge)).collect();
-        if !kept.contains(&back) {
-            kept.push(run);
-        }
-    }
-    for run in kept {
-        let walked: Vec<Segment> = run.into_iter().map(&oriented).collect();
-        let (from, to) = (walked[0].start(), walked[walked.len() - 1].end());
-        let forwards = from
-            .x
-            .total_cmp(&to.x)
-            .then(from.y.total_cmp(&to.y))
-            .is_le();
-        chains.push(if forwards {
-            walked
-        } else {
-            walked.iter().rev().map(|piece| piece.reversed()).collect()
-        });
-    }
-    // Every closed cycle bounds a cell, with the cell on its left. The cells
-    // that hold material wind positive; the arrangement's complement, and the
-    // inside of every ring, wind negative. Keeping the positive ones keeps each
-    // bounding loop exactly once — whether it stands alone, is one of several
-    // disjoint loops, or is a ring, whose inner loop arrives positive as the
-    // boundary of the cell it encloses. Nesting is then read off by
-    // containment, which is `nest_section_loops`, not by winding.
-    for ring in rings {
-        let walked: Vec<Segment> = ring.into_iter().map(&oriented).collect();
-        if chain_signed_area(&walked) > 0.0 {
-            chains.push(walked);
-        }
-    }
-    chains
+    cycles
 }
 
-/// The area a chain encloses in the face's own parameter space, sampled along
-/// each arc so a harmonic's bow counts rather than only its chord.
-fn chain_signed_area(chain: &[Segment]) -> f64 {
-    let mut points: Vec<Point2> = Vec::new();
-    for segment in chain {
-        for step in 0..16 {
-            points.push(segment.point_at(f64::from(step) / 16.0));
-        }
+/// The azimuths a section piece on a cylinder spans, lowest first.
+///
+/// Every piece a cylinder's section is made of runs one way in the azimuth —
+/// a ring chord, a harmonic, a trace between its landmarks — or not at all,
+/// as a generator does, so its two ends bound it.
+fn abscissa_span(piece: Segment) -> Option<(f64, f64)> {
+    match piece {
+        Segment::Line { start, end }
+        | Segment::Harmonic { start, end, .. }
+        | Segment::Trace { start, end, .. } => Some((start.x.min(end.x), start.x.max(end.x))),
+        Segment::Arc { .. } | Segment::Ellipse { .. } => None,
     }
-    let count = points.len();
-    if count < 3 {
-        return 0.0;
-    }
-    (0..count)
-        .map(|index| {
-            let (a, b) = (points[index], points[(index + 1) % count]);
-            a.x.mul_add(b.y, -(b.x * a.y))
-        })
-        .sum::<f64>()
-        * 0.5
 }
 
-/// Orders the open chains across a periodic window from low to high, by where
-/// they run rather than by their average height.
-///
-/// The bands that close the window are cut between consecutive chains, so this
-/// order decides which chain each band reaches from and to, and therefore which
-/// side of each chain the section claims as the other solid's material.
-///
-/// Averaging a chain's height cannot do it. Two chains that are reflections of
-/// one another about the same level average to the same number, and the two
-/// traces of a Steinmetz seam on a bore wall are exactly that pair:
-/// `v = 980 ± 8·cos u`, both averaging 980 to the last bit. The order then came
-/// from the order the chains happened to arrive in, and the bands came out
-/// spanning the lens between the traces instead of avoiding it — so the section
-/// said the other solid's material was where its void is, and the face's 2D
-/// Boolean was handed a hole where it should have been handed a region.
-///
-/// Comparing heights at sampled azimuths is a real order wherever the chains do
-/// not cross inside the window, which is the case they have to be stackable in
-/// anyway: two chains that cross part the window into more bands than there are
-/// gaps between them. The Steinmetz pair crosses exactly on the seams, where
-/// the window ends.
-fn stack_open_chains(open: &mut [Vec<Segment>], u_min: f64, u_max: f64) {
-    // A chain's height at one azimuth, by bisecting the piece that spans it.
-    // Every chain reaches across the whole window, so every chain has a height
-    // at every azimuth inside it.
-    let height_at = |chain: &[Segment], u: f64| -> f64 {
-        let piece = chain
-            .iter()
-            .find(|piece| piece.start().x <= u && u <= piece.end().x)
-            .copied()
-            .unwrap_or(chain[chain.len() / 2]);
-        let (mut low, mut high) = (0.0_f64, 1.0_f64);
-        for _ in 0..48 {
-            let middle = 0.5 * (low + high);
-            if piece.point_at(middle).x < u {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
-        piece.point_at(0.5 * (low + high)).y
-    };
-    let profile = |chain: &[Segment]| -> Vec<f64> {
-        (1..8)
-            .map(|step| height_at(chain, (u_max - u_min).mul_add(f64::from(step) / 8.0, u_min)))
-            .collect()
-    };
-    open.sort_by(|left, right| {
-        profile(left)
-            .into_iter()
-            .zip(profile(right))
-            .map(|(left, right)| left.total_cmp(&right))
-            .find(|order| order.is_ne())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-}
-
-fn close_periodic_sections(
-    pieces: Vec<Segment>,
-    region: &[Vec<Segment>],
-    cylinder: &Cylinder,
-    other: &Topology,
-    precision: PrecisionPolicy,
-) -> Result<Vec<Vec<Segment>>, AnalyticBooleanError> {
-    let tau = std::f64::consts::TAU;
-    let (u_min, u_max, v_min, v_max) = region
-        .iter()
-        .flatten()
-        .flat_map(|segment| [segment.start(), segment.end()])
-        .fold(
-            (
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-            ),
-            |(a, b, c, d), point| {
-                (
-                    a.min(point.x),
-                    b.max(point.x),
-                    c.min(point.y),
-                    d.max(point.y),
-                )
-            },
-        );
-    if !u_min.is_finite() || !u_max.is_finite() {
-        return Err(AnalyticBooleanError::DomainUnsupported);
+/// A section piece cut to the part whose azimuth lies in `[low, high]`, with
+/// every cut end landing on the bound itself. `None` when nothing of the
+/// piece is strictly inside.
+fn clip_to_azimuths(piece: Segment, low: f64, high: f64) -> Option<Segment> {
+    let (first, last) = abscissa_span(piece)?;
+    if (last - first).abs() <= f64::EPSILON * first.abs().max(1.0) {
+        // A generator: in the band or not, whole.
+        return (first > low && first < high).then_some(piece);
     }
-    // A trace can run across this face's seam without ever leaving the face
-    // it was trimmed against, so a piece may straddle the window's edge. The
-    // seam is a boundary of this face, and a piece that crosses it is two
-    // pieces: one here, one on the face across it. A plane section never
-    // needs this — its trace runs the whole period — so only a trace is cut.
-    let mut pieces = pieces;
-    for seam in [u_min, u_max] {
-        let mut split = Vec::with_capacity(pieces.len());
-        for piece in pieces {
-            let (low, high) = (
-                piece.start().x.min(piece.end().x),
-                piece.start().x.max(piece.end().x),
-            );
-            if !matches!(piece, Segment::Trace { .. })
-                || seam <= low + 1.0e-9
-                || seam >= high - 1.0e-9
-            {
-                split.push(piece);
-                continue;
-            }
-            match (
-                piece.trace_to_abscissa(seam, false),
-                piece.trace_to_abscissa(seam, true),
-            ) {
-                (Some(before), Some(after)) => {
-                    split.push(before);
-                    split.push(after);
-                }
-                _ => split.push(piece),
-            }
-        }
-        pieces = split;
+    if last <= low || first >= high {
+        return None;
     }
-    // Every piece into the face's own angular window, by whole turns, and
-    // pieces that only touch the window at a seam, or never enter it, are
-    // left out: they belong to the face across the seam, or to a far cap's
-    // section of the same carrier.
-    let scale_hint = pieces
-        .iter()
-        .flat_map(|segment| [segment.start(), segment.end()])
-        .map(|point| point.x.abs().max(point.y.abs()))
-        .fold(1.0_f64, f64::max);
-    let margin = precision.linear_agreement.max(1.0e-12) * scale_hint * 128.0;
-    let pieces: Vec<Segment> = pieces
-        .into_iter()
-        .map(|piece| {
-            let middle = 0.5 * (piece.start().x + piece.end().x);
-            let turns = ((u_min - middle) / tau).ceil();
-            if turns == 0.0 {
-                piece
-            } else {
-                piece.translated(Point2::new(-turns * tau, 0.0))
-            }
-        })
-        .filter(|piece| {
-            (1..8).any(|step| {
-                let point = piece.point_at(f64::from(step) / 8.0);
-                point.x > u_min + margin
-                    && point.x < u_max - margin
-                    && point.y >= v_min - margin
-                    && point.y <= v_max + margin
-            })
-        })
-        .collect();
-    if pieces.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Weld endpoints and read off closed loops and open chains.
-    let scale = pieces
-        .iter()
-        .flat_map(|segment| [segment.start(), segment.end()])
-        .map(|point| point.x.abs().max(point.y.abs()))
-        .fold(1.0_f64, f64::max);
-    let weld = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
-    let mut representatives: Vec<Point2> = Vec::new();
-    let mut canonical = |point: Point2| -> Point2 {
-        if let Some(found) = representatives
-            .iter()
-            .find(|candidate| (candidate.x - point.x).hypot(candidate.y - point.y) <= weld)
-        {
-            return *found;
-        }
-        representatives.push(point);
-        point
-    };
-    let welded: Vec<Segment> = pieces
-        .into_iter()
-        .map(|piece| {
-            let start = canonical(piece.start());
-            let end = canonical(piece.end());
-            piece.with_endpoints(start, end)
-        })
-        .collect();
-    let key = |point: Point2| (point.x.to_bits(), point.y.to_bits());
-    let mut loops: Vec<Vec<Segment>> = Vec::new();
-    let mut open: Vec<Vec<Segment>> = Vec::new();
-    for mut chain in trace_section_chains(&welded) {
-        let first = chain[0].start();
-        let last = chain[chain.len() - 1].end();
-        if key(first) == key(last) {
-            loops.push(chain);
-            continue;
-        }
-        // Every open chain runs left to right, and must reach from one seam
-        // of the window to the other: round the whole period, or across a
-        // face that is one part of it.
-        if first.x > last.x {
-            chain = chain.iter().rev().map(|piece| piece.reversed()).collect();
-        }
-        let first = chain[0].start();
-        let last = chain[chain.len() - 1].end();
-        // A chain that leaves one seam and returns to it takes a bite out of
-        // the face's edge rather than crossing the face. A plane section
-        // never does this — its trace runs the whole period — but the curve
-        // of two cylinders does whenever the narrower one reaches the seam
-        // without passing it. The bite closes along the seam itself, which
-        // is a boundary the face already has.
-        let same_seam =
-            |seam: f64| (first.x - seam).abs() <= margin && (last.x - seam).abs() <= margin;
-        if same_seam(u_min) || same_seam(u_max) {
-            chain.push(Segment::Line {
-                start: last,
-                end: first,
-            });
-            loops.push(chain);
-            continue;
-        }
-        if first.x > u_min + margin || last.x < u_max - margin {
-            return Err(
-                if chain.iter().any(|p| matches!(p, Segment::Trace { .. })) {
-                    AnalyticBooleanError::TraceUnclosed
+    let carry = |piece: Segment, abscissa: f64, at_start: bool| -> Option<Segment> {
+        match piece {
+            Segment::Line { start, end } => {
+                let from = if at_start { end } else { start };
+                let to = if at_start { start } else { end };
+                let along = (abscissa - from.x) / (to.x - from.x);
+                let landed = Point2::new(abscissa, (to.y - from.y).mul_add(along, from.y));
+                Some(if at_start {
+                    Segment::Line { start: landed, end }
                 } else {
-                    AnalyticBooleanError::DomainUnsupported
-                },
-            );
-        }
-        open.push(chain);
-    }
-    if open.is_empty() {
-        return Ok(loops);
-    }
-    // The open chains part the window into bands. The other solid's
-    // material fills every other band, starting on whichever side of the
-    // lowest chain a probe says it lies; each band closes round the
-    // outside of the window, past the seams, so nothing it adds lies on
-    // the face's own edges.
-    // Each chain reaches past both seams by a clear margin, along its own
-    // carrier, so the connectors the bands add never touch the face.
-    let reach = 0.05;
-    let left = u_min - reach;
-    let right = u_max + reach;
-    let extend = |segment: Segment, to_x: f64, at_start: bool| -> Option<Segment> {
-        match segment {
+                    Segment::Line { start, end: landed }
+                })
+            }
             Segment::Harmonic {
                 mean,
                 amplitude,
@@ -1100,104 +765,386 @@ fn close_periodic_sections(
                 start,
                 end,
             } => {
-                let section = CylinderSectionHarmonic {
-                    cylinder: *cylinder,
+                let landed =
+                    Point2::new(abscissa, amplitude.mul_add((abscissa - phase).cos(), mean));
+                Some(Segment::Harmonic {
                     mean,
                     amplitude,
                     phase,
-                };
-                Some(if at_start {
-                    section.segment(to_x, end.x)
-                } else {
-                    section.segment(start.x, to_x)
+                    start: if at_start { landed } else { start },
+                    end: if at_start { end } else { landed },
                 })
             }
-            Segment::Line { start, end } if (end.y - start.y).abs() <= weld => Some(if at_start {
-                Segment::Line {
-                    start: Point2::new(to_x, start.y),
-                    end,
-                }
-            } else {
-                Segment::Line {
-                    start,
-                    end: Point2::new(to_x, end.y),
-                }
-            }),
-            trace @ Segment::Trace { .. } => trace.trace_to_abscissa(to_x, at_start),
-            _ => None,
+            trace @ Segment::Trace { .. } => trace.trace_to_abscissa(abscissa, at_start),
+            Segment::Arc { .. } | Segment::Ellipse { .. } => None,
         }
     };
-    for chain in &mut open {
-        let count = chain.len();
-        if chain[0].start().x > left {
-            chain[0] =
-                extend(chain[0], left, true).ok_or(AnalyticBooleanError::DomainUnsupported)?;
-        }
-        if chain[count - 1].end().x < right {
-            chain[count - 1] = extend(chain[count - 1], right, false)
-                .ok_or(AnalyticBooleanError::DomainUnsupported)?;
+    let mut piece = piece;
+    for at_start in [true, false] {
+        let end = if at_start { piece.start() } else { piece.end() };
+        if end.x < low {
+            piece = carry(piece, low, at_start)?;
+        } else if end.x > high {
+            piece = carry(piece, high, at_start)?;
         }
     }
-    stack_open_chains(&mut open, u_min, u_max);
-    let lowest = &open[0];
-    let probe = lowest[lowest.len() / 2].point_at(0.5);
-    let step = (v_max - v_min).max(1.0) * 1.0e-3;
-    let probe_point = cylinder.evaluate(Point2::new(probe.x, probe.y + step));
-    // A section is a closure: where the other solid has a face on this very
-    // carrier, the probe lies on that skin, and a ray's parity there is a
-    // coin toss. The skin counts as covered, and only a probe off every
-    // coincident face is asked of the solid's interior.
-    let above_lowest =
-        match on_coincident_face(&Surface::Cylinder(*cylinder), other, probe_point, precision) {
-            Some(covered) => covered,
-            None => {
-                point_in_solid(other, probe_point).ok_or(AnalyticBooleanError::DomainUnsupported)?
-            }
+    Some(piece)
+}
+
+/// Closes the other solid's section on a periodic face into regions.
+///
+/// A section is the part of this face's carrier that lies inside the other
+/// solid, and its boundary is every curve the other solid's faces cut the
+/// carrier in. On a cylinder those curves live on a surface that wraps round,
+/// and the face is one window of it: a plane's trace crosses the window from
+/// seam to seam, a bore of the same size crosses it in a lens, and a narrower
+/// bore that reaches a seam without passing it takes a bite out of the edge
+/// and leaves by the seam it came in by. Asking which of those shapes a
+/// section is, and closing each its own way, is the approach that kept
+/// needing another case; this does not ask.
+///
+/// The curves are lifted onto the unrolled carrier and cut to a window a
+/// little wider than the face's own, so the face lies strictly inside it and
+/// nothing added below ever touches the face's edges. Inside that window the
+/// section is bounded by the curves and by stretches of the window's two edge
+/// generators — and which stretches is not a question about shapes but a
+/// count. A generator is a line on the carrier. Far enough along it, it is
+/// outside the other solid, which is bounded; every curve it crosses takes it
+/// in or out. So along each edge generator the crossings, taken in order,
+/// pair off: first and second bound a stretch inside, third and fourth the
+/// next. Those stretches close every chain that the window cut open, and the
+/// section comes back as closed loops for [`nest_section_loops`] — whatever
+/// mixture of bands, bites, lenses and islands it happens to be.
+///
+/// A curve that meets an edge generator and turns back, or two curves that
+/// cross on it, put an even number of ends at one point: the side does not
+/// change there, so those ends pair with each other rather than with the
+/// stretch, and a stretch that runs past such a point is cut at it.
+fn close_periodic_sections(
+    pieces: Vec<Segment>,
+    region: &[Vec<Segment>],
+    precision: PrecisionPolicy,
+) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
+    let tau = std::f64::consts::TAU;
+    let unclosed = |pieces: &[Segment]| {
+        if pieces
+            .iter()
+            .any(|piece| matches!(piece, Segment::Trace { .. }))
+        {
+            AnalyticBooleanError::TraceUnclosed
+        } else {
+            AnalyticBooleanError::DomainUnsupported
+        }
+    };
+    let Some((u_min, u_max)) = azimuth_window(region) else {
+        return Err(AnalyticBooleanError::DomainUnsupported);
+    };
+    let reach = 0.05;
+    let (low, high) = (u_min - reach, u_max + reach);
+
+    // Each curve once: the matrix offers a piece on every turn a window
+    // might use, and pieces handed over from another face arrive on
+    // whichever turn that face's arctangent gave. Brought to one turn, the
+    // copies are the same piece, and a copy left in would double a curve.
+    let scale = pieces
+        .iter()
+        .flat_map(|segment| [segment.start(), segment.end()])
+        .map(|point| point.x.abs().max(point.y.abs()))
+        .fold(1.0_f64, f64::max);
+    let weld = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
+    let mut once: Vec<Segment> = Vec::new();
+    for piece in pieces {
+        let (first, _) = abscissa_span(piece).ok_or(AnalyticBooleanError::DomainUnsupported)?;
+        let turns = (first / tau).floor();
+        let piece = if turns == 0.0 {
+            piece
+        } else {
+            piece.translated(Point2::new(turns * tau, 0.0))
         };
-    let left = open
-        .iter()
-        .map(|chain| chain[0].start().x)
-        .fold(f64::INFINITY, f64::min);
-    let right = open
-        .iter()
-        .map(|chain| chain[chain.len() - 1].end().x)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let far_below = v_min - (v_max - v_min).max(1.0);
-    let far_above = v_max + (v_max - v_min).max(1.0);
-    let level = |height: f64| -> Vec<Segment> {
-        vec![Segment::Line {
-            start: Point2::new(left, height),
-            end: Point2::new(right, height),
-        }]
+        once.push(piece);
+    }
+    let once = without_repeated_pieces(once, precision);
+
+    // Then every turn of each that reaches into the window, cut to it.
+    let mut lifted: Vec<Segment> = Vec::new();
+    for piece in once {
+        let (first, last) = abscissa_span(piece).ok_or(AnalyticBooleanError::DomainUnsupported)?;
+        let lowest = ((low - last) / tau).floor() as i64;
+        let highest = ((high - first) / tau).ceil() as i64;
+        for turns in lowest..=highest {
+            let shifted = if turns == 0 {
+                piece
+            } else {
+                piece.translated(Point2::new(-(turns as f64) * tau, 0.0))
+            };
+            if let Some(kept) = clip_to_azimuths(shifted, low, high)
+                && kept.length() > weld
+            {
+                lifted.push(kept);
+            }
+        }
+    }
+    if lifted.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Weld ends that meet, then cut the curves wherever they cross or touch
+    // away from an edge of the other solid — the pinch of a Steinmetz seam
+    // is two curves crossing where the cylinders are tangent — so the pieces
+    // meet only at their ends and the walk below sees cells, not one loop
+    // wound through a crossing.
+    let welded = weld_aligned(lifted, weld);
+    // Curves that overlap along a stretch, rather than crossing, are a
+    // contact this closure does not classify.
+    let crossed = split_at_mutual_crossings(&welded, precision)
+        .map_err(|_| AnalyticBooleanError::DomainUnsupported)?;
+    let crossed = weld_aligned(crossed, weld);
+    // A generator the carrier is only tangent along bounds nothing. On the
+    // face's own edge that is a smooth edge of the result — a fillet's
+    // cutter touches the body's faces exactly along its two seams — and the
+    // line is dropped. Strictly inside the face it is two solids touching
+    // along a line, which publishes a seam of no width; tangential contact
+    // fails closed, as it does everywhere else in this engine.
+    let margin = precision.linear_agreement.max(1.0e-12) * scale * 128.0;
+    let mut welded: Vec<Segment> = Vec::with_capacity(crossed.len());
+    for piece in &crossed {
+        if generator_bounds(*piece, &crossed) {
+            welded.push(*piece);
+        } else if piece.start().x > u_min + margin && piece.start().x < u_max - margin {
+            return Err(AnalyticBooleanError::DomainUnsupported);
+        }
+    }
+
+    // The stretches of each edge generator that lie inside the other solid.
+    let mut closures: Vec<Segment> = Vec::new();
+    for bound in [low, high] {
+        let mut ends: Vec<(Point2, usize)> = Vec::new();
+        for piece in &welded {
+            for point in [piece.start(), piece.end()] {
+                if (point.x - bound).abs() > weld {
+                    continue;
+                }
+                match ends.iter_mut().find(|(held, _)| *held == point) {
+                    Some((_, count)) => *count += 1,
+                    None => ends.push((point, 1)),
+                }
+            }
+        }
+        let mut crossings: Vec<Point2> = ends
+            .iter()
+            .filter(|(_, count)| count % 2 == 1)
+            .map(|(point, _)| *point)
+            .collect();
+        let touches: Vec<Point2> = ends
+            .iter()
+            .filter(|(_, count)| count % 2 == 0)
+            .map(|(point, _)| *point)
+            .collect();
+        crossings.sort_by(|left, right| left.y.total_cmp(&right.y));
+        if !crossings.len().is_multiple_of(2) {
+            return Err(unclosed(&welded));
+        }
+        for pair in crossings.chunks(2) {
+            let mut stops = vec![pair[0]];
+            stops.extend(
+                touches
+                    .iter()
+                    .filter(|touch| touch.y > pair[0].y && touch.y < pair[1].y),
+            );
+            stops.push(pair[1]);
+            stops.sort_by(|left, right| left.y.total_cmp(&right.y));
+            for stretch in stops.windows(2) {
+                closures.push(Segment::Line {
+                    start: stretch[0],
+                    end: stretch[1],
+                });
+            }
+        }
+    }
+    welded.extend(closures);
+
+    // Every cycle of the arrangement bounds the cell on its left, and each
+    // cell is wholly inside the other solid or wholly outside it, since
+    // every curve is a boundary of that solid's section. The cells inside
+    // are the section: their outer cycles wind positive, and a cycle round
+    // a hole in one winds negative with the material still on its left.
+    // Cycles whose left is outside — the boundary of the window's outside,
+    // and of every void a curve encloses — are dropped whatever their
+    // winding. Asking the cell rather than the winding is what lets two
+    // lobes pinched at a point, or a lens cut out of a band, come back as
+    // what they are.
+    let mut outers: Vec<Vec<Segment>> = Vec::new();
+    let mut holes: Vec<Vec<Segment>> = Vec::new();
+    for cycle in halfedge_cycles(&welded) {
+        let length = cycle.len();
+        if (0..length).any(|position| cycle[position] == cycle[(position + 1) % length] ^ 1) {
+            // A walk that turns back ran out along a dangling curve: some
+            // face of the other solid did not report the piece that
+            // continues it.
+            return Err(unclosed(&welded));
+        }
+        let cycle: Vec<Segment> = cycle
+            .into_iter()
+            .map(|halfedge| halfedge_segment(&welded, halfedge))
+            .collect();
+        if !material_on_left(&cycle, &welded) {
+            continue;
+        }
+        if loop_area(&cycle) > 0.0 {
+            outers.push(cycle);
+        } else {
+            holes.push(cycle);
+        }
+    }
+    let mut regions: Vec<ProfileRegion> = outers
+        .into_iter()
+        .map(|outer| ProfileRegion {
+            outer,
+            holes: Vec::new(),
+        })
+        .collect();
+    for hole in holes {
+        // A hole's own pieces are its alone — no two cycles share one — so
+        // the middle of one of them sits strictly inside the cell it holes.
+        let sample = longest_piece(&hole).point_at(0.5);
+        let owner = regions
+            .iter_mut()
+            .filter(|region| {
+                crate::analytic_extrusion::point_inside_loop(
+                    sample,
+                    &crate::analytic_extrusion::AnalyticLoop {
+                        segments: region.outer.clone(),
+                        signed_area: 0.0,
+                    },
+                )
+            })
+            .min_by(|left, right| loop_area(&left.outer).total_cmp(&loop_area(&right.outer)));
+        let Some(owner) = owner else {
+            return Err(unclosed(&welded));
+        };
+        owner.holes.push(hole);
+    }
+    Ok(regions)
+}
+
+/// Whether a generator in the section actually bounds it.
+///
+/// A plane tangent to the carrier touches it along a generator, and the
+/// matrix reports that line; but the carrier does not cross the plane there,
+/// so the other solid is on the same side of it to the left and to the right,
+/// and the line bounds nothing. A fillet's own cutter meets the body's faces
+/// exactly so, along both of its seams. Kept, such a line splits one cell of
+/// the section into two that share it, which the face's 2D Boolean then has
+/// to reconcile along the face's own edge. So a generator is asked what every
+/// piece of a section must be: a place where the count changes. Only a
+/// generator can fail the question — a curve that is not one is crossed by
+/// the count itself — and only a tangency makes it fail.
+fn generator_bounds(piece: Segment, arrangement: &[Segment]) -> bool {
+    let Segment::Line { start, end } = piece else {
+        return true;
     };
-    let mut levels: Vec<Vec<Segment>> = Vec::new();
-    if !above_lowest {
-        levels.push(level(far_below));
+    if (start.x - end.x).abs() > 1.0e-12 * start.x.abs().max(1.0) {
+        return true;
     }
-    levels.extend(open);
-    if levels.len() % 2 == 1 {
-        levels.push(level(far_above));
+    let middle = piece.point_at(0.5);
+    let reach = 1.0e-7 * (1.0 + middle.x.abs() + middle.y.abs());
+    let parity = |azimuth: f64| {
+        arrangement
+            .iter()
+            .filter(|candidate| {
+                ordinate_at(**candidate, azimuth).is_some_and(|height| height < middle.y)
+            })
+            .count()
+            % 2
+    };
+    parity(middle.x - reach) != parity(middle.x + reach)
+}
+
+/// A loop's signed area in its face's parameter space.
+fn loop_area(segments: &[Segment]) -> f64 {
+    segments
+        .iter()
+        .map(|segment| segment.signed_area_contribution())
+        .sum()
+}
+
+/// The longest piece of a loop: its middle is as far from the loop's
+/// vertices as the loop allows.
+fn longest_piece(segments: &[Segment]) -> Segment {
+    segments
+        .iter()
+        .copied()
+        .max_by(|left, right| left.length().total_cmp(&right.length()))
+        .unwrap_or(segments[0])
+}
+
+/// The height of a section piece at an azimuth it spans, for the count
+/// below. Each piece is taken half-open, so a vertex two pieces share is
+/// counted once; a generator spans no azimuth at all.
+fn ordinate_at(piece: Segment, azimuth: f64) -> Option<f64> {
+    let (start, end) = (piece.start(), piece.end());
+    let (low, high) = (start.x.min(end.x), start.x.max(end.x));
+    if !(low <= azimuth && azimuth < high) {
+        return None;
     }
-    for pair in levels.chunks(2) {
-        let lower = &pair[0];
-        let upper = &pair[1];
-        let mut band = lower.clone();
-        let lower_end = lower[lower.len() - 1].end();
-        let upper_end = upper[upper.len() - 1].end();
-        band.push(Segment::Line {
-            start: lower_end,
-            end: upper_end,
-        });
-        band.extend(upper.iter().rev().map(|piece| piece.reversed()));
-        let upper_start = upper[0].start();
-        let lower_start = lower[0].start();
-        band.push(Segment::Line {
-            start: upper_start,
-            end: lower_start,
-        });
-        loops.push(band);
+    match piece {
+        Segment::Line { start, end } => {
+            Some((end.y - start.y).mul_add((azimuth - start.x) / (end.x - start.x), start.y))
+        }
+        Segment::Harmonic {
+            mean,
+            amplitude,
+            phase,
+            ..
+        } => Some(amplitude.mul_add((azimuth - phase).cos(), mean)),
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            shift,
+            ..
+        } => Some(
+            CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .height_clamped(azimuth - shift.x)
+                + shift.y,
+        ),
+        Segment::Arc { .. } | Segment::Ellipse { .. } => None,
     }
-    Ok(loops)
+}
+
+/// Whether the other solid's material lies on the left of a traced cycle.
+///
+/// The count is the closure's own: walk down the generator through a point
+/// just left of the cycle, and every curve crossed below takes the walk in
+/// or out of the other solid, which it starts outside of. The point is
+/// taken off the middle of the cycle's longest piece, a hair to its left —
+/// far from every vertex, and nearer that piece than anything else.
+fn material_on_left(cycle: &[Segment], arrangement: &[Segment]) -> bool {
+    let piece = longest_piece(cycle);
+    let middle = piece.point_at(0.5);
+    let (ahead, behind) = (piece.point_at(0.5 + 1.0e-3), piece.point_at(0.5 - 1.0e-3));
+    let (dx, dy) = (ahead.x - behind.x, ahead.y - behind.y);
+    let length = dx.hypot(dy);
+    if length <= 0.0 {
+        return false;
+    }
+    let reach = 1.0e-7 * (1.0 + middle.x.abs() + middle.y.abs());
+    let probe = Point2::new(
+        (-dy / length).mul_add(reach, middle.x),
+        (dx / length).mul_add(reach, middle.y),
+    );
+    arrangement
+        .iter()
+        .filter(|candidate| {
+            ordinate_at(**candidate, probe.x).is_some_and(|height| height < probe.y)
+        })
+        .count()
+        % 2
+        == 1
 }
 
 /// Groups chained section loops into regions by even-odd depth.
@@ -1210,7 +1157,17 @@ fn nest_section_loops(
             .map(|segment| segment.signed_area_contribution())
             .sum()
     };
-    let sample = |segments: &[Segment]| segments[0].start();
+    // A point of the loop that no other loop passes through. A vertex will
+    // not do: loops of a section meet at points — the pinch of a Steinmetz
+    // seam, a curve crossing the window's edge — and a vertex there is on
+    // both, where containment is a coin toss. Loops never share a stretch,
+    // so the middle of one of a loop's own pieces is its alone.
+    let sample = |segments: &[Segment]| {
+        segments
+            .iter()
+            .max_by(|left, right| left.length().total_cmp(&right.length()))
+            .map_or_else(|| segments[0].start(), |piece| piece.point_at(0.5))
+    };
     let inside = |point: Point2, segments: &[Segment]| {
         let wrapped = crate::analytic_extrusion::AnalyticLoop {
             segments: segments.to_vec(),
@@ -1440,10 +1397,23 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
             let u = cylinder.angular_sign * angle;
             let base = offset.dot(axis);
             let along = direction.dot(axis);
-            Some(vec![Segment::Line {
-                start: Point2::new(u, along.mul_add(-SPAN, base)),
-                end: Point2::new(u, along.mul_add(SPAN, base)),
-            }])
+            // On every turn a bounded face window can reach, as a ring or a
+            // harmonic is: the arctangent hands back the principal azimuth,
+            // and a face whose window is the other half turn would otherwise
+            // never see the generator that runs down the middle of it.
+            let tau = std::f64::consts::TAU;
+            Some(
+                [-1.0, 0.0, 1.0]
+                    .into_iter()
+                    .map(|turns: f64| {
+                        let at = turns.mul_add(tau, u);
+                        Segment::Line {
+                            start: Point2::new(at, along.mul_add(-SPAN, base)),
+                            end: Point2::new(at, along.mul_add(SPAN, base)),
+                        }
+                    })
+                    .collect(),
+            )
         }
         (
             Surface::Cylinder(cylinder),
@@ -1479,48 +1449,55 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
             ])
         }
         (Surface::Cylinder(cylinder), IntersectionCurve::Trace(trace)) => {
-            // The curve exists only between its branch points, where the
-            // discriminant is positive, so the turn is cut there first and
-            // each surviving span becomes one piece. A face's own window may
-            // sit on any whole turn, so each piece is offered on the three
-            // branches a bounded window can reach, exactly as a ring chord is.
-            let on_other = same_cylinder(cylinder, &trace.other);
-            if !on_other && !same_cylinder(cylinder, &trace.host) {
+            // Read over this face's own azimuth, whichever of the pair holds
+            // the edge's parameter: every 2D stage reads a trace as a graph
+            // over its own face (ADR 0047). The curve is cut at its
+            // landmarks — both cylinders' branch points — and nowhere else,
+            // so the face across the curve cuts it at the same points.
+            let other = if same_carrier(*cylinder, trace.other) {
+                trace.host
+            } else if same_carrier(*cylinder, trace.host) {
+                trace.other
+            } else {
                 return None;
-            }
+            };
+            let own = CylinderTrace {
+                host: *cylinder,
+                other,
+                branch: 1.0,
+            };
             let tau = std::f64::consts::TAU;
-            let interior = trace.branch_points(-tau, tau);
-            let mut cuts = vec![-tau];
-            cuts.extend(interior.iter().copied());
-            cuts.push(tau);
             let mut pieces = Vec::new();
-            for (index, window) in cuts.windows(2).enumerate() {
-                let (from, to) = (window[0], window[1]);
-                let (from_is_branch, to_is_branch) = (index > 0, index + 2 < cuts.len());
-                if to - from <= 1.0e-9 {
+            for arc in own.arcs()? {
+                // The matrix names the curve one root at a time, over the
+                // pair's canonical reading; each arc lies on one of those
+                // roots, since the canonical host's branch points are among
+                // the landmarks, and is offered once, with its own root.
+                let reading = CylinderTrace {
+                    branch: arc.branch,
+                    ..own
+                };
+                let middle = reading.point_clamped(0.5 * (arc.from + arc.to));
+                let canonical = cylinder_local(trace.host, middle);
+                if trace.branch_at(canonical) != Some(trace.branch) {
                     continue;
                 }
-                let inside = trace.height_at(0.5 * (from + to)).is_some();
-                if !inside {
-                    continue;
-                }
-                for turns in [-1.0, 0.0, 1.0] {
+                // A face's window may sit on any whole turn, so each arc is
+                // offered on every turn a bounded window can reach, exactly
+                // as a ring chord is.
+                for turns in [-2.0, -1.0, 0.0, 1.0] {
                     let shift = Point2::new(turns * tau, 0.0);
-                    let piece = Segment::Trace {
-                        host: trace.host,
-                        other: trace.other,
-                        branch: trace.branch,
-                        on_other,
+                    let place = |point: Point2| Point2::new(point.x + shift.x, point.y);
+                    pieces.push(Segment::Trace {
+                        host: *cylinder,
+                        other,
+                        branch: arc.branch,
                         shift,
-                        from,
-                        to,
-                        start: Point2::new(0.0, 0.0),
-                        end: Point2::new(0.0, 0.0),
-                    };
-                    let start = trace.endpoint(from, from_is_branch, on_other);
-                    let end = trace.endpoint(to, to_is_branch, on_other);
-                    let place = |point: Point2| Point2::new(point.x + shift.x, point.y + shift.y);
-                    pieces.push(piece.with_endpoints(place(start), place(end)));
+                        from: arc.from,
+                        to: arc.to,
+                        start: place(arc.start),
+                        end: place(arc.end),
+                    });
                 }
             }
             (!pieces.is_empty()).then_some(pieces)
@@ -1751,34 +1728,43 @@ fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segmen
                     }
                 }
                 // The piece already carries both cylinders, so handing it to
-                // the other face is a change of which one it is read in, not
-                // a change of curve. The parameter stays the host's azimuth
-                // either way, which is what keeps the two faces' uses of the
-                // edge welded.
+                // another face is a change of which azimuth it is read over,
+                // not a change of curve: the receiving face's own, whether
+                // that is the other cylinder or this one in another frame.
+                // Its ends are carried exactly, so a branch point's double
+                // root stays the end both branches share.
                 Segment::Trace {
                     host,
                     other,
                     branch,
+                    shift,
                     from,
                     to,
-                    ..
+                    start,
+                    end,
                 } => {
-                    let on_other = same_cylinder(cylinder, &other);
-                    if !on_other && !same_cylinder(cylinder, &host) {
-                        return None;
-                    }
-                    let carried = Segment::Trace {
+                    let trace = CylinderTrace {
                         host,
                         other,
                         branch,
-                        on_other,
-                        shift: Point2::new(0.0, 0.0),
-                        from,
-                        to,
-                        start: Point2::new(0.0, 0.0),
-                        end: Point2::new(0.0, 0.0),
                     };
-                    Some(carried.with_endpoints(carried.point_at(0.0), carried.point_at(1.0)))
+                    let unshifted =
+                        |point: Point2| Point2::new(point.x - shift.x, point.y - shift.y);
+                    let ends = [
+                        host.evaluate(unshifted(start)),
+                        host.evaluate(unshifted(end)),
+                    ];
+                    let (read, arc) = trace.read_on(*cylinder, from, to, ends)?;
+                    Some(Segment::Trace {
+                        host: *cylinder,
+                        other: read.other,
+                        branch: read.branch,
+                        shift: Point2::new(0.0, 0.0),
+                        from: arc.from,
+                        to: arc.to,
+                        start: arc.start,
+                        end: arc.end,
+                    })
                 }
                 arc @ Segment::Arc { start, end, .. } => {
                     // A circular arc lies on the cylinder only as a ring arc:
@@ -2076,65 +2062,6 @@ fn face_sample_inside(
 
 /// Exact parity ray cast against a whole topology, retrying awkward
 /// directions before giving up.
-/// A point's parameters on a surface, for a point that lies on it.
-fn surface_local(surface: &Surface, point: Point3) -> Option<Point2> {
-    match surface {
-        Surface::Plane(plane) => Some(Point2::new(
-            (point - plane.origin).dot(plane.u),
-            (point - plane.origin).dot(plane.v),
-        )),
-        Surface::Cylinder(cylinder) => {
-            let axis = cylinder.axis / cylinder.axis.length();
-            let offset = point - cylinder.origin;
-            let height = offset.dot(axis);
-            let radial = offset - axis * height;
-            let angle = radial
-                .dot(cylinder.radial_v)
-                .atan2(radial.dot(cylinder.radial_u));
-            Some(Point2::new(cylinder.angular_sign * angle, height))
-        }
-        _ => None,
-    }
-}
-
-/// Whether a point of `carrier` lies on a face of `other` that shares that
-/// carrier: `Some(true)` on such a face, `None` otherwise — off every such
-/// face the point may still be inside the solid, which is the interior's
-/// question and not the skin's.
-fn on_coincident_face(
-    carrier: &Surface,
-    other: &Topology,
-    point: Point3,
-    precision: PrecisionPolicy,
-) -> Option<bool> {
-    let tau = std::f64::consts::TAU;
-    for other_face in &other.faces {
-        if !matches!(
-            intersect(*carrier, other_face.value.surface, precision),
-            Ok(SurfaceIntersection::Coincident)
-        ) {
-            continue;
-        }
-        let Ok(region) = face_region(other, &other_face.value) else {
-            continue;
-        };
-        let Some(mut local) = surface_local(&other_face.value.surface, point) else {
-            continue;
-        };
-        // On a periodic face the azimuth is asked on the face's own branch.
-        if let (Surface::Cylinder(_), Some((low, high))) =
-            (other_face.value.surface, azimuth_window(&region))
-        {
-            let turns = (((low + high) / 2.0 - local.x) / tau).round();
-            local = Point2::new(local.x + turns * tau, local.y);
-        }
-        if point_in_loops(local, &wrap_loops(&region)) {
-            return Some(true);
-        }
-    }
-    None
-}
-
 pub(crate) fn point_in_solid(topology: &Topology, point: Point3) -> Option<bool> {
     for direction in ray_directions() {
         let mut crossings = 0_usize;
@@ -2189,22 +2116,6 @@ fn mirror_sew_face(piece: SewFace) -> Result<SewFace, AnalyticBooleanError> {
         loops,
         role: piece.role,
     })
-}
-
-/// Whether two cylinder records describe the same carrier, to the agreement
-/// the rest of the engine uses rather than to the last bit.
-fn same_cylinder(left: &Cylinder, right: &Cylinder) -> bool {
-    let scale = left.radius.abs().max(right.radius.abs()).max(1.0);
-    let tolerance = scale * 1.0e-9;
-    let (Some(left_axis), Some(right_axis)) = (
-        (left.axis.length() > f64::EPSILON).then(|| left.axis / left.axis.length()),
-        (right.axis.length() > f64::EPSILON).then(|| right.axis / right.axis.length()),
-    ) else {
-        return false;
-    };
-    (left.radius - right.radius).abs() <= tolerance
-        && left_axis.cross(right_axis).length() <= 1.0e-9
-        && (right.origin - left.origin).cross(left_axis).length() <= tolerance
 }
 
 fn mirror_segment(segment: Segment, mirror: fn(Point2) -> Point2) -> Segment {
@@ -2282,37 +2193,34 @@ fn mirror_segment(segment: Segment, mirror: fn(Point2) -> Point2) -> Segment {
                 end: mirror(start),
             }
         }
-        // Mirroring the azimuth is exactly reversing the carriers' angular
+        // Mirroring the azimuth is exactly reversing this face's angular
         // sense: `radial(−x)` is what `radial(x)` becomes when the sign
-        // flips, so the curve mirrors in parameter space with no reflection
-        // of the carriers themselves.
+        // flips, so the graph mirrors in parameter space with the same root
+        // and no reflection of anything in space. Only the face's own
+        // cylinder changes frame; the other is the face across the curve,
+        // and keeps the frame that face walks it in.
         Segment::Trace {
             host,
             other,
             branch,
-            on_other,
             shift,
             from,
             to,
             start,
             end,
-        } => {
-            let flip = |mut cylinder: crate::topology::Cylinder| {
-                cylinder.angular_sign = -cylinder.angular_sign;
-                cylinder
-            };
-            Segment::Trace {
-                host: flip(host),
-                other: flip(other),
-                branch,
-                on_other,
-                shift: Point2::new(-shift.x, shift.y),
-                from: -to,
-                to: -from,
-                start: mirror(end),
-                end: mirror(start),
-            }
-        }
+        } => Segment::Trace {
+            host: Cylinder {
+                angular_sign: -host.angular_sign,
+                ..host
+            },
+            other,
+            branch,
+            shift: Point2::new(-shift.x, shift.y),
+            from: -to,
+            to: -from,
+            start: mirror(end),
+            end: mirror(start),
+        },
     }
 }
 
@@ -2419,10 +2327,32 @@ mod tests {
         pieces.join("|")
     }
 
-    /// What a presentation traces, as one comparable string: how many chains,
+    /// Every cycle the face-boundary walk traces, as pieces.
+    fn cycles(pieces: &[Segment]) -> Vec<Vec<Segment>> {
+        halfedge_cycles(pieces)
+            .into_iter()
+            .map(|cycle| {
+                cycle
+                    .into_iter()
+                    .map(|halfedge| halfedge_segment(pieces, halfedge))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cycles that wind positive: the outer boundary of every bounded
+    /// cell of the arrangement.
+    fn rings(pieces: &[Segment]) -> Vec<Vec<Segment>> {
+        cycles(pieces)
+            .into_iter()
+            .filter(|cycle| signed_area(cycle) > 0.0)
+            .collect()
+    }
+
+    /// What a presentation traces, as one comparable string: how many cycles,
     /// what each encloses, and what each *is*.
     fn fingerprint(pieces: &[Segment]) -> String {
-        let chains = trace_section_chains(pieces);
+        let chains = cycles(pieces);
         let mut described: Vec<String> = chains
             .iter()
             .map(|chain| {
@@ -2572,7 +2502,7 @@ mod tests {
         // And the answer they agree on is the one the geometry has. Each lobe
         // is `∫ 8·cos u du` over half a period, which is 32; sampling it as a
         // polygon undercuts that by a few hundredths.
-        let chains = trace_section_chains(&presentations[0]);
+        let chains = rings(&presentations[0]);
         assert_eq!(chains.len(), 2, "a pinch is two lobes, not one loop");
         for chain in &chains {
             let area = signed_area(chain);
@@ -2584,35 +2514,30 @@ mod tests {
         }
     }
 
-    /// A section that does not close is the ordinary case on a bore wall: the
-    /// trace runs across the parameter window and out the other side, and the
-    /// periodic stitching downstream closes it round the seams.
-    ///
-    /// A face boundary walks such a run once each way, because there is no
-    /// second face on the far side of it to walk it back. Both journeys are the
-    /// same chain, and handing back both doubles every open section — which
-    /// `nest_section_loops` reads as a loop containing itself, so every depth
-    /// comes out one too high and outer loops are taken for holes.
+    /// A curve that stops inside the window is a section some face of the
+    /// other solid did not finish. The closure refuses it rather than guess
+    /// which way round it was meant to go: the walk goes out along it and
+    /// comes back, and a walk that turns back is not a boundary.
     #[test]
-    fn an_open_run_is_one_chain_and_not_its_return_journey_as_well() {
+    fn a_section_that_stops_inside_the_window_is_refused() {
+        let pi = std::f64::consts::PI;
         let corner = |from: (f64, f64), to: (f64, f64)| Segment::Line {
             start: Point2::new(from.0, from.1),
             end: Point2::new(to.0, to.1),
         };
-        let path = vec![
-            corner((0.0, 0.0), (1.0, 1.0)),
-            corner((1.0, 1.0), (2.0, 0.0)),
-            corner((2.0, 0.0), (3.0, 1.5)),
+        let face = vec![vec![
+            corner((0.0, 0.0), (pi, 0.0)),
+            corner((pi, 0.0), (pi, 10.0)),
+            corner((pi, 10.0), (0.0, 10.0)),
+            corner((0.0, 10.0), (0.0, 0.0)),
+        ]];
+        let dangling = vec![
+            corner((0.5, 2.0), (1.5, 3.0)),
+            corner((1.5, 3.0), (2.5, 2.0)),
         ];
-        let presentations = some_presentations(&path, 200);
-        agreed(&presentations);
-
-        let chains = trace_section_chains(&presentations[0]);
-        assert_eq!(chains.len(), 1, "one run out and back is one chain");
-        assert_eq!(chains[0].len(), 3, "and it is the whole run");
-        assert!(
-            chains[0][0].start().x < chains[0][2].end().x,
-            "an open chain is handed back running left to right"
+        assert_eq!(
+            close_periodic_sections(dangling, &face, PrecisionPolicy::default()).err(),
+            Some(AnalyticBooleanError::DomainUnsupported)
         );
     }
 
@@ -2639,7 +2564,7 @@ mod tests {
         let presentations = some_presentations(&pieces, 200);
         agreed(&presentations);
 
-        let chains = trace_section_chains(&presentations[0]);
+        let chains = rings(&presentations[0]);
         assert_eq!(chains.len(), 2, "two squares are two loops");
         for chain in &chains {
             let area = signed_area(chain);
@@ -2653,14 +2578,18 @@ mod tests {
 
     /// The two traces a Steinmetz seam leaves on a bore wall are reflections of
     /// one another about the middle of the window, so they have the same
-    /// average height — to the last bit, not merely close. Stacking them by
-    /// that average is therefore not stacking them at all: the order comes from
-    /// the order they arrived in, and it decides which chain each band is cut
-    /// between. The bands then span the lens between the traces instead of
-    /// avoiding it, and the section claims the other solid's material is
-    /// exactly where its void is.
+    /// average height — to the last bit, not merely close. When the section was
+    /// closed by stacking its chains into bands, that average decided the
+    /// order, the order came from the order the traces arrived in, and the
+    /// bands spanned the lens between them instead of avoiding it: the section
+    /// claimed the other solid's material was exactly where its void is.
+    ///
+    /// The closure now counts crossings along the window's edge generators
+    /// instead, and nothing in that depends on arrival order. The fixture
+    /// stays because it is the one that once fooled the closure: the lens has
+    /// to come back as material however the traces arrive.
     #[test]
-    fn two_traces_that_average_alike_are_still_stacked_by_where_they_run() {
+    fn two_traces_that_average_alike_still_close_on_the_lens_between_them() {
         // `v = 980 ± 8·cos(u − 3π/2)` over the window `u ∈ [π, 2π]`, each split
         // at its apex and reaching a half period past either seam, which is how
         // the bore wall's own section arrives: one whole period, in two pieces.
@@ -2685,7 +2614,7 @@ mod tests {
         // The average cannot tell them apart. This is the premise, so it is
         // asserted rather than described: if it ever stopped being true the
         // test below would pass for a reason that has nothing to do with the
-        // fix.
+        // closure.
         let mean = |chain: &[Segment]| -> f64 {
             let heights: Vec<f64> = chain
                 .iter()
@@ -2699,21 +2628,48 @@ mod tests {
             "the fixture's two traces must average alike for this test to mean anything"
         );
 
-        // However they arrive, the lower trace is the lower one.
+        let corner = |u: f64, v: f64| Point2::new(u, v);
+        let face = vec![vec![
+            Segment::Line {
+                start: corner(u_min, 900.0),
+                end: corner(u_max, 900.0),
+            },
+            Segment::Line {
+                start: corner(u_max, 900.0),
+                end: corner(u_max, 1_060.0),
+            },
+            Segment::Line {
+                start: corner(u_max, 1_060.0),
+                end: corner(u_min, 1_060.0),
+            },
+            Segment::Line {
+                start: corner(u_min, 1_060.0),
+                end: corner(u_min, 900.0),
+            },
+        ]];
         for arrival in [
-            vec![upper.clone(), lower.clone()],
-            vec![lower.clone(), upper.clone()],
+            [upper.clone(), lower.clone()].concat(),
+            [lower.clone(), upper.clone()].concat(),
         ] {
-            let mut stacked = arrival;
-            stack_open_chains(&mut stacked, u_min, u_max);
-            let apex_of = |chain: &[Segment]| chain[0].end().y;
-            assert!(
-                apex_of(&stacked[0]) < apex_of(&stacked[1]),
-                "stacked low to high, the first chain's apex ({}) must sit below \
-                 the second's ({})",
-                apex_of(&stacked[0]),
-                apex_of(&stacked[1])
-            );
+            let regions = close_periodic_sections(arrival, &face, PrecisionPolicy::default())
+                .expect("the Steinmetz section closes");
+            let loops: Vec<Vec<Segment>> = regions
+                .into_iter()
+                .flat_map(|region| std::iter::once(region.outer).chain(region.holes))
+                .collect();
+            let wrapped = crate::profile_boolean::wrap_loops(&loops);
+            for (u, v) in [(apex, 980.0), (1.2 * pi, 980.0), (1.8 * pi, 980.0)] {
+                assert!(
+                    crate::profile_boolean::point_in_loops(Point2::new(u, v), &wrapped),
+                    "the lens is the other bore's material, at ({u}, {v})"
+                );
+            }
+            for (u, v) in [(apex, 989.0), (apex, 971.0), (1.05 * pi, 985.0)] {
+                assert!(
+                    !crate::profile_boolean::point_in_loops(Point2::new(u, v), &wrapped),
+                    "outside the lens is not, at ({u}, {v})"
+                );
+            }
         }
     }
 

@@ -11,7 +11,8 @@ use artificer_protocol::{Point3, Vector3};
 
 /// The fixture set: every surface kind, seams, a blend with toric and
 /// spherical faces, a cone from a drafted extrusion, an elliptical edge
-/// from an oblique cylinder section, and a body with a cavity.
+/// from an oblique cylinder section, a body with a cavity, and bores of
+/// unequal radius crossing in the quartic two cylinders share.
 fn fixtures() -> Vec<(&'static str, String)> {
     vec![
         (
@@ -54,6 +55,10 @@ fn fixtures() -> Vec<(&'static str, String)> {
         (
             "cavity",
             "let outer = box(size: [40, 40, 40], label: \"outer\");\nlet inner = box(origin: [10, 10, 10], size: [20, 20, 20], label: \"inner\");\ndifference(target: outer, tool: inner, label: \"hollow\");\n".to_owned(),
+        ),
+        (
+            "crossing_bores",
+            include_str!("../examples/three_holes_and_cut.art").to_owned(),
         ),
     ]
 }
@@ -547,8 +552,95 @@ fn check_edge_geometry(name: &str, reader: &Reader, edge: &Entity) {
                 assert!(dot(relative, axis).abs() < 1.0e-6, "{name}: ellipse plane");
             }
         }
+        "INTERSECTION_CURVE" => {
+            // Two cylinders, and a cubic spline for the curve they share
+            // that starts and ends on the edge's vertices and stays on both
+            // surfaces all the way — to the file's own accuracy, read here
+            // through the spline's own definition.
+            let surfaces = references(&curve.args[2]);
+            assert_eq!(surfaces.len(), 2, "{name}: two surfaces");
+            let surfaces: Vec<&Entity> = surfaces.iter().map(|id| reader.get(*id)).collect();
+            for surface in &surfaces {
+                assert_eq!(surface.kind, "CYLINDRICAL_SURFACE", "{name}");
+            }
+            assert_eq!(curve.args[3], ".CURVE_3D.", "{name}");
+            let spline = reader.get(reference(&curve.args[1]));
+            assert_eq!(spline.kind, "B_SPLINE_CURVE_WITH_KNOTS", "{name}");
+            assert_eq!(spline.args[1], "3", "{name}: cubic");
+            let points: Vec<[f64; 3]> = references(&spline.args[2])
+                .into_iter()
+                .map(|id| reader.point(id))
+                .collect();
+            let list = |text: &str| -> Vec<String> {
+                split_args(text.trim().trim_start_matches('(').trim_end_matches(')'))
+            };
+            let multiplicities: Vec<usize> = list(&spline.args[6])
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            let distinct: Vec<f64> = list(&spline.args[7])
+                .iter()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            let knots: Vec<f64> = distinct
+                .iter()
+                .zip(&multiplicities)
+                .flat_map(|(knot, count)| std::iter::repeat_n(*knot, *count))
+                .collect();
+            assert_eq!(knots.len(), points.len() + 4, "{name}: knot count");
+            // The edge's vertices bound the curve in the edge's own sense.
+            let (first, last) = (points[0], points[points.len() - 1]);
+            let (first, last) = if edge.args[4] == ".T." {
+                (first, last)
+            } else {
+                (last, first)
+            };
+            assert!(norm(sub(start, first)) < 1.0e-6, "{name}: spline start");
+            assert!(norm(sub(end, last)) < 1.0e-6, "{name}: spline end");
+            for window in distinct.windows(2) {
+                for step in 0..=16 {
+                    let t = window[0] + (window[1] - window[0]) * f64::from(step) / 16.0;
+                    let point = de_boor(&knots, &points, t);
+                    for surface in &surfaces {
+                        let (origin, axis, _) = reader.placement(reference(&surface.args[1]));
+                        let radius: f64 = surface.args[2].parse().unwrap();
+                        let relative = sub(point, origin);
+                        let radial = sub(relative, scale(axis, dot(relative, axis)));
+                        assert!(
+                            (norm(radial) - radius).abs() < 1.0e-6,
+                            "{name}: the spline strays {} from a cylinder at {t}",
+                            norm(radial) - radius
+                        );
+                    }
+                }
+            }
+        }
         other => panic!("{name}: unexpected curve {other}"),
     }
+}
+
+/// A cubic B-spline's point at `t`, by de Boor's recursion.
+fn de_boor(knots: &[f64], points: &[[f64; 3]], t: f64) -> [f64; 3] {
+    const DEGREE: usize = 3;
+    let last = points.len() - 1;
+    // The span `[knots[k], knots[k + 1])` holding `t`, the final one closed.
+    let span = (DEGREE..=last)
+        .rev()
+        .find(|&k| knots[k] <= t && knots[k] < knots[k + 1])
+        .unwrap_or(DEGREE);
+    let mut local: Vec<[f64; 3]> = (0..=DEGREE).map(|j| points[span - DEGREE + j]).collect();
+    for r in 1..=DEGREE {
+        for j in (r..=DEGREE).rev() {
+            let index = span - DEGREE + j;
+            let alpha = (t - knots[index]) / (knots[index + DEGREE + 1 - r] - knots[index]);
+            local[j] = [
+                (1.0 - alpha) * local[j - 1][0] + alpha * local[j][0],
+                (1.0 - alpha) * local[j - 1][1] + alpha * local[j][1],
+                (1.0 - alpha) * local[j - 1][2] + alpha * local[j][2],
+            ];
+        }
+    }
+    local[DEGREE]
 }
 
 #[test]
@@ -569,7 +661,7 @@ fn every_fixture_exports_as_a_closed_manifold_brep_with_the_kernel_orientation()
                 | "TOROIDAL_SURFACE" => {
                     kinds.insert(entity.kind.clone());
                 }
-                "LINE" | "CIRCLE" | "ELLIPSE" => {
+                "LINE" | "CIRCLE" | "ELLIPSE" | "INTERSECTION_CURVE" => {
                     curves.insert(entity.kind.clone());
                 }
                 "BREP_WITH_VOIDS" => voids += 1,
@@ -579,7 +671,7 @@ fn every_fixture_exports_as_a_closed_manifold_brep_with_the_kernel_orientation()
     }
     // The fixture set covers the whole vocabulary.
     assert_eq!(kinds.len(), 5, "{kinds:?}");
-    assert_eq!(curves.len(), 3, "{curves:?}");
+    assert_eq!(curves.len(), 4, "{curves:?}");
     assert!(voids >= 1, "a cavity fixture");
 }
 

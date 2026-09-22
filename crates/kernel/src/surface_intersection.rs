@@ -467,6 +467,17 @@ fn axis_order(axis: Vector3) -> [i64; 3] {
     [quantize(axis.x), quantize(axis.y), quantize(axis.z)]
 }
 
+/// Whether `host` is the cylinder whose azimuth parameterizes the curve it
+/// shares with `other` (ADR 0047): the first of the pair in the canonical
+/// axis order. The sewer asks the same question the matrix answers, so an
+/// edge built from either face reads its curve over the one parameter.
+pub(crate) fn hosts_trace(host: &Cylinder, other: &Cylinder) -> bool {
+    match (unit(host.axis), unit(other.axis)) {
+        (Ok(host), Ok(other)) => axis_order(host) <= axis_order(other),
+        _ => true,
+    }
+}
+
 /// Where two axes cross, or nothing if they are skew.
 ///
 /// Skew axes have a common perpendicular of non-zero length and no common
@@ -534,7 +545,7 @@ fn cylinder_cylinder(first: Cylinder, second: Cylinder, tolerances: Tolerances) 
         // The host is picked by the same canonical axis order the crossing
         // case uses, so `intersect(a, b)` and `intersect(b, a)` name one
         // curve with one parameter.
-        let (host, other) = if axis_order(axis) <= axis_order(other) {
+        let (host, other) = if hosts_trace(&first, &second) {
             (first, second)
         } else {
             (second, first)

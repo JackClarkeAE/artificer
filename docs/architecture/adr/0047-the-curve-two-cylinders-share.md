@@ -1,8 +1,8 @@
 # ADR 0047: The curve two cylinders share
 
-Status: partly implemented — the curve is exact, carried through the
-vocabulary, and produced by the intersection matrix; the section it leaves on
-a face is not yet closed into a boundary.
+Status: implemented — the curve is exact, carried through the vocabulary,
+produced by the intersection matrix, closed into face boundaries by the exact
+Boolean, mirrored and moved with the body, and written to STEP.
 
 - Date: 2026-09-19
 - Decision owners: Artificer project
@@ -92,22 +92,95 @@ digest and the validator, whose locus proof for the pair is the sampled and
 tangent comparison — complete, because both descriptions run over the same
 parameter, and a quartic has no frame to compare.
 
-### What is not done
+### Closing the section on a cylinder
 
-The section a trace leaves on a face is not yet assembled into a boundary in
-every configuration. On a half-cylinder face a trace can enter and leave by
-the same seam — a bite out of the face's edge — where a plane section always
-runs the whole period; that case is closed along the seam, but others remain,
-and the closure reports `BOOLEAN_TRACE_NOT_CLOSED` rather than guessing.
+A plane section always runs a cylinder face's whole period, so the older
+closure could chain it from seam to seam. A trace need not: on a half-cylinder
+face it can enter and leave by the same seam (a bite out of the face's edge),
+make a closed lens between two branch points, or wind round as a ring. So the
+section on a cylindrical face is closed the way a planar arrangement is:
 
-Until that is finished, a cut across such a pair still reaches the faceted
-tier and is labelled an approximation, as before. What changed is that the
-reason given is now the true one — the curve is carried; the closure is
-what is missing — instead of a claim that the vocabulary cannot name it.
+- Every 2D stage reads a trace as a graph over its **own face's** azimuth.
+  The sewer converts to the canonical host at the end (`read_on`), so each
+  face's own arithmetic stays well conditioned.
+- Both cylinders' branch points are **landmarks**. Every piece is cut at all
+  of them, on both faces, so the two uses of an edge start and end at the
+  same places.
+- The pieces are laid on a window a turn wider than the face, lifted by whole
+  turns and clipped to the face's azimuths. The face's own seam generators
+  are offered at the neighbouring turns too. Crossings are cut on both pieces
+  (`split_at_mutual_crossings`), and a weld keeps lines on their own
+  abscissa or ordinate (`weld_aligned`).
+- The arrangement's half-edge cycles are classified by the material on their
+  left, which is how a lens, a bite and a ring all close without a separate
+  rule for each.
 
-Mirroring a body that already carries a trace edge refuses by name: the two
-callers of the loop-reversal walk reflect their surfaces differently, and
-guessing the handedness would publish a body that is not the mirror of the
-one asked for. STEP export refuses one too, because AP242 carries an
-intersection curve only as a surface curve with an approximating spline
-beside its two pcurves, which this exporter does not build yet.
+A section still refuses in two cases, and says why. One is a curve that ends
+inside the face (`BOOLEAN_TRACE_NOT_CLOSED`). The other is a tangency inside
+the face, such as two cylinders that kiss (`Contact`). Anything the exact
+route builds must also pass the solid validator before the ladder accepts it.
+A candidate that fails is declined as `Invalid` and handed to the faceted
+tier with its label, so an unsound exact body is never published.
+
+The sewer also merges a vertex that no other face uses, joining the
+same-carrier pieces either side of it. A face split where its neighbour is
+not would otherwise leave the neighbour's edge used once. A trace is never
+joined this way: its landmarks are where both faces cut it.
+
+### Conditioning at the branch points
+
+A branch point is a root of `D`, and the height there is a square root of
+something that should be zero. So any error in `D`'s coefficients turns into
+the square root of that error in height. Three things keep that error small
+enough for the weld and the validator:
+
+- The coefficients are built from the **feet of the axes' common
+  perpendicular**, not from the cylinders' own origins. A cut's tool keeps
+  its origin at the far end of its sweep, perhaps a thousand away. Written
+  from there, the constant terms are a million that cancel to a hundred,
+  which leaves the branch points picoradians adrift and the heights a
+  hundred-thousandth out after a mirror. From the feet, every term is the
+  size of the axes' distance and the radii. The host's height is moved back
+  by the foot's own offset.
+- A discriminant within a millionth of a millionth of its terms counts as
+  zero. Every float that is the branch point then evaluates to the double
+  root, and the double root and the clamped height share one `mul_add`, so
+  they agree to the bit.
+- A stretch read onto the other cylinder snaps an end to the branch point it
+  sits on in space before reading the azimuth off it.
+
+Arc length and the area a trace bounds are integrated through
+`x = a + (b − a)(3t² − 2t³)`, whose rate vanishes at both ends. The square-
+root cusp at a branch-point end becomes smooth in `t`, and the quadrature
+converges exponentially right up to the branch point.
+
+### Mirrors and moves
+
+A similarity moves both cylinders a trace is written on, and the trace is
+re-derived from them. A mirror also turns every face's azimuth round. On the
+other cylinder's face the curve is still walked over the reflected host's
+azimuth, and only the window it lies near is negated. On the host's own face
+the curve is re-read as the same root over the reversed record, walked from
+`−end` to `−start`. If that record is not the reflected host read backwards,
+the mirror refuses by name instead of guessing a parameterisation.
+
+### STEP
+
+STEP has no entity for this quartic. It does have `intersection_curve`,
+which says that the edge is where two named surfaces meet and carries a 3D
+curve beside them. The exporter writes that entity. It names the two
+cylinders and gives a cubic B-spline as the 3D curve, fitted to within
+`1e-7` mm, a tenth of the confusion accuracy the file declares.
+
+The spline is a C¹ chain of Hermite cubics through the curve's own points and
+rates. Each piece is halved until it is within the tolerance at its quarter
+points. Towards a branch-point end the curve is walked by a `t` whose azimuth
+moves like `t²`, the same substitution the quadrature uses, so the spline
+interpolates an analytic function all the way to the branch point.
+
+What the file states exactly is the pair of surfaces. The spline is the
+representation STEP asks for beside them, and it is within the file's own
+accuracy of the curve. That is also how other kernels write intersection
+curves they hold procedurally. The spline exists only in the file. The
+model never holds one, so ADR 0026's rule that the kernel carries no splines
+still stands.

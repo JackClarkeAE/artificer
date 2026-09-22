@@ -15,7 +15,8 @@
 //! vertices keep their identities, so history maps one to one.
 
 use crate::topology::{
-    Curve2, Curve3, ParameterRange, Plane, Point2, Point3, Surface, Topology, Vector2, Vector3,
+    Curve2, Curve3, Cylinder, ParameterRange, Plane, Point2, Point3, Surface, Topology, Vector2,
+    Vector3,
 };
 
 /// Why a mirror was refused.
@@ -130,7 +131,14 @@ pub(crate) fn mirror_topology(
                 }
             }
         };
-        reverse_face_loops(&mut output, face_index, mirror)?;
+        let reflect_cylinder = |mut cylinder: Cylinder| {
+            cylinder.origin = reflect_point(cylinder.origin);
+            cylinder.axis = reflect_vector(cylinder.axis);
+            cylinder.radial_u = reflect_vector(cylinder.radial_u);
+            cylinder.radial_v = reflect_vector(cylinder.radial_v);
+            cylinder
+        };
+        reverse_face_loops(&mut output, face_index, mirror, &reflect_cylinder)?;
     }
     Ok(output)
 }
@@ -142,12 +150,23 @@ pub(crate) fn mirror_topology(
 /// walking its loops the other way, so the two halves belong together: the
 /// mirror of a body and the void of a shell both need exactly this, and
 /// both call it here.
+///
+/// A trace is written on two cylinders, so reversing it needs to know what
+/// became of them: `carry` maps a cylinder as it was to the cylinder it is
+/// now — reflected, for a mirror; unchanged, for a shell's void — exactly as
+/// the caller has already carried every edge's curve, so a trace's own
+/// parameter keeps naming the same point on both sides of its edge.
 pub(crate) fn reverse_face_loops(
     topology: &mut Topology,
     face_index: usize,
     mirror: fn(Point2) -> Point2,
+    carry: &dyn Fn(Cylinder) -> Cylinder,
 ) -> Result<(), MirrorError> {
     let planar = matches!(topology.faces[face_index].value.surface, Surface::Plane(_));
+    let face_cylinder = match topology.faces[face_index].value.surface {
+        Surface::Cylinder(cylinder) => Some(cylinder),
+        _ => None,
+    };
     let loops: Vec<_> = topology.faces[face_index].value.loops().collect();
     for loop_key in loops {
         let loop_record = &mut topology.loops[loop_key.0];
@@ -198,13 +217,61 @@ pub(crate) fn reverse_face_loops(
                     };
                     coedge.parameter_range = ParameterRange::new(range.end, range.start);
                 }
-                // Reflecting a trace means reflecting the two carriers it is
-                // written on, in step with the face's own surface, and the
-                // two callers of this walk reflect their surfaces
-                // differently. Refusing by name beats guessing the handedness
-                // and publishing a body that is not the mirror of the one
-                // asked for.
-                Curve2::Trace { .. } => return Err(MirrorError::UnsupportedPcurve),
+                // The face's azimuth now runs the other way, and the trace
+                // goes with it. On the other cylinder's face the curve is
+                // still walked over the host's azimuth, carried as the edge
+                // was, and read into the face's new coordinates; only the
+                // window it lies near turns round with the face. On the
+                // host's own face the curve is a graph over the face's own
+                // azimuth, which is now its old one negated: the same root
+                // over the reversed record, walked from `−end` to `−start`,
+                // which is still an affine match for the edge's parameter.
+                Curve2::Trace {
+                    host,
+                    other,
+                    branch,
+                    on_other,
+                    shift,
+                } => {
+                    let Some(face_cylinder) = face_cylinder else {
+                        return Err(MirrorError::UnsupportedPcurve);
+                    };
+                    if on_other {
+                        coedge.pcurve = Curve2::Trace {
+                            host: carry(host),
+                            other: face_cylinder,
+                            branch,
+                            on_other: true,
+                            shift: Point2::new(-shift.x, shift.y),
+                        };
+                        coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                    } else {
+                        // The reversed record has to be the carried host read
+                        // backwards, or the graph over it is a different
+                        // parameterization, not a reversed one; refusing by
+                        // name beats publishing a mirror of something else.
+                        let carried = carry(host);
+                        let reversed = |x: f64| {
+                            (face_cylinder.evaluate(Point2::new(x, 0.0))
+                                - carried.evaluate(Point2::new(-x, 0.0)))
+                            .length()
+                        };
+                        let scale = 1.0 + face_cylinder.radius.abs();
+                        if reversed(1.0).max(reversed(-2.0)) > 1.0e-9 * scale
+                            || (face_cylinder.axis - carried.axis).length() > 1.0e-12 * scale
+                        {
+                            return Err(MirrorError::UnsupportedPcurve);
+                        }
+                        coedge.pcurve = Curve2::Trace {
+                            host: face_cylinder,
+                            other: carry(other),
+                            branch,
+                            on_other: false,
+                            shift: Point2::new(-shift.x, shift.y),
+                        };
+                        coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
+                    }
+                }
                 Curve2::Harmonic {
                     mean,
                     amplitude,

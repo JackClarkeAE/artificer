@@ -909,7 +909,8 @@ impl NativeKernel {
                                 BooleanOperation::Difference,
                                 request.precision,
                             )
-                            .map_err(ExactRouteDecline::from_engine),
+                            .map_err(ExactRouteDecline::from_engine)
+                            .and_then(|topology| exact_candidate(topology, request.precision)),
                         };
                         match exact {
                             Ok(topology) => {
@@ -1086,7 +1087,8 @@ impl NativeKernel {
                                 boolean_operation,
                                 request.precision,
                             )
-                            .map_err(ExactRouteDecline::from_engine)?;
+                            .map_err(ExactRouteDecline::from_engine)
+                            .and_then(|topology| exact_candidate(topology, request.precision))?;
                             // An add whose profile misses the face has no
                             // interface, and the union of two solids that
                             // never meet is two solids, not a boss.
@@ -1877,9 +1879,10 @@ impl NativeKernel {
                                 vec![simple_diagnostic(
                                     "BOOLEAN_TRACE_NOT_CLOSED",
                                     KernelStage::Construction,
-                                    "The two cylinders meet in a space quartic, which this kernel \
-                                     carries exactly; the section it leaves on one of the faces is \
-                                     a shape the boundary closure does not assemble yet.",
+                                    "Two cylinders meet in a space quartic, which this kernel \
+                                     carries exactly, but on one face the curves of the section \
+                                     did not close into a boundary: one ends inside the face, and \
+                                     the closure refuses rather than guess how it continues.",
                                 )],
                             ));
                         }
@@ -3265,13 +3268,17 @@ enum ExactRouteDecline {
     },
     /// A contact the engine does not classify.
     Contact,
-    /// The curve two cylinders share is carried, but the section it leaves
-    /// on one of the faces is not assembled into a boundary yet.
+    /// The curve two cylinders share is carried, but on one of the faces a
+    /// curve of the section ends inside the face, and the closure refuses to
+    /// guess how it continues.
     TraceUnclosed,
     /// The exact result was empty.
     Empty,
     /// The prism tool itself could not be built from the profile.
     Tool,
+    /// The exact engine built a candidate that the solid validator did not
+    /// pass: a defect in the exact route, not a limit of it.
+    Invalid,
 }
 
 impl ExactRouteDecline {
@@ -3301,12 +3308,17 @@ impl ExactRouteDecline {
             Self::Contact => "the operands meet tangentially or share geometry the exact engine \
                               does not classify"
                 .to_owned(),
-            Self::TraceUnclosed => "the two cylinders meet in a space quartic, which this kernel \
-                                    now carries exactly, but the section it leaves on one of the \
-                                    faces is a shape the boundary closure does not assemble yet"
+            Self::TraceUnclosed => "two cylinders meet in a space quartic, which this kernel \
+                                    carries exactly, but on one face the curves of the section did \
+                                    not close into a boundary: one ends inside the face, and the \
+                                    closure refuses rather than guess how it continues"
                 .to_owned(),
             Self::Empty => "the exact operation produced no material".to_owned(),
             Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
+            Self::Invalid => "the exact engine built a body that did not pass the solid \
+                              validator, which is a defect in the exact route rather than a \
+                              limit of it"
+                .to_owned(),
         }
     }
 
@@ -3327,6 +3339,28 @@ impl ExactRouteDecline {
     }
 }
 
+/// The exact engine's body, held to the solid validator before it is taken.
+///
+/// The commit gate validates whatever a rung hands it, and refuses a body that
+/// fails — which, for the exact route, used to end the operation even where
+/// the faceted tier could have answered. An exact candidate that is not a
+/// valid solid is a defect in the exact route; the step still deserves an
+/// answer, labelled as the approximation it is, and the report names the
+/// defect as the reason the exact route stood aside.
+fn exact_candidate(
+    topology: Topology,
+    precision: PrecisionPolicy,
+) -> Result<Topology, ExactRouteDecline> {
+    if validator::validate(&topology, precision.linear_agreement)
+        .diagnostics
+        .is_empty()
+    {
+        Ok(topology)
+    } else {
+        Err(ExactRouteDecline::Invalid)
+    }
+}
+
 /// A faceted-tier refusal with the exact route's reason in front of it: a
 /// message about tessellation for a problem that was about vocabulary is
 /// the wrong message.
@@ -3343,8 +3377,8 @@ fn faceted_cut_warning() -> ProtocolDiagnostic {
         "This cut crosses geometry that the exact rewrite cannot split - curved walls, or an \
          interior void with material resuming beyond it - so the body was rebuilt from a \
          tessellation. Its faces, edges, and measures approximate the true solid rather than \
-         certifying it: two round bores that cross meet in ellipses, which are outside this \
-         kernel's line-and-circle curve vocabulary.",
+         certifying it. Why the exact route stood aside is the \
+         FACE_FEATURE_EXACT_ROUTE_DECLINED diagnostic beside this one.",
     )
 }
 
@@ -9091,10 +9125,13 @@ mod tests {
             "turned drill volume {} should equal {expected}",
             turned_drill.snapshot.measures().volume
         );
-        // Two cylinders on skew axes meet in a space quartic. Since ADR 0047
-        // the matrix names that curve rather than refusing it, so what the
-        // refusal reports now is the step that is still missing — closing the
-        // section it leaves into a face boundary — and not the vocabulary.
+        // Two cylinders on skew axes meet in a space quartic (ADR 0047). The
+        // matrix names that curve, the section it leaves closes, and the
+        // difference is exact: its volume is the upright's less the lens the
+        // two share, which is measured here by a quadrature of its own —
+        // slice the lens across the skew cylinder's axis and each slice is a
+        // chord of one circle times a chord of the other — so the oracle
+        // owes nothing to the kernel's trace arithmetic.
         let skew = NativeKernel::execute(
             &NativeKernel::empty(),
             &ExecuteRequest {
@@ -9117,28 +9154,53 @@ mod tests {
         )
         .expect("a cylinder along y")
         .snapshot;
-        let refused = NativeKernel::execute_boolean(
+        let bitten = NativeKernel::execute_boolean(
             &upright,
             &skew,
             &boolean_request(&upright, &skew, BooleanOperation::Difference),
             &CancellationToken::new(),
         )
-        .expect_err("skew cylinders meet in a quartic");
+        .expect("skew cylinders meet in a trace the engine closes exactly");
         assert!(
-            refused.diagnostics.iter().any(|diagnostic| {
-                matches!(
-                    diagnostic.code.as_str(),
-                    "BOOLEAN_TRACE_NOT_CLOSED" | "BOOLEAN_CONTACT_UNSUPPORTED"
-                )
-            }),
-            "unexpected refusal: {refused:?}"
+            bitten.report.warnings.is_empty(),
+            "an exact result carries no approximation warning: {:?}",
+            bitten.report.warnings
         );
-        // And it names what it is about rather than the whole operand.
+        assert!(NativeKernel::validate(&bitten.snapshot, ValidationProfile::Solid).valid);
+        // The lens: `x ∈ [1, 1.5]`, where the upright's disc has the chord
+        // `2√(1 − (x − 2)²)` and the skew cylinder the chord `2√(2.25 − x²)`.
+        // Walked through `x = 1 + ½s²(3 − 2s)`, whose rate vanishes at both
+        // ends, the square roots there become smooth and composite Simpson
+        // converges to the last digits.
+        let lens = {
+            let panels = 20_000;
+            let step = 1.0 / f64::from(panels);
+            (0..=panels)
+                .map(|index| {
+                    let s = f64::from(index) * step;
+                    let x = 0.5f64.mul_add(s * s * 2.0f64.mul_add(-s, 3.0), 1.0);
+                    let rate = 3.0 * s * (1.0 - s);
+                    let chords = 4.0
+                        * (1.0 - (x - 2.0).powi(2)).max(0.0).sqrt()
+                        * x.mul_add(-x, 2.25).max(0.0).sqrt();
+                    let weight = if index == 0 || index == panels {
+                        1.0
+                    } else if index % 2 == 1 {
+                        4.0
+                    } else {
+                        2.0
+                    };
+                    weight * chords * rate
+                })
+                .sum::<f64>()
+                * step
+                / 3.0
+        };
+        let expected = std::f64::consts::PI.mul_add(20.0, -lens);
         assert!(
-            refused.diagnostics.iter().any(|diagnostic| {
-                diagnostic.message.contains("cylinder") || diagnostic.message.contains("quartic")
-            }),
-            "the refusal should name the geometry it is about: {refused:?}"
+            ((bitten.snapshot.measures().volume - expected) / expected).abs() < 1.0e-9,
+            "bitten volume {} should equal {expected}",
+            bitten.snapshot.measures().volume
         );
     }
 
@@ -11551,25 +11613,28 @@ mod tests {
         assert_ne!(first.snapshot.id(), second.snapshot.id());
         assert!(second.snapshot.measures().volume < first.snapshot.measures().volume);
         assert!(NativeKernel::validate(&second.snapshot, ValidationProfile::Solid).valid);
+        // The two bores are equal and their axes cross, so they meet in the
+        // Steinmetz pair of ellipses and the body is exact: no caveat, the
+        // closed-form volume, and the six planes plus four half-bore walls —
+        // the crossing adds no face. This body used to reach the faceted tier,
+        // where it published 834 edges after the coplanar merge; the bounds
+        // below were written for that route and still guard it, but the exact
+        // body sits far inside them.
+        assert!(
+            second.report.warnings.is_empty(),
+            "an exact crossing publishes no caveat: {:?}",
+            second.report.warnings
+        );
+        let radius = 0.75_f64;
+        let bore = std::f64::consts::PI * radius * radius;
+        let exact = 16.0f64.mul_add(radius.powi(3) / 3.0, bore.mul_add(-5.0, 24.0));
+        assert!(
+            ((second.snapshot.measures().volume - exact) / exact).abs() < 1.0e-12,
+            "two crossing bores are the closed form: {} vs {exact}",
+            second.snapshot.measures().volume
+        );
+        assert_eq!(second.snapshot.counts().faces, 10);
         let presentation = NativeKernel::debug_scene(&second.snapshot);
-        // The planar fragment fan must not reach the screen. This used to be
-        // stated as a ratio — visible edges had to stay under a seventh of the
-        // total — because the fan was there and the question was whether its
-        // seams were being drawn. The coplanar merge removes the fan itself, so
-        // the ratio no longer measures anything: it was counting the smooth
-        // interior seams, and removing them raises it while improving the
-        // drawing.
-        //
-        // The measurement that replaced it is a better statement of the same
-        // intent. This body publishes 4,470 edges without the merge and 834
-        // with it. Of those, 519 draw without the merge and 366 with it — not
-        // because any line went missing, but because a line that arrived as
-        // several collinear pieces now arrives as one edge, the vertices
-        // between them having been dissolved as corners to nobody.
-        //
-        // So bound the total, and pin the direction: the merge takes seams
-        // out and joins collinear runs, and neither can put a new line on
-        // the screen.
         let visible_edges = presentation
             .edges
             .iter()
@@ -11581,8 +11646,8 @@ mod tests {
             presentation.edges.len(),
         );
         assert!(
-            (300..=519).contains(&visible_edges),
-            "the merge may join drawn lines; it may not add one: {visible_edges} visible"
+            visible_edges <= 519,
+            "a crossing may not draw more lines than its faceted form did: {visible_edges} visible"
         );
         let logical_cylindrical_sides = second
             .snapshot
@@ -11599,11 +11664,18 @@ mod tests {
             "two analytic circle cuts must retain at most two logical side owners, got \
              {logical_cylindrical_sides:?}"
         );
+        // Each cut's side is one carrier: exact cylinder walls, and the seam
+        // between a wall's own halves draws smooth, as the faceted route's
+        // panels had to be recognised as one prismatic carrier to do.
         let topology = &second.snapshot.topology;
-        let prismatic_roles = presentation_prismatic_feature_roles(topology);
-        assert_eq!(
-            prismatic_roles, logical_cylindrical_sides,
-            "each circle cut must publish one coherent prismatic carrier"
+        assert!(
+            topology.faces.iter().all(|face| match face.value.role {
+                FaceRole::FeatureSide(role) if logical_cylindrical_sides.contains(&role) => {
+                    matches!(face.value.surface, Surface::Cylinder(_))
+                }
+                _ => true,
+            }),
+            "each circle cut must publish its side as a cylinder, not panels"
         );
         let smooth = presentation_smooth_edge_flags(topology);
         let incidence = edge_incident_face_indices(topology);
@@ -11611,7 +11683,7 @@ mod tests {
             let classification = presentation_edge_classification(topology, &incidence, edge_index);
             classification
                 .same_feature_side_role
-                .filter(|role| prismatic_roles.contains(role))
+                .filter(|role| logical_cylindrical_sides.contains(role))
                 .is_none_or(|_| *smooth)
         }));
     }

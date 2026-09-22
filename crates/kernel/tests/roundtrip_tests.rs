@@ -150,7 +150,7 @@ fn snapshot_bound_references_become_history_selectors() {
 
 #[test]
 fn an_approximate_step_is_annotated_and_rebuilds_on_the_same_tier() {
-    let session = run(include_str!("../examples/three_holes_and_cut.art"));
+    let session = run(include_str!("../examples/blend_then_drill.art"));
     assert_eq!(session.tier(), Tier::Approximate);
     let script = session.to_art(&DecompileOptions::default()).unwrap();
     assert!(

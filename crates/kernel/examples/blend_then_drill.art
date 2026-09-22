@@ -1,0 +1,36 @@
+// blend_then_drill.art — a hole drilled through a blended rim.
+//
+// A flanged hub whose flange rim is rounded by an exact torus band, then a
+// bolt hole drilled down through that band. The hole's cylinder meets the
+// torus off its axis, which is a pair the exact engine does not carry yet,
+// so the kernel answers that one step from its faceted tier and labels the
+// result as an approximation — on the step, on the body, and in the script
+// the journal decompiles to. Drilling the hole before the blend keeps both
+// exact; see flanged_hub.art.
+
+param hub_radius: f64 = 20.0;
+param hub_height: f64 = 40.0;
+param flange_radius: f64 = 45.0;
+param flange_thickness: f64 = 8.0;
+param bore_radius: f64 = 6.0;
+param rim_fillet: f64 = 2.0;
+
+let section = sketch(on: "XZ", label: "section", entities: [
+    line(start: [bore_radius, 0], end: [flange_radius, 0]),
+    line(start: [flange_radius, 0], end: [flange_radius, flange_thickness]),
+    line(start: [flange_radius, flange_thickness], end: [hub_radius, flange_thickness]),
+    line(start: [hub_radius, flange_thickness], end: [hub_radius, hub_height]),
+    line(start: [hub_radius, hub_height], end: [bore_radius, hub_height]),
+    line(start: [bore_radius, hub_height], end: [bore_radius, 0]),
+]);
+let hub = revolve(sketch: section, axis: [0, 0, 1], label: "hub");
+
+fillet(edges: [nearest(point: [0, flange_radius, flange_thickness], kind: "edge"),
+               nearest(point: [0, -flange_radius, flange_thickness], kind: "edge")],
+       radius: rim_fillet, label: "flange_top_rim");
+
+// The flange's top face, found by a point on it clear of the band; the hole
+// straddles the band, reaching from r = 40 out past the rim at r = 45.
+let flange_top = nearest(point: [30.0, 0.0, flange_thickness]);
+drill(face: flange_top, center: [43.0, 0.0], diameter: 6.0, depth: flange_thickness,
+      label: "rim_hole");

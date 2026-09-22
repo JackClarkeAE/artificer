@@ -94,7 +94,10 @@ it (`surface`: `plane` with `origin`; `cylinder` with
 planar face; a point at the parametric centre of a curved one), the outward
 `normal` there, the number of `loops` (one, plus one per hole), a one-line
 `summary`, and its `names`. Edges carry their curve (`line`, `circular_arc`,
-`elliptical_arc`), exact `length`, `midpoint`, `summary` and `names`.
+`elliptical_arc`, or `surface_trace` — where two cylinders meet in a curve
+none of those describes, reported by its ends and the two radii
+`host_radius` and `other_radius`), exact `length`, `midpoint`, `summary` and
+`names`.
 
 The same description is available for one selected entity through the
 JSON-RPC method `query.describe`, which takes a selector, and through
@@ -230,8 +233,11 @@ JSON-RPC server or the command line rather than directly.
 carrier (plane, cylinder, cone, sphere, torus as the five STEP elementary
 surfaces), every edge its exact curve (`line`, `circle`, `ellipse`), every
 coedge an `oriented_edge`, cavities as `brep_with_voids`, in millimetres.
-Nothing is tessellated, so a reader recovers the volume and area the
-kernel measures. `--faceted` writes the display triangles as a STEP
+Where two cylinders meet in a quartic, which STEP has no entity for, the
+edge is an `intersection_curve` naming both cylinders. Its 3D curve is a
+cubic B-spline within `1e-7` mm of the true curve, a tenth of the file's
+declared accuracy (ADR 0047). Nothing is tessellated, so a reader recovers
+the volume and area the kernel measures. `--faceted` writes the display triangles as a STEP
 surface model instead, for mesh consumers. Over JSON-RPC the methods are
 `export.step` and `export.step_faceted`; in Rust, `export_step`,
 `export_step_bodies` (several bodies as one product) and
@@ -242,6 +248,8 @@ The exporter's own test reads every fixture back as a B-rep: references
 resolve, loops chain and close, every edge is used by exactly two faces in
 opposite senses, every vertex lies on its edge's curve, and every face's
 `same_sense` agrees with the kernel's outward normal at the face centre.
+An intersection curve's spline is also evaluated by de Boor's recursion
+across every knot span, and each point must lie on both named cylinders.
 The independent check is the OpenCascade oracle of ADR 0001:
 `tools/oracle-occt/step_measure.py` imports a file with OCCT and prints
 its volume and area, and with `ARTIFICER_STEP_ORACLE` pointing at it the

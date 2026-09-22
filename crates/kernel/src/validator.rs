@@ -454,6 +454,21 @@ fn validate_geometry(
                     .with_measure(sweep, std::f64::consts::TAU),
                 );
             }
+        } else if matches!(coedge.value.pcurve, Curve2::Trace { .. }) {
+            // A trace's parameter is its host's azimuth, as on its edge: any
+            // finite span short of a whole turn. A trace never runs a whole
+            // turn between the landmarks every piece of one is cut at.
+            let sweep =
+                (coedge.value.parameter_range.end - coedge.value.parameter_range.start).abs();
+            if !sweep.is_finite() || sweep <= f64::EPSILON || sweep >= std::f64::consts::TAU {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::ParameterRangeInvalid,
+                        format!("coedge/{}/parameter-range", coedge.id.get()),
+                    )
+                    .with_measure(sweep, std::f64::consts::TAU),
+                );
+            }
         } else if coedge.value.parameter_range != crate::topology::ParameterRange::new(0.0, 1.0) {
             diagnostics.push(Diagnostic::new(
                 DiagnosticCode::ParameterRangeInvalid,
@@ -824,9 +839,28 @@ fn pcurve_locus_error(
         )
     });
 
-    let edge_tangent = edge.curve.derivative(edge_start) * edge_delta;
-    let pcurve_point = coedge.pcurve.evaluate(pcurve_start);
-    let pcurve_derivative = coedge.pcurve.derivative(pcurve_start);
+    // Tangents are compared where a piece starts, except on a trace: its
+    // parameter is an azimuth that stops being one at a branch point — the
+    // curve runs along a generator there and the rate is unbounded — and a
+    // piece of trace routinely starts at one. Only a direction survives at
+    // such a point, so the two descriptions are compared in the middle of
+    // the piece instead, where both are regular and the comparison is as
+    // sharp as it is anywhere.
+    let tangent_fraction = if matches!(
+        (coedge.pcurve, edge.curve),
+        (Curve2::Trace { .. }, Curve3::Trace { .. })
+    ) {
+        0.5
+    } else {
+        0.0
+    };
+    let edge_tangent = edge
+        .curve
+        .derivative(edge_delta.mul_add(tangent_fraction, edge_start))
+        * edge_delta;
+    let pcurve_at = pcurve_delta.mul_add(tangent_fraction, pcurve_start);
+    let pcurve_point = coedge.pcurve.evaluate(pcurve_at);
+    let pcurve_derivative = coedge.pcurve.derivative(pcurve_at);
     let surface_tangent = surface.map_tangent(
         pcurve_point,
         crate::topology::Vector2::new(

@@ -1,14 +1,17 @@
 //! A cut through the side of a holed block that crosses the holes
 //! perpendicularly.
 //!
-//! Two round bores that cross meet in quartic curves, and a round bore
-//! crossing a square one meets it in ellipses; both are outside the
-//! line-and-circle vocabulary, so every case here is answered by the faceted
-//! tier and must say so. What the tier owes is a closed, valid solid whose
-//! volume sits between the holed block and the block minus the whole cutter,
-//! at every offset — including the ones where the cutter's silhouette lands
-//! exactly on a hole's axis line, which is where welded sliver fragments used
-//! to be dropped and the shell failed to close.
+//! Two round bores that cross meet in a space quartic, and a round bore
+//! crossing a square one meets its walls in generator lines and rings. These
+//! used to be answered by the faceted tier, labelled as approximations; since
+//! ADR 0047 the exact engine carries the quartic and closes the sections every
+//! one of them leaves, so each case here is exact, and each is checked against
+//! a volume computed without the kernel: the block, less the cutter, plus
+//! what the cutter and each hole share — a closed form where the overlap is a
+//! prism or half a disc, and otherwise a quadrature of one circle's chord times
+//! the hole's chord across the cutter's axis. That includes the offsets where
+//! the cutter's silhouette lands exactly on a hole's axis line, which is where
+//! welded sliver fragments were once dropped and the shell failed to close.
 
 use std::f64::consts::PI;
 
@@ -140,28 +143,68 @@ fn side_cut(
     NativeKernel::execute(snapshot, &request, &CancellationToken::new())
 }
 
-/// The cut must publish a valid closed solid, labelled as an approximation,
-/// whose volume lies between the holed block and that block minus the whole
-/// cutter.
-fn assert_crossing_cut(base: &Snapshot, outcome: &ExecutionOutcome, cutter_volume: f64) {
+/// The cut must publish a valid closed solid, with no caveat, whose volume is
+/// the one given.
+fn assert_exact_cut(outcome: &ExecutionOutcome, expected: f64) {
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION"),
-        "a crossing cut is a labelled approximation: {:?}",
+        outcome.report.warnings.is_empty(),
+        "a crossing cut is exact and carries no caveat: {:?}",
         outcome.report.warnings
     );
     let validation = NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid);
     assert!(validation.valid, "{:?}", validation.diagnostics);
-    let before = base.measures().volume;
     let after = outcome.snapshot.measures().volume;
     assert!(
-        after < before && after > before - cutter_volume,
-        "volume {after} must lie between {before} and {}",
-        before - cutter_volume
+        ((after - expected) / expected).abs() < 1.0e-9,
+        "volume {after} should be {expected}"
     );
+}
+
+/// `∫ f` over `[from, to]`, walked through `x = from + (to − from)(3t² − 2t³)`
+/// so a square root vanishing at either end becomes smooth, then composite
+/// Simpson. Independent of the kernel's own quadrature on purpose.
+fn integrate(from: f64, to: f64, integrand: &dyn Fn(f64) -> f64) -> f64 {
+    let panels = 20_000;
+    let step = 1.0 / f64::from(panels);
+    let span = to - from;
+    (0..=panels)
+        .map(|index| {
+            let t = f64::from(index) * step;
+            let x = span.mul_add(t * t * 2.0f64.mul_add(-t, 3.0), from);
+            let rate = 6.0 * span * t * (1.0 - t);
+            let weight = if index == 0 || index == panels {
+                1.0
+            } else if index % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            weight * integrand(x) * rate
+        })
+        .sum::<f64>()
+        * step
+        / 3.0
+}
+
+/// Half a chord of a circle of `radius` at a distance `offset` from its
+/// centre, zero past it.
+fn half_chord(radius: f64, offset: f64) -> f64 {
+    offset.mul_add(-offset, radius * radius).max(0.0).sqrt()
+}
+
+/// What a round cutter along `y` at `cutter_x` shares with a round hole along
+/// `z` at `hole_x`, the hole lying wholly within the cutter's depth: across
+/// the cutter's axis at `x`, the cutter's chord in `z` times the hole's chord
+/// in `y`.
+fn lens(cutter_x: f64, cutter_radius: f64, hole_x: f64, hole_radius: f64) -> f64 {
+    let from = (cutter_x - cutter_radius).max(hole_x - hole_radius);
+    let to = (cutter_x + cutter_radius).min(hole_x + hole_radius);
+    if to <= from {
+        return 0.0;
+    }
+    integrate(from, to, &|x: f64| {
+        4.0 * half_chord(cutter_radius, x - cutter_x) * half_chord(hole_radius, x - hole_x)
+    })
 }
 
 fn cylinder_volume(radius: f64, depth: f64) -> f64 {
@@ -169,7 +212,7 @@ fn cylinder_volume(radius: f64, depth: f64) -> f64 {
 }
 
 #[test]
-fn a_round_cutter_crossing_a_round_and_a_square_hole_closes() {
+fn a_round_cutter_crossing_a_round_and_a_square_hole_is_exact() {
     let base = block(
         vec![
             circle((40.0, 50.0), HOLE_RADIUS),
@@ -186,16 +229,21 @@ fn a_round_cutter_crossing_a_round_and_a_square_hole_closes() {
             &format!("round-and-square-{label}"),
         )
         .expect("a round cutter crossing both holes");
-        assert_crossing_cut(
-            &base,
-            &outcome,
-            cylinder_volume(CUTTER_RADIUS, depth.min(SIDE)),
-        );
+        // The square hole's share: its 16 of `y` times the cutter's chord in
+        // `z`, over the stretch `x ∈ [52, 60]` the two have in common.
+        let square = 16.0
+            * integrate(52.0, 60.0, &|x: f64| {
+                2.0 * half_chord(CUTTER_RADIUS, x - 50.0)
+            });
+        let expected = base.measures().volume - cylinder_volume(CUTTER_RADIUS, depth.min(SIDE))
+            + lens(50.0, CUTTER_RADIUS, 40.0, HOLE_RADIUS)
+            + square;
+        assert_exact_cut(&outcome, expected);
     }
 }
 
 #[test]
-fn a_round_cutter_crossing_two_round_holes_closes() {
+fn a_round_cutter_crossing_two_round_holes_is_exact() {
     let base = block(
         vec![
             circle((40.0, 50.0), HOLE_RADIUS),
@@ -211,11 +259,14 @@ fn a_round_cutter_crossing_two_round_holes_closes() {
         "two-round",
     )
     .expect("a round cutter crossing two round holes");
-    assert_crossing_cut(&base, &outcome, cylinder_volume(CUTTER_RADIUS, 60.0));
+    let expected = base.measures().volume - cylinder_volume(CUTTER_RADIUS, 60.0)
+        + lens(50.0, CUTTER_RADIUS, 40.0, HOLE_RADIUS)
+        + lens(50.0, CUTTER_RADIUS, 60.0, HOLE_RADIUS);
+    assert_exact_cut(&outcome, expected);
 }
 
 #[test]
-fn a_square_cutter_crossing_two_holes_closes() {
+fn a_square_cutter_crossing_two_holes_is_exact() {
     let base = block(
         vec![
             circle((40.0, 50.0), HOLE_RADIUS),
@@ -231,11 +282,17 @@ fn a_square_cutter_crossing_two_holes_closes() {
         "square-cutter",
     )
     .expect("a square cutter crossing both holes");
-    assert_crossing_cut(&base, &outcome, 20.0 * 20.0 * 60.0);
+    // The cutter spans `x ∈ [40, 60]`, `z ∈ [10, 30]`: it takes the half of
+    // the round hole past its axis, 20 deep, and `[52, 60]` of the square
+    // hole's `[52, 68]`, 16 long and 20 deep.
+    let expected = base.measures().volume - 20.0 * 20.0 * 60.0
+        + 20.0 * PI * HOLE_RADIUS * HOLE_RADIUS / 2.0
+        + 8.0 * 16.0 * 20.0;
+    assert_exact_cut(&outcome, expected);
 }
 
 #[test]
-fn a_round_cutter_crossing_a_triangular_and_an_l_shaped_hole_closes() {
+fn a_round_cutter_crossing_a_triangular_and_an_l_shaped_hole_is_exact() {
     let triangle = polygon(&[(52.0, 42.0), (68.0, 42.0), (60.0, 58.0)]);
     let l_shape = polygon(&[
         (22.0, 42.0),
@@ -254,11 +311,19 @@ fn a_round_cutter_crossing_a_triangular_and_an_l_shaped_hole_closes() {
         "triangle-and-l",
     )
     .expect("a round cutter crossing arbitrary holes");
-    assert_crossing_cut(&base, &outcome, cylinder_volume(CUTTER_RADIUS, 60.0));
+    // The cutter reaches `x ∈ [35, 55]`. The triangle's chord in `y` at `x`
+    // is `2(x − 52)` from its corner at 52; the L's is its 8-wide foot over
+    // `[35, 38]`.
+    let chord = |x: f64| 2.0 * half_chord(CUTTER_RADIUS, x - 45.0);
+    let triangle_share = integrate(52.0, 55.0, &|x: f64| chord(x) * 2.0 * (x - 52.0));
+    let l_share = integrate(35.0, 38.0, &|x: f64| chord(x) * 8.0);
+    let expected =
+        base.measures().volume - cylinder_volume(CUTTER_RADIUS, 60.0) + triangle_share + l_share;
+    assert_exact_cut(&outcome, expected);
 }
 
 #[test]
-fn a_cutter_whose_silhouette_grazes_a_hole_axis_still_closes() {
+fn a_cutter_whose_silhouette_grazes_a_hole_axis_is_exact() {
     // One round hole at x = 40; the cutter's silhouette generatrix lies on
     // the hole's axis line whenever `offset == cutter radius`. Sweep the
     // band either side of it, including the off-grid case.
@@ -280,13 +345,17 @@ fn a_cutter_whose_silhouette_grazes_a_hole_axis_still_closes() {
             &format!("graze-{x}-{radius}"),
         )
         .unwrap_or_else(|error| panic!("offset {x}, radius {radius}: {error:?}"));
-        assert_crossing_cut(&base, &outcome, cylinder_volume(radius, 60.0));
+        let expected = base.measures().volume - cylinder_volume(radius, 60.0)
+            + lens(x, radius, 40.0, HOLE_RADIUS);
+        assert_exact_cut(&outcome, expected);
     }
 
     let off_grid = block(vec![circle((40.37, 50.0), 7.3)], "off-grid-base");
     let outcome = side_cut(&off_grid, 49.0, circle((0.0, 0.0), 9.7), 60.0, "off-grid")
         .expect("an off-grid grazing cut");
-    assert_crossing_cut(&off_grid, &outcome, cylinder_volume(9.7, 60.0));
+    let expected =
+        off_grid.measures().volume - cylinder_volume(9.7, 60.0) + lens(49.0, 9.7, 40.37, 7.3);
+    assert_exact_cut(&outcome, expected);
 }
 
 #[test]

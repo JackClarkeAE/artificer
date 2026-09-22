@@ -606,12 +606,13 @@ pub(crate) enum Curve2 {
     /// The trace of [`Curve3::Trace`] in one of the two faces it separates,
     /// read over `host`'s azimuth whichever face this is.
     ///
-    /// On the host's own face that is the graph `(x, y(x))` itself. On the
-    /// other's it is the same point mapped into that face's coordinates.
-    /// Both faces share one parameter, which is what lets the sewer weld
-    /// their two uses of the edge; `shift` carries the result onto the
-    /// azimuth branch a face's own window sits on, and is a whole turn
-    /// wherever it is not zero.
+    /// On the host's own face that is the graph `(x, y(x))` itself, moved by
+    /// `shift`. On the other's it is the same point mapped into that face's
+    /// coordinates, with the azimuth taken within half a turn of `shift.x` —
+    /// the azimuth of the face's own window the piece lies in, which keeps
+    /// the piece continuous wherever the mapping's arctangent jumps — and
+    /// the height moved by `shift.y`. Both faces share one parameter, which
+    /// is what lets the sewer weld their two uses of the edge.
     Trace {
         host: Cylinder,
         other: Cylinder,
@@ -686,12 +687,15 @@ impl Curve2 {
                 // `shift` places the result in this face's own parameter
                 // window; the walk's parameter is the host's azimuth either
                 // way, and is not shifted with it.
-                let point = if on_other {
-                    trace.on_other(parameter, 0.0)
+                if on_other {
+                    let point = trace.on_other_near(parameter, shift.x);
+                    Point2::new(point.x, point.y + shift.y)
                 } else {
-                    Point2::new(parameter, trace.height_clamped(parameter))
-                };
-                Point2::new(point.x + shift.x, point.y + shift.y)
+                    Point2::new(
+                        parameter + shift.x,
+                        trace.height_clamped(parameter) + shift.y,
+                    )
+                }
             }
         }
     }
@@ -739,7 +743,7 @@ impl Curve2 {
                     let rate = trace.on_other_rate(parameter);
                     Vector2::new(rate.x, rate.y)
                 } else {
-                    Vector2::new(1.0, trace.slope_at(parameter).unwrap_or(0.0))
+                    Vector2::new(1.0, trace.slope_clamped(parameter))
                 }
             }
         }

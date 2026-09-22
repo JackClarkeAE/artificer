@@ -11311,6 +11311,11 @@ mod tests {
     /// many small B-rep edges between coplanar cap fragments and wall
     /// panels. Hovering one of them must light the whole rim, as it does on
     /// an exact body, and a slot's arc must light as one arc.
+    ///
+    /// Bores crossing a side cut used to be the faceted case here. The exact
+    /// engine owns them now (ADR 0047), so they stay beside the plate as a
+    /// second exact body. The faceted case is now a hub with a bolt hole,
+    /// re-faceted when a later hole goes through its blended rim.
     #[test]
     fn a_faceted_bore_rim_hovers_as_one_logical_edge() {
         use artificer_kernel::api::scripting::NoModules;
@@ -11320,19 +11325,27 @@ mod tests {
         let plate = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");";
         let crossed = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");\ndrill(face: faces(\">Z\"), center: [15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_b\");\ndrill(face: faces(\"<Y\"), center: [0.0, 0.0], diameter: 20.0, depth: 30.0, label: \"side_cut\");";
         let slot = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet s = sketch(on: faces(\">Z\"), entities: [line(start: [-10, -5], end: [10, -5]), arc(center: [10, 0], radius: 5, start_angle: -90, end_angle: 90), line(start: [10, 5], end: [-10, 5]), arc(center: [-10, 0], radius: 5, start_angle: 90, end_angle: 270)], label: \"s\");\nextrude(sketch: s, distance: 10, operation: \"cut\", label: \"slot\");";
-        // Chords on the top face of hole_a's rim: at z = 40, eight from the
-        // hole's centre at (35, 25). The faceted tier splits a rim's polygon
-        // sides at points along the chord, which sit inside the circle by up
-        // to the sagitta of a sixteen-gon, so the band is half a millimetre.
-        let on_hole_a = |edge: &&DebugEdge| {
-            edge.endpoints.iter().all(|point| {
-                (point.z - 40.0).abs() < 1.0e-6
-                    && ((point.x - 35.0).hypot(point.y - 25.0) - 8.0).abs() < 0.5
-            })
-        };
-        for (label, script, expected_sources) in
-            [("exact plate", plate, 2), ("crossing cut", crossed, 0)]
-        {
+        // A hub whose flange rim is blended, a bolt hole drilled beside the
+        // band, and a second hole drilled through the band: that last step
+        // meets the torus off its axis and reaches the faceted tier, which
+        // re-facets the whole body, the bolt hole's rim included.
+        let hub = "let section = sketch(on: \"XZ\", label: \"section\", entities: [line(start: [6, 0], end: [45, 0]), line(start: [45, 0], end: [45, 8]), line(start: [45, 8], end: [20, 8]), line(start: [20, 8], end: [20, 40]), line(start: [20, 40], end: [6, 40]), line(start: [6, 40], end: [6, 0])]);\nlet hub = revolve(sketch: section, axis: [0, 0, 1], label: \"hub\");\nfillet(edges: [nearest(point: [0, 45, 8], kind: \"edge\"), nearest(point: [0, -45, 8], kind: \"edge\")], radius: 2, label: \"flange_top_rim\");\ndrill(face: nearest(point: [-30.0, 5.0, 8.0]), center: [-30.0, 0.0], diameter: 6.0, depth: 8.0, label: \"bolt\");\ndrill(face: nearest(point: [25.0, 10.0, 8.0]), center: [43.0, 0.0], diameter: 6.0, depth: 8.0, label: \"rim_hole\");";
+        // Each case names a bore's rim on a top face: hole_a's at z = 40,
+        // eight from (35, 25), or the bolt hole's at z = 8, three from
+        // (−30, 0). The faceted tier splits a rim's polygon sides at points
+        // along the chord, which sit inside the circle by up to the sagitta
+        // of a sixteen-gon, so the band is half a millimetre.
+        for (label, script, centre, radius, expected_sources) in [
+            ("exact plate", plate, (35.0, 25.0, 40.0), 8.0, 2),
+            ("crossing cut", crossed, (35.0, 25.0, 40.0), 8.0, 2),
+            ("faceted hub", hub, (-30.0, 0.0, 8.0), 3.0, 0),
+        ] {
+            let on_hole_a = |edge: &&DebugEdge| {
+                edge.endpoints.iter().all(|point| {
+                    (point.z - centre.2).abs() < 1.0e-6
+                        && ((point.x - centre.0).hypot(point.y - centre.1) - radius).abs() < 0.5
+                })
+            };
             session.reset();
             let outcome = session.run_script_with(script, &BTreeMap::new(), &NoModules, &token);
             assert!(outcome.failure.is_none(), "{label}: {:?}", outcome.failure);

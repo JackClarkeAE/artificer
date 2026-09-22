@@ -57,7 +57,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0044](0044-a-corner-already-finished-asks-before-it-answers.md) | A corner already finished asks before it answers | Accepted and implemented | 0034, 0043, 0045 |
 | [0045](0045-a-boolean-that-resolves-what-it-touches.md) | A Boolean that resolves what it touches | Implemented | 0025, 0044 |
 | [0046](0046-a-hole-rim-is-one-closed-edge.md) | A hole rim is one closed edge | Implemented | 0023, 0034 |
-| [0047](0047-the-curve-two-cylinders-share.md) | The curve two cylinders share | Partly implemented | 0025, 0026, 0045 |
+| [0047](0047-the-curve-two-cylinders-share.md) | The curve two cylinders share | Implemented | 0025, 0026, 0045 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

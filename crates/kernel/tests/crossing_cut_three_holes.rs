@@ -1,10 +1,13 @@
 //! A round cut through the side of a three-hole block that crosses two of
 //! the holes perpendicularly and misses the third.
 //!
-//! The crossings meet in quartic curves, outside the line-and-circle
-//! vocabulary, so the faceted tier answers and must say so; the cut still
-//! owes a valid closed solid whose volume lies between the holed block and
-//! the block minus the whole cutter.
+//! The crossings meet in quartic curves — a cutter of radius 10 against holes
+//! of radius 8 whose axes pass it at 10 and 12 — which the faceted tier used
+//! to answer, labelled as an approximation. Since ADR 0047 the exact engine
+//! carries the curve and closes the section it leaves, so the cut is exact:
+//! no caveat, and a volume that is the block less the cutter plus the two
+//! lenses it shares with the holes, each measured here by a quadrature of its
+//! own.
 
 use std::f64::consts::PI;
 
@@ -16,7 +19,7 @@ use artificer_protocol::{
 };
 
 #[test]
-fn a_side_cut_crossing_two_of_three_holes_closes_and_says_it_is_faceted() {
+fn a_side_cut_crossing_two_of_three_holes_is_exact() {
     let frame = PlanarFrame3::new(
         Point3::new(0.0, 0.0, 0.0),
         Vector3::new(1.0, 0.0, 0.0),
@@ -130,26 +133,58 @@ fn a_side_cut_crossing_two_of_three_holes_closes_and_says_it_is_faceted() {
         .expect("the crossing cut closes");
 
     assert!(
-        outcome
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION"),
-        "a crossing cut is a labelled approximation: {:?}",
+        outcome.report.warnings.is_empty(),
+        "an exact cut carries no caveat: {:?}",
         outcome.report.warnings
     );
     let validation = NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid);
     assert!(validation.valid, "{:?}", validation.diagnostics);
+
+    // Each lens: across the cutter's axis at `x`, the cutter's chord in z is
+    // `2√(100 − x²)` and the hole's chord in y is `2√(64 − (x − offset)²)`,
+    // wholly inside the cutter's 30 of depth. Both are known; their product is
+    // integrated over the stretch of `x` the two discs share.
+    let lens = |offset: f64| {
+        integrate(offset - 8.0, 10.0, &|x: f64| {
+            4.0 * x.mul_add(-x, 100.0).max(0.0).sqrt()
+                * (x - offset).mul_add(-(x - offset), 64.0).max(0.0).sqrt()
+        })
+    };
+    let expected = PI.mul_add(-100.0 * 30.0, base_volume) + lens(10.0) + lens(12.0);
     let after = outcome.snapshot.measures().volume;
-    let cutter = PI * 100.0 * 30.0;
     assert!(
-        after < base_volume && after > base_volume - cutter,
-        "volume {after} must lie between {base_volume} and {}",
-        base_volume - cutter
+        ((after - expected) / expected).abs() < 1.0e-9,
+        "volume {after} should be {expected}"
     );
     assert!(
         !NativeKernel::debug_scene(&outcome.snapshot)
             .triangles
             .is_empty()
     );
+}
+
+/// `∫ f` over `[from, to]`, walked through `x = from + (to − from)(3t² − 2t³)`
+/// so the square roots that vanish at either end become smooth, then composite
+/// Simpson. Independent of the kernel's own quadrature on purpose.
+fn integrate(from: f64, to: f64, integrand: &dyn Fn(f64) -> f64) -> f64 {
+    let panels = 20_000;
+    let step = 1.0 / f64::from(panels);
+    let span = to - from;
+    (0..=panels)
+        .map(|index| {
+            let t = f64::from(index) * step;
+            let x = span.mul_add(t * t * 2.0f64.mul_add(-t, 3.0), from);
+            let rate = 6.0 * span * t * (1.0 - t);
+            let weight = if index == 0 || index == panels {
+                1.0
+            } else if index % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            weight * integrand(x) * rate
+        })
+        .sum::<f64>()
+        * step
+        / 3.0
 }

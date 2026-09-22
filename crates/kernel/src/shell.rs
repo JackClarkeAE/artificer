@@ -699,5 +699,5 @@ fn reverse_face(topology: &mut Topology, face_index: usize) -> Option<()> {
         // lies inside the tube, and no edit of the frame moves it out.
         Surface::Torus(_) | Surface::Sphere(_) => return None,
     };
-    crate::mirror::reverse_face_loops(topology, face_index, mirror).ok()
+    crate::mirror::reverse_face_loops(topology, face_index, mirror, &|cylinder| cylinder).ok()
 }

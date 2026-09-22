@@ -873,8 +873,10 @@
           "enum": [
             "line",
             "circular_arc",
-            "elliptical_arc"
-          ]
+            "elliptical_arc",
+            "surface_trace"
+          ],
+          "description": "surface_trace: where two cylinders meet in a curve no line, circle or ellipse describes (ADR 0047). It has no frame, so it is reported by its ends and the radii of the two cylinders that generate it."
         },
         "start": {
           "$ref": "#/$defs/point"
@@ -899,6 +901,14 @@
         },
         "sweep_degrees": {
           "type": "number"
+        },
+        "host_radius": {
+          "type": "number",
+          "description": "surface_trace: radius of the cylinder whose azimuth parameterizes the curve."
+        },
+        "other_radius": {
+          "type": "number",
+          "description": "surface_trace: radius of the other cylinder."
         },
         "length": {
           "type": "number",
