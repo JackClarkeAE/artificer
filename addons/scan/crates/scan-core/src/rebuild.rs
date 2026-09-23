@@ -1533,6 +1533,37 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
             }
             lap("footprints + index");
             let empty: Vec<usize> = Vec::new();
+            // B-spline patches compete for the cells too, on the same
+            // terms. Their material has left the analytic features, so
+            // without a say here every cell over a freeform surface goes
+            // to whichever facet is left nearby, and one 45 mm^2 facet
+            // draws 880 mm^2 flat across a curved top.
+            let spline_boxes: Vec<(Point3, Point3)> = report
+                .splines
+                .iter()
+                .map(|patch| {
+                    let (low, high) = patch.bounds();
+                    let pad = Vector3::new(band, band, band);
+                    (low - pad, high + pad)
+                })
+                .collect();
+            let spline_claim = |point: Point3, normal: Vector3| -> Option<(i64, f64)> {
+                report
+                    .splines
+                    .iter()
+                    .zip(&spline_boxes)
+                    .filter(|(_, (low, high))| {
+                        (low.x..=high.x).contains(&point.x)
+                            && (low.y..=high.y).contains(&point.y)
+                            && (low.z..=high.z).contains(&point.z)
+                    })
+                    .filter_map(|(patch, _)| {
+                        let (distance, surface_normal) = patch.trimmed_distance(point)?;
+                        (distance.abs() <= band && normal.dot(surface_normal).abs() >= 0.82)
+                            .then_some(((distance.abs() / 0.05).floor() as i64, patch.area))
+                    })
+                    .min_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)))
+            };
             for &(point, normal) in scan_cells.values() {
                 // Distance decides in coarse buckets and AREA breaks
                 // the tie: a micro-fragment's locally tighter fit must
@@ -1561,7 +1592,14 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                         best = Some((slot, bucket, areas[slot]));
                     }
                 }
-                let Some((slot, _, _)) = best else { continue };
+                let Some((slot, bucket, area)) = best else {
+                    continue;
+                };
+                if let Some((spline_bucket, spline_area)) = spline_claim(point, normal)
+                    && (spline_bucket < bucket || (spline_bucket == bucket && spline_area > area))
+                {
+                    continue;
+                }
                 if let Some((a, b)) = patched[slot].1.to_uv(point) {
                     let (ca, cb) = (
                         (a / PATCH_STEP).floor() as i64,
@@ -1842,6 +1880,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         // hybrid model that says which parts are exact beats an exact
         // model of half a part.
         let (mut measured, mut measured_area) = (0usize, 0.0);
+        let (mut splined, mut splined_area, mut splined_rms) = (0usize, 0.0, 0.0f64);
         // The emitted analytic surfaces, hoisted once for the carry
         // filter below.
         let patched_surfaces: Vec<&SurfaceClass> = report
@@ -1860,12 +1899,44 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
             {
                 continue;
             }
+            // Freeform that got a B-spline patch is drawn as the patch,
+            // trimmed to where its material stops: a surface, not a
+            // photocopy of the scan.
+            if let Some(patch) = report.splines.iter().find(|p| p.feature == feature.id) {
+                let soup = patch.tessellate(crate::freeform::TESSELLATION_STEP);
+                if !soup.is_empty() {
+                    push_soup(
+                        soup,
+                        feature.id,
+                        &mut positions,
+                        &mut triangles,
+                        &mut feature_of_face,
+                    );
+                    splined += 1;
+                    splined_area += feature.area;
+                    splined_rms = splined_rms.max(patch.fit.deviation.rms);
+                    continue;
+                }
+            }
             // A carried face that an emitted analytic surface already
             // explains is the same material drawn twice — the second
             // copy is the speckle fighting the clean patch above it.
             // Material stays in the carry only where no patched
-            // carrier accounts for it.
+            // carrier — and no B-spline patch — accounts for it.
             let explain_band = 1.3 * report.tolerance;
+            let spline_explains = |centroid: Point3| {
+                report.splines.iter().any(|patch| {
+                    let (low, high) = patch.bounds();
+                    let pad = Vector3::new(explain_band, explain_band, explain_band);
+                    let (low, high) = (low - pad, high + pad);
+                    (low.x..=high.x).contains(&centroid.x)
+                        && (low.y..=high.y).contains(&centroid.y)
+                        && (low.z..=high.z).contains(&centroid.z)
+                        && patch
+                            .trimmed_distance(centroid)
+                            .is_some_and(|(distance, _)| distance.abs() <= explain_band)
+                })
+            };
             let raw: Vec<[Point3; 3]> = feature
                 .faces
                 .iter()
@@ -1886,7 +1957,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
                         surface
                             .probe(centroid)
                             .is_some_and(|(distance, _)| distance.abs() <= explain_band)
-                    })
+                    }) && !spline_explains(centroid)
                 })
                 .map(|&face| {
                     let corners = mesh.triangle_points(face as usize);
@@ -1923,6 +1994,12 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
             );
             measured += 1;
             measured_area += feature.area;
+        }
+        if splined > 0 {
+            notes.push(format!(
+                "{splined} freeform region(s) totalling {splined_area:.0} mm^2 emitted as trimmed \
+                 B-spline patches (worst rms {splined_rms:.4} against the scan)"
+            ));
         }
         if measured > 0 {
             notes.push(format!(

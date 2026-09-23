@@ -83,8 +83,9 @@ pub struct Score {
     pub seconds: f64,
     pub slowest_stage: String,
     pub slowest_seconds: f64,
-    /// Share of the scan's area that ends the pipeline freeform: no
-    /// analytic surface claims it.
+    /// Share of the scan's area that ends the pipeline as measured mesh:
+    /// freeform that neither an analytic surface nor a B-spline patch
+    /// carries.
     pub freeform: f64,
     /// Area-weighted RMS of the analytic fits against their own faces
     /// (mm), and the worst single deviation among them.
@@ -103,6 +104,16 @@ pub struct Score {
     /// surface rather than as measured mesh. Negative when the fixture
     /// has no truth.
     pub truth_cad: f64,
+    /// B-spline patches made, and the share of the scan's area their
+    /// trimmed surfaces explain.
+    pub spline_patches: usize,
+    pub spline: f64,
+    /// Area-weighted RMS of the patches against their own samples (mm)
+    /// and the worst single deviation among them.
+    pub spline_rms: f64,
+    pub spline_max: f64,
+    /// Seconds the spline stage took.
+    pub spline_seconds: f64,
 }
 
 impl Score {
@@ -132,6 +143,11 @@ impl Score {
             truth_rms: 0.0,
             truth_max: 0.0,
             truth_cad: -1.0,
+            spline_patches: 0,
+            spline: 0.0,
+            spline_rms: 0.0,
+            spline_max: 0.0,
+            spline_seconds: 0.0,
         }
     }
 }
@@ -232,11 +248,29 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
     let freeform: f64 = report
         .features
         .iter()
-        .filter(|f| matches!(f.surface, SurfaceClass::Freeform))
+        .filter(|f| {
+            matches!(f.surface, SurfaceClass::Freeform)
+                && !report.splines.iter().any(|patch| patch.feature == f.id)
+        })
         .map(|f| f.area)
         .sum();
     score.freeform = freeform / report.total_area.max(1e-9);
     (score.analytic_rms, score.analytic_max) = analytic_deviation(&report);
+    score.spline_patches = report.splines.len();
+    {
+        let (mut squared, mut area) = (0.0f64, 0.0f64);
+        for patch in &report.splines {
+            squared += patch.area * patch.fit.deviation.rms * patch.fit.deviation.rms;
+            area += patch.area;
+            score.spline_max = score.spline_max.max(patch.fit.deviation.max_abs);
+        }
+        score.spline_rms = (squared / area.max(1e-9)).sqrt();
+    }
+    score.spline_seconds = report
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "spline-fit")
+        .map_or(0.0, |stage| stage.seconds);
     let Some(rebuilt) = crate::rebuild::rebuild_sharp(&scan.mesh, &report) else {
         return score;
     };
@@ -272,6 +306,17 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
             crate::coverage::explained_area(&scan.mesh, &analytic, alignment, report.tolerance);
         score.analytic = exact / total.max(1e-9);
     }
+    // The patches' own share, measured on their trimmed surfaces alone.
+    let patches: Vec<[artificer_geometry::Point3; 3]> = report
+        .splines
+        .iter()
+        .flat_map(|patch| patch.tessellate(crate::freeform::TESSELLATION_STEP))
+        .collect();
+    if let Some(splines) = TriangleMesh::from_triangle_soup(&patches, 1e-6) {
+        let (carried, _) =
+            crate::coverage::explained_area(&scan.mesh, &splines, alignment, report.tolerance);
+        score.spline = carried / total.max(1e-9);
+    }
     score.bores_found = rebuilt.bores.len();
     if fixture.bore_diameter > 0.0 {
         for bore in &rebuilt.bores {
@@ -287,12 +332,17 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
         .strip_prefix(SYNTH_PREFIX)
         .and_then(crate::synth::ground_truth)
     {
+        // A B-spline patch is a CAD surface as much as a plane is; what
+        // does not count is measured mesh carried as it was scanned.
         let certified = |face: usize| {
             report
                 .features
                 .iter()
                 .find(|f| f.id == rebuilt.feature_of_face[face])
-                .is_some_and(|f| !matches!(f.surface, SurfaceClass::Freeform))
+                .is_some_and(|f| {
+                    !matches!(f.surface, SurfaceClass::Freeform)
+                        || report.splines.iter().any(|patch| patch.feature == f.id)
+                })
         };
         let against = score_truth(&scan.mesh, &rebuilt.mesh, alignment, truth, certified);
         (score.truth_rms, score.truth_max, score.truth_cad) = against;
@@ -398,7 +448,8 @@ pub fn table(scores: &[Score]) -> String {
         "\nbores read on-size / found / expected; worst-d is the largest diameter error (mm)\n",
     );
     out.push_str(
-        "\nfixture              free%  an-rms  an-max  sewn%  open   truth-rms truth-max  cad%   secs\n",
+        "\nfixture              free%  an-rms  an-max   spl% patch spl-rms spl-max spl-s  \
+         sewn%  open  truth-rms truth-max  cad%   secs\n",
     );
     for score in scores {
         let truth = if score.truth_cad < 0.0 {
@@ -412,21 +463,29 @@ pub fn table(scores: &[Score]) -> String {
             )
         };
         out.push_str(&format!(
-            "{:<20} {:>5.1} {:>7.4} {:>7.3} {:>6.1} {:>5}   {truth} {:>6.1}\n",
+            "{:<20} {:>5.1} {:>7.4} {:>7.3} {:>6.1} {:>5} {:>7.4} {:>7.3} {:>5.1} {:>6.1} {:>5}  \
+             {truth} {:>6.1}\n",
             truncate(&score.name, 20),
             100.0 * score.freeform,
             score.analytic_rms,
             score.analytic_max,
+            100.0 * score.spline,
+            score.spline_patches,
+            score.spline_rms,
+            score.spline_max,
+            score.spline_seconds,
             100.0 * score.sewn,
             score.open_ends,
             score.seconds,
         ));
     }
     out.push_str(
-        "\nfree% is the scan area left freeform; an-rms/an-max the analytic fits against their \
-         own faces (mm);\nsewn% the rebuilt shell's sewn edges; truth-* the model against a \
-         synthetic part's known\nsurface (mm), cad% the share of that surface carried as a CAD \
-         surface rather than measured mesh\n",
+        "\nfree% is the scan area left as measured mesh; an-rms/an-max the analytic fits against \
+         their own faces (mm);\nspl% the scan area B-spline patches explain, spl-rms/spl-max the \
+         patches against their samples (mm),\nspl-s the stage's seconds; sewn% the rebuilt \
+         shell's sewn edges; truth-* the model against a\nsynthetic part's known surface (mm), \
+         cad% the share of that surface carried as a CAD surface\n(analytic or B-spline) rather \
+         than measured mesh\n",
     );
     out
 }
@@ -469,6 +528,12 @@ pub fn to_text(scores: &[Score]) -> String {
             out.push_str(&format!(
                 " truth_rms={:.4} truth_max={:.4} truth_cad={:.4}",
                 s.truth_rms, s.truth_max, s.truth_cad
+            ));
+        }
+        if s.spline_patches > 0 {
+            out.push_str(&format!(
+                " patches={} spl={:.4} spl_rms={:.4} spl_max={:.4} spl_s={:.1}",
+                s.spline_patches, s.spline, s.spline_rms, s.spline_max, s.spline_seconds
             ));
         }
         out.push('\n');
@@ -514,6 +579,11 @@ pub fn from_text(text: &str) -> Vec<Score> {
                 "truth_rms" => score.truth_rms = f,
                 "truth_max" => score.truth_max = f,
                 "truth_cad" => score.truth_cad = f,
+                "patches" => score.spline_patches = f as usize,
+                "spl" => score.spline = f,
+                "spl_rms" => score.spline_rms = f,
+                "spl_max" => score.spline_max = f,
+                "spl_s" => score.spline_seconds = f,
                 _ => {}
             }
         }
@@ -532,7 +602,7 @@ pub fn from_text(text: &str) -> Vec<Score> {
 /// one that failed to run.
 pub fn compare(baseline: &[Score], current: &[Score]) -> String {
     let mut out = String::from(
-        "fixture              expl%      inv%     anly%   on-size  worst-d     free%      cad%\n",
+        "fixture              expl%      inv%     anly%   on-size  worst-d     free%      spl%      cad%\n",
     );
     let mut regressed = 0;
     for now in current {
@@ -557,7 +627,7 @@ pub fn compare(baseline: &[Score], current: &[Score]) -> String {
             format!("{:>9}", "-")
         };
         out.push_str(&format!(
-            "{:<20} {:>+6.2} {:>+9.2} {:>+9.2} {:>+8} {:>+8.3} {:>+9.2} {cad}{}\n",
+            "{:<20} {:>+6.2} {:>+9.2} {:>+9.2} {:>+8} {:>+8.3} {:>+9.2} {:>+9.2} {cad}{}\n",
             truncate(&now.name, 20),
             100.0 * (now.explained - was.explained),
             100.0 * (now.invented - was.invented),
@@ -565,6 +635,7 @@ pub fn compare(baseline: &[Score], current: &[Score]) -> String {
             now.bores_on_size as i64 - was.bores_on_size as i64,
             now.worst_bore_error - was.worst_bore_error,
             100.0 * (now.freeform - was.freeform),
+            100.0 * (now.spline - was.spline),
             if worse { "   REGRESSED" } else { "" },
         ));
     }
@@ -650,6 +721,11 @@ mod tests {
             truth_rms: 0.0182,
             truth_max: 0.094,
             truth_cad: 0.35,
+            spline_patches: 2,
+            spline: 0.362,
+            spline_rms: 0.0244,
+            spline_max: 0.559,
+            spline_seconds: 2.3,
         }];
         let read = from_text(&to_text(&scores));
         assert_eq!(read.len(), 1);
@@ -660,6 +736,8 @@ mod tests {
         assert!((read[0].freeform - 0.081).abs() < 1e-6);
         assert_eq!(read[0].open_ends, 96);
         assert!((read[0].truth_cad - 0.35).abs() < 1e-6);
+        assert_eq!(read[0].spline_patches, 2);
+        assert!((read[0].spline - 0.362).abs() < 1e-6);
         // A line from before these columns existed reads as "no truth".
         let old = from_text("name=rail tri=10 feat=2 expl=0.9\n");
         assert!(old[0].truth_cad < 0.0);

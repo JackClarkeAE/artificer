@@ -57,13 +57,14 @@ fn usage() -> String {
                             [--no-ransac] [--min-support N] [--ransac-epsilon MM]\n\
      [--no-consolidate]\n\
                             [--no-merge] [--min-feature MM2] [--no-datum] [--datum-candidate N]\n\
-                            [--no-snap] [--snap-max MM] [--json out.json]\n\
+                            [--no-snap] [--snap-max MM] [--no-splines] [--no-reclaim]\n\
+                            [--json out.json] [--step patches.step]\n\
                             [--aligned-out mesh.stl] [--history plan.json] [--profile-out master.png]\n\
                             [--labels labels.bin]\n\
      artificer-scan view <mesh> [reverse options] [--out viewer.html]\n\
      artificer-scan snapshot <mesh> [reverse options] [--top] [--out snapshot.png]\n\
      artificer-scan rebuild <mesh> [reverse options] [--out model.stl] [--snapshot cmp.png]\n\
-                            [--edges edges.obj] [--sew-triage triage.png]\n\
+                            [--edges edges.obj] [--sew-triage triage.png] [--step patches.step]\n\
      artificer-scan sections <mesh> [reverse options] [--meridians N] [--levels N]\n\
                              [--panel PX] [--gap MM] [--fixed-scale]\n                             [--z-from MM] [--z-to MM] [--z-step MM] [--out sections.png]\n\
      artificer-scan simulate <mesh> [--density MM] [--smooth MM] [--noise MM]\n\
@@ -74,6 +75,28 @@ fn usage() -> String {
      artificer-scan demo [--out scan.stl]\n\
      a <mesh> is a .stl/.ply/.obj/.step file, or synth:plate-with-boss / synth:freeform-block"
         .to_owned()
+}
+
+/// Writes the report's B-spline patches as a STEP surface model and says
+/// plainly what the file is — and is not.
+fn write_patches_step(
+    report: &artificer_scan_core::ReverseReport,
+    source: &str,
+    out: &str,
+) -> Result<(), String> {
+    let product = Path::new(source)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("scan");
+    let text = artificer_scan_core::step::write_spline_patches(&report.splines, product);
+    std::fs::write(out, text).map_err(|e| format!("cannot write {out}: {e}"))?;
+    let area: f64 = report.splines.iter().map(|patch| patch.area).sum();
+    println!(
+        "{} B-spline face(s) over {area:.0} mm^2 written to {out}, as open shells: the analytic \
+         faces are not in the file and nothing is sewn into a solid yet",
+        report.splines.len()
+    );
+    Ok(())
 }
 
 fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
@@ -159,6 +182,17 @@ fn parse_reverse_options(args: &mut Vec<String>) -> Result<ReverseOptions, Strin
     }
     if take_flag(args, "--no-adaptive-tolerance") {
         options.adaptive_tolerance = false;
+    }
+    // Freeform as measured mesh, as before B-spline patches existed.
+    if take_flag(args, "--no-splines") {
+        options.splines = None;
+    }
+    // Patches over freeform regions only: strained analytic facets are
+    // left as they are, however badly they describe a curved surface.
+    if take_flag(args, "--no-reclaim")
+        && let Some(splines) = &mut options.splines
+    {
+        splines.reclaim_facets = false;
     }
     options.snap = if take_flag(args, "--no-snap") {
         None
@@ -259,6 +293,7 @@ fn run() -> Result<(), String> {
             let history_path = take_flag_value(&mut args, "--history");
             let profile_path = take_flag_value(&mut args, "--profile-out");
             let labels_path = take_flag_value(&mut args, "--labels");
+            let step_path = take_flag_value(&mut args, "--step");
             let path = args.first().ok_or_else(usage)?;
             let mesh = load_mesh(path)?;
             let report = reverse_engineer(&mesh, &options);
@@ -273,6 +308,9 @@ fn run() -> Result<(), String> {
             if let Some(json_path) = &json_path {
                 std::fs::write(json_path, report_to_json(&report))
                     .map_err(|e| format!("cannot write {json_path}: {e}"))?;
+            }
+            if let Some(step_path) = &step_path {
+                write_patches_step(&report, path, step_path)?;
             }
             if let Some(aligned_path) = &aligned_path {
                 let aligned = match &report.datum {
@@ -409,6 +447,7 @@ fn run() -> Result<(), String> {
             let snapshot_path = take_flag_value(&mut args, "--snapshot");
             let triage_path = take_flag_value(&mut args, "--sew-triage");
             let edges_out = take_flag_value(&mut args, "--edges");
+            let step_path = take_flag_value(&mut args, "--step");
             let path = args.first().ok_or_else(usage)?;
             let mesh = load_mesh(path)?;
             let report = reverse_engineer(&mesh, &options);
@@ -420,6 +459,9 @@ fn run() -> Result<(), String> {
             );
             for note in &report.demotions {
                 println!("  demoted: {note}");
+            }
+            if let Some(step_path) = &step_path {
+                write_patches_step(&report, path, step_path)?;
             }
             let rebuilt = artificer_scan_core::rebuild_sharp(&mesh, &report)
                 .ok_or("rebuild needs a datum frame (auto-datum found none)")?;

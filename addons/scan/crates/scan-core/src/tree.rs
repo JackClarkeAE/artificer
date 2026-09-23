@@ -130,6 +130,7 @@ pub fn order_tree(
     plan: &crate::reconstruct::ReconstructionPlan,
     alignment: Option<&DatumAlignment>,
     organic_area: f64,
+    spline_area: f64,
 ) -> FeatureTree {
     let identity = crate::transform::RigidTransform::IDENTITY;
     let to_frame = alignment.map_or(&identity, |a| &a.transform);
@@ -167,6 +168,18 @@ pub fn order_tree(
             index: 0,
             label: "circular pattern band".to_owned(),
             area: 0.0,
+        });
+    }
+    // Freeform surface a B-spline patch carries: a body bounded by a
+    // designed surface, which the machined features are cut into just as
+    // they would be into a casting — but exact rather than measured.
+    if spline_area > 0.0 {
+        solids.push(Step {
+            role: Role::Add,
+            operation: "bspline_surface_body".to_owned(),
+            index: 0,
+            label: "freeform body bounded by trimmed B-spline surface".to_owned(),
+            area: spline_area,
         });
     }
     // Cast or organic surface: a measured body the rest is cut into.
@@ -407,7 +420,7 @@ mod tests {
                 },
                 ..Default::default()
             };
-            let tree = order_tree(&mesh, &features, &plan, None, 0.0);
+            let tree = order_tree(&mesh, &features, &plan, None, 0.0, 0.0);
             assert_eq!(tree.steps.len(), 1);
             let role = tree.steps[0].role;
             if expect_add {
@@ -443,7 +456,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let tree = order_tree(&mesh, &[], &plan, None, 0.0);
+        let tree = order_tree(&mesh, &[], &plan, None, 0.0, 0.0);
         assert_eq!(tree.steps.first().map(|step| step.role), Some(Role::Base));
         assert_eq!(tree.steps.last().map(|step| step.role), Some(Role::Finish));
     }
