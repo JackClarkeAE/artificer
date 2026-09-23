@@ -6795,10 +6795,19 @@ impl KernelLabApp {
     }
 
     /// The numbers the selected feature lets the user change, if any.
+    ///
+    /// A library part's insertion is not one of them. Its extrusion is the
+    /// part the library resolved at the length the user chose, and the
+    /// component record keeps that length and its digest; changing the
+    /// extrusion here would resize the part behind the library's back, past
+    /// its limits, and leave the record describing a part that is no longer
+    /// there.
     fn selected_feature_scalars(&self) -> Vec<feature_editor::EditableScalar> {
         self.selected_history_feature
             .and_then(|feature| self.document.feature(feature))
-            .filter(|node| !node.state.read_only && !node.state.suppressed)
+            .filter(|node| {
+                !node.state.read_only && !node.state.suppressed && node.component_instance.is_none()
+            })
             .map(|node| feature_editor::action_scalars(&node.action))
             .unwrap_or_default()
     }
@@ -6820,6 +6829,13 @@ impl KernelLabApp {
         };
         if node.state.read_only {
             self.document_status = Some("That feature cannot be edited".to_owned());
+            return false;
+        }
+        if node.component_instance.is_some() {
+            self.document_status = Some(
+                "A library part keeps the size it was inserted at · insert it again from the library for another size"
+                    .to_owned(),
+            );
             return false;
         }
         let Some(edited) = feature_editor::with_action_scalar(&node.action, index, value) else {
@@ -19200,6 +19216,13 @@ impl KernelLabApp {
                             RichText::new(format!(
                                 "{definition_key} · revision {definition_revision}"
                             ))
+                            .small()
+                            .color(theme::muted()),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Sized when it was inserted · insert it again from the library for another size",
+                            )
                             .small()
                             .color(theme::muted()),
                         );
@@ -32849,6 +32872,50 @@ mod extrusion_workbench_tests {
             ((volume - 2.0 * area) / (2.0 * area)).abs() < 1.0e-6,
             "volume {volume} against area {area} × 2"
         );
+    }
+
+    /// An inserted library part is sized by the library, not by its feature.
+    /// The feature card offers nothing to drag, and an edit that reaches the
+    /// feature anyway is refused, so the part and its component record, which
+    /// keeps the length it was inserted at, cannot disagree.
+    #[test]
+    fn a_library_part_is_not_resized_through_its_feature() {
+        let mut app = KernelLabApp::default();
+        app.part_library.set_length_text("125");
+        let staging_id = app.part_library.stage_selected().expect("the part stages");
+        app.pending_operation = Some(PendingOperation::LibraryInsertion { staging_id });
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let feature = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.component_instance.is_some())
+            .expect("the insertion is in the history")
+            .id;
+        let volume = app
+            .displayed_measures()
+            .expect("the part is on screen")
+            .volume;
+
+        app.selected_history_feature = Some(feature);
+        assert!(
+            app.selected_feature_scalars().is_empty(),
+            "the feature card offers no dimension to drag"
+        );
+        assert!(!app.edit_feature_scalar(feature, 0, 900.0));
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("insert it again")),
+            "{:?}",
+            app.document_status
+        );
+        let after = app
+            .displayed_measures()
+            .expect("the part is still there")
+            .volume;
+        assert!((after - volume).abs() < 1.0e-9, "the part kept its size");
     }
 
     /// The bootstrap block, and the three edges meeting at one of its corners.
