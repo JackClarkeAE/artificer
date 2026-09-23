@@ -569,6 +569,7 @@ fn bind_recipe_command(
         | ReplayAction::Boolean(_)
         | ReplayAction::DatumPlane(_)
         | ReplayAction::SketchLoft(_)
+        | ReplayAction::SketchRevolve(_)
         | ReplayAction::KernelChain(_) => Err(LibraryCatalogError::RecipeContract(
             "the parameterized root recipe did not resolve to an independent kernel command".into(),
         )),

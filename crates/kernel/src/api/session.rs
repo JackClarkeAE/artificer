@@ -8,7 +8,7 @@ use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
     ExecuteRequest, KernelCommand, LoftOperation, LoftSection, OperationReport, PlanarAxis2,
     PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3,
-    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, Tier, Vector3,
+    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, SolidOperation, Tier, Vector3,
 };
 
 use artificer_protocol::FaceExtrusionOperation;
@@ -993,12 +993,6 @@ impl Session {
                 operation,
                 ..
             } => {
-                if *operation != ExtrudeOp::New {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidInput,
-                        "Revolve builds a new body; add and cut revolves are not supported",
-                    ));
-                }
                 if (angle_degrees - 360.0).abs() > 1.0e-9 {
                     return Err(ApiError::new(
                         ApiErrorCode::InvalidInput,
@@ -1038,6 +1032,11 @@ impl Session {
                     profile,
                     axis: PlanarAxis2 { start, end },
                     angle: RevolveAngle::FullTurn,
+                    operation: match operation {
+                        ExtrudeOp::New => SolidOperation::New,
+                        ExtrudeOp::Add => SolidOperation::Add,
+                        ExtrudeOp::Cut => SolidOperation::Cut,
+                    },
                 })
             }
             ApiCommand::BooleanUnion { .. }

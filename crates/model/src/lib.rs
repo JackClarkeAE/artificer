@@ -15,6 +15,7 @@ pub mod loft;
 pub mod parameterized;
 pub mod parameters;
 pub mod persistent;
+pub mod revolve;
 pub mod sketch_region;
 pub mod sketches;
 
@@ -53,6 +54,10 @@ pub use parameters::{
     ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, QuantityValue,
     format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
+pub use revolve::{
+    CURRENT_SKETCH_REVOLVE_RECIPE_VERSION, OriginAxis, RevolveAxis, RevolveExtent,
+    SketchAxisDirection, SketchRevolve, SketchRevolveError,
+};
 pub use sketch_region::{
     CURRENT_SKETCH_REGION_RECIPE_VERSION, MAX_SELECTED_SKETCH_REGIONS, SketchRegionExtrusion,
     SketchRegionExtrusionTarget, SketchRegionRecipeError, SketchRegionResolveError,
@@ -73,8 +78,9 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 /// makes a construction plane a recipe rather than a marker (ADR 0048).
 /// Version 8 adds the loft between sketch sections (ADR 0051). Version 9
 /// lets an extrusion's distance follow a variable and a library part replay
-/// as the chain of kernel commands it was built from.
-pub const CURRENT_DOCUMENT_VERSION: u32 = 9;
+/// as the chain of kernel commands it was built from. Version 10 adds the
+/// revolve feature (ADR 0055).
+pub const CURRENT_DOCUMENT_VERSION: u32 = 10;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
 /// First native schema with a persistent assembly hierarchy and joint graph.
@@ -90,6 +96,8 @@ pub const SKETCH_LOFT_DOCUMENT_VERSION: u32 = 8;
 /// First native schema whose extrusion distances can follow a variable and
 /// whose features can replay a chain of kernel commands.
 pub const LINKED_PARAMETER_DOCUMENT_VERSION: u32 = 9;
+/// First native schema that can hold a revolve feature.
+pub const SKETCH_REVOLVE_DOCUMENT_VERSION: u32 = 10;
 /// The longest chain of kernel commands one feature may replay.
 pub const MAX_KERNEL_CHAIN_COMMANDS: usize = 1_024;
 /// Oldest native document schema this version can migrate in memory.
@@ -157,6 +165,7 @@ pub enum FeatureKind {
     Transform,
     Boolean,
     Loft,
+    Revolve,
 }
 
 impl FeatureKind {
@@ -164,7 +173,10 @@ impl FeatureKind {
     /// so hides the sketch it has spent (see `auto_hide_sketch_consumed_by`).
     #[must_use]
     pub const fn consumes_sketches(self) -> bool {
-        matches!(self, Self::Extrude | Self::Add | Self::Cut | Self::Loft)
+        matches!(
+            self,
+            Self::Extrude | Self::Add | Self::Cut | Self::Loft | Self::Revolve
+        )
     }
 }
 
@@ -239,6 +251,9 @@ pub enum ReplayAction {
     /// A loft whose sections are resolved from their sketches, on their
     /// planes, immediately before replay (ADR 0051).
     SketchLoft(SketchLoft),
+    /// A revolve whose regions and axis are resolved from its sketch, on its
+    /// plane, immediately before replay (ADR 0055).
+    SketchRevolve(SketchRevolve),
     /// Kernel commands run in order, each on the result of the one before,
     /// from the feature's input: a library part as its own recipe built it,
     /// at the values it was inserted with. A command may name an entity of
@@ -275,6 +290,7 @@ impl ReplayAction {
             | Self::Boolean(_)
             | Self::DatumPlane(_)
             | Self::SketchLoft(_)
+            | Self::SketchRevolve(_)
             | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
@@ -292,6 +308,7 @@ impl ReplayAction {
             | Self::Boolean(_)
             | Self::DatumPlane(_)
             | Self::SketchLoft(_)
+            | Self::SketchRevolve(_)
             | Self::KernelChain(_) => false,
         }
     }
@@ -328,6 +345,7 @@ impl ReplayAction {
                 recipe.resolve_in_frame(document, precision, frame)
             }
             Self::SketchLoft(recipe) => recipe.resolve_with_planes(document, precision, planes),
+            Self::SketchRevolve(recipe) => recipe.resolve_with_planes(document, precision, planes),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
@@ -3150,6 +3168,12 @@ pub enum DocumentError {
     SketchLoft(#[from] SketchLoftError),
     #[error("a loft feature must carry a loft recipe, and a loft recipe must be a loft feature")]
     InvalidLoftFeature,
+    #[error("invalid revolve: {0}")]
+    SketchRevolve(#[from] SketchRevolveError),
+    #[error(
+        "a revolve feature must carry a revolve recipe, and a revolve recipe must be a revolve feature"
+    )]
+    InvalidRevolveFeature,
     #[error("a kernel chain must hold between one and {MAX_KERNEL_CHAIN_COMMANDS} commands")]
     InvalidKernelChain,
     #[error("a sketch value follows {0:?}, which is not a variable of this document")]
@@ -3308,6 +3332,7 @@ pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), Docume
         }
         ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchRevolve(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::KernelChain(commands) => {
             if commands.is_empty() || commands.len() > MAX_KERNEL_CHAIN_COMMANDS {
                 Err(DocumentError::InvalidKernelChain)
@@ -3330,6 +3355,9 @@ fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), 
     // way round: the history names features by what they are.
     if matches!(action, ReplayAction::SketchLoft(_)) != (kind == FeatureKind::Loft) {
         return Err(DocumentError::InvalidLoftFeature);
+    }
+    if matches!(action, ReplayAction::SketchRevolve(_)) != (kind == FeatureKind::Revolve) {
+        return Err(DocumentError::InvalidRevolveFeature);
     }
     Ok(())
 }
@@ -3372,6 +3400,7 @@ fn validate_action_parameter_inputs(
         | ReplayAction::Boolean(_)
         | ReplayAction::DatumPlane(_)
         | ReplayAction::SketchLoft(_)
+        | ReplayAction::SketchRevolve(_)
         | ReplayAction::KernelChain(_) => {}
     }
     Ok(())
@@ -3409,6 +3438,20 @@ fn validate_action_feature_inputs(
                 .any(|input| matches!(input, FeatureInput::Body(_)))
         {
             return Err(SketchLoftError::MissingTargetBody.into());
+        }
+    }
+    // A revolve reads its sketch on every replay; an add or a cut changes a
+    // body, which is its branch.
+    if let ReplayAction::SketchRevolve(recipe) = action {
+        if !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch)) {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+        }
+        if recipe.operation != artificer_protocol::SolidOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchRevolveError::MissingTargetBody.into());
         }
     }
     if let ReplayAction::Boolean(recipe) = action

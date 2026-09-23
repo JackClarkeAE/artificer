@@ -260,8 +260,9 @@ impl KernelLabApp {
         }
     }
 
-    /// The body an add or cut loft combines with, when one is staged.
-    fn loft_target_snapshot(&self, target: Option<BodyId>) -> Option<Snapshot> {
+    /// The body an add or cut loft or revolve combines with, when one is
+    /// staged.
+    pub(crate) fn solid_target_snapshot(&self, target: Option<BodyId>) -> Option<Snapshot> {
         let body = target?;
         self.bodies
             .iter()
@@ -291,11 +292,11 @@ impl KernelLabApp {
             let input = if staged.operation == LoftOperation::New {
                 self.empty_snapshot.clone()
             } else {
-                self.loft_target_snapshot(staged.target).ok_or_else(|| {
+                self.solid_target_snapshot(staged.target).ok_or_else(|| {
                     "An add or cut loft needs a visible body to combine with".to_owned()
                 })?
             };
-            let (snapshot, report) = self.execute_loft_command(&input, command)?;
+            let (snapshot, report) = self.execute_preview_command(&input, command, "loft")?;
             Ok(LoftPreview {
                 recipe,
                 scene: NativeKernel::debug_scene(&snapshot),
@@ -319,14 +320,17 @@ impl KernelLabApp {
         }
     }
 
-    fn execute_loft_command(
+    /// Runs a staged solid's command for its preview, and names the reason
+    /// when the kernel refuses it.
+    pub(crate) fn execute_preview_command(
         &self,
         input: &Snapshot,
         command: KernelCommand,
+        what: &str,
     ) -> Result<(Snapshot, OperationReport), String> {
         let request = ExecuteRequest {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            request_id: RequestId::new(format!("workbench-{}-loft-preview", self.request_serial)),
+            request_id: RequestId::new(format!("workbench-{}-{what}-preview", self.request_serial)),
             expected_snapshot: input.id(),
             precision: input.precision_policy().unwrap_or_default(),
             command,
@@ -517,7 +521,7 @@ impl KernelLabApp {
                 anchors: section
                     .regions
                     .iter()
-                    .filter_map(|region| self.loft_region_anchor(section.sketch, region))
+                    .filter_map(|region| self.region_anchor(section.sketch, region))
                     .collect(),
                 regions: section.regions.clone(),
             })
@@ -540,7 +544,11 @@ impl KernelLabApp {
     }
 
     /// Where a region of a committed sketch is anchored in the model view.
-    fn loft_region_anchor(&self, sketch: SketchId, region: &RegionSignature) -> Option<[f64; 2]> {
+    pub(crate) fn region_anchor(
+        &self,
+        sketch: SketchId,
+        region: &RegionSignature,
+    ) -> Option<[f64; 2]> {
         let record = self.document.sketch(sketch)?;
         let payload = self
             .document
@@ -592,6 +600,7 @@ impl KernelLabApp {
                 self.move_history_cursor(self.document.features().len());
                 self.selected_history_feature = Some(feature);
                 if self.rebuild_document_from(feature) {
+                    self.activate_body_made_by(feature);
                     self.document_status =
                         Some("Loft rewritten; everything after it rebuilt".to_owned());
                 }

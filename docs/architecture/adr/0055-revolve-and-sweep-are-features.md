@@ -1,8 +1,9 @@
 # ADR 0055: Revolve and sweep are features
 
-Status: proposed. This is a survey of what exists and a phased plan for
-making revolve a history feature and adding a sweep. Nothing in it is built
-yet.
+Status: accepted. Phases R1 and R2 are implemented: Revolve is a history
+feature that turns a sketch profile about a centreline, the sketch's own
+axes or an origin axis, as a new body or added to or cut from the active
+one. The later phases are planned below.
 
 - Date: 2026-09-23
 - Decision owners: Artificer project
@@ -91,7 +92,7 @@ What is missing:
   `SketchEntityId`s (`FragmentKey::source_entity`). A recipe that names an
   axis line or a path by entity id is therefore no new kind of reference.
 
-## Decision (proposed)
+## Decision
 
 ### Revolve becomes a feature, the way the loft did
 
@@ -105,7 +106,7 @@ What is missing:
       regions: Vec<RegionSignature>,
       axis: RevolveAxis,
       extent: RevolveExtent,
-      operation: BodyOperation,        // New | Add | Cut, as LoftOperation
+      operation: SolidOperation,       // New | Add | Cut
       angle_expression: Option<ParameterExpression>,   // phase R3
   }
   ```
@@ -114,7 +115,10 @@ What is missing:
   - `SketchLine { entity: SketchEntityId }`, a line in the same sketch
     (normally a centreline);
   - `SketchAxis { axis: U | V }`, the sketch's own horizontal or vertical
-    axis through its origin.
+    axis through its origin;
+  - `OriginAxis { axis: X | Y | Z }`, one of the document's origin axes,
+    where it lies in the sketch's plane;
+  - a construction axis feature, later.
 
   Both are resolved late from the sketch's current authoring, so the
   revolve follows sketch edits and linked variables (ADR 0054) exactly as
@@ -141,7 +145,7 @@ What is missing:
       profile: SketchLoftSection,      // a sketch and its regions
       path: SweepPath { sketch: SketchId, entities: Vec<SketchEntityId> },
       orientation: SweepOrientation,   // RotationMinimising | Fixed
-      operation: BodyOperation,
+      operation: SolidOperation,
   }
   ```
 
@@ -296,16 +300,43 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
   `CURRENT_DOCUMENT_VERSION` and must equal it. Moving to version 10 moves
   the built-in part's revision to 1.10.0, as version 9 moved it to 1.9.0.
 
-## Open questions for the owner
+## The owner's decisions
 
-1. **Axes.** Is the sketch's own U and V enough as axes besides a drawn
-   centreline? The other options are document origin axes, and datum axes
-   as a new feature.
-2. **Sweep exactness.** Is an approximate B-spline sweep with a stated
-   tolerance acceptable for v1? The alternative is to start with exact
-   special cases only: straight and circular paths.
-3. **Orientation.** Is rotation-minimising a good default, with Fixed as
-   the only alternative, and guide rails and twist deferred?
-4. **Old revolves.** Should the preset's baked revolves in existing
-   documents stay as they are, or be offered a one-time "convert to feature"
-   when the sketch is still present?
+1. **Axes: every source.** A drawn line, the sketch's own U and V axes and
+   the document's origin axes are all offered now. A construction axis — a
+   datum axis feature, as construction planes are (ADR 0048) — comes next,
+   as another `RevolveAxis` variant.
+2. **Sweeps may be approximate, to a stated tolerance.** A swept wall that
+   no exact surface carries is a B-spline surface fitted to a chord
+   tolerance the kernel states and certifies, and the result says so.
+3. **Orientation: rotation-minimising by default**, with Fixed as the only
+   alternative; twist and guide rails are deferred.
+4. **No migration.** No saved document holds the preset's revolves, so the
+   preset and its fixed tube were removed outright.
+
+## As built (R1 and R2)
+
+- **Protocol.** `LoftOperation` became `SolidOperation` (the loft keeps its
+  name as an alias), and `KernelCommand::RevolvePlanarProfile` gained an
+  `operation` that reads as New from a command written before it.
+- **Kernel.** An add or a cut revolve runs through `tool_boolean` with the
+  `REVOLVE_BOOLEAN` labels: exact through the prism or analytic rung when
+  the revolve's faces are planes and coaxial cylinders, and the labelled
+  faceted tier (`revolve/faceted`, `REVOLVE_FACETED_APPROXIMATION`)
+  otherwise. Scripts' `revolve(operation: …)` now adds and cuts too.
+- **Model.** `crates/model/src/revolve.rs` holds `SketchRevolve`,
+  `RevolveAxis` (`SketchLine`, `SketchAxis`, `OriginAxis`), `RevolveExtent`
+  (full turn for now) and the axis resolution. A revolve is a
+  `FeatureKind::Revolve` feature whose sketch is an input and whose add or
+  cut names its body. The native document is at version 10.
+- **Workbench** (`apps/workbench/src/revolve.rs`):
+  - The Revolve button finishes a sketch still being drawn, takes its
+    picked regions or its only region, and starts on its first centreline.
+  - The card lists every axis, each origin axis that does not lie in the
+    sketch's plane disabled with the reason, and New/Add/Cut.
+  - The preview is the solid the kernel builds, drawn in place of the body
+    an add or cut changes.
+  - The Revolve chip's menu reopens the editor, and confirming rewrites the
+    revolve in place.
+  - A sketch dimension or variable the sketch follows (ADR 0054) reshapes
+    the revolve on rebuild.

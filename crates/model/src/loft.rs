@@ -156,7 +156,9 @@ impl SketchLoft {
     }
 }
 
-fn section_plane(
+/// The frame of the construction plane `sketch` is drawn on, where a rebuild
+/// has already placed that plane.
+pub(crate) fn section_plane(
     document: &ModelDocument,
     sketch: SketchId,
     planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,

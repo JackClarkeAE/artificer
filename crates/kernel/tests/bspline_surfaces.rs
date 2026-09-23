@@ -1254,6 +1254,7 @@ fn what_cannot_be_certified_is_refused_by_name() {
                     end: Point2::new(0.0, 1.0),
                 },
                 angle: RevolveAngle::FullTurn,
+                operation: Default::default(),
             },
         ),
         ["PLANAR_PROFILE_SPLINE_UNSUPPORTED"]

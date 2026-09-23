@@ -66,6 +66,8 @@ are stable, slash-separated paths:
 | `extrusion/polygon`, `extrusion/linear-profile`, `extrusion/analytic-profile` | A new body from a sketch; the last two carry arcs and circles exactly. |
 | `extrusion/spline-profile` | A new body from a sketch with a spline in it (ADR 0050): each spline sweeps a B-spline wall, exactly. |
 | `revolve/full-turn` | A revolved section. |
+| `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
+| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
 | `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise, and B-spline walls ruled between the rows where a section has a spline (ADR 0050). |
 | `loft/skinned` | A new body lofted smoothly through three planar sections or more (ADR 0050): every wall one B-spline surface through all the sections, smooth across the middle ones. |

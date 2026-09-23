@@ -396,6 +396,7 @@ let ring = revolve(sketch: section, axis: [0, 0, 1], label: "ring");
 | `axis_origin` | no | A point on the axis. Default `[0, 0, 0]`. |
 | `angle` | no | Degrees. Default and only supported value: `360`. |
 | `regions` | no | As for `extrude`. |
+| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. |
 
 The section must lie on one side of the axis (touching it is fine). A section
 drawn on `"XZ"` about `[0, 0, 1]` is the usual `(r, z)` half-section: `x` is

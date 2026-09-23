@@ -65,7 +65,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0052](0052-an-extrusion-distance-can-follow-a-variable.md) | An extrusion distance can follow a variable | Implemented | 0014, 0017, 0021 |
 | [0053](0053-a-part-can-be-saved-into-the-library.md) | A part can be saved into the library, and placed at any values | Implemented | 0017, 0018, 0052 |
 | [0054](0054-a-sketch-dimension-can-follow-a-variable.md) | A sketch dimension can follow a variable | Implemented | 0021, 0052, 0053 |
-| [0055](0055-revolve-and-sweep-are-features.md) | Revolve and sweep are features | Proposed | 0023, 0026, 0041, 0049, 0050, 0051 |
+| [0055](0055-revolve-and-sweep-are-features.md) | Revolve and sweep are features | Accepted (R1, R2 implemented) | 0023, 0026, 0041, 0049, 0050, 0051 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

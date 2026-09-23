@@ -720,6 +720,8 @@ pub enum SketchRegionResolveError {
     Profile(ProfileCompileError),
     #[error("invalid loft recipe: {0}")]
     InvalidLoft(crate::loft::SketchLoftError),
+    #[error("invalid revolve: {0}")]
+    InvalidRevolve(crate::revolve::SketchRevolveError),
 }
 
 /// Compiles the named regions of a sketch's current authoring graph into an
@@ -1034,10 +1036,7 @@ mod tests {
             restored.feature(feature).unwrap().action,
             document.feature(feature).unwrap().action
         );
-        assert_eq!(
-            restored.to_native().version(),
-            crate::LINKED_PARAMETER_DOCUMENT_VERSION
-        );
+        assert!(restored.to_native().version() >= crate::LINKED_PARAMETER_DOCUMENT_VERSION);
     }
 
     #[test]
@@ -1755,6 +1754,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(section_heights(live), vec![0.0, 25.0]);
+    }
+
+    /// A revolve reads its sketch and finds its axis there on every replay,
+    /// holds the sketch as an input, is written in the schema that knows
+    /// revolves, and only a revolve feature carries one (ADR 0055).
+    #[test]
+    fn a_revolve_names_its_sketch_and_finds_its_axis_on_replay() {
+        use crate::{OriginAxis, RevolveAxis, RevolveExtent, SketchAxisDirection, SketchRevolve};
+        use artificer_protocol::{PlanarAxis2, Point2, SolidOperation};
+        let (mut document, sketch, signature) = document_with_rectangle();
+        let revolve = |axis| {
+            SketchRevolve::new(
+                sketch,
+                vec![signature.clone()],
+                axis,
+                RevolveExtent::FullTurn,
+                SolidOperation::New,
+            )
+            .unwrap()
+        };
+        let resolved_axis = |recipe: &SketchRevolve| -> Result<PlanarAxis2, String> {
+            match recipe
+                .resolve_with_planes(
+                    &document,
+                    PrecisionPolicy::default(),
+                    &std::collections::BTreeMap::new(),
+                )
+                .map_err(|error| error.to_string())?
+            {
+                ReplayAction::Kernel(KernelCommand::RevolvePlanarProfile {
+                    axis,
+                    angle,
+                    operation,
+                    ..
+                }) => {
+                    assert_eq!(angle, artificer_protocol::RevolveAngle::FullTurn);
+                    assert_eq!(operation, SolidOperation::New);
+                    Ok(axis)
+                }
+                other => panic!("not a revolve: {other:?}"),
+            }
+        };
+        // The sketch's own vertical axis, and the document's Y axis, which
+        // lies in this sketch's XY plane.
+        let vertical = PlanarAxis2::new(Point2::new(0.0, 0.0), Point2::new(0.0, 1.0));
+        assert_eq!(
+            resolved_axis(&revolve(RevolveAxis::SketchAxis {
+                axis: SketchAxisDirection::V
+            })),
+            Ok(vertical)
+        );
+        assert_eq!(
+            resolved_axis(&revolve(RevolveAxis::OriginAxis {
+                axis: OriginAxis::Y
+            })),
+            Ok(vertical)
+        );
+        assert!(
+            resolved_axis(&revolve(RevolveAxis::OriginAxis {
+                axis: OriginAxis::Z
+            }))
+            .unwrap_err()
+            .contains("Z axis"),
+            "the Z axis stands out of an XY sketch"
+        );
+        // One of the rectangle's own sides, found as the sketch now stands.
+        let side = {
+            let authoring = document
+                .sketch_payload(sketch, document.sketch(sketch).unwrap().geometry_revision)
+                .and_then(crate::SketchPayload::authoring)
+                .unwrap();
+            authoring
+                .active_entities()
+                .find(|entity| {
+                    matches!(
+                        authoring.evaluated_curve(entity.id),
+                        Ok(artificer_sketch::EvaluatedCurve2::Line { start, end })
+                            if start.u.abs() < 1.0e-12 && end.u.abs() < 1.0e-12
+                    )
+                })
+                .map(|entity| entity.id)
+                .expect("the side on the V axis")
+        };
+        let on_side = resolved_axis(&revolve(RevolveAxis::SketchLine { entity: side })).unwrap();
+        assert!(on_side.start.x.abs() < 1.0e-12 && on_side.end.x.abs() < 1.0e-12);
+
+        let marker = SnapshotAssociation::new(
+            SnapshotId::ZERO,
+            SnapshotId::ZERO,
+            SemanticDigest::new([0; 32]),
+        );
+        let recipe = revolve(RevolveAxis::SketchAxis {
+            axis: SketchAxisDirection::V,
+        });
+        let draft = |kind| {
+            FeatureDraft::new(
+                kind,
+                "Revolve 1",
+                ReplayAction::SketchRevolve(recipe.clone()),
+            )
+            .with_commit(marker)
+            .with_output(OutputDraft::CreateBody {
+                label: "Body 1".into(),
+            })
+        };
+        assert_eq!(
+            document
+                .append_feature(draft(FeatureKind::Revolve))
+                .unwrap_err(),
+            crate::DocumentError::SketchRegionSourceMustBeInput(sketch)
+        );
+        assert_eq!(
+            document
+                .append_feature(
+                    draft(FeatureKind::Extrude).with_input(FeatureInput::Sketch(sketch))
+                )
+                .unwrap_err(),
+            crate::DocumentError::InvalidRevolveFeature
+        );
+        let appended = document
+            .append_feature(draft(FeatureKind::Revolve).with_input(FeatureInput::Sketch(sketch)))
+            .unwrap();
+        let native = document.to_native();
+        assert!(native.version() >= crate::SKETCH_REVOLVE_DOCUMENT_VERSION);
+        let json = serde_json::to_string(&native).unwrap();
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            restored.feature(appended.feature).map(|node| &node.action),
+            document.feature(appended.feature).map(|node| &node.action)
+        );
     }
 
     #[test]

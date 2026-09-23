@@ -25,6 +25,7 @@ pub mod material;
 mod parametric;
 pub mod part_library;
 pub mod part_preview;
+mod revolve;
 mod ribbon;
 pub mod saved_parts;
 pub mod shell;
@@ -75,10 +76,10 @@ use artificer_protocol::{
     DiagnosticSeverity, DiagnosticSubject, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
     FaceExtrusionOperation, HistoryRelation, KernelCommand, KernelError, KernelErrorCode,
     KernelStage, LoftOperation, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
-    MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarAxis2,
-    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
-    Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle, RotationQuaternion,
-    SemanticDigest, SnapshotId, TopologyCounts, Vector3,
+    MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarCurve2,
+    PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2 as ProtocolPoint2, Point3,
+    PrecisionPolicy, RequestId, RotationQuaternion, SemanticDigest, SnapshotId, TopologyCounts,
+    Vector3,
 };
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
@@ -425,15 +426,6 @@ impl LabCase {
 ///
 /// Widgets may create or edit this state, but only
 /// `confirm_pending_operation` may execute it through the kernel.
-/// A revolve captured at staging time: the region, the axis it turns about,
-/// and the frame both live in.
-#[derive(Clone, Debug, PartialEq)]
-struct StagedRevolve {
-    frame: PlanarFrame3,
-    profile: PlanarProfile2,
-    axis: PlanarAxis2,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PendingOperation {
     Transform {
@@ -481,6 +473,12 @@ enum PendingOperation {
     /// live in `staged_loft` beside the operation, as a plane's values do.
     StageLoft {
         /// The committed loft this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
+    /// A revolve in its editor (ADR 0055). Its picks live in
+    /// `staged_revolve` beside the operation, as a loft's do.
+    StageRevolve {
+        /// The committed revolve this editor was reopened on, when it was.
         editing: Option<FeatureId>,
     },
     /// The tool bodies are picked interactively while this is staged and live
@@ -618,6 +616,8 @@ impl PendingOperation {
             Self::StagePlane { editing: Some(_) } => "Edit construction plane",
             Self::StageLoft { editing: None } => "Loft",
             Self::StageLoft { editing: Some(_) } => "Edit loft",
+            Self::StageRevolve { editing: None } => "Revolve",
+            Self::StageRevolve { editing: Some(_) } => "Edit revolve",
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
                 BooleanOperation::Difference => "Subtract bodies",
@@ -679,6 +679,12 @@ impl PendingOperation {
             Self::StageLoft { editing: Some(_) } => {
                 "Confirm to rewrite the loft and replay everything built after it"
             }
+            Self::StageRevolve { editing: None } => {
+                "Click the profile, choose the axis, then confirm to build the revolve"
+            }
+            Self::StageRevolve { editing: Some(_) } => {
+                "Confirm to rewrite the revolve and replay everything built after it"
+            }
             Self::BooleanBodies { .. } => {
                 "Click the tool bodies to combine with the target, then confirm to publish a validated successor"
             }
@@ -736,7 +742,9 @@ impl PendingOperation {
                 object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
                 object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
-            Self::StagePlane { editing } | Self::StageLoft { editing } => {
+            Self::StagePlane { editing }
+            | Self::StageLoft { editing }
+            | Self::StageRevolve { editing } => {
                 if let Some(feature) = editing {
                     object.insert("editing".to_owned(), serde_json::json!(feature.get()));
                 }
@@ -836,7 +844,6 @@ const HOLE_PATTERN_COUNT: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SolidFeaturePreset {
-    Revolve,
     Hole,
     Rib,
     Mirror,
@@ -945,7 +952,6 @@ enum PendingPlaneSketch {
 impl SolidFeaturePreset {
     const fn label(self) -> &'static str {
         match self {
-            Self::Revolve => "Revolve radial section",
             Self::Hole => "Drill hole",
             Self::Rib => "Add rib",
             Self::Mirror => "Mirror body",
@@ -959,7 +965,6 @@ impl SolidFeaturePreset {
 
     const fn detail(self) -> &'static str {
         match self {
-            Self::Revolve => "Create an exact full-turn annular revolve as a new body",
             Self::Hole => "Cut an exact cylindrical hole normal to the selected planar face",
             Self::Rib => "Add a straight rectangular rib to the selected planar face",
             Self::Mirror => "Mirror the browser-selected bodies across the selected plane",
@@ -1198,6 +1203,7 @@ enum ModelBodyKind {
     PushedPulled,
     Boolean,
     Lofted,
+    Revolved,
 }
 
 impl ModelBodyKind {
@@ -1210,6 +1216,7 @@ impl ModelBodyKind {
             Self::PushedPulled => "native pushed/pulled solid",
             Self::Boolean => "native Boolean result",
             Self::Lofted => "native loft",
+            Self::Revolved => "native revolve",
         }
     }
 }
@@ -1363,6 +1370,8 @@ enum FeaturePreviewKind {
     Boolean,
     /// A loft between sketch sections, named by its feature (ADR 0051).
     Loft,
+    /// A revolve of a sketch profile, named by its feature (ADR 0055).
+    Revolve,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1410,6 +1419,10 @@ impl FeaturePreviewEntry {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Loft {}", self.ordinal)),
+            FeaturePreviewKind::Revolve => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Revolve {}", self.ordinal)),
         }
     }
 
@@ -2168,6 +2181,8 @@ enum TimelineContextCommand {
     EditPlane,
     /// Reopen a loft's editor (ADR 0051).
     EditLoft,
+    /// Reopen a revolve's editor (ADR 0055).
+    EditRevolve,
     Rename,
     Suppress,
     Restore,
@@ -2181,6 +2196,7 @@ impl TimelineContextCommand {
             Self::Edit => "Edit this extrusion",
             Self::EditPlane => "Edit this plane",
             Self::EditLoft => "Edit this loft",
+            Self::EditRevolve => "Edit this revolve",
             Self::Rename => "Rename…",
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
@@ -2774,10 +2790,9 @@ pub struct KernelLabApp {
     /// Tool bodies picked while a Boolean is staged, in click order. Empty
     /// outside a staged Boolean; the target is never a member.
     boolean_tools: Vec<BodyId>,
-    /// The sketch region and axis captured when a revolve was staged. It lives
-    /// beside the pending operation rather than inside it because a profile is
-    /// not `Copy`, exactly as the Boolean tool list does.
-    staged_revolve: Option<StagedRevolve>,
+    /// A revolve in its editor (ADR 0055), beside
+    /// `PendingOperation::StageRevolve`.
+    staged_revolve: Option<revolve::StagedRevolve>,
     active_tool: ActiveTool,
     display_transform: DisplayTransform,
     pending_operation: Option<PendingOperation>,
@@ -5258,6 +5273,7 @@ impl KernelLabApp {
                 | PendingOperation::AddUserParameter { .. }
                 | PendingOperation::StagePlane { .. }
                 | PendingOperation::StageLoft { .. }
+                | PendingOperation::StageRevolve { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
                 | PendingOperation::SketchEdit { .. }
@@ -5523,6 +5539,7 @@ impl KernelLabApp {
                 FeatureKind::Transform => previous_kind,
                 FeatureKind::Boolean => ModelBodyKind::Boolean,
                 FeatureKind::Loft => ModelBodyKind::Lofted,
+                FeatureKind::Revolve => ModelBodyKind::Revolved,
                 FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch => {
                     previous_kind
                 }
@@ -6253,6 +6270,7 @@ impl KernelLabApp {
             FeatureKind::Transform => format!("Transform {ordinal}"),
             FeatureKind::Boolean => format!("Boolean {ordinal}"),
             FeatureKind::Loft => format!("Loft {ordinal}"),
+            FeatureKind::Revolve => format!("Revolve {ordinal}"),
         }
     }
 
@@ -6452,6 +6470,7 @@ impl KernelLabApp {
                 FeatureKind::Transform => FeaturePreviewKind::Transform,
                 FeatureKind::Boolean => FeaturePreviewKind::Boolean,
                 FeatureKind::Loft => FeaturePreviewKind::Loft,
+                FeatureKind::Revolve => FeaturePreviewKind::Revolve,
             };
             let key = kind as u8;
             let ordinal = if matches!(
@@ -6533,7 +6552,9 @@ impl KernelLabApp {
                     } else {
                         feature.label.clone()
                     }),
-                    FeaturePreviewKind::Loft => Some(feature.label.clone()),
+                    FeaturePreviewKind::Loft | FeaturePreviewKind::Revolve => {
+                        Some(feature.label.clone())
+                    }
                     _ => None,
                 },
             });
@@ -6977,7 +6998,9 @@ impl KernelLabApp {
                 ReplayAction::ParameterizedKernel(_) => {
                     unreachable!("parameterized replay actions are resolved before kernel dispatch")
                 }
-                ReplayAction::SketchRegionExtrusion(_) | ReplayAction::SketchLoft(_) => {
+                ReplayAction::SketchRegionExtrusion(_)
+                | ReplayAction::SketchLoft(_)
+                | ReplayAction::SketchRevolve(_) => {
                     unreachable!("sketch-region replay actions are resolved before kernel dispatch")
                 }
                 ReplayAction::Boolean(recipe) => RebuildDispatch::Boolean(recipe),
@@ -7046,6 +7069,7 @@ impl KernelLabApp {
                         .unwrap_or(ModelBodyKind::Cuboid),
                     Some(FeatureKind::Boolean) => ModelBodyKind::Boolean,
                     Some(FeatureKind::Loft) => ModelBodyKind::Lofted,
+                    Some(FeatureKind::Revolve) => ModelBodyKind::Revolved,
                     Some(FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch)
                     | None => ModelBodyKind::Cuboid,
                 };
@@ -12110,6 +12134,7 @@ impl KernelLabApp {
             }
             PendingOperation::StagePlane { editing } => self.commit_staged_plane(editing),
             PendingOperation::StageLoft { editing } => self.commit_staged_loft(editing),
+            PendingOperation::StageRevolve { editing } => self.commit_staged_revolve(editing),
             PendingOperation::BooleanBodies {
                 target,
                 operation,
@@ -12295,12 +12320,12 @@ impl KernelLabApp {
                 }
             }
             PendingOperation::StageLoft { editing } => self.cancel_staged_loft(editing),
+            PendingOperation::StageRevolve { editing } => self.cancel_staged_revolve(editing),
             PendingOperation::SetParameterBindingEntry { .. } => {
                 self.staged_parameter_binding = None;
                 self.pending_operation = None;
             }
             PendingOperation::PresetFeature { .. } => {
-                self.staged_revolve = None;
                 self.pending_operation = None;
             }
             PendingOperation::SketchEdit { .. } => {
@@ -14329,23 +14354,6 @@ impl KernelLabApp {
         ));
     }
 
-    /// The active sketch's closed profile and centreline, if it has both.
-    ///
-    /// A revolve needs a region and an axis in the same frame, which is
-    /// exactly what a sketch with one centreline already is.
-    fn staged_sketch_revolve(&self) -> Option<StagedRevolve> {
-        let (start, end) = self.sketch.centreline_axis()?;
-        let profile = self.sketch_planar_profile_payload()?;
-        Some(StagedRevolve {
-            frame: self.sketch_support.frame(),
-            profile,
-            axis: PlanarAxis2::new(
-                ProtocolPoint2::new(start.u, start.v),
-                ProtocolPoint2::new(end.u, end.v),
-            ),
-        })
-    }
-
     /// The mirror plane chosen in the Browser or viewport: the selected
     /// construction plane when there is one, the selected planar face if one
     /// is picked, and the selected origin plane otherwise.
@@ -14394,25 +14402,6 @@ impl KernelLabApp {
 
     fn stage_preset_feature(&mut self, preset: SolidFeaturePreset) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
-            return;
-        }
-        if preset == SolidFeaturePreset::Revolve {
-            // A sketched region turning about its own centreline is the real
-            // command; the fixed tube remains only for an empty document.
-            self.staged_revolve = self.staged_sketch_revolve();
-            self.document_status = Some(if self.staged_revolve.is_some() {
-                "Revolve staged from the active sketch profile and centreline".to_owned()
-            } else {
-                "Revolve staged · draw a closed profile and one centreline to revolve your own"
-                    .to_owned()
-            });
-            self.pending_operation = Some(PendingOperation::PresetFeature {
-                preset,
-                base_snapshot: SnapshotId::ZERO,
-                body: None,
-                target_face: None,
-                frame: None,
-            });
             return;
         }
         let Some(index) = self.active_body_index() else {
@@ -14603,9 +14592,7 @@ impl KernelLabApp {
         target_face: Option<EntityRef>,
         frame: Option<PlanarFrame3>,
     ) {
-        let input = if preset == SolidFeaturePreset::Revolve {
-            NativeKernel::empty()
-        } else {
+        let input = {
             let Some(body) = body else {
                 return;
             };
@@ -14638,47 +14625,6 @@ impl KernelLabApp {
             }
         }
         let command = match preset {
-            // The preset is still a fixed tube, but it now travels the
-            // general revolve: a section rectangle beside an axis in its own
-            // frame, exactly as a sketched profile will once region-and-axis
-            // staging lands. `MakeRevolvedAnnulus` has no consumer left in the
-            // product.
-            SolidFeaturePreset::Revolve => {
-                let staged = self.staged_revolve.clone();
-                staged.map_or_else(
-                    // No sketch to turn: the preset still builds the tube it
-                    // always did, so an empty document has something to show.
-                    || KernelCommand::RevolvePlanarProfile {
-                        frame: PlanarFrame3::new(
-                            Point3::new(0.0, 0.0, 0.0),
-                            Vector3::new(1.0, 0.0, 0.0),
-                            Vector3::new(0.0, 0.0, 1.0),
-                        ),
-                        profile: PlanarProfile2 {
-                            regions: vec![PlanarRegion2 {
-                                outer: PlanarLoop2::from_polygon(&[
-                                    ProtocolPoint2::new(1.0, 0.0),
-                                    ProtocolPoint2::new(2.0, 0.0),
-                                    ProtocolPoint2::new(2.0, 3.0),
-                                    ProtocolPoint2::new(1.0, 3.0),
-                                ]),
-                                holes: Vec::new(),
-                            }],
-                        },
-                        axis: PlanarAxis2::new(
-                            ProtocolPoint2::new(0.0, 0.0),
-                            ProtocolPoint2::new(0.0, 1.0),
-                        ),
-                        angle: RevolveAngle::FullTurn,
-                    },
-                    |staged| KernelCommand::RevolvePlanarProfile {
-                        frame: staged.frame,
-                        profile: staged.profile,
-                        axis: staged.axis,
-                        angle: RevolveAngle::FullTurn,
-                    },
-                )
-            }
             SolidFeaturePreset::Hole => KernelCommand::DrillHole {
                 target_face: target_face.expect("staged hole face"),
                 frame: frame.expect("staged hole frame"),
@@ -14830,15 +14776,12 @@ impl KernelLabApp {
                 return;
             }
         };
-        // The captured region and axis have been spent.
-        self.staged_revolve = None;
         let association = SnapshotAssociation::new(
             outcome.report.input_snapshot,
             outcome.report.output_snapshot,
             outcome.report.semantic_digest,
         );
         let kind = match preset {
-            SolidFeaturePreset::Revolve => FeatureKind::BaseBody,
             SolidFeaturePreset::Hole => FeatureKind::Cut,
             SolidFeaturePreset::Rib => FeatureKind::Add,
             SolidFeaturePreset::HolePattern | SolidFeaturePreset::Shell => FeatureKind::Cut,
@@ -14899,7 +14842,7 @@ impl KernelLabApp {
                 .with_output(OutputDraft::ModifyBody(body));
         } else {
             draft = draft.with_output(OutputDraft::CreateBody {
-                label: "Revolved body".to_owned(),
+                label: format!("Body {}", self.next_body_ordinal),
             });
         }
         let appended = match next_document.append_feature(draft) {
@@ -14947,7 +14890,6 @@ impl KernelLabApp {
         self.model_body_kind = match preset {
             SolidFeaturePreset::Hole => ModelBodyKind::CutPocket,
             SolidFeaturePreset::Rib => ModelBodyKind::AddedBoss,
-            SolidFeaturePreset::Revolve => ModelBodyKind::SketchExtrusion,
             _ => ModelBodyKind::Boolean,
         };
         // History replay restores immutable snapshots from this archive. Edge
@@ -16994,6 +16936,8 @@ impl KernelLabApp {
                 TimelineContextCommand::EditPlane
             } else if node.kind == FeatureKind::Loft {
                 TimelineContextCommand::EditLoft
+            } else if node.kind == FeatureKind::Revolve {
+                TimelineContextCommand::EditRevolve
             } else {
                 TimelineContextCommand::Edit
             });
@@ -17026,6 +16970,9 @@ impl KernelLabApp {
             }
             TimelineContextCommand::EditLoft => {
                 self.begin_loft_edit(feature);
+            }
+            TimelineContextCommand::EditRevolve => {
+                self.begin_revolve_edit(feature);
             }
             TimelineContextCommand::Rename => self.begin_feature_rename(feature),
             TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
@@ -17216,6 +17163,40 @@ impl KernelLabApp {
         self.timeline_context_menu = Some(menu);
     }
 
+    /// The solid a staged loft or revolve would build, with the body an add
+    /// or a cut draws it in place of, for the viewport to show.
+    ///
+    /// It takes the two editors rather than the app so the viewport can hold
+    /// the answer while it borrows the rest of the app mutably.
+    fn staged_solid_preview<'a>(
+        staged_loft: &'a Option<loft::StagedLoft>,
+        staged_revolve: &'a Option<revolve::StagedRevolve>,
+    ) -> Option<(
+        Option<BodyId>,
+        &'a OperationReport,
+        &'a artificer_kernel::DebugScene,
+    )> {
+        if let Some(staged) = staged_loft.as_ref() {
+            let preview = staged.preview.as_ref()?;
+            return Some((
+                staged
+                    .target
+                    .filter(|_| staged.operation != LoftOperation::New),
+                &preview.report,
+                &preview.scene,
+            ));
+        }
+        let staged = staged_revolve.as_ref()?;
+        let preview = staged.preview.as_ref()?;
+        Some((
+            staged
+                .target
+                .filter(|_| staged.operation != artificer_protocol::SolidOperation::New),
+            &preview.report,
+            &preview.scene,
+        ))
+    }
+
     /// Whether this feature has a 3D editor to reopen.
     #[must_use]
     pub fn feature_has_an_editor(&self, feature: FeatureId) -> bool {
@@ -17229,6 +17210,7 @@ impl KernelLabApp {
                     ReplayAction::SketchRegionExtrusion(_)
                         | ReplayAction::DatumPlane(_)
                         | ReplayAction::SketchLoft(_)
+                        | ReplayAction::SketchRevolve(_)
                 ) && !node.state.read_only
             })
     }
@@ -20181,12 +20163,28 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(
+                        self.pending_operation,
+                        Some(PendingOperation::StageRevolve { .. })
+                    )
+                {
+                    card(ui, "revolve", "REVOLVE", &mut |ui| {
+                        self.revolve_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
                     && !matches!(
                         self.pending_operation,
-                        Some(PendingOperation::StagePlane { .. } | PendingOperation::StageLoft { .. })
+                        Some(
+                            PendingOperation::StagePlane { .. }
+                                | PendingOperation::StageLoft { .. }
+                                | PendingOperation::StageRevolve { .. }
+                        )
                     )
                 {
                     card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
@@ -22046,6 +22044,8 @@ impl KernelLabApp {
         // While a loft is staged, its sections are what is picked.
         let selected_sketch_regions = if self.loft_pick_active() {
             self.loft_region_selections()
+        } else if self.revolve_pick_active() {
+            self.revolve_region_selections()
         } else {
             self.selected_sketch_region_selections()
         };
@@ -22079,15 +22079,8 @@ impl KernelLabApp {
                 // A staged loft is drawn as what confirming would build: in
                 // place of the body an add or a cut changes, or beside the
                 // bodies as a new one.
-                let loft_preview = self.staged_loft.as_ref().and_then(|staged| {
-                    let preview = staged.preview.as_ref()?;
-                    Some((
-                        staged
-                            .target
-                            .filter(|_| staged.operation != LoftOperation::New),
-                        preview,
-                    ))
-                });
+                let loft_preview =
+                    Self::staged_solid_preview(&self.staged_loft, &self.staged_revolve);
                 let mut body_instances = self
                     .bodies
                     .iter()
@@ -22095,14 +22088,14 @@ impl KernelLabApp {
                     .filter_map(|body| {
                         let source_bounds = body.body.report.bounds?;
                         let body_key = viewport::BodyInstanceKey::new(body.id.get());
-                        if let Some((Some(target), preview)) = loft_preview
+                        if let Some((Some(target), report, scene)) = loft_preview
                             && target == body.id
                         {
-                            let bounds = preview.report.bounds.unwrap_or(source_bounds);
+                            let bounds = report.bounds.unwrap_or(source_bounds);
                             return Some(
                                 viewport::DocumentBodyInstance::new(
                                     body_key,
-                                    &preview.scene,
+                                    scene,
                                     Some(bounds),
                                     bounds_center(source_bounds),
                                 )
@@ -22173,13 +22166,13 @@ impl KernelLabApp {
                         )
                     })
                     .collect::<Vec<_>>();
-                if let Some((None, preview)) = loft_preview
-                    && let Some(bounds) = preview.report.bounds
+                if let Some((None, report, scene)) = loft_preview
+                    && let Some(bounds) = report.bounds
                 {
                     body_instances.push(
                         viewport::DocumentBodyInstance::new(
                             viewport::BodyInstanceKey::new(loft::LOFT_PREVIEW_BODY_KEY),
-                            &preview.scene,
+                            scene,
                             Some(bounds),
                             bounds_center(bounds),
                         )
@@ -22337,6 +22330,13 @@ impl KernelLabApp {
                         if let Some(region) = output.selected_sketch_region {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.pick_loft_region(region.sketch_index, region.anchor, additive);
+                        }
+                    } else if self.revolve_pick_active() {
+                        // The revolve editor owns clicks on sketch regions:
+                        // each one is its profile.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_revolve_region(region.sketch_index, region.anchor, additive);
                         }
                     } else if self.extrusion_face_pick_armed() {
                         // A side waiting for its face owns the next click on
@@ -27656,6 +27656,32 @@ mod extrusion_workbench_tests {
 
     use super::*;
 
+    /// A tube about the world Z axis — radius 1 to 2 and 3 tall — revolved
+    /// from a rectangle on the XZ plane about that sketch's vertical axis:
+    /// the second body several tests need, made the way a person makes one
+    /// (ADR 0055).
+    fn revolve_a_tube(app: &mut KernelLabApp) {
+        app.open_origin_plane_sketch(SketchPlane::XZ);
+        let rectangle = app
+            .sketch
+            .stage_geometry(SketchGeometry::Rectangle {
+                first: SketchPoint::new(1.0, 0.0),
+                opposite: SketchPoint::new(2.0, 3.0),
+            })
+            .expect("the section stages");
+        app.commit_sketch_stroke(rectangle);
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        app.set_revolve_axis(artificer_model::RevolveAxis::SketchAxis {
+            axis: artificer_model::SketchAxisDirection::V,
+        });
+        assert!(
+            app.staged_revolve_has_preview(),
+            "{:?}",
+            app.staged_revolve_issue()
+        );
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+    }
+
     fn point(u: f64, v: f64) -> SketchPoint {
         SketchPoint::new(u, v)
     }
@@ -31353,13 +31379,6 @@ mod extrusion_workbench_tests {
 
     #[test]
     fn solid_feature_presets_stage_before_committing_to_history() {
-        let mut revolve = KernelLabApp::default();
-        let bodies_before = revolve.body_count();
-        revolve.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert_eq!(revolve.body_count(), bodies_before);
-        assert!(revolve.confirm_pending_operation());
-        assert_eq!(revolve.body_count(), bodies_before + 1);
-
         let mut mirror = KernelLabApp::default();
         // Mirror follows the Browser's plane selection; pick YZ explicitly so
         // the flip lands on the X axis.
@@ -31392,8 +31411,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn an_interference_study_measures_every_visible_pair_without_touching_the_document() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2);
         let before = app.document.features().len();
         let digests = app
@@ -31437,8 +31455,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn a_study_leaves_a_heat_map_bound_to_the_facets_it_was_measured_on() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2);
 
         app.run_interference_study();
@@ -31497,8 +31514,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn a_fit_judges_the_study_that_is_already_measured_and_repaints_it() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         app.run_interference_study();
 
         // A study with no fit measures and does not judge, and its heat map
@@ -31590,8 +31606,7 @@ mod extrusion_workbench_tests {
             app.document_status
         );
 
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         app.run_interference_study();
         let report = app.interference_report().expect("a study");
         assert_eq!(
@@ -31607,8 +31622,7 @@ mod extrusion_workbench_tests {
     fn the_boolean_card_names_both_operands_and_keeps_tools_on_request() {
         let mut app = KernelLabApp::default();
         // Two bodies: the bootstrap cuboid and a second one from a revolve.
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2, "two bodies to combine");
         let target = app.active_body_id().expect("an active body");
         let other = app
@@ -32071,7 +32085,6 @@ mod extrusion_workbench_tests {
             SolidFeaturePreset::Shell,
             SolidFeaturePreset::Mirror,
             SolidFeaturePreset::LinearPattern,
-            SolidFeaturePreset::Revolve,
         ] {
             let mut app = KernelLabApp::default();
 
@@ -34448,11 +34461,21 @@ mod circle_extrude_repro {
         app.commit_sketch_stroke(axis);
         assert!(app.sketch.centreline_axis().is_some());
 
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        // Revolve finishes the sketch, takes its only region and starts on
+        // its centreline (ADR 0055).
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
         assert!(
-            app.staged_revolve.is_some(),
-            "the sketch profile and centreline should be captured: {:?}",
-            app.document_status
+            matches!(
+                app.staged_revolve_axis(),
+                Some(artificer_model::RevolveAxis::SketchLine { .. })
+            ),
+            "the centreline is the axis: {:?}",
+            app.staged_revolve_axis()
+        );
+        assert!(
+            app.staged_revolve_has_preview(),
+            "{:?}",
+            app.staged_revolve_issue()
         );
         assert!(app.confirm_pending_operation());
 
@@ -34466,22 +34489,23 @@ mod circle_extrude_repro {
             "revolved volume {volume} should equal {expected}"
         );
         assert!(app.staged_revolve.is_none(), "the staging is spent");
+        let revolve = app
+            .document
+            .features()
+            .iter()
+            .find(|feature| feature.kind == FeatureKind::Revolve)
+            .expect("a revolve feature in the history");
+        assert!(matches!(revolve.action, ReplayAction::SketchRevolve(_)));
     }
 
+    /// With nothing sketched there is nothing to revolve: the command says
+    /// so rather than building a stand-in (ADR 0055).
     #[test]
-    fn revolve_without_a_centreline_still_builds_its_preset_tube() {
-        let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.staged_revolve.is_none());
-        assert!(app.confirm_pending_operation());
-        let volume = app
-            .displayed_measures()
-            .expect("the preset tube should publish measures")
-            .volume;
-        let expected = std::f64::consts::PI * (4.0 - 1.0) * 3.0;
+    fn revolve_needs_a_sketch_to_turn() {
+        let app = KernelLabApp::default();
         assert!(
-            ((volume - expected) / expected).abs() < 1.0e-9,
-            "preset revolve volume {volume} should equal {expected}"
+            !app.command_availability(crate::commands::ModelCommand::Revolve)
+                .is_enabled()
         );
     }
 

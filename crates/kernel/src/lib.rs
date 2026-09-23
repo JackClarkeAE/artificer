@@ -64,8 +64,8 @@ use artificer_protocol::{
     KernelError, KernelErrorCode, KernelStage, LoftOperation, NumericInterval, OperationReport,
     OperationRole, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
     Point2 as ProtocolPoint2, Point3 as ProtocolPoint3, PrecisionPolicy, QuantityKind,
-    SemanticDigest, SnapshotId, TopologyCounts as ProtocolTopologyCounts, ValidationProfile,
-    ValidationReport as ProtocolValidationReport, Vector3 as ProtocolVector3,
+    SemanticDigest, SnapshotId, SolidOperation, TopologyCounts as ProtocolTopologyCounts,
+    ValidationProfile, ValidationReport as ProtocolValidationReport, Vector3 as ProtocolVector3,
 };
 use sha2::{Digest, Sha256};
 
@@ -938,13 +938,33 @@ impl NativeKernel {
                 profile,
                 axis,
                 angle,
+                operation,
             } => {
-                validate_extrusion_source(input)?;
+                if *operation == SolidOperation::New {
+                    validate_extrusion_source(input)?;
+                }
                 let revolved =
                     revolve::validate_revolve(*frame, profile, *axis, *angle, request.precision)
                         .map_err(|reason| revolve_input_error(input.id, reason))?;
-                rung = "revolve/full-turn";
-                (revolve::build_revolve(&revolved), HistoryMode::Generated)
+                let tool = revolve::build_revolve(&revolved);
+                match operation {
+                    SolidOperation::New => {
+                        rung = "revolve/full-turn";
+                        (tool, HistoryMode::Generated)
+                    }
+                    SolidOperation::Add | SolidOperation::Cut => {
+                        let (topology, answered) = tool_boolean(
+                            input,
+                            tool,
+                            *operation == SolidOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                            &REVOLVE_BOOLEAN,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
+                }
             }
             KernelCommand::TransformSnapshot { transform } => {
                 validate_transform_source(input)?;
@@ -1795,6 +1815,7 @@ impl NativeKernel {
                             profile,
                             axis,
                             angle,
+                            operation: SolidOperation::New,
                         })?;
                         let topology =
                             shell::hollow(&input.topology, &core.topology).ok_or_else(|| {
@@ -1821,6 +1842,7 @@ impl NativeKernel {
                             profile,
                             axis,
                             angle,
+                            operation: SolidOperation::New,
                         })?;
                         let opened = BooleanRequest {
                             protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -4154,6 +4176,23 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
         "loft/boolean-prism",
         "loft/boolean-analytic",
         "loft/faceted",
+    ],
+};
+
+/// A revolve added to or cut from a body (ADR 0055). A revolve whose
+/// faces are all planes and coaxial cylinders is a prism along its axis and
+/// answers exactly; a cone, torus or sphere takes the faceted tier until the
+/// coaxial Boolean of ADR 0026 F4 exists.
+const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "revolve",
+    empty: "REVOLVE_TARGET_EMPTY",
+    declined: "REVOLVE_EXACT_ROUTE_DECLINED",
+    unresolved: "REVOLVE_FACETED_UNRESOLVED",
+    approximation: "REVOLVE_FACETED_APPROXIMATION",
+    rungs: [
+        "revolve/boolean-prism",
+        "revolve/boolean-analytic",
+        "revolve/faceted",
     ],
 };
 

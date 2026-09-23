@@ -431,7 +431,9 @@ pub fn hydrate_model_document(
             ReplayAction::ParameterizedKernel(_) => {
                 unreachable!("parameterized replay actions are resolved before kernel dispatch")
             }
-            ReplayAction::SketchRegionExtrusion(_) | ReplayAction::SketchLoft(_) => {
+            ReplayAction::SketchRegionExtrusion(_)
+            | ReplayAction::SketchLoft(_)
+            | ReplayAction::SketchRevolve(_) => {
                 unreachable!("sketch-region replay actions are resolved before kernel dispatch")
             }
             ReplayAction::Boolean(recipe) => {

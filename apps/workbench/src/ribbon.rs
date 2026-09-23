@@ -801,7 +801,26 @@ impl KernelLabApp {
                 CommandAvailability::Enabled
             }
             ModelCommand::Extrude => self.extrude_availability(),
-            ModelCommand::Revolve => self.preset_feature_availability(SolidFeaturePreset::Revolve),
+            ModelCommand::Revolve => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                // A sketch being drawn is finished by the press, and one
+                // already finished is picked from in the model view.
+                let drawing = self.workbench_mode == WorkbenchMode::Sketch
+                    && !self.sketch.authoring().operations().is_empty();
+                if !drawing
+                    && !self
+                        .sketches
+                        .iter()
+                        .any(|sketch| sketch.finished && sketch.id.is_some())
+                {
+                    return CommandAvailability::disabled(
+                        "A revolve turns a sketch profile about an axis. Sketch the profile first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::Loft => {
                 if let Some(blocked) = free(self) {
                     return blocked;
@@ -985,7 +1004,6 @@ impl KernelLabApp {
             );
         }
         let ready = match preset {
-            SolidFeaturePreset::Revolve => true,
             // Converted (ADR 0041): pressing one with nothing picked enters it
             // and asks for a face, so availability asks only whether this
             // workspace has a body to put a face feature on.
@@ -1163,7 +1181,9 @@ impl KernelLabApp {
                 // that will commit it.
                 let _ = staged;
             }
-            ModelCommand::Revolve => self.stage_preset_feature(SolidFeaturePreset::Revolve),
+            ModelCommand::Revolve => {
+                self.stage_revolve();
+            }
             ModelCommand::Loft => {
                 self.stage_loft();
             }

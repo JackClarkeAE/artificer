@@ -12,7 +12,7 @@ use artificer_protocol::{
     ArcDirection, CURRENT_PROTOCOL_VERSION, EdgeFinishKind, EntityRef, ExecuteRequest,
     KernelCommand, KernelError, PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2,
     PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId, RevolveAngle,
-    ValidationProfile, Vector3,
+    SolidOperation, Tier, ValidationProfile, Vector3,
 };
 
 const TAU: f64 = std::f64::consts::TAU;
@@ -51,6 +51,7 @@ fn revolve_about(
             profile,
             axis,
             angle: RevolveAngle::FullTurn,
+            operation: Default::default(),
         },
     };
     NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
@@ -366,5 +367,151 @@ fn the_axis_direction_does_not_change_the_result() {
     assert!(
         (forward.measures().volume - reversed.measures().volume).abs() < 1.0e-12,
         "axis direction must not change the swept volume"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Adding and cutting (ADR 0055): a revolve meets the body it is given through
+// the same Boolean ladder a loft does.
+// ---------------------------------------------------------------------------
+
+/// A 40 × 40 block whose top face is the plane z = 0.
+fn block() -> Snapshot {
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("block"),
+        expected_snapshot: NativeKernel::empty().id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::MakeCuboid {
+            origin: Point3::new(-20.0, -20.0, -20.0),
+            size_x: 40.0,
+            size_y: 40.0,
+            size_z: 20.0,
+        },
+    };
+    NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+        .expect("block")
+        .snapshot
+}
+
+fn revolve_into(
+    body: &Snapshot,
+    profile: PlanarProfile2,
+    operation: SolidOperation,
+) -> Result<artificer_kernel::ExecutionOutcome, KernelError> {
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("revolve-into"),
+        expected_snapshot: body.id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::RevolvePlanarProfile {
+            frame: frame(),
+            profile,
+            axis: axis(),
+            angle: RevolveAngle::FullTurn,
+            operation,
+        },
+    };
+    NativeKernel::execute(body, &request, &CancellationToken::new())
+}
+
+fn half_disc(radius: f64) -> PlanarProfile2 {
+    PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: PlanarLoop2 {
+                curves: vec![
+                    PlanarCurve2::CircularArc {
+                        center: Point2::new(0.0, 0.0),
+                        start: Point2::new(0.0, -radius),
+                        end: Point2::new(0.0, radius),
+                        direction: ArcDirection::CounterClockwise,
+                    },
+                    PlanarCurve2::Line {
+                        start: Point2::new(0.0, radius),
+                        end: Point2::new(0.0, -radius),
+                    },
+                ],
+            },
+            holes: vec![],
+        }],
+    }
+}
+
+#[test]
+fn a_revolved_boss_adds_to_a_block_exactly() {
+    // A cylinder of radius 5 standing from 5 below the top face to 10 above.
+    let outcome = revolve_into(
+        &block(),
+        polygon(&[(0.0, -5.0), (5.0, -5.0), (5.0, 10.0), (0.0, 10.0)]),
+        SolidOperation::Add,
+    )
+    .expect("the boss adds");
+    let rung = outcome.report.rung.clone().unwrap_or_default();
+    assert!(
+        rung == "revolve/boolean-prism" || rung == "revolve/boolean-analytic",
+        "planes and a cylinder stay exact: {rung}"
+    );
+    assert_eq!(outcome.report.tier(), Tier::Exact);
+    assert_volume(
+        &outcome.snapshot,
+        32_000.0 + PI * 25.0 * 10.0,
+        "block and boss",
+    );
+}
+
+#[test]
+fn a_revolved_bore_cuts_a_block_exactly() {
+    let outcome = revolve_into(
+        &block(),
+        polygon(&[(0.0, -10.0), (5.0, -10.0), (5.0, 5.0), (0.0, 5.0)]),
+        SolidOperation::Cut,
+    )
+    .expect("the bore cuts");
+    assert_eq!(outcome.report.tier(), Tier::Exact);
+    assert_volume(
+        &outcome.snapshot,
+        32_000.0 - PI * 25.0 * 10.0,
+        "block less bore",
+    );
+}
+
+#[test]
+fn a_revolved_sphere_cuts_a_block_on_the_faceted_tier_and_says_so() {
+    // A sphere of radius 5 centred on the top face takes a hemisphere away.
+    let outcome =
+        revolve_into(&block(), half_disc(5.0), SolidOperation::Cut).expect("the sphere cuts");
+    assert_eq!(outcome.report.rung.as_deref(), Some("revolve/faceted"));
+    let codes = outcome
+        .report
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        codes.contains(&"REVOLVE_FACETED_APPROXIMATION".to_owned()),
+        "{codes:?}"
+    );
+    let expected = 32_000.0 - 2.0 / 3.0 * PI * 125.0;
+    let volume = outcome.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-2,
+        "{volume} against {expected}"
+    );
+}
+
+#[test]
+fn a_revolve_that_adds_needs_a_body_to_add_to() {
+    let error = revolve_into(
+        &NativeKernel::empty(),
+        polygon(&[(0.0, 0.0), (5.0, 0.0), (5.0, 5.0), (0.0, 5.0)]),
+        SolidOperation::Add,
+    )
+    .expect_err("nothing to add to");
+    assert!(
+        error
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.as_str() == "REVOLVE_TARGET_EMPTY"),
+        "{error:?}"
     );
 }

@@ -1500,6 +1500,11 @@ pub enum KernelCommand {
         profile: PlanarProfile2,
         axis: PlanarAxis2,
         angle: RevolveAngle,
+        /// A body of its own, or joined to or taken from the input body
+        /// (ADR 0055). A command written before revolves could add or cut
+        /// makes a body of its own.
+        #[serde(default)]
+        operation: SolidOperation,
     },
     /// Adds an outward linear-profile boss or removes a blind/through pocket
     /// from one supported axis-aligned planar boundary patch.
@@ -1627,17 +1632,24 @@ pub struct LoftSection {
     pub profile: PlanarProfile2,
 }
 
-/// What a loft does with the body it is given.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// What a solid built from a profile — a loft, a revolve — does with the
+/// body it is given.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
-pub enum LoftOperation {
+pub enum SolidOperation {
     /// A body of its own, from the empty snapshot.
+    #[default]
     New,
     /// Joined to the body.
     Add,
     /// Taken away from the body.
     Cut,
 }
+
+/// The loft's name for [`SolidOperation`], which it had first.
+pub type LoftOperation = SolidOperation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
