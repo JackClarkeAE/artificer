@@ -36,7 +36,7 @@ The current bounded targets are cuboid X/Y/Z size, standalone planar-profile ext
 
 The kernel lab loads a document by replaying it into a private `HydratedDocument` before changing the current workspace. The stage owns regenerated immutable snapshots, operation reports, body-branch heads, suppression results, and history-cursor evidence. It handles independent roots and chained features, rebinds targeted commands only from operation reports regenerated during that load, and verifies every clean feature against its persisted input snapshot, output snapshot, and semantic digest.
 
-Any parse, kernel, persistent-reference, or provenance error drops the complete stage and leaves the current document and viewport unchanged. Dirty features may regenerate, but their stale association is not accepted as provenance. To preserve forward history, the application privately hydrates retained features through the end and then restores the saved history cursor before publication.
+Any parse, kernel, persistent-reference, or provenance error drops the complete stage and leaves the current document and viewport unchanged. (Amended below: a feature that does not build now opens suppressed.) Dirty features may regenerate, but their stale association is not accepted as provenance. To preserve forward history, the application privately hydrates retained features through the end and then restores the saved history cursor before publication.
 
 The resulting runtime projects exact supported sketches back into the Browser and viewport. Origin and planar-face sketches retain their authored frame; face support is resolved against regenerated operation history. An unconsumed closed sketch can remain visible after restart and can be extruded separately.
 
@@ -71,3 +71,37 @@ It does not yet provide:
 - successful replay outside the kernel's declared command and persistent-reference domains.
 
 Constrained sketch solving, arbitrary parameter editing, feature reorder/deletion, reference repair, and configuration management remain required before M5 is complete.
+
+## Amendment: a feature that does not build opens suppressed (2026-09-23)
+
+A file could be saved that no build would open. Committing a variable or
+a sketch edit and then failing to rebuild what follows rolls back the rebuild
+but keeps the change, as it should, so the features after it wait with their
+last results on screen. Saved like that, the file held a recipe that no longer
+built, and opening it refused the whole file over that one feature. A kernel
+that tightens what it accepts does the same thing to an older file.
+
+Opening now treats a feature whose recipe does not build as a feature to
+suppress, not a file to refuse. This covers a kernel refusal, a sketch region
+that has gone, a parameter binding that no longer resolves, and a persistent
+target that is missing or ambiguous. The loader suppresses that feature,
+replays again with what depends on it skipped, and repeats until the replay
+completes. The workspace then opens with those features suppressed, says
+which and why, and counts as changed, because it is no longer what is on
+disk. The suppression is the undo baseline, since undoing it would only bring
+back what cannot be built.
+
+Everything else still refuses the file and leaves the current workspace
+untouched:
+
+- a file that does not parse;
+- parameters that do not evaluate;
+- a structural inconsistency in the branch graph;
+- a clean feature whose regenerated result does not match its recorded
+  provenance.
+
+Changing saved geometry without updating provenance therefore still rejects.
+
+Saving never refuses the work. When features are waiting on a rebuild that
+failed, the save replays the document privately, as opening does, and its
+report names the features that would open suppressed.

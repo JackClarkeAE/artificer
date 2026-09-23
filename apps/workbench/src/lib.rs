@@ -2657,6 +2657,9 @@ pub struct KernelLabApp {
     /// The document's revision the last time it was saved or loaded. The
     /// document is dirty when its revision has moved on from this.
     saved_revision: u64,
+    /// Features the last open had to suppress because they could not be
+    /// rebuilt.
+    suppressed_on_open: Vec<FeatureId>,
     /// Whether Open, Save as and the exports use the desktop's own file
     /// dialog. Off, they fall back to typed paths, which is also what a
     /// headless test drives.
@@ -2960,6 +2963,7 @@ impl Default for KernelLabApp {
             document_properties_open: false,
             pending_export: None,
             saved_revision: 0,
+            suppressed_on_open: Vec::new(),
             native_file_dialogs: true,
             last_dialog_directory: None,
             document_path_prompt: None,
@@ -3451,6 +3455,13 @@ impl KernelLabApp {
         self.document.revision() != self.saved_revision
     }
 
+    /// The features the last open had to suppress because they could not
+    /// be rebuilt.
+    #[must_use]
+    pub fn features_suppressed_on_open(&self) -> &[FeatureId] {
+        &self.suppressed_on_open
+    }
+
     /// Records that the document as it stands is what is on disk.
     pub const fn mark_document_saved(&mut self) {
         self.saved_revision = self.document.revision();
@@ -3692,7 +3703,13 @@ impl KernelLabApp {
     /// after the whole load rather than before it.
     pub fn load_workspace_json(&mut self, json: &str) -> Result<(), String> {
         self.load_workspace_json_unmarked(json)?;
-        self.mark_document_saved();
+        if self.suppressed_on_open.is_empty() {
+            self.mark_document_saved();
+        } else {
+            // Features were suppressed to open it, so what is open is no
+            // longer what is on disk.
+            self.saved_revision = u64::MAX;
+        }
         Ok(())
     }
 
@@ -3765,6 +3782,63 @@ impl KernelLabApp {
         self.load_native_document_json(&json)
     }
 
+    /// Replays a document privately, as opening it does. A feature whose
+    /// recipe no longer builds — a variable changed under it before the
+    /// save, a kernel that now refuses it — is suppressed in `document`, and
+    /// what depends on it with it, rather than refusing the whole document;
+    /// each is returned with why. A document that is malformed, or whose
+    /// recorded results do not match what it rebuilds, still refuses.
+    fn hydrate_suppressing_unbuildable(
+        document: &mut ModelDocument,
+    ) -> Result<(HydratedDocument, Vec<(FeatureId, String)>), String> {
+        let mut unbuildable = Vec::<(FeatureId, String)>::new();
+        loop {
+            let mut replay_document = document.clone();
+            if replay_document.history_position() != replay_document.features().len() {
+                replay_document
+                    .set_history_position(replay_document.features().len())
+                    .map_err(|error| {
+                        format!("history could not be prepared for replay: {error}")
+                    })?;
+                replay_document.clear_undo_history();
+            }
+            match hydrate_model_document(replay_document, HydrationOptions::default()) {
+                Ok(hydrated) => return Ok((hydrated, unbuildable)),
+                Err(error) => {
+                    let Some(feature) = error.unbuildable_feature() else {
+                        return Err(error.to_string());
+                    };
+                    if !matches!(document.set_feature_suppressed(feature, true), Ok(true)) {
+                        return Err(error.to_string());
+                    }
+                    unbuildable.push((feature, error.to_string()));
+                }
+            }
+        }
+    }
+
+    /// The features, by name, that would open suppressed if the document
+    /// were saved now: those a change upstream left waiting on a rebuild
+    /// that did not succeed. Only a document with such a feature is replayed
+    /// to find out.
+    #[must_use]
+    pub fn features_awaiting_rebuild(&self) -> Vec<String> {
+        if !self.document.features().iter().any(|feature| {
+            !feature.state.suppressed && feature.state.rebuild == RebuildState::Dirty
+        }) {
+            return Vec::new();
+        }
+        let mut probe = self.document.clone();
+        match Self::hydrate_suppressing_unbuildable(&mut probe) {
+            Ok((_, unbuildable)) => unbuildable
+                .iter()
+                .filter_map(|(feature, _)| self.document.feature(*feature))
+                .map(|feature| feature.label.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Atomically replaces the workspace from a native document archive.
     /// Kernel snapshots and reports are regenerated in a private stage; any
     /// parse, replay, persistent-reference, or provenance error leaves the
@@ -3773,21 +3847,31 @@ impl KernelLabApp {
         if self.pending_operation.is_some() {
             return Err("confirm or cancel the pending operation before loading a document".into());
         }
-        let original = serde_json::from_str::<ModelDocument>(json)
+        let mut original = serde_json::from_str::<ModelDocument>(json)
             .map_err(|error| format!("native document is invalid: {error}"))?;
         let saved_history_position = original.history_position();
-        let mut replay_document = original.clone();
-        if replay_document.history_position() != replay_document.features().len() {
-            replay_document
-                .set_history_position(replay_document.features().len())
-                .map_err(|error| format!("history could not be prepared for replay: {error}"))?;
-            replay_document.clear_undo_history();
+        let (hydrated, unbuildable) = Self::hydrate_suppressing_unbuildable(&mut original)?;
+        if !unbuildable.is_empty() {
+            // Undoing the suppression would only bring back what cannot be
+            // built; the opened document starts from here.
+            original.clear_undo_history();
         }
-        let hydrated = hydrate_model_document(replay_document, HydrationOptions::default())
-            .map_err(|error| error.to_string())?;
         let mut runtime = Self::project_hydrated_runtime(hydrated)?;
         runtime.document = original;
         self.publish_hydrated_runtime(runtime);
+        self.suppressed_on_open = unbuildable.iter().map(|(feature, _)| *feature).collect();
+        if !unbuildable.is_empty()
+            && let Some(first) = self
+                .document
+                .active_features()
+                .iter()
+                .find(|feature| feature.state.rebuild == RebuildState::Dirty)
+                .map(|feature| feature.id)
+        {
+            // The suppression marked what follows it for rebuilding; the
+            // runtime just built is that rebuild, so record it as one.
+            self.rebuild_document_from(first);
+        }
         if saved_history_position != self.document.features().len() {
             self.restore_runtime_from_document();
             self.history_scrub_position = saved_history_position;
@@ -3795,6 +3879,33 @@ impl KernelLabApp {
                 "Loaded native document at history position {saved_history_position} of {}",
                 self.document.features().len()
             ));
+        }
+        if !unbuildable.is_empty() {
+            let described = unbuildable
+                .iter()
+                .map(|(feature, reason)| {
+                    let label = self
+                        .document
+                        .feature(*feature)
+                        .map_or_else(|| format!("Feature {feature}"), |node| node.label.clone());
+                    (label, reason.as_str())
+                })
+                .collect::<Vec<_>>();
+            self.document_status = Some(match described.as_slice() {
+                [(label, reason)] => format!(
+                    "Opened with {label} suppressed: it could not be rebuilt ({reason}). \
+                     Fix it and unsuppress it from the history."
+                ),
+                many => format!(
+                    "Opened with {} features suppressed because they could not be rebuilt: {}. \
+                     Fix them and unsuppress them from the history.",
+                    many.len(),
+                    many.iter()
+                        .map(|(label, reason)| format!("{label} ({reason})"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            });
         }
         Ok(())
     }
@@ -16031,14 +16142,32 @@ impl KernelLabApp {
     }
 
     /// Saves to `path`, adopts it as the document's own, and reports.
+    ///
+    /// A save never refuses: the work is kept whatever state it is in. When
+    /// a feature is still waiting on a rebuild that failed, the report says
+    /// which, because the model on screen is then not what the file builds,
+    /// and the file will open with that feature suppressed.
     pub fn save_document_to(&mut self, path: &Path) -> bool {
         match self.save_workspace_to_path(path) {
             Ok(()) => {
                 self.set_document_path(path.to_path_buf());
                 self.remember_dialog_directory(path);
                 self.mark_document_saved();
-                self.document_status =
-                    Some(format!("Saved Artificer workspace to {}", path.display()));
+                let unbuilt = self.features_awaiting_rebuild();
+                self.document_status = Some(match unbuilt.as_slice() {
+                    [] => format!("Saved Artificer workspace to {}", path.display()),
+                    [label] => format!(
+                        "Saved to {}, but {label} did not rebuild after the last change: \
+                         the file will open with it suppressed until it is fixed",
+                        path.display()
+                    ),
+                    labels => format!(
+                        "Saved to {}, but {} did not rebuild after the last change: \
+                         the file will open with them suppressed until they are fixed",
+                        path.display(),
+                        labels.join(", ")
+                    ),
+                });
                 true
             }
             Err(error) => {
@@ -28354,6 +28483,66 @@ mod extrusion_workbench_tests {
                 .as_deref()
                 .is_some_and(|status| status.contains("needs repair"))
         );
+
+        // Saved like this, the file holds an extrusion whose region has
+        // gone. The save says so; it does not refuse the work.
+        let directory = std::env::temp_dir().join(format!(
+            "artificer-unbuilt-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("unbuilt.artificer.json");
+        let extrusion_label = app.document.feature(extrusion).unwrap().label.clone();
+        assert_eq!(
+            app.features_awaiting_rebuild(),
+            std::slice::from_ref(&extrusion_label)
+        );
+        assert!(app.save_document_to(&path));
+        let status = app.document_status.clone().unwrap_or_default();
+        assert!(
+            status.contains(&extrusion_label) && status.contains("did not rebuild"),
+            "the save must name what did not rebuild: {status}"
+        );
+        assert!(!app.is_document_dirty());
+
+        // Opened, that extrusion is suppressed instead of the whole file
+        // refusing, the sketch that was edited is there as edited, and
+        // nothing is left waiting on a rebuild.
+        let mut restored = KernelLabApp::default();
+        restored
+            .load_workspace_from_path(&path)
+            .expect("a file with an unbuildable feature still opens");
+        assert_eq!(restored.features_suppressed_on_open(), [extrusion]);
+        let reopened = restored.document.feature(extrusion).unwrap();
+        assert!(reopened.state.suppressed);
+        assert!(
+            restored
+                .document
+                .features()
+                .iter()
+                .all(|feature| feature.state.rebuild == RebuildState::Clean),
+            "the open rebuilds what the suppression touched"
+        );
+        assert!(restored.features_awaiting_rebuild().is_empty());
+        let status = restored.document_status.clone().unwrap_or_default();
+        assert!(
+            status.contains(&extrusion_label) && status.contains("suppressed"),
+            "the open must say what it suppressed and why: {status}"
+        );
+        assert!(
+            restored.is_document_dirty(),
+            "what is open differs from the file by the suppression"
+        );
+        let edited = restored.document.sketch(sketch).unwrap();
+        assert_eq!(
+            edited.geometry_revision,
+            app.document.sketch(sketch).unwrap().geometry_revision
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

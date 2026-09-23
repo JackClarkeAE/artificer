@@ -225,6 +225,34 @@ impl fmt::Display for DocumentHydrationError {
 
 impl std::error::Error for DocumentHydrationError {}
 
+impl DocumentHydrationError {
+    /// The feature this error is about, when the error is that feature's
+    /// recipe not building — the kernel refused it, its sketch region has
+    /// gone, a binding or a target no longer resolves — rather than the file
+    /// being malformed or its recorded results not matching. A feature that
+    /// does not build can be opened suppressed; anything else refuses the
+    /// file.
+    #[must_use]
+    pub const fn unbuildable_feature(&self) -> Option<FeatureId> {
+        match self {
+            Self::ParameterizedAction { feature, .. }
+            | Self::SketchRegion { feature, .. }
+            | Self::PersistentTargetMissing { feature, .. }
+            | Self::PersistentTargetAmbiguous { feature, .. }
+            | Self::Kernel { feature, .. } => Some(*feature),
+            Self::Deserialize(_)
+            | Self::ParameterEvaluation(_)
+            | Self::KernelActionWithoutBody { .. }
+            | Self::MissingBranchSnapshot { .. }
+            | Self::MixedRootAndExistingBranches { .. }
+            | Self::DivergentBranchInputs { .. }
+            | Self::SnapshotUnavailable { .. }
+            | Self::MissingCleanProvenance { .. }
+            | Self::ProvenanceMismatch { .. } => None,
+        }
+    }
+}
+
 /// Deserializes and reconstructs a persisted native document using the default
 /// root precision policy.
 pub fn hydrate_document_json(json: &str) -> Result<HydratedDocument, DocumentHydrationError> {
