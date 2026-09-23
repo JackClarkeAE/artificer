@@ -285,7 +285,11 @@ fn the_axis_pick_is_armed_from_the_card() {
 
     click_button(&mut harness, "Revolve");
     assert!(!harness.state().revolve_axis_pick_armed());
-    reveal_in_card(&mut harness, Role::Button, "Pick the revolve axis in the view");
+    reveal_in_card(
+        &mut harness,
+        Role::Button,
+        "Pick the revolve axis in the view",
+    );
     click_button(&mut harness, "Pick the revolve axis in the view");
     assert!(harness.state().revolve_axis_pick_armed());
     assert!(
