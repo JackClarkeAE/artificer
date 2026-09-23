@@ -802,6 +802,23 @@ impl KernelLabApp {
             }
             ModelCommand::Extrude => self.extrude_availability(),
             ModelCommand::Revolve => self.preset_feature_availability(SolidFeaturePreset::Revolve),
+            ModelCommand::Loft => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self
+                    .sketches
+                    .iter()
+                    .filter(|sketch| sketch.finished && sketch.id.is_some())
+                    .count()
+                    < 2
+                {
+                    return CommandAvailability::disabled(
+                        "A loft runs through profiles in two sketches on different planes. Sketch both first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::Hole => self.preset_feature_availability(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.preset_feature_availability(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.preset_feature_availability(SolidFeaturePreset::Mirror),
@@ -1147,6 +1164,9 @@ impl KernelLabApp {
                 let _ = staged;
             }
             ModelCommand::Revolve => self.stage_preset_feature(SolidFeaturePreset::Revolve),
+            ModelCommand::Loft => {
+                self.stage_loft();
+            }
             ModelCommand::Hole => self.stage_preset_feature(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.stage_preset_feature(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.stage_preset_feature(SolidFeaturePreset::Mirror),

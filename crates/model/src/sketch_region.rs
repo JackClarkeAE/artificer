@@ -11,7 +11,7 @@ use artificer_protocol::{
     SnapshotId, Vector3,
 };
 use artificer_sketch::{
-    ArrangementLimits, ProfileCompileError, RegionSignature, SketchValidationError,
+    ArrangementLimits, ProfileCompileError, RegionSignature, SketchPoint2, SketchValidationError,
     build_arrangement, compile_selected_profile,
 };
 use serde::{Deserialize, Serialize};
@@ -504,64 +504,8 @@ impl SketchRegionExtrusion {
     ) -> Result<ReplayAction, SketchRegionResolveError> {
         self.validate()
             .map_err(SketchRegionResolveError::InvalidRecipe)?;
-        let sketch = document
-            .sketch(self.sketch)
-            .ok_or(SketchRegionResolveError::UnknownSketch(self.sketch))?;
-        let payload = document
-            .sketch_payload(self.sketch, sketch.geometry_revision)
-            .ok_or(SketchRegionResolveError::MissingSketchPayload {
-                sketch: self.sketch,
-                geometry_revision: sketch.geometry_revision,
-            })?;
-        let authoring =
-            payload
-                .authoring()
-                .ok_or(SketchRegionResolveError::MissingAuthoringDefinition {
-                    sketch: self.sketch,
-                    geometry_revision: sketch.geometry_revision,
-                })?;
-        authoring.validate(precision).map_err(|error| {
-            SketchRegionResolveError::InvalidAuthoringDefinition {
-                sketch: self.sketch,
-                error,
-            }
-        })?;
-        let inputs = authoring.arrangement_inputs().map_err(|error| {
-            SketchRegionResolveError::InvalidAuthoringDefinition {
-                sketch: self.sketch,
-                error,
-            }
-        })?;
-        let arrangement = build_arrangement(&inputs, &precision, ArrangementLimits::default());
-
-        // Do not let `cell()` silently choose the first entry if a corrupt or
-        // future arrangement implementation ever emits duplicate signatures.
-        for signature in &self.regions {
-            match arrangement
-                .cells
-                .iter()
-                .filter(|cell| &cell.signature == signature)
-                .count()
-            {
-                0 => {
-                    return Err(SketchRegionResolveError::MissingRegion {
-                        sketch: self.sketch,
-                        signature: signature.clone(),
-                    });
-                }
-                1 => {}
-                count => {
-                    return Err(SketchRegionResolveError::AmbiguousRegion {
-                        sketch: self.sketch,
-                        signature: signature.clone(),
-                        candidates: count,
-                    });
-                }
-            }
-        }
-
-        let compiled = compile_selected_profile(&arrangement, &self.regions, &precision)
-            .map_err(SketchRegionResolveError::Profile)?;
+        let (profile, drawn_frame) =
+            compile_sketch_regions(document, self.sketch, &self.regions, precision)?;
         // Replay must reconstruct the same solid the feature first built, so
         // the sign is re-expressed here exactly as it was when the command was
         // issued: a reversed frame plus a positive depth.
@@ -571,11 +515,11 @@ impl SketchRegionExtrusion {
         };
         let placed = frame
             .or_else(|| document.sketch_frame(self.sketch))
-            .unwrap_or(payload.frame);
+            .unwrap_or(drawn_frame);
         let (frame, profile) = if extrusion_frame_is_reversed(operation, self.distance) {
-            reversed_extrusion_direction(placed, compiled.profile)
+            reversed_extrusion_direction(placed, profile)
         } else {
-            (placed, compiled.profile)
+            (placed, profile)
         };
         let distance = self.distance.abs();
         // A second side starts the sweep behind the plane: the frame moves
@@ -699,6 +643,104 @@ pub enum SketchRegionResolveError {
     },
     #[error("the selected sketch regions could not compile: {0}")]
     Profile(ProfileCompileError),
+    #[error("invalid loft recipe: {0}")]
+    InvalidLoft(crate::loft::SketchLoftError),
+}
+
+/// Compiles the named regions of a sketch's current authoring graph into an
+/// exact kernel profile, and returns it with the frame the sketch was drawn
+/// in.
+///
+/// Every signature must name exactly one bounded cell: a region that has gone
+/// is refused, and so is one that now names two, rather than letting the
+/// arrangement's first match stand in for it. Extrusions and lofts both read
+/// their regions through this, so they fail the same way on the same sketch.
+pub(crate) fn compile_sketch_regions(
+    document: &ModelDocument,
+    sketch_id: SketchId,
+    regions: &[RegionSignature],
+    precision: PrecisionPolicy,
+) -> Result<(PlanarProfile2, PlanarFrame3), SketchRegionResolveError> {
+    let sketch = document
+        .sketch(sketch_id)
+        .ok_or(SketchRegionResolveError::UnknownSketch(sketch_id))?;
+    let payload = document
+        .sketch_payload(sketch_id, sketch.geometry_revision)
+        .ok_or(SketchRegionResolveError::MissingSketchPayload {
+            sketch: sketch_id,
+            geometry_revision: sketch.geometry_revision,
+        })?;
+    let authoring =
+        payload
+            .authoring()
+            .ok_or(SketchRegionResolveError::MissingAuthoringDefinition {
+                sketch: sketch_id,
+                geometry_revision: sketch.geometry_revision,
+            })?;
+    authoring.validate(precision).map_err(|error| {
+        SketchRegionResolveError::InvalidAuthoringDefinition {
+            sketch: sketch_id,
+            error,
+        }
+    })?;
+    let inputs = authoring.arrangement_inputs().map_err(|error| {
+        SketchRegionResolveError::InvalidAuthoringDefinition {
+            sketch: sketch_id,
+            error,
+        }
+    })?;
+    let arrangement = build_arrangement(&inputs, &precision, ArrangementLimits::default());
+
+    // Do not let `cell()` silently choose the first entry if a corrupt or
+    // future arrangement implementation ever emits duplicate signatures.
+    for signature in regions {
+        match arrangement
+            .cells
+            .iter()
+            .filter(|cell| &cell.signature == signature)
+            .count()
+        {
+            0 => {
+                return Err(SketchRegionResolveError::MissingRegion {
+                    sketch: sketch_id,
+                    signature: signature.clone(),
+                });
+            }
+            1 => {}
+            count => {
+                return Err(SketchRegionResolveError::AmbiguousRegion {
+                    sketch: sketch_id,
+                    signature: signature.clone(),
+                    candidates: count,
+                });
+            }
+        }
+    }
+
+    let compiled = compile_selected_profile(&arrangement, regions, &precision)
+        .map_err(SketchRegionResolveError::Profile)?;
+    Ok((compiled.profile, payload.frame))
+}
+
+/// The region of a sketch, as the sketch now stands, that contains `point`
+/// (in the sketch's own coordinates): the smallest bounded cell around it.
+///
+/// This is how a pick in the model view becomes a region a feature can name.
+/// `None` when the sketch has no editable graph or the point is in no cell.
+#[must_use]
+pub fn sketch_region_at(
+    document: &ModelDocument,
+    sketch_id: SketchId,
+    point: [f64; 2],
+    precision: PrecisionPolicy,
+) -> Option<RegionSignature> {
+    let sketch = document.sketch(sketch_id)?;
+    let payload = document.sketch_payload(sketch_id, sketch.geometry_revision)?;
+    let inputs = payload.authoring()?.arrangement_inputs().ok()?;
+    let arrangement = build_arrangement(&inputs, &precision, ArrangementLimits::default());
+    arrangement
+        .cell_at_point(SketchPoint2::new(point[0], point[1]), &precision)
+        .map(|cell| cell.signature.clone())
 }
 
 fn validate_face_reference(
@@ -1387,6 +1429,203 @@ mod tests {
         let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
         assert_eq!(restored.datum_plane(plane), document.datum_plane(plane));
         assert_eq!(restored.sketch_frame(sketch), document.sketch_frame(sketch));
+    }
+
+    /// A plane sketch document with a second sketch on the XY origin plane,
+    /// for a loft from the origin up to the plane.
+    fn document_with_two_sections() -> (ModelDocument, crate::FeatureId, SketchId, SketchId) {
+        let (mut document, plane, upper, _) = document_with_plane_sketch();
+        let definition = rectangle(4.0, 4.0);
+        let (_, profile) = selected_profile(&definition);
+        let payload = SketchPayload::from_authoring(
+            frame(),
+            definition,
+            Some(profile),
+            SketchSupportRecipe::Origin,
+        )
+        .unwrap();
+        let marker = SnapshotAssociation::new(
+            SnapshotId::ZERO,
+            SnapshotId::ZERO,
+            SemanticDigest::new([0; 32]),
+        );
+        let lower = document
+            .append_feature(
+                FeatureDraft::new(FeatureKind::Sketch, "Sketch", ReplayAction::Marker)
+                    .with_sketch_payload(payload)
+                    .with_output(OutputDraft::CreateSketch {
+                        label: "Sketch 2".into(),
+                        geometry_revision: 1,
+                    })
+                    .with_commit(marker),
+            )
+            .unwrap()
+            .created_sketches[0];
+        (document, plane, lower, upper)
+    }
+
+    fn loft_between(
+        document: &ModelDocument,
+        lower: SketchId,
+        upper: SketchId,
+        operation: artificer_protocol::LoftOperation,
+    ) -> crate::SketchLoft {
+        let precision = PrecisionPolicy::default();
+        let section = |sketch| {
+            crate::SketchLoftSection::new(
+                sketch,
+                vec![sketch_region_at(document, sketch, [1.0, 1.0], precision).unwrap()],
+            )
+        };
+        crate::SketchLoft::new(vec![section(lower), section(upper)], operation).unwrap()
+    }
+
+    fn section_heights(action: ReplayAction) -> Vec<f64> {
+        match action {
+            ReplayAction::Kernel(KernelCommand::LoftPlanarSections { sections, .. }) => sections
+                .iter()
+                .map(|section| section.frame.origin.z)
+                .collect(),
+            other => panic!("a loft recipe resolves to a loft between sections: {other:?}"),
+        }
+    }
+
+    /// Each section is compiled from its own sketch and placed on that
+    /// sketch's plane; a plane the rebuild has just moved carries its section
+    /// with it before any cache is refreshed.
+    #[test]
+    fn a_loft_places_each_section_on_its_own_plane() {
+        let (document, plane, lower, upper) = document_with_two_sections();
+        let recipe = loft_between(
+            &document,
+            lower,
+            upper,
+            artificer_protocol::LoftOperation::New,
+        );
+        let action = ReplayAction::SketchLoft(recipe);
+        let cached = action
+            .resolve_sketch_regions(&document, PrecisionPolicy::default())
+            .unwrap();
+        assert_eq!(section_heights(cached), vec![0.0, 10.0]);
+        let moved = crate::datum::ResolvedDatumPlane {
+            frame: crate::datum::offset_along_normal(crate::datum::OriginPlane::Xy.frame(), 25.0),
+            half_extent: [25.0, 25.0],
+        };
+        let live = action
+            .resolve_sketch_regions_with_planes(
+                &document,
+                PrecisionPolicy::default(),
+                &std::collections::BTreeMap::from([(plane, moved)]),
+            )
+            .unwrap();
+        assert_eq!(section_heights(live), vec![0.0, 25.0]);
+    }
+
+    #[test]
+    fn a_loft_needs_two_sections_from_two_sketches() {
+        let (document, _, lower, upper) = document_with_two_sections();
+        let recipe = loft_between(
+            &document,
+            lower,
+            upper,
+            artificer_protocol::LoftOperation::New,
+        );
+        let one = crate::SketchLoft::new(
+            recipe.sections[..1].to_vec(),
+            artificer_protocol::LoftOperation::New,
+        );
+        assert_eq!(one.unwrap_err(), crate::SketchLoftError::TooFewSections);
+        let repeated = crate::SketchLoft::new(
+            vec![recipe.sections[0].clone(), recipe.sections[0].clone()],
+            artificer_protocol::LoftOperation::New,
+        );
+        assert_eq!(
+            repeated.unwrap_err(),
+            crate::SketchLoftError::RepeatedSketch(lower)
+        );
+    }
+
+    /// A loft reads its sketches on every replay and changes the body an add
+    /// or a cut names, so the history holds both as inputs; and only a loft
+    /// feature carries a loft recipe.
+    #[test]
+    fn a_loft_feature_names_its_sketches_and_its_body() {
+        use artificer_protocol::LoftOperation;
+        let (mut document, _, lower, upper) = document_with_two_sections();
+        let marker = SnapshotAssociation::new(
+            SnapshotId::ZERO,
+            SnapshotId::ZERO,
+            SemanticDigest::new([0; 32]),
+        );
+        let new_body = loft_between(&document, lower, upper, LoftOperation::New);
+        let draft = |kind, recipe: crate::SketchLoft| {
+            FeatureDraft::new(kind, "Loft 1", ReplayAction::SketchLoft(recipe)).with_commit(marker)
+        };
+        assert_eq!(
+            document
+                .append_feature(
+                    draft(FeatureKind::Loft, new_body.clone())
+                        .with_input(FeatureInput::Sketch(lower))
+                )
+                .unwrap_err(),
+            crate::DocumentError::SketchRegionSourceMustBeInput(upper)
+        );
+        assert_eq!(
+            document
+                .append_feature(
+                    draft(FeatureKind::Extrude, new_body.clone())
+                        .with_input(FeatureInput::Sketch(lower))
+                        .with_input(FeatureInput::Sketch(upper))
+                )
+                .unwrap_err(),
+            crate::DocumentError::InvalidLoftFeature
+        );
+        let cut = loft_between(&document, lower, upper, LoftOperation::Cut);
+        assert_eq!(
+            document
+                .append_feature(
+                    draft(FeatureKind::Loft, cut)
+                        .with_input(FeatureInput::Sketch(lower))
+                        .with_input(FeatureInput::Sketch(upper))
+                )
+                .unwrap_err(),
+            crate::DocumentError::SketchLoft(crate::SketchLoftError::MissingTargetBody)
+        );
+        let appended = document
+            .append_feature(
+                draft(FeatureKind::Loft, new_body)
+                    .with_input(FeatureInput::Sketch(lower))
+                    .with_input(FeatureInput::Sketch(upper))
+                    .with_output(OutputDraft::CreateBody {
+                        label: "Body 1".into(),
+                    }),
+            )
+            .unwrap();
+        assert_eq!(appended.created_bodies.len(), 1);
+        // A loft document is written in the schema that knows lofts, and
+        // reads back to the same recipe.
+        let native = document.to_native();
+        assert_eq!(native.version(), crate::SKETCH_LOFT_DOCUMENT_VERSION);
+        let json = serde_json::to_string(&native).unwrap();
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            restored.feature(appended.feature).map(|node| &node.action),
+            document.feature(appended.feature).map(|node| &node.action)
+        );
+    }
+
+    #[test]
+    fn a_pick_inside_a_region_names_it_and_a_pick_outside_names_nothing() {
+        let (document, sketch, signature) = document_with_rectangle();
+        let precision = PrecisionPolicy::default();
+        assert_eq!(
+            sketch_region_at(&document, sketch, [1.0, 1.5], precision),
+            Some(signature)
+        );
+        assert_eq!(
+            sketch_region_at(&document, sketch, [5.0, 1.5], precision),
+            None
+        );
     }
 }
 

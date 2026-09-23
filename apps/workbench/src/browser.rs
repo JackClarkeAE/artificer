@@ -570,7 +570,7 @@ impl KernelLabApp {
                             (
                                 index,
                                 sketch.ordinal,
-                                sketch.support.label(),
+                                self.support_label(&sketch.support),
                                 sketch.finished,
                                 sketch.visible,
                                 sketch.consumed,
@@ -651,7 +651,7 @@ impl KernelLabApp {
                             &format!(
                                 "Sketch {} · {} · empty",
                                 self.feature_preview.current_sketch_ordinal(),
-                                self.sketch_support.label()
+                                self.support_label(&self.sketch_support)
                             ),
                             theme::accent(),
                         );

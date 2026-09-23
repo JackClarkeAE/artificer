@@ -28,6 +28,8 @@
 ## What is new since 0.99.7
 
 - **A construction plane is a feature you can place, move and edit.** The Plane command puts a plane on whatever is picked — a face, two parallel faces, a straight edge, an origin or construction plane — and draws it there before anything is committed. An arrow drags it off its base and, on a plane through an edge, an arc turns it about the edge; the card on the right carries the same Offset and Angle as typed fields, and a Flip. Confirmed, it is a chip in the history like any other feature: right-click to edit it where it was made, rename it, suppress it, or delete it when nothing is built on it. It is linked, not copied: a plane on a face follows the face when the body under it is rebuilt, a sketch on a plane moves with the plane and so does everything extruded from it, and a side of an extrusion can end at a plane and follows it too. Planes from older files open where they were. ADR 0048 records the design.
+- **Loft.** The Loft command builds a solid through profiles drawn on different planes — a square on the ground up to a circle on a plane above it is the first one anyone tries. Click a profile in each sketch, in the order the loft runs; the card lists the sections, lets you reorder or drop them, and chooses New body, Add or Cut, and the viewport shows the solid the kernel builds before you confirm, or the card says by name why there is none. Walls are exact: a plane, cylinder or cone where one fits, and a ruled surface between the two edges otherwise (ADR 0049). The loft is a history feature that follows its sketches and their planes — move the plane and the loft moves with it — and its chip reopens it in its editor. ADR 0051 records the design.
+- **Spline sketch curves.** The Line chooser now offers a fit-point spline, which passes through every point you click, and a control-vertex spline, which is pulled toward them. Double-click, Enter or Finish spline ends one; clicking the first point closes it into a smooth loop with no corner where it started.
 
 ## What is new in 0.99.7
 
@@ -296,6 +298,8 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `sketch(on: "XY" \| "XZ" \| "YZ" \| face, entities: [...], label:)` with `line(start:, end:)`, `circle(center:, radius:)`, `arc(center:, radius:, start_angle:, end_angle:)`, `rect(origin: or center:, width:, height:)` | A profile on a plane or a face. Lines and arcs chain into loops; nested loops become holes. |
 | `extrude(sketch:, distance:, operation: "new" \| "add" \| "cut", draft:, regions:, label:)` | A prism, or a drafted loft for a new body. |
 | `revolve(sketch:, axis:, axis_origin:, angle:, operation:, label:)` | A solid of revolution. |
+| `plane(from: "XY", offset:)`, `plane(origin:, normal:, x_axis:)`, `plane(origin:, x_axis:, y_axis:)` | A plane in space for `sketch(on:)`. |
+| `loft(sections: [a, b], operation: "new" \| "add" \| "cut", label:)` | A solid between two sketches on different planes, with exact walls: planes, cylinders and cones where they fit, ruled surfaces otherwise. |
 | `drill(face:, center:, diameter:, depth:)`, `push_pull(face:, distance:)`, `fillet(edges:, radius:)`, `chamfer(edges:, distance:)` | Face and edge features. |
 | `shell(open:, wall:)` | Hollows the current body to one wall, open at one face, two opposite faces, or none; prisms and solids of revolution. |
 | `mirror(origin:, normal:)` | Reflects the current body exactly. |
@@ -460,7 +464,9 @@ The dependency rules between these layers are checked by `scripts/check-architec
 - [x] The kernel API: Rust, JSON-RPC, `.art` scripts, headless snapshots and export.
 - [x] Multi-document workbench, sketch text, drafted extrusion as the first loft rung.
 - [x] Shell.
-- [ ] Sweeps along paths and lofts between arbitrary sections; draft on existing faces.
+- [x] Construction planes as history features, placed on faces, edges and planes, and followed by what is built on them.
+- [x] The ruled surface, and a loft between two sections on any two planes, in the kernel, scripts and the workbench.
+- [ ] Sweeps along paths, smooth lofts through several sections on B-spline surfaces, draft on existing faces.
 - [x] The ellipse curve, first slice: the mitre seam of a fillet turning a sharp corner, so fillets round square holes and L-shaped rims are exact.
 - [x] Oblique plane sections of cylinders on the same curve, through the analytic Boolean: angled holes, mitred cylinder ends, oblique cuts of round bodies.
 - [ ] Oblique cone sections, and pipe tees (equal cylinders crossing) on the same ellipse.

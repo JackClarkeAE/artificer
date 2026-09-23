@@ -20,6 +20,7 @@ pub enum CommandIcon {
     Interference,
     Extrude,
     Revolve,
+    Loft,
     Hole,
     Rib,
     Mirror,
@@ -236,6 +237,15 @@ impl IconPainter<'_> {
                 self.closed_path(&[(0.42, 0.30), (0.72, 0.30), (0.72, 0.70), (0.42, 0.70)]);
                 self.arc((0.18, 0.50), 0.40, -1.05, 2.10);
                 self.arrowhead((0.38, 0.85), (0.35, 0.35), 0.09);
+            }
+            CommandIcon::Loft => {
+                // A square section below, a circle above, and the rungs a
+                // loft draws between them.
+                self.closed_path(&[(0.14, 0.72), (0.58, 0.72), (0.86, 0.88), (0.42, 0.88)]);
+                self.circle((0.50, 0.24), 0.16);
+                self.line((0.14, 0.72), (0.34, 0.24));
+                self.line((0.86, 0.88), (0.66, 0.24));
+                self.dashed((0.50, 0.80), (0.50, 0.40));
             }
             CommandIcon::Hole => {
                 self.rectangle((0.12, 0.20), (0.88, 0.80));

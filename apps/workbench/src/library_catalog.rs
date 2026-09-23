@@ -543,7 +543,8 @@ fn bind_recipe_command(
         | ReplayAction::ParameterizedKernel(_)
         | ReplayAction::SketchRegionExtrusion(_)
         | ReplayAction::Boolean(_)
-        | ReplayAction::DatumPlane(_) => Err(LibraryCatalogError::RecipeContract(
+        | ReplayAction::DatumPlane(_)
+        | ReplayAction::SketchLoft(_) => Err(LibraryCatalogError::RecipeContract(
             "the parameterized root recipe did not resolve to an independent kernel command".into(),
         )),
     }

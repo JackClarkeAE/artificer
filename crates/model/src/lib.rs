@@ -11,6 +11,7 @@ pub mod assembly;
 pub mod components;
 pub mod datum;
 pub mod kinematics;
+pub mod loft;
 pub mod parameterized;
 pub mod parameters;
 pub mod persistent;
@@ -37,6 +38,9 @@ pub use datum::{
     CURRENT_DATUM_PLANE_RECIPE_VERSION, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef,
     DatumPlaneBase, DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, OriginPlane,
     ResolvedDatumPlane,
+};
+pub use loft::{
+    CURRENT_SKETCH_LOFT_RECIPE_VERSION, SketchLoft, SketchLoftError, SketchLoftSection,
 };
 pub use parameterized::{
     KernelParameterBinding, KernelReplayTemplate, KernelScalarTarget,
@@ -67,7 +71,8 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 /// kernel recipes. Version 5 adds the persistent assembly joint forest.
 /// Version 6 adds authoritative editable sketch-operation graphs. Version 7
 /// makes a construction plane a recipe rather than a marker (ADR 0048).
-pub const CURRENT_DOCUMENT_VERSION: u32 = 7;
+/// Version 8 adds the loft between sketch sections (ADR 0051).
+pub const CURRENT_DOCUMENT_VERSION: u32 = 8;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
 /// First native schema with a persistent assembly hierarchy and joint graph.
@@ -78,6 +83,8 @@ pub const EDITABLE_SKETCH_DOCUMENT_VERSION: u32 = 6;
 /// Older files hold plane markers, which the workbench migrates from the
 /// frames its workspace envelope kept for them.
 pub const DATUM_PLANE_DOCUMENT_VERSION: u32 = 7;
+/// First native schema that can hold a loft feature.
+pub const SKETCH_LOFT_DOCUMENT_VERSION: u32 = 8;
 /// Oldest native document schema this version can migrate in memory.
 pub const MIN_SUPPORTED_DOCUMENT_VERSION: u32 = 1;
 /// Hard ceiling for one document's ordered feature timeline.
@@ -142,6 +149,16 @@ pub enum FeatureKind {
     Cut,
     Transform,
     Boolean,
+    Loft,
+}
+
+impl FeatureKind {
+    /// Whether this kind of feature builds solid from a sketch's regions, and
+    /// so hides the sketch it has spent (see `auto_hide_sketch_consumed_by`).
+    #[must_use]
+    pub const fn consumes_sketches(self) -> bool {
+        matches!(self, Self::Extrude | Self::Add | Self::Cut | Self::Loft)
+    }
 }
 
 /// Stable two-body Boolean intent. The target owns the successor snapshot;
@@ -212,6 +229,9 @@ pub enum ReplayAction {
     /// A construction plane. It runs no kernel command; replay resolves where
     /// its base now puts it (ADR 0048).
     DatumPlane(DatumPlaneRecipe),
+    /// A loft whose sections are resolved from their sketches, on their
+    /// planes, immediately before replay (ADR 0051).
+    SketchLoft(SketchLoft),
 }
 
 impl ReplayAction {
@@ -238,7 +258,8 @@ impl ReplayAction {
             | Self::Kernel(_)
             | Self::SketchRegionExtrusion(_)
             | Self::Boolean(_)
-            | Self::DatumPlane(_) => Ok(self.clone()),
+            | Self::DatumPlane(_)
+            | Self::SketchLoft(_) => Ok(self.clone()),
         }
     }
 
@@ -273,6 +294,7 @@ impl ReplayAction {
                     .map(|plane| plane.frame);
                 recipe.resolve_in_frame(document, precision, frame)
             }
+            Self::SketchLoft(recipe) => recipe.resolve_with_planes(document, precision, planes),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
@@ -2028,10 +2050,7 @@ impl ModelDocument {
             .ok_or(DocumentError::UnavailableDependency(consumer))?;
         if feature.committed.is_none()
             || feature.state.suppressed
-            || !matches!(
-                feature.kind,
-                FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-            )
+            || !feature.kind.consumes_sketches()
             || !feature.inputs.contains(&FeatureInput::Sketch(sketch))
         {
             return Err(DocumentError::UnavailableDependency(consumer));
@@ -2996,6 +3015,10 @@ pub enum DocumentError {
     SketchRegionRecipe(#[from] SketchRegionRecipeError),
     #[error(transparent)]
     DatumPlane(#[from] DatumPlaneError),
+    #[error("invalid loft: {0}")]
+    SketchLoft(#[from] SketchLoftError),
+    #[error("a loft feature must carry a loft recipe, and a loft recipe must be a loft feature")]
+    InvalidLoftFeature,
     #[error("a construction plane must be a construction-plane feature with a plane recipe")]
     InvalidDatumPlaneFeature,
     #[error("{0} is not a construction plane")]
@@ -3149,6 +3172,7 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
             Err(DocumentError::InvalidBooleanFeature)
         }
         ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::Marker
         | ReplayAction::Kernel(_)
         | ReplayAction::TargetedKernel(_)
@@ -3159,6 +3183,11 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
 fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), DocumentError> {
     if matches!(action, ReplayAction::DatumPlane(_)) && kind != FeatureKind::DatumPlane {
         return Err(DocumentError::InvalidDatumPlaneFeature);
+    }
+    // A loft is the only thing that can build a loft feature, and the other
+    // way round: the history names features by what they are.
+    if matches!(action, ReplayAction::SketchLoft(_)) != (kind == FeatureKind::Loft) {
+        return Err(DocumentError::InvalidLoftFeature);
     }
     Ok(())
 }
@@ -3189,6 +3218,23 @@ fn validate_action_feature_inputs(
             .find(|plane| !feature_inputs.contains(&FeatureInput::Feature(*plane)))
         {
             return Err(DocumentError::EndPlaneMustBeInput(plane));
+        }
+    }
+    // Every section is read from its sketch on every replay, so every sketch
+    // is an input; an add or a cut changes a body, which is its branch.
+    if let ReplayAction::SketchLoft(recipe) = action {
+        if let Some(sketch) = recipe
+            .sketches()
+            .find(|sketch| !feature_inputs.contains(&FeatureInput::Sketch(*sketch)))
+        {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(sketch));
+        }
+        if recipe.operation != artificer_protocol::LoftOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchLoftError::MissingTargetBody.into());
         }
     }
     if let ReplayAction::Boolean(recipe) = action
@@ -4069,10 +4115,8 @@ fn validate_loaded_state(
                     "a sketch auto-hide references a missing feature",
                 ));
             };
-            if !matches!(
-                feature.kind,
-                FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-            ) || !feature.inputs.contains(&FeatureInput::Sketch(sketch.id))
+            if !feature.kind.consumes_sketches()
+                || !feature.inputs.contains(&FeatureInput::Sketch(sketch.id))
             {
                 return Err(DocumentError::InvalidArchive(
                     "a sketch auto-hide is not owned by a consuming modeling feature",

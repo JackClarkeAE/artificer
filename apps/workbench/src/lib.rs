@@ -20,6 +20,7 @@ mod export;
 pub mod feature_editor;
 pub mod invocation;
 pub mod library_catalog;
+mod loft;
 pub mod material;
 mod parametric;
 pub mod part_library;
@@ -68,7 +69,7 @@ use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
     DiagnosticSeverity, DiagnosticSubject, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
     FaceExtrusionOperation, HistoryRelation, KernelCommand, KernelError, KernelErrorCode,
-    KernelStage, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
+    KernelStage, LoftOperation, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
     MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarAxis2,
     PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
     Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle, RotationQuaternion,
@@ -480,6 +481,12 @@ enum PendingOperation {
         /// The committed plane this editor was reopened on, when it was.
         editing: Option<FeatureId>,
     },
+    /// A loft in its editor. The picked sections are not `Copy`, so they
+    /// live in `staged_loft` beside the operation, as a plane's values do.
+    StageLoft {
+        /// The committed loft this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
     /// The tool bodies are picked interactively while this is staged and live
     /// in `boolean_tools`, the same way an edge finish collects `selected_edges`.
     /// Keeping them out of the pending value lets the operation stay `Copy`.
@@ -615,6 +622,8 @@ impl PendingOperation {
             },
             Self::StagePlane { editing: None } => "Create construction plane",
             Self::StagePlane { editing: Some(_) } => "Edit construction plane",
+            Self::StageLoft { editing: None } => "Loft",
+            Self::StageLoft { editing: Some(_) } => "Edit loft",
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
                 BooleanOperation::Difference => "Subtract bodies",
@@ -675,6 +684,12 @@ impl PendingOperation {
             }
             Self::StagePlane { editing: Some(_) } => {
                 "Confirm to rewrite the plane and replay everything built on it"
+            }
+            Self::StageLoft { editing: None } => {
+                "Click a profile in each sketch in order, then confirm to build the loft"
+            }
+            Self::StageLoft { editing: Some(_) } => {
+                "Confirm to rewrite the loft and replay everything built after it"
             }
             Self::BooleanBodies { .. } => {
                 "Click the tool bodies to combine with the target, then confirm to publish a validated successor"
@@ -743,7 +758,7 @@ impl PendingOperation {
                 object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
                 object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
-            Self::StagePlane { editing } => {
+            Self::StagePlane { editing } | Self::StageLoft { editing } => {
                 if let Some(feature) = editing {
                     object.insert("editing".to_owned(), serde_json::json!(feature.get()));
                 }
@@ -1186,6 +1201,7 @@ enum ModelBodyKind {
     CutPocket,
     PushedPulled,
     Boolean,
+    Lofted,
 }
 
 impl ModelBodyKind {
@@ -1197,6 +1213,7 @@ impl ModelBodyKind {
             Self::CutPocket => "native cut pocket",
             Self::PushedPulled => "native pushed/pulled solid",
             Self::Boolean => "native Boolean result",
+            Self::Lofted => "native loft",
         }
     }
 }
@@ -1348,6 +1365,8 @@ enum FeaturePreviewKind {
     Cut,
     Transform,
     Boolean,
+    /// A loft between sketch sections, named by its feature (ADR 0051).
+    Loft,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1391,6 +1410,10 @@ impl FeaturePreviewEntry {
             FeaturePreviewKind::Cut => format!("Cut {}", self.ordinal),
             FeaturePreviewKind::Transform => format!("Transform {}", self.ordinal),
             FeaturePreviewKind::Boolean => format!("Boolean {}", self.ordinal),
+            FeaturePreviewKind::Loft => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Loft {}", self.ordinal)),
         }
     }
 
@@ -2147,6 +2170,8 @@ enum TimelineContextCommand {
     Edit,
     /// Reopen a construction plane's editor (ADR 0048).
     EditPlane,
+    /// Reopen a loft's editor (ADR 0051).
+    EditLoft,
     Rename,
     Suppress,
     Restore,
@@ -2159,6 +2184,7 @@ impl TimelineContextCommand {
         match self {
             Self::Edit => "Edit this extrusion",
             Self::EditPlane => "Edit this plane",
+            Self::EditLoft => "Edit this loft",
             Self::Rename => "Rename…",
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
@@ -2619,6 +2645,8 @@ pub struct KernelLabApp {
     selected_construction_plane: Option<u64>,
     /// The plane editor's working values while `StagePlane` is pending.
     staged_plane: Option<StagedPlane>,
+    /// A loft in its editor (ADR 0051), beside `PendingOperation::StageLoft`.
+    staged_loft: Option<loft::StagedLoft>,
     /// A plane being renamed from the history or the Browser, and its text.
     plane_rename: Option<(FeatureId, String)>,
     /// Planes whose base did not resolve at the last rebuild; each stands on
@@ -2923,6 +2951,7 @@ impl Default for KernelLabApp {
             construction_planes: Vec::new(),
             selected_construction_plane: None,
             staged_plane: None,
+            staged_loft: None,
             plane_rename: None,
             stale_planes: BTreeSet::new(),
             document_properties_open: false,
@@ -4301,7 +4330,21 @@ impl KernelLabApp {
 
     #[must_use]
     pub fn sketch_support_label(&self) -> String {
-        self.sketch_support.label()
+        self.support_label(&self.sketch_support)
+    }
+
+    /// What a sketch is drawn on, as the user named it: a construction
+    /// plane by its feature's name rather than by its id.
+    fn support_label(&self, support: &SketchSupport) -> String {
+        if let SketchSupport::ConstructionPlane { id: Some(id), .. } = support
+            && let Some(plane) = self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+        {
+            return plane.name.clone();
+        }
+        support.label()
     }
 
     #[must_use]
@@ -4722,6 +4765,7 @@ impl KernelLabApp {
                 | PendingOperation::RemoveParameter { .. }
                 | PendingOperation::AddUserParameter { .. }
                 | PendingOperation::StagePlane { .. }
+                | PendingOperation::StageLoft { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
                 | PendingOperation::SketchEdit { .. }
@@ -4986,6 +5030,7 @@ impl KernelLabApp {
                 FeatureKind::Cut => ModelBodyKind::CutPocket,
                 FeatureKind::Transform => previous_kind,
                 FeatureKind::Boolean => ModelBodyKind::Boolean,
+                FeatureKind::Loft => ModelBodyKind::Lofted,
                 FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch => {
                     previous_kind
                 }
@@ -5215,10 +5260,7 @@ impl KernelLabApp {
                 document.feature_is_active(feature.id).unwrap_or(false)
                     && feature.committed.is_some()
                     && !feature.state.suppressed
-                    && matches!(
-                        feature.kind,
-                        FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-                    )
+                    && feature.kind.consumes_sketches()
                     && feature.inputs.contains(&FeatureInput::Sketch(record.id))
             });
             let auto_hidden_consumer_active = record.auto_hidden_by.is_some_and(|consumer| {
@@ -5718,6 +5760,7 @@ impl KernelLabApp {
             FeatureKind::Cut => format!("Cut {ordinal}"),
             FeatureKind::Transform => format!("Transform {ordinal}"),
             FeatureKind::Boolean => format!("Boolean {ordinal}"),
+            FeatureKind::Loft => format!("Loft {ordinal}"),
         }
     }
 
@@ -5916,6 +5959,7 @@ impl KernelLabApp {
                 FeatureKind::Cut => FeaturePreviewKind::Cut,
                 FeatureKind::Transform => FeaturePreviewKind::Transform,
                 FeatureKind::Boolean => FeaturePreviewKind::Boolean,
+                FeatureKind::Loft => FeaturePreviewKind::Loft,
             };
             let key = kind as u8;
             let ordinal = if matches!(
@@ -5991,13 +6035,15 @@ impl KernelLabApp {
                 group,
                 // A plane whose base did not resolve stands where it last
                 // was, and its chip says so (ADR 0048).
-                name: (kind == FeaturePreviewKind::Plane).then(|| {
-                    if self.stale_planes.contains(&feature.id) {
+                name: match kind {
+                    FeaturePreviewKind::Plane => Some(if self.stale_planes.contains(&feature.id) {
                         format!("{} · held", feature.label)
                     } else {
                         feature.label.clone()
-                    }
-                }),
+                    }),
+                    FeaturePreviewKind::Loft => Some(feature.label.clone()),
+                    _ => None,
+                },
             });
         }
         self.feature_preview = FeaturePreviewState {
@@ -6114,10 +6160,7 @@ impl KernelLabApp {
                 self.document.feature_is_active(feature.id).unwrap_or(false)
                     && feature.committed.is_some()
                     && !feature.state.suppressed
-                    && matches!(
-                        feature.kind,
-                        FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-                    )
+                    && feature.kind.consumes_sketches()
                     && feature.inputs.contains(&FeatureInput::Sketch(id))
             });
             let auto_hidden_consumer_active = record.auto_hidden_by.is_some_and(|consumer| {
@@ -6438,7 +6481,7 @@ impl KernelLabApp {
                 ReplayAction::ParameterizedKernel(_) => {
                     unreachable!("parameterized replay actions are resolved before kernel dispatch")
                 }
-                ReplayAction::SketchRegionExtrusion(_) => {
+                ReplayAction::SketchRegionExtrusion(_) | ReplayAction::SketchLoft(_) => {
                     unreachable!("sketch-region replay actions are resolved before kernel dispatch")
                 }
                 ReplayAction::Boolean(recipe) => RebuildDispatch::Boolean(recipe),
@@ -6491,6 +6534,7 @@ impl KernelLabApp {
                         })
                         .unwrap_or(ModelBodyKind::Cuboid),
                     Some(FeatureKind::Boolean) => ModelBodyKind::Boolean,
+                    Some(FeatureKind::Loft) => ModelBodyKind::Lofted,
                     Some(FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch)
                     | None => ModelBodyKind::Cuboid,
                 };
@@ -11499,6 +11543,7 @@ impl KernelLabApp {
                 }
             }
             PendingOperation::StagePlane { editing } => self.commit_staged_plane(editing),
+            PendingOperation::StageLoft { editing } => self.commit_staged_loft(editing),
             PendingOperation::BooleanBodies {
                 target,
                 operation,
@@ -11685,6 +11730,7 @@ impl KernelLabApp {
                     self.document_status = Some("Plane edit abandoned".to_owned());
                 }
             }
+            PendingOperation::StageLoft { editing } => self.cancel_staged_loft(editing),
             PendingOperation::SetParameterBindingEntry { .. } => {
                 self.staged_parameter_binding = None;
                 self.pending_operation = None;
@@ -16344,6 +16390,8 @@ impl KernelLabApp {
         if self.feature_has_an_editor(feature) {
             commands.push(if plane {
                 TimelineContextCommand::EditPlane
+            } else if node.kind == FeatureKind::Loft {
+                TimelineContextCommand::EditLoft
             } else {
                 TimelineContextCommand::Edit
             });
@@ -16373,6 +16421,9 @@ impl KernelLabApp {
             }
             TimelineContextCommand::EditPlane => {
                 self.begin_plane_edit(feature);
+            }
+            TimelineContextCommand::EditLoft => {
+                self.begin_loft_edit(feature);
             }
             TimelineContextCommand::Rename => self.begin_feature_rename(feature),
             TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
@@ -16573,7 +16624,9 @@ impl KernelLabApp {
             .is_some_and(|node| {
                 matches!(
                     node.action,
-                    ReplayAction::SketchRegionExtrusion(_) | ReplayAction::DatumPlane(_)
+                    ReplayAction::SketchRegionExtrusion(_)
+                        | ReplayAction::DatumPlane(_)
+                        | ReplayAction::SketchLoft(_)
                 ) && !node.state.read_only
             })
     }
@@ -18562,7 +18615,7 @@ impl KernelLabApp {
                 if !contextual {
                 collapsible_card(ui, "sketch_plane", "SKETCH PLANE", true, |ui| {
                     ui.label(
-                        RichText::new(self.sketch_support.label())
+                        RichText::new(self.support_label(&self.sketch_support))
                             .color(theme::accent())
                             .strong(),
                     );
@@ -19460,10 +19513,22 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageLoft { .. }))
+                {
+                    card(ui, "loft", "LOFT", &mut |ui| {
+                        self.loft_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
-                    && !matches!(self.pending_operation, Some(PendingOperation::StagePlane { .. }))
+                    && !matches!(
+                        self.pending_operation,
+                        Some(PendingOperation::StagePlane { .. } | PendingOperation::StageLoft { .. })
+                    )
                 {
                     card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
                         self.extrusion_controls(ui);
@@ -20065,7 +20130,7 @@ impl KernelLabApp {
         ui.label(
             RichText::new(format!(
                 "{} · revision {}",
-                self.sketch_support.label(),
+                self.support_label(&self.sketch_support),
                 self.sketch_revision
             ))
             .small()
@@ -20965,13 +21030,13 @@ impl KernelLabApp {
             ui,
             "sketch_canvas_breadcrumb",
             title_rect,
-            &format!("Sketch · {}", self.sketch_support.label()),
+            &format!("Sketch · {}", self.support_label(&self.sketch_support)),
             theme::accent(),
         );
         let accessible_plane = if self.sketch_is_face_supported() {
             format!(
                 "{} · face-aligned orthographic sketch",
-                self.sketch_support.label()
+                self.support_label(&self.sketch_support)
             )
         } else {
             format!(
@@ -21363,7 +21428,12 @@ impl KernelLabApp {
             sketch_overlays.push(overlay);
         }
         sketch_overlays.extend(self.visible_reference_plane_overlays());
-        let selected_sketch_regions = self.selected_sketch_region_selections();
+        // While a loft is staged, its sections are what is picked.
+        let selected_sketch_regions = if self.loft_pick_active() {
+            self.loft_region_selections()
+        } else {
+            self.selected_sketch_region_selections()
+        };
         let reference_plane_bounds = self.visible_reference_plane_bounds();
         let active_body = self
             .active_body_id()
@@ -21391,13 +21461,39 @@ impl KernelLabApp {
             .show(ui, |ui| {
                 ui.set_min_size(viewport_size);
                 ui.set_max_size(viewport_size);
-                let body_instances = self
+                // A staged loft is drawn as what confirming would build: in
+                // place of the body an add or a cut changes, or beside the
+                // bodies as a new one.
+                let loft_preview = self.staged_loft.as_ref().and_then(|staged| {
+                    let preview = staged.preview.as_ref()?;
+                    Some((
+                        staged
+                            .target
+                            .filter(|_| staged.operation != LoftOperation::New),
+                        preview,
+                    ))
+                });
+                let mut body_instances = self
                     .bodies
                     .iter()
                     .filter(|body| body.visible)
                     .filter_map(|body| {
                         let source_bounds = body.body.report.bounds?;
                         let body_key = viewport::BodyInstanceKey::new(body.id.get());
+                        if let Some((Some(target), preview)) = loft_preview
+                            && target == body.id
+                        {
+                            let bounds = preview.report.bounds.unwrap_or(source_bounds);
+                            return Some(
+                                viewport::DocumentBodyInstance::new(
+                                    body_key,
+                                    &preview.scene,
+                                    Some(bounds),
+                                    bounds_center(source_bounds),
+                                )
+                                .with_base_transform(self.occurrence_transform_for_body(body.id)),
+                            );
+                        }
                         // A cut candidate is a privately evaluated body shown
                         // in place of the committed one, and its faces belong
                         // to a snapshot nothing outside the preview holds. A
@@ -21462,6 +21558,19 @@ impl KernelLabApp {
                         )
                     })
                     .collect::<Vec<_>>();
+                if let Some((None, preview)) = loft_preview
+                    && let Some(bounds) = preview.report.bounds
+                {
+                    body_instances.push(
+                        viewport::DocumentBodyInstance::new(
+                            viewport::BodyInstanceKey::new(loft::LOFT_PREVIEW_BODY_KEY),
+                            &preview.scene,
+                            Some(bounds),
+                            bounds_center(bounds),
+                        )
+                        .with_tint(Some(loft::LOFT_PREVIEW_TINT)),
+                    );
+                }
                 // A finished sketch is content even when no body exists yet:
                 // the placeholder must not replace the viewport while there is
                 // still something to look at.
@@ -21606,6 +21715,13 @@ impl KernelLabApp {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.select_model_edge(edge, additive);
                             self.apply_tangent_edge_chain();
+                        }
+                    } else if self.loft_pick_active() {
+                        // The loft editor owns clicks on sketch regions: each
+                        // one is a section, in the order they are clicked.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_loft_region(region.sketch_index, region.anchor, additive);
                         }
                     } else if self.extrusion_face_pick_armed() {
                         // A side waiting for its face owns the next click on
