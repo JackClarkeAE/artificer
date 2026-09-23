@@ -2939,7 +2939,10 @@ impl Default for KernelLabApp {
         let step_export_path_text = document_path.with_extension("step").display().to_string();
         let mut part_library = PartLibraryState::default();
         if let Ok(package) = builtin_aluminium_extrusion_package() {
-            part_library.set_definition_digest(package.content_digest().to_hex());
+            part_library.set_definition(
+                package.content_digest().to_hex(),
+                crate::library_catalog::builtin_part_revision_parts(),
+            );
         }
         let mut app = Self {
             document: ModelDocument::default(),
@@ -3195,14 +3198,21 @@ impl KernelLabApp {
     fn open_catalog_store(&mut self, root: impl AsRef<Path>) -> Result<(), String> {
         let package = builtin_aluminium_extrusion_package().map_err(|error| error.to_string())?;
         let digest = package.content_digest();
-        let store =
-            CatalogStore::open(root.as_ref().to_path_buf()).map_err(|error| error.to_string())?;
-        store.publish(&package).map_err(|error| error.to_string())?;
-        let rebuilt = store.rebuild_index().map_err(|error| error.to_string())?;
+        let store = CatalogStore::open(root.as_ref().to_path_buf())
+            .map_err(|error| plain_catalog_error(&error))?;
+        store
+            .publish(&package)
+            .map_err(|error| plain_catalog_error(&error))?;
+        let rebuilt = store
+            .rebuild_index()
+            .map_err(|error| plain_catalog_error(&error))?;
         if rebuilt.accepted() == 0 {
             return Err("the catalog contains no accepted definitions".into());
         }
-        self.part_library.set_definition_digest(digest.to_hex());
+        self.part_library.set_definition(
+            digest.to_hex(),
+            crate::library_catalog::builtin_part_revision_parts(),
+        );
         self.catalog_store = Some(store);
         self.document_status = Some(format!(
             "Local Part Library ready · {} verified definition(s)",
@@ -8172,7 +8182,10 @@ impl KernelLabApp {
         };
         let definition = match ComponentDefinitionRef::new(
             intent.definition_key.clone(),
-            ComponentDefinitionRevision::new(intent.definition_revision, 0, 0),
+            {
+                let [major, minor, patch] = intent.definition_revision;
+                ComponentDefinitionRevision::new(major, minor, patch)
+            },
             ComponentContentDigest::from_bytes(*resolved.evidence().definition_digest().as_bytes()),
         ) {
             Ok(definition) => definition,
@@ -25161,6 +25174,27 @@ impl invocation::InvocationContext for KernelLabApp {
             .is_some_and(|body| {
                 NativeKernel::planar_face_support(&body.body.snapshot, face.face).is_ok()
             })
+    }
+}
+
+/// A catalog failure as the status line says it. The store's own messages
+/// name packages by their content address, which is what a developer
+/// debugging the store needs and a sixty-four character hash is not what
+/// anyone else can act on.
+fn plain_catalog_error(error: &artificer_catalog::CatalogError) -> String {
+    use artificer_catalog::CatalogError;
+    match error {
+        CatalogError::RevisionConflict {
+            definition,
+            revision,
+            ..
+        } => format!(
+            "the library folder already holds a different copy of {definition} revision {revision}"
+        ),
+        CatalogError::DigestMismatch { .. } | CatalogError::ObjectNotFound(_) => {
+            "a part in the library folder is damaged or missing".to_owned()
+        }
+        other => other.to_string(),
     }
 }
 

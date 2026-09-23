@@ -349,6 +349,25 @@ impl CatalogStore {
         package.verify()?;
         let bytes = package.to_json_bytes()?;
         let digest = package.content_digest();
+        // A revision that already names other content is refused before any
+        // object is written. Checking only after the object was in place left
+        // an unreachable copy behind on every refused publish.
+        let definition = package.definition();
+        let reference_path = self.reference_path(definition.id(), definition.revision());
+        if reference_path.exists() {
+            let existing = parse_reference_bytes(&read_limited_regular_file(
+                &reference_path,
+                MAX_REFERENCE_BYTES,
+            )?)?;
+            if existing != digest {
+                return Err(CatalogError::RevisionConflict {
+                    definition: definition.id().clone(),
+                    revision: definition.revision(),
+                    existing,
+                    attempted: digest,
+                });
+            }
+        }
         let object_path = self.object_path(digest);
         let object_parent = object_path
             .parent()
@@ -356,10 +375,8 @@ impl CatalogStore {
         ensure_directory(object_parent)?;
         atomic_create_or_verify(&object_path, &bytes, MAX_PACKAGE_BYTES)?;
 
-        let definition = package.definition();
         let reference_directory = self.reference_directory(definition.id());
         ensure_directory(&reference_directory)?;
-        let reference_path = self.reference_path(definition.id(), definition.revision());
         let reference_bytes = format!("{digest}\n").into_bytes();
         match atomic_create_or_compare(&reference_path, &reference_bytes, MAX_REFERENCE_BYTES)? {
             CreateOutcome::Created | CreateOutcome::Identical => {}
@@ -926,6 +943,9 @@ mod tests {
             store.publish(&replacement),
             Err(CatalogError::RevisionConflict { .. })
         ));
+        // A refused publish writes nothing: no unreachable copy of the
+        // replacement is left in the object store.
+        assert!(!store.object_path(replacement.content_digest()).exists());
         assert_eq!(
             store
                 .resolve(first.definition().id(), PartRevision::new(1, 0, 0))

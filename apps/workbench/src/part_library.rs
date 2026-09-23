@@ -23,7 +23,11 @@ use crate::theme::{
 pub const ALUMINIUM_EXTRUSION_20X20_KEY: &str = "builtin.aluminium-extrusion-20x20";
 /// Human-readable name of the first built-in parametric library definition.
 pub const ALUMINIUM_EXTRUSION_20X20_NAME: &str = "20 × 20 Aluminium Extrusion";
-/// The current immutable revision of the built-in example definition.
+/// The authored (major) revision of the built-in example definition. The
+/// package's full revision adds a minor that follows the native document
+/// schema it embeds, because the embedded document — and so the package's
+/// content address — changes with the schema even when the part does not
+/// (see `library_catalog::builtin_part_revision`).
 pub const ALUMINIUM_EXTRUSION_20X20_REVISION: u32 = 1;
 /// Stable key of the exposed extrusion-length parameter.
 pub const LENGTH_PARAMETER_KEY: &str = "length";
@@ -57,7 +61,8 @@ pub struct PartParameterAssignment {
 pub struct PartInsertionIntent {
     pub staging_id: u64,
     pub definition_key: String,
-    pub definition_revision: u32,
+    /// The exact revision, `[major, minor, patch]`, of the package selected.
+    pub definition_revision: [u32; 3],
     /// SHA-256 address of the exact immutable package selected in the library.
     pub definition_digest: String,
     pub display_name: String,
@@ -152,6 +157,8 @@ pub struct PartLibraryState {
     /// The document's length unit, which the Length field shows and reads.
     length_unit: LengthUnit,
     definition_digest: String,
+    /// The exact revision of the package the card is pinned to.
+    definition_revision: [u32; 3],
     next_staging_id: u64,
     staged: Option<PartInsertionIntent>,
     committed: Vec<PartInsertionIntent>,
@@ -188,6 +195,7 @@ impl PartLibraryState {
             length_default_mm: valid_default,
             length_unit: LengthUnit::Millimetre,
             definition_digest: String::new(),
+            definition_revision: [ALUMINIUM_EXTRUSION_20X20_REVISION, 0, 0],
             next_staging_id: 1,
             staged: None,
             committed: Vec::new(),
@@ -235,8 +243,20 @@ impl PartLibraryState {
     }
 
     /// Pins the visible card to one exact immutable catalog package.
-    pub(crate) fn set_definition_digest(&mut self, digest: impl Into<String>) {
+    pub(crate) fn set_definition(&mut self, digest: impl Into<String>, revision: [u32; 3]) {
         self.definition_digest = digest.into();
+        self.definition_revision = revision;
+    }
+
+    /// The exact revision of the package the card is pinned to.
+    #[must_use]
+    pub const fn definition_revision(&self) -> [u32; 3] {
+        self.definition_revision
+    }
+
+    fn revision_label(&self) -> String {
+        let [major, minor, patch] = self.definition_revision;
+        format!("{major}.{minor}.{patch}")
     }
 
     #[must_use]
@@ -301,7 +321,7 @@ impl PartLibraryState {
         self.staged = Some(PartInsertionIntent {
             staging_id,
             definition_key: ALUMINIUM_EXTRUSION_20X20_KEY.to_owned(),
-            definition_revision: ALUMINIUM_EXTRUSION_20X20_REVISION,
+            definition_revision: self.definition_revision,
             definition_digest: self.definition_digest.clone(),
             display_name: ALUMINIUM_EXTRUSION_20X20_NAME.to_owned(),
             parameters: vec![PartParameterAssignment {
@@ -501,15 +521,14 @@ impl PartLibraryState {
                 .color(library_text())
                 .strong(),
         );
+        let revision = self.revision_label();
         let package_identity = if self.definition_digest.len() == 64 {
             format!(
-                "Parametric part · revision {ALUMINIUM_EXTRUSION_20X20_REVISION}.0.0 · verified {}…",
+                "Parametric part · revision {revision} · verified {}…",
                 &self.definition_digest[..12]
             )
         } else {
-            format!(
-                "Parametric part · revision {ALUMINIUM_EXTRUSION_20X20_REVISION}.0.0 · package unavailable"
-            )
+            format!("Parametric part · revision {revision} · package unavailable")
         };
         ui.label(
             RichText::new(package_identity)

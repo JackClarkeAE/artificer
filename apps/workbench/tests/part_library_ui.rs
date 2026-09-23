@@ -293,6 +293,67 @@ fn persistent_store_selection_pins_digest_and_inserts_through_exact_revision() {
     assert_eq!(reopened.index_snapshot().unwrap().len(), 1);
 }
 
+/// A library a previous build wrote still opens, and still inserts through
+/// the store.
+///
+/// Every build rebuilds the built-in part from code, and the document it
+/// embeds records the schema it was written in, so a schema bump changes the
+/// package's bytes. The built-in used to keep revision 1.0.0 regardless, so
+/// the store refused the new copy as a clash with the old one, the workbench
+/// fell back to its in-memory part for good, and each refused publish left
+/// another unreachable copy on disk.
+#[test]
+fn a_store_written_by_an_older_build_still_opens_and_inserts() {
+    use artificer_catalog::{PartDefinition, PartPackage, PartRevision};
+    use artificer_workbench::library_catalog::builtin_aluminium_extrusion_package;
+
+    let catalog = TemporaryCatalogRoot::new();
+    let current = builtin_aluminium_extrusion_package().expect("the built-in part builds");
+    let definition = current.definition();
+    let older = PartPackage::seal(
+        PartDefinition::parametric(
+            definition.id().clone(),
+            PartRevision::new(1, 0, 0),
+            definition
+                .metadata()
+                .clone()
+                .with_description("The built-in part as an earlier build wrote it.")
+                .expect("valid metadata"),
+            definition.parameters().to_vec(),
+            definition.document().clone(),
+        )
+        .expect("a valid definition"),
+    )
+    .expect("the older package seals");
+    {
+        let store = CatalogStore::open(&catalog.path).expect("the store opens");
+        store.publish(&older).expect("the older build publishes");
+    }
+
+    let mut harness = catalog_harness(catalog.path.clone());
+    harness.run();
+    assert!(
+        harness.state().persistent_catalog_active(),
+        "the store must stay in use after an upgrade"
+    );
+    assert_eq!(
+        harness.state().catalog_entry_count(),
+        2,
+        "the older revision stays, beside the current one"
+    );
+
+    click_button(&mut harness, "Library");
+    enter_length(&mut harness, "125");
+    click_button(&mut harness, "Add to current workspace");
+    let staged = harness
+        .state()
+        .staged_part_insertion()
+        .expect("the store-backed intent stages");
+    assert_eq!(staged.definition_revision[1], CURRENT_DOCUMENT_VERSION);
+    click_button(&mut harness, "Confirm operation");
+    assert_eq!(harness.state().component_instance_count(), 1);
+}
+
 #[test]
 fn component_variants_survive_fresh_process_save_load_and_replay() {
     let mut source = harness();
