@@ -65,8 +65,8 @@ drill(face: plate.face("top_face"), center: [0, 0], diameter: 5, depth: 6, label
   only; math functions and `faces("...")`/`edges("...")` take positional
   arguments.
 - **Methods** are `step.face("role")`, `step.edge("role")`,
-  `step.edges("role", count: n)` and `step.edges()`; a face selector has
-  `.edges()` and `.rim()` (section 7).
+  `step.edges("role", count: n)`, `step.edges()` and `step.faces()`; a face
+  selector has `.edges()` and `.rim()` (section 7).
 - **Expressions**: numbers (`12`, `1.5`), strings (`"top"`), arrays
   (`[1, 2, 3]`), identifiers, unary minus, `+ - * /`, parentheses, calls and
   methods. `pi` is predefined.
@@ -103,6 +103,27 @@ A script that fails to parse or evaluate reports one error with its **line
 and column**. A step the kernel refuses reports the step's label and the
 kernel's reason. Script Studio shows both in the console and marks the line;
 the CLI prints them; the JSON-RPC server returns them as the error object.
+
+### Limits
+
+A script is refused, with its line and column, rather than allowed to
+exhaust the machine:
+
+- an expression nested more than 64 levels deep, where brackets, calls,
+  arrays and every link of an operator or method chain each count as one —
+  a sum of more than about 64 terms is written as a loop instead;
+- blocks nested more than 64 deep, calls more than 32 deep, arrays of
+  arrays more than 32 deep, and evaluation more than 256 levels deep in all;
+- more than 10 million evaluation steps in all, where every expression,
+  block, array element and byte of text built or passed counts;
+- more than 10,000 loop iterations in all, an array of more than 100,000
+  elements, or text over 1 MiB;
+- a number that is not finite, whether written (`1e400`) or computed.
+
+An analysis study takes at most 64 subjects, and a sweep at most 10,000
+positions and 200,000 measurements. A JSON-RPC request line is at most
+16 MiB; the rest of a longer line is read and discarded, and the request
+refused.
 
 ---
 
@@ -278,7 +299,7 @@ chain end to end into a closed loop; a loop may close along the revolve axis.
 |---|---|---|
 | `line(start: [x, y], end: [x, y])` | both required | A segment. Chain segments into loops. |
 | `circle(center: [x, y], radius: r)` | `radius` or `diameter`; `center` defaults to `[0, 0]` | A closed loop. |
-| `arc(center:, radius:, start_angle:, end_angle:)` | `radius` or `diameter`; angles in degrees, counter-clockwise | Part of a loop with lines or other arcs. |
+| `arc(center:, radius:, start_angle:, end_angle:)` | `radius` or `diameter`; angles in degrees, counter-clockwise, or `start_radians:`/`end_radians:` instead | Part of a loop with lines or other arcs. The decompiler writes radians only where no short decimal of degrees comes back to the same angle. |
 | `rect(width:, height:, origin: [x, y])` | `origin` is the minimum corner | A closed loop. |
 | `rect(width:, height:, center: [x, y])` | centred | `rect(width:, height:)` alone is centred on `[0, 0]`. |
 | `spline(points: [[x, y], ...], closed: false)` | at least two points; three when `closed` | A smooth curve through the points. Open, it is part of a loop with lines, arcs or other splines; `closed: true` makes it a loop of its own. |
@@ -704,6 +725,7 @@ let top = b.face("top_face");
 let one_edge = b.edge("edge", ordinal: 3);
 let ring = b.edges("edge", count: 12);   // every edge the step made under that role
 let every = b.edges();                   // every edge the step made, whatever the role
+let skin = b.faces();                    // every face the step made
 ```
 
 Roles are what the step reported when it ran. Boxes report the six face
@@ -712,7 +734,8 @@ roles listed under `box`; drills report `FeatureSide` walls and a
 has several entities, `ordinal:` picks one and `.edges(count:)` lists them.
 `.edges()` with nothing named needs no role at all: it is every crease edge
 the step made, so `cyl.edges()` is a cylinder's rims although a cylinder
-reports no `edge` role.
+reports no `edge` role. `.faces()` is the same for faces: every face the step
+made, which is how a decompiled script names them.
 
 ### Naming faces: `let name = <selector>`
 
@@ -986,7 +1009,10 @@ label prefixed with the call's `label` argument and a slash, so the first
 call above builds `s1/boss/profile`, `s1/boss` and `s1/hole`, and a loop of
 calls needs no string arithmetic to stay unique. The step that carries the
 call's own label (the `extrude(... label: label)` inside `cylinder_on`) *is*
-the call's step, `s1/boss`, not `s1/boss/boss`. A function without a `label`
+the call's step, `s1/boss`, not `s1/boss/boss`. A label already under the
+prefix — the prefix and a slash — is left as it is; one that merely begins
+with the same letters is scoped like any other, so `label + "_boss"` in a
+call labelled `b` builds `b/b_boss`. A function without a `label`
 parameter, or called without one, scopes by its name and call count:
 `block_1/`, `block_2/`. Nested calls nest their prefixes.
 
