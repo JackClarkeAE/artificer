@@ -59,7 +59,8 @@ by tests, and **proposed** is a plan not yet executed.
 | [0046](0046-a-hole-rim-is-one-closed-edge.md) | A hole rim is one closed edge | Implemented | 0023, 0034 |
 | [0047](0047-the-curve-two-cylinders-share.md) | The curve two cylinders share | Implemented | 0025, 0026, 0045 |
 | [0048](0048-a-construction-plane-is-a-feature.md) | A construction plane is a feature | Implemented (workbench) | 0008, 0014, 0036, 0037, 0041 |
-| [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md) | Ruled and spline surfaces enter the vocabulary | Accepted (K-A implemented) | 0025, 0045, 0047; supersedes 0026's splines row |
+| [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md) | Ruled and spline surfaces enter the vocabulary | Accepted (K-A and K-B implemented) | 0025, 0045, 0047, 0050; supersedes 0026's splines row |
+| [0050](0050-b-spline-curves-and-surfaces-as-carriers.md) | B-spline curves and surfaces as carriers | Accepted and implemented | 0026, 0047, 0049 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.
