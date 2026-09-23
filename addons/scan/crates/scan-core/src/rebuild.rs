@@ -95,6 +95,9 @@ pub struct RebuiltModel {
     /// Edge ends no corner adopted, each with the reason it is open —
     /// the watertightness work list, located in space.
     pub open_ends: Vec<crate::sew::OpenEnd>,
+    /// The walked shell: how much of the recovered boundary sews, which
+    /// is the number that says whether the rebuild is a solid yet.
+    pub shell: crate::sew::Shell,
     /// Bores emitted as exact tubes. Structured rather than only
     /// narrated, so a bench can score them against a known part: a
     /// diameter that drifts from 10.00 to 11.29 is invisible in the
@@ -226,6 +229,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
     let mut edges: Vec<SharedEdge>;
     let corners: Vec<crate::sew::Corner>;
     let open_ends: Vec<crate::sew::OpenEnd>;
+    let sewn_shell: crate::sew::Shell;
     // Recognized cut volumes: built inside the plan block, consumed
     // once more by the punch after every emission stage has run.
     let mut cut_volumes: Vec<CutVolume> = Vec::new();
@@ -1711,6 +1715,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
             notes.push(format!("open-end triage: {listing}"));
         }
         notes.push(shell.describe());
+        sewn_shell = shell;
         if trimmed_overlap > 0.0 {
             notes.push(format!(
                 "{trimmed_overlap:.0} mm^2 of interpenetrating material cut back to the exact                  line where the two faces meet"
@@ -2005,6 +2010,7 @@ pub fn rebuild_sharp(mesh: &TriangleMesh, report: &ReverseReport) -> Option<Rebu
         edges,
         corners,
         open_ends,
+        shell: sewn_shell,
         bores,
     })
 }

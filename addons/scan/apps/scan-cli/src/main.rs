@@ -21,6 +21,11 @@ mod snapshot;
 mod viewer;
 
 fn load_mesh(path: &str) -> Result<TriangleMesh, String> {
+    // `synth:NAME` is a part built in code, so a fixture or a demo can
+    // be a command line rather than a file that can be lost.
+    if let Some(built) = artificer_scan_core::bench::synthetic_source(path) {
+        return built;
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let extension = Path::new(path)
         .extension()
@@ -66,7 +71,8 @@ fn usage() -> String {
                              [--out scan.stl] [--snapshot cmp.png]\n\
      artificer-scan bench [--manifest bench/fixtures.txt] [--only NAME]\n\
      \x20                    [--baseline file] [--write-baseline file]\n\
-     artificer-scan demo [--out scan.stl]"
+     artificer-scan demo [--out scan.stl]\n\
+     a <mesh> is a .stl/.ply/.obj/.step file, or synth:plate-with-boss / synth:freeform-block"
         .to_owned()
 }
 

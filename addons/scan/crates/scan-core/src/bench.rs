@@ -18,11 +18,32 @@
 //!
 //! Fixtures are simulated from source CAD at a fixed seed, so a run is
 //! reproducible from the repository and a scratchpad wipe costs nothing
-//! but the time to regenerate.
+//! but the time to regenerate. A source written `synth:NAME` is a part
+//! built in code ([`crate::synth::named_part`]) rather than read from a
+//! file, so those fixtures need nothing but the repository — and where
+//! the part carries a known freeform surface, the rebuild is scored
+//! against that surface too, which no file-based fixture can offer.
+//!
+//! Freeform is scored as its own question. A region no analytic surface
+//! explains is carried as measured mesh, which reads as "explained" in
+//! the coverage totals while being nothing a CAD system can hold, so
+//! the share of the scan left freeform, and how much of a known
+//! freeform surface arrives as a *surface*, travel beside the totals.
 
 use crate::mesh::TriangleMesh;
 use crate::report::{ReverseOptions, reverse_engineer};
+use crate::segment::SurfaceClass;
 use crate::simulate::{SimulateOptions, simulate_scan};
+
+/// Prefix naming a part built in code rather than read from a file.
+pub const SYNTH_PREFIX: &str = "synth:";
+
+/// The mesh a `synth:NAME` source names, or `None` when the source is
+/// a file path for the caller to read.
+pub fn synthetic_source(source: &str) -> Option<Result<TriangleMesh, String>> {
+    let name = source.strip_prefix(SYNTH_PREFIX)?;
+    Some(crate::synth::named_part(name).ok_or_else(|| format!("no synthetic part named `{name}`")))
+}
 
 /// One part, the scan to make of it, and what it is known to contain.
 #[derive(Debug, Clone)]
@@ -62,6 +83,57 @@ pub struct Score {
     pub seconds: f64,
     pub slowest_stage: String,
     pub slowest_seconds: f64,
+    /// Share of the scan's area that ends the pipeline freeform: no
+    /// analytic surface claims it.
+    pub freeform: f64,
+    /// Area-weighted RMS of the analytic fits against their own faces
+    /// (mm), and the worst single deviation among them.
+    pub analytic_rms: f64,
+    pub analytic_max: f64,
+    /// Share of the rebuilt shell's walked edges that sew, and the edge
+    /// ends left open. A solid is 1 and 0.
+    pub sewn: f64,
+    pub open_ends: usize,
+    /// Against a synthetic part's known freeform surface, where the
+    /// fixture has one: the rebuilt model's RMS and worst deviation
+    /// from it (mm) over the true surface's interior...
+    pub truth_rms: f64,
+    pub truth_max: f64,
+    /// ...and the share of that interior the model carries as a CAD
+    /// surface rather than as measured mesh. Negative when the fixture
+    /// has no truth.
+    pub truth_cad: f64,
+}
+
+impl Score {
+    /// A score with nothing measured yet.
+    pub fn empty() -> Self {
+        Score {
+            name: String::new(),
+            noise_sigma: 0.0,
+            tolerance: 0.0,
+            features: 0,
+            triangles: 0,
+            explained: 0.0,
+            invented: 0.0,
+            analytic: 0.0,
+            bores_expected: 0,
+            bores_found: 0,
+            bores_on_size: 0,
+            worst_bore_error: 0.0,
+            seconds: 0.0,
+            slowest_stage: String::new(),
+            slowest_seconds: 0.0,
+            freeform: 0.0,
+            analytic_rms: 0.0,
+            analytic_max: 0.0,
+            sewn: 0.0,
+            open_ends: 0,
+            truth_rms: 0.0,
+            truth_max: 0.0,
+            truth_cad: -1.0,
+        }
+    }
 }
 
 /// Reads a fixture manifest.
@@ -146,16 +218,10 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
         tolerance: report.tolerance,
         features: report.features.len(),
         triangles: scan.mesh.triangles().len(),
-        explained: 0.0,
-        invented: 0.0,
-        analytic: 0.0,
         bores_expected: fixture.expect_bores,
-        bores_found: 0,
-        bores_on_size: 0,
-        worst_bore_error: 0.0,
         seconds,
-        slowest_stage: String::new(),
-        slowest_seconds: 0.0,
+        truth_cad: -1.0,
+        ..Score::empty()
     };
     for stage in &report.stages {
         if stage.seconds > score.slowest_seconds {
@@ -163,12 +229,22 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
             score.slowest_stage = stage.stage.clone();
         }
     }
+    let freeform: f64 = report
+        .features
+        .iter()
+        .filter(|f| matches!(f.surface, SurfaceClass::Freeform))
+        .map(|f| f.area)
+        .sum();
+    score.freeform = freeform / report.total_area.max(1e-9);
+    (score.analytic_rms, score.analytic_max) = analytic_deviation(&report);
     let Some(rebuilt) = crate::rebuild::rebuild_sharp(&scan.mesh, &report) else {
         return score;
     };
     let Some(alignment) = report.datum.as_ref() else {
         return score;
     };
+    score.sewn = rebuilt.shell.watertight_fraction();
+    score.open_ends = rebuilt.open_ends.len();
     let (explained, total) =
         crate::coverage::explained_area(&scan.mesh, &rebuilt.mesh, alignment, report.tolerance);
     let (invented, emitted) =
@@ -206,7 +282,94 @@ pub fn score_fixture(fixture: &Fixture, source: &TriangleMesh, seconds: f64) -> 
             }
         }
     }
+    if let Some(truth) = fixture
+        .source
+        .strip_prefix(SYNTH_PREFIX)
+        .and_then(crate::synth::ground_truth)
+    {
+        let certified = |face: usize| {
+            report
+                .features
+                .iter()
+                .find(|f| f.id == rebuilt.feature_of_face[face])
+                .is_some_and(|f| !matches!(f.surface, SurfaceClass::Freeform))
+        };
+        let against = score_truth(&scan.mesh, &rebuilt.mesh, alignment, truth, certified);
+        (score.truth_rms, score.truth_max, score.truth_cad) = against;
+    }
     score
+}
+
+/// Area-weighted RMS over the analytic fits and the worst single
+/// deviation among them — how well the surfaces that *were* recognized
+/// describe their own material.
+fn analytic_deviation(report: &crate::report::ReverseReport) -> (f64, f64) {
+    let (mut squared, mut area, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+    for feature in &report.features {
+        let deviation = match &feature.surface {
+            SurfaceClass::Plane(fit) => fit.deviation,
+            SurfaceClass::Cylinder(fit) => fit.deviation,
+            SurfaceClass::Sphere(fit) => fit.deviation,
+            SurfaceClass::Cone(fit) => fit.deviation,
+            SurfaceClass::Blend(fit) | SurfaceClass::Torus(fit) => fit.deviation,
+            _ => continue,
+        };
+        squared += feature.area * deviation.rms * deviation.rms;
+        area += feature.area;
+        worst = worst.max(deviation.max_abs);
+    }
+    ((squared / area.max(1e-9)).sqrt(), worst)
+}
+
+/// The rebuilt model against a synthetic part's known surface: RMS and
+/// worst deviation (mm) of the model's geometry lying over the true
+/// surface's interior, and the share of that interior — measured as the
+/// scan's own area there — the model carries on `certified` faces, which
+/// is to say as a surface rather than as measured mesh.
+///
+/// The model is in the datum frame and the truth in the part's own, so
+/// every rebuilt vertex is carried back before it is asked.
+fn score_truth(
+    scan: &TriangleMesh,
+    rebuilt: &TriangleMesh,
+    alignment: &crate::datum::DatumAlignment,
+    truth: crate::synth::GroundTruth,
+    certified: impl Fn(usize) -> bool,
+) -> (f64, f64, f64) {
+    let back = alignment.transform.inverse();
+    let (mut squared, mut weight, mut worst) = (0.0f64, 0.0f64, 0.0f64);
+    let mut carried = 0.0f64;
+    for face in 0..rebuilt.triangles().len() {
+        let corners = rebuilt.triangle_points(face).map(|p| back.apply_point(p));
+        let centroid = artificer_geometry::Point3::new(
+            (corners[0].x + corners[1].x + corners[2].x) / 3.0,
+            (corners[0].y + corners[1].y + corners[2].y) / 3.0,
+            (corners[0].z + corners[1].z + corners[2].z) / 3.0,
+        );
+        if truth(centroid).is_none() {
+            continue;
+        }
+        let area = rebuilt.face_area(face);
+        for point in corners.into_iter().chain([centroid]) {
+            if let Some(distance) = truth(point) {
+                squared += area * distance * distance;
+                weight += area;
+                worst = worst.max(distance.abs());
+            }
+        }
+        if certified(face) {
+            carried += area;
+        }
+    }
+    let true_area: f64 = (0..scan.triangles().len())
+        .filter(|&face| truth(scan.face_centroid(face)).is_some())
+        .map(|face| scan.face_area(face))
+        .sum();
+    (
+        (squared / weight.max(1e-12)).sqrt(),
+        worst,
+        carried / true_area.max(1e-9),
+    )
 }
 
 /// The scoreboard as a table.
@@ -234,6 +397,37 @@ pub fn table(scores: &[Score]) -> String {
     out.push_str(
         "\nbores read on-size / found / expected; worst-d is the largest diameter error (mm)\n",
     );
+    out.push_str(
+        "\nfixture              free%  an-rms  an-max  sewn%  open   truth-rms truth-max  cad%   secs\n",
+    );
+    for score in scores {
+        let truth = if score.truth_cad < 0.0 {
+            format!("{:>9} {:>9} {:>5}", "-", "-", "-")
+        } else {
+            format!(
+                "{:>9.4} {:>9.3} {:>5.1}",
+                score.truth_rms,
+                score.truth_max,
+                100.0 * score.truth_cad
+            )
+        };
+        out.push_str(&format!(
+            "{:<20} {:>5.1} {:>7.4} {:>7.3} {:>6.1} {:>5}   {truth} {:>6.1}\n",
+            truncate(&score.name, 20),
+            100.0 * score.freeform,
+            score.analytic_rms,
+            score.analytic_max,
+            100.0 * score.sewn,
+            score.open_ends,
+            score.seconds,
+        ));
+    }
+    out.push_str(
+        "\nfree% is the scan area left freeform; an-rms/an-max the analytic fits against their \
+         own faces (mm);\nsewn% the rebuilt shell's sewn edges; truth-* the model against a \
+         synthetic part's known\nsurface (mm), cad% the share of that surface carried as a CAD \
+         surface rather than measured mesh\n",
+    );
     out
 }
 
@@ -244,7 +438,8 @@ pub fn to_text(scores: &[Score]) -> String {
     for s in scores {
         out.push_str(&format!(
             "name={} tri={} feat={} sigma={:.4} tol={:.4} expl={:.4} inv={:.4} anly={:.4} \
-             on_size={} found={} expected={} worst_d={:.4} slowest={} slowest_s={:.1}\n",
+             on_size={} found={} expected={} worst_d={:.4} slowest={} slowest_s={:.1} \
+             secs={:.1} free={:.4} an_rms={:.4} an_max={:.4} sewn={:.4} open={}",
             s.name,
             s.triangles,
             s.features,
@@ -263,7 +458,20 @@ pub fn to_text(scores: &[Score]) -> String {
                 &s.slowest_stage
             },
             s.slowest_seconds,
+            s.seconds,
+            s.freeform,
+            s.analytic_rms,
+            s.analytic_max,
+            s.sewn,
+            s.open_ends,
         ));
+        if s.truth_cad >= 0.0 {
+            out.push_str(&format!(
+                " truth_rms={:.4} truth_max={:.4} truth_cad={:.4}",
+                s.truth_rms, s.truth_max, s.truth_cad
+            ));
+        }
+        out.push('\n');
     }
     out
 }
@@ -276,23 +484,7 @@ pub fn from_text(text: &str) -> Vec<Score> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let mut score = Score {
-            name: String::new(),
-            noise_sigma: 0.0,
-            tolerance: 0.0,
-            features: 0,
-            triangles: 0,
-            explained: 0.0,
-            invented: 0.0,
-            analytic: 0.0,
-            bores_expected: 0,
-            bores_found: 0,
-            bores_on_size: 0,
-            worst_bore_error: 0.0,
-            seconds: 0.0,
-            slowest_stage: String::new(),
-            slowest_seconds: 0.0,
-        };
+        let mut score = Score::empty();
         for field in line.split_whitespace() {
             let Some((key, value)) = field.split_once('=') else {
                 continue;
@@ -313,6 +505,15 @@ pub fn from_text(text: &str) -> Vec<Score> {
                 "worst_d" => score.worst_bore_error = f,
                 "slowest" => score.slowest_stage = value.to_owned(),
                 "slowest_s" => score.slowest_seconds = f,
+                "secs" => score.seconds = f,
+                "free" => score.freeform = f,
+                "an_rms" => score.analytic_rms = f,
+                "an_max" => score.analytic_max = f,
+                "sewn" => score.sewn = f,
+                "open" => score.open_ends = f as usize,
+                "truth_rms" => score.truth_rms = f,
+                "truth_max" => score.truth_max = f,
+                "truth_cad" => score.truth_cad = f,
                 _ => {}
             }
         }
@@ -330,8 +531,9 @@ pub fn from_text(text: &str) -> Vec<Score> {
 /// comparison that only lists regressions cannot be told apart from
 /// one that failed to run.
 pub fn compare(baseline: &[Score], current: &[Score]) -> String {
-    let mut out =
-        String::from("fixture              expl%      inv%     anly%   on-size  worst-d\n");
+    let mut out = String::from(
+        "fixture              expl%      inv%     anly%   on-size  worst-d     free%      cad%\n",
+    );
     let mut regressed = 0;
     for now in current {
         let Some(was) = baseline.iter().find(|b| b.name == now.name) else {
@@ -349,14 +551,20 @@ pub fn compare(baseline: &[Score], current: &[Score]) -> String {
         if worse {
             regressed += 1;
         }
+        let cad = if now.truth_cad >= 0.0 && was.truth_cad >= 0.0 {
+            format!("{:>+9.2}", 100.0 * (now.truth_cad - was.truth_cad))
+        } else {
+            format!("{:>9}", "-")
+        };
         out.push_str(&format!(
-            "{:<20} {:>+6.2} {:>+9.2} {:>+9.2} {:>+8} {:>+8.3}{}\n",
+            "{:<20} {:>+6.2} {:>+9.2} {:>+9.2} {:>+8} {:>+8.3} {:>+9.2} {cad}{}\n",
             truncate(&now.name, 20),
             100.0 * (now.explained - was.explained),
             100.0 * (now.invented - was.invented),
             100.0 * (now.analytic - was.analytic),
             now.bores_on_size as i64 - was.bores_on_size as i64,
             now.worst_bore_error - was.worst_bore_error,
+            100.0 * (now.freeform - was.freeform),
             if worse { "   REGRESSED" } else { "" },
         ));
     }
@@ -431,9 +639,17 @@ mod tests {
             bores_found: 4,
             bores_on_size: 4,
             worst_bore_error: 0.04,
-            seconds: 0.0,
+            seconds: 12.5,
             slowest_stage: "coaxial-unify".to_owned(),
             slowest_seconds: 3219.4,
+            freeform: 0.081,
+            analytic_rms: 0.0213,
+            analytic_max: 0.412,
+            sewn: 0.171,
+            open_ends: 96,
+            truth_rms: 0.0182,
+            truth_max: 0.094,
+            truth_cad: 0.35,
         }];
         let read = from_text(&to_text(&scores));
         assert_eq!(read.len(), 1);
@@ -441,6 +657,12 @@ mod tests {
         assert_eq!(read[0].bores_on_size, 4);
         assert!((read[0].invented - 0.036).abs() < 1e-6);
         assert_eq!(read[0].slowest_stage, "coaxial-unify");
+        assert!((read[0].freeform - 0.081).abs() < 1e-6);
+        assert_eq!(read[0].open_ends, 96);
+        assert!((read[0].truth_cad - 0.35).abs() < 1e-6);
+        // A line from before these columns existed reads as "no truth".
+        let old = from_text("name=rail tri=10 feat=2 expl=0.9\n");
+        assert!(old[0].truth_cad < 0.0);
     }
 
     #[test]
@@ -479,23 +701,21 @@ mod tests {
         assert!(report.contains("not run"), "{report}");
     }
 
+    #[test]
+    fn a_synthetic_source_is_built_in_code_and_a_path_is_left_to_the_caller() {
+        let mesh = synthetic_source("synth:freeform-block")
+            .expect("a synth source")
+            .expect("a known part");
+        assert!(mesh.triangles().len() > 1000);
+        assert!(
+            synthetic_source("synth:no-such-part")
+                .expect("synth")
+                .is_err()
+        );
+        assert!(synthetic_source("bench/parts/wheel-spacer.step").is_none());
+    }
+
     fn blank() -> Score {
-        Score {
-            name: String::new(),
-            noise_sigma: 0.0,
-            tolerance: 0.0,
-            features: 0,
-            triangles: 0,
-            explained: 0.0,
-            invented: 0.0,
-            analytic: 0.0,
-            bores_expected: 0,
-            bores_found: 0,
-            bores_on_size: 0,
-            worst_bore_error: 0.0,
-            seconds: 0.0,
-            slowest_stage: String::new(),
-            slowest_seconds: 0.0,
-        }
+        Score::empty()
     }
 }

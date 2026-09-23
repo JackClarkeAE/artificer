@@ -388,6 +388,32 @@ deterministic path, so the saved STL is exactly what `simulate` prints
 with the same options. Rendering is `scan-core::render` — the same
 rasterizer the snapshots use, so the lab shows what CI would.
 
+**Synthetic parts and the freeform columns (2026-09-23).** Any `<mesh>`
+argument, and any bench `source=`, may be `synth:plate-with-boss` or
+`synth:freeform-block`: parts built in code, so their fixtures need
+nothing but the repository (the wheel spacer and DIN rail STEPs are
+kept out of the tree and are not on every machine). The freeform block
+is a closed block whose top is a known bump-and-saddle height field
+(`synth::freeform_top_height`), which gives the bench something no file
+fixture has: ground truth for a surface no analytic fitter describes.
+The bench prints a second table beside the first — `free%`, the scan
+area left freeform; `an-rms`/`an-max`, the analytic fits against their
+own faces; `sewn%` and `open`, how much of the rebuilt shell closes;
+and on a part with truth, `truth-rms`/`truth-max` of the rebuilt model
+against the true surface and `cad%`, the share of that surface carried
+as a CAD surface rather than as measured mesh (over 100% means some of
+it is drawn twice, by overlapping patches).
+
+The first run on the block says where freeform actually goes, and it
+is not where it was assumed to go. Almost none of the top stays
+freeform (0.2%): RANSAC carves it into forty-odd plane facets, a few
+spheres and an 81° cone, each passing the 0.12 mm working tolerance
+because the tolerance is seven noise sigmas and a gently curved surface
+is flat to that over a hand's width. Together they miss the true
+surface by up to 1.16 mm, overlap until the top is drawn 1.8 times, and
+leave the shell 12.9% sewn — and the feature tree reads the facets as
+a stack of extrudes.
+
 **Drilled holes are recognized and opened (2026-08-16).** A lone
 cylinder is the commonest extrusion there is — a drilled hole — and the
 pooled kinematic gate could never license one (a single cylinder's
