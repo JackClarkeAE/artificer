@@ -40,6 +40,7 @@ mod ruled;
 mod section_revolve;
 mod sew;
 mod shell;
+mod spline_profile;
 mod step_export;
 mod surface_intersection;
 mod topology;
@@ -969,7 +970,20 @@ impl NativeKernel {
                 distance,
             } => {
                 validate_extrusion_source(input)?;
-                if profile_contains_analytic_curves(profile) {
+                if spline_profile::profile_contains_splines(profile) {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "extrusion/spline-profile";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if profile_contains_analytic_curves(profile) {
                     let extrusion = validate_analytic_profile_extrusion(
                         *frame,
                         profile,
@@ -1003,7 +1017,32 @@ impl NativeKernel {
                     .precision
                     .modeling_resolution
                     .max(request.precision.min_feature_size);
-                if offset.abs() <= minimum {
+                let splines = spline_profile::profile_contains_splines(profile);
+                if splines && offset.abs() <= minimum {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "loft/straight";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if splines {
+                    // The offset of a spline is not a spline of any degree,
+                    // so the drafted section would have no exact carrier.
+                    return Err(planar_profile_error(
+                        input.id,
+                        KernelErrorCode::Unsupported,
+                        "LOFT_OFFSET_SPLINE_UNSUPPORTED",
+                        "a drafted loft offsets its section, and the offset of a B-spline is not \
+                         a B-spline, so a profile with splines cannot be drafted. Loft between \
+                         the profile and a scaled copy of it instead.",
+                    ));
+                } else if offset.abs() <= minimum {
                     // No draft is a straight extrusion; build it as one so the
                     // walls are the cylinders and planes an extrusion makes.
                     let extrusion = validate_analytic_profile_extrusion(
@@ -1090,6 +1129,26 @@ impl NativeKernel {
                         exit_face,
                     },
                 )
+            }
+            KernelCommand::ExtrudeFacePlanarProfile {
+                target_face,
+                frame,
+                profile,
+                distance,
+                operation,
+            } if spline_profile::profile_contains_splines(profile) => {
+                let (topology, answered) = spline_face_feature(
+                    input,
+                    *target_face,
+                    *frame,
+                    profile,
+                    *distance,
+                    *operation,
+                    request.precision,
+                    &mut warnings,
+                )?;
+                rung = answered;
+                (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::ExtrudeFacePlanarProfile {
                 target_face,
@@ -3944,15 +4003,50 @@ fn faceted_candidate_refusal(
     ))
 }
 
-/// A loft added to or cut from a body, through the Boolean ladder: the prism
-/// reduction, then the analytic engine where it carries both operands, then
-/// the faceted tier with its label. Returns the body and the rung that
-/// answered.
-///
-/// The loft is certified as a solid before it meets the body, so an invalid
-/// tool never reaches any tier. A loft whose walls all came out as planes,
-/// cylinders or cones — a frustum, say — is inside the exact engines' reach;
-/// a ruled wall is not (ADR 0049), and the engines decline it by name.
+/// How one feature that builds a tool body and combines it with the body
+/// names the rungs of the Boolean ladder and its own refusals and warnings.
+struct ToolBoolean {
+    /// What the tool is, in the messages: "loft" or "spline profile".
+    noun: &'static str,
+    empty: &'static str,
+    declined: &'static str,
+    unresolved: &'static str,
+    approximation: &'static str,
+    /// The rungs, in order: the prism reduction, the analytic engine, the
+    /// faceted tier.
+    rungs: [&'static str; 3],
+}
+
+/// A loft added to or cut from a body (ADR 0049).
+const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "loft",
+    empty: "LOFT_TARGET_EMPTY",
+    declined: "LOFT_EXACT_ROUTE_DECLINED",
+    unresolved: "LOFT_FACETED_UNRESOLVED",
+    approximation: "LOFT_FACETED_APPROXIMATION",
+    rungs: [
+        "loft/boolean-prism",
+        "loft/boolean-analytic",
+        "loft/faceted",
+    ],
+};
+
+/// A spline profile added to or cut from a face (ADR 0050), which answers
+/// as every other face feature does.
+const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "spline profile",
+    empty: "FACE_FEATURE_TARGET_MISSING",
+    declined: "FACE_FEATURE_EXACT_ROUTE_DECLINED",
+    unresolved: "FACE_FEATURE_FACETED_UNRESOLVED",
+    approximation: "FACE_FEATURE_FACETED_APPROXIMATION",
+    rungs: [
+        "face-feature/exact-prism",
+        "face-feature/analytic-boolean",
+        "face-feature/faceted",
+    ],
+};
+
+/// A loft added to or cut from a body, through the Boolean ladder.
 fn loft_boolean(
     input: &Snapshot,
     tool: Topology,
@@ -3960,11 +4054,43 @@ fn loft_boolean(
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
 ) -> Result<(Topology, &'static str), KernelError> {
+    tool_boolean(input, tool, add, precision, warnings, &LOFT_BOOLEAN)
+}
+
+/// A tool body added to or cut from a body, through the Boolean ladder: the
+/// prism reduction, then the analytic engine where it carries both operands,
+/// then the faceted tier with its label. Returns the body and the rung that
+/// answered.
+///
+/// The tool is certified as a solid before it meets the body, so an invalid
+/// tool never reaches any tier. A tool whose walls are all planes, cylinders
+/// or cones — a frustum, say — is inside the exact engines' reach; a ruled
+/// wall (ADR 0049) or a B-spline wall (ADR 0050) is not, and the engines
+/// decline it by name.
+fn tool_boolean(
+    input: &Snapshot,
+    tool: Topology,
+    add: bool,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+    labels: &ToolBoolean,
+) -> Result<(Topology, &'static str), KernelError> {
+    let noun = labels.noun;
     if input.topology.solids.is_empty() {
-        return Err(simple_invalid_input(
+        let message = format!(
+            "An add or cut {noun} needs a body to combine with; a {noun} of its own is a new \
+             body."
+        );
+        return Err(error(
+            KernelErrorCode::InvalidInput,
+            KernelStage::Preflight,
             input.id,
-            "LOFT_TARGET_EMPTY",
-            "An add or cut loft needs a body to combine with; a loft of its own is a new body.",
+            message.clone(),
+            vec![simple_diagnostic(
+                labels.empty,
+                KernelStage::Preflight,
+                &message,
+            )],
         ));
     }
     let tool_validation = validator::validate(&tool, precision.linear_agreement);
@@ -3973,7 +4099,7 @@ fn loft_boolean(
             KernelErrorCode::ValidationFailed,
             KernelStage::Validation,
             input.id,
-            "the loft failed solid validation before it was combined with the body",
+            format!("the {noun} failed solid validation before it was combined with the body"),
             protocol_validation(input.id, ValidationProfile::Solid, &tool_validation).diagnostics,
         ));
     }
@@ -3988,14 +4114,14 @@ fn loft_boolean(
             .diagnostics
             .is_empty()
     {
-        return Ok((topology, "loft/boolean-prism"));
+        return Ok((topology, labels.rungs[0]));
     }
     let decline = if analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool) {
         match analytic_boolean::build_analytic_boolean(&input.topology, &tool, operation, precision)
             .map_err(ExactRouteDecline::from_engine)
             .and_then(|topology| exact_candidate(topology, precision))
         {
-            Ok(topology) => return Ok((topology, "loft/boolean-analytic")),
+            Ok(topology) => return Ok((topology, labels.rungs[1])),
             Err(decline) => decline,
         }
     } else {
@@ -4004,16 +4130,16 @@ fn loft_boolean(
     let declined = |mut refusal: KernelError| {
         for diagnostic in &mut refusal.diagnostics {
             if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
-                diagnostic.code = ProtocolDiagnosticCode::new("LOFT_FACETED_UNRESOLVED");
+                diagnostic.code = ProtocolDiagnosticCode::new(labels.unresolved);
             }
         }
         refusal.diagnostics.insert(
             0,
-            decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Error),
+            decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Error),
         );
         refusal
     };
-    // The faceted tier works on the body and the loft as tessellated at a
+    // The faceted tier works on the body and the tool as tessellated at a
     // bounded budget, as the face-feature tier does: a dense tessellation is
     // an unsuitable Boolean operand.
     let mut boolean_precision = precision;
@@ -4039,12 +4165,14 @@ fn loft_boolean(
             KernelErrorCode::Unsupported,
             KernelStage::Construction,
             input.id,
-            "the faceted tier could not combine the loft with the body",
+            format!("the faceted tier could not combine the {noun} with the body"),
             vec![simple_diagnostic(
-                "LOFT_FACETED_UNRESOLVED",
+                labels.unresolved,
                 KernelStage::Construction,
-                "The loft and the body were rebuilt from their tessellations, but the rebuilt \
-                 shell did not close within the approximation budget.",
+                &format!(
+                    "The {noun} and the body were rebuilt from their tessellations, but the \
+                     rebuilt shell did not close within the approximation budget."
+                ),
             )],
         ))
     })?;
@@ -4058,15 +4186,164 @@ fn loft_boolean(
     )
     .map_err(declined)?;
     warnings.push(approximation_warning(
-        "LOFT_FACETED_APPROXIMATION",
-        "The exact Boolean engines do not carry this loft's walls, so the loft and the body \
-         were combined from their tessellations. The result's faces, edges and measures \
-         approximate the true solid rather than certifying it. Why the exact route stood aside \
-         is the LOFT_EXACT_ROUTE_DECLINED diagnostic beside this one.",
+        labels.approximation,
+        &format!(
+            "The exact Boolean engines do not carry this {noun}'s walls, so the {noun} and the \
+             body were combined from their tessellations. The result's faces, edges and \
+             measures approximate the true solid rather than certifying it. Why the exact route \
+             stood aside is the {} diagnostic beside this one.",
+            labels.declined
+        ),
     ));
-    warnings
-        .push(decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Warning));
-    Ok((topology, "loft/faceted"))
+    warnings.push(decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Warning));
+    Ok((topology, labels.rungs[2]))
+}
+
+/// A spline profile added to or cut from a planar face (ADR 0050): the
+/// profile swept into a tool body standing on the face — below it for a cut,
+/// overshooting the face so no cap lies on its plane, and above it for an
+/// add — and combined with the body through the Boolean ladder. A B-spline
+/// wall is outside the exact engines' vocabulary, so the ladder answers on
+/// its faceted tier, with its label, as it does for a ruled wall.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_feature(
+    input: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    profile: &PlanarProfile2,
+    distance: f64,
+    operation: FaceExtrusionOperation,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<(Topology, &'static str), KernelError> {
+    let refuse = |reason: FaceFeatureInputError| {
+        planar_profile_input_error(input.id, PlanarProfileInputError::FaceFeature(reason))
+    };
+    if target_face.snapshot != input.id {
+        return Err(refuse(FaceFeatureInputError::TargetSnapshotMismatch));
+    }
+    if target_face.kind != EntityKind::Face {
+        return Err(refuse(FaceFeatureInputError::TargetNotFace));
+    }
+    let target = input
+        .topology
+        .faces
+        .iter()
+        .find(|face| face.id.get() == target_face.entity.0)
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetMissing))?;
+    let plane = target
+        .value
+        .surface
+        .as_plane()
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetNotPlanar))?;
+    let normal_length = plane.normal.length();
+    if !normal_length.is_finite() || normal_length <= f64::EPSILON {
+        return Err(refuse(FaceFeatureInputError::TargetDegenerate));
+    }
+    let outward = plane.normal / normal_length;
+    let normalized = analytic_extrusion::normalize_frame(frame, precision)
+        .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+    // The sketch lies in the face's plane and faces out of it, as every
+    // face feature's does.
+    let off_plane = (normalized.origin - plane.origin).dot(outward).abs();
+    if normalized.normal.dot(outward) < 1.0 - precision.angular_agreement_radians.max(1.0e-12)
+        || off_plane > precision.modeling_resolution
+    {
+        return Err(refuse(FaceFeatureInputError::FrameOffTargetPlane));
+    }
+    let add = operation == FaceExtrusionOperation::Add;
+    // A cut's tool starts below the face and rises through it; an add's
+    // stands on it.
+    let overshoot = if add {
+        0.0
+    } else {
+        (distance * 0.01).max(precision.min_feature_size * 8.0)
+    };
+    let origin = if add {
+        frame.origin
+    } else {
+        ProtocolPoint3::new(
+            frame.origin.x - outward.x * distance,
+            frame.origin.y - outward.y * distance,
+            frame.origin.z - outward.z * distance,
+        )
+    };
+    let regions = spline_profile::validate_spline_profile_extrusion(
+        PlanarFrame3::new(origin, frame.u, frame.v),
+        profile,
+        distance + overshoot,
+        precision,
+    )
+    .map_err(|reason| spline_profile_error(input.id, reason))?;
+    let tool = spline_profile::build_spline_extrusion(&regions);
+    tool_boolean(input, tool, add, precision, warnings, &SPLINE_FACE_BOOLEAN)
+}
+
+/// The named refusal for a profile with splines.
+fn spline_profile_error(
+    snapshot: SnapshotId,
+    reason: spline_profile::SplineProfileError,
+) -> KernelError {
+    use spline_profile::SplineProfileError;
+    match reason {
+        SplineProfileError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        SplineProfileError::Spline(reason) => bspline_input_error(snapshot, reason),
+        SplineProfileError::Degenerate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_CURVE_DEGENERATE",
+            "a spline in the profile stalls — its rate vanishes at a cusp, or at an end whose \
+             first two control points coincide — so a wall swept from it would have no side to \
+             face there",
+        ),
+        SplineProfileError::Indeterminate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::NumericallyIndeterminate,
+            "BSPLINE_CLEARANCE_INDETERMINATE",
+            "two curves of the profile come so close that subdividing them could not settle \
+             whether they stay the feature floor apart; move them apart or join them",
+        ),
+    }
+}
+
+/// The named refusal for a spline the kernel does not carry.
+fn bspline_input_error(snapshot: SnapshotId, reason: bspline::SplineError) -> KernelError {
+    use bspline::SplineError;
+    match reason {
+        SplineError::Degree => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_DEGREE_UNSUPPORTED",
+            "the kernel carries B-splines of degree one to five; the quadrature its measures use \
+             is exact on every knot span up to degree five",
+        ),
+        SplineError::Rational => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_RATIONAL_UNSUPPORTED",
+            "the spline carries weights that differ, which makes it a rational spline; the \
+             kernel carries non-rational B-splines only (ADR 0050)",
+        ),
+        SplineError::Unclamped => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_UNCLAMPED_UNSUPPORTED",
+            "the spline's knot vector is not clamped: each end must repeat degree + 1 times, so \
+             the curve starts and ends on its end control points",
+        ),
+        SplineError::Knots => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_KNOTS_INVALID",
+            "the spline's knot vector does not match its control points: it must have control \
+             points + degree + 1 knots, never falling, with no interior knot repeated more than \
+             the degree",
+        ),
+        SplineError::NonFinite => planar_profile_input_error(
+            snapshot,
+            PlanarProfileInputError::Extrusion(ExtrusionInputError::NonFinite),
+        ),
+    }
 }
 
 /// The edge-finish ladder beyond the six-plane cuboid: each exact rung runs
@@ -6894,6 +7171,14 @@ fn planar_profile_input_error(
             KernelErrorCode::Unsupported,
             "PLANAR_PROFILE_ANALYTIC_ROUTE_REQUIRED",
             "the profile contains analytic curves that require the native analytic extrusion path",
+        ),
+        PlanarProfileInputError::SplineCurve => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "PLANAR_PROFILE_SPLINE_UNSUPPORTED",
+            "the profile carries a B-spline curve, and this operation does not: a spline profile \
+             can be extruded, added or cut on a face, and lofted (ADR 0050), but not revolved \
+             or drafted",
         ),
         PlanarProfileInputError::OverlappingRegions => planar_profile_error(
             snapshot,

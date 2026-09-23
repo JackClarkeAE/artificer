@@ -967,6 +967,10 @@ pub enum PlanarCurve2 {
         radius: f64,
         direction: ArcDirection,
     },
+    /// A B-spline from its first control point to its last. The kernel
+    /// builds with clamped, non-rational splines of degree one to five and
+    /// refuses weights that are not all equal, and knot vectors that are not
+    /// clamped, by name (ADR 0050).
     Bspline {
         degree: usize,
         control_points: Vec<Point2>,
