@@ -64,14 +64,16 @@ are stable, slash-separated paths:
 | --- | --- |
 | `primitive/cuboid`, `primitive/revolved-annulus` | A box or a cylinder. |
 | `extrusion/polygon`, `extrusion/linear-profile`, `extrusion/analytic-profile` | A new body from a sketch; the last two carry arcs and circles exactly. |
+| `extrusion/spline-profile` | A new body from a sketch with a spline in it (ADR 0050): each spline sweeps a B-spline wall, exactly. |
 | `revolve/full-turn` | A revolved section. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
-| `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise. |
+| `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise, and B-spline walls ruled between the rows where a section has a spline (ADR 0050). |
+| `loft/skinned` | A new body lofted smoothly through three planar sections or more (ADR 0050): every wall one B-spline surface through all the sections, smooth across the middle ones. |
 | `loft/boolean-prism`, `loft/boolean-analytic` | A loft added to or cut from the body, exactly, by the prism reduction or the general engine: every wall came out a plane, a cylinder or a cone. |
-| `loft/faceted` | A loft added to or cut from the body on the faceted tier, because a wall is ruled and the exact engines do not carry it. Carries `LOFT_FACETED_APPROXIMATION` and the reason, `LOFT_EXACT_ROUTE_DECLINED`. |
+| `loft/faceted` | A loft added to or cut from the body on the faceted tier, because a wall is ruled or a B-spline and the exact engines do not carry it. Carries `LOFT_FACETED_APPROXIMATION` and the reason, `LOFT_EXACT_ROUTE_DECLINED`. |
 | `face-feature/exact-prism` | An add or cut on a face that the exact prism path owns. |
 | `face-feature/analytic-boolean` | A cut that crossed earlier geometry, rebuilt exactly by the analytic Boolean engine. |
-| `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier. |
+| `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier; also every add or cut whose profile has a spline, whose B-spline walls the exact engines do not carry (ADR 0050). |
 | `drill/exact-prism`, `rib/exact-prism`, `push-pull/planar` | The kernel's own drill, rib and push/pull. |
 | `edge-finish/analytic`, `edge-finish/prism`, `edge-finish/rim-blend`, `edge-finish/rim-loop-blend`, `edge-finish/logical-successor` | Exact fillets and chamfers, by the rung that carried them. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
@@ -94,15 +96,19 @@ Every face in `body.faces` carries its carrier with the numbers that define
 it (`surface`: `plane` with `origin`; `cylinder` with
 `origin`, `axis`, `radius`; `cone` with `apex`, `axis`, `half_angle_degrees`;
 `sphere`; `torus`; `ruled` with `first_rail` and `second_rail`, each a
-`line`, `circular_arc` or `elliptical_arc` with its `start` and `end`), an
+`line`, `circular_arc` or `elliptical_arc` with its `start` and `end`;
+`bspline` with `degree_u`, `degree_v`, `control_points_u` and
+`control_points_v`), an
 exact `area`, a `centre` (the area centroid of a
 planar face; a point at the parametric centre of a curved one), the outward
 `normal` there, the number of `loops` (one, plus one per hole), a one-line
 `summary`, and its `names`. Edges carry their curve (`line`, `circular_arc`,
-`elliptical_arc`, or `surface_trace` — where two cylinders meet in a curve
+`elliptical_arc`, `surface_trace` — where two cylinders meet in a curve
 none of those describes, reported by its ends and the two radii
-`host_radius` and `other_radius`), exact `length`, `midpoint`, `summary` and
-`names`.
+`host_radius` and `other_radius` — or `bspline`, reported by its ends, its
+`degree` and its number of `control_points`), exact `length`, `midpoint`,
+`summary` and `names`. The body's `surfaces` count carries `bspline` beside
+the other kinds.
 
 The same description is available for one selected entity through the
 JSON-RPC method `query.describe`, which takes a selector, and through

@@ -1,0 +1,41 @@
+// A vase lofted smoothly through four sections, and a tray with a pocket
+// outlined by a closed spline.
+//
+// Through three sections or more a loft is smooth (ADR 0050). The sections
+// are cut to one correspondence by the rules a two-section loft uses, and
+// each wall is one B-spline surface through every section in order: cubic
+// along the vase here, because there are four sections, so the walls are
+// smooth through the belly and the waist rather than creased there. The
+// waist is itself a spline through four points, closed. The vase is exact
+// and measured exactly.
+//
+// The pocket's wall is the tray outline's spline swept straight down, a
+// B-spline surface too. The Boolean engines do not carry B-spline walls
+// yet, so the cut is answered by the faceted tier and says so.
+
+param foot: f64 [mm] in 20..80 = 40.0 "side of the square foot";
+param belly: f64 [mm] in 30..120 = 64.0 "diameter at the widest";
+param waist: f64 [mm] in 10..60 = 26.0 "width of the waist";
+param height: f64 [mm] in 60..240 = 120.0 "height of the vase";
+
+// The waist's points lie toward the foot's corners, so every section starts
+// where the one below it does and the walls do not twist.
+let w = waist / 2;
+let base = sketch(on: plane(from: "XY"), entities: [rect(width: foot, height: foot)], label: "base");
+let widest = sketch(on: plane(from: "XY", offset: height * 0.35), entities: [circle(diameter: belly)], label: "widest");
+let narrow = sketch(
+    on: plane(from: "XY", offset: height * 0.75),
+    entities: [spline(points: [[-w, -w * 0.8], [w, -w * 0.8], [w, w * 0.8], [-w, w * 0.8]], closed: true)],
+    label: "narrow"
+);
+let lip = sketch(on: plane(from: "XY", offset: height), entities: [circle(diameter: waist * 1.5)], label: "lip");
+let vase = loft(sections: [base, widest, narrow, lip], label: "vase");
+
+// A tray beside the vase, and a pocket whose outline is a closed spline.
+let tray = box(origin: [80, -40, 0], size: [90, 80, 12], label: "tray");
+let outline = sketch(
+    on: faces(">Z"),
+    entities: [spline(points: [[30, 0], [5, 22], [-30, 10], [-25, -20], [10, -25]], closed: true)],
+    label: "outline"
+);
+extrude(sketch: outline, distance: 6, operation: "cut", label: "pocket");

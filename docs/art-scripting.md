@@ -116,7 +116,7 @@ the CLI prints them; the JSON-RPC server returns them as the error object.
 | Array | `[1, 2, 3]`, `corners[i]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. `a[i]` reads element `i`, counting from 0. |
 | Step | `let b = box(...)` | The bound name of an executed step; passed to Booleans and used for methods. |
 | Body | `let s = standoff(...)` | What a function returns: a step plus the faces it exports, read as `s.top` (section 14). |
-| Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)` | Only valid inside `sketch(entities: [...])`. |
+| Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)`, `spline(...)` | Only valid inside `sketch(entities: [...])`. |
 | Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")`, `faces(">Z").edges()` | Names a face or edge of the current body, or a set of edges, resolved when the step runs. |
 
 ---
@@ -192,7 +192,7 @@ let profile = sketch(on: "XY", label: "profile", entities: [
 | Argument | Required | Meaning |
 |---|---|---|
 | `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, a `plane(...)`, or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
-| `entities` | yes | An array of `line`, `circle`, `arc`, `rect`. |
+| `entities` | yes | An array of `line`, `circle`, `arc`, `rect`, `spline`. |
 | `label` | no | Step label. |
 
 **Coordinates.** On a world plane, 2D coordinates are that plane's axes with
@@ -238,6 +238,29 @@ chain end to end into a closed loop; a loop may close along the revolve axis.
 | `arc(center:, radius:, start_angle:, end_angle:)` | `radius` or `diameter`; angles in degrees, counter-clockwise | Part of a loop with lines or other arcs. |
 | `rect(width:, height:, origin: [x, y])` | `origin` is the minimum corner | A closed loop. |
 | `rect(width:, height:, center: [x, y])` | centred | `rect(width:, height:)` alone is centred on `[0, 0]`. |
+| `spline(points: [[x, y], ...], closed: false)` | at least two points; three when `closed` | A smooth curve through the points. Open, it is part of a loop with lines, arcs or other splines; `closed: true` makes it a loop of its own. |
+| `spline(control_points: [[x, y], ...], degree: 3, closed: false)` | at least two points; `degree` from 1 to 5, default 3, and lowered to one less than the number of points when there are fewer | A curve drawn by its control points instead, on uniform knots: it starts on the first and ends on the last, and is pulled toward the others. `closed: true` runs it back to the first point, with a corner there unless the points either side line up with it. |
+
+**Splines.** A spline is a B-spline curve (ADR 0050), carried exactly: the
+fit-point form is the curve of degree `min(3, n − 1)` through the points at
+their chord-length parameters, and a closed one is the cubic through the
+points and back to the first, with one tangent either side of the seam.
+Either form writes a clamped, non-rational B-spline, the one the sketcher's
+own spline tools draw. Extruded, a spline sweeps a wall that is a B-spline
+surface, and the body is exact and measured exactly. A spline must not touch
+itself or the rest of its loop, and must not stall — two coincident control
+points at an end make a curve with no direction there, refused as
+`BSPLINE_CURVE_DEGENERATE`.
+
+```art
+let blob = sketch(on: "XY", entities: [
+    spline(points: [[18, 0], [9, 11], [-6, 13], [-17, 2], [-10, -10], [6, -12]], closed: true),
+], label: "blob");
+let slot = sketch(on: "XY", entities: [
+    spline(control_points: [[10, 0], [8, 7], [-8, 7], [-10, 0]], degree: 2),
+    line(start: [-10, 0], end: [10, 0]),
+], label: "slot");
+```
 
 ---
 
@@ -264,6 +287,13 @@ let frustum = extrude(sketch: square, distance: 10, draft: -5, label: "frustum")
 (`sketch(on: faces(">Z"), ...)`). A sketch on a world plane can only make a
 new body; join it with `union` afterwards if that is what you want.
 
+A sketch with a spline extrudes exactly as a new body. Added or cut, its
+B-spline walls are more than the exact Boolean engines carry yet, so the
+step is built on the faceted tier and says so (rung `face-feature/faceted`,
+tier `approximate`). A `draft` offsets the section, and the offset of a
+spline is not a spline: a drafted extrusion of a sketch with a spline is
+refused (`LOFT_OFFSET_SPLINE_UNSUPPORTED`).
+
 ### `loft`
 
 ```art
@@ -274,15 +304,16 @@ let duct = loft(sections: [base, spigot], label: "duct");
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `sections` | yes | Two sketches, each on a plane of its own. |
+| `sections` | yes | Two sketches or more, each on a plane of its own. |
 | `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`. |
 | `label` | no | Step label. |
 
-The body runs from the first section to the second. The two sketches may be
-on any two planes that are not the same plane — parallel, offset sideways,
-tilted, or not parallel at all — as long as neither section reaches through
-the other's plane. Each sketch must be one region: an outer loop of lines,
-arcs and circles, with holes if both sections have the same number of them.
+The body runs from the first section to the last, through the others in
+order. The sketches may be on any planes that are not the same plane —
+parallel, offset sideways, tilted, or not parallel at all — as long as no
+section reaches through its neighbours' planes. Each sketch must be one
+region: an outer loop of lines, arcs, circles and splines, with holes if
+every section has the same number of them.
 
 **How the sections pair up.** Corners pair with corners. With as many
 segments on both sides they pair in order, starting wherever makes the
@@ -302,14 +333,38 @@ carry ruled walls yet: an `"add"` or `"cut"` loft whose walls are all flat,
 conical or cylindrical is exact; one with ruled walls is built on the
 faceted tier and says so (rung `loft/faceted`, tier `approximate`).
 
+**Splines in a section.** A spline piece is ruled to the piece it pairs
+with by a B-spline wall, exact like the others (ADR 0050). Where an arc
+pairs with a spline, the arc is carried by its cubic fit, within half the
+model's linear agreement of the circle (half a picometre by default), so
+the two can share one wall. A smooth loft carries its arcs the same way.
+
+**Three sections or more.** A loft through several sections is smooth: the
+sections are put into one correspondence by the rules above, applied from
+each section to the next, and every wall is one B-spline surface through
+all of them, cubic along the loft from four sections and quadratic through
+three. The walls pass through every section exactly and bend smoothly
+through the middle ones, with no crease there; the first and last sections
+are the caps. The loft's shape between two sections depends on where the
+sections are along it, so one set of sections spaced differently makes a
+different body.
+
+```art
+let foot = sketch(on: plane(from: "XY"), entities: [rect(width: 40, height: 40)], label: "foot");
+let belly = sketch(on: plane(from: "XY", offset: 40), entities: [circle(diameter: 64)], label: "belly");
+let lip = sketch(on: plane(from: "XY", offset: 120), entities: [circle(diameter: 36)], label: "lip");
+let vase = loft(sections: [foot, belly, lip], label: "vase");
+```
+
 A loft is refused by name when its rungs or walls would cross
 (`LOFT_RUNGS_CROSS`), a wall would pinch to a point (`LOFT_WALL_DEGENERATE`),
-the sections share a plane (`LOFT_SECTIONS_COPLANAR`), one reaches through
-the other's plane (`LOFT_SECTION_CROSSES_PLANE`), or their holes do not pair
-(`LOFT_HOLE_COUNT_MISMATCH`). A loft through three or more sections needs a
-surface that stays smooth across the middle ones, a B-spline surface, and is
-refused (`LOFT_MULTI_SECTION_UNSUPPORTED`) until those arrive; so is a
-section drawn with a spline.
+two neighbouring sections share a plane (`LOFT_SECTIONS_COPLANAR`), one
+reaches through a neighbour's plane (`LOFT_SECTION_CROSSES_PLANE`), or their
+holes do not pair (`LOFT_HOLE_COUNT_MISMATCH`). A smooth loft can do one
+thing a ruled one cannot: bend back on itself between two sections, when
+the sections are spaced so unevenly that the curve through them overshoots.
+That is refused too (`LOFT_SKIN_FOLDS`); space the sections more evenly or
+add one where the loft turns.
 
 ### `revolve`
 
@@ -822,9 +877,9 @@ For an agent, the rules that make this reliable:
 
 ## 13. Not in 0.3
 
-Partial revolves, sweeps, lofts through more than two sections (they need
-B-spline surfaces, which ADR 0049 plans), splines as sketch entities,
-exact Booleans with a loft's ruled walls (they fall to the faceted tier),
+Partial revolves, sweeps, revolved splines, drafted splines, exact
+Booleans with a loft's ruled or B-spline walls or a spline extrusion's
+(they fall to the faceted tier),
 concave fillets between a boss and its plate, text as sketch geometry from a
 script, and threads. A script builds parts; joints and occurrences belong
 to a document, so a mechanism is assembled in the workbench and analysed
