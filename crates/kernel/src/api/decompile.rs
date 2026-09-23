@@ -255,11 +255,11 @@ impl Writer<'_> {
                             start_angle,
                             end_angle,
                         } => format!(
-                            "arc(center: {}, radius: {}, start_angle: {}, end_angle: {})",
+                            "arc(center: {}, radius: {}, {}, {})",
                             point2(*center),
                             number(*radius),
-                            number(start_angle.to_degrees()),
-                            number(end_angle.to_degrees())
+                            arc_angle("start", *start_angle),
+                            arc_angle("end", *end_angle)
                         ),
                         SketchEntity::Rectangle {
                             origin,
@@ -813,6 +813,59 @@ fn plane_text(frame: PlanarFrame3) -> String {
     )
 }
 
+/// How many floats either side of an angle's nearest degrees are tried for
+/// one that converts back to the angle exactly. Degrees and radians differ
+/// by a factor between 32 and 64 in the spacing of their floats, so the
+/// degrees that convert to a given angle, when there are any, sit within a
+/// float or two of the nearest; this is ample.
+const DEGREE_SEARCH: usize = 8;
+
+/// One end angle of an arc as a script argument that rebuilds it to the
+/// bit.
+///
+/// Scripts write angles in degrees and an arc holds radians, and the two
+/// conversions do not undo one another: the shortest degrees for an angle
+/// can convert back to a neighbouring float, and some angles are no number
+/// of degrees converted at all. So the degrees are written when some value
+/// within [`DEGREE_SEARCH`] floats of the nearest converts back to exactly
+/// the angle held, the shortest such, which is always the case for an arc
+/// a script wrote in degrees; otherwise the radians are written as they
+/// are, as `start_radians` or `end_radians`.
+fn arc_angle(end: &str, radians: f64) -> String {
+    match degrees_for(radians) {
+        Some(degrees) => format!("{end}_angle: {}", number(degrees)),
+        None => format!("{end}_radians: {}", number(radians)),
+    }
+}
+
+/// The degrees, written shortest, that a script converts back to exactly
+/// `radians`, when there are any near the nearest.
+fn degrees_for(radians: f64) -> Option<f64> {
+    let nearest = radians.to_degrees();
+    if !nearest.is_finite() {
+        return None;
+    }
+    let exact = |degrees: f64| degrees.to_radians().to_bits() == radians.to_bits();
+    let mut best: Option<(usize, f64)> = None;
+    let mut consider = |degrees: f64| {
+        if exact(degrees) {
+            let length = number(degrees).len();
+            if best.is_none_or(|(held, _)| length < held) {
+                best = Some((length, degrees));
+            }
+        }
+    };
+    consider(nearest);
+    let (mut up, mut down) = (nearest, nearest);
+    for _ in 0..DEGREE_SEARCH {
+        up = up.next_up();
+        down = down.next_down();
+        consider(up);
+        consider(down);
+    }
+    best.map(|(_, degrees)| degrees)
+}
+
 fn regions_text(regions: &[u32]) -> String {
     if regions.is_empty() {
         String::new()
@@ -861,9 +914,12 @@ fn quoted(text: &str) -> String {
 
 /// A number as script text, round-tripping exactly: whole numbers without
 /// a fraction, everything else with the shortest digits that read back to
-/// the same float.
+/// the same float. Negative zero is written `-0`, which a script reads back
+/// as negative zero; `0` would read back as the other zero.
 pub fn number(value: f64) -> String {
-    if value.fract() == 0.0 && value.abs() < 1.0e15 {
+    if value == 0.0 && value.is_sign_negative() {
+        "-0".to_owned()
+    } else if value.fract() == 0.0 && value.abs() < 1.0e15 {
         format!("{}", value as i64)
     } else {
         format!("{value}")
