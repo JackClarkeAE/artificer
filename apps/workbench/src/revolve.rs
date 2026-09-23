@@ -5,15 +5,22 @@
 //! Its profile is a region of a finished sketch, picked in the model view;
 //! its axis is chosen on the card from everything that can serve as one — a
 //! centreline drawn in the sketch, the sketch's own axes, or the document's
-//! origin axes where they lie in the sketch's plane. Every change asks the
-//! kernel for the result at once, so the preview is the solid the history
-//! will hold, or the reason there is none.
+//! origin axes where they lie in the sketch's plane. It turns a full turn or
+//! through an angle, one way, the other or both; an angle typed over document
+//! variables stays with them (ADR 0052). Every change asks the kernel for the
+//! result at once, so the preview is the solid the history will hold, or the
+//! reason there is none.
 
 use artificer_kernel::{DebugScene, NativeKernel, Snapshot};
+use std::collections::BTreeMap;
+use std::f64::consts::TAU;
+
 use artificer_model::{
     BodyId, FeatureDraft, FeatureId, FeatureInput, FeatureKind, OriginAxis, OutputDraft,
-    ReplayAction, RevolveAxis, RevolveExtent, SketchAxisDirection, SketchId, SketchRevolve,
-    SnapshotAssociation, revolve::origin_axis_in_frame, sketch_region::sketch_region_at,
+    ParameterBinding, ParameterExpression, ParameterOverrides, ParameterUnit, ParameterValue,
+    ParsedParameterEntry, QuantityKind, ReplayAction, RevolveAxis, RevolveDirection, RevolveExtent,
+    SketchAxisDirection, SketchId, SketchRevolve, SnapshotAssociation, format_parameter_binding,
+    parse_parameter_entry, revolve::origin_axis_in_frame, sketch_region::sketch_region_at,
 };
 use artificer_protocol::{OperationReport, PrecisionPolicy, SolidOperation};
 use artificer_sketch::{EvaluatedCurve2, RegionSignature, SketchEntityRole};
@@ -64,12 +71,63 @@ pub(crate) struct StagedRevolve {
     pub(crate) operation: SolidOperation,
     /// The body an add or a cut changes.
     pub(crate) target: Option<BodyId>,
+    /// A full turn, or the angle below.
+    pub(crate) full_turn: bool,
+    /// The angle it turns through when it stops short of a full turn, in
+    /// radians: what the angle field last came to.
+    pub(crate) angle: f64,
+    pub(crate) direction: RevolveDirection,
+    /// The angle field as typed.
+    pub(crate) angle_text: String,
+    /// The variables the angle follows, while it follows any.
+    pub(crate) angle_link: Option<AngleLink>,
     pub(crate) preview: Option<RevolvePreview>,
     /// Why there is no preview, when there is not.
     pub(crate) issue: Option<String>,
 }
 
+/// An angle typed over document variables: `sweep`, `sweep / 2 + 10`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AngleLink {
+    /// What was typed, shown back in the field.
+    pub(crate) text: String,
+    pub(crate) expression: ParameterExpression,
+}
+
+/// The angle a partial revolve starts on: a quarter turn.
+const DEFAULT_REVOLVE_ANGLE: f64 = std::f64::consts::FRAC_PI_2;
+
 impl StagedRevolve {
+    fn new(target: Option<BodyId>) -> Self {
+        Self {
+            sketch: None,
+            regions: Vec::new(),
+            anchors: Vec::new(),
+            axis: None,
+            operation: SolidOperation::New,
+            target,
+            full_turn: true,
+            angle: DEFAULT_REVOLVE_ANGLE,
+            direction: RevolveDirection::Forward,
+            angle_text: format_degrees(DEFAULT_REVOLVE_ANGLE),
+            angle_link: None,
+            preview: None,
+            issue: None,
+        }
+    }
+
+    /// How far the staged revolve turns.
+    pub(crate) const fn extent(&self) -> RevolveExtent {
+        if self.full_turn {
+            RevolveExtent::FullTurn
+        } else {
+            RevolveExtent::Angle {
+                radians: self.angle,
+                direction: self.direction,
+            }
+        }
+    }
+
     fn recipe(&self) -> Result<SketchRevolve, String> {
         let sketch = self
             .sketch
@@ -77,15 +135,32 @@ impl StagedRevolve {
         let axis = self
             .axis
             .ok_or_else(|| "Choose the axis to revolve about".to_owned())?;
-        SketchRevolve::new(
+        let recipe = SketchRevolve::new(
             sketch,
             self.regions.clone(),
             axis,
-            RevolveExtent::FullTurn,
+            self.extent(),
             self.operation,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        // An angle typed over variables stays with them; a full turn has no
+        // angle to follow.
+        let expression = self
+            .angle_link
+            .as_ref()
+            .filter(|_| !self.full_turn)
+            .map(|link| link.expression.clone());
+        recipe
+            .with_angle_expression(expression)
+            .map_err(|error| error.to_string())
     }
+}
+
+/// An angle in radians as the angle field shows it, in degrees.
+fn format_degrees(radians: f64) -> String {
+    let degrees = radians.to_degrees();
+    let rounded = (degrees * 1.0e6).round() / 1.0e6;
+    format!("{rounded}")
 }
 
 /// One thing a revolve can turn about, as the card offers it.
@@ -95,6 +170,15 @@ pub struct RevolveAxisChoice {
     pub label: String,
     /// Why it cannot serve this sketch, when it cannot.
     pub unavailable: Option<String>,
+}
+
+/// A human name for which way a partial revolve turns, as the card says it.
+const fn direction_label(direction: RevolveDirection) -> &'static str {
+    match direction {
+        RevolveDirection::Forward => "One way",
+        RevolveDirection::Reversed => "Other way",
+        RevolveDirection::Symmetric => "Symmetric",
+    }
 }
 
 /// A human name for a revolve operation, as the card and the status line
@@ -126,17 +210,7 @@ impl KernelLabApp {
         {
             return false;
         }
-        let target = self.plane_boolean_target();
-        let mut staged = StagedRevolve {
-            sketch: None,
-            regions: Vec::new(),
-            anchors: Vec::new(),
-            axis: None,
-            operation: SolidOperation::New,
-            target,
-            preview: None,
-            issue: None,
-        };
+        let mut staged = StagedRevolve::new(self.plane_boolean_target());
         if let Some((sketch, regions, anchors)) = self.revolve_profile_from_selection() {
             staged.axis = self.default_revolve_axis(sketch);
             staged.sketch = Some(sketch);
@@ -378,6 +452,110 @@ impl KernelLabApp {
         }
     }
 
+    /// Turns the staged revolve a full turn, or through its angle.
+    pub fn set_revolve_full_turn(&mut self, full_turn: bool) {
+        if let Some(staged) = self.staged_revolve.as_mut()
+            && staged.full_turn != full_turn
+        {
+            staged.full_turn = full_turn;
+            self.refresh_revolve_preview();
+        }
+    }
+
+    /// Chooses which way a partial revolve turns from its sketch.
+    pub fn set_revolve_direction(&mut self, direction: RevolveDirection) {
+        if let Some(staged) = self.staged_revolve.as_mut()
+            && staged.direction != direction
+        {
+            staged.direction = direction;
+            self.refresh_revolve_preview();
+        }
+    }
+
+    /// Takes what was typed in the angle field: degrees, `90`, or arithmetic
+    /// over document variables, `sweep / 2`. An entry that names variables
+    /// stays linked to them, so the revolve follows when they change. The
+    /// revolve then stops short of a full turn.
+    pub fn enter_revolve_angle(&mut self, text: &str) -> bool {
+        if self.staged_revolve.is_none() {
+            return false;
+        }
+        let entry = self.revolve_angle_entry(text);
+        let Some(staged) = self.staged_revolve.as_mut() else {
+            return false;
+        };
+        staged.angle_text = text.trim().to_owned();
+        match entry {
+            Ok((radians, link)) => {
+                staged.angle = radians;
+                staged.angle_link = link;
+                staged.full_turn = false;
+                self.refresh_revolve_preview();
+                true
+            }
+            Err(message) => {
+                self.document_status = Some(format!("Revolve angle: {message}"));
+                false
+            }
+        }
+    }
+
+    /// What an angle entry comes to, in radians, and the link it makes when
+    /// it names variables.
+    fn revolve_angle_entry(&self, text: &str) -> Result<(f64, Option<AngleLink>), String> {
+        let names = self
+            .document
+            .parameters()
+            .records()
+            .iter()
+            .map(|record| (record.spec.key.clone(), record.id))
+            .collect::<BTreeMap<_, _>>();
+        let parsed = parse_parameter_entry(text, ParameterUnit::Degree, &|name: &str| {
+            names.get(name).copied()
+        })
+        .map_err(|error| error.to_string())?;
+        let not_an_angle = || "that is not an angle".to_owned();
+        let (radians, link) = match parsed {
+            ParsedParameterEntry::Literal(ParameterValue::Quantity { value }) => {
+                let radians = match value.unit {
+                    ParameterUnit::Degree => value.magnitude.to_radians(),
+                    ParameterUnit::Radian => value.magnitude,
+                    _ => return Err(not_an_angle()),
+                };
+                (radians, None)
+            }
+            ParsedParameterEntry::Literal(_) => return Err(not_an_angle()),
+            ParsedParameterEntry::Expression(expression) => {
+                let evaluated = self
+                    .document
+                    .evaluate_parameters(&ParameterOverrides::default())
+                    .map_err(|error| error.to_string())?;
+                let ParameterValue::Quantity { value } = expression
+                    .evaluate_with(&evaluated)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Err(not_an_angle());
+                };
+                if value.unit.quantity_kind() != QuantityKind::Angle {
+                    return Err(not_an_angle());
+                }
+                // Canonical angles are radians.
+                let link = (!expression.referenced_parameters().is_empty()).then(|| AngleLink {
+                    text: text.trim().to_owned(),
+                    expression,
+                });
+                (value.magnitude, link)
+            }
+        };
+        if !(radians.is_finite() && radians > 0.0 && radians < TAU) {
+            return Err(format!(
+                "{}° is not more than nothing and less than a full turn; choose Full turn for 360°",
+                format_degrees(radians)
+            ));
+        }
+        Ok((radians, link))
+    }
+
     /// Asks the kernel for the staged revolve as its picks now stand.
     fn refresh_revolve_preview(&mut self) {
         let Some(staged) = self.staged_revolve.as_ref() else {
@@ -464,6 +642,11 @@ impl KernelLabApp {
         )
         .with_commit(association)
         .with_input(FeatureInput::Sketch(sketch));
+        // An angle that follows variables reads them, so changing one
+        // rebuilds the revolve and none can be deleted from under it.
+        for parameter in preview.recipe.parameter_references() {
+            draft = draft.with_parameter(parameter);
+        }
         draft = match target {
             Some(body) => draft
                 .with_input(FeatureInput::Body(body))
@@ -587,16 +770,41 @@ impl KernelLabApp {
             .iter()
             .filter_map(|region| self.region_anchor(recipe.sketch, region))
             .collect();
-        self.staged_revolve = Some(StagedRevolve {
-            sketch: Some(recipe.sketch),
-            regions: recipe.regions.clone(),
-            anchors,
-            axis: Some(recipe.axis),
-            operation: recipe.operation,
-            target: target.or_else(|| self.plane_boolean_target()),
-            preview: None,
-            issue: None,
-        });
+        let mut staged = StagedRevolve::new(target.or_else(|| self.plane_boolean_target()));
+        staged.sketch = Some(recipe.sketch);
+        staged.regions = recipe.regions.clone();
+        staged.anchors = anchors;
+        staged.axis = Some(recipe.axis);
+        staged.operation = recipe.operation;
+        if let RevolveExtent::Angle { radians, direction } = recipe.extent {
+            staged.full_turn = false;
+            staged.angle = radians;
+            staged.direction = direction;
+            staged.angle_text = format_degrees(radians);
+        }
+        // An angle that follows variables reopens as the expression, so
+        // confirming the edit keeps the link rather than freezing a number.
+        if let Some(expression) = &recipe.angle_expression {
+            let names = self
+                .document
+                .parameters()
+                .records()
+                .iter()
+                .map(|record| (record.id, record.spec.key.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let text = format_parameter_binding(
+                &ParameterBinding::Expression {
+                    expression: expression.clone(),
+                },
+                &|id| names.get(&id).cloned(),
+            );
+            staged.angle_text.clone_from(&text);
+            staged.angle_link = Some(AngleLink {
+                text,
+                expression: expression.clone(),
+            });
+        }
+        self.staged_revolve = Some(staged);
         self.pending_operation = Some(PendingOperation::StageRevolve {
             editing: Some(feature),
         });
@@ -634,10 +842,12 @@ impl KernelLabApp {
         if let Some(body) = target {
             inputs.push(FeatureInput::Body(body));
         }
-        match self.document.replace_feature_action_and_inputs(
+        let parameter_inputs = recipe.parameter_references().into_iter().collect();
+        match self.document.replace_feature_recipe(
             feature,
             ReplayAction::SketchRevolve(recipe),
             inputs,
+            parameter_inputs,
         ) {
             Ok(_) => {
                 self.move_history_cursor(self.document.features().len());
@@ -778,6 +988,7 @@ impl KernelLabApp {
                 self.set_revolve_axis(axis);
             }
         }
+        self.revolve_extent_controls(ui, &staged);
         let can_combine = staged.target.is_some();
         ui.horizontal(|ui| {
             for operation in [
@@ -839,6 +1050,122 @@ impl KernelLabApp {
                 .small()
                 .color(theme::muted()),
         );
+    }
+
+    /// The card's extent row: a full turn or an angle, the angle itself —
+    /// degrees or variables — and which way it turns.
+    fn revolve_extent_controls(&mut self, ui: &mut egui::Ui, staged: &StagedRevolve) {
+        ui.label(RichText::new("Extent").small().color(theme::muted()));
+        let mut full_turn = None;
+        ui.horizontal(|ui| {
+            for (full, label, hover) in [
+                (true, "Full turn", "Turn the profile all the way round"),
+                (
+                    false,
+                    "Angle",
+                    "Turn the profile through an angle and close it with the profile at each end",
+                ),
+            ] {
+                let response = ui
+                    .add(egui::Button::new(label).selected(staged.full_turn == full))
+                    .on_hover_text(hover);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("Revolve extent {label}"),
+                    )
+                });
+                if response.clicked() {
+                    full_turn = Some(full);
+                }
+            }
+        });
+        if let Some(full) = full_turn {
+            self.set_revolve_full_turn(full);
+        }
+        if staged.full_turn {
+            return;
+        }
+        // Degrees, or arithmetic over document variables: `sweep`,
+        // `sweep / 2`. Evaluated when the field is left; an entry that names
+        // variables stays linked to them.
+        let mut text = staged.angle_text.clone();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .desired_width(ui.available_width().min(160.0))
+                .hint_text("degrees or variables…"),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Revolve angle")
+        });
+        if response.changed()
+            && let Some(current) = self.staged_revolve.as_mut()
+        {
+            current.angle_text.clone_from(&text);
+        }
+        if response.lost_focus() {
+            self.enter_revolve_angle(&text);
+        }
+        if let Some(link) = &staged.angle_link {
+            ui.label(
+                RichText::new(format!(
+                    "Follows {} · changing the variable rebuilds this revolve",
+                    link.text
+                ))
+                .small()
+                .color(theme::accent()),
+            );
+        }
+        let mut direction = None;
+        ui.horizontal(|ui| {
+            for candidate in [
+                RevolveDirection::Forward,
+                RevolveDirection::Reversed,
+                RevolveDirection::Symmetric,
+            ] {
+                let label = direction_label(candidate);
+                let response = ui
+                    .add(egui::Button::new(label).selected(staged.direction == candidate))
+                    .on_hover_text(match candidate {
+                        RevolveDirection::Forward => "Turn right-handed about the axis as it runs",
+                        RevolveDirection::Reversed => "Turn the other way round the axis",
+                        RevolveDirection::Symmetric => {
+                            "Turn half the angle each way, with the sketch in the middle"
+                        }
+                    });
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        format!("Revolve direction {label}"),
+                    )
+                });
+                if response.clicked() {
+                    direction = Some(candidate);
+                }
+            }
+        });
+        if let Some(direction) = direction {
+            self.set_revolve_direction(direction);
+        }
+    }
+
+    /// How far the staged revolve turns.
+    #[must_use]
+    pub fn staged_revolve_extent(&self) -> Option<RevolveExtent> {
+        self.staged_revolve.as_ref().map(StagedRevolve::extent)
+    }
+
+    /// Which variables the staged revolve's angle follows, as typed, while
+    /// it follows any.
+    #[must_use]
+    pub fn staged_revolve_angle_follows(&self) -> Option<String> {
+        self.staged_revolve
+            .as_ref()
+            .filter(|staged| !staged.full_turn)
+            .and_then(|staged| staged.angle_link.as_ref())
+            .map(|link| link.text.clone())
     }
 
     /// Why the staged revolve has no preview, when it has none.
@@ -1047,6 +1374,106 @@ mod tests {
             ReplayAction::SketchRevolve(recipe)
                 if recipe.axis == RevolveAxis::SketchAxis { axis: SketchAxisDirection::U }
         )));
+    }
+
+    fn preview_centroid(app: &KernelLabApp) -> artificer_protocol::Point3 {
+        app.staged_revolve
+            .as_ref()
+            .and_then(|staged| staged.preview.as_ref())
+            .and_then(|preview| preview.snapshot.measures().centroid)
+            .unwrap_or_else(|| panic!("no preview: {:?}", app.staged_revolve_issue()))
+    }
+
+    /// Turned through an angle, a revolve sweeps its share of the tube, one
+    /// way, the other, or both; an angle typed over a variable follows it and
+    /// reopens as it; and a full turn has no angle to follow.
+    #[test]
+    fn a_revolve_turns_through_an_angle_one_way_the_other_or_both() {
+        let mut app = KernelLabApp::default();
+        let sweep = app
+            .document
+            .add_parameter(
+                artificer_model::ParameterSpec::new(
+                    "sweep",
+                    "sweep",
+                    artificer_model::ParameterType::Quantity(QuantityKind::Angle),
+                )
+                .with_display_unit(ParameterUnit::Degree),
+                ParameterBinding::literal(ParameterValue::quantity(45.0, ParameterUnit::Degree)),
+            )
+            .expect("the variable is added");
+        rectangle_beside_a_centreline(&mut app);
+        assert!(app.stage_revolve());
+        let tube = PI * (4.0 - 1.0) * 3.0;
+        assert_eq!(app.staged_revolve_extent(), Some(RevolveExtent::FullTurn));
+        assert_close(preview_volume(&app), tube, "full turn");
+
+        // The sketch is on XZ and the centreline runs up +Z, so turning one
+        // way from the profile on +X goes towards +Y.
+        assert!(app.enter_revolve_angle("90"), "{:?}", app.document_status);
+        assert_close(preview_volume(&app), tube / 4.0, "a quarter");
+        assert!(preview_centroid(&app).y > 0.5);
+        app.set_revolve_direction(RevolveDirection::Reversed);
+        assert_close(preview_volume(&app), tube / 4.0, "the other way");
+        assert!(preview_centroid(&app).y < -0.5);
+        app.set_revolve_direction(RevolveDirection::Symmetric);
+        assert!(preview_centroid(&app).y.abs() < 1.0e-9);
+
+        // Out of range is refused and changes nothing.
+        assert!(!app.enter_revolve_angle("400"));
+        assert!(!app.enter_revolve_angle("5 mm"));
+        assert_close(preview_volume(&app), tube / 4.0, "unchanged");
+
+        assert!(
+            app.enter_revolve_angle("sweep * 4"),
+            "{:?}",
+            app.document_status
+        );
+        assert_eq!(
+            app.staged_revolve_angle_follows().as_deref(),
+            Some("sweep * 4")
+        );
+        assert_close(preview_volume(&app), tube / 2.0, "half, from the variable");
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let feature = revolve_feature(&app);
+        assert_eq!(
+            app.document
+                .feature(feature)
+                .expect("the revolve")
+                .parameter_inputs,
+            vec![sweep],
+            "the revolve reads the variable its angle names"
+        );
+        assert!(app.document.clone().remove_parameter(sweep).is_err());
+
+        // Reopened, it keeps the link and the direction.
+        assert!(app.begin_revolve_edit(feature), "{:?}", app.document_status);
+        assert_eq!(
+            app.staged_revolve_angle_follows().as_deref(),
+            Some("sweep * 4")
+        );
+        assert_eq!(
+            app.staged_revolve_extent(),
+            Some(RevolveExtent::Angle {
+                radians: PI,
+                direction: RevolveDirection::Symmetric,
+            })
+        );
+        // A full turn lets the variable go.
+        app.set_revolve_full_turn(true);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert!(
+            app.document
+                .feature(feature)
+                .expect("the revolve")
+                .parameter_inputs
+                .is_empty()
+        );
+        assert_close(
+            revolved_body(&app, feature).body.snapshot.measures().volume,
+            tube,
+            "a full turn again",
+        );
     }
 
     /// Added to or cut from the body it is staged over, a revolve changes

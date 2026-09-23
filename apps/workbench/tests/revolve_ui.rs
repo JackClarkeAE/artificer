@@ -59,6 +59,33 @@ fn click_sketch_point(harness: &mut Harness<'static, KernelLabApp>, point: Sketc
     press(harness, position, egui::PointerButton::Primary);
 }
 
+/// Scrolls the operation pane until a control in it clears the pane's
+/// confirm bar, as a user would to reach the lower rows of a long card.
+fn reveal_in_card(harness: &mut Harness<'static, KernelLabApp>, role: Role, label: &str) {
+    for _ in 0..24 {
+        let bar = harness
+            .get_by_role_and_label(Role::Button, CONFIRM_OPERATION)
+            .rect()
+            .top();
+        let target = harness.get_by_role_and_label(role, label).rect();
+        if target.bottom() < bar - 4.0 {
+            return;
+        }
+        harness.hover_at(egui::pos2(target.center().x, bar - 80.0));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -40.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        // The pane scrolls smoothly, so it is stepped rather than settled.
+        for _ in 0..12 {
+            harness.step();
+        }
+    }
+    panic!("{label} stays behind the operation pane's confirm bar");
+}
+
 fn replace_text(harness: &mut Harness<'static, KernelLabApp>, label: &str, value: &str) {
     harness
         .get_by_role_and_label(Role::TextInput, label)
@@ -179,4 +206,63 @@ fn a_sketched_profile_is_revolved_follows_its_variable_and_reopens_from_its_chip
     click_button(&mut harness, "Revolve axis Origin Z axis");
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_close(volume(&harness), PI * (36.0 - 1.0) * 3.0, "edited");
+}
+
+/// An angle typed over a variable: the revolve turns through it, follows it
+/// when it changes, and reopens still following it.
+#[test]
+fn a_revolve_angle_typed_over_a_variable_follows_it() {
+    let mut harness = harness();
+    harness.run();
+
+    // A `sweep` variable; new angle variables start at 45 degrees.
+    click_button(&mut harness, "Parametric ribbon tab");
+    click_button(&mut harness, "New angle variable");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    replace_text(&mut harness, "Variable name Angle1", "sweep");
+    click_button(&mut harness, "Variables");
+
+    // A rectangle r in [1, 2], 3 tall.
+    click_button(&mut harness, "XZ Plane");
+    click_button(&mut harness, "Sketch mode");
+    for _ in 0..24 {
+        harness.step();
+    }
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(1.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 3.0));
+    click_button(&mut harness, "Finish sketch");
+
+    click_button(&mut harness, "Revolve");
+    click_button(&mut harness, "Revolve axis Sketch vertical axis");
+    reveal_in_card(&mut harness, Role::Button, "Revolve extent Angle");
+    click_button(&mut harness, "Revolve extent Angle");
+    reveal_in_card(&mut harness, Role::TextInput, "Revolve angle");
+    // Enter takes the angle and confirms the revolve.
+    replace_text(&mut harness, "Revolve angle", "sweep * 2");
+    assert_eq!(harness.state().last_error_code(), None);
+    let tube = PI * (4.0 - 1.0) * 3.0;
+    assert_close(volume(&harness), tube / 4.0, "a quarter turn");
+
+    click_button(&mut harness, "Parametric ribbon tab");
+    click_button(&mut harness, "Variables");
+    replace_text(&mut harness, "Variable value sweep", "60");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_close(volume(&harness), tube / 3.0, "a third of a turn");
+    click_button(&mut harness, "Variables");
+
+    let chip = harness
+        .get_by_role_and_label(Role::Button, "Revolve 1 feature")
+        .rect()
+        .center();
+    press(&mut harness, chip, egui::PointerButton::Secondary);
+    click_button(&mut harness, "Edit this revolve");
+    assert_eq!(
+        harness.state().staged_revolve_angle_follows().as_deref(),
+        Some("sweep * 2")
+    );
+    reveal_in_card(&mut harness, Role::Button, "Revolve direction Symmetric");
+    click_button(&mut harness, "Revolve direction Symmetric");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_close(volume(&harness), tube / 3.0, "symmetric");
 }

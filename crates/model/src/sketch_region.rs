@@ -1886,6 +1886,182 @@ mod tests {
         );
     }
 
+    /// A revolve typed through `sweep` keeps following it: the feature reads
+    /// the variable, replay takes the angle from it — a whole turn making a
+    /// full turn — and a length cannot stand in for it.
+    #[test]
+    fn a_revolve_angle_follows_the_variable_it_names() {
+        use crate::{
+            RevolveAxis, RevolveDirection, RevolveExtent, SketchAxisDirection, SketchRevolve,
+        };
+        use artificer_protocol::{RevolveAngle, SolidOperation};
+        let (mut document, sketch, signature) = document_with_rectangle();
+        let angle_variable = |document: &mut ModelDocument, key: &str, degrees: f64| {
+            document
+                .add_parameter(
+                    crate::ParameterSpec::new(
+                        key,
+                        key,
+                        crate::ParameterType::Quantity(QuantityKind::Angle),
+                    )
+                    .with_display_unit(crate::ParameterUnit::Degree),
+                    crate::ParameterBinding::literal(ParameterValue::quantity(
+                        degrees,
+                        crate::ParameterUnit::Degree,
+                    )),
+                )
+                .unwrap()
+        };
+        let sweep = angle_variable(&mut document, "sweep", 90.0);
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let axis = RevolveAxis::SketchAxis {
+            axis: SketchAxisDirection::V,
+        };
+        let recipe = SketchRevolve::new(
+            sketch,
+            vec![signature.clone()],
+            axis,
+            RevolveExtent::Angle {
+                radians: quarter,
+                direction: RevolveDirection::Symmetric,
+            },
+            SolidOperation::New,
+        )
+        .unwrap()
+        .with_angle_expression(Some(ParameterExpression::reference(sweep)))
+        .unwrap();
+        assert_eq!(
+            recipe.extent.kernel_angle(),
+            RevolveAngle::partial(-quarter / 2.0, quarter),
+            "a symmetric turn starts half its angle back"
+        );
+        let draft = |recipe: &SketchRevolve, parameters: &[crate::ParameterId]| {
+            let mut draft = FeatureDraft::new(
+                FeatureKind::Revolve,
+                "Revolve 1",
+                ReplayAction::SketchRevolve(recipe.clone()),
+            )
+            .with_input(FeatureInput::Sketch(sketch))
+            .with_output(OutputDraft::CreateBody {
+                label: "Body 1".into(),
+            });
+            for parameter in parameters {
+                draft = draft.with_parameter(*parameter);
+            }
+            draft
+        };
+        assert!(
+            document
+                .clone()
+                .append_feature(draft(&recipe, &[]))
+                .is_err(),
+            "a feature must declare the variables its angle reads"
+        );
+        let feature = document
+            .append_feature(draft(&recipe, &[sweep]))
+            .unwrap()
+            .feature;
+        assert!(document.feature(feature).unwrap().action.reads_parameters());
+
+        let resolved_extent = |document: &ModelDocument| {
+            let evaluated = document
+                .evaluate_parameters(&crate::ParameterOverrides::default())
+                .unwrap();
+            match document
+                .feature(feature)
+                .unwrap()
+                .action
+                .resolve_parameters(&evaluated)
+            {
+                Ok(ReplayAction::SketchRevolve(resolved)) => Ok(resolved.extent),
+                Ok(other) => panic!("still a revolve: {other:?}"),
+                Err(error) => Err(error),
+            }
+        };
+        let set = |document: &mut ModelDocument, degrees: f64| {
+            document
+                .set_parameter_binding(
+                    sweep,
+                    crate::ParameterBinding::literal(ParameterValue::quantity(
+                        degrees,
+                        crate::ParameterUnit::Degree,
+                    )),
+                )
+                .unwrap();
+        };
+        set(&mut document, 120.0);
+        assert_eq!(
+            document.feature(feature).unwrap().state.rebuild,
+            RebuildState::Dirty
+        );
+        let Ok(RevolveExtent::Angle { radians, direction }) = resolved_extent(&document) else {
+            panic!("a partial turn");
+        };
+        assert!((radians - 120.0_f64.to_radians()).abs() < 1.0e-12);
+        assert_eq!(direction, RevolveDirection::Symmetric);
+        set(&mut document, 360.0);
+        assert_eq!(resolved_extent(&document), Ok(RevolveExtent::FullTurn));
+        set(&mut document, 400.0);
+        assert_eq!(
+            resolved_extent(&document),
+            Err(crate::ParameterizedKernelError::InvalidAngleValue)
+        );
+        assert!(document.remove_parameter(sweep).is_err());
+
+        // The link survives the file.
+        let json = serde_json::to_string(&document.to_native()).unwrap();
+        assert!(json.contains("angle_expression"));
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            restored.feature(feature).unwrap().action,
+            document.feature(feature).unwrap().action
+        );
+
+        // A length does not turn anything, and a full turn has no angle.
+        let width = length_variable(&mut document, "width", 10.0);
+        let by_length = SketchRevolve::new(
+            sketch,
+            vec![signature.clone()],
+            axis,
+            RevolveExtent::Angle {
+                radians: quarter,
+                direction: RevolveDirection::Forward,
+            },
+            SolidOperation::New,
+        )
+        .unwrap()
+        .with_angle_expression(Some(ParameterExpression::reference(width)))
+        .unwrap();
+        assert!(
+            document
+                .append_feature(draft(&by_length, &[width]))
+                .is_err()
+        );
+        let full = SketchRevolve::new(
+            sketch,
+            vec![signature],
+            axis,
+            RevolveExtent::FullTurn,
+            SolidOperation::New,
+        )
+        .unwrap();
+        assert_eq!(
+            full.clone()
+                .with_angle_expression(Some(ParameterExpression::reference(sweep)))
+                .unwrap_err(),
+            crate::SketchRevolveError::ExpressionOnAFullTurn
+        );
+        let mut beyond = full;
+        beyond.extent = RevolveExtent::Angle {
+            radians: std::f64::consts::TAU,
+            direction: RevolveDirection::Forward,
+        };
+        assert_eq!(
+            beyond.validate(),
+            Err(crate::SketchRevolveError::InvalidAngle)
+        );
+    }
+
     #[test]
     fn a_loft_needs_two_sections_from_two_sketches() {
         let (document, _, lower, upper) = document_with_two_sections();

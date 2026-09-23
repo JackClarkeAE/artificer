@@ -394,7 +394,7 @@ let ring = revolve(sketch: section, axis: [0, 0, 1], label: "ring");
 | `sketch` | yes | A sketch whose plane contains the axis. |
 | `axis` | no | Axis direction. Default `[0, 0, 1]`. |
 | `axis_origin` | no | A point on the axis. Default `[0, 0, 0]`. |
-| `angle` | no | Degrees. Default and only supported value: `360`. |
+| `angle` | no | Degrees. Default `360`, a full turn. Less turns that far right-handed about `axis`, and closes the solid with the section at each end; a negative angle turns the other way. |
 | `regions` | no | As for `extrude`. |
 | `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. |
 

@@ -324,6 +324,12 @@ pub enum ParameterizedKernelError {
     DistanceNotALength,
     #[error("the distance expression comes to zero or a non-finite length")]
     InvalidDistanceValue,
+    #[error("the angle expression did not evaluate: {0}")]
+    AngleExpression(String),
+    #[error("the angle expression does not come to an angle")]
+    AngleNotAnAngle,
+    #[error("the angle expression comes to nothing, less, or more than a full turn")]
+    InvalidAngleValue,
 }
 
 fn canonical_length(

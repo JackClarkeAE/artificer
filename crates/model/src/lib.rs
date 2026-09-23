@@ -55,8 +55,8 @@ pub use parameters::{
     format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
 pub use revolve::{
-    CURRENT_SKETCH_REVOLVE_RECIPE_VERSION, OriginAxis, RevolveAxis, RevolveExtent,
-    SketchAxisDirection, SketchRevolve, SketchRevolveError,
+    CURRENT_SKETCH_REVOLVE_RECIPE_VERSION, OriginAxis, RevolveAxis, RevolveDirection,
+    RevolveExtent, SketchAxisDirection, SketchRevolve, SketchRevolveError,
 };
 pub use sketch_region::{
     CURRENT_SKETCH_REGION_RECIPE_VERSION, MAX_SELECTED_SKETCH_REGIONS, SketchRegionExtrusion,
@@ -284,13 +284,15 @@ impl ReplayAction {
             Self::SketchRegionExtrusion(recipe) => recipe
                 .resolve_parameters(parameters)
                 .map(Self::SketchRegionExtrusion),
+            Self::SketchRevolve(recipe) => recipe
+                .resolve_parameters(parameters)
+                .map(Self::SketchRevolve),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
             | Self::SketchLoft(_)
-            | Self::SketchRevolve(_)
             | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
@@ -302,13 +304,13 @@ impl ReplayAction {
         match self {
             Self::ParameterizedKernel(_) => true,
             Self::SketchRegionExtrusion(recipe) => recipe.distance_expression.is_some(),
+            Self::SketchRevolve(recipe) => recipe.angle_expression.is_some(),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
             | Self::SketchLoft(_)
-            | Self::SketchRevolve(_)
             | Self::KernelChain(_) => false,
         }
     }
@@ -3394,13 +3396,33 @@ fn validate_action_parameter_inputs(
                 }
             }
         }
+        // A revolve reads exactly the variables its angle names.
+        ReplayAction::SketchRevolve(recipe) => {
+            let declared = parameter_inputs.iter().copied().collect::<BTreeSet<_>>();
+            if declared.len() != parameter_inputs.len() {
+                return Err(ParameterizedKernelError::DuplicateParameterInput.into());
+            }
+            if declared != recipe.parameter_references() {
+                return Err(ParameterizedKernelError::ParameterInputMismatch.into());
+            }
+            if let Some(expression) = &recipe.angle_expression {
+                match parameters.expression_type(expression) {
+                    Ok(ParameterType::Quantity(QuantityKind::Angle)) => {}
+                    Ok(_) => return Err(ParameterizedKernelError::AngleNotAnAngle.into()),
+                    Err(error) => {
+                        return Err(
+                            ParameterizedKernelError::AngleExpression(error.to_string()).into()
+                        );
+                    }
+                }
+            }
+        }
         ReplayAction::Marker
         | ReplayAction::TargetedKernel(_)
         | ReplayAction::Kernel(_)
         | ReplayAction::Boolean(_)
         | ReplayAction::DatumPlane(_)
         | ReplayAction::SketchLoft(_)
-        | ReplayAction::SketchRevolve(_)
         | ReplayAction::KernelChain(_) => {}
     }
     Ok(())

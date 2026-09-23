@@ -993,12 +993,19 @@ impl Session {
                 operation,
                 ..
             } => {
-                if (angle_degrees - 360.0).abs() > 1.0e-9 {
+                // A full turn, or a partial one measured right-handed about
+                // the axis direction; a negative angle turns the other way.
+                let angle = if (angle_degrees.abs() - 360.0).abs() <= 1.0e-9 {
+                    RevolveAngle::FullTurn
+                } else if angle_degrees.is_finite() && angle_degrees.abs() < 360.0 {
+                    let sweep = angle_degrees.abs().to_radians();
+                    RevolveAngle::partial(if *angle_degrees < 0.0 { -sweep } else { 0.0 }, sweep)
+                } else {
                     return Err(ApiError::new(
                         ApiErrorCode::InvalidInput,
-                        "Only a full 360 degree revolve is supported",
+                        "A revolve turns through at most 360 degrees either way",
                     ));
-                }
+                };
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 let profile = select_regions(profile, regions)?;
                 // The axis must lie in the sketch plane: project its origin
@@ -1031,7 +1038,7 @@ impl Session {
                     frame,
                     profile,
                     axis: PlanarAxis2 { start, end },
-                    angle: RevolveAngle::FullTurn,
+                    angle,
                     operation: match operation {
                         ExtrudeOp::New => SolidOperation::New,
                         ExtrudeOp::Add => SolidOperation::Add,

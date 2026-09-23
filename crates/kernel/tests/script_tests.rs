@@ -610,3 +610,40 @@ fillet(edges: cyl.edges(), radius: 1, label: \"round\");
     .unwrap();
     assert_eq!(program.names[0].1, EntitySelector::history_edges("b"));
 }
+
+#[test]
+fn a_revolve_angle_short_of_a_turn_is_a_partial_revolve_either_way() {
+    let ring = |angle: f64| {
+        run(&format!(
+            "let section = sketch(on: \"XZ\", label: \"section\", entities: [
+    rect(origin: [10, 0], width: 5, height: 4),
+]);
+let ring = revolve(sketch: section, axis: [0, 0, 1], angle: {angle}, label: \"ring\");
+"
+        ))
+    };
+    let quarter = std::f64::consts::PI * (15.0 * 15.0 - 10.0 * 10.0) * 4.0 / 4.0;
+    for (angle, side) in [(90.0, 1.0), (-90.0, -1.0)] {
+        let session = ring(angle);
+        assert_eq!(
+            session.step_reports["ring"].rung.as_deref(),
+            Some("revolve/partial-turn")
+        );
+        let measures = session.snapshot.measures();
+        assert!(
+            ((measures.volume - quarter) / quarter).abs() < 1.0e-9,
+            "{angle}: {} should be {quarter}",
+            measures.volume
+        );
+        let centroid = measures.centroid.expect("a centroid");
+        assert!(
+            centroid.y * side > 1.0,
+            "{angle} degrees about +Z turns towards {side} Y: {centroid:?}"
+        );
+    }
+    let full = ring(360.0);
+    assert_eq!(
+        full.step_reports["ring"].rung.as_deref(),
+        Some("revolve/full-turn")
+    );
+}

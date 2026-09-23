@@ -7,8 +7,16 @@
 //! the axis in the sketch and the document as they now stand, so editing the
 //! sketch, moving its plane or changing a variable one of its dimensions
 //! follows reshapes the revolve the next time it is rebuilt.
+//!
+//! A revolve turns a full turn, or through an angle (ADR 0055 R3). An angle
+//! typed over document variables stays with them, the way an extrusion's
+//! distance does (ADR 0052): the recipe keeps the expression, and replay
+//! evaluates it.
 
 use std::collections::BTreeMap;
+
+use std::collections::BTreeSet;
+use std::f64::consts::TAU;
 
 use artificer_protocol::{
     KernelCommand, PlanarAxis2, PlanarFrame3, Point2, PrecisionPolicy, RevolveAngle,
@@ -19,10 +27,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::loft::section_plane;
+use crate::parameterized::ParameterizedKernelError;
+use crate::parameters::{EvaluatedParameters, ParameterExpression, ParameterValue, QuantityKind};
 use crate::sketch_region::{
     MAX_SELECTED_SKETCH_REGIONS, SketchRegionResolveError, compile_sketch_regions,
 };
-use crate::{FeatureId, ModelDocument, ReplayAction, ResolvedDatumPlane, SketchId};
+use crate::{FeatureId, ModelDocument, ParameterId, ReplayAction, ResolvedDatumPlane, SketchId};
 
 /// Schema written for newly created revolve recipes.
 pub const CURRENT_SKETCH_REVOLVE_RECIPE_VERSION: u32 = 1;
@@ -85,12 +95,60 @@ pub enum RevolveAxis {
     OriginAxis { axis: OriginAxis },
 }
 
+/// Which way a revolve that stops short of a full turn goes from its sketch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RevolveDirection {
+    /// Right-handed about the axis as it runs: thumb along the axis, the
+    /// turn goes the way the fingers curl.
+    #[default]
+    Forward,
+    /// The other way round.
+    Reversed,
+    /// Half the angle each way, so the sketch sits in the middle.
+    Symmetric,
+}
+
 /// How far a revolve turns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RevolveExtent {
     #[default]
     FullTurn,
+    /// Through `radians`, strictly between nothing and a full turn.
+    Angle {
+        radians: f64,
+        #[serde(default)]
+        direction: RevolveDirection,
+    },
+}
+
+impl RevolveExtent {
+    /// The kernel's angle for this extent: where the turn starts, measured
+    /// from the sketch, and how far it goes.
+    #[must_use]
+    pub fn kernel_angle(self) -> RevolveAngle {
+        match self {
+            Self::FullTurn => RevolveAngle::FullTurn,
+            Self::Angle { radians, direction } => RevolveAngle::partial(
+                match direction {
+                    RevolveDirection::Forward => 0.0,
+                    RevolveDirection::Reversed => -radians,
+                    RevolveDirection::Symmetric => -radians / 2.0,
+                },
+                radians,
+            ),
+        }
+    }
+
+    /// The angle turned through, in radians: a full turn's is `2π`.
+    #[must_use]
+    pub const fn radians(self) -> f64 {
+        match self {
+            Self::FullTurn => TAU,
+            Self::Angle { radians, .. } => radians,
+        }
+    }
 }
 
 /// A revolve of regions of one sketch about an axis.
@@ -104,6 +162,12 @@ pub struct SketchRevolve {
     #[serde(default)]
     pub extent: RevolveExtent,
     pub operation: SolidOperation,
+    /// The angle follows this expression over document variables: `sweep`,
+    /// `sweep / 2`. Replay evaluates it and uses its value as the extent's
+    /// angle, which holds what it last came to. Only an angle can follow
+    /// one; a full turn has nothing to follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle_expression: Option<ParameterExpression>,
 }
 
 impl SketchRevolve {
@@ -123,9 +187,67 @@ impl SketchRevolve {
             axis,
             extent,
             operation,
+            angle_expression: None,
         };
         recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Makes the angle follow an expression over document variables, or
+    /// stop following one. The extent's angle should hold what the
+    /// expression evaluates to now.
+    pub fn with_angle_expression(
+        mut self,
+        expression: Option<ParameterExpression>,
+    ) -> Result<Self, SketchRevolveError> {
+        self.angle_expression = expression;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The variables the recipe reads, which its feature lists as parameter
+    /// inputs so that changing one rebuilds it.
+    #[must_use]
+    pub fn parameter_references(&self) -> BTreeSet<ParameterId> {
+        self.angle_expression
+            .as_ref()
+            .map(ParameterExpression::referenced_parameters)
+            .unwrap_or_default()
+    }
+
+    /// The recipe with its angle taken from the evaluated variables. A recipe
+    /// that follows no expression is returned as it is. An expression that
+    /// comes to a whole turn makes a full turn.
+    pub fn resolve_parameters(
+        &self,
+        parameters: &EvaluatedParameters,
+    ) -> Result<Self, ParameterizedKernelError> {
+        let Some(expression) = &self.angle_expression else {
+            return Ok(self.clone());
+        };
+        let value = expression
+            .evaluate_with(parameters)
+            .map_err(|error| ParameterizedKernelError::AngleExpression(error.to_string()))?;
+        let ParameterValue::Quantity { value } = value else {
+            return Err(ParameterizedKernelError::AngleNotAnAngle);
+        };
+        if value.unit.quantity_kind() != QuantityKind::Angle {
+            return Err(ParameterizedKernelError::AngleNotAnAngle);
+        }
+        // Canonical angles are radians, the recipe's unit.
+        let radians = value.magnitude;
+        let RevolveExtent::Angle { direction, .. } = self.extent else {
+            return Err(ParameterizedKernelError::InvalidAngleValue);
+        };
+        let mut resolved = self.clone();
+        resolved.extent = if (radians - TAU).abs() <= FULL_TURN_AGREEMENT {
+            RevolveExtent::FullTurn
+        } else if is_partial_turn(radians) {
+            RevolveExtent::Angle { radians, direction }
+        } else {
+            return Err(ParameterizedKernelError::InvalidAngleValue);
+        };
+        Ok(resolved)
     }
 
     /// Structural checks that need no geometry.
@@ -148,6 +270,21 @@ impl SketchRevolve {
         }
         if self.regions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(SketchRevolveError::NonCanonicalRegions);
+        }
+        if let RevolveExtent::Angle { radians, .. } = self.extent
+            && !is_partial_turn(radians)
+        {
+            return Err(SketchRevolveError::InvalidAngle);
+        }
+        if let Some(expression) = &self.angle_expression {
+            if self.extent == RevolveExtent::FullTurn {
+                return Err(SketchRevolveError::ExpressionOnAFullTurn);
+            }
+            if expression.validate_bounds().is_err()
+                || expression.referenced_parameters().is_empty()
+            {
+                return Err(SketchRevolveError::InvalidAngleExpression);
+            }
         }
         Ok(())
     }
@@ -173,17 +310,22 @@ impl SketchRevolve {
             .unwrap_or(drawn_frame);
         let axis = resolve_axis(document, self.sketch, self.axis, frame, precision)
             .map_err(SketchRegionResolveError::InvalidRevolve)?;
-        let angle = match self.extent {
-            RevolveExtent::FullTurn => RevolveAngle::FullTurn,
-        };
         Ok(ReplayAction::Kernel(KernelCommand::RevolvePlanarProfile {
             frame,
             profile,
             axis,
-            angle,
+            angle: self.extent.kernel_angle(),
             operation: self.operation,
         }))
     }
+}
+
+/// How close to a whole turn an evaluated angle may come and still be one.
+const FULL_TURN_AGREEMENT: f64 = 1.0e-9;
+
+/// Whether `radians` is an angle a partial revolve can turn through.
+fn is_partial_turn(radians: f64) -> bool {
+    radians.is_finite() && radians > 0.0 && radians < TAU
 }
 
 /// Finds a revolve axis in the sketch's own coordinates, where the kernel
@@ -281,6 +423,12 @@ pub enum SketchRevolveError {
     AxisNotALine { entity: SketchEntityId },
     #[error("the {} does not lie in the sketch's plane", axis.label())]
     AxisOffSketchPlane { axis: OriginAxis },
+    #[error("a revolve's angle must be more than nothing and less than a full turn")]
+    InvalidAngle,
+    #[error("a full-turn revolve has no angle to follow a variable")]
+    ExpressionOnAFullTurn,
+    #[error("a revolve's angle expression must name at least one variable")]
+    InvalidAngleExpression,
 }
 
 #[cfg(test)]

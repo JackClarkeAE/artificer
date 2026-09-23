@@ -1,4 +1,4 @@
-//! Full-turn revolves of a certified planar profile (ADR 0026, F3).
+//! Revolves of a certified planar profile (ADR 0026 F3, ADR 0055).
 //!
 //! The kernel already knew how to build every surface a revolve needs: a
 //! coaxial solid of revolution is exactly its `(r, z)` section, and
@@ -13,6 +13,13 @@
 //! makes that rotation orientation-preserving, so a counter-clockwise profile
 //! arrives as a counter-clockwise section — the winding the builder already
 //! expects, with no case analysis and no chance of an inside-out solid.
+//!
+//! A partial turn is measured about the axis as the caller gave it. When the
+//! profile lies on the other side of that axis, the section frame's axis is
+//! the reverse of it, so the requested span of azimuths is mirrored before
+//! the frame is turned to where the span begins.
+
+use std::f64::consts::TAU;
 
 use artificer_protocol::{
     MAX_PLANAR_PROFILE_CURVES, MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, PlanarAxis2,
@@ -21,7 +28,7 @@ use artificer_protocol::{
 
 use crate::analytic_extrusion::{Segment, normalize_frame, parse_loop, reversed_loop};
 use crate::planar_profile::PlanarProfileInputError;
-use crate::section_revolve::{RzSection, build_revolved_topology};
+use crate::section_revolve::{RzSection, build_turned_topology};
 use crate::topology::{FaceRole, Point2, Topology, Vector3};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +47,11 @@ pub(crate) enum RevolveInputError {
     /// The chain left after dropping axis-collinear segments is not one
     /// contiguous section.
     SectionNotContiguous,
+    /// A partial turn's sweep is not strictly between nothing and a full
+    /// turn, its start is not a finite angle within a turn, or the sweep or
+    /// the gap it leaves is narrower than the minimum feature at the
+    /// profile's outermost radius.
+    AngleInvalid,
 }
 
 impl From<PlanarProfileInputError> for RevolveInputError {
@@ -51,11 +63,21 @@ impl From<PlanarProfileInputError> for RevolveInputError {
 #[derive(Debug)]
 pub(crate) struct ValidatedRevolve {
     section: RzSection,
+    /// How far the section turns from its frame's azimuth zero: a full turn,
+    /// or less.
+    sweep: f64,
+}
+
+impl ValidatedRevolve {
+    /// Whether this revolve stops short of a full turn.
+    pub(crate) fn is_partial(&self) -> bool {
+        self.sweep < TAU
+    }
 }
 
 #[must_use]
 pub(crate) fn build_revolve(revolve: &ValidatedRevolve) -> Topology {
-    build_revolved_topology(&revolve.section)
+    build_turned_topology(&revolve.section, revolve.sweep)
 }
 
 /// Certifies a profile and axis, and rewrites the profile as a section chain.
@@ -66,7 +88,18 @@ pub(crate) fn validate_revolve(
     angle: RevolveAngle,
     precision: PrecisionPolicy,
 ) -> Result<ValidatedRevolve, RevolveInputError> {
-    let RevolveAngle::FullTurn = angle;
+    let turn = match angle {
+        RevolveAngle::FullTurn => None,
+        RevolveAngle::Partial { start, sweep } => {
+            if !start.is_finite() || !sweep.is_finite() || start.abs() > TAU {
+                return Err(RevolveInputError::AngleInvalid);
+            }
+            if sweep <= 0.0 || sweep >= TAU {
+                return Err(RevolveInputError::AngleInvalid);
+            }
+            Some((start, sweep))
+        }
+    };
     if profile.regions.is_empty() {
         return Err(PlanarProfileInputError::EmptyProfile.into());
     }
@@ -142,7 +175,7 @@ pub(crate) fn validate_revolve(
                 (negative || radius < -on_axis, positive || radius > on_axis)
             })
     };
-    match side(radial) {
+    let reversed_axis = match side(radial) {
         (true, true) => return Err(RevolveInputError::ProfileCrossesAxis),
         (true, false) => {
             // The material is on the other side. Reversing the axis reverses
@@ -150,14 +183,18 @@ pub(crate) fn validate_revolve(
             // and the section still lands in the positive half-plane.
             along = Point2::new(-along.x, -along.y);
             radial = Point2::new(along.y, -along.x);
+            true
         }
-        _ => {}
-    }
+        _ => false,
+    };
 
-    // The section rotation: r along `radial`, z along `along`.
+    // The section rotation: r along `radial`, z along `along`. A point within
+    // agreement of the axis is on it, exactly, so that it closes a cap or a
+    // pole rather than sweeping a vanishing ring.
     let to_section = |point: Point2| {
+        let radius = radius_of(point, radial);
         Point2::new(
-            radius_of(point, radial).max(0.0),
+            if radius <= on_axis { 0.0 } else { radius },
             (point.x - origin.x).mul_add(along.x, (point.y - origin.y) * along.y),
         )
     };
@@ -221,13 +258,38 @@ pub(crate) fn validate_revolve(
         return Err(RevolveInputError::SectionNotContiguous);
     }
 
+    // The span, in the section frame's own azimuth. About a reversed axis the
+    // requested span runs the other way round, so it is mirrored.
+    let (begin, sweep) = match turn {
+        None => (0.0, TAU),
+        Some((start, sweep)) => {
+            let outermost = chain.iter().map(outermost_radius).fold(0.0_f64, f64::max);
+            if sweep * outermost < minimum || (TAU - sweep) * outermost < minimum {
+                return Err(RevolveInputError::AngleInvalid);
+            }
+            if reversed_axis {
+                (-(start + sweep), sweep)
+            } else {
+                (start, sweep)
+            }
+        }
+    };
+
     let roles = (0..chain.len())
         .map(|index| FaceRole::ExtrusionSide(u32::try_from(index).unwrap_or(u32::MAX)))
         .collect();
     let center = frame.point(origin, 0.0);
     let axis_direction = frame.u * along.x + frame.v * along.y;
-    let radial_u = frame.u * radial.x + frame.v * radial.y;
-    let radial_v = cross(axis_direction, radial_u);
+    let profile_radial = frame.u * radial.x + frame.v * radial.y;
+    let profile_tangent = cross(axis_direction, profile_radial);
+    // Turn the frame to where the span begins; a full turn begins at the
+    // profile itself.
+    let (radial_u, radial_v) = if begin == 0.0 {
+        (profile_radial, profile_tangent)
+    } else {
+        let radial_u = profile_radial * begin.cos() + profile_tangent * begin.sin();
+        (radial_u, cross(axis_direction, radial_u))
+    };
     Ok(ValidatedRevolve {
         section: RzSection::from_parts(
             center,
@@ -238,7 +300,18 @@ pub(crate) fn validate_revolve(
             roles,
             closed,
         ),
+        sweep,
     })
+}
+
+/// The farthest a section segment reaches from the axis: its endpoints, or an
+/// arc's bulge beyond them.
+fn outermost_radius(segment: &Segment) -> f64 {
+    let ends = segment.start().x.max(segment.end().x);
+    match *segment {
+        Segment::Arc { center, radius, .. } => ends.max(center.x + radius),
+        _ => ends,
+    }
 }
 
 fn meets(left: Point2, right: Point2, agreement: f64) -> bool {

@@ -515,3 +515,304 @@ fn a_revolve_that_adds_needs_a_body_to_add_to() {
         "{error:?}"
     );
 }
+
+fn revolve_through(
+    profile: PlanarProfile2,
+    axis: PlanarAxis2,
+    angle: RevolveAngle,
+    label: &str,
+) -> Result<Snapshot, KernelError> {
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new(label),
+        expected_snapshot: NativeKernel::empty().id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::RevolvePlanarProfile {
+            frame: frame(),
+            profile,
+            axis,
+            angle,
+            operation: SolidOperation::New,
+        },
+    };
+    NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+        .map(|outcome| outcome.snapshot)
+}
+
+/// A block r in [1, 3], z in [0, 2] with a quarter-disc bite of radius 1
+/// taken out of its top outer corner, centred at (3, 2): the profile's one
+/// arc runs clockwise, which is the concave case.
+fn notched_block() -> PlanarProfile2 {
+    PlanarProfile2 {
+        regions: vec![PlanarRegion2 {
+            outer: PlanarLoop2 {
+                curves: vec![
+                    PlanarCurve2::Line {
+                        start: Point2::new(1.0, 0.0),
+                        end: Point2::new(3.0, 0.0),
+                    },
+                    PlanarCurve2::Line {
+                        start: Point2::new(3.0, 0.0),
+                        end: Point2::new(3.0, 1.0),
+                    },
+                    PlanarCurve2::CircularArc {
+                        center: Point2::new(3.0, 2.0),
+                        start: Point2::new(3.0, 1.0),
+                        end: Point2::new(2.0, 2.0),
+                        direction: ArcDirection::Clockwise,
+                    },
+                    PlanarCurve2::Line {
+                        start: Point2::new(2.0, 2.0),
+                        end: Point2::new(1.0, 2.0),
+                    },
+                    PlanarCurve2::Line {
+                        start: Point2::new(1.0, 2.0),
+                        end: Point2::new(1.0, 0.0),
+                    },
+                ],
+            },
+            holes: vec![],
+        }],
+    }
+}
+
+/// Pappus for the notched block: the square's moment about the axis, less
+/// the quarter disc's, whose centroid sits `4r/3π` in from its centre.
+fn notched_block_volume() -> f64 {
+    let quarter = PI / 4.0;
+    TAU * (4.0 * 2.0 - quarter * (3.0 - 4.0 / (3.0 * PI)))
+}
+
+/// A concave arc sweeps a band whose material lies outside its tube: the face
+/// must point in towards the arc's centre. This once came out inside out and
+/// failed edge-use orientation, refusing any profile with a concave round.
+#[test]
+fn a_concave_arc_in_the_profile_revolves_outside_in() {
+    let notched = revolve(notched_block(), "revolve-notch").expect("a concave arc revolves");
+    assert_volume(&notched, notched_block_volume(), "notched block");
+}
+
+/// Every carrier the section builder emits, and the full-turn volume of each.
+fn carriers() -> Vec<(&'static str, PlanarProfile2, f64)> {
+    let radius = 4.0_f64;
+    let (major, minor) = (10.0_f64, 2.5_f64);
+    let (lower, upper, height) = (6.0_f64, 3.0_f64, 8.0_f64);
+    vec![
+        (
+            "tube",
+            polygon(&[(2.0, 0.0), (5.0, 0.0), (5.0, 3.0), (2.0, 3.0)]),
+            PI * (25.0 - 4.0) * 3.0,
+        ),
+        (
+            "cylinder",
+            polygon(&[(0.0, 0.0), (4.0, 0.0), (4.0, 9.0), (0.0, 9.0)]),
+            PI * 16.0 * 9.0,
+        ),
+        ("sphere", half_disc(radius), 4.0 / 3.0 * PI * radius.powi(3)),
+        (
+            "frustum",
+            polygon(&[(0.0, 0.0), (lower, 0.0), (upper, height), (0.0, height)]),
+            PI * height / 3.0 * lower.mul_add(lower, upper.mul_add(upper, lower * upper)),
+        ),
+        (
+            "torus",
+            PlanarProfile2 {
+                regions: vec![PlanarRegion2 {
+                    outer: PlanarLoop2 {
+                        curves: vec![PlanarCurve2::Circle {
+                            center: Point2::new(major, 0.0),
+                            radius: minor,
+                            direction: ArcDirection::CounterClockwise,
+                        }],
+                    },
+                    holes: vec![],
+                }],
+            },
+            TAU * major * PI * minor * minor,
+        ),
+        ("notch", notched_block(), notched_block_volume()),
+    ]
+}
+
+/// Pappus again: a partial turn sweeps its share of the full turn's volume.
+/// The sweeps cover a quarter, a half and three quarters, either side of
+/// half a turn, where the split of each carrier into two faces falls on the
+/// far side of its seam, and a narrow sliver.
+#[test]
+fn a_partial_turn_sweeps_its_share_of_every_carrier() {
+    for (name, profile, full) in carriers() {
+        for sweep in [PI / 2.0, PI, 1.5 * PI, PI - 0.25, PI + 0.25, 0.3] {
+            let label = format!("{name} through {sweep}");
+            let partial = revolve_through(
+                profile.clone(),
+                axis(),
+                RevolveAngle::partial(0.0, sweep),
+                &label,
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_volume(&partial, full * sweep / TAU, &label);
+        }
+    }
+}
+
+/// The two wedge faces are the section itself, so a partial tube's area is
+/// its share of the full turn's area plus the section twice.
+#[test]
+fn a_partial_tube_is_closed_by_its_section_at_both_ends() {
+    // r in [2, 5], z in [0, 3]: outer and inner walls, two annular caps.
+    let full_area = TAU * 5.0 * 3.0 + TAU * 2.0 * 3.0 + 2.0 * PI * (25.0 - 4.0);
+    let section = 3.0 * 3.0;
+    for sweep in [PI / 2.0, PI, 1.5 * PI] {
+        let tube = revolve_through(
+            polygon(&[(2.0, 0.0), (5.0, 0.0), (5.0, 3.0), (2.0, 3.0)]),
+            axis(),
+            RevolveAngle::partial(0.0, sweep),
+            "revolve-partial-tube-area",
+        )
+        .expect("a partial tube revolves");
+        let area = tube.measures().surface_area;
+        let expected = full_area * sweep / TAU + 2.0 * section;
+        assert!(
+            ((area - expected) / expected).abs() < 1.0e-9,
+            "area {area} should be {expected} at {sweep}"
+        );
+    }
+}
+
+fn centroid(snapshot: &Snapshot) -> Point3 {
+    snapshot
+        .measures()
+        .centroid
+        .expect("a solid has a centroid")
+}
+
+/// A partial turn is measured right-handed about the axis as it was given.
+/// The frame is XZ with the axis up +Z, so a quarter turn from the profile
+/// on +X ends on +Y.
+#[test]
+fn a_partial_turn_goes_the_way_its_axis_and_start_say() {
+    let right = || polygon(&[(2.0, 0.0), (5.0, 0.0), (5.0, 3.0), (2.0, 3.0)]);
+    let quarter = PI / 2.0;
+    let turned = |profile, axis, start, label| {
+        let snapshot = revolve_through(profile, axis, RevolveAngle::partial(start, quarter), label)
+            .expect("the quarter turn revolves");
+        centroid(&snapshot)
+    };
+
+    let forward = turned(right(), axis(), 0.0, "revolve-forward");
+    assert!(
+        forward.x > 1.0 && forward.y > 1.0,
+        "a quarter turn from +X about +Z ends in the +X+Y quadrant: {forward:?}"
+    );
+    let back = turned(right(), axis(), -quarter, "revolve-back");
+    assert!(
+        back.x > 1.0 && back.y < -1.0,
+        "starting a quarter turn back ends at the profile: {back:?}"
+    );
+    let symmetric = turned(right(), axis(), -quarter / 2.0, "revolve-symmetric");
+    assert!(
+        symmetric.x > 1.0 && symmetric.y.abs() < 1.0e-9,
+        "half a quarter each way sits astride the profile's plane: {symmetric:?}"
+    );
+
+    // The same axis walked the other way turns the other way.
+    let down = PlanarAxis2::new(Point2::new(0.0, 1.0), Point2::new(0.0, 0.0));
+    let reversed = turned(right(), down, 0.0, "revolve-reversed-axis");
+    assert!(
+        reversed.x > 1.0 && reversed.y < -1.0,
+        "a quarter turn about -Z goes from +X towards -Y: {reversed:?}"
+    );
+
+    // A profile on the far side of the axis turns about the axis as given
+    // too, although the kernel reverses its own section axis to build it.
+    let left = polygon(&[(-5.0, 0.0), (-2.0, 0.0), (-2.0, 3.0), (-5.0, 3.0)]);
+    let far = turned(left, axis(), 0.0, "revolve-far-side");
+    assert!(
+        far.x < -1.0 && far.y < -1.0,
+        "a quarter turn from -X about +Z goes towards -Y: {far:?}"
+    );
+}
+
+#[test]
+fn a_partial_turn_out_of_range_is_refused_by_name() {
+    let refused = |angle: RevolveAngle| {
+        let error = revolve_through(
+            polygon(&[(2.0, 0.0), (5.0, 0.0), (5.0, 3.0), (2.0, 3.0)]),
+            axis(),
+            angle,
+            "revolve-bad-angle",
+        )
+        .expect_err("the angle is refused");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.as_str() == "REVOLVE_ANGLE_INVALID"),
+            "{angle:?}: {error:?}"
+        );
+    };
+    for sweep in [0.0, -1.0, TAU, 7.0, f64::NAN, 1.0e-9, TAU - 1.0e-9] {
+        refused(RevolveAngle::partial(0.0, sweep));
+    }
+    for start in [f64::NAN, f64::INFINITY, 10.0] {
+        refused(RevolveAngle::partial(start, 1.0));
+    }
+}
+
+/// A partial revolve writes out as the planes, cylinders and tori it is
+/// built from, with nothing approximated.
+#[test]
+fn a_partial_revolve_exports_its_exact_carriers_to_step() {
+    for (name, profile, _) in carriers() {
+        let partial = revolve_through(
+            profile,
+            axis(),
+            RevolveAngle::partial(0.0, 1.5 * PI),
+            "revolve-partial-step",
+        )
+        .expect("the partial turn revolves");
+        let step = NativeKernel::export_step(&partial, name).expect("the partial revolve exports");
+        assert!(step.contains("PLANE"), "{name}: the wedges are planes");
+        assert!(
+            !step.contains("B_SPLINE_SURFACE"),
+            "{name}: nothing is approximated"
+        );
+        let carrier = match name {
+            "tube" | "cylinder" => "CYLINDRICAL_SURFACE",
+            "sphere" => "SPHERICAL_SURFACE",
+            "frustum" => "CONICAL_SURFACE",
+            _ => "TOROIDAL_SURFACE",
+        };
+        assert!(step.contains(carrier), "{name}: {carrier}");
+    }
+}
+
+/// A partial turn joins the Boolean ladder like a full one: a quarter tube of
+/// planes and coaxial cylinders, sunk in the block, comes out of it exactly.
+#[test]
+fn a_partial_revolve_cuts_a_block_exactly() {
+    let body = block();
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("revolve-partial-cut"),
+        expected_snapshot: body.id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::RevolvePlanarProfile {
+            frame: frame(),
+            profile: polygon(&[(2.0, -10.0), (5.0, -10.0), (5.0, -5.0), (2.0, -5.0)]),
+            axis: axis(),
+            angle: RevolveAngle::partial(0.0, PI / 2.0),
+            operation: SolidOperation::Cut,
+        },
+    };
+    let cut = NativeKernel::execute(&body, &request, &CancellationToken::new())
+        .expect("a quarter tube cuts the block");
+    let removed = PI * (25.0 - 4.0) * 5.0 / 4.0;
+    assert_volume(
+        &cut.snapshot,
+        40.0 * 40.0 * 20.0 - removed,
+        "block less a quarter tube",
+    );
+    assert_eq!(cut.report.rung.as_deref(), Some("revolve/boolean-prism"));
+    assert_eq!(cut.report.tier(), Tier::Exact);
+}

@@ -1,8 +1,9 @@
 # ADR 0055: Revolve and sweep are features
 
-Status: accepted. Phases R1 and R2 are implemented: Revolve is a history
-feature that turns a sketch profile about a centreline, the sketch's own
-axes or an origin axis, as a new body or added to or cut from the active
+Status: accepted. Phases R1, R2 and R3 are implemented: Revolve is a
+history feature that turns a sketch profile about a centreline, the
+sketch's own axes or an origin axis, a full turn or through an angle that
+can follow a variable, as a new body or added to or cut from the active
 one. The later phases are planned below.
 
 - Date: 2026-09-23
@@ -340,3 +341,70 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
     revolve in place.
   - A sketch dimension or variable the sketch follows (ADR 0054) reshapes
     the revolve on rebuild.
+
+## As built (R3)
+
+- **Protocol.** `RevolveAngle::Partial { start, sweep }`: the solid between
+  azimuths `start` and `start + sweep`, measured right-handed about the
+  axis as given, with zero at the profile's own half-plane. `sweep` lies
+  strictly between nothing and a full turn. `RevolveAngle` is no longer
+  `Eq`.
+- **The seam rule, as built.** The plan kept seams at 0 and π, with one
+  face per carrier for a sweep of π or less. That breaks the pole: a
+  sphere band reaching the axis closes through one degenerate edge, which
+  must be used twice, in opposite senses, for edge use to stay exact. So
+  every carrier is split halfway round the turn instead, at `sweep / 2`.
+  Each face then spans at most half a turn, a pole edge is always shared
+  by two faces, and a full turn is simply the case whose split falls at π
+  (ADR 0016's seams, digest for digest). A partial turn adds:
+  - a vertex at the end station of every ring, and generators there;
+  - planar caps as sectors, and annular caps as annular sectors, bounded
+    by straight generators at both ends;
+  - an axis edge from the section's last point to its first, when the
+    section closes through the axis;
+  - two planar wedge faces, the section at azimuth zero and its turned
+    copy at the end, with roles `ExtrusionBottom` and `ExtrusionTop`, as
+    a loft's caps have.
+- **A concave round revolved inside out, and still would have.** A
+  profile arc that runs clockwise (a concave round) flipped its torus or
+  sphere's axis and negated its angle. The two flips cancel, so the face
+  pointed into the material, and any profile with a concave round failed
+  edge-use orientation. Such an arc is now built as a descending line is:
+  the section's own axis, `angular_sign = -1`, rings taken bottom to top.
+  The validator's frame rule for tori and spheres required
+  `radial_u × radial_v = axis · angular_sign`, which only ever allows the
+  outward-facing surface — the rule ADR 0023 lifted from cones for the
+  same reason. It now asks only for an orthonormal frame, and the frame's
+  handedness times the angular sign decides which way the surface faces;
+  either handedness is accepted, so the left-handed frames tori already
+  carry keep their meaning. STEP export, tessellation and
+  the analytic Boolean already read orientation through that product.
+- **Refusals.** `REVOLVE_ANGLE_INVALID`: a sweep outside the open range, a
+  start that is not finite or is beyond a turn, or a sweep or remaining gap
+  narrower than the minimum feature at the profile's outermost radius.
+  A section point within agreement of the axis is now put on it exactly.
+- **Downstream.** `extract_rz_section` refuses a wedge face, so a partial
+  revolve takes no rim blend or section shell; it falls to the other
+  finish and shell routes, or to their refusals. It does combine: a quarter
+  tube cuts a block exactly through `revolve/boolean-prism`. The rung for a
+  new partial body is `revolve/partial-turn`. Scripts'
+  `revolve(angle: …)` takes any angle within a turn either way.
+- **Model.** `RevolveExtent::Angle { radians, direction }`, where
+  `direction` is `Forward`, `Reversed` or `Symmetric`, lowered to the
+  kernel's start and sweep. `SketchRevolve::angle_expression` follows
+  document variables as ADR 0052's distance does; the feature declares the
+  variables, replay evaluates them, and an expression that comes to a
+  whole turn makes a full turn. Both stay in document version 10.
+- **Workbench.** The card gains an Extent row (Full turn or Angle), an
+  angle field that takes degrees or an expression over variables and says
+  what it follows, and One way, Other way or Symmetric. Reopening a
+  revolve restores all three, the link included.
+- **Tests.**
+  - Pappus volumes at a quarter, a half and three quarters of a turn, and
+    either side of a half. They cover a tube, a solid cylinder, a sphere, a
+    cone frustum, a torus and a concave notch.
+  - The wedge area, and the direction for a start, a reversed axis and a
+    profile across the axis.
+  - Each refusal, STEP export for each carrier, and the exact partial cut.
+  - The model's angle link, and the card's and the real widgets' angle
+    typed over a variable.

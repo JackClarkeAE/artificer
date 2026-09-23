@@ -1073,11 +1073,30 @@ impl PlanarAxis2 {
 /// How far a revolve sweeps.
 ///
 /// An enum rather than an angle so that partial revolves extend this contract
-/// later instead of reinterpreting a number whose full-turn value was special.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// instead of reinterpreting a number whose full-turn value was special.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RevolveAngle {
     FullTurn,
+    /// The solid between azimuths `start` and `start + sweep`, in radians,
+    /// measured right-handed about the axis as given (from its `start` point
+    /// towards its `end`), with zero at the profile's own half-plane.
+    ///
+    /// `sweep` lies strictly between zero and a full turn. A start of zero
+    /// turns the profile one way, `-sweep` turns it the other way, and
+    /// `-sweep / 2` turns it symmetrically about its own plane.
+    Partial {
+        start: f64,
+        sweep: f64,
+    },
+}
+
+impl RevolveAngle {
+    /// The partial revolve that turns `sweep` radians from `start`.
+    #[must_use]
+    pub const fn partial(start: f64, sweep: f64) -> Self {
+        Self::Partial { start, sweep }
+    }
 }
 
 /// A deterministic set of disjoint planar material regions.

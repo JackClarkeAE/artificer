@@ -949,7 +949,11 @@ impl NativeKernel {
                 let tool = revolve::build_revolve(&revolved);
                 match operation {
                     SolidOperation::New => {
-                        rung = "revolve/full-turn";
+                        rung = if revolved.is_partial() {
+                            "revolve/partial-turn"
+                        } else {
+                            "revolve/full-turn"
+                        };
                         (tool, HistoryMode::Generated)
                     }
                     SolidOperation::Add | SolidOperation::Cut => {
@@ -7397,6 +7401,10 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
         revolve::RevolveInputError::SectionNotContiguous => (
             "REVOLVE_SECTION_NOT_CONTIGUOUS",
             "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",
+        ),
+        revolve::RevolveInputError::AngleInvalid => (
+            "REVOLVE_ANGLE_INVALID",
+            "A partial revolve turns through more than nothing and less than a full turn, from a start within one turn, and both the turn and the gap it leaves must be wider than the minimum feature at the profile's outermost radius; use a full turn to close the gap.",
         ),
     };
     error(

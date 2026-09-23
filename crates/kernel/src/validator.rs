@@ -548,10 +548,11 @@ fn validate_geometry(
                 .max(torus.radial_u.dot(torus.axis).abs())
                 .max(torus.radial_v.dot(torus.axis).abs())
                 .max((torus.angular_sign.abs() - 1.0).abs())
-                .max(
-                    (torus.radial_u.cross(torus.radial_v) - torus.axis * torus.angular_sign)
-                        .length(),
-                )
+                // Either handedness: the frame's handedness times the angular
+                // sign decides which way the surface faces, so a band whose
+                // material lies outside its tube — a concave round in a
+                // revolved section — can be expressed, as for a cone.
+                .max((torus.radial_u.cross(torus.radial_v).dot(torus.axis).abs() - 1.0).abs())
                 .max(if torus.minor_radius > 0.0 && torus.major_radius > 0.0 {
                     0.0
                 } else {
@@ -588,9 +589,15 @@ fn validate_geometry(
                 .max(sphere.radial_u.dot(sphere.axis).abs())
                 .max(sphere.radial_v.dot(sphere.axis).abs())
                 .max((sphere.angular_sign.abs() - 1.0).abs())
+                // As for a torus, either handedness: a sphere may face in.
                 .max(
-                    (sphere.radial_u.cross(sphere.radial_v) - sphere.axis * sphere.angular_sign)
-                        .length(),
+                    (sphere
+                        .radial_u
+                        .cross(sphere.radial_v)
+                        .dot(sphere.axis)
+                        .abs()
+                        - 1.0)
+                        .abs(),
                 )
                 .max(if sphere.radius > 0.0 {
                     0.0

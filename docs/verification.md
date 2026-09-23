@@ -66,6 +66,7 @@ are stable, slash-separated paths:
 | `extrusion/polygon`, `extrusion/linear-profile`, `extrusion/analytic-profile` | A new body from a sketch; the last two carry arcs and circles exactly. |
 | `extrusion/spline-profile` | A new body from a sketch with a spline in it (ADR 0050): each spline sweeps a B-spline wall, exactly. |
 | `revolve/full-turn` | A revolved section. |
+| `revolve/partial-turn` | A section turned through less than a full turn (ADR 0055 R3): its curved faces are split halfway round the turn, and two planar wedge faces, the section and its turned copy, close it. |
 | `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
 | `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
