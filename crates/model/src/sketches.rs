@@ -6,6 +6,7 @@ use artificer_protocol::{
 };
 use artificer_sketch::SketchDefinition;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 use crate::persistent::{
@@ -81,6 +82,27 @@ impl SketchPayload {
     #[must_use]
     pub const fn authoring(&self) -> Option<&SketchDefinition> {
         self.authoring.as_ref()
+    }
+
+    /// The names of the document variables this sketch's values follow
+    /// (ADR 0054). A link that does not read names nothing here; the
+    /// sketch's own validation refuses it.
+    #[must_use]
+    pub fn followed_variable_names(&self) -> BTreeSet<String> {
+        self.authoring
+            .iter()
+            .flat_map(SketchDefinition::value_links)
+            .filter_map(|link| artificer_sketch::expression::entry_names(&link.text).ok())
+            .flatten()
+            .collect()
+    }
+
+    /// Renames a variable wherever this sketch's values follow it. Returns
+    /// whether anything changed.
+    pub fn rename_followed_variable(&mut self, from: &str, to: &str) -> bool {
+        self.authoring
+            .as_mut()
+            .is_some_and(|authoring| authoring.rename_in_value_links(from, to))
     }
 
     /// Validates defensive bounds and snapshot-independent support identity.

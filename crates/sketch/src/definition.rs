@@ -18,6 +18,33 @@ pub const MAX_CURVE_EDITS_PER_TRANSACTION: usize = 1_024;
 pub const MAX_PATTERN_INSTANCES: u16 = 256;
 pub const MAX_POLYGON_SIDES: u16 = 256;
 pub const MIN_POLYGON_SIDES: u16 = 3;
+/// Most recipe values one sketch may keep linked to document variables.
+pub const MAX_SKETCH_VALUE_LINKS: usize = 4_096;
+/// Longest recipe field key a value link may name, in bytes.
+pub const MAX_VALUE_LINK_FIELD_BYTES: usize = 64;
+/// Longest entry a value link may keep, in bytes.
+pub const MAX_VALUE_LINK_TEXT_BYTES: usize = 1_024;
+
+/// One recipe value that follows the document's variables.
+///
+/// A dimension typed as `width / 2` is worked out when it is typed, and the
+/// recipe keeps the number that came out. On its own that is a copy: change
+/// `width` and the sketch keeps its old size. A link is what makes it stay
+/// linked. It names the operation and the recipe field the entry was typed
+/// into, and keeps the entry itself, written with its units
+/// ([`crate::expression::written_entry`]) so it reads the same whatever unit
+/// the document is later shown in. Whoever owns the variables works the
+/// entry out again when one changes and replaces the recipe with the answer.
+///
+/// The sketch never evaluates a link itself; it only keeps it with the
+/// operation it belongs to, through edits, undo and saving, and drops it
+/// when that operation is retired.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SketchValueLink {
+    pub operation: SketchOperationId,
+    pub field: String,
+    pub text: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "index", rename_all = "snake_case")]
@@ -269,6 +296,10 @@ pub struct SketchDefinition {
     /// definition so a replay closes exactly the regions the canvas did.
     #[serde(default)]
     pub(crate) support_curves: Vec<EvaluatedCurve2>,
+    /// The recipe values that follow document variables, ordered by
+    /// operation and field, at most one per field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) value_links: Vec<SketchValueLink>,
 }
 
 impl Default for SketchDefinition {
@@ -282,6 +313,7 @@ impl SketchDefinition {
     pub const fn new() -> Self {
         Self {
             support_curves: Vec::new(),
+            value_links: Vec::new(),
             points: BTreeMap::new(),
             operations: Vec::new(),
             entities: BTreeMap::new(),
@@ -598,6 +630,87 @@ impl SketchDefinition {
         &self.support_curves
     }
 
+    /// Every recipe value that follows a document variable.
+    #[must_use]
+    pub fn value_links(&self) -> &[SketchValueLink] {
+        &self.value_links
+    }
+
+    /// The entry one recipe field follows, if it follows one.
+    #[must_use]
+    pub fn value_link(&self, operation: SketchOperationId, field: &str) -> Option<&str> {
+        self.value_links
+            .binary_search_by(|link| (link.operation, link.field.as_str()).cmp(&(operation, field)))
+            .ok()
+            .map(|index| self.value_links[index].text.as_str())
+    }
+
+    /// Links or unlinks one recipe field, keeping the list in order. Returns
+    /// whether anything changed. The revision is the caller's to advance:
+    /// a link is set as part of the edit that typed it.
+    pub(crate) fn set_value_link(
+        &mut self,
+        operation: SketchOperationId,
+        field: &str,
+        text: Option<String>,
+    ) -> bool {
+        let found = self.value_links.binary_search_by(|link| {
+            (link.operation, link.field.as_str()).cmp(&(operation, field))
+        });
+        match (found, text) {
+            (Ok(index), Some(text)) => {
+                if self.value_links[index].text == text {
+                    return false;
+                }
+                self.value_links[index].text = text;
+            }
+            (Ok(index), None) => {
+                self.value_links.remove(index);
+            }
+            (Err(index), Some(text)) => self.value_links.insert(
+                index,
+                SketchValueLink {
+                    operation,
+                    field: field.to_owned(),
+                    text,
+                },
+            ),
+            (Err(_), None) => return false,
+        }
+        true
+    }
+
+    /// Drops the links of operations that are no longer active: whatever
+    /// they drove has been retired with them.
+    pub(crate) fn prune_value_links(&mut self) {
+        let active: BTreeSet<SketchOperationId> = self
+            .active_operations()
+            .map(|operation| operation.id)
+            .collect();
+        self.value_links
+            .retain(|link| active.contains(&link.operation));
+    }
+
+    /// Renames a variable in every link that uses it. Returns whether any
+    /// link changed. Like the variable it follows, a renamed link is not an
+    /// edit of the sketch, so the revision stays.
+    pub fn rename_in_value_links(&mut self, from: &str, to: &str) -> bool {
+        let mut changed = false;
+        for link in &mut self.value_links {
+            let Ok(names) = crate::expression::entry_names(&link.text) else {
+                continue;
+            };
+            if !names.contains(from) {
+                continue;
+            }
+            if let Ok(renamed) = crate::expression::rename_in_entry(&link.text, from, to) {
+                link.text = renamed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The entity id the `index`th support curve takes in an arrangement.
     ///
     /// Support curves are not entities and have none of their own, but a
@@ -706,6 +819,14 @@ impl SketchDefinition {
                 resource: "constraints",
                 requested: self.constraints.len(),
                 limit: crate::MAX_SKETCH_CONSTRAINTS,
+            });
+        }
+
+        if self.value_links.len() > MAX_SKETCH_VALUE_LINKS {
+            return Err(SketchValidationError::ResourceLimit {
+                resource: "value_links",
+                requested: self.value_links.len(),
+                limit: MAX_SKETCH_VALUE_LINKS,
             });
         }
 
@@ -818,6 +939,29 @@ impl SketchDefinition {
         }
         self.solve_constraints(precision)
             .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
+
+        for (index, link) in self.value_links.iter().enumerate() {
+            let invalid = SketchValidationError::InvalidValueLink {
+                operation: link.operation,
+            };
+            let ordered = index == 0 || {
+                let previous = &self.value_links[index - 1];
+                (previous.operation, previous.field.as_str())
+                    < (link.operation, link.field.as_str())
+            };
+            if !ordered
+                || !operation_positions.contains_key(&link.operation)
+                || link.field.is_empty()
+                || link.field.len() > MAX_VALUE_LINK_FIELD_BYTES
+                || link.text.len() > MAX_VALUE_LINK_TEXT_BYTES
+            {
+                return Err(invalid);
+            }
+            match crate::expression::entry_names(&link.text) {
+                Ok(names) if !names.is_empty() => {}
+                _ => return Err(invalid),
+            }
+        }
 
         if self.allocator.point < self.points.keys().map(|id| id.get()).max().unwrap_or(0)
             || self.allocator.operation
@@ -1209,6 +1353,11 @@ pub enum SketchValidationError {
     },
     InvalidConstraint,
     ConstraintSystemConflict,
+    /// A value link out of order, on an operation the sketch does not have,
+    /// or whose entry does not read or names no variable.
+    InvalidValueLink {
+        operation: SketchOperationId,
+    },
 }
 
 impl fmt::Display for SketchValidationError {
@@ -1349,6 +1498,10 @@ impl fmt::Display for SketchValidationError {
             Self::ConstraintSystemConflict => {
                 formatter.write_str("sketch constraint system is conflicting")
             }
+            Self::InvalidValueLink { operation } => write!(
+                formatter,
+                "a value of operation {operation} is linked to an entry that cannot be kept"
+            ),
         }
     }
 }

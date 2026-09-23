@@ -3,7 +3,8 @@
 //! saved from the File menu, then placed several times at different lengths,
 //! each its own component; the built-in extrusion is placed at several
 //! lengths beside them; and the document keeps every placement when it is
-//! opened again in an app that has no library at all.
+//! opened again in an app that has no library at all. A part whose sketch
+//! dimension follows a variable is placed at different sizes the same way.
 
 use artificer_workbench::{KernelLabApp, sketch::SketchPoint};
 use egui::accesskit::Role;
@@ -239,4 +240,87 @@ fn a_saved_part_is_placed_many_times_at_different_lengths() {
         "{} against {total}",
         reopened.state().mass_properties().volume
     );
+}
+
+/// A `width` variable at 12 mm, and a rectangle whose width is dimensioned
+/// as `width`, extruded 3 mm.
+fn draw_a_plate_whose_sketch_follows_width(harness: &mut Harness<'static, KernelLabApp>) {
+    click_button(harness, "Parametric ribbon tab");
+    click_button(harness, "New length variable");
+    click_button(harness, CONFIRM_OPERATION);
+    replace_text(harness, "Variable name Length1", "width");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    replace_text(harness, "Variable value width", "12");
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    click_button(harness, CONFIRM_OPERATION);
+
+    click_button(harness, "XY Plane");
+    click_button(harness, "Sketch mode");
+    click_button(harness, "Two-point rectangle");
+    for point in [SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)] {
+        let position = harness
+            .state()
+            .sketch_point_screen_position(harness.get_by_label("Sketch viewport").rect(), point);
+        click_at(harness, position);
+    }
+    click_button(harness, "Sketch dimension");
+    let top = harness.state().sketch_point_screen_position(
+        harness.get_by_label("Sketch viewport").rect(),
+        SketchPoint::new(0.0, 1.0),
+    );
+    click_at(harness, top);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness
+        .get_by_role_and_label(Role::TextInput, "Rectangle width")
+        .type_text("width");
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+
+    click_button(harness, "Extrude");
+    replace_text(harness, "Extrusion distance expression", "3");
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    click_button(harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let volume = harness.state().mass_properties().volume;
+    assert!((volume - 12.0 * 2.0 * 3.0).abs() < 1.0e-6, "{volume}");
+}
+
+#[test]
+fn a_saved_part_whose_sketch_follows_a_variable_is_placed_at_different_sizes() {
+    let library = TemporaryLibrary::new("sketch-widths");
+    let mut harness = harness_with_library(library.path.clone());
+    harness.run();
+    draw_a_plate_whose_sketch_follows_width(&mut harness);
+
+    click_button(&mut harness, "File menu");
+    click_button(&mut harness, "Save to Part Library…");
+    replace_text(&mut harness, "Part name", "Plate");
+    click_button(&mut harness, "Save to library");
+    assert_eq!(
+        harness.state().document_status_text(),
+        Some("Saved Plate v1.0.0 into the Part Library")
+    );
+    let part = harness
+        .state()
+        .part_library()
+        .selected_part()
+        .expect("the saved part is selected")
+        .clone();
+    assert_eq!(part.parameters.len(), 1);
+    assert_eq!(part.parameters[0].default, Some(12.0));
+
+    // Each placement is the plate at its own width: the sketch dimension
+    // follows the value given for it, as an extrusion distance would.
+    for width in [5.0, 20.0, 47.5] {
+        let volume = place(&mut harness, "width (mm)", &format!("{width}"));
+        assert!(
+            (volume - width * 2.0 * 3.0).abs() < 1.0e-6,
+            "{width} mm wide placed as {volume} mm³"
+        );
+    }
+    assert_eq!(harness.state().component_instance_count(), 3);
 }

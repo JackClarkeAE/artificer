@@ -28,6 +28,7 @@ pub mod part_preview;
 mod ribbon;
 pub mod saved_parts;
 pub mod shell;
+pub mod sketch_links;
 pub mod spacemouse;
 pub mod update;
 pub mod user_data;
@@ -3422,7 +3423,7 @@ impl KernelLabApp {
                     }
                     ui.label(
                         RichText::new(
-                            "An extrusion whose distance was typed as a variable follows the value given when the part is placed; the variable's value now is its default.",
+                            "A sketch dimension or extrusion distance typed over a variable follows the value given when the part is placed; the variable's value now is its default.",
                         )
                         .small()
                         .color(theme::muted()),
@@ -6655,6 +6656,9 @@ impl KernelLabApp {
                 && (record.visible
                     || record.auto_hidden_by.is_some() && !auto_hidden_consumer_active);
         }
+        // Undo and redo restore sketch payloads along with everything else,
+        // including those a variable change made its sketches follow.
+        self.refresh_sketch_payloads_from_document();
         self.extruded_sketch_revision = self
             .active_sketch_index
             .and_then(|index| self.sketches.get(index))
@@ -12021,8 +12025,16 @@ impl KernelLabApp {
                         match self
                             .document
                             .set_parameter_binding(parameter, binding.clone())
-                        {
-                            Ok(_) => {
+                            .map_err(|error| error.to_string())
+                            .and_then(|changed| {
+                                // Only a change has an undo step to abandon.
+                                if changed {
+                                    self.follow_variables_in_sketches()
+                                } else {
+                                    Ok(())
+                                }
+                            }) {
+                            Ok(()) => {
                                 self.pending_operation = None;
                                 self.variable_value_drafts.remove(&parameter.get());
                                 self.rebuild_after_parameter_change();
@@ -18577,6 +18589,18 @@ impl KernelLabApp {
                 );
             } else if let Some(reason) = parameter.read_only_reason {
                 ui.label(RichText::new(reason).small().color(theme::muted()));
+            } else if parameter.follows_variables {
+                // Said once, where the value is: this is not a copy.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Follows its variables and changes when they do · a plain number unlinks it",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    )
+                    .wrap(),
+                );
             }
         }
     }
@@ -20170,6 +20194,68 @@ impl KernelLabApp {
     fn display_coordinate(value: f64) -> f64 {
         let rounded = (value * 1000.0).round() / 1000.0;
         if rounded == 0.0 { 0.0 } else { rounded }
+    }
+
+    /// Works every sketch that follows a variable out again after one
+    /// changed (ADR 0054), inside the variable's own undo step. A sketch
+    /// that cannot take the new value abandons the change, so the document
+    /// is left exactly as it was and the reason is the refusal.
+    fn follow_variables_in_sketches(&mut self) -> Result<(), String> {
+        let keep_connected = self.sketch.snap_settings().keep_points_connected;
+        match sketch_links::follow_variables(&mut self.document, keep_connected) {
+            Ok(followed) => {
+                if !followed.is_empty() {
+                    self.refresh_sketch_payloads_from_document();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                self.document.abandon_last_edit();
+                self.restore_runtime_from_document();
+                Err(error)
+            }
+        }
+    }
+
+    /// Brings every sketch record's copy of its document payload, and the
+    /// regions drawn from it, up to date after the document changed them
+    /// without the canvas: a followed variable, a renamed one.
+    fn refresh_sketch_payloads_from_document(&mut self) {
+        for sketch in &mut self.sketches {
+            let Some(id) = sketch.id else {
+                continue;
+            };
+            let Some(payload) = self
+                .document
+                .sketch(id)
+                .and_then(|record| self.document.sketch_payload(id, record.geometry_revision))
+            else {
+                continue;
+            };
+            if sketch.portable_payload.as_ref() == Some(payload) {
+                continue;
+            }
+            sketch.portable_payload = Some(payload.clone());
+            sketch.overlay_regions = payload_overlay_regions(payload);
+        }
+    }
+
+    /// The canvas worked its own linked values out again because the
+    /// variables changed. Where it holds a sketch the document has already
+    /// followed, the two now agree and the sketch stays as finished as it
+    /// was; a sketch still being drawn has simply been edited.
+    fn canvas_followed_variables(&mut self) {
+        let document_agrees = self
+            .active_sketch_index
+            .and_then(|index| self.sketches.get(index))
+            .and_then(|record| record.portable_payload.as_ref())
+            .and_then(SketchPayload::authoring)
+            .is_some_and(|authoring| same_links_and_geometry(authoring, self.sketch.authoring()));
+        if document_agrees {
+            self.sync_active_sketch_record();
+        } else {
+            self.publish_committed_sketch_edit();
+        }
     }
 
     fn rebuild_after_parameter_change(&mut self) {
@@ -23138,7 +23224,9 @@ impl eframe::App for KernelLabApp {
         } else {
             self.evaluated_variable_values()
         };
-        self.sketch.set_named_values(named_values);
+        if self.sketch.set_named_values(named_values) {
+            self.canvas_followed_variables();
+        }
         let operation_at_frame_start = self.pending_operation;
         if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
             self.last_focused_editor = Some(focused);
@@ -25290,6 +25378,17 @@ fn points_coincide(left: Point3, right: Point3) -> bool {
 ///
 /// A payload with no authoring graph is a legacy one whose profile *is* its
 /// geometry, so it never takes this route.
+/// Whether two sketches say the same thing, whatever edits brought each
+/// there: the canvas and the document follow a variable separately, so the
+/// revisions they count differ even where the sketches agree.
+fn same_links_and_geometry(first: &SketchDefinition, second: &SketchDefinition) -> bool {
+    first.operations() == second.operations()
+        && first.points() == second.points()
+        && first.entities() == second.entities()
+        && first.constraints() == second.constraints()
+        && first.value_links() == second.value_links()
+}
+
 fn same_authored_sketch(committed: &SketchPayload, candidate: &SketchPayload) -> bool {
     committed.frame == candidate.frame
         && committed.support == candidate.support
@@ -25362,7 +25461,7 @@ fn compile_single_authoring_region(authoring: &SketchDefinition) -> Option<Plana
     .map(|compiled| compiled.profile)
 }
 
-fn authoring_region_signatures_for_profile(
+pub(crate) fn authoring_region_signatures_for_profile(
     authoring: &SketchDefinition,
     profile: &PlanarProfile2,
 ) -> Option<Vec<RegionSignature>> {

@@ -1663,6 +1663,9 @@ pub struct SelectedRecipeParameter {
     pub editable: bool,
     pub read_only_reason: Option<&'static str>,
     pub error: Option<RecipeParameterError>,
+    /// Whether the value follows document variables: its text is the entry
+    /// it was typed as, and it changes when they do.
+    pub follows_variables: bool,
 }
 
 /// Read-only projection of the selected operation's persistent design intent.
@@ -1687,6 +1690,10 @@ struct RetainedRecipeParameter {
     error: Option<RecipeParameterError>,
     /// Whether the value is a length, shown and read in the document unit.
     length: bool,
+    /// The entry the value follows when it was typed over document
+    /// variables, written with its units: what the sketch keeps as the
+    /// field's value link, and what the field shows.
+    link: Option<String>,
 }
 
 impl RetainedRecipeParameter {
@@ -1707,6 +1714,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1728,6 +1736,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: true,
+            link: None,
         }
     }
 
@@ -1747,6 +1756,7 @@ impl RetainedRecipeParameter {
             read_only_reason: Some("Driven by a model input; edit the owning parameter instead"),
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1774,6 +1784,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1784,6 +1795,11 @@ impl RetainedRecipeParameter {
             return;
         }
         self.unit = unit.suffix();
+        // A followed entry is written with its units and reads the same in
+        // any unit, so it is shown as it is.
+        if self.link.is_some() {
+            return;
+        }
         if let Some(millimetres) = self.value
             && self.error.is_none()
         {
@@ -1809,8 +1825,50 @@ impl RetainedRecipeParameter {
             editable: self.value.is_some() || self.is_text(),
             read_only_reason: self.read_only_reason,
             error: self.error,
+            follows_variables: self.link.is_some(),
         }
     }
+
+    /// What an entry typed into this field is read against.
+    fn field_unit(&self, unit: LengthUnit) -> FieldUnit {
+        if self.length {
+            FieldUnit::length(unit.millimetres_per_unit())
+        } else if self.is_angle() {
+            FieldUnit::degrees()
+        } else {
+            FieldUnit::SCALAR
+        }
+    }
+
+    /// A kept entry's value in this field's canonical terms — millimetres,
+    /// degrees, or the number itself — over the named variables.
+    fn evaluate_link(
+        &self,
+        text: &str,
+        names: &BTreeMap<String, NamedQuantity>,
+    ) -> Result<f64, artificer_sketch::expression::ExpressionError> {
+        // A kept entry reads the same in any unit, so millimetres, which
+        // keeps the answer canonical, will do.
+        let value = evaluate_entry(text, self.field_unit(LengthUnit::Millimetre), &|name| {
+            names.get(name).copied()
+        })?;
+        Ok(if self.is_angle() {
+            value.to_degrees()
+        } else {
+            value
+        })
+    }
+}
+
+/// The entry to keep as a field's value link: `Some` when what was typed
+/// names a document variable, written so it reads the same in any unit;
+/// `None` for a plain number, which the recipe keeps on its own.
+fn value_link_for_entry(text: &str, field: FieldUnit) -> Option<String> {
+    let names = artificer_sketch::expression::entry_names(text).ok()?;
+    if names.is_empty() {
+        return None;
+    }
+    artificer_sketch::expression::written_entry(text, field).ok()
 }
 
 #[derive(Clone, Debug)]
@@ -2675,6 +2733,120 @@ fn polygon_driven_diameter(
     }
 }
 
+/// Why a sketch's linked values could not follow the document variables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedValueError {
+    pub operation: CoreOperationId,
+    pub field: String,
+    pub text: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for LinkedValueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the sketch {} that follows {} cannot be set: {}",
+            self.field.replace('_', " "),
+            self.text,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for LinkedValueError {}
+
+/// Works every value link in `authoring` out again over `names` and
+/// replaces each linked recipe with the answer, in operation order.
+///
+/// This is what makes a dimension typed as `width / 2` stay linked to
+/// `width`: whoever owns the variables calls it when one changes, and when
+/// a part is evaluated at new values. Each linked operation is restaged
+/// through the same replacement a typed value would have made — carrying
+/// its joined neighbours when `keep_points_connected` says so — and
+/// committed, so the result is a sketch the canvas itself could have
+/// produced. `Ok(None)` means every linked value already agrees.
+///
+/// A link that no longer reads, names a variable that is not there, comes
+/// to a value its field refuses, or whose replacement the sketch cannot
+/// replay is an error naming the field, and nothing is changed.
+pub fn regenerate_linked_values(
+    authoring: &CoreSketchDefinition,
+    names: &BTreeMap<String, NamedQuantity>,
+    keep_points_connected: bool,
+) -> Result<Option<CoreSketchDefinition>, LinkedValueError> {
+    let mut linked: BTreeMap<CoreOperationId, Vec<(String, String)>> = BTreeMap::new();
+    for link in authoring.value_links() {
+        linked
+            .entry(link.operation)
+            .or_default()
+            .push((link.field.clone(), link.text.clone()));
+    }
+    let mut working = authoring.clone();
+    let mut changed = false;
+    for (operation, links) in linked {
+        let Some(record) = working.operation(operation).filter(|record| record.active) else {
+            continue;
+        };
+        let original = record.recipe.clone();
+        let mut editor = selected_recipe_editor_for(
+            SketchEntityId(0),
+            operation,
+            original.clone(),
+            LengthUnit::Millimetre,
+        );
+        for (field, text) in &links {
+            let refuse = |reason: String| LinkedValueError {
+                operation,
+                field: field.clone(),
+                text: text.clone(),
+                reason,
+            };
+            let Some(parameter) = editor
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.stable_key == field.as_str())
+                .filter(|parameter| parameter.value.is_some())
+            else {
+                return Err(refuse("the recipe no longer has that value".to_owned()));
+            };
+            let value = parameter
+                .evaluate_link(text, names)
+                .map_err(|error| refuse(error.to_string()))
+                .and_then(|value| {
+                    validate_tool_value(value, parameter.domain)
+                        .map_err(|error| refuse(error.label().to_owned()))
+                })?;
+            parameter.value = Some(value);
+        }
+        let refuse = |reason: &str| LinkedValueError {
+            operation,
+            field: links[0].0.clone(),
+            text: links[0].1.clone(),
+            reason: reason.to_owned(),
+        };
+        let recipe = rebuilt_selected_recipe(&editor)
+            .map_err(|()| refuse("the value does not fit the recipe"))?;
+        if recipe == original {
+            continue;
+        }
+        let inputs = Default::default();
+        let precision = PrecisionPolicy::default();
+        let label = "Follow variables";
+        let transaction = if keep_points_connected {
+            working.stage_replace_pulling_followers(operation, recipe, label, &inputs, precision)
+        } else {
+            working.stage_replace(operation, recipe, label, &inputs, precision)
+        }
+        .map_err(|_| refuse("the sketch cannot be rebuilt with it"))?;
+        working
+            .commit(transaction, CoreConfirmationSource::GreenTick)
+            .map_err(|_| refuse("the sketch cannot be rebuilt with it"))?;
+        changed = true;
+    }
+    Ok(changed.then_some(working))
+}
+
 fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, ()> {
     let mut recipe = editor.original_recipe.clone();
     match &mut recipe {
@@ -3142,6 +3314,7 @@ struct DimensionEditOriginal {
     geometry: SketchGeometry,
     fields: Vec<DimensionField>,
     three_point_arc: Option<ThreePointArcConstraint>,
+    links: Vec<(SketchDimensionKind, String)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3164,6 +3337,11 @@ struct DimensionSession {
     focus_next_frame: bool,
     serial: u64,
     three_point_arc: Option<ThreePointArcConstraint>,
+    /// The entries typed over document variables, by the dimension they
+    /// were typed into, written with their units. They become value links
+    /// on the operation the draft stages, where a field of it states the
+    /// same value.
+    links: Vec<(SketchDimensionKind, String)>,
 }
 
 impl DimensionSession {
@@ -3230,6 +3408,7 @@ impl DimensionSession {
             focus_next_frame: false,
             serial,
             three_point_arc: None,
+            links: Vec::new(),
         }
     }
 
@@ -3498,6 +3677,7 @@ impl DimensionSession {
             geometry: self.geometry,
             fields: self.fields.clone(),
             three_point_arc: self.three_point_arc,
+            links: self.links.clone(),
         });
         self.error = None;
         self.focus_next_frame = true;
@@ -3556,6 +3736,15 @@ impl DimensionSession {
             self.fields = previous_fields;
             return Err(error);
         }
+        let field = if kind.is_angle() {
+            FieldUnit::degrees()
+        } else {
+            FieldUnit::length(entry.unit.millimetres_per_unit())
+        };
+        self.links.retain(|(linked, _)| *linked != kind);
+        if let Some(link) = value_link_for_entry(&self.buffer, field) {
+            self.links.push((kind, link));
+        }
         self.error = None;
         Ok(())
     }
@@ -3576,6 +3765,7 @@ impl DimensionSession {
         self.geometry = original.geometry;
         self.fields = original.fields;
         self.three_point_arc = original.three_point_arc;
+        self.links = original.links;
         self.active = None;
         self.buffer.clear();
         self.error = None;
@@ -4900,6 +5090,10 @@ pub struct PendingSketchEdit {
     /// beside a red original, because accepting the typed value is the
     /// commit. Only the selected-feature parameter editor stages one.
     in_place: bool,
+    /// Entries the draft's dimension boxes were typed as over document
+    /// variables, to link on the operation this edit inserts when it is
+    /// confirmed.
+    draft_links: Vec<(SketchDimensionKind, String)>,
 }
 
 struct PendingCorePresentation {
@@ -5474,6 +5668,12 @@ pub struct SketchCanvasState {
     /// names in arithmetic entries: `width`, `width / 2 + 5`. The workbench
     /// refreshes the map from the document's parameter table.
     named_values: BTreeMap<String, NamedQuantity>,
+    /// The named values changed while an edit was pending, so the values
+    /// that follow them are still to be worked out again.
+    linked_values_stale: bool,
+    /// Why the values that follow the named values could not, the last
+    /// time they were worked out again.
+    linked_value_issue: Option<LinkedValueError>,
 }
 
 impl Default for SketchCanvasState {
@@ -5526,6 +5726,8 @@ impl Default for SketchCanvasState {
             last_context_fit_key: None,
             support_curves: Vec::new(),
             named_values: BTreeMap::new(),
+            linked_values_stale: false,
+            linked_value_issue: None,
         }
     }
 }
@@ -5638,6 +5840,8 @@ impl SketchCanvasState {
             let _ = self.rebuild_presentation_from_authoring();
             return false;
         }
+        // What was restored followed the variables as they were then.
+        self.linked_values_stale = !self.authoring.value_links().is_empty();
         true
     }
 
@@ -5653,6 +5857,7 @@ impl SketchCanvasState {
             let _ = self.rebuild_presentation_from_authoring();
             return false;
         }
+        self.linked_values_stale = !self.authoring.value_links().is_empty();
         true
     }
 
@@ -6087,10 +6292,79 @@ impl SketchCanvasState {
     /// millimetres for a length, radians for an angle — and says what it
     /// measures, so an angle variable in an angle box reads as the angle it
     /// is and a length in an angle box is refused rather than misread.
-    pub fn set_named_values(&mut self, values: BTreeMap<String, NamedQuantity>) {
+    ///
+    /// Values typed over them keep following them (ADR 0054): when they
+    /// change, every linked recipe is worked out again, as soon as no edit is
+    /// pending. Returns whether the sketch's geometry changed.
+    pub fn set_named_values(&mut self, values: BTreeMap<String, NamedQuantity>) -> bool {
         if self.named_values != values {
             self.named_values = values;
+            self.linked_values_stale = !self.authoring.value_links().is_empty();
         }
+        if self.linked_values_stale && self.pending.is_none() {
+            self.linked_values_stale = false;
+            return self.follow_named_values();
+        }
+        false
+    }
+
+    /// Works the linked values out again at the current named values and
+    /// shows the result, keeping the selection on the operation it was on.
+    /// A value that cannot follow leaves the sketch as it was and is
+    /// reported by [`Self::linked_value_issue`].
+    fn follow_named_values(&mut self) -> bool {
+        let followed = match regenerate_linked_values(
+            &self.authoring,
+            &self.named_values,
+            self.snap.keep_points_connected,
+        ) {
+            Ok(Some(followed)) => followed,
+            Ok(None) => {
+                self.linked_value_issue = None;
+                return false;
+            }
+            Err(error) => {
+                self.linked_value_issue = Some(error);
+                return false;
+            }
+        };
+        let selected_operation = self
+            .selected
+            .and_then(|selected| self.operation_by_ui.get(&selected).copied());
+        let previous = std::mem::replace(&mut self.authoring, followed);
+        if self.rebuild_presentation_from_authoring().is_err() {
+            self.authoring = previous;
+            let _ = self.rebuild_presentation_from_authoring();
+            return false;
+        }
+        self.linked_value_issue = None;
+        if let Some(operation) = selected_operation
+            && let Some(entity) = self
+                .operation_by_ui
+                .iter()
+                .find_map(|(entity, owner)| (*owner == operation).then_some(*entity))
+        {
+            self.set_selected(Some(entity));
+        }
+        true
+    }
+
+    /// Why the values that follow the named values could not follow them
+    /// the last time they changed, if they could not.
+    #[must_use]
+    pub const fn linked_value_issue(&self) -> Option<&LinkedValueError> {
+        self.linked_value_issue.as_ref()
+    }
+
+    /// Renames a named value wherever this sketch's values follow it, as the
+    /// document does when a variable is renamed. Returns whether anything
+    /// changed.
+    pub fn rename_named_value(&mut self, from: &str, to: &str) -> bool {
+        if !self.authoring.rename_in_value_links(from, to) {
+            return false;
+        }
+        self.rebuild_selected_recipe_editor();
+        true
     }
 
     /// Evaluates one length entry over the published document variables —
@@ -6555,12 +6829,18 @@ impl SketchCanvasState {
                     .map(|record| record.provenance.operation)
             })?;
             let recipe = self.authoring.operation(operation)?.recipe.clone();
-            Some(selected_recipe_editor_for(
-                subject,
-                operation,
-                recipe,
-                self.length_unit,
-            ))
+            let mut editor =
+                selected_recipe_editor_for(subject, operation, recipe, self.length_unit);
+            // A value that follows variables shows the entry it follows.
+            for parameter in &mut editor.parameters {
+                if parameter.value.is_some()
+                    && let Some(text) = self.authoring.value_link(operation, parameter.stable_key)
+                {
+                    parameter.text = text.to_owned();
+                    parameter.link = Some(text.to_owned());
+                }
+            }
+            Some(editor)
         });
     }
 
@@ -6700,6 +6980,10 @@ impl SketchCanvasState {
             match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
+                    // Typed over a variable, the value keeps following it;
+                    // a plain number is a plain number again.
+                    parameter.link =
+                        value_link_for_entry(&parameter.text, parameter.field_unit(unit));
                     Some(value)
                 }
                 Err(error) => {
@@ -6712,10 +6996,22 @@ impl SketchCanvasState {
         let recipe = rebuilt_selected_recipe(self.selected_recipe_editor.as_ref()?).ok()?;
         // Typing an angle or a length is as deliberate as dragging the same
         // endpoint would have been, so it carries its joined neighbours the
-        // same way.
+        // same way. The fields' links ride in the same edit, so they are
+        // confirmed, cancelled and undone with the values they produced.
         let transaction = self
             .stage_deliberate_replacement(operation, recipe, "Edit sketch parameters")
-            .ok();
+            .ok()
+            .and_then(|mut transaction| {
+                let editor = self.selected_recipe_editor.as_ref()?;
+                for parameter in &editor.parameters {
+                    if parameter.value.is_some() {
+                        transaction
+                            .set_value_link(operation, parameter.stable_key, parameter.link.clone())
+                            .ok()?;
+                    }
+                }
+                Some(transaction)
+            });
         let Some(transaction) = transaction else {
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
@@ -7008,6 +7304,7 @@ impl SketchCanvasState {
             core_entities: vec![None],
             retired_entities: Vec::new(),
             in_place: false,
+            draft_links: Vec::new(),
         });
         let existing_draft = self.dimension_session.take().filter(|session| {
             session.target == DimensionTarget::Draft
@@ -7133,6 +7430,7 @@ impl SketchCanvasState {
             core_entities,
             retired_entities,
             in_place,
+            draft_links: Vec::new(),
         });
         self.dimension_session = None;
         self.refresh_profile_analysis();
@@ -7322,6 +7620,18 @@ impl SketchCanvasState {
         let coincidences = self.auto_coincidences(&transaction);
         if !coincidences.is_empty() {
             let _ = transaction.append_constraints(coincidences);
+        }
+        // A drafted insertion keeps following the variables its boxes were
+        // typed over. The boxes may still be open on the pending geometry,
+        // in which case they say last what was typed.
+        if !pending.in_place {
+            let links = match &self.dimension_session {
+                Some(session) if session.target == DimensionTarget::Pending(subject) => {
+                    session.links.clone()
+                }
+                _ => pending.draft_links.clone(),
+            };
+            link_draft_values(&mut transaction, &links, &self.named_values);
         }
         let inserted_core_entities = transaction
             .impact()
@@ -10316,6 +10626,7 @@ impl SketchCanvasState {
             core_entities: Vec::new(),
             retired_entities: Vec::new(),
             in_place: false,
+            draft_links: Vec::new(),
         });
         self.refresh_profile_analysis();
         Ok(subject)
@@ -14017,15 +14328,12 @@ const fn canvas_dimensionable_keys(recipe: &CoreRecipe) -> &'static [&'static st
     }
 }
 
-/// The recipe literal a committed dimension box drives, if the Dimension tool
-/// has armed one.
-fn committed_dimension_parameter(
-    state: &SketchCanvasState,
+/// The recipe field a dimension of `kind` states for the recipe `editor`
+/// shows.
+fn dimension_parameter_key(
     kind: SketchDimensionKind,
-) -> Option<&RetainedRecipeParameter> {
-    if state.exact_tool != ToolVariant::Dimension {
-        return None;
-    }
+    editor: &SelectedRecipeEditor,
+) -> Option<&'static str> {
     let stable_key = match kind {
         SketchDimensionKind::Width => "width",
         SketchDimensionKind::Height => "height",
@@ -14037,42 +14345,41 @@ fn committed_dimension_parameter(
         SketchDimensionKind::AngleDegrees => "angle",
         _ => return None,
     };
-    let editor = state.selected_recipe_editor.as_ref()?;
-    let stable_key = if stable_key == "length"
-        && !editor
+    let has = |key: &str| {
+        editor
             .parameters
             .iter()
-            .any(|parameter| parameter.stable_key == "length")
-    {
-        if editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "overall_length")
-        {
+            .any(|parameter| parameter.stable_key == key)
+    };
+    Some(if stable_key == "length" && !has("length") {
+        if has("overall_length") {
             "overall_length"
-        } else if editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "centre_distance")
-        {
+        } else if has("centre_distance") {
             "centre_distance"
         } else {
             "side"
         }
     } else if (stable_key == "radius" || stable_key == "diameter")
-        && !editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == stable_key)
-        && editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "width")
+        && !has(stable_key)
+        && has("width")
     {
         "width"
     } else {
         stable_key
-    };
+    })
+}
+
+/// The recipe literal a committed dimension box drives, if the Dimension tool
+/// has armed one.
+fn committed_dimension_parameter(
+    state: &SketchCanvasState,
+    kind: SketchDimensionKind,
+) -> Option<&RetainedRecipeParameter> {
+    if state.exact_tool != ToolVariant::Dimension {
+        return None;
+    }
+    let editor = state.selected_recipe_editor.as_ref()?;
+    let stable_key = dimension_parameter_key(kind, editor)?;
     if state
         .pending
         .as_ref()
@@ -15345,7 +15652,93 @@ fn show_dimension_widgets(
     }
 }
 
+/// Links the fields of a drafted insertion to the entries its dimension
+/// boxes were typed as, so a circle drawn with its diameter typed as `w`
+/// keeps following `w` once it is confirmed.
+///
+/// A box and a recipe field do not always state the same number: a
+/// two-point rectangle drawn leftwards keeps a negative width behind a box
+/// that shows its size. So an entry is linked only where the field holds
+/// exactly what the entry comes to, or its negation, which is linked
+/// negated; a box with no field that agrees stays a copy.
+fn link_draft_values(
+    transaction: &mut CoreTransaction,
+    links: &[(SketchDimensionKind, String)],
+    names: &BTreeMap<String, NamedQuantity>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let mut inserted = transaction.impact().inserted_operations.iter().copied();
+    let (Some(operation), None) = (inserted.next(), inserted.next()) else {
+        return;
+    };
+    let Some(recipe) = transaction
+        .preview()
+        .operation(operation)
+        .map(|record| record.recipe.clone())
+    else {
+        return;
+    };
+    let editor =
+        selected_recipe_editor_for(SketchEntityId(0), operation, recipe, LengthUnit::Millimetre);
+    for (kind, text) in links {
+        let Some(key) = dimension_parameter_key(*kind, &editor) else {
+            continue;
+        };
+        let Some(parameter) = editor
+            .parameters
+            .iter()
+            .find(|parameter| parameter.stable_key == key)
+        else {
+            continue;
+        };
+        let (Some(value), Ok(followed)) = (parameter.value, parameter.evaluate_link(text, names))
+        else {
+            continue;
+        };
+        let agrees = |candidate: f64| {
+            let difference = if parameter.is_angle() {
+                (value - candidate)
+                    .rem_euclid(360.0)
+                    .min((candidate - value).rem_euclid(360.0))
+            } else {
+                (value - candidate).abs()
+            };
+            difference <= 1.0e-9 * value.abs().max(1.0)
+        };
+        let link = if agrees(followed) {
+            text.clone()
+        } else if agrees(-followed)
+            && let Ok(expression) = artificer_sketch::expression::parse_expression(text)
+        {
+            artificer_sketch::expression::Expression::Negate(Box::new(expression)).to_string()
+        } else {
+            continue;
+        };
+        let _ = transaction.set_value_link(operation, key, Some(link));
+    }
+}
+
 fn stage_complete_dimension_draft(state: &mut SketchCanvasState) -> Option<SketchEntityId> {
+    let links = state
+        .dimension_session
+        .as_ref()
+        .filter(|session| session.target == DimensionTarget::Draft)
+        .map(|session| session.links.clone())
+        .unwrap_or_default();
+    let staged = stage_complete_dimension_draft_unlinked(state)?;
+    if let Some(pending) = state.pending.as_mut()
+        && pending.draft_links.is_empty()
+    {
+        pending.draft_links = links;
+    }
+    Some(staged)
+}
+
+fn stage_complete_dimension_draft_unlinked(
+    state: &mut SketchCanvasState,
+) -> Option<SketchEntityId> {
     let (phase, geometry) = state.dimension_session.as_ref().and_then(|session| {
         (session.target == DimensionTarget::Draft).then_some((session.phase, session.geometry))
     })?;
@@ -22084,6 +22477,257 @@ mod length_unit_tests {
             format_dimension_readout(readout, LengthUnit::Inch),
             "W 1.575 in"
         );
+    }
+
+    fn circle_followed_by(entry: &str) -> (SketchCanvasState, SketchEntityId, CoreOperationId) {
+        let mut sketch = SketchCanvasState::default();
+        sketch.set_named_values(document_variables());
+        let circle = sketch
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(2.0, 0.0),
+            ))
+            .expect("circle should stage");
+        sketch.commit_pending().expect("circle should commit");
+        assert!(sketch.set_selected(Some(circle)) || sketch.selected() == Some(circle));
+        assert_eq!(
+            sketch.set_selected_recipe_parameter_text("diameter", entry.to_owned()),
+            Some(circle)
+        );
+        assert_eq!(sketch.commit_pending(), Ok(circle));
+        let operation = sketch
+            .authoring()
+            .active_operations()
+            .next()
+            .expect("the circle's operation")
+            .id;
+        (sketch, circle, operation)
+    }
+
+    fn diameter_of(sketch: &CoreSketchDefinition) -> f64 {
+        let operation = sketch.active_operations().next().expect("the circle");
+        match &operation.recipe {
+            CoreRecipe::CentrePointCircle {
+                radius: CoreValue::Literal(radius),
+                ..
+            } => 2.0 * radius.get(),
+            other => panic!("not a literal circle: {other:?}"),
+        }
+    }
+
+    /// A dimension typed over a variable keeps the entry, written with its
+    /// units, and shows it; the sketch holds the value it came to.
+    #[test]
+    fn a_dimension_typed_over_a_variable_stays_linked_to_it() {
+        let (mut sketch, _, operation) = circle_followed_by("depth / 2 + 1");
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth / 2 + 1mm")
+        );
+        assert!((diameter_of(sketch.authoring()) - 11.0).abs() < 1.0e-9);
+        let parameter = &sketch.selected_recipe_editor().unwrap().parameters[0];
+        assert_eq!(parameter.text, "depth / 2 + 1mm");
+        assert!(parameter.follows_variables);
+
+        // The written entry reads the same in an inch document.
+        sketch.set_length_unit(LengthUnit::Inch);
+        let parameter = &sketch.selected_recipe_editor().unwrap().parameters[0];
+        assert_eq!(parameter.text, "depth / 2 + 1mm");
+
+        // A plain number is a plain number again.
+        assert!(
+            sketch
+                .set_selected_recipe_parameter_text("diameter", "0.5".to_owned())
+                .is_some()
+        );
+        assert!(sketch.commit_pending().is_ok());
+        assert_eq!(sketch.authoring().value_link(operation, "diameter"), None);
+        assert!((diameter_of(sketch.authoring()) - 12.7).abs() < 1.0e-9);
+        assert!(!sketch.selected_recipe_editor().unwrap().parameters[0].follows_variables);
+
+        // Undo brings the link back with the value it produced.
+        assert!(sketch.undo_local());
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth / 2 + 1mm")
+        );
+    }
+
+    /// Escape drops a link typed but never confirmed.
+    #[test]
+    fn a_cancelled_entry_leaves_no_link() {
+        let (mut sketch, circle, operation) = circle_followed_by("8");
+        assert_eq!(sketch.authoring().value_link(operation, "diameter"), None);
+        assert_eq!(
+            sketch.set_selected_recipe_parameter_text("diameter", "depth".to_owned()),
+            Some(circle)
+        );
+        assert!(sketch.revert_selected_recipe_edit());
+        assert!(sketch.authoring().value_links().is_empty());
+        assert_eq!(
+            sketch.selected_recipe_editor().unwrap().parameters[0].text,
+            "8"
+        );
+    }
+
+    /// When a variable changes the linked recipe is worked out again; when
+    /// nothing changes nothing is rebuilt; and a variable that is gone is
+    /// named, with the sketch left as it was.
+    #[test]
+    fn linked_values_follow_the_variables_they_name() {
+        let (sketch, _, operation) = circle_followed_by("depth * 2");
+        let authoring = sketch.authoring().clone();
+        assert!((diameter_of(&authoring) - 40.0).abs() < 1.0e-9);
+
+        assert_eq!(
+            regenerate_linked_values(&authoring, &document_variables(), true),
+            Ok(None),
+            "the variables already agree with the sketch"
+        );
+
+        let mut names = document_variables();
+        names.get_mut("depth").unwrap().canonical = 7.5;
+        let regenerated = regenerate_linked_values(&authoring, &names, true)
+            .expect("the sketch follows")
+            .expect("and changes");
+        assert!((diameter_of(&regenerated) - 15.0).abs() < 1.0e-9);
+        assert_eq!(
+            regenerated.value_link(operation, "diameter"),
+            Some("depth * 2")
+        );
+        regenerated
+            .validate(PrecisionPolicy::default())
+            .expect("a sketch the canvas could have made");
+        let hydrated = SketchCanvasState::from_authoring(SketchPlane::XY, regenerated)
+            .expect("the followed sketch opens");
+        assert!(hydrated.entities().iter().any(|entity| {
+            entity.geometry
+                == SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(7.5, 0.0))
+        }));
+
+        names.remove("depth");
+        let error = regenerate_linked_values(&authoring, &names, true)
+            .expect_err("a missing variable is refused");
+        assert_eq!(error.field, "diameter");
+        assert!(error.to_string().contains("depth"), "{error}");
+
+        names.insert(
+            "depth".to_owned(),
+            NamedQuantity {
+                canonical: -3.0,
+                dimension: Dimension::LENGTH,
+            },
+        );
+        assert!(
+            regenerate_linked_values(&authoring, &names, true).is_err(),
+            "a negative diameter is refused"
+        );
+    }
+
+    /// The canvas follows the named values it is given: a changed variable
+    /// resizes what follows it and keeps the selection, and one that cannot
+    /// be followed is reported with the sketch left as it was.
+    #[test]
+    fn the_canvas_follows_its_named_values() {
+        let (mut sketch, circle, operation) = circle_followed_by("depth * 2");
+        assert!(
+            !sketch.set_named_values(document_variables()),
+            "nothing moved"
+        );
+        let mut names = document_variables();
+        names.get_mut("depth").unwrap().canonical = 3.0;
+        assert!(sketch.set_named_values(names.clone()));
+        assert!((diameter_of(sketch.authoring()) - 6.0).abs() < 1.0e-9);
+        assert!(sketch.entities().iter().any(|entity| {
+            entity.geometry
+                == SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(3.0, 0.0))
+        }));
+        let selected = sketch.selected().expect("the circle is still selected");
+        assert_eq!(sketch.operation_by_ui.get(&selected), Some(&operation));
+        assert_eq!(
+            sketch.selected_recipe_editor().unwrap().parameters[0].text,
+            "depth * 2"
+        );
+        let _ = circle;
+
+        names.get_mut("depth").unwrap().canonical = -1.0;
+        assert!(!sketch.set_named_values(names));
+        assert!(sketch.linked_value_issue().is_some());
+        assert!((diameter_of(sketch.authoring()) - 6.0).abs() < 1.0e-9);
+
+        assert!(sketch.rename_named_value("depth", "span"));
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("span * 2")
+        );
+    }
+
+    /// A box typed over a variable while drawing links the field it states.
+    #[test]
+    fn a_draft_dimension_typed_over_a_variable_links_what_it_draws() {
+        let names = document_variables();
+        let draft = |entry: &str| {
+            let mut sketch = SketchCanvasState::default();
+            sketch.set_named_values(document_variables());
+            let mut session = DimensionSession::from_geometry(
+                DimensionTarget::Draft,
+                SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(2.0, 0.0)),
+                1,
+            );
+            assert!(session.begin_kind(SketchDimensionKind::Diameter, LengthUnit::Millimetre));
+            session.buffer = entry.to_owned();
+            session
+                .accept(DimensionEntry {
+                    names: &names,
+                    unit: LengthUnit::Millimetre,
+                })
+                .expect("the entry reads");
+            let geometry = session.geometry;
+            sketch.dimension_session = Some(session);
+            sketch.stage_geometry(geometry).expect("the circle stages");
+            sketch.commit_pending().expect("the circle commits");
+            sketch
+        };
+
+        let sketch = draft("depth + 2");
+        let operation = sketch.authoring().active_operations().next().unwrap().id;
+        assert!((diameter_of(sketch.authoring()) - 22.0).abs() < 1.0e-9);
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth + 2mm")
+        );
+
+        // A plain number drafts a plain circle.
+        let sketch = draft("22");
+        assert!(sketch.authoring().value_links().is_empty());
+
+        // A box whose number no field states stays a copy.
+        let mut transaction = CoreSketchDefinition::new()
+            .stage(
+                core_recipe_for_entity(SketchEntity {
+                    id: SketchEntityId(1),
+                    geometry: SketchGeometry::circle(
+                        SketchPoint::new(0.0, 0.0),
+                        SketchPoint::new(11.0, 0.0),
+                    ),
+                    role: SketchEntityRole::Profile,
+                })
+                .expect("a circle recipe"),
+                "Circle",
+            )
+            .expect("the circle stages");
+        link_draft_values(
+            &mut transaction,
+            &[(SketchDimensionKind::Diameter, "depth".to_owned())],
+            &names,
+        );
+        assert!(transaction.preview().value_links().is_empty());
+        link_draft_values(
+            &mut transaction,
+            &[(SketchDimensionKind::Diameter, "depth + 2mm".to_owned())],
+            &names,
+        );
+        assert_eq!(transaction.preview().value_links().len(), 1);
     }
 
     #[test]

@@ -75,6 +75,27 @@ impl SketchTransaction {
         &self.impact
     }
 
+    /// Links one recipe field of the candidate to an entry over document
+    /// variables, or unlinks it with `None`, as part of this edit: the link
+    /// arrives, is undone and is cancelled with the value it produced.
+    ///
+    /// The candidate is checked again so that a link the sketch cannot keep
+    /// is refused here, and a refusal leaves the transaction as it was.
+    pub fn set_value_link(
+        &mut self,
+        operation: SketchOperationId,
+        field: &str,
+        text: Option<String>,
+    ) -> Result<bool, SketchTransactionError> {
+        let mut candidate = self.candidate.clone();
+        if !candidate.set_value_link(operation, field, text) {
+            return Ok(false);
+        }
+        candidate.validate_with_inputs(&self.inputs, self.precision)?;
+        self.candidate = candidate;
+        Ok(true)
+    }
+
     /// Appends one branch-replacing modifier to this transaction's current
     /// candidate. The complete batch retains the revision observed when the
     /// first operation was staged and publishes only one successor revision.
@@ -940,16 +961,16 @@ impl SketchDefinition {
                 actual: self.revision(),
             });
         }
-        transaction
-            .candidate
-            .validate_with_inputs(&transaction.inputs, precision)?;
+        let mut candidate = transaction.candidate;
+        candidate.prune_value_links();
+        candidate.validate_with_inputs(&transaction.inputs, precision)?;
         let commit = SketchCommit {
-            revision: transaction.candidate.revision(),
+            revision: candidate.revision(),
             confirmation,
             label: transaction.label,
             impact: transaction.impact,
         };
-        *self = transaction.candidate;
+        *self = candidate;
         Ok(commit)
     }
 }

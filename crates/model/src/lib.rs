@@ -840,8 +840,27 @@ impl ModelDocument {
     ) -> Result<bool, DocumentError> {
         let previous = self.state.clone();
         let mut affected = self.state.parameters.affected_by(id);
+        let old_key = self
+            .state
+            .parameters
+            .get(id)
+            .map(|record| record.spec.key.clone());
+        let new_key = spec.key.clone();
         if !self.state.parameters.replace_spec(id, spec)? {
             return Ok(false);
+        }
+        // Sketch values name the variables they follow, so a renamed
+        // variable is renamed in every sketch revision that follows it.
+        if let Some(old_key) = old_key
+            && old_key != new_key
+        {
+            for feature in &mut self.state.features {
+                if feature.parameter_inputs.contains(&id)
+                    && let Some(payload) = feature.sketch_payload.as_mut()
+                {
+                    payload.rename_followed_variable(&old_key, &new_key);
+                }
+            }
         }
         if let Err(error) = validate_all_action_parameter_inputs(&self.state) {
             self.state = previous;
@@ -1334,7 +1353,42 @@ impl ModelDocument {
         sketch: SketchId,
         payload: SketchPayload,
     ) -> Result<bool, DocumentError> {
+        let Some(previous) = self.install_sketch_payload(sketch, payload)? else {
+            return Ok(false);
+        };
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces a sketch's payload with the one its linked values come to
+    /// after a variable changed (ADR 0054).
+    ///
+    /// It is the same replacement as [`Self::replace_sketch_payload`], made
+    /// as part of the variable change that caused it rather than as an edit
+    /// of its own: it adds no undo step, so one undo takes back the variable
+    /// and every sketch that followed it together.
+    pub fn follow_variables_in_sketch(
+        &mut self,
+        sketch: SketchId,
+        payload: SketchPayload,
+    ) -> Result<bool, DocumentError> {
+        if self.install_sketch_payload(sketch, payload)?.is_none() {
+            return Ok(false);
+        }
+        self.bump_revision();
+        Ok(true)
+    }
+
+    /// Installs a new payload for a sketch's current revision, returning
+    /// the state before it when anything changed. The sketch feature reads
+    /// exactly the variables its values follow.
+    fn install_sketch_payload(
+        &mut self,
+        sketch: SketchId,
+        payload: SketchPayload,
+    ) -> Result<Option<DocumentState>, DocumentError> {
         payload.validate()?;
+        let parameter_inputs = followed_parameters(&payload, &self.state.parameters)?;
         let sketch_index = self.sketch_index(sketch)?;
         let record = &self.state.sketches[sketch_index];
         if record.read_only {
@@ -1376,7 +1430,7 @@ impl ModelDocument {
             }
         }
         if feature.sketch_payload.as_ref() == Some(&payload) {
-            return Ok(false);
+            return Ok(None);
         }
         let next_revision = record
             .geometry_revision
@@ -1397,14 +1451,14 @@ impl ModelDocument {
         let previous = self.state.clone();
         let feature = &mut self.state.features[feature_index];
         feature.sketch_payload = Some(payload);
+        feature.parameter_inputs = parameter_inputs;
         feature.outputs[0] = FeatureOutput::Sketch {
             sketch,
             geometry_revision: next_revision,
         };
         self.state.sketches[sketch_index].geometry_revision = next_revision;
         self.mark_branch_dirty(feature_index);
-        self.finish_user_edit(previous);
-        Ok(true)
+        Ok(Some(previous))
     }
 
     #[must_use]
@@ -1447,6 +1501,19 @@ impl ModelDocument {
         true
     }
 
+    /// Takes the last edit back as if it had never been made: unlike
+    /// [`Self::undo`] it leaves nothing to redo. This is for an edit whose
+    /// consequences turned out to be refused — a variable no sketch that
+    /// follows it can take — so the refusal cannot be redone by accident.
+    pub fn abandon_last_edit(&mut self) -> bool {
+        let Some(previous) = self.undo.pop_back() else {
+            return false;
+        };
+        self.state = previous;
+        self.bump_revision();
+        true
+    }
+
     pub fn redo(&mut self) -> bool {
         let Some(next) = self.redo.pop_back() else {
             return false;
@@ -1478,6 +1545,12 @@ impl ModelDocument {
             return Err(DocumentError::InvalidDatumPlaneFeature);
         }
         validate_label(&draft.label)?;
+        // A sketch reads exactly the variables its values follow.
+        if draft.kind == FeatureKind::Sketch
+            && let Some(payload) = &draft.sketch_payload
+        {
+            draft.parameter_inputs = followed_parameters(payload, &self.state.parameters)?;
+        }
         validate_reference_count("inputs", draft.inputs.len())?;
         validate_reference_count("parameter inputs", draft.parameter_inputs.len())?;
         validate_reference_count("dependencies", draft.dependencies.len())?;
@@ -3079,6 +3152,8 @@ pub enum DocumentError {
     InvalidLoftFeature,
     #[error("a kernel chain must hold between one and {MAX_KERNEL_CHAIN_COMMANDS} commands")]
     InvalidKernelChain,
+    #[error("a sketch value follows {0:?}, which is not a variable of this document")]
+    UnknownSketchVariable(String),
     #[error("a construction plane must be a construction-plane feature with a plane recipe")]
     InvalidDatumPlaneFeature,
     #[error("{0} is not a construction plane")]
@@ -3359,6 +3434,27 @@ fn validate_action_feature_inputs(
         }
     }
     Ok(())
+}
+
+/// The document variables a sketch's values follow, by id, in order. A
+/// name the document does not have is refused.
+fn followed_parameters(
+    payload: &SketchPayload,
+    parameters: &ParameterTable,
+) -> Result<Vec<ParameterId>, DocumentError> {
+    let mut followed = payload
+        .followed_variable_names()
+        .into_iter()
+        .map(|name| {
+            parameters
+                .get_by_key(&name)
+                .map(|record| record.id)
+                .ok_or(DocumentError::UnknownSketchVariable(name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    followed.sort_unstable();
+    followed.dedup();
+    Ok(followed)
 }
 
 fn validate_all_action_parameter_inputs(state: &DocumentState) -> Result<(), DocumentError> {
@@ -3981,6 +4077,23 @@ fn validate_loaded_state(
                 "parameterized replay inputs or declared parameter types are invalid",
             )
         })?;
+        if feature.kind == FeatureKind::Sketch {
+            let followed = match &feature.sketch_payload {
+                Some(payload) => followed_parameters(payload, &state.parameters).map_err(|_| {
+                    DocumentError::InvalidArchive(
+                        "a sketch value follows a variable the document does not have",
+                    )
+                })?,
+                None => Vec::new(),
+            };
+            let mut declared = feature.parameter_inputs.clone();
+            declared.sort_unstable();
+            if declared != followed {
+                return Err(DocumentError::InvalidArchive(
+                    "a sketch's variable inputs are not the variables its values follow",
+                ));
+            }
+        }
         validate_label(&feature.label)?;
         validate_reference_count("inputs", feature.inputs.len())?;
         validate_reference_count("dependencies", feature.dependencies.len())?;
@@ -6170,6 +6283,141 @@ mod tests {
             )
             .expect("parameterized cuboid recipe should validate"),
         )
+    }
+
+    /// An origin sketch whose one operation has a value following `entry`.
+    fn sketch_payload_following(entry: &str) -> SketchPayload {
+        let mut payload = origin_sketch_payload();
+        let authoring = payload.authoring.as_ref().expect("an editable sketch");
+        let operation = authoring.operations()[0].id;
+        let mut json = serde_json::to_value(authoring).expect("the sketch encodes");
+        json["value_links"] =
+            serde_json::json!([{ "operation": operation, "field": "width", "text": entry }]);
+        payload.authoring = Some(serde_json::from_value(json).expect("the sketch decodes"));
+        payload
+            .validate()
+            .expect("a followed sketch is a valid sketch");
+        payload
+    }
+
+    fn sketch_following(entry: &str) -> FeatureDraft {
+        FeatureDraft::new(FeatureKind::Sketch, "Sketch", ReplayAction::Marker)
+            .with_sketch_payload(sketch_payload_following(entry))
+            .with_output(OutputDraft::CreateSketch {
+                label: "Sketch".to_owned(),
+                geometry_revision: 1,
+            })
+    }
+
+    /// A sketch value typed over a variable is a read of it (ADR 0054): the
+    /// sketch declares it, cannot outlive it, follows its name, and a
+    /// variable change and the sketch that follows it undo as one.
+    #[test]
+    fn a_sketch_reads_the_variables_its_values_follow() {
+        let mut document = ModelDocument::default();
+        let width = document
+            .add_parameter(
+                length_parameter_spec("width"),
+                ParameterBinding::literal(ParameterValue::quantity(
+                    40.0,
+                    ParameterUnit::Millimeter,
+                )),
+            )
+            .expect("parameter should append");
+        assert_eq!(
+            document.append_feature(sketch_following("depth * 2")),
+            Err(DocumentError::UnknownSketchVariable("depth".to_owned()))
+        );
+        let feature = document
+            .append_feature(sketch_following("width / 2"))
+            .expect("a followed sketch appends")
+            .feature;
+        assert_eq!(
+            document
+                .feature(feature)
+                .expect("the sketch")
+                .parameter_inputs,
+            vec![width]
+        );
+        assert!(matches!(
+            document.remove_parameter(width),
+            Err(DocumentError::ParameterInUse { parameter, .. }) if parameter == width
+        ));
+
+        let sketch = document.sketches()[0].id;
+        let followed = |document: &ModelDocument| {
+            let revision = document
+                .sketch(sketch)
+                .expect("the sketch")
+                .geometry_revision;
+            document
+                .sketch_payload(sketch, revision)
+                .and_then(SketchPayload::authoring)
+                .expect("the sketch payload")
+                .value_links()[0]
+                .text
+                .clone()
+        };
+        assert!(
+            document
+                .replace_parameter_spec(width, length_parameter_spec("span"))
+                .expect("the rename applies")
+        );
+        assert_eq!(followed(&document), "span / 2");
+        assert!(document.undo());
+        assert_eq!(followed(&document), "width / 2");
+        assert!(document.redo());
+
+        // The variable changes, and the sketch follows as part of it.
+        assert!(
+            document
+                .set_parameter_binding(
+                    width,
+                    ParameterBinding::literal(ParameterValue::quantity(
+                        60.0,
+                        ParameterUnit::Millimeter,
+                    )),
+                )
+                .expect("the new value applies")
+        );
+        let revision = document.revision();
+        assert!(
+            document
+                .follow_variables_in_sketch(sketch, sketch_payload_following("span / 3"))
+                .expect("the sketch follows")
+        );
+        assert!(document.revision() > revision);
+        assert_eq!(followed(&document), "span / 3");
+        assert!(document.undo(), "one undo takes both back");
+        assert!(document.redo());
+        assert_eq!(followed(&document), "span / 3");
+        assert!(document.abandon_last_edit());
+        assert!(!document.can_redo(), "an abandoned edit cannot come back");
+        assert_eq!(followed(&document), "span / 2");
+        assert_eq!(
+            document
+                .evaluate_parameters(&ParameterOverrides::default())
+                .expect("the variables evaluate")
+                .get(width),
+            Some(&ParameterValue::quantity(40.0, ParameterUnit::Millimeter))
+        );
+
+        // Saved and opened again, the read is kept; a file that says
+        // otherwise does not open.
+        let native = document.to_native();
+        ModelDocument::from_native(native.clone()).expect("the document reopens");
+        let mut tampered = native;
+        let index = tampered
+            .state
+            .features
+            .iter()
+            .position(|candidate| candidate.id == feature)
+            .expect("the sketch feature");
+        tampered.state.features[index].parameter_inputs.clear();
+        assert!(matches!(
+            ModelDocument::from_native(tampered),
+            Err(DocumentError::InvalidArchive(_))
+        ));
     }
 
     #[test]

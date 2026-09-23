@@ -13,7 +13,7 @@ use artificer_model::{
     ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, QuantityValue,
     format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
-use artificer_sketch::expression::{Dimension, NamedQuantity};
+use artificer_sketch::expression::NamedQuantity;
 use eframe::egui;
 use egui::{Frame, Margin, RichText, Stroke};
 
@@ -104,6 +104,11 @@ impl KernelLabApp {
         spec.label = trimmed.to_owned();
         match self.document.replace_parameter_spec(parameter, spec) {
             Ok(_) => {
+                // Sketch values name what they follow; the document renamed
+                // it in every finished sketch, and the canvas renames it in
+                // the one being drawn.
+                self.sketch.rename_named_value(&record.spec.key, trimmed);
+                self.refresh_sketch_payloads_from_document();
                 self.document_status = Some(format!("Variable renamed to {trimmed}"));
             }
             Err(error) => {
@@ -118,35 +123,7 @@ impl KernelLabApp {
     /// it is and cannot be typed where a length belongs.
     #[must_use]
     pub fn evaluated_variable_values(&self) -> std::collections::BTreeMap<String, NamedQuantity> {
-        let Ok(evaluated) = self
-            .document
-            .evaluate_parameters(&ParameterOverrides::default())
-        else {
-            return std::collections::BTreeMap::new();
-        };
-        self.document
-            .parameters()
-            .records()
-            .iter()
-            .filter_map(|record| {
-                let value = evaluated.get(record.id)?;
-                let ParameterValue::Quantity { value } = value else {
-                    return None;
-                };
-                let dimension = match value.unit.quantity_kind() {
-                    QuantityKind::Length => Dimension::LENGTH,
-                    QuantityKind::Angle => Dimension::ANGLE,
-                    QuantityKind::Scalar => Dimension::SCALAR,
-                };
-                Some((
-                    record.spec.key.clone(),
-                    NamedQuantity {
-                        canonical: value.magnitude,
-                        dimension,
-                    },
-                ))
-            })
-            .collect()
+        crate::sketch_links::variable_values(&self.document)
     }
 
     /// The variables panel: one row per parameter with its name, its value or
@@ -206,10 +183,9 @@ impl KernelLabApp {
                 ui.label(
                     RichText::new(
                         "A variable can be an expression over others, such as width * 2 + 5mm, \
-                         and follows them when they change. An extrusion distance typed as a \
-                         variable follows it too, and rebuilds when it changes. Typed into a \
-                         sketch dimension, a name is read once: the dimension keeps the number \
-                         it gave.",
+                         and follows them when they change. A sketch dimension or an extrusion \
+                         distance typed over a variable follows it too, and the model rebuilds \
+                         when it changes; typing a plain number there unlinks it.",
                     )
                     .small()
                     .color(theme::muted()),

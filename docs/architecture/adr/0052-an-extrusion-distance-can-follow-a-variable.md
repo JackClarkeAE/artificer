@@ -41,10 +41,10 @@ When it is present:
 - **Ended sides.** A side that ends at a face or a plane has no distance to
   follow, so a recipe with both is refused.
 
-The second side stays a plain number. Sketch dimensions are unchanged: a
-variable typed into one is still read once. Linking sketch dimensions needs
-the sketch to regenerate its geometry from new input values, which is a
-separate piece of work.
+The second side stays a plain number. Sketch dimensions were unchanged by
+this record: a variable typed into one was still read once. ADR 0054 has
+since linked them too, by having the sketch keep the entry and regenerate
+its geometry when a variable changes.
 
 ### The editor records the link
 

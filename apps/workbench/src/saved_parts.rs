@@ -389,6 +389,10 @@ pub fn evaluate_saved_part(
             )
             .map_err(refused)?;
     }
+    // A sketch value typed over a variable follows it here as it does in
+    // the app (ADR 0054), so a sketch dimension is as much a part's
+    // parameter as an extrusion distance.
+    crate::sketch_links::follow_variables(&mut document, true).map_err(SavedPartError::Refused)?;
     let evaluated = document
         .evaluate_parameters(&ParameterOverrides::default())
         .map_err(refused)?;

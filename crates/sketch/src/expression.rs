@@ -16,6 +16,7 @@
 //! factor beside something dimensioned is a pure number (`width * 2` doubles
 //! it, it does not multiply two lengths).
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// A unit a number may carry, written directly after it (`5mm`) or after a
@@ -52,6 +53,21 @@ impl ExpressionUnit {
         match self {
             Self::Degree | Self::Radian => Dimension::ANGLE,
             _ => Dimension::LENGTH,
+        }
+    }
+
+    /// The suffix this unit is written with.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Micrometer => "um",
+            Self::Millimeter => "mm",
+            Self::Centimeter => "cm",
+            Self::Meter => "m",
+            Self::Inch => "in",
+            Self::Foot => "ft",
+            Self::Degree => "deg",
+            Self::Radian => "rad",
         }
     }
 
@@ -223,6 +239,38 @@ impl FieldUnit {
             canonical_scale: std::f64::consts::PI / 180.0,
         }
     }
+
+    /// A number `magnitude` of this field's own units, written so that it
+    /// reads the same in any field: with the grammar's suffix for the unit,
+    /// or converted to the canonical unit when the grammar has none. A pure
+    /// number stays bare.
+    fn written(self, magnitude: f64) -> Expression {
+        if self.dimension == Dimension::SCALAR {
+            return Expression::Number {
+                magnitude,
+                unit: None,
+            };
+        }
+        let named = EXPRESSION_UNIT_SUFFIXES.iter().find(|(_, unit)| {
+            unit.dimension() == self.dimension
+                && (unit.canonical_scale() - self.canonical_scale).abs()
+                    <= 1.0e-12 * self.canonical_scale.abs()
+        });
+        match named {
+            Some((_, unit)) => Expression::Number {
+                magnitude,
+                unit: Some(*unit),
+            },
+            None => Expression::Number {
+                magnitude: magnitude * self.canonical_scale,
+                unit: Some(if self.dimension == Dimension::ANGLE {
+                    ExpressionUnit::Radian
+                } else {
+                    ExpressionUnit::Millimeter
+                }),
+            },
+        }
+    }
 }
 
 impl Expression {
@@ -238,6 +286,69 @@ impl Expression {
             | Self::Subtract(left, right)
             | Self::Multiply(left, right)
             | Self::Divide(left, right) => left.is_dimensioned() || right.is_dimensioned(),
+        }
+    }
+
+    /// Every name the entry uses, once each, in order.
+    #[must_use]
+    pub fn names(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        self.collect_names(&mut names);
+        names
+    }
+
+    fn collect_names(&self, names: &mut BTreeSet<String>) {
+        match self {
+            Self::Number { .. } => {}
+            Self::Name(name) => {
+                names.insert(name.clone());
+            }
+            Self::Negate(operand) => operand.collect_names(names),
+            Self::Add(left, right)
+            | Self::Subtract(left, right)
+            | Self::Multiply(left, right)
+            | Self::Divide(left, right) => {
+                left.collect_names(names);
+                right.collect_names(names);
+            }
+        }
+    }
+
+    /// The same entry with every use of `from` naming `to` instead.
+    #[must_use]
+    pub fn renamed(self, from: &str, to: &str) -> Self {
+        let rename = |operand: Box<Self>| Box::new(operand.renamed(from, to));
+        match self {
+            Self::Name(name) if name == from => Self::Name(to.to_owned()),
+            Self::Number { .. } | Self::Name(_) => self,
+            Self::Negate(operand) => Self::Negate(rename(operand)),
+            Self::Add(left, right) => Self::Add(rename(left), rename(right)),
+            Self::Subtract(left, right) => Self::Subtract(rename(left), rename(right)),
+            Self::Multiply(left, right) => Self::Multiply(rename(left), rename(right)),
+            Self::Divide(left, right) => Self::Divide(rename(left), rename(right)),
+        }
+    }
+
+    /// How tightly the entry's outermost operation binds, for printing it
+    /// back with only the parentheses it needs.
+    const fn precedence(&self) -> u8 {
+        match self {
+            Self::Add(..) | Self::Subtract(..) => 1,
+            Self::Multiply(..) | Self::Divide(..) => 2,
+            Self::Negate(_) => 3,
+            Self::Number { .. } | Self::Name(_) => 4,
+        }
+    }
+
+    fn write_operand(
+        &self,
+        formatter: &mut fmt::Formatter<'_>,
+        parenthesized: bool,
+    ) -> fmt::Result {
+        if parenthesized {
+            write!(formatter, "({self})")
+        } else {
+            write!(formatter, "{self}")
         }
     }
 
@@ -292,7 +403,71 @@ impl Expression {
     }
 }
 
+/// Prints the entry back as text that parses to the same tree: operators
+/// spaced, numbers as written with their units, and parentheses only where
+/// the grouping needs them.
+impl fmt::Display for Expression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let precedence = self.precedence();
+        match self {
+            Self::Number { magnitude, unit } => {
+                write!(formatter, "{magnitude}")?;
+                if let Some(unit) = unit {
+                    formatter.write_str(unit.suffix())?;
+                }
+                Ok(())
+            }
+            Self::Name(name) => formatter.write_str(name),
+            Self::Negate(operand) => {
+                formatter.write_str("-")?;
+                operand.write_operand(formatter, operand.precedence() < precedence)
+            }
+            Self::Add(left, right)
+            | Self::Subtract(left, right)
+            | Self::Multiply(left, right)
+            | Self::Divide(left, right) => {
+                let operator = match self {
+                    Self::Add(..) => " + ",
+                    Self::Subtract(..) => " - ",
+                    Self::Multiply(..) => " * ",
+                    _ => " / ",
+                };
+                left.write_operand(formatter, left.precedence() < precedence)?;
+                formatter.write_str(operator)?;
+                right.write_operand(formatter, right.precedence() <= precedence)
+            }
+        }
+    }
+}
+
 impl TypedExpression {
+    /// The entry with every number that took the field's own unit written
+    /// with that unit, so it means the same in any field. `w + 5` typed
+    /// into a field in inches becomes `w + 5in`; pure numbers stay bare.
+    #[must_use]
+    pub fn with_units_written(self, field: FieldUnit) -> Expression {
+        let write = |operand: Box<Self>| Box::new(operand.with_units_written(field));
+        match self {
+            Self::Number { magnitude, unit } => match unit {
+                NumberUnit::Field => field.written(magnitude),
+                NumberUnit::Scalar => Expression::Number {
+                    magnitude,
+                    unit: None,
+                },
+                NumberUnit::Explicit(unit) => Expression::Number {
+                    magnitude,
+                    unit: Some(unit),
+                },
+            },
+            Self::Name(name) => Expression::Name(name),
+            Self::Negate(operand) => Expression::Negate(write(operand)),
+            Self::Add(left, right) => Expression::Add(write(left), write(right)),
+            Self::Subtract(left, right) => Expression::Subtract(write(left), write(right)),
+            Self::Multiply(left, right) => Expression::Multiply(write(left), write(right)),
+            Self::Divide(left, right) => Expression::Divide(write(left), write(right)),
+        }
+    }
+
     /// Whether the whole entry is one number, signed or not: a literal
     /// rather than an expression.
     #[must_use]
@@ -390,6 +565,30 @@ pub fn evaluate_entry(
     parse_expression(text)?
         .assign_roles()
         .evaluate(field, resolve)
+}
+
+/// An entry as it is kept when it is to be read again later, perhaps in a
+/// field shown in another unit: every number that took the field's unit is
+/// written with it, and the spacing is the grammar's own. Reading the kept
+/// text in any field of the same kind gives the same value the entry had
+/// where it was typed.
+pub fn written_entry(text: &str, field: FieldUnit) -> Result<String, ExpressionError> {
+    Ok(parse_expression(text)?
+        .assign_roles()
+        .with_units_written(field)
+        .to_string())
+}
+
+/// The names an entry uses.
+pub fn entry_names(text: &str) -> Result<BTreeSet<String>, ExpressionError> {
+    Ok(parse_expression(text)?.names())
+}
+
+/// An entry with the name `from` replaced by `to` wherever it is used. A
+/// name is dimensioned whatever it is called, so no number beside it changes
+/// what it means.
+pub fn rename_in_entry(text: &str, from: &str, to: &str) -> Result<String, ExpressionError> {
+    Ok(parse_expression(text)?.renamed(from, to).to_string())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -723,6 +922,61 @@ mod tests {
         close(
             evaluate_entry("count * 2", FieldUnit::SCALAR, &variables).unwrap(),
             6.0,
+        );
+    }
+
+    #[test]
+    fn a_kept_entry_writes_its_units_and_reads_the_same_anywhere() {
+        let inches = FieldUnit::length(25.4);
+        let millimetres = FieldUnit::length(1.0);
+        for (typed, field, written) in [
+            ("width + 1", inches, "width + 1in"),
+            ("width*2", inches, "width * 2"),
+            ("width / 2 + 5 mm", inches, "width / 2 + 5mm"),
+            ("2 * 3", inches, "2in * 3"),
+            ("(1 + 2) * width / 4", millimetres, "(1 + 2) * width / 4"),
+            ("(1 + 2) * 4", millimetres, "(1mm + 2mm) * 4"),
+            ("width - (1 - 2)", millimetres, "width - (1mm - 2mm)"),
+            ("-(width * 2)", millimetres, "-(width * 2)"),
+            ("−width × 2 ÷ 4", millimetres, "-width * 2 / 4"),
+            ("tilt / 3 + 15", FieldUnit::degrees(), "tilt / 3 + 15deg"),
+            ("count * 2 + 1", FieldUnit::SCALAR, "count * 2 + 1"),
+            ("width + 1", FieldUnit::length(2.0), "width + 2mm"),
+        ] {
+            let kept = written_entry(typed, field).unwrap();
+            assert_eq!(kept, written, "{typed:?}");
+            // Kept text means what was typed, in the field it was typed
+            // into and in any other of its kind (a pure number has only one).
+            let original = evaluate_entry(typed, field, &variables).unwrap();
+            let elsewhere = if field.dimension == Dimension::SCALAR {
+                field
+            } else {
+                FieldUnit {
+                    canonical_scale: 7.0,
+                    ..field
+                }
+            };
+            for reading in [field, elsewhere] {
+                close(
+                    evaluate_entry(&kept, reading, &variables).unwrap(),
+                    original,
+                );
+            }
+            // And keeping it again changes nothing.
+            assert_eq!(written_entry(&kept, field).unwrap(), kept);
+        }
+    }
+
+    #[test]
+    fn names_are_listed_and_renamed_where_they_are_used() {
+        assert_eq!(
+            entry_names("width / 2 + width + tilt * 0").unwrap(),
+            BTreeSet::from(["tilt".to_owned(), "width".to_owned()])
+        );
+        assert!(entry_names("5mm + 2").unwrap().is_empty());
+        assert_eq!(
+            rename_in_entry("width / 2 + widths + 1mm", "width", "span").unwrap(),
+            "span / 2 + widths + 1mm"
         );
     }
 

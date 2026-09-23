@@ -4,7 +4,10 @@
 //! or an expression in the Variables panel, and drive a sketch dimension with
 //! it by name.
 
-use artificer_workbench::{KernelLabApp, WorkbenchMode, sketch::SketchPoint};
+use artificer_workbench::{
+    KernelLabApp, WorkbenchMode,
+    sketch::{SketchGeometry, SketchPoint},
+};
 use egui::accesskit::Role;
 use egui_kittest::{Harness, kittest::Queryable as _};
 
@@ -121,9 +124,11 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
 
 /// The point of the whole feature: a sketch dimension driven by a variable's
 /// name. Draw a rectangle, arm the Dimension tool on a side, and type
-/// arithmetic over the document variable into the box.
+/// arithmetic over the document variable into the box. The dimension keeps
+/// the entry and follows the variable (ADR 0054): extruded, the body is
+/// rebuilt when the variable changes, and one undo takes both back.
 #[test]
-fn a_sketch_dimension_accepts_a_variable_expression() {
+fn a_sketch_dimension_follows_the_variable_it_is_typed_over() {
     let mut harness = harness();
     harness.run();
     create_length_variable(&mut harness);
@@ -161,11 +166,102 @@ fn a_sketch_dimension_accepts_a_variable_expression() {
         .selected_sketch_recipe_editor()
         .expect("the rectangle stays selected")
         .parameters[0]
-        .text
         .clone();
+    assert_eq!(width.text, "depth * 2", "the field shows what it follows");
+    assert!(width.follows_variables);
+    // The sketch's extent: a rectangle is shown whole when drawn and side by
+    // side once it has been rebuilt.
+    let spans = |harness: &Harness<'static, KernelLabApp>| {
+        let points = harness
+            .state()
+            .sketch_entity_geometries()
+            .into_iter()
+            .flat_map(|geometry| match geometry {
+                SketchGeometry::Rectangle { first, opposite } => vec![first, opposite],
+                SketchGeometry::Segment { start, end } => vec![start, end],
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        assert!(!points.is_empty(), "the rectangle");
+        let span = |coordinate: fn(&SketchPoint) -> f64| {
+            let values = points.iter().map(coordinate);
+            values.clone().fold(f64::MIN, f64::max) - values.fold(f64::MAX, f64::min)
+        };
+        (span(|point| point.u), span(|point| point.v))
+    };
+    let (u, v) = spans(&harness);
+    assert!(
+        (u - 20.0).abs() < 1.0e-9 && (v - 2.0).abs() < 1.0e-9,
+        "depth * 2 with depth = 10 mm is 20 mm: {u} × {v}"
+    );
+
+    // Extruded, the body is the rectangle's size.
+    click_button(&mut harness, "Extrude");
+    let extrusion = harness
+        .get_by_role_and_label(Role::TextInput, "Extrusion distance expression")
+        .rect()
+        .center();
+    click_at(&mut harness, extrusion);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness
+        .get_by_role_and_label(Role::TextInput, "Extrusion distance expression")
+        .type_text("5");
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let volume =
+        |harness: &Harness<'static, KernelLabApp>| harness.state().mass_properties().volume;
+    assert!(
+        (volume(&harness) - 20.0 * 2.0 * 5.0).abs() < 1.0e-6,
+        "{}",
+        volume(&harness)
+    );
+
+    // Changing the variable rebuilds the sketch and the body from it.
+    click_button(&mut harness, "Parametric ribbon tab");
+    replace_text_input(&mut harness, "Variable value depth", "15");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert!(
+        (volume(&harness) - 30.0 * 2.0 * 5.0).abs() < 1.0e-6,
+        "{} · {:?}",
+        volume(&harness),
+        harness.state().document_status_text()
+    );
+    let (u, _) = spans(&harness);
+    assert!(
+        (u - 30.0).abs() < 1.0e-9,
+        "the open sketch follows too: {u}"
+    );
+
+    // A value the rectangle cannot take is refused, and nothing changes.
+    replace_text_input(&mut harness, "Variable value depth", "-3");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert!(
+        harness
+            .state()
+            .document_status_text()
+            .is_some_and(|status| status.contains("rejected")),
+        "{:?}",
+        harness.state().document_status_text()
+    );
     assert_eq!(
-        width, "20",
-        "depth * 2 with depth = 10 mm must commit 20 mm"
+        harness.state().evaluated_variable_values()["depth"].canonical,
+        15.0
+    );
+    assert!((volume(&harness) - 30.0 * 2.0 * 5.0).abs() < 1.0e-6);
+    click_button(&mut harness, "Cancel operation");
+
+    // One undo takes the variable and the sketch that followed it back.
+    click_button(&mut harness, "Undo history change");
+    assert_eq!(
+        harness.state().evaluated_variable_values()["depth"].canonical,
+        10.0
+    );
+    assert!(
+        (volume(&harness) - 20.0 * 2.0 * 5.0).abs() < 1.0e-6,
+        "{}",
+        volume(&harness)
     );
 }
 
