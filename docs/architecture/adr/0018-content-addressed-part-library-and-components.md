@@ -33,7 +33,7 @@ Sealing a definition computes a SHA-256 digest over its canonical authored conte
 
 The in-memory search index is disposable and rebuilt from verified refs and objects. Corrupt, unsafe, oversized, or symlinked entries are rejected and reported rather than becoming searchable. Object writes and ref writes use same-directory temporary files and atomic create/compare behavior, so an interrupted publication cannot replace an existing revision.
 
-At application startup the first built-in definition, `20 × 20 Aluminium Extrusion` revision `1.0.0`, is sealed and idempotently published into the local store. `ARTIFICER_CATALOG_DIR` overrides the store root; otherwise the application uses the operating system's local application-data location. If the store cannot open, the same verified built-in package remains available as an explicit in-memory fallback.
+At application startup the first built-in definition, `20 × 20 Aluminium Extrusion` revision `1.0.0`, is sealed and idempotently published into the local store. `ARTIFICER_CATALOG_DIR` overrides the store root; otherwise the application uses the per-user data folder described in the amendment on where the library lives. If the store cannot open, the same verified built-in package remains available as an explicit in-memory fallback.
 
 ### Parameterized insertion
 
@@ -99,3 +99,30 @@ rough size, so a part can be recognised without reading its description.
   for a package it does not hold. A missing, damaged or oversized preview
   reads as none, so the answer is to draw it again rather than to fail the
   library. The index never mistakes a preview for a package.
+
+## Amendment: where the library lives (2026-09-23)
+
+The library, the theme, the preferences and the reopened workspace live in
+the operating system's per-user data folder. Each of these is hidden from
+everyday browsing, so it is neither in the way nor easy to delete by
+accident:
+
+| System | Folder |
+| --- | --- |
+| Windows | `%APPDATA%\Artificer` (Roaming `AppData`, hidden) |
+| macOS | `~/Library/Application Support/Artificer` (`~/Library` is hidden) |
+| Linux and other Unix | `$XDG_DATA_HOME/artificer`, else `~/.local/share/artificer` |
+
+The library itself is the `catalog` folder inside it. A `README.txt` in the
+library says what the folder is, and that deleting it removes the parts.
+
+Windows used to keep all of this in `%LOCALAPPDATA%\Artificer`. That is
+the folder the installer puts the application in (ADR 0029, pack id
+`Artificer`), and uninstalling removes it whole, parts included. At start
+the application copies anything it finds there that the new folder lacks.
+It overwrites nothing, and the old copies stay where they are.
+
+When the system names no per-user folder, there is no library on disk
+rather than one in the temporary folder, which the system empties. The
+verified built-in part remains available, as for a store that fails to
+open.

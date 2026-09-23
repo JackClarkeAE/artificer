@@ -29,6 +29,7 @@ mod ribbon;
 pub mod shell;
 pub mod spacemouse;
 pub mod update;
+pub mod user_data;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -3086,17 +3087,34 @@ impl KernelLabApp {
             ..Self::default()
         };
         app.reset_to_blank_workspace();
-        app.theme_preferences_path = Some(theme_preferences_path());
+        // Earlier builds on Windows kept all of this inside the installer's
+        // own folder, which uninstalling removes; bring it across first.
+        if let Err(error) = user_data::migrate_legacy_data() {
+            app.document_status = Some(format!(
+                "Could not bring settings and parts over from the earlier location: {error}"
+            ));
+        }
+        app.theme_preferences_path = theme_preferences_path();
         app.load_theme_preferences(egui_ctx);
-        app.user_preferences_path = Some(user_preferences_path());
+        app.user_preferences_path = user_preferences_path();
         app.load_user_preferences();
         // The 3D mouse is opened once per process; a further document
         // shares the reader and takes its motion while it is in front.
         app.spacemouse = spacemouse::SpaceMouseNavigation::attach(egui_ctx);
-        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
-            app.document_status = Some(format!(
-                "Local Part Library is using its verified built-in fallback: {error}"
-            ));
+        match user_data::library_directory() {
+            Some(root) => {
+                if let Err(error) = app.open_catalog_store(root) {
+                    app.document_status = Some(format!(
+                        "Local Part Library is using its verified built-in fallback: {error}"
+                    ));
+                }
+            }
+            None => {
+                app.document_status = Some(
+                    "Local Part Library is using its verified built-in fallback: this system names no per-user data folder to keep parts in"
+                        .to_owned(),
+                );
+            }
         }
         app
     }
@@ -3148,6 +3166,9 @@ impl KernelLabApp {
         let package = builtin_aluminium_extrusion_package().map_err(|error| error.to_string())?;
         let store = CatalogStore::open(root.as_ref().to_path_buf())
             .map_err(|error| plain_catalog_error(&error))?;
+        // A note for anyone who comes across the folder; not having one is
+        // no reason to go without the library.
+        let _ = user_data::write_library_readme(root.as_ref());
         // Saving the part into the library draws its picture, once; a store
         // that already has it hands back the kept one.
         let (digest, preview) = crate::part_preview::publish_with_preview(&store, &package)
@@ -23848,40 +23869,6 @@ fn translucent(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-fn default_catalog_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("ARTIFICER_CATALOG_DIR").filter(|value| !value.is_empty())
-    {
-        return PathBuf::from(root);
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("Artificer")
-            .join("catalog");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(local_data) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return PathBuf::from(local_data).join("Artificer").join("catalog");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty())
-        {
-            return PathBuf::from(data_home).join("artificer").join("catalog");
-        }
-        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("artificer")
-                .join("catalog");
-        }
-    }
-    std::env::temp_dir().join("artificer-catalog")
-}
-
 /// The theme choice and edited palettes live beside the catalog, in the
 /// per-user Artificer data directory.
 /// One sketch's exact authored curves in its own plane, ready for the DXF
@@ -24018,26 +24005,20 @@ fn sketch_export_curves_from_entities(entities: &[SketchEntity]) -> Vec<export::
     curves
 }
 
-fn theme_preferences_path() -> PathBuf {
+fn theme_preferences_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARTIFICER_THEME_PATH").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    default_catalog_root()
-        .parent()
-        .map_or_else(default_catalog_root, Path::to_path_buf)
-        .join("theme.json")
+    user_data::data_directory().map(|data| data.join("theme.json"))
 }
 
-fn user_preferences_path() -> PathBuf {
+fn user_preferences_path() -> Option<PathBuf> {
     if let Some(path) =
         std::env::var_os("ARTIFICER_PREFERENCES_PATH").filter(|value| !value.is_empty())
     {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    default_catalog_root()
-        .parent()
-        .map_or_else(default_catalog_root, Path::to_path_buf)
-        .join("preferences.json")
+    user_data::data_directory().map(|data| data.join("preferences.json"))
 }
 
 /// Where an export should land when the user has not said otherwise.
@@ -24066,10 +24047,11 @@ fn default_document_path() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    let catalog = default_catalog_root();
-    catalog
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
+    // With no per-user folder, the working folder: the workspace is then at
+    // least somewhere a person can see, rather than somewhere the system
+    // empties.
+    user_data::data_directory()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("current.artificer")
 }
 
