@@ -32,6 +32,8 @@ pub(crate) enum BrowserContextTarget {
     Sketch(usize),
     ConstructionPlane(u64),
     OriginPlane(SketchPlane),
+    /// A construction axis row, by its feature.
+    ConstructionAxis(artificer_model::FeatureId),
 }
 
 /// The Browser's floating right-click menu.
@@ -71,6 +73,12 @@ enum BrowserContextCommand {
     HidePlane,
     ShowPlane,
     DeletePlane,
+    SelectAxis,
+    EditAxis,
+    RenameAxis,
+    HideAxis,
+    ShowAxis,
+    DeleteAxis,
 }
 
 impl BrowserContextCommand {
@@ -96,6 +104,12 @@ impl BrowserContextCommand {
             Self::HidePlane => "Hide this plane",
             Self::ShowPlane => "Show this plane",
             Self::DeletePlane => "Delete this plane",
+            Self::SelectAxis => "Select this axis",
+            Self::EditAxis => "Edit this axis",
+            Self::RenameAxis => "Rename this axis…",
+            Self::HideAxis => "Hide this axis",
+            Self::ShowAxis => "Show this axis",
+            Self::DeleteAxis => "Delete this axis",
         }
     }
 }
@@ -465,6 +479,82 @@ impl KernelLabApp {
                         if let Some(id) = selected_plane {
                             self.selected_construction_plane = Some(id);
                             self.clear_model_entity_selection();
+                        }
+                    }
+                    if !self.construction_axes.is_empty() {
+                        let rows = self
+                            .construction_axes
+                            .iter()
+                            .map(|axis| {
+                                (
+                                    axis.feature,
+                                    axis.name.clone(),
+                                    axis.visible,
+                                    self.selected_history_feature == Some(axis.feature),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let mut visibility_change = None;
+                        let mut selected_axis = None;
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("Axes ({})", rows.len()))
+                                .font(FontId::proportional(12.0))
+                                .color(theme::text())
+                                .strong(),
+                        )
+                        .id_salt("browser_construction_axes")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for (feature, name, visible, selected) in rows {
+                                ui.horizontal(|ui| {
+                                    let action_label = if visible {
+                                        format!("Hide {name}")
+                                    } else {
+                                        format!("Show {name}")
+                                    };
+                                    if visibility_toggle(ui, visible, &action_label).clicked() {
+                                        visibility_change = Some((feature, !visible));
+                                    }
+                                    let response = browser_row_button(
+                                        ui,
+                                        CommandIcon::Axis,
+                                        None,
+                                        name.clone(),
+                                        (ui.available_width() - 2.0).max(24.0),
+                                        selected,
+                                    );
+                                    // As for a plane row: "Axis 1" alone would
+                                    // collide with its history stop.
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!("Select {name}"),
+                                        )
+                                    });
+                                    let response = response.on_hover_text(format!(
+                                        "{name} · a revolve can turn about it; right-click to edit, rename, hide or delete it"
+                                    ));
+                                    if response.clicked() {
+                                        selected_axis = Some(feature);
+                                    }
+                                    if response.secondary_clicked() {
+                                        let position = response
+                                            .interact_pointer_pos()
+                                            .unwrap_or_else(|| response.rect.left_bottom());
+                                        context_request = Some((
+                                            position,
+                                            BrowserContextTarget::ConstructionAxis(feature),
+                                        ));
+                                    }
+                                });
+                            }
+                        });
+                        if let Some((feature, visible)) = visibility_change {
+                            self.set_construction_axis_visible(feature, visible);
+                        }
+                        if let Some(feature) = selected_axis {
+                            self.selected_history_feature = Some(feature);
                         }
                     }
                     let body_rows = self
@@ -931,6 +1021,28 @@ impl KernelLabApp {
                 });
                 commands.push(BrowserContextCommand::DeletePlane);
             }
+            BrowserContextTarget::ConstructionAxis(feature) => {
+                let Some(axis) = self
+                    .construction_axes
+                    .iter()
+                    .find(|axis| axis.feature == feature)
+                else {
+                    return commands;
+                };
+                if self.selected_history_feature != Some(feature) {
+                    commands.push(BrowserContextCommand::SelectAxis);
+                }
+                if self.feature_has_an_editor(feature) {
+                    commands.push(BrowserContextCommand::EditAxis);
+                }
+                commands.push(BrowserContextCommand::RenameAxis);
+                commands.push(if axis.visible {
+                    BrowserContextCommand::HideAxis
+                } else {
+                    BrowserContextCommand::ShowAxis
+                });
+                commands.push(BrowserContextCommand::DeleteAxis);
+            }
             BrowserContextTarget::OriginPlane(plane) => {
                 let has_other_plane_sketch = self.sketch_open_on_another_plane(plane);
                 let already_selected = self.selected_origin_plane == plane
@@ -1089,7 +1201,9 @@ impl KernelLabApp {
                         self.select_origin_plane(plane);
                     }
                 }
-                BrowserContextTarget::Body(_) | BrowserContextTarget::Sketch(_) => {}
+                BrowserContextTarget::Body(_)
+                | BrowserContextTarget::Sketch(_)
+                | BrowserContextTarget::ConstructionAxis(_) => {}
             },
             BrowserContextCommand::HidePlane | BrowserContextCommand::ShowPlane => {
                 if let BrowserContextTarget::ConstructionPlane(id) = target {
@@ -1112,6 +1226,34 @@ impl KernelLabApp {
             BrowserContextCommand::DeletePlane => {
                 if let Some(feature) = self.construction_plane_feature(target) {
                     self.delete_construction_plane(feature);
+                }
+            }
+            BrowserContextCommand::SelectAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.selected_history_feature = Some(feature);
+                }
+            }
+            BrowserContextCommand::EditAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.begin_axis_edit(feature);
+                }
+            }
+            BrowserContextCommand::RenameAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.begin_feature_rename(feature);
+                }
+            }
+            BrowserContextCommand::HideAxis | BrowserContextCommand::ShowAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.set_construction_axis_visible(
+                        feature,
+                        command == BrowserContextCommand::ShowAxis,
+                    );
+                }
+            }
+            BrowserContextCommand::DeleteAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.delete_construction_axis(feature);
                 }
             }
         }
@@ -1352,5 +1494,74 @@ mod tests {
                 10.0 - before,
             );
         }
+    }
+
+    /// A construction axis has a Browser row with a menu like a plane's:
+    /// select, edit, rename, hide or show, delete.
+    #[test]
+    fn a_construction_axis_row_offers_what_a_plane_row_does() {
+        let mut app = KernelLabApp::default();
+        let edge = app
+            .displayed
+            .as_ref()
+            .expect("the block is displayed")
+            .scene
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.x - 2.0).abs() < 1.0e-9 && point.y.abs() < 1.0e-9)
+            })
+            .expect("the block's upright edge")
+            .source_edge;
+        let recipe = app
+            .edge_axis_recipe(crate::viewport::DocumentEdgeSelection {
+                body: crate::viewport::BodyInstanceKey::new(
+                    app.active_body_id().expect("a body").get(),
+                ),
+                edge,
+            })
+            .expect("the edge makes an axis");
+        let (axis, _) = app
+            .append_construction_axis(recipe)
+            .expect("the axis is appended");
+        let target = BrowserContextTarget::ConstructionAxis(axis);
+        app.selected_history_feature = None;
+        assert_eq!(
+            app.browser_context_commands(target),
+            vec![
+                BrowserContextCommand::SelectAxis,
+                BrowserContextCommand::EditAxis,
+                BrowserContextCommand::RenameAxis,
+                BrowserContextCommand::HideAxis,
+                BrowserContextCommand::DeleteAxis,
+            ]
+        );
+
+        app.run_browser_context_command(BrowserContextCommand::SelectAxis, target);
+        assert_eq!(app.selected_history_feature, Some(axis));
+        assert!(
+            !app.browser_context_commands(target)
+                .contains(&BrowserContextCommand::SelectAxis)
+        );
+
+        // Hidden, it is not drawn and the menu offers to show it; the
+        // document keeps the choice.
+        app.run_browser_context_command(BrowserContextCommand::HideAxis, target);
+        assert!(app.construction_axis_overlays().is_empty());
+        assert!(
+            app.browser_context_commands(target)
+                .contains(&BrowserContextCommand::ShowAxis)
+        );
+        assert!(matches!(
+            &app.document.feature(axis).expect("the axis").action,
+            artificer_model::ReplayAction::DatumAxis(recipe) if !recipe.visible
+        ));
+        app.run_browser_context_command(BrowserContextCommand::ShowAxis, target);
+        assert_eq!(app.construction_axis_overlays().len(), 1);
+
+        app.run_browser_context_command(BrowserContextCommand::DeleteAxis, target);
+        assert!(app.construction_axes.is_empty());
     }
 }

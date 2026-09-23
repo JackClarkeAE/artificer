@@ -4,8 +4,10 @@
 //! what confirming would build, and the contextual card carries the choices.
 //! Its profile is a region of a finished sketch, picked in the model view;
 //! its axis is chosen on the card from everything that can serve as one — a
-//! centreline drawn in the sketch, the sketch's own axes, or the document's
-//! origin axes where they lie in the sketch's plane. It turns a full turn or
+//! centreline drawn in the sketch, the sketch's own axes, the document's
+//! origin axes or a construction axis where they lie in the sketch's plane —
+//! or picked in the view: a line of the sketch, a construction axis, or a
+//! straight model edge, which becomes a construction axis of its own. It turns a full turn or
 //! through an angle, one way, the other or both; an angle typed over document
 //! variables stays with them (ADR 0052). Every change asks the kernel for the
 //! result at once, so the preview is the solid the history will hold, or the
@@ -84,6 +86,13 @@ pub(crate) struct StagedRevolve {
     pub(crate) preview: Option<RevolvePreview>,
     /// Why there is no preview, when there is not.
     pub(crate) issue: Option<String>,
+    /// The next click in the model view picks the axis rather than the
+    /// profile.
+    pub(crate) picking_axis: bool,
+    /// A construction axis this editor made from a picked model edge. It
+    /// stays with the revolve when it is confirmed, and goes when the
+    /// revolve is abandoned or turns about something else.
+    pub(crate) made_axis: Option<FeatureId>,
 }
 
 /// An angle typed over document variables: `sweep`, `sweep / 2 + 10`.
@@ -113,6 +122,8 @@ impl StagedRevolve {
             angle_link: None,
             preview: None,
             issue: None,
+            picking_axis: false,
+            made_axis: None,
         }
     }
 
@@ -220,8 +231,10 @@ impl KernelLabApp {
         self.staged_revolve = Some(staged);
         self.pending_operation = Some(PendingOperation::StageRevolve { editing: None });
         self.refresh_revolve_preview();
-        self.document_status =
-            Some("Revolve · click the profile, then choose the axis on the card".to_owned());
+        self.document_status = Some(
+            "Revolve · click the profile, then choose the axis on the card or pick it in the view"
+                .to_owned(),
+        );
         true
     }
 
@@ -335,6 +348,18 @@ impl KernelLabApp {
                 unavailable: None,
             })
             .collect::<Vec<_>>();
+        // A line of the sketch picked in the view that is not a centreline,
+        // an edge of the profile say, is listed as what it is.
+        if let Some(axis @ RevolveAxis::SketchLine { .. }) =
+            self.staged_revolve.as_ref().and_then(|staged| staged.axis)
+            && !choices.iter().any(|choice| choice.axis == axis)
+        {
+            choices.push(RevolveAxisChoice {
+                axis,
+                label: "Picked sketch line".to_owned(),
+                unavailable: None,
+            });
+        }
         for (axis, label) in [
             (SketchAxisDirection::U, "Sketch horizontal axis"),
             (SketchAxisDirection::V, "Sketch vertical axis"),
@@ -455,12 +480,209 @@ impl KernelLabApp {
 
     /// Chooses the axis the staged revolve turns about.
     pub fn set_revolve_axis(&mut self, axis: RevolveAxis) {
+        let mut abandoned = None;
         if let Some(staged) = self.staged_revolve.as_mut()
             && staged.axis != Some(axis)
         {
             staged.axis = Some(axis);
+            staged.picking_axis = false;
+            // An axis this editor made for an edge goes once the revolve
+            // turns about something else.
+            if staged.made_axis.is_some()
+                && staged
+                    .made_axis
+                    .map(|feature| RevolveAxis::DatumAxis { axis: feature })
+                    != Some(axis)
+            {
+                abandoned = staged.made_axis.take();
+            }
             self.refresh_revolve_preview();
         }
+        if let Some(feature) = abandoned {
+            self.delete_construction_axis(feature);
+        }
+    }
+
+    /// Arms or disarms picking the axis in the model view.
+    pub fn arm_revolve_axis_pick(&mut self, armed: bool) {
+        if let Some(staged) = self.staged_revolve.as_mut() {
+            staged.picking_axis = armed;
+            self.document_status = Some(if armed {
+                "Revolve · click a line of the sketch, a construction axis or a straight edge of the model to turn about".to_owned()
+            } else {
+                "Revolve · click the profile, then choose the axis".to_owned()
+            });
+        }
+    }
+
+    /// Whether the next click in the model view picks the revolve's axis.
+    #[must_use]
+    pub fn revolve_axis_pick_armed(&self) -> bool {
+        self.revolve_pick_active()
+            && self
+                .staged_revolve
+                .as_ref()
+                .is_some_and(|staged| staged.picking_axis)
+    }
+
+    /// A line picked in the model view as the revolve's axis: a line of the
+    /// revolve's own sketch, or a construction axis.
+    pub fn pick_revolve_axis_line(&mut self, line: viewport::PickableLine) -> bool {
+        let Some(sketch) = self
+            .staged_revolve
+            .as_ref()
+            .and_then(|staged| staged.sketch)
+        else {
+            return false;
+        };
+        let axis = match line {
+            viewport::PickableLine::SketchEntity {
+                sketch_index,
+                entity,
+            } => {
+                if self.sketches.get(sketch_index).and_then(|picked| picked.id) != Some(sketch) {
+                    self.document_status = Some(
+                        "A revolve turns about a line of its own sketch · pick one there"
+                            .to_owned(),
+                    );
+                    return false;
+                }
+                let Some(entity) = artificer_sketch::SketchEntityId::new(entity) else {
+                    return false;
+                };
+                RevolveAxis::SketchLine { entity }
+            }
+            viewport::PickableLine::ConstructionAxis(raw) => {
+                let Some(axis) = self
+                    .construction_axes
+                    .iter()
+                    .find(|axis| axis.feature.get() == raw)
+                else {
+                    return false;
+                };
+                RevolveAxis::DatumAxis { axis: axis.feature }
+            }
+        };
+        self.set_revolve_axis(axis);
+        if let Some(staged) = self.staged_revolve.as_mut() {
+            staged.picking_axis = false;
+        }
+        true
+    }
+
+    /// A straight model edge picked as the revolve's axis. The edge becomes
+    /// a construction axis, which the revolve then turns about, so the
+    /// revolve follows the edge when the body changes. The axis has to come
+    /// before the revolve in the history, so a revolve being edited cannot
+    /// make one: its axis is made first, then picked.
+    pub fn pick_revolve_axis_edge(&mut self, edge: viewport::DocumentEdgeSelection) -> bool {
+        let Some(staged) = self.staged_revolve.as_ref() else {
+            return false;
+        };
+        if matches!(
+            self.pending_operation,
+            Some(PendingOperation::StageRevolve { editing: Some(_) })
+        ) {
+            self.document_status = Some(
+                "An edge makes a construction axis, which has to come before the revolve · make the axis first, then pick it".to_owned(),
+            );
+            return false;
+        }
+        let Some(sketch) = staged.sketch else {
+            return false;
+        };
+        let recipe = match self.edge_axis_recipe(edge) {
+            Ok(recipe) => recipe,
+            Err(error) => {
+                self.document_status = Some(format!("That edge cannot be the axis: {error}"));
+                return false;
+            }
+        };
+        let line = recipe.cached();
+        let in_plane = self.document.sketch_frame(sketch).is_some_and(|frame| {
+            artificer_model::revolve::line_in_frame(
+                line.origin,
+                line.direction,
+                frame,
+                PrecisionPolicy::default(),
+            )
+            .is_some()
+        });
+        if !in_plane {
+            self.document_status = Some(
+                "That edge does not lie in the sketch's plane, so nothing can turn about it"
+                    .to_owned(),
+            );
+            return false;
+        }
+        let (feature, label) = match self.append_construction_axis(recipe) {
+            Ok(appended) => appended,
+            Err(error) => {
+                self.document_status = Some(format!("That edge cannot be the axis: {error}"));
+                return false;
+            }
+        };
+        self.set_revolve_axis(RevolveAxis::DatumAxis { axis: feature });
+        if let Some(staged) = self.staged_revolve.as_mut() {
+            staged.made_axis = Some(feature);
+            staged.picking_axis = false;
+        }
+        self.document_status = Some(format!(
+            "Revolve · turning about {label}, made along the picked edge"
+        ));
+        true
+    }
+
+    /// The straight lines of the staged revolve's sketch, in world space, for
+    /// the model view to offer while the axis is being picked.
+    pub(crate) fn revolve_axis_pickable_lines(
+        &self,
+        sketch_index: usize,
+    ) -> Vec<(viewport::PickableLine, [artificer_protocol::Point3; 2])> {
+        let Some(staged) = self
+            .staged_revolve
+            .as_ref()
+            .filter(|staged| staged.picking_axis)
+        else {
+            return Vec::new();
+        };
+        let Some(sketch) = staged.sketch.filter(|sketch| {
+            self.sketches.get(sketch_index).and_then(|picked| picked.id) == Some(*sketch)
+        }) else {
+            return Vec::new();
+        };
+        let (Some(authoring), Some(frame)) = (
+            self.document
+                .sketch(sketch)
+                .and_then(|record| {
+                    self.document
+                        .sketch_payload(sketch, record.geometry_revision)
+                })
+                .and_then(|payload| payload.authoring()),
+            self.document.sketch_frame(sketch),
+        ) else {
+            return Vec::new();
+        };
+        let place = |u: f64, v: f64| {
+            artificer_protocol::Point3::new(
+                frame.origin.x + frame.u.x * u + frame.v.x * v,
+                frame.origin.y + frame.u.y * u + frame.v.y * v,
+                frame.origin.z + frame.u.z * u + frame.v.z * v,
+            )
+        };
+        authoring
+            .active_entities()
+            .filter_map(|entity| match authoring.evaluated_curve(entity.id) {
+                Ok(EvaluatedCurve2::Line { start, end }) => Some((
+                    viewport::PickableLine::SketchEntity {
+                        sketch_index,
+                        entity: entity.id.get(),
+                    },
+                    [place(start.u, start.v), place(end.u, end.v)],
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Chooses what the staged revolve does: a body of its own, or joined to
@@ -918,8 +1140,15 @@ impl KernelLabApp {
 
     /// Abandons the revolve editor. An edit puts the whole model back.
     pub(crate) fn cancel_staged_revolve(&mut self, editing: Option<FeatureId>) {
+        let made = self
+            .staged_revolve
+            .as_ref()
+            .and_then(|staged| staged.made_axis);
         self.staged_revolve = None;
         self.pending_operation = None;
+        if let Some(axis) = made {
+            self.delete_construction_axis(axis);
+        }
         if editing.is_some() {
             self.move_history_cursor(self.document.features().len());
             self.document_status = Some("Revolve edit abandoned".to_owned());
@@ -1016,6 +1245,33 @@ impl KernelLabApp {
             });
             if let Some(axis) = chosen {
                 self.set_revolve_axis(axis);
+            }
+        }
+        if staged.sketch.is_some() {
+            let response = ui
+                .add(egui::Button::new("Pick in view").selected(staged.picking_axis))
+                .on_hover_text(
+                    "Click a line of the sketch, a construction axis or a straight edge of the model to turn about",
+                );
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    true,
+                    staged.picking_axis,
+                    "Pick the revolve axis in the view",
+                )
+            });
+            if response.clicked() {
+                self.arm_revolve_axis_pick(!staged.picking_axis);
+            }
+            if staged.picking_axis {
+                ui.label(
+                    RichText::new(
+                        "Click a sketch line, a construction axis or a straight model edge",
+                    )
+                    .small()
+                    .color(theme::muted()),
+                );
             }
         }
         self.revolve_extent_controls(ui, &staged);

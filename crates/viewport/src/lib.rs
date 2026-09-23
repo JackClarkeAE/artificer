@@ -397,6 +397,9 @@ pub struct DocumentViewportOutput {
     pub edge_finish_distance_delta: Option<f64>,
     pub selected_sketch_region: Option<ModelSketchRegionSelection>,
     pub selected_reference_plane: Option<ReferencePlaneSelection>,
+    /// A click on a line an overlay offers to be picked: a sketch line or a
+    /// construction axis, when the shell asks for one.
+    pub selected_line: Option<PickableLine>,
     /// A drag on a staged plane's arrow or arc.
     pub datum_drag: Option<DatumHandleDrag>,
     pub context_click: Option<ViewportContextClick>,
@@ -472,6 +475,16 @@ impl ModelSketchRegion {
     }
 }
 
+/// A straight line an overlay offers to be picked, named the way the shell
+/// knows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickableLine {
+    /// A line of a sketch, by the sketch's index and the entity's number.
+    SketchEntity { sketch_index: usize, entity: u64 },
+    /// A construction axis, by its feature's number.
+    ConstructionAxis(u64),
+}
+
 /// Presentation-only world-space lines retained for a committed sketch.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelSketchOverlay {
@@ -484,6 +497,8 @@ pub struct ModelSketchOverlay {
     regions: Vec<ModelSketchRegion>,
     reference_plane: Option<ReferencePlaneOverlay>,
     datum_handles: Option<DatumPlaneHandles>,
+    /// Lines a click may pick, each with its two ends in world space.
+    pickable_lines: Vec<(PickableLine, [Point3; 2])>,
 }
 
 impl ModelSketchOverlay {
@@ -499,7 +514,22 @@ impl ModelSketchOverlay {
             regions: Vec::new(),
             reference_plane: None,
             datum_handles: None,
+            pickable_lines: Vec::new(),
         }
+    }
+
+    /// Offers straight lines to be picked: a click near one reports it as
+    /// the viewport's `selected_line`, and the pointer over one lights it.
+    #[must_use]
+    pub fn with_pickable_lines(mut self, lines: Vec<(PickableLine, [Point3; 2])>) -> Self {
+        self.pickable_lines = lines;
+        self
+    }
+
+    /// Number of lines this overlay offers to be picked.
+    #[must_use]
+    pub fn pickable_line_count(&self) -> usize {
+        self.pickable_lines.len()
     }
 
     /// Gives a staged plane's card its offset arrow and, for a plane through
@@ -2523,6 +2553,36 @@ fn show_document_impl(
     } else {
         None
     };
+    // A line offered for picking answers before anything under it: the
+    // shell only offers lines while it is asking for one.
+    let line_at = |position: Pos2| {
+        hit_test_pickable_lines(
+            position,
+            sketch_overlays,
+            bodies,
+            active_body,
+            projection,
+            *view,
+            *active_display_transform,
+            animation_phase,
+        )
+    };
+    let selected_line = if active_tool == ActiveTool::Select
+        && !feature_interaction.consumes_primary
+        && canvas.clicked_by(PointerButton::Primary)
+    {
+        canvas
+            .interact_pointer_pos()
+            .and_then(&line_at)
+            .map(|(line, _)| line)
+    } else {
+        None
+    };
+    if active_tool == ActiveTool::Select
+        && let Some((_, ends)) = hover_position.and_then(line_at)
+    {
+        painter.line_segment(ends, Stroke::new(4.0, HOVERED));
+    }
     let selected_reference_plane = if active_tool == ActiveTool::Select
         && !feature_interaction.consumes_primary
         && clicked_edge.is_none()
@@ -2752,10 +2812,62 @@ fn show_document_impl(
         edge_finish_distance_delta,
         selected_sketch_region,
         selected_reference_plane,
+        selected_line,
         datum_drag: datum_interaction.event,
         context_click,
         clicked_empty,
     }
+}
+
+/// The offered line nearest a screen position, within picking reach, with
+/// its two ends on screen.
+#[allow(clippy::too_many_arguments)]
+fn hit_test_pickable_lines(
+    position: Pos2,
+    overlays: &[ModelSketchOverlay],
+    bodies: &[DocumentBodyInstance<'_>],
+    active_body: Option<BodyInstanceKey>,
+    projection: Projection,
+    view: ViewState,
+    active_transform: DisplayTransform,
+    animation_phase: f64,
+) -> Option<(PickableLine, [Pos2; 2])> {
+    const LINE_PICK_RADIUS: f32 = 8.0;
+    overlays
+        .iter()
+        .filter(|overlay| !overlay.pickable_lines.is_empty())
+        .filter_map(|overlay| {
+            let presentation = overlay_presentation(
+                overlay,
+                bodies,
+                active_body,
+                active_transform,
+                animation_phase,
+            )?;
+            overlay
+                .pickable_lines
+                .iter()
+                .map(|(line, ends)| {
+                    let ends =
+                        ends.map(|point| projection.instance_point(point, view, presentation));
+                    (*line, ends, distance_to_screen_segment(position, ends))
+                })
+                .filter(|(_, _, distance)| *distance <= LINE_PICK_RADIUS)
+                .min_by(|left, right| left.2.total_cmp(&right.2))
+        })
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+        .map(|(line, ends, _)| (line, ends))
+}
+
+/// How far a screen point is from a screen segment.
+fn distance_to_screen_segment(point: Pos2, [start, end]: [Pos2; 2]) -> f32 {
+    let along = end - start;
+    let length = along.length_sq();
+    if length <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(along) / length).clamp(0.0, 1.0);
+    point.distance(start + along * t)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8266,6 +8378,61 @@ mod tests {
             ),
             Some(ReferencePlaneSelection::Origin(0))
         );
+    }
+
+    /// A line an overlay offers is picked by a click near it, the nearer of
+    /// two wins, and a click far from both picks nothing.
+    #[test]
+    fn an_offered_line_is_picked_by_a_click_near_it() {
+        let sketch_line = PickableLine::SketchEntity {
+            sketch_index: 0,
+            entity: 7,
+        };
+        let axis = PickableLine::ConstructionAxis(3);
+        let overlays = [
+            ModelSketchOverlay::new(Vec::new(), Vec::new(), false).with_pickable_lines(vec![(
+                sketch_line,
+                [Point3::new(-2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            )]),
+            ModelSketchOverlay::new(Vec::new(), Vec::new(), false).with_pickable_lines(vec![(
+                axis,
+                [Point3::new(0.0, -2.0, 0.0), Point3::new(0.0, 2.0, 0.0)],
+            )]),
+        ];
+        let mut view = ViewState::default();
+        view.frame(Aabb3::new(
+            Point3::new(-2.0, -2.0, -2.0),
+            Point3::new(2.0, 2.0, 2.0),
+        ));
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+        )
+        .expect("framed projection");
+        let screen = |point: Point3| {
+            projection.instance_point(
+                point,
+                view,
+                InstancePresentation::identity(Point3::default()),
+            )
+        };
+        let pick = |position: Pos2| {
+            hit_test_pickable_lines(
+                position,
+                &overlays,
+                &[],
+                None,
+                projection,
+                view,
+                DisplayTransform::default(),
+                0.0,
+            )
+            .map(|(line, _)| line)
+        };
+        assert_eq!(pick(screen(Point3::new(1.5, 0.0, 0.0))), Some(sketch_line));
+        assert_eq!(pick(screen(Point3::new(0.0, 1.5, 0.0))), Some(axis));
+        assert_eq!(pick(screen(Point3::new(1.5, 1.5, 0.0))), None);
+        assert_eq!(overlays[0].pickable_line_count(), 1);
     }
 
     #[test]

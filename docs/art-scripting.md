@@ -238,6 +238,35 @@ let middle = plane(between: [faces("<X"), faces(">X")]);
 let leaning = plane(through: nearest(point: [20, 0, 10], kind: "edge"), face: faces(">Z"), angle: 60);
 ```
 
+### Axes: `axis(...)`
+
+A revolve turns about an axis. `axis(...)` names one, the script form of
+the workbench's construction axes:
+
+```art
+let up = axis(from: "Z");                                   // the world Z axis
+let slanted = axis(origin: [10, 0, 0], direction: [0, 0, 1]);
+let b = box(size: [40, 40, 10], label: "b");
+let hinge = axis(along: nearest(point: [0, 0, 5], kind: "edge"));
+let corner = axis(between: [faces("<X"), faces("<Y")]);
+revolve(sketch: ring, axis: hinge, label: "turned");
+```
+
+| Form | Meaning |
+|---|---|
+| `axis(from: "X")` | A world axis through the origin: `"X"`, `"Y"` or `"Z"`. |
+| `axis(origin: [x, y, z], direction: [x, y, z])` | A line in space. `origin` defaults to the world origin. |
+| `axis(along: edge)` | Along a straight edge, from its start to its end. |
+| `axis(through: face)` | A curved face's own axis: a cylinder's, a cone's, a sphere's or a torus's. |
+| `axis(between: [a, b])` | Where two flat faces meet, running along the first's normal crossed with the second's. |
+
+Every form takes `flip: true` to run the other way, which turns a partial
+revolve the other way. The last three are placed by the current body and
+resolved when the revolve runs, against the body as it then stands; each is
+refused by name where it cannot be placed: a curved edge, a flat face with
+no axis, or two faces that are parallel. A decompiled script writes a placed
+axis back as the `axis(...)` that made it.
+
 **Regions.** Closed loops become regions. A loop inside another loop is a
 hole in it, so the sketch above is a plate with a hole. Intersecting loops
 are not split into regions: draw closed, non-crossing loops. Lines must
@@ -392,8 +421,8 @@ let ring = revolve(sketch: section, axis: [0, 0, 1], label: "ring");
 | Argument | Required | Meaning |
 |---|---|---|
 | `sketch` | yes | A sketch whose plane contains the axis. |
-| `axis` | no | Axis direction. Default `[0, 0, 1]`. |
-| `axis_origin` | no | A point on the axis. Default `[0, 0, 0]`. |
+| `axis` | no | Axis direction, or an `axis(...)`. Default `[0, 0, 1]`. |
+| `axis_origin` | no | A point on the axis, with a direction. Default `[0, 0, 0]`; an `axis(...)` says where it runs itself. |
 | `angle` | no | Degrees. Default `360`, a full turn. Less turns that far right-handed about `axis`, and closes the solid with the section at each end; a negative angle turns the other way. |
 | `regions` | no | As for `extrude`. |
 | `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. Turned about the body's own axis, as a groove in a shaft is, it is exact whatever its faces; about another axis, a cone, sphere or torus face takes the faceted tier. |

@@ -1315,6 +1315,32 @@ impl ModelDocument {
         Ok(true)
     }
 
+    /// Shows or hides a construction axis. Nothing is rebuilt: visibility is
+    /// how the axis is drawn, not where it is. Returns whether it changed.
+    pub fn set_datum_axis_visible(
+        &mut self,
+        id: FeatureId,
+        visible: bool,
+    ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        let ReplayAction::DatumAxis(recipe) = &feature.action else {
+            return Err(DocumentError::NotADatumAxis(id));
+        };
+        if recipe.visible == visible {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        if let ReplayAction::DatumAxis(recipe) = &mut self.state.features[index].action {
+            recipe.visible = visible;
+        }
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
     /// Replaces the frames cached in construction-plane recipes, and in the
     /// payloads of the sketches drawn on them, with the ones a replay just
     /// resolved. Nothing is rebuilt: the frames are the ones the rebuild

@@ -266,3 +266,36 @@ fn a_revolve_angle_typed_over_a_variable_follows_it() {
     click_button(&mut harness, CONFIRM_OPERATION);
     assert_close(volume(&harness), tube / 3.0, "symmetric");
 }
+
+/// The card's "Pick in view" arms the axis pick, and a second press puts it
+/// away; while it is armed the model view offers the sketch's lines.
+#[test]
+fn the_axis_pick_is_armed_from_the_card() {
+    let mut harness = harness();
+    harness.run();
+    click_button(&mut harness, "XZ Plane");
+    click_button(&mut harness, "Sketch mode");
+    for _ in 0..24 {
+        harness.step();
+    }
+    click_button(&mut harness, "Two-point rectangle");
+    click_sketch_point(&mut harness, SketchPoint::new(1.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(2.0, 3.0));
+    click_button(&mut harness, "Finish sketch");
+
+    click_button(&mut harness, "Revolve");
+    assert!(!harness.state().revolve_axis_pick_armed());
+    reveal_in_card(&mut harness, Role::Button, "Pick the revolve axis in the view");
+    click_button(&mut harness, "Pick the revolve axis in the view");
+    assert!(harness.state().revolve_axis_pick_armed());
+    assert!(
+        harness
+            .get_by_role_and_label(Role::Button, "Pick the revolve axis in the view")
+            .accesskit_node()
+            .toggled()
+            == Some(egui::accesskit::Toggled::True),
+        "the button shows the pick is armed"
+    );
+    click_button(&mut harness, "Pick the revolve axis in the view");
+    assert!(!harness.state().revolve_axis_pick_armed());
+}

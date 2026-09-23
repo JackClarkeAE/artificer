@@ -8009,10 +8009,13 @@ impl KernelLabApp {
                     }
                 }
                 (!points.is_empty() || !segments.is_empty()).then(|| {
+                    // While a revolve's axis is being picked, its sketch's
+                    // straight lines are offered.
                     let overlay =
                         viewport::ModelSketchOverlay::new(points, segments, sketch.consumed)
                             .on_frame(frame)
-                            .selectable(sketch_index, selectable_regions);
+                            .selectable(sketch_index, selectable_regions)
+                            .with_pickable_lines(self.revolve_axis_pickable_lines(sketch_index));
                     match sketch.body {
                         Some(body) => overlay.for_body(viewport::BodyInstanceKey::new(body.get())),
                         None => overlay,
@@ -22523,6 +22526,20 @@ impl KernelLabApp {
                         if let Some(region) = output.selected_sketch_region {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.pick_loft_region(region.sketch_index, region.anchor, additive);
+                        }
+                    } else if self.revolve_axis_pick_armed() {
+                        // Picking the axis: a line of the sketch or a
+                        // construction axis, else a straight model edge.
+                        if let Some(line) = output.selected_line {
+                            self.pick_revolve_axis_line(line);
+                        } else if let Some(edge) = output.selected_edge {
+                            self.pick_revolve_axis_edge(edge);
+                        } else if output.selected_face.is_some()
+                            || output.selected_sketch_region.is_some()
+                        {
+                            self.document_status = Some(
+                                "A revolve turns about a line · click a sketch line, a construction axis or a straight edge".into(),
+                            );
                         }
                     } else if self.revolve_pick_active() {
                         // The revolve editor owns clicks on sketch regions:

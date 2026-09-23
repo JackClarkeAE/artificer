@@ -847,3 +847,52 @@ shared section, exactly, as ADR 0026 F4 planned.
   - a script `difference` of two coaxial bodies;
   - the open shell of a tapered post;
   - a cone about another axis, which is not taken for coaxial.
+
+### Picking the axis, and construction axes in the Browser and scripts
+
+The axis used to be chosen only from the card's buttons. Construction axes
+had a timeline chip but no Browser row, and scripts could name an axis only
+by numbers.
+- **Picking in the view.** The card's "Pick in view" arms a pick, and the
+  next click in the model view names the axis.
+  - The viewport offers straight lines to be picked (`PickableLine`): a
+    sketch line, by its sketch and entity, or a construction axis, by its
+    feature. An overlay carries them only while the shell asks, so a
+    region pick is never taken for a line. The line under the pointer is
+    lit, and a click within 8 px of it is reported as `selected_line`.
+  - A line of the revolve's own sketch is taken as `SketchLine`, whether
+    or not it is a centreline; one that is not is listed on the card as
+    "Picked sketch line". A construction axis is taken as `DatumAxis`.
+  - A straight model edge becomes a construction axis along it
+    (`DatumAxisBase::Edge`), appended before the revolve, which turns about
+    it. It follows the edge when the body changes, and it is refused when
+    it does not lie in the sketch's plane. It goes with the revolve if the
+    revolve is abandoned, or if the revolve turns about something else.
+  - The history only appends, so a revolve being edited cannot make an
+    axis that would come after it. The pick says to make the axis first,
+    then pick it.
+- **The Browser.** Construction axes have an "Axes" section after the
+  planes, a row each with a visibility toggle. The row's menu offers what a
+  plane row's does: select, edit, rename, hide or show, and delete.
+  Visibility is kept in the recipe (`set_datum_axis_visible`) and changes
+  how the axis is drawn, not where it is.
+- **Scripts.** `axis(...)` names an axis for `revolve(axis: ...)`:
+  - `axis(from: "Z")` and `axis(origin:, direction:)` are lines in space;
+  - `axis(along: edge)`, `axis(through: face)` and
+    `axis(between: [a, b])` are placed by the body and resolved when the
+    revolve runs (`AxisPlacement`);
+  - every form takes `flip: true`.
+  A placed axis is journalled on the revolve (`axis_placement`), omitted
+  when absent so older journals read unchanged, and decompiles to the
+  `axis(...)` that made it.
+- **Tests.**
+  - The viewport picks the nearer offered line and nothing far from both.
+  - In the workbench, an edge's axis goes with an abandoned revolve and
+    stays with a confirmed one; a sketch side turns the profile about
+    itself; an edited revolve refuses an edge and takes a construction
+    axis.
+  - An axis row's menu, and hide and show kept in the document.
+  - Scripts: a world axis and a line in space match the numeric form digest
+    for digest; an edge, two faces and a curved face each place the axis;
+    `flip` mirrors a partial turn; a placed axis round-trips through the
+    journal and the decompiler; the refusals.

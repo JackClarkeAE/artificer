@@ -13,7 +13,9 @@ use std::fmt::Write as _;
 
 use artificer_protocol::{EntityKind, EntityRef, PlanarFrame3, Point2, Point3, Tier, Vector3};
 
-use crate::api::commands::{ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane};
+use crate::api::commands::{
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane,
+};
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::journal::Journal;
 use crate::api::selectors::{
@@ -345,17 +347,26 @@ impl Writer<'_> {
                 axis_direction,
                 angle_degrees,
                 operation,
+                axis_placement,
                 ..
-            } => format!(
-                "revolve(sketch: {}{}, axis_origin: {}, axis: {}, angle: {}, operation: {}, label: {})",
-                self.step_ident(&sketch.0)?,
-                regions_text(regions),
-                point3(*axis_origin),
-                vector3(*axis_direction),
-                number(*angle_degrees),
-                operation_text(*operation),
-                quoted(&label)
-            ),
+            } => {
+                let axis = match axis_placement {
+                    Some(placement) => format!("axis: {}", self.axis_text(placement)?),
+                    None => format!(
+                        "axis_origin: {}, axis: {}",
+                        point3(*axis_origin),
+                        vector3(*axis_direction)
+                    ),
+                };
+                format!(
+                    "revolve(sketch: {}{}, {axis}, angle: {}, operation: {}, label: {})",
+                    self.step_ident(&sketch.0)?,
+                    regions_text(regions),
+                    number(*angle_degrees),
+                    operation_text(*operation),
+                    quoted(&label)
+                )
+            }
             ApiCommand::PushPull { face, distance, .. } => format!(
                 "push_pull(face: {}, distance: {}, label: {})",
                 self.selector(face)?,
@@ -496,6 +507,35 @@ impl Writer<'_> {
     }
 
     /// A selector as the script language spells it.
+    /// An axis the body places, as `axis(...)` spells it.
+    fn axis_text(&mut self, placement: &AxisPlacement) -> Result<String, ApiError> {
+        let flip = |flip: bool| if flip { ", flip: true" } else { "" };
+        Ok(match placement {
+            AxisPlacement::Along {
+                edge,
+                flip: flipped,
+            } => {
+                format!("axis(along: {}{})", self.selector(edge)?, flip(*flipped))
+            }
+            AxisPlacement::Through {
+                face,
+                flip: flipped,
+            } => {
+                format!("axis(through: {}{})", self.selector(face)?, flip(*flipped))
+            }
+            AxisPlacement::Between {
+                first,
+                second,
+                flip: flipped,
+            } => format!(
+                "axis(between: [{}, {}]{})",
+                self.selector(first)?,
+                self.selector(second)?,
+                flip(*flipped)
+            ),
+        })
+    }
+
     fn selector(&mut self, selector: &EntitySelector) -> Result<String, ApiError> {
         Ok(match selector {
             EntitySelector::ByHistory {

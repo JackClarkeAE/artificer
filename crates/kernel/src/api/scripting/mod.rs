@@ -31,7 +31,8 @@ use artificer_protocol::{EntityKind, PlanarFrame3, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::commands::{
-    ApiCommand, ExtrudeOp, PatternPlacement, SketchConstraint, SketchEntity, SketchPlane, StepLabel,
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchConstraint, SketchEntity,
+    SketchPlane, StepLabel,
 };
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::scripting::ast::{
@@ -1476,15 +1477,39 @@ impl<'a> Interp<'a> {
                 }))
             }
             "plane" => script_plane(&args).map(Value::Plane),
-            "revolve" => Ok(Value::Command(ApiCommand::Revolve {
-                label: args.label()?,
-                sketch: args.required("sketch")?.as_step()?,
-                regions: args.regions()?,
-                axis_origin: args.point3_or("axis_origin", origin)?,
-                axis_direction: args.vector3_or("axis", up)?,
-                angle_degrees: args.number_or("angle", 360.0)?,
-                operation: args.operation()?,
-            })),
+            "axis" => script_axis(&args).map(Value::Axis),
+            "revolve" => {
+                // `axis` is a direction through `axis_origin`, or an
+                // axis(...) that says where it runs itself.
+                let (axis_origin, axis_direction, axis_placement) = match args.values.get("axis") {
+                    Some(Value::Axis(axis)) => {
+                        if args.values.contains_key("axis_origin") {
+                            return Err(ScriptError::eval(
+                                "revolve(): an axis(...) says where it runs; leave out `axis_origin`",
+                            ));
+                        }
+                        match axis {
+                            ScriptAxis::Line { origin, direction } => (*origin, *direction, None),
+                            ScriptAxis::Placed(placement) => (origin, up, Some(placement.clone())),
+                        }
+                    }
+                    _ => (
+                        args.point3_or("axis_origin", origin)?,
+                        args.vector3_or("axis", up)?,
+                        None,
+                    ),
+                };
+                Ok(Value::Command(ApiCommand::Revolve {
+                    label: args.label()?,
+                    sketch: args.required("sketch")?.as_step()?,
+                    regions: args.regions()?,
+                    axis_origin,
+                    axis_direction,
+                    angle_degrees: args.number_or("angle", 360.0)?,
+                    operation: args.operation()?,
+                    axis_placement,
+                }))
+            }
             // ---- face and edge features ------------------------------------
             "drill" => Ok(Value::Command(ApiCommand::DrillHole {
                 label: args.label()?,
@@ -1892,8 +1917,21 @@ enum Value {
     /// space, or a plane placed by the body's faces and edges, which is
     /// resolved when the sketch runs.
     Plane(SketchPlane),
+    /// An axis named by `axis(...)`, for `revolve(axis: ...)`: a line in
+    /// space, or one placed by the body's edges and faces, which is resolved
+    /// when the revolve runs.
+    Axis(ScriptAxis),
     /// What a function without a `return` value evaluates to.
     Unit,
+}
+
+/// What `axis(...)` names.
+#[derive(Clone, Debug, PartialEq)]
+enum ScriptAxis {
+    /// A line in space, fixed as written.
+    Line { origin: Point3, direction: Vector3 },
+    /// A line the body places.
+    Placed(AxisPlacement),
 }
 
 impl Value {
@@ -1916,6 +1954,7 @@ impl Value {
                 }
             ),
             Self::Plane(_) => "a plane".to_owned(),
+            Self::Axis(_) => "an axis".to_owned(),
             Self::Unit => "nothing".to_owned(),
         }
     }
@@ -2386,6 +2425,94 @@ fn script_plane(args: &Args<'_>) -> Result<SketchPlane, ScriptError> {
         ));
     }
     world_plane(args).map(|frame| SketchPlane::Frame { frame })
+}
+
+/// `axis(...)`: an axis for `revolve(axis: ...)`.
+///
+/// - `axis(from: "Z")` is a world axis through the origin.
+/// - `axis(origin: [...], direction: [...])` is a line in space.
+/// - `axis(along: edge)` runs along a straight edge, from its start to its
+///   end.
+/// - `axis(through: face)` is a curved face's own axis: a cylinder's, a
+///   cone's, a sphere's or a torus's.
+/// - `axis(between: [a, b])` is where two flat faces meet.
+///
+/// The last three are placed by the body and resolved when the revolve
+/// runs, against the body as it then stands. Each form takes `flip: true`
+/// to run the other way, which turns a partial revolve the other way.
+fn script_axis(args: &Args<'_>) -> Result<ScriptAxis, ScriptError> {
+    let flip = match args.values.get("flip") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(ScriptError::eval(format!(
+                "axis(): `flip` is true or false, got {}",
+                other.describe()
+            )));
+        }
+    };
+    if let Some(edge) = args.values.get("along") {
+        return Ok(ScriptAxis::Placed(AxisPlacement::Along {
+            edge: Box::new(edge.as_selector()?),
+            flip,
+        }));
+    }
+    if let Some(face) = args.values.get("through") {
+        return Ok(ScriptAxis::Placed(AxisPlacement::Through {
+            face: Box::new(face.as_selector()?),
+            flip,
+        }));
+    }
+    if let Some(faces) = args.values.get("between") {
+        let faces = faces.as_selectors()?;
+        let [first, second] = <[EntitySelector; 2]>::try_from(faces).map_err(|faces| {
+            ScriptError::eval(format!(
+                "axis(): `between` is an array of two flat faces, got {}",
+                faces.len()
+            ))
+        })?;
+        return Ok(ScriptAxis::Placed(AxisPlacement::Between {
+            first: Box::new(first),
+            second: Box::new(second),
+            flip,
+        }));
+    }
+    let sign = if flip { -1.0 } else { 1.0 };
+    if let Some(from) = args.values.get("from") {
+        let name = from.as_string()?;
+        let direction = match name.to_ascii_uppercase().as_str() {
+            "X" => Vector3::new(sign, 0.0, 0.0),
+            "Y" => Vector3::new(0.0, sign, 0.0),
+            "Z" => Vector3::new(0.0, 0.0, sign),
+            _ => {
+                return Err(ScriptError::eval(format!(
+                    "axis(): `from` is \"X\", \"Y\" or \"Z\", not \"{name}\""
+                )));
+            }
+        };
+        return Ok(ScriptAxis::Line {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            direction,
+        });
+    }
+    let origin = args.point3_or("origin", Point3::new(0.0, 0.0, 0.0))?;
+    let direction = args.required("direction").map_err(|_| {
+        ScriptError::eval(
+            "axis(): give `from`, `origin` and `direction`, `along` an edge, `through` a curved face, or `between` two flat faces",
+        )
+    })?;
+    let direction = direction.as_vector3()?;
+    let length =
+        (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
+    if !length.is_finite() || length == 0.0 {
+        return Err(ScriptError::eval(
+            "axis(): `direction` must be a non-zero direction",
+        ));
+    }
+    Ok(ScriptAxis::Line {
+        origin,
+        direction: Vector3::new(sign * direction.x, sign * direction.y, sign * direction.z),
+    })
 }
 
 /// A plane in space as a frame: a world plane moved along its normal, or

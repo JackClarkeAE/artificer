@@ -350,6 +350,25 @@ impl KernelLabApp {
             self.apply_axis_edit(feature, recipe);
             return;
         }
+        match self.append_construction_axis(recipe) {
+            Ok((feature, label)) => {
+                self.staged_axis = None;
+                self.pending_operation = None;
+                self.selected_history_feature = Some(feature);
+                self.document_status =
+                    Some(format!("{label} committed · a revolve can turn about it"));
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Axis rejected: {error}"));
+            }
+        }
+    }
+
+    /// Appends a new axis to the history, returning its feature and name.
+    pub(crate) fn append_construction_axis(
+        &mut self,
+        recipe: DatumAxisRecipe,
+    ) -> Result<(FeatureId, String), String> {
         // An axis reads the body its base names, and any plane it is the
         // meeting of; a second body's latest feature is a dependency.
         let bodies = recipe.base.bodies();
@@ -384,21 +403,38 @@ impl KernelLabApp {
         for dependency in dependencies {
             draft = draft.with_dependency(dependency);
         }
-        match self.document.append_feature(draft) {
-            Ok(appended) => {
-                self.staged_axis = None;
-                self.pending_operation = None;
-                self.selected_history_feature = Some(appended.feature);
-                self.history_scrub_position = self.document.history_position();
-                self.sync_construction_axes_from_document();
-                self.sync_feature_preview_from_document();
-                self.document_status =
-                    Some(format!("{label} committed · a revolve can turn about it"));
-            }
-            Err(error) => {
-                self.document_status = Some(format!("Axis rejected: {error}"));
-            }
-        }
+        let appended = self
+            .document
+            .append_feature(draft)
+            .map_err(|error| error.to_string())?;
+        self.history_scrub_position = self.document.history_position();
+        self.sync_construction_axes_from_document();
+        self.sync_feature_preview_from_document();
+        Ok((appended.feature, label))
+    }
+
+    /// The recipe for an axis along a straight model edge, as picking the
+    /// edge for a revolve makes it.
+    pub(crate) fn edge_axis_recipe(
+        &self,
+        edge: viewport::DocumentEdgeSelection,
+    ) -> Result<DatumAxisRecipe, String> {
+        let body = self
+            .bodies
+            .iter()
+            .find(|body| body.id.get() == edge.body.get())
+            .ok_or_else(|| "the edge's body is no longer available".to_owned())?;
+        let ends = NativeKernel::straight_edge_ends(&body.body.snapshot, edge.edge)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the edge is curved; pick a straight edge".to_owned())?;
+        let line = edge_line(ends).ok_or_else(|| "the edge has no length".to_owned())?;
+        let base = self.staged_axis_recipe_base(&StagedAxisBase::Edge {
+            body: body.id,
+            edge: edge.edge,
+        })?;
+        let recipe = DatumAxisRecipe::new(base, line);
+        recipe.validate().map_err(|error| error.to_string())?;
+        Ok(recipe)
     }
 
     /// Reopens a committed axis in its editor. As with a plane, the history
@@ -484,6 +520,16 @@ impl KernelLabApp {
     }
 
     /// Deletes an axis nothing is built on.
+    /// Shows or hides a committed axis.
+    pub(crate) fn set_construction_axis_visible(&mut self, feature: FeatureId, visible: bool) {
+        match self.document.set_datum_axis_visible(feature, visible) {
+            Ok(_) => self.sync_construction_axes_from_document(),
+            Err(error) => {
+                self.document_status = Some(format!("Axis visibility unchanged: {error}"));
+            }
+        }
+    }
+
     pub(crate) fn delete_construction_axis(&mut self, feature: FeatureId) {
         match self.document.remove_datum_axis(feature) {
             Ok(removed) => {
@@ -564,7 +610,26 @@ impl KernelLabApp {
                     Some(PendingOperation::StageAxis { editing: Some(editing) }) if editing == axis.feature
                 )
             })
-            .map(|axis| axis_overlay(axis.line, true))
+            .map(|axis| {
+                let overlay = axis_overlay(axis.line, true);
+                // While a revolve's axis is being picked, every committed
+                // axis is offered.
+                if self.revolve_axis_pick_armed() {
+                    let end = |sign: f64| {
+                        Point3::new(
+                            axis.line.origin.x + sign * axis.line.direction.x * axis.line.half_length,
+                            axis.line.origin.y + sign * axis.line.direction.y * axis.line.half_length,
+                            axis.line.origin.z + sign * axis.line.direction.z * axis.line.half_length,
+                        )
+                    };
+                    overlay.with_pickable_lines(vec![(
+                        viewport::PickableLine::ConstructionAxis(axis.feature.get()),
+                        [end(-1.0), end(1.0)],
+                    )])
+                } else {
+                    overlay
+                }
+            })
             .collect::<Vec<_>>();
         if let Some(staged) = &self.staged_axis {
             overlays.push(axis_overlay(staged.resolved(), false));
@@ -838,6 +903,114 @@ mod tests {
             app.document_status
         );
         assert_eq!(app.construction_axis_names().len(), 1);
+    }
+
+    /// The revolve's axis is picked in the view: a straight model edge makes
+    /// a construction axis that goes if the revolve is abandoned and stays
+    /// if it is confirmed; a line of the sketch serves as it is; and a
+    /// revolve being edited cannot make an axis after itself.
+    #[test]
+    fn a_revolve_axis_is_picked_in_the_view() {
+        let mut app = KernelLabApp::default();
+        // A rectangle from x = 3 to 4, 1 tall, on the XZ plane, beside the
+        // block's upright edge at x = 2.
+        app.open_origin_plane_sketch(SketchPlane::XZ);
+        let rectangle = app
+            .sketch
+            .stage_geometry(SketchGeometry::Rectangle {
+                first: SketchPoint::new(3.0, 0.0),
+                opposite: SketchPoint::new(4.0, 1.0),
+            })
+            .expect("the section stages");
+        app.commit_sketch_stroke(rectangle);
+        let sketch_index = app.sketches.len() - 1;
+        let about_edge = PI * (4.0 - 1.0) * 1.0;
+        let preview = |app: &KernelLabApp| {
+            app.staged_revolve
+                .as_ref()
+                .and_then(|staged| staged.preview.as_ref())
+                .map(|preview| preview.snapshot.measures().volume)
+                .unwrap_or_else(|| panic!("no preview: {:?}", app.staged_revolve_issue()))
+        };
+
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        assert!(
+            app.revolve_axis_pickable_lines(sketch_index).is_empty(),
+            "nothing is offered until the pick is armed"
+        );
+        app.arm_revolve_axis_pick(true);
+        assert!(app.revolve_axis_pick_armed());
+        assert_eq!(app.revolve_axis_pickable_lines(sketch_index).len(), 4);
+
+        // An edge makes an axis, and abandoning the revolve takes it away.
+        assert!(app.pick_revolve_axis_edge(upright_edge(&app)));
+        assert!(!app.revolve_axis_pick_armed(), "a pick disarms");
+        assert_eq!(app.construction_axis_names(), vec!["Axis 1".to_owned()]);
+        assert_close(preview(&app), about_edge, "about the edge");
+        assert!(app.cancel_pending_operation());
+        assert!(app.construction_axis_names().is_empty());
+
+        // A line of the sketch: its left side, at x = 3, turns it into a
+        // disc of radius 1.
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        app.arm_revolve_axis_pick(true);
+        let (left, _) = app
+            .revolve_axis_pickable_lines(sketch_index)
+            .into_iter()
+            .find(|(_, ends)| ends.iter().all(|point| (point.x - 3.0).abs() < 1.0e-9))
+            .expect("the rectangle's left side");
+        assert!(app.pick_revolve_axis_line(left));
+        assert_close(preview(&app), PI, "about its own side");
+        assert!(
+            app.revolve_axis_choices()
+                .iter()
+                .any(|choice| choice.label == "Picked sketch line"
+                    && Some(choice.axis) == app.staged_revolve_axis())
+        );
+
+        // The edge again, confirmed: the axis stays, and the revolve turns
+        // about it.
+        app.arm_revolve_axis_pick(true);
+        assert!(app.pick_revolve_axis_edge(upright_edge(&app)));
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_eq!(app.construction_axis_names(), vec!["Axis 1".to_owned()]);
+        let axis = app.construction_axes[0].feature;
+        let revolve = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Revolve)
+            .expect("the revolve is in the history")
+            .id;
+        assert!(matches!(
+            &app.document.feature(revolve).expect("the revolve").action,
+            ReplayAction::SketchRevolve(recipe) if recipe.axis == RevolveAxis::DatumAxis { axis }
+        ));
+        assert_close(
+            app.displayed_measures().expect("the revolve").volume,
+            about_edge,
+            "confirmed",
+        );
+
+        // Reopened, a revolve cannot make an axis that would come after it.
+        assert!(app.begin_revolve_edit(revolve), "{:?}", app.document_status);
+        app.arm_revolve_axis_pick(true);
+        assert!(!app.pick_revolve_axis_edge(upright_edge(&app)));
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("make the axis first")),
+            "{:?}",
+            app.document_status
+        );
+        assert_eq!(app.construction_axis_names().len(), 1);
+        // A construction axis picked in the view is taken as it is.
+        assert!(app.pick_revolve_axis_line(viewport::PickableLine::ConstructionAxis(axis.get())));
+        assert_eq!(
+            app.staged_revolve_axis(),
+            Some(RevolveAxis::DatumAxis { axis })
+        );
     }
 
     /// Two flat faces meet in an axis; reopened and flipped, it runs the

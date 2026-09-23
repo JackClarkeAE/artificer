@@ -190,6 +190,34 @@ impl PatternPlacement {
     }
 }
 
+/// A construction axis the body places, as `axis(...)` names it: found
+/// again against the body as it stands when the step that uses it runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AxisPlacement {
+    /// Along a straight edge, from its start to its end.
+    Along {
+        edge: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+    /// Through a curved face: the axis of its cylinder, cone, sphere or
+    /// torus.
+    Through {
+        face: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+    /// Where two flat faces meet, running along the first's normal crossed
+    /// with the second's.
+    Between {
+        first: Box<EntitySelector>,
+        second: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+}
+
 /// Commands for geometry operations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -242,6 +270,10 @@ pub enum ApiCommand {
         axis_direction: Vector3,
         angle_degrees: f64,
         operation: ExtrudeOp,
+        /// An axis the body places, found again when the revolve runs; it
+        /// stands in for `axis_origin` and `axis_direction`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_placement: Option<AxisPlacement>,
     },
     PushPull {
         label: String,

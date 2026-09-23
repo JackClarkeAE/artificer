@@ -14,7 +14,7 @@ use artificer_protocol::{
 use artificer_protocol::FaceExtrusionOperation;
 
 use crate::api::commands::{
-    ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane, StepLabel,
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane, StepLabel,
 };
 use crate::api::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
 use crate::api::journal::{Journal, JournalEntry};
@@ -991,8 +991,15 @@ impl Session {
                 axis_direction,
                 angle_degrees,
                 operation,
+                axis_placement,
                 ..
             } => {
+                // An axis the body places is found where the body now has
+                // it; a line in space is used as written.
+                let (axis_origin, axis_direction) = match axis_placement {
+                    Some(placement) => &self.placed_axis(placement)?,
+                    None => &(*axis_origin, *axis_direction),
+                };
                 // A full turn, or a partial one measured right-handed about
                 // the axis direction; a negative angle turns the other way.
                 let angle = if (angle_degrees.abs() - 360.0).abs() <= 1.0e-9 {
@@ -1165,6 +1172,104 @@ impl Session {
                 "Target step is not a Sketch",
             )),
         }
+    }
+
+    /// The line an `axis(...)` placed by the body names, as the body now
+    /// stands: a point on it and its unit direction.
+    fn placed_axis(&self, placement: &AxisPlacement) -> Result<(Point3, Vector3), ApiError> {
+        let resolve = |selector: &EntitySelector| {
+            resolve_selector(
+                selector,
+                &self.snapshot,
+                &self.step_order,
+                &self.step_reports,
+            )
+        };
+        let unit = |vector: Vector3| {
+            let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+            (length.is_finite() && length > 1.0e-12)
+                .then(|| Vector3::new(vector.x / length, vector.y / length, vector.z / length))
+        };
+        let cross = |a: Vector3, b: Vector3| {
+            Vector3::new(
+                a.y * b.z - a.z * b.y,
+                a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x,
+            )
+        };
+        let (origin, direction, flip) = match placement {
+            AxisPlacement::Along { edge, flip } => {
+                let ends = NativeKernel::straight_edge_ends(&self.snapshot, resolve(edge)?)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "axis(along:) needs a straight edge",
+                        )
+                    })?;
+                let along = Vector3::new(
+                    ends[1].x - ends[0].x,
+                    ends[1].y - ends[0].y,
+                    ends[1].z - ends[0].z,
+                );
+                let direction = unit(along).ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "axis(along:) edge has no length",
+                    )
+                })?;
+                (ends[0], direction, *flip)
+            }
+            AxisPlacement::Through { face, flip } => {
+                let axis = NativeKernel::face_axis(&self.snapshot, resolve(face)?)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "axis(through:) needs a curved face: a cylinder, cone, sphere or torus",
+                        )
+                    })?;
+                (axis.origin, axis.direction, *flip)
+            }
+            AxisPlacement::Between {
+                first,
+                second,
+                flip,
+            } => {
+                let first = self.planar_face_frame(first)?;
+                let second = self.planar_face_frame(second)?;
+                let (first_normal, second_normal) =
+                    (cross(first.u, first.v), cross(second.u, second.v));
+                let along = cross(first_normal, second_normal);
+                let squared = along.x * along.x + along.y * along.y + along.z * along.z;
+                let direction = unit(along).filter(|_| squared > 1.0e-18).ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "axis(between:) needs two flat faces that meet; these are parallel",
+                    )
+                })?;
+                // The point on both planes nearest the world origin:
+                // (d₁ n₂ × l + d₂ l × n₁) / |l|², with l = n₁ × n₂.
+                let dot = |a: Vector3, b: Point3| a.x * b.x + a.y * b.y + a.z * b.z;
+                let (d1, d2) = (
+                    dot(first_normal, first.origin),
+                    dot(second_normal, second.origin),
+                );
+                let (a, b) = (cross(second_normal, along), cross(along, first_normal));
+                let origin = Point3::new(
+                    (d1 * a.x + d2 * b.x) / squared,
+                    (d1 * a.y + d2 * b.y) / squared,
+                    (d1 * a.z + d2 * b.z) / squared,
+                );
+                (origin, direction, *flip)
+            }
+        };
+        let direction = if flip {
+            Vector3::new(-direction.x, -direction.y, -direction.z)
+        } else {
+            direction
+        };
+        Ok((origin, direction))
     }
 
     /// The frame of the planar face a selector names, as a sketch on that face
