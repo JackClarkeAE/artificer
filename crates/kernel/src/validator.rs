@@ -168,6 +168,38 @@ pub(crate) fn validate_with_pool(
                 .with_measure(measures.signed_volume, linear_tolerance.powi(3)),
         );
     }
+    // The total alone cannot see a cavity turned inside out: its shell then
+    // adds its volume instead of taking it away, and the sum is still
+    // positive. So wherever a solid declares cavities, each of its shells
+    // answers for its own sign — the outer shell encloses material, a
+    // cavity's encloses the void it faces into. A solid of one shell has
+    // nothing the total does not already say. Nor is a topology of several
+    // solids held to "every one positive": the general Boolean engine writes
+    // a cavity it leaves as a solid of its own, whose only shell faces into
+    // the void, and which of them nest is not recorded to check against.
+    let has_cavities = topology
+        .solids
+        .iter()
+        .any(|solid| !solid.value.inner_shells.is_empty());
+    if has_cavities && let Some(volumes) = shell_signed_volumes(topology, measures.bounds) {
+        let floor = linear_tolerance.powi(3);
+        for shell in volumes {
+            let enclosed = if shell.outer {
+                shell.signed_volume
+            } else {
+                -shell.signed_volume
+            };
+            if !enclosed.is_finite() || enclosed <= floor {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::FaceOrientationInvalid,
+                        format!("shell/{}/orientation", shell.id.get()),
+                    )
+                    .with_measure(enclosed, floor),
+                );
+            }
+        }
+    }
 
     diagnostics.sort_by(|left, right| {
         left.code
@@ -261,10 +293,13 @@ fn validate_geometry(
                 // A trace has no frame of its own to be degenerate: its two
                 // carriers are validated where they are surfaces, and the one
                 // thing this curve needs beyond them is a branch it can read.
+                // An unreadable one is no frame at all, and reports as the
+                // other arms' fatal faults do: the tolerance itself would
+                // never exceed the tolerance it is tested against.
                 if host.is_finite() && other.is_finite() && (branch.abs() - 1.0).abs() <= 1.0e-12 {
                     0.0
                 } else {
-                    linear_tolerance
+                    f64::INFINITY
                 }
             }
             // A stored B-spline is well formed by construction — clamped, of
@@ -1772,6 +1807,39 @@ pub(crate) fn harmonic_area_contribution(
     0.5 * (antiderivative(to) - antiderivative(from))
 }
 
+/// `⅓∮x(x dy − y dx)` and `⅓∮y(x dy − y dx)` along `(θ, m + A cos(θ − φ))`
+/// from `from` to `to`: the harmonic's share of a region's first moment, in
+/// the same symmetric form the chords and the area use.
+///
+/// With `w = θ − φ` and the turn `x dy − y dx = (−Aθ sin w − m − A cos w) dθ`,
+/// the two integrands are `−Aθ² sin w − mθ − Aθ cos w` and
+/// `−m² − 2Am cos w − A² cos² w − Amθ sin w − A²θ sin w cos w`, each of which
+/// integrates by parts in closed form.
+fn harmonic_moment_contribution(
+    mean: f64,
+    amplitude: f64,
+    phase: f64,
+    from: f64,
+    to: f64,
+) -> Vector2 {
+    let (m, a) = (mean, amplitude);
+    let along_x = |t: f64| {
+        let (sin, cos) = (t - phase).sin_cos();
+        a * t * t * cos - 3.0 * a * t * sin - 3.0 * a * cos - 0.5 * m * t * t
+    };
+    let along_y = |t: f64| {
+        let (sin, cos) = (t - phase).sin_cos();
+        let (sin_double, cos_double) = (2.0 * (t - phase)).sin_cos();
+        -m * m * t - 3.0 * a * m * sin + a * m * t * cos - 0.5 * a * a * t
+            + 0.25 * a * a * t * cos_double
+            - 0.375 * a * a * sin_double
+    };
+    Vector2::new(
+        (along_x(to) - along_x(from)) / 3.0,
+        (along_y(to) - along_y(from)) / 3.0,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointLocation {
     Outside,
@@ -2191,6 +2259,16 @@ fn validate_shell(
         );
     }
 
+    // Faces meet across shared edges, so the walk goes face → its edges →
+    // the faces on each. Scanning every face for a shared edge at each step
+    // instead made the walk quadratic in the face count, which a patterned
+    // body of a few thousand faces pays on every validation.
+    let mut edge_faces = BTreeMap::<EdgeKey, Vec<FaceKey>>::new();
+    for (face_key, edges) in &face_edges {
+        for edge in edges {
+            edge_faces.entry(*edge).or_default().push(*face_key);
+        }
+    }
     let start = *faces.first().expect("non-empty checked above");
     let mut visited = BTreeSet::from([start]);
     let mut queue = VecDeque::from([start]);
@@ -2198,14 +2276,11 @@ fn validate_shell(
         let Some(current_edges) = face_edges.get(&current) else {
             continue;
         };
-        for candidate in &faces {
-            if !visited.contains(candidate)
-                && face_edges
-                    .get(candidate)
-                    .is_some_and(|edges| !current_edges.is_disjoint(edges))
-            {
-                visited.insert(*candidate);
-                queue.push_back(*candidate);
+        for edge in current_edges {
+            for neighbour in edge_faces.get(edge).map_or(&[][..], Vec::as_slice) {
+                if visited.insert(*neighbour) {
+                    queue.push_back(*neighbour);
+                }
             }
         }
     }
@@ -2389,336 +2464,10 @@ pub(crate) fn calculate_exact_shell_measures(
     let mut moment = Vector3::new(0.0, 0.0, 0.0);
 
     for face in &topology.faces {
-        // A face whose loop winds clockwise in parameter space has its outward
-        // normal opposite to the surface's own, so its flux changes sign. The
-        // area never does.
-        let (parameter_area, _) = face_parameter_area_and_moment(topology, &face.value)?;
-        let orientation = if parameter_area < 0.0 { -1.0 } else { 1.0 };
-        match face.value.surface {
-            Surface::Plane(plane) => {
-                // The parameter area is the true area for an orthonormal
-                // planar frame, and the arm below rejects any other frame.
-                let jacobian = plane.u.cross(plane.v).length();
-                if (jacobian - 1.0).abs() > 1.0e-9 {
-                    return None;
-                }
-                if (plane.u.length() - 1.0).abs() > 1.0e-9
-                    || (plane.v.length() - 1.0).abs() > 1.0e-9
-                    || plane.u.dot(plane.v).abs() > 1.0e-9
-                {
-                    return None;
-                }
-                let offset = (plane.origin - anchor).dot(plane.normal);
-                surface_area += parameter_area.abs();
-                flux += offset * parameter_area;
-                // ∫∫|y|² over the region, expanded about the parameter anchor
-                // the loop helpers share: |y|² = |c|² + 2c·(u'U + v'V) + |w'|²
-                // for an orthonormal planar frame.
-                let (_, first) = face_parameter_area_and_moment(topology, &face.value)?;
-                let polar = face_parameter_polar_moment(topology, &face.value)?;
-                let base = plane.origin - anchor;
-                let square = base.dot(base).mul_add(
-                    parameter_area,
-                    2.0 * base
-                        .dot(plane.u)
-                        .mul_add(first.x, base.dot(plane.v) * first.y),
-                ) + polar;
-                moment = moment + plane.normal * (square / 2.0);
-            }
-            Surface::Cylinder(cylinder)
-                if let Some(contour) =
-                    cylinder_contour_measures(topology, &face.value, cylinder, anchor) =>
-            {
-                // The general path: the parameter region bounded by any
-                // mix of axis-aligned lines and harmonics, integrated by
-                // Green's theorem along the loops. A rectangle takes the
-                // arm below, which it must agree with to the last bit.
-                surface_area += contour.area.abs();
-                flux += contour.flux;
-                moment = moment + contour.moment;
-            }
-            Surface::Cylinder(cylinder) => {
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let sign = cylinder.angular_sign;
-                let radial_integral =
-                    cylinder.radial_u * ((sign * u_max).sin() - (sign * u_min).sin()) / sign
-                        + cylinder.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
-                let sweep = u_max - u_min;
-                let extent = v_max - v_min;
-                let area = cylinder.radius * sweep * extent;
-                surface_area += area.abs();
-                // (x − p)·n = (origin − p)·radial(u) + radius.
-                flux += orientation
-                    * cylinder.angular_sign
-                    * cylinder.radius
-                    * ((cylinder.origin - anchor).dot(radial_integral) * extent
-                        + cylinder.radius * sweep * extent);
-
-                // ρ = r, z = v: the latitude integrals collapse to powers of v.
-                let azimuth = azimuth_moments(
-                    cylinder.radial_u,
-                    cylinder.radial_v,
-                    sign,
-                    cylinder.origin - anchor,
-                    u_min,
-                    u_max,
-                );
-                let offset = cylinder.origin - anchor;
-                let axial = offset.dot(cylinder.axis);
-                let first = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
-                let second = (v_max.powi(3) - v_min.powi(3)) / 3.0;
-                let radius = cylinder.radius;
-                let intrinsic = offset.dot(offset) + radius * radius;
-                let along = radius * (intrinsic.mul_add(extent, second) + 2.0 * axial * first);
-                let across = radius * radius * extent;
-                moment = moment
-                    + revolution_moment(
-                        orientation * sign,
-                        &azimuth,
-                        cylinder.axis,
-                        [along, across, 0.0, 0.0],
-                    );
-            }
-            Surface::Sphere(sphere) => {
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let sign = sphere.angular_sign;
-                let radial_integral =
-                    sphere.radial_u * ((sign * u_max).sin() - (sign * u_min).sin()) / sign
-                        + sphere.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
-                let sweep = u_max - u_min;
-                let sine_span = v_max.sin() - v_min.sin();
-                let area = sphere.radius * sphere.radius * sweep * sine_span;
-                surface_area += area.abs();
-                // ∮ n cos v du dv splits into the radial and axial halves.
-                let cosine_square = ((v_max + v_max.sin() * v_max.cos())
-                    - (v_min + v_min.sin() * v_min.cos()))
-                    / 2.0;
-                let sine_cosine = (v_max.sin().powi(2) - v_min.sin().powi(2)) / 2.0;
-                let normal_integral =
-                    radial_integral * cosine_square + sphere.axis * (sweep * sine_cosine);
-                flux += orientation
-                    * sphere.angular_sign
-                    * sphere.radius
-                    * sphere.radius
-                    * ((sphere.origin - anchor).dot(normal_integral)
-                        + sphere.radius * sweep * sine_span);
-
-                // ρ = r cos v, z = r sin v, so ρ² + z² is the constant r².
-                let azimuth = azimuth_moments(
-                    sphere.radial_u,
-                    sphere.radial_v,
-                    sign,
-                    sphere.origin - anchor,
-                    u_min,
-                    u_max,
-                );
-                let offset = sphere.origin - anchor;
-                let axial = offset.dot(sphere.axis);
-                let radius = sphere.radius;
-                let constant = offset.dot(offset) + radius * radius;
-                let twist = 2.0 * radius * axial;
-                let along = radius
-                    * radius
-                    * constant.mul_add(
-                        trig_moment(2, 0, v_min, v_max),
-                        twist * trig_moment(2, 1, v_min, v_max),
-                    );
-                let across = radius.powi(3) * trig_moment(3, 0, v_min, v_max);
-                let axial_along = -radius
-                    * radius
-                    * constant.mul_add(
-                        trig_moment(1, 1, v_min, v_max),
-                        twist * trig_moment(1, 2, v_min, v_max),
-                    );
-                let axial_across = -radius.powi(3) * trig_moment(2, 1, v_min, v_max);
-                moment = moment
-                    + revolution_moment(
-                        orientation * sign,
-                        &azimuth,
-                        sphere.axis,
-                        [along, across, axial_along, axial_across],
-                    );
-            }
-            Surface::Torus(torus) => {
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let sign = torus.angular_sign;
-                let radial_integral =
-                    torus.radial_u * ((sign * u_max).sin() - (sign * u_min).sin()) / sign
-                        + torus.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
-                let sweep = u_max - u_min;
-                let major = torus.major_radius;
-                let minor = torus.minor_radius;
-                // Minor-angle integrals shared by the area and the flux.
-                let sine = v_max.sin() - v_min.sin();
-                let cosine = v_min.cos() - v_max.cos();
-                let cosine_square = ((v_max + v_max.sin() * v_max.cos())
-                    - (v_min + v_min.sin() * v_min.cos()))
-                    / 2.0;
-                let sine_cosine = (v_max.sin().powi(2) - v_min.sin().powi(2)) / 2.0;
-                let span = v_max - v_min;
-
-                let area = minor * sweep * major.mul_add(span, minor * sine);
-                surface_area += area.abs();
-                // (x - p).n = (origin - p).n + major*cos v + minor, and
-                // dA = minor*(major + minor*cos v) du dv.
-                let normal_integral = radial_integral * major.mul_add(sine, minor * cosine_square)
-                    + torus.axis * (sweep * major.mul_add(cosine, minor * sine_cosine));
-                let intrinsic = minor
-                    * sweep
-                    * (major * major * sine
-                        + major * minor * cosine_square
-                        + minor * major * span
-                        + minor * minor * sine);
-                flux += orientation
-                    * sign
-                    * (minor * (torus.origin - anchor).dot(normal_integral) + intrinsic);
-
-                // ρ = R + r cos v, z = r sin v, so ρ² + z² = R² + r² + 2Rr cos v.
-                let azimuth = azimuth_moments(
-                    torus.radial_u,
-                    torus.radial_v,
-                    sign,
-                    torus.origin - anchor,
-                    u_min,
-                    u_max,
-                );
-                let offset = torus.origin - anchor;
-                let axial = offset.dot(torus.axis);
-                let constant = offset.dot(offset) + major * major + minor * minor;
-                let cosine_weight = 2.0 * major * minor;
-                let sine_weight = 2.0 * minor * axial;
-                let moments = |cosines: u32, sines: u32| trig_moment(cosines, sines, v_min, v_max);
-                let along = minor
-                    * (major * constant * moments(1, 0)
-                        + 2.0 * major * major * minor * moments(2, 0)
-                        + major * sine_weight * moments(1, 1)
-                        + minor * constant * moments(2, 0)
-                        + minor * cosine_weight * moments(3, 0)
-                        + minor * sine_weight * moments(2, 1));
-                let across = minor
-                    * (major * major * moments(1, 0)
-                        + cosine_weight * moments(2, 0)
-                        + minor * minor * moments(3, 0));
-                let axial_along = -minor
-                    * (major * constant * moments(0, 1)
-                        + 2.0 * major * major * minor * moments(1, 1)
-                        + major * sine_weight * moments(0, 2)
-                        + minor * constant * moments(1, 1)
-                        + minor * cosine_weight * moments(2, 1)
-                        + minor * sine_weight * moments(1, 2));
-                let axial_across = -minor
-                    * (major * major * moments(0, 1)
-                        + cosine_weight * moments(1, 1)
-                        + minor * minor * moments(2, 1));
-                moment = moment
-                    + revolution_moment(
-                        orientation * sign,
-                        &azimuth,
-                        torus.axis,
-                        [along, across, axial_along, axial_across],
-                    );
-            }
-            Surface::Cone(cone) => {
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let sign = cone.angular_sign;
-                let radial_integral = cone.radial_u * ((sign * u_max).sin() - (sign * u_min).sin())
-                    / sign
-                    + cone.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
-                let sweep = u_max - u_min;
-                let base = cone.base_radius;
-                let slope = cone.slope;
-                // Ring-radius moments over the face's own axial extent.
-                let span = v_max - v_min;
-                let square = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
-                let cube = v_max.powi(3) - v_min.powi(3);
-                let ring = slope.mul_add(square, base * span);
-                let ring_square = base.mul_add(
-                    base * span,
-                    (base * slope).mul_add(2.0 * square, slope * slope * cube / 3.0),
-                );
-                let ring_moment = base.mul_add(square, slope * cube / 3.0);
-                // dA = ring(v)·sqrt(1 + slope²) du dv, and the unit normal is
-                // (radial − slope·axis)/sqrt(1 + slope²), so the root cancels
-                // out of the flux entirely.
-                surface_area += (slope.mul_add(slope, 1.0).sqrt() * sweep * ring).abs();
-                let axial = (cone.origin - anchor).dot(cone.axis);
-                flux += orientation
-                    * sign
-                    * ((cone.origin - anchor).dot(radial_integral) * ring
-                        + sweep * slope.mul_add(-axial.mul_add(ring, ring_moment), ring_square));
-
-                // ρ = b + m·v, z = v: every latitude integral is polynomial,
-                // and ρ' = m makes the axial pair a multiple of the radial one.
-                let azimuth = azimuth_moments(
-                    cone.radial_u,
-                    cone.radial_v,
-                    sign,
-                    cone.origin - anchor,
-                    u_min,
-                    u_max,
-                );
-                let offset = cone.origin - anchor;
-                let first = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
-                let second = (v_max.powi(3) - v_min.powi(3)) / 3.0;
-                let third = (v_max.powi(4) - v_min.powi(4)) / 4.0;
-                let cube = base.powi(3) * span
-                    + 3.0 * base * base * slope * first
-                    + 3.0 * base * slope * slope * second
-                    + slope.powi(3) * third;
-                let along = offset.dot(offset).mul_add(
-                    slope.mul_add(first, base * span),
-                    cube + slope.mul_add(third, base * second),
-                ) + 2.0 * axial * slope.mul_add(second, base * first);
-                let across = base.mul_add(
-                    base * span,
-                    slope.mul_add(2.0 * base * first, slope * slope * second),
-                );
-                moment = moment
-                    + revolution_moment(
-                        orientation * sign,
-                        &azimuth,
-                        cone.axis,
-                        [along, across, slope * along, slope * across],
-                    );
-            }
-            // A ruled face is integrated over its parameter rectangle by
-            // quadrature (ADR 0049). Only a face that is the whole
-            // rectangle it spans is in that form — every face the loft
-            // builds, and every face a transform or mirror of one keeps.
-            Surface::Ruled(ruled) => {
-                if !face.value.inner_loops.is_empty() {
-                    return None;
-                }
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let rectangle = (u_max - u_min) * (v_max - v_min);
-                if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
-                    return None;
-                }
-                let measures = ruled.measures((u_min, u_max, v_min, v_max), anchor);
-                surface_area += measures.area;
-                flux += orientation * measures.flux;
-                moment = moment + measures.moment * orientation;
-            }
-            // A B-spline face is integrated over its parameter rectangle by
-            // Gauss–Legendre on every span cell (ADR 0050): exact for the
-            // flux and the moment, whose integrands are polynomials there.
-            // As for a ruled face, only a face that is the whole rectangle it
-            // spans is in that form, which every builder makes.
-            Surface::Bspline(surface) => {
-                if !face.value.inner_loops.is_empty() {
-                    return None;
-                }
-                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
-                let rectangle = (u_max - u_min) * (v_max - v_min);
-                if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
-                    return None;
-                }
-                let measures = surface.measures((u_min, u_max, v_min, v_max), anchor);
-                surface_area += measures.area;
-                flux += orientation * measures.flux;
-                moment = moment + measures.moment * orientation;
-            }
-        }
+        let share = exact_face_contribution(topology, &face.value, anchor)?;
+        surface_area += share.area;
+        flux += share.flux;
+        moment = moment + share.moment;
     }
 
     let signed_volume = flux / 3.0;
@@ -2737,6 +2486,428 @@ pub(crate) fn calculate_exact_shell_measures(
             centroid,
         },
     )
+}
+
+/// One shell of one solid and the volume its faces enclose, signed by their
+/// orientation.
+struct ShellVolume {
+    id: EntityId,
+    /// Whether this is its solid's outer shell rather than a cavity.
+    outer: bool,
+    signed_volume: f64,
+}
+
+/// The signed volume each shell of each solid with cavities encloses, by the
+/// same boundary integrals the body's own measures use, summed shell by
+/// shell.
+///
+/// An all-planar body takes the polygon fans the planar measures take — every
+/// edge between two planes is straight, so they are exact — and any other
+/// takes each face's exact flux. `None` when a face cannot be integrated,
+/// which the body's own measure has already reported.
+fn shell_signed_volumes(topology: &Topology, bounds: Option<Bounds3>) -> Option<Vec<ShellVolume>> {
+    let anchor = bounds.map_or_else(Point3::default, |bounds| {
+        Point3::new(
+            bounds.min.x + (bounds.max.x - bounds.min.x) * 0.5,
+            bounds.min.y + (bounds.max.y - bounds.min.y) * 0.5,
+            bounds.min.z + (bounds.max.z - bounds.min.z) * 0.5,
+        )
+    });
+    let planar = topology
+        .faces
+        .iter()
+        .all(|face| matches!(face.value.surface, Surface::Plane(_)));
+    let face_volume = |face: &Face| -> Option<f64> {
+        if planar {
+            let mut volume = 0.0;
+            for polygon in face_boundary_polygons(topology, face)? {
+                let Some(first) = polygon.first().copied() else {
+                    continue;
+                };
+                for pair in polygon.windows(2).skip(1) {
+                    volume +=
+                        (first - anchor).dot((pair[0] - anchor).cross(pair[1] - anchor)) / 6.0;
+                }
+            }
+            Some(volume)
+        } else {
+            Some(exact_face_contribution(topology, face, anchor)?.flux / 3.0)
+        }
+    };
+    let mut volumes = Vec::new();
+    for solid in &topology.solids {
+        if solid.value.inner_shells.is_empty() {
+            continue;
+        }
+        for (index, shell_key) in solid.value.shells().enumerate() {
+            let shell = topology.shell(shell_key)?;
+            let mut signed_volume = 0.0;
+            for face_key in &shell.value.faces {
+                signed_volume += face_volume(&topology.face(*face_key)?.value)?;
+            }
+            volumes.push(ShellVolume {
+                id: shell.id,
+                outer: index == 0,
+                signed_volume,
+            });
+        }
+    }
+    Some(volumes)
+}
+
+/// One face's share of a shell's exact measures: its area, its share of
+/// `3V = ∮ (x − p)·n dA`, and its share of the first moment
+/// `∮ (|y|²/2) n dA`, all about `anchor`.
+///
+/// Summed over a closed shell these are that shell's own area, three times
+/// its signed volume, and its moment, which is what lets the validator ask
+/// each shell of a solid for its own sign as well as the body for its total.
+fn exact_face_contribution(
+    topology: &Topology,
+    face: &Face,
+    anchor: Point3,
+) -> Option<FaceContribution> {
+    let mut surface_area = 0.0;
+    let mut flux = 0.0;
+    let mut moment = Vector3::new(0.0, 0.0, 0.0);
+    // A face whose loop winds clockwise in parameter space has its outward
+    // normal opposite to the surface's own, so its flux changes sign. The
+    // area never does.
+    let (parameter_area, first) = face_parameter_area_and_moment(topology, face)?;
+    let orientation = if parameter_area < 0.0 { -1.0 } else { 1.0 };
+    match face.surface {
+        Surface::Plane(plane) => {
+            // The parameter area is the true area for an orthonormal
+            // planar frame, and the arm below rejects any other frame.
+            let jacobian = plane.u.cross(plane.v).length();
+            if (jacobian - 1.0).abs() > 1.0e-9 {
+                return None;
+            }
+            if (plane.u.length() - 1.0).abs() > 1.0e-9
+                || (plane.v.length() - 1.0).abs() > 1.0e-9
+                || plane.u.dot(plane.v).abs() > 1.0e-9
+            {
+                return None;
+            }
+            let offset = (plane.origin - anchor).dot(plane.normal);
+            surface_area += parameter_area.abs();
+            flux += offset * parameter_area;
+            // ∫∫|y|² over the region, expanded about the parameter anchor
+            // the loop helpers share: |y|² = |c|² + 2c·(u'U + v'V) + |w'|²
+            // for an orthonormal planar frame.
+            let polar = face_parameter_polar_moment(topology, face)?;
+            let base = plane.origin - anchor;
+            let square = base.dot(base).mul_add(
+                parameter_area,
+                2.0 * base
+                    .dot(plane.u)
+                    .mul_add(first.x, base.dot(plane.v) * first.y),
+            ) + polar;
+            moment = moment + plane.normal * (square / 2.0);
+        }
+        Surface::Cylinder(cylinder)
+            if let Some(contour) = cylinder_contour_measures(topology, face, cylinder, anchor) =>
+        {
+            // The general path: the parameter region bounded by any
+            // mix of axis-aligned lines and harmonics, integrated by
+            // Green's theorem along the loops. A rectangle takes the
+            // arm below, which it must agree with to the last bit.
+            surface_area += contour.area.abs();
+            flux += contour.flux;
+            moment = moment + contour.moment;
+        }
+        Surface::Cylinder(cylinder) => {
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let sign = cylinder.angular_sign;
+            let radial_integral = cylinder.radial_u * ((sign * u_max).sin() - (sign * u_min).sin())
+                / sign
+                + cylinder.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
+            let sweep = u_max - u_min;
+            let extent = v_max - v_min;
+            let area = cylinder.radius * sweep * extent;
+            surface_area += area.abs();
+            // (x − p)·n = (origin − p)·radial(u) + radius.
+            flux += orientation
+                * cylinder.angular_sign
+                * cylinder.radius
+                * ((cylinder.origin - anchor).dot(radial_integral) * extent
+                    + cylinder.radius * sweep * extent);
+
+            // ρ = r, z = v: the latitude integrals collapse to powers of v.
+            let azimuth = azimuth_moments(
+                cylinder.radial_u,
+                cylinder.radial_v,
+                sign,
+                cylinder.origin - anchor,
+                u_min,
+                u_max,
+            );
+            let offset = cylinder.origin - anchor;
+            let axial = offset.dot(cylinder.axis);
+            let first = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
+            let second = (v_max.powi(3) - v_min.powi(3)) / 3.0;
+            let radius = cylinder.radius;
+            let intrinsic = offset.dot(offset) + radius * radius;
+            let along = radius * (intrinsic.mul_add(extent, second) + 2.0 * axial * first);
+            let across = radius * radius * extent;
+            moment = moment
+                + revolution_moment(
+                    orientation * sign,
+                    &azimuth,
+                    cylinder.axis,
+                    [along, across, 0.0, 0.0],
+                );
+        }
+        Surface::Sphere(sphere) => {
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let sign = sphere.angular_sign;
+            let radial_integral = sphere.radial_u * ((sign * u_max).sin() - (sign * u_min).sin())
+                / sign
+                + sphere.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
+            let sweep = u_max - u_min;
+            let sine_span = v_max.sin() - v_min.sin();
+            let area = sphere.radius * sphere.radius * sweep * sine_span;
+            surface_area += area.abs();
+            // ∮ n cos v du dv splits into the radial and axial halves.
+            let cosine_square =
+                ((v_max + v_max.sin() * v_max.cos()) - (v_min + v_min.sin() * v_min.cos())) / 2.0;
+            let sine_cosine = (v_max.sin().powi(2) - v_min.sin().powi(2)) / 2.0;
+            let normal_integral =
+                radial_integral * cosine_square + sphere.axis * (sweep * sine_cosine);
+            flux += orientation
+                * sphere.angular_sign
+                * sphere.radius
+                * sphere.radius
+                * ((sphere.origin - anchor).dot(normal_integral)
+                    + sphere.radius * sweep * sine_span);
+
+            // ρ = r cos v, z = r sin v, so ρ² + z² is the constant r².
+            let azimuth = azimuth_moments(
+                sphere.radial_u,
+                sphere.radial_v,
+                sign,
+                sphere.origin - anchor,
+                u_min,
+                u_max,
+            );
+            let offset = sphere.origin - anchor;
+            let axial = offset.dot(sphere.axis);
+            let radius = sphere.radius;
+            let constant = offset.dot(offset) + radius * radius;
+            let twist = 2.0 * radius * axial;
+            let along = radius
+                * radius
+                * constant.mul_add(
+                    trig_moment(2, 0, v_min, v_max),
+                    twist * trig_moment(2, 1, v_min, v_max),
+                );
+            let across = radius.powi(3) * trig_moment(3, 0, v_min, v_max);
+            let axial_along = -radius
+                * radius
+                * constant.mul_add(
+                    trig_moment(1, 1, v_min, v_max),
+                    twist * trig_moment(1, 2, v_min, v_max),
+                );
+            let axial_across = -radius.powi(3) * trig_moment(2, 1, v_min, v_max);
+            moment = moment
+                + revolution_moment(
+                    orientation * sign,
+                    &azimuth,
+                    sphere.axis,
+                    [along, across, axial_along, axial_across],
+                );
+        }
+        Surface::Torus(torus) => {
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let sign = torus.angular_sign;
+            let radial_integral = torus.radial_u * ((sign * u_max).sin() - (sign * u_min).sin())
+                / sign
+                + torus.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
+            let sweep = u_max - u_min;
+            let major = torus.major_radius;
+            let minor = torus.minor_radius;
+            // Minor-angle integrals shared by the area and the flux.
+            let sine = v_max.sin() - v_min.sin();
+            let cosine = v_min.cos() - v_max.cos();
+            let cosine_square =
+                ((v_max + v_max.sin() * v_max.cos()) - (v_min + v_min.sin() * v_min.cos())) / 2.0;
+            let sine_cosine = (v_max.sin().powi(2) - v_min.sin().powi(2)) / 2.0;
+            let span = v_max - v_min;
+
+            let area = minor * sweep * major.mul_add(span, minor * sine);
+            surface_area += area.abs();
+            // (x - p).n = (origin - p).n + major*cos v + minor, and
+            // dA = minor*(major + minor*cos v) du dv.
+            let normal_integral = radial_integral * major.mul_add(sine, minor * cosine_square)
+                + torus.axis * (sweep * major.mul_add(cosine, minor * sine_cosine));
+            let intrinsic = minor
+                * sweep
+                * (major * major * sine
+                    + major * minor * cosine_square
+                    + minor * major * span
+                    + minor * minor * sine);
+            flux += orientation
+                * sign
+                * (minor * (torus.origin - anchor).dot(normal_integral) + intrinsic);
+
+            // ρ = R + r cos v, z = r sin v, so ρ² + z² = R² + r² + 2Rr cos v.
+            let azimuth = azimuth_moments(
+                torus.radial_u,
+                torus.radial_v,
+                sign,
+                torus.origin - anchor,
+                u_min,
+                u_max,
+            );
+            let offset = torus.origin - anchor;
+            let axial = offset.dot(torus.axis);
+            let constant = offset.dot(offset) + major * major + minor * minor;
+            let cosine_weight = 2.0 * major * minor;
+            let sine_weight = 2.0 * minor * axial;
+            let moments = |cosines: u32, sines: u32| trig_moment(cosines, sines, v_min, v_max);
+            let along = minor
+                * (major * constant * moments(1, 0)
+                    + 2.0 * major * major * minor * moments(2, 0)
+                    + major * sine_weight * moments(1, 1)
+                    + minor * constant * moments(2, 0)
+                    + minor * cosine_weight * moments(3, 0)
+                    + minor * sine_weight * moments(2, 1));
+            let across = minor
+                * (major * major * moments(1, 0)
+                    + cosine_weight * moments(2, 0)
+                    + minor * minor * moments(3, 0));
+            let axial_along = -minor
+                * (major * constant * moments(0, 1)
+                    + 2.0 * major * major * minor * moments(1, 1)
+                    + major * sine_weight * moments(0, 2)
+                    + minor * constant * moments(1, 1)
+                    + minor * cosine_weight * moments(2, 1)
+                    + minor * sine_weight * moments(1, 2));
+            let axial_across = -minor
+                * (major * major * moments(0, 1)
+                    + cosine_weight * moments(1, 1)
+                    + minor * minor * moments(2, 1));
+            moment = moment
+                + revolution_moment(
+                    orientation * sign,
+                    &azimuth,
+                    torus.axis,
+                    [along, across, axial_along, axial_across],
+                );
+        }
+        Surface::Cone(cone) => {
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let sign = cone.angular_sign;
+            let radial_integral = cone.radial_u * ((sign * u_max).sin() - (sign * u_min).sin())
+                / sign
+                + cone.radial_v * ((sign * u_min).cos() - (sign * u_max).cos()) / sign;
+            let sweep = u_max - u_min;
+            let base = cone.base_radius;
+            let slope = cone.slope;
+            // Ring-radius moments over the face's own axial extent.
+            let span = v_max - v_min;
+            let square = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
+            let cube = v_max.powi(3) - v_min.powi(3);
+            let ring = slope.mul_add(square, base * span);
+            let ring_square = base.mul_add(
+                base * span,
+                (base * slope).mul_add(2.0 * square, slope * slope * cube / 3.0),
+            );
+            let ring_moment = base.mul_add(square, slope * cube / 3.0);
+            // dA = ring(v)·sqrt(1 + slope²) du dv, and the unit normal is
+            // (radial − slope·axis)/sqrt(1 + slope²), so the root cancels
+            // out of the flux entirely.
+            surface_area += (slope.mul_add(slope, 1.0).sqrt() * sweep * ring).abs();
+            let axial = (cone.origin - anchor).dot(cone.axis);
+            flux += orientation
+                * sign
+                * ((cone.origin - anchor).dot(radial_integral) * ring
+                    + sweep * slope.mul_add(-axial.mul_add(ring, ring_moment), ring_square));
+
+            // ρ = b + m·v, z = v: every latitude integral is polynomial,
+            // and ρ' = m makes the axial pair a multiple of the radial one.
+            let azimuth = azimuth_moments(
+                cone.radial_u,
+                cone.radial_v,
+                sign,
+                cone.origin - anchor,
+                u_min,
+                u_max,
+            );
+            let offset = cone.origin - anchor;
+            let first = v_max.mul_add(v_max, -(v_min * v_min)) / 2.0;
+            let second = (v_max.powi(3) - v_min.powi(3)) / 3.0;
+            let third = (v_max.powi(4) - v_min.powi(4)) / 4.0;
+            let cube = base.powi(3) * span
+                + 3.0 * base * base * slope * first
+                + 3.0 * base * slope * slope * second
+                + slope.powi(3) * third;
+            let along = offset.dot(offset).mul_add(
+                slope.mul_add(first, base * span),
+                cube + slope.mul_add(third, base * second),
+            ) + 2.0 * axial * slope.mul_add(second, base * first);
+            let across = base.mul_add(
+                base * span,
+                slope.mul_add(2.0 * base * first, slope * slope * second),
+            );
+            moment = moment
+                + revolution_moment(
+                    orientation * sign,
+                    &azimuth,
+                    cone.axis,
+                    [along, across, slope * along, slope * across],
+                );
+        }
+        // A ruled face is integrated over its parameter rectangle by
+        // quadrature (ADR 0049). Only a face that is the whole
+        // rectangle it spans is in that form — every face the loft
+        // builds, and every face a transform or mirror of one keeps.
+        Surface::Ruled(ruled) => {
+            if !face.inner_loops.is_empty() {
+                return None;
+            }
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let rectangle = (u_max - u_min) * (v_max - v_min);
+            if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
+                return None;
+            }
+            let measures = ruled.measures((u_min, u_max, v_min, v_max), anchor);
+            surface_area += measures.area;
+            flux += orientation * measures.flux;
+            moment = moment + measures.moment * orientation;
+        }
+        // A B-spline face is integrated over its parameter rectangle by
+        // Gauss–Legendre on every span cell (ADR 0050): exact for the
+        // flux and the moment, whose integrands are polynomials there.
+        // As for a ruled face, only a face that is the whole rectangle it
+        // spans is in that form, which every builder makes.
+        Surface::Bspline(surface) => {
+            if !face.inner_loops.is_empty() {
+                return None;
+            }
+            let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, face)?;
+            let rectangle = (u_max - u_min) * (v_max - v_min);
+            if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
+                return None;
+            }
+            let measures = surface.measures((u_min, u_max, v_min, v_max), anchor);
+            surface_area += measures.area;
+            flux += orientation * measures.flux;
+            moment = moment + measures.moment * orientation;
+        }
+    }
+    Some(FaceContribution {
+        area: surface_area,
+        flux,
+        moment,
+    })
+}
+
+/// One face's share of the exact shell measures; see [`exact_face_contribution`].
+struct FaceContribution {
+    area: f64,
+    flux: f64,
+    moment: Vector3,
 }
 
 /// The azimuth integrals every surface of revolution in the vocabulary needs.
@@ -3674,17 +3845,52 @@ pub(crate) fn face_parameter_area_and_moment(
                 phase,
             } = coedge.pcurve
             {
-                // The exact contour term of the harmonic, less the chord
-                // already counted, in the anchored frame (the anchor shift
-                // changes only the moment, which harmonics never feed).
-                let exact = harmonic_area_contribution(
-                    mean - anchor.y,
-                    amplitude,
-                    phase,
+                // The exact contour terms of the harmonic, less the chord
+                // already counted, in the anchored frame. Moving the origin
+                // to the anchor moves the curve too: `x' = θ − aₓ` makes it
+                // `m − a_y + A cos(x' − (φ − aₓ))`, so the phase shifts with
+                // the range. Shifting the range alone slides the harmonic
+                // along under its own chord, which changed every cylinder
+                // face's area whose anchor was not at a zero azimuth. The
+                // moment is no longer left out either: a face's centre is
+                // read from it, and a cylinder's is bounded by harmonics.
+                let (mean, phase) = (mean - anchor.y, phase - anchor.x);
+                let (from, to) = (
                     coedge.parameter_range.start - anchor.x,
                     coedge.parameter_range.end - anchor.x,
                 );
+                let exact = harmonic_area_contribution(mean, amplitude, phase, from, to);
+                let exact_moment = harmonic_moment_contribution(mean, amplitude, phase, from, to);
                 area += exact - chord_area;
+                moment.x += exact_moment.x - chord_cross * (start.x + end.x) / 6.0;
+                moment.y += exact_moment.y - chord_cross * (start.y + end.y) / 6.0;
+            }
+            if let Curve2::Trace { .. } = coedge.pcurve {
+                // A trace has no closed form, so its contour terms are
+                // integrated along it as `loop_parameter_area` integrates its
+                // area, in the chords' symmetric form and less the chord's
+                // share. Without them a face the quartic bounds was measured
+                // as the polygon of its vertices.
+                let range = coedge.parameter_range;
+                let turn = |parameter: f64| {
+                    let point = coedge.pcurve.evaluate(parameter);
+                    let rate = coedge.pcurve.derivative(parameter);
+                    let (x, y) = (point.x - anchor.x, point.y - anchor.y);
+                    (x, y, x.mul_add(rate.y, -(y * rate.x)))
+                };
+                let exact_area =
+                    crate::cylinder_trace::integrate(range.start, range.end, &|t| 0.5 * turn(t).2);
+                let exact_x = crate::cylinder_trace::integrate(range.start, range.end, &|t| {
+                    let (x, _, turn) = turn(t);
+                    x * turn / 3.0
+                });
+                let exact_y = crate::cylinder_trace::integrate(range.start, range.end, &|t| {
+                    let (_, y, turn) = turn(t);
+                    y * turn / 3.0
+                });
+                area += exact_area - chord_area;
+                moment.x += exact_x - chord_cross * (start.x + end.x) / 6.0;
+                moment.y += exact_y - chord_cross * (start.y + end.y) / 6.0;
             }
         }
     }
@@ -3974,5 +4180,176 @@ pub(crate) mod malformed {
 
     pub(crate) fn dangling_coedge(topology: &mut Topology) {
         topology.loops[0].value.coedges[0] = CoedgeKey(usize::MAX);
+    }
+}
+
+#[cfg(test)]
+mod review_fixes {
+    use super::*;
+    use crate::analytic_extrusion::merge_topologies;
+    use crate::cuboid::build_cuboid;
+    use crate::topology::{Cylinder, Plane, ShellKey};
+
+    const TOLERANCE: f64 = 1.0e-9;
+
+    /// Turns a closed shell inside out the way the kernel's own reversals
+    /// do: each planar face's frame is mirrored, its pcurves mapped through
+    /// the same mirror, and its loops walked the other way, so every face
+    /// stays positively wound in its own frame and every edge keeps two
+    /// opposite uses.
+    fn turn_inside_out(topology: &mut Topology, shell: ShellKey) {
+        let faces = topology.shells[shell.0].value.faces.clone();
+        for face_key in faces {
+            let face = &mut topology.faces[face_key.0].value;
+            let Surface::Plane(plane) = face.surface else {
+                panic!("the fixture's faces are planar");
+            };
+            face.surface = Surface::Plane(Plane::new(plane.origin, plane.v, plane.u));
+            let loops = face.loops().collect::<Vec<_>>();
+            for loop_key in loops {
+                let coedges = &mut topology.loops[loop_key.0].value.coedges;
+                coedges.reverse();
+                for coedge_key in coedges.clone() {
+                    let coedge = &mut topology.coedges[coedge_key.0].value;
+                    coedge.orientation = coedge.orientation.reversed();
+                    let Curve2::Line { endpoints } = coedge.pcurve else {
+                        panic!("the fixture's pcurves are straight");
+                    };
+                    let mirror = |point: Point2| Point2::new(point.y, point.x);
+                    coedge.pcurve = Curve2::Line {
+                        endpoints: [mirror(endpoints[1]), mirror(endpoints[0])],
+                    };
+                }
+            }
+        }
+    }
+
+    /// A 10 cube with a 4 cube inside it made a cavity of it: the inner
+    /// shell is the small cube's, facing into the void when `facing_void`,
+    /// and facing into the material — inside out — when not.
+    fn cube_with_cavity(facing_void: bool) -> Topology {
+        let outer = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(10.0, 10.0, 10.0));
+        let inner = build_cuboid(Point3::new(3.0, 3.0, 3.0), Vector3::new(4.0, 4.0, 4.0));
+        let mut merged = merge_topologies(vec![outer, inner]);
+        assert_eq!(merged.solids.len(), 2);
+        let cavity = merged.solids[1].value.outer_shell;
+        merged.solids.truncate(1);
+        merged.solids[0].value.inner_shells = vec![cavity];
+        if facing_void {
+            turn_inside_out(&mut merged, cavity);
+        }
+        merged
+    }
+
+    #[test]
+    fn a_cavity_facing_its_void_validates_and_subtracts() {
+        let report = validate(&cube_with_cavity(true), TOLERANCE);
+        assert!(report.is_valid(), "{:?}", report.diagnostics);
+        assert!((report.measures.signed_volume - (1000.0 - 64.0)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn a_cavity_turned_inside_out_is_rejected() {
+        // Its shell adds 64 instead of taking it away, and the body's total,
+        // 1064, is as positive as the right answer: only the shell's own
+        // sign says it is wrong.
+        let report = validate(&cube_with_cavity(false), TOLERANCE);
+        assert!((report.measures.signed_volume - (1000.0 + 64.0)).abs() < 1.0e-9);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == DiagnosticCode::FaceOrientationInvalid
+                    && diagnostic.path.ends_with("/orientation")
+            }),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn two_bodies_in_one_shell_are_disconnected() {
+        let first = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 2.0, 2.0));
+        let second = build_cuboid(Point3::new(5.0, 0.0, 0.0), Vector3::new(2.0, 2.0, 2.0));
+        let mut merged = merge_topologies(vec![first, second]);
+        let moved = merged.shells[1].value.faces.clone();
+        merged.shells[0].value.faces.extend(moved);
+        merged.shells.truncate(1);
+        merged.solids.truncate(1);
+        let report = validate(&merged, TOLERANCE);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == DiagnosticCode::ShellDisconnected),
+            "{:?}",
+            report.diagnostics
+        );
+        let whole = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 2.0, 2.0));
+        assert!(validate(&whole, TOLERANCE).is_valid());
+    }
+
+    #[test]
+    fn an_unreadable_trace_branch_is_reported() {
+        let host = Cylinder {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(0.0, 0.0, 1.0),
+            radial_u: Vector3::new(1.0, 0.0, 0.0),
+            radial_v: Vector3::new(0.0, 1.0, 0.0),
+            radius: 8.0,
+            angular_sign: 1.0,
+        };
+        let other = Cylinder {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            axis: Vector3::new(1.0, 0.0, 0.0),
+            radial_u: Vector3::new(0.0, 1.0, 0.0),
+            radial_v: Vector3::new(0.0, 0.0, 1.0),
+            radius: 10.0,
+            angular_sign: 1.0,
+        };
+        let mut topology = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 3.0, 4.0));
+        let id = topology.edges[0].id;
+        topology.edges[0].value.curve = Curve3::Trace {
+            host,
+            other,
+            branch: 0.5,
+        };
+        let report = validate(&topology, TOLERANCE);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == DiagnosticCode::CurveFrameInvalid
+                    && diagnostic.path == format!("edge/{}/curve", id.get())
+            }),
+            "{:?}",
+            report.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_harmonics_moment_terms_match_their_integrals() {
+        for (mean, amplitude, phase, from, to) in [
+            (2.0, 1.5, 0.3, -0.7, 2.9),
+            (-1.25, 0.4, 2.5, 3.1, 0.2),
+            (7.0, 3.0, -1.0, 0.0, std::f64::consts::TAU),
+        ] {
+            let exact = harmonic_moment_contribution(mean, amplitude, phase, from, to);
+            // `(y, x dy − y dx)` per unit of the parameter, at `x = t`.
+            let turn = |t: f64| {
+                let (sin, cos) = (t - phase).sin_cos();
+                let y = amplitude.mul_add(cos, mean);
+                (y, t * (-amplitude * sin) - y)
+            };
+            let along_x = crate::cylinder_trace::integrate(from, to, &|t| t * turn(t).1 / 3.0);
+            let along_y = crate::cylinder_trace::integrate(from, to, &|t| {
+                let (y, turn) = turn(t);
+                y * turn / 3.0
+            });
+            assert!(
+                (exact.x - along_x).abs() < 1.0e-10,
+                "{exact:?} vs {along_x}"
+            );
+            assert!(
+                (exact.y - along_y).abs() < 1.0e-10,
+                "{exact:?} vs {along_y}"
+            );
+        }
     }
 }

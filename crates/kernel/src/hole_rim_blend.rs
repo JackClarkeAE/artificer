@@ -27,8 +27,8 @@ use artificer_protocol::{EdgeFinishKind, EntityKind, EntityRef, PrecisionPolicy,
 
 use crate::topology::{
     Coedge, CoedgeKey, Cone, Curve2, Curve3, Edge, EdgeKey, EntityId, Face, FaceKey, FaceRole,
-    Loop, LoopKey, Orientation, ParameterRange, Point2, Record, Surface, Topology, Torus, Vertex,
-    VertexKey,
+    Loop, LoopKey, Orientation, ParameterRange, Point2, Point3, Record, Surface, Topology, Torus,
+    Vector3, Vertex, VertexKey,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,6 +197,9 @@ pub(crate) fn build_hole_rim_blend(
         })
         .ok_or(HoleRimBlendError::DomainUnsupported)?;
     // Room on the wall: every other loop of it stays clear of the grown hole.
+    // The nearest approach is taken exactly rather than sampled: a straight
+    // edge five away passes closest between any samples spread along it, and
+    // a rim grown to 5.3 then crosses it unseen.
     let reach = radius + distance + floor;
     for loop_key in topology.faces[wall].value.loops() {
         if loop_key == rim_loop {
@@ -204,15 +207,8 @@ pub(crate) fn build_hole_rim_blend(
         }
         for coedge in &topology.loops[loop_key.0].value.coedges {
             let edge = topology.edges[topology.coedges[coedge.0].value.edge.0].value;
-            for step in 0..=8 {
-                let t = edge.parameter_range.start
-                    + (edge.parameter_range.end - edge.parameter_range.start) * f64::from(step)
-                        / 8.0;
-                let point = edge.curve.evaluate(t);
-                let offset = point - center;
-                if (offset - normal * offset.dot(normal)).length() < reach {
-                    return Err(HoleRimBlendError::DistanceInvalid);
-                }
+            if distance_from_axis(edge, center, normal) < reach {
+                return Err(HoleRimBlendError::DistanceInvalid);
             }
         }
     }
@@ -573,4 +569,94 @@ fn next_entity_id(topology: &Topology) -> u64 {
         .max()
         .unwrap_or(0)
         + 1
+}
+
+/// The least distance from the hole's axis to an edge lying in the wall,
+/// measured square to the axis.
+///
+/// Lines and circles, which is what a wall's other loops are made of almost
+/// always, take their closed forms: the foot of the perpendicular on a
+/// segment, and the radial nearest point on an arc when the arc reaches it.
+/// Anything else is bracketed on a fine sampling and each bracket narrowed
+/// to its minimum, which converges on the true nearest point rather than on
+/// the nearest sample.
+fn distance_from_axis(edge: Edge, center: Point3, normal: Vector3) -> f64 {
+    let across = |point: Point3| {
+        let offset = point - center;
+        offset - normal * offset.dot(normal)
+    };
+    let range = edge.parameter_range;
+    match edge.curve {
+        Curve3::Line { endpoints } => {
+            let start = across(endpoints[0]);
+            let run = across(endpoints[1]) - start;
+            let span = run.dot(run);
+            let t = if span > 0.0 {
+                (-start.dot(run) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (start + run * t).length()
+        }
+        Curve3::Circle {
+            center: arc_center,
+            u,
+            v,
+            radius,
+        } if u.dot(normal).abs() <= 1.0e-9 && v.dot(normal).abs() <= 1.0e-9 => {
+            let ends = [range.start, range.end].map(|t| across(edge.curve.evaluate(t)).length());
+            let nearest_end = ends[0].min(ends[1]);
+            // The circle's nearest point to the axis lies along the line from
+            // its centre to the axis, which is inside the arc or not at all.
+            let toward_axis = across(center) - across(arc_center);
+            let reach = toward_axis.length();
+            if reach <= f64::EPSILON {
+                return radius.min(nearest_end);
+            }
+            let angle = toward_axis.dot(v).atan2(toward_axis.dot(u));
+            let (low, high) = if range.start <= range.end {
+                (range.start, range.end)
+            } else {
+                (range.end, range.start)
+            };
+            let on_arc =
+                (angle - low).rem_euclid(std::f64::consts::TAU) <= high - low + f64::EPSILON;
+            if on_arc {
+                (reach - radius).abs().min(nearest_end)
+            } else {
+                nearest_end
+            }
+        }
+        curve => {
+            let distance_at = |t: f64| across(curve.evaluate(t)).length();
+            let samples = 256_u32;
+            let step = (range.end - range.start) / f64::from(samples);
+            let values = (0..=samples)
+                .map(|index| distance_at(range.start + step * f64::from(index)))
+                .collect::<Vec<_>>();
+            let mut least = values.iter().copied().fold(f64::INFINITY, f64::min);
+            for index in 0..=samples as usize {
+                let before = index.checked_sub(1).map_or(f64::INFINITY, |at| values[at]);
+                let after = values.get(index + 1).copied().unwrap_or(f64::INFINITY);
+                if values[index] > before || values[index] > after {
+                    continue;
+                }
+                // Golden-section search over the two samples either side.
+                let mut low = range.start + step * (index as f64 - 1.0).max(0.0);
+                let mut high = range.start + step * (index as f64 + 1.0).min(f64::from(samples));
+                let ratio = (5.0_f64.sqrt() - 1.0) / 2.0;
+                for _ in 0..80 {
+                    let first = high - (high - low) * ratio;
+                    let second = low + (high - low) * ratio;
+                    if distance_at(first) <= distance_at(second) {
+                        high = second;
+                    } else {
+                        low = first;
+                    }
+                }
+                least = least.min(distance_at((low + high) / 2.0));
+            }
+            least
+        }
+    }
 }
