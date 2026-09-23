@@ -386,6 +386,15 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
   start that is not finite or is beyond a turn, or a sweep or remaining gap
   narrower than the minimum feature at the profile's outermost radius.
   A section point within agreement of the axis is now put on it exactly.
+  `REVOLVE_PROFILE_PINCHED_ON_AXIS`: the profile meets the axis at a single
+  point — a corner, a place the chain closes, or an arc's tangency —
+  rather than along an edge on it, so the solid would be pinched to a
+  point. `REVOLVE_ARC_CENTRE_ACROSS_AXIS`: an arc centred on the far side of
+  the axis would turn into the inner lemon of a spindle torus, a carrier
+  the kernel does not certify. The profile is checked as an extrusion's
+  is (holes nested and apart, regions disjoint, coordinates within the
+  limit), an arc's bulge counts when deciding which side of the axis the
+  profile lies, and a loop may start anywhere along its run on the axis.
 - **Downstream.** As first landed, `extract_rz_section` refused a wedge
   face, so a partial revolve took no rim blend or section shell. Both now
   work; see "Finishing a partial revolve" below. It combines: a quarter

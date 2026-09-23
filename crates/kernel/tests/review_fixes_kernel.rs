@@ -7,9 +7,10 @@ use std::f64::consts::PI;
 use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
-    ArcDirection, CURRENT_PROTOCOL_VERSION, ExecuteRequest, KernelCommand, KernelError,
-    PlanarAxis2, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2,
-    Point3, PrecisionPolicy, RequestId, RevolveAngle, ValidationProfile, Vector3,
+    ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EntityRef,
+    ExecuteRequest, FaceExtrusionOperation, KernelCommand, KernelError, PlanarAxis2, PlanarCurve2,
+    PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy,
+    RequestId, RevolveAngle, RotationQuaternion, SimilarityTransform3, ValidationProfile, Vector3,
 };
 
 fn run(source: &str) -> Session {
@@ -328,4 +329,366 @@ shell(open: nearest(point: [17, 0, 10], kind: \"face\"), wall: 2, label: \"cup\"
     let core = PI * (324.0 * 2.0 + 16.0 * 4.0 + (324.0 - 256.0) * 6.0);
     assert_close(session.snapshot.measures().volume, body - core, "volume");
     assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+}
+
+/// A 10 × 10 × 10 box with a 4 × 4 pocket cut up 8 from its underside,
+/// then its top pushed down by `distance`.
+fn pocketed_box_pushed(distance: f64) -> String {
+    format!(
+        "let b = box(size: [10, 10, 10], label: \"b\");
+let under = sketch(on: faces(\"<Z\"), label: \"under\", entities: [
+    rect(origin: [-2, -2], width: 4, height: 4),
+]);
+extrude(sketch: under, distance: 8, operation: \"cut\", label: \"pocket\");
+push_pull(face: faces(\">Z\"), distance: {distance}, label: \"lower\");
+"
+    )
+}
+
+/// Pushing a top down past the ceiling of a pocket beneath it would leave
+/// the pocket poking out through the new top. The push used to commit that
+/// self-intersecting solid, which validated.
+#[test]
+fn pushing_a_cap_down_through_a_pocket_below_is_refused() {
+    let session = run(&pocketed_box_pushed(-1.0));
+    assert_close(
+        session.snapshot.measures().volume,
+        900.0 - 16.0 * 8.0,
+        "a cap lowered clear of the pocket",
+    );
+    let mut session = Session::new();
+    let outcome = session.run_script(
+        &pocketed_box_pushed(-5.0),
+        &BTreeMap::new(),
+        &CancellationToken::default(),
+    );
+    let failure = outcome
+        .failure
+        .unwrap_or_else(|| panic!("committed volume {}", session.snapshot.measures().volume));
+    assert!(
+        failure
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "FACE_PUSH_PULL_INTERIOR_CONTACT"),
+        "{failure:?}"
+    );
+}
+
+fn execute(base: &Snapshot, command: KernelCommand) -> Result<Snapshot, KernelError> {
+    NativeKernel::execute(
+        base,
+        &ExecuteRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("review-step"),
+            expected_snapshot: base.id(),
+            precision: PrecisionPolicy::default(),
+            command,
+        },
+        &CancellationToken::new(),
+    )
+    .map(|outcome| outcome.snapshot)
+}
+
+/// The face whose every display triangle satisfies `on`.
+fn face_where(snapshot: &Snapshot, on: impl Fn(Point3) -> bool) -> EntityRef {
+    NativeKernel::debug_scene(snapshot)
+        .triangles
+        .iter()
+        .find(|triangle| triangle.vertices.iter().all(|point| on(*point)))
+        .expect("the face")
+        .source_face
+}
+
+fn rectangle(x: (f64, f64), y: (f64, f64)) -> PlanarProfile2 {
+    region(
+        polygon_loop(&[(x.0, y.0), (x.1, y.0), (x.1, y.1), (x.0, y.1)]),
+        vec![],
+    )
+}
+
+fn face_cut(
+    base: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    profile: PlanarProfile2,
+    distance: f64,
+    operation: FaceExtrusionOperation,
+) -> Result<Snapshot, KernelError> {
+    execute(
+        base,
+        KernelCommand::ExtrudeFacePlanarProfile {
+            target_face,
+            frame,
+            profile,
+            distance,
+            operation,
+        },
+    )
+}
+
+/// A 20 × 20 × 10 block bored through along X, radius 2, at y = 10, z = 5.
+fn bored_block() -> Snapshot {
+    let block = execute(
+        &NativeKernel::empty(),
+        KernelCommand::MakeCuboid {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            size_x: 20.0,
+            size_y: 20.0,
+            size_z: 10.0,
+        },
+    )
+    .expect("block");
+    let side = face_where(&block, |point| point.x.abs() <= 1.0e-9);
+    face_cut(
+        &block,
+        side,
+        PlanarFrame3::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ),
+        region(circle((10.0, 5.0), 2.0), vec![]),
+        20.0,
+        FaceExtrusionOperation::Cut,
+    )
+    .expect("bore")
+}
+
+/// A sketch frame on a face may face either way; the cut still goes into
+/// the body. Where the face-feature path handed a cut on to the general
+/// engines — a sweep that meets other geometry, a profile past the face's
+/// edge — a frame facing into the body used to have its axes swapped, which
+/// moved the profile to its mirror image across the frame's diagonal, or
+/// sent the tool out of the body where it removed nothing.
+#[test]
+fn a_cut_sketched_on_a_frame_facing_into_the_body_lands_where_it_was_drawn() {
+    let base = bored_block();
+    let top = face_where(&base, |point| (point.z - 10.0).abs() <= 1.0e-9);
+    let origin = Point3::new(0.0, 0.0, 10.0);
+    let (x, y) = (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0));
+    // x in [2, 6], y in [4, 16], 8 deep: across the bore, which it shares
+    // for a length of 4.
+    let expected = 20.0 * 20.0 * 10.0 - PI * 4.0 * 20.0 - 4.0 * 12.0 * 8.0 + PI * 4.0 * 4.0;
+    for (what, frame, profile) in [
+        (
+            "outward",
+            PlanarFrame3::new(origin, x, y),
+            rectangle((2.0, 6.0), (4.0, 16.0)),
+        ),
+        (
+            "inward",
+            PlanarFrame3::new(origin, y, x),
+            rectangle((4.0, 16.0), (2.0, 6.0)),
+        ),
+    ] {
+        let cut = face_cut(&base, top, frame, profile, 8.0, FaceExtrusionOperation::Cut)
+            .unwrap_or_else(|error| panic!("{what}: {:?}", error.diagnostics));
+        assert_solid(&cut, expected, what);
+    }
+
+    // A circle of radius 1 half over the block's x = 20 edge, from a frame
+    // facing into the block: a cut 0.4 deep takes the half over the block,
+    // and a boss 0.4 high, overhang and all, adds the whole of it.
+    let inward = PlanarFrame3::new(origin, y, x);
+    let over_the_edge = region(circle((3.0, 20.0), 1.0), vec![]);
+    let half = PI * 0.4 / 2.0;
+    for (operation, expected) in [
+        (FaceExtrusionOperation::Cut, 4000.0 - PI * 80.0 - half),
+        (FaceExtrusionOperation::Add, 4000.0 - PI * 80.0 + 2.0 * half),
+    ] {
+        let feature = face_cut(&base, top, inward, over_the_edge.clone(), 0.4, operation)
+            .unwrap_or_else(|error| panic!("{operation:?}: {:?}", error.diagnostics));
+        let report = NativeKernel::validate(&feature, ValidationProfile::Solid);
+        assert!(report.valid, "{operation:?}: {:?}", report.diagnostics);
+        let volume = feature.measures().volume;
+        assert!(
+            (volume - expected).abs() <= 1.0e-3 * half,
+            "{operation:?}: {volume} is not {expected}"
+        );
+    }
+}
+
+/// A cut that stops short of the far face by less than the minimum feature
+/// would leave a floor thinner than any feature the kernel keeps. It used to
+/// build that film of a floor; it now goes through.
+#[test]
+fn a_cut_stopping_a_hair_short_of_the_far_face_goes_through() {
+    let block = execute(
+        &NativeKernel::empty(),
+        KernelCommand::MakeCuboid {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            size_x: 10.0,
+            size_y: 10.0,
+            size_z: 10.0,
+        },
+    )
+    .expect("block");
+    let top = face_where(&block, |point| (point.z - 10.0).abs() <= 1.0e-9);
+    let floor = PrecisionPolicy::default().min_feature_size / 2.0;
+    let cut = face_cut(
+        &block,
+        top,
+        PlanarFrame3::new(
+            Point3::new(0.0, 0.0, 10.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+        ),
+        rectangle((3.0, 7.0), (3.0, 7.0)),
+        10.0 - floor,
+        FaceExtrusionOperation::Cut,
+    )
+    .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+    assert_solid(&cut, 1000.0 - 16.0 * 10.0, "a through hole");
+}
+
+/// A mirror or a pattern can carry a body past the coordinate limit every
+/// other construction keeps to. Both used to commit it unchecked, and a
+/// mirror plane with a non-finite normal passed the zero-length test.
+#[test]
+fn a_mirror_or_pattern_past_the_coordinate_limit_is_refused() {
+    let block = execute(
+        &NativeKernel::empty(),
+        KernelCommand::MakeCuboid {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            size_x: 10.0,
+            size_y: 10.0,
+            size_z: 10.0,
+        },
+    )
+    .expect("block");
+    let limit = PrecisionPolicy::default().max_abs_coordinate;
+    let codes = |result: Result<Snapshot, KernelError>| {
+        result
+            .err()
+            .map(|error| {
+                error
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.as_str().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let mirror = |origin: Point3, normal: Vector3| {
+        execute(
+            &block,
+            KernelCommand::MirrorSnapshot {
+                plane_origin: origin,
+                plane_normal: normal,
+            },
+        )
+    };
+    let far = mirror(
+        Point3::new(0.6 * limit, 0.0, 0.0),
+        Vector3::new(1.0, 0.0, 0.0),
+    );
+    assert!(
+        codes(far).contains(&"TRANSFORM_COORDINATE_LIMIT_EXCEEDED".to_owned()),
+        "a mirror past the limit"
+    );
+    let near = mirror(Point3::new(20.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0))
+        .expect("a mirror within the limit");
+    assert_solid(&near, 1000.0, "mirrored block");
+    assert!(
+        codes(mirror(
+            Point3::new(20.0, 0.0, 0.0),
+            Vector3::new(f64::NAN, 0.0, 0.0)
+        ))
+        .contains(&"MIRROR_DOMAIN_UNSUPPORTED".to_owned()),
+        "a NaN normal"
+    );
+    let pattern = execute(
+        &block,
+        KernelCommand::LinearPatternSnapshot {
+            direction: Vector3::new(1.0, 0.0, 0.0),
+            spacing: 0.4 * limit,
+            count: 5,
+        },
+    );
+    assert!(
+        codes(pattern).contains(&"TRANSFORM_COORDINATE_LIMIT_EXCEEDED".to_owned()),
+        "a pattern past the limit"
+    );
+}
+
+/// A 10-cube at `x0` less a 3 × 3 bar tilted through it, and the rung that
+/// answered.
+fn tilted_bar_cut(x0: f64) -> (Snapshot, Option<String>) {
+    let cube = execute(
+        &NativeKernel::empty(),
+        KernelCommand::MakeCuboid {
+            origin: Point3::new(x0, 0.0, 0.0),
+            size_x: 10.0,
+            size_y: 10.0,
+            size_z: 10.0,
+        },
+    )
+    .expect("cube");
+    let bar = execute(
+        &NativeKernel::empty(),
+        KernelCommand::MakeCuboid {
+            origin: Point3::new(-10.0, -1.5, -1.5),
+            size_x: 20.0,
+            size_y: 3.0,
+            size_z: 3.0,
+        },
+    )
+    .expect("bar");
+    // 20° about (0, 1, 1): off every axis the cube is a prism along.
+    let (sin, cos) = 10.0_f64.to_radians().sin_cos();
+    let half = std::f64::consts::FRAC_1_SQRT_2 * sin;
+    let bar = execute(
+        &bar,
+        KernelCommand::TransformSnapshot {
+            transform: SimilarityTransform3 {
+                translation: Vector3::new(x0 + 5.0, 5.0, 5.0),
+                rotation: RotationQuaternion {
+                    w: cos,
+                    x: 0.0,
+                    y: half,
+                    z: half,
+                },
+                uniform_scale: 1.0,
+            },
+        },
+    )
+    .expect("tilted bar");
+    let outcome = NativeKernel::execute_boolean(
+        &cube,
+        &bar,
+        &BooleanRequest {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id: RequestId::new("tilted-bar"),
+            expected_target_snapshot: cube.id(),
+            expected_tool_snapshot: bar.id(),
+            precision: PrecisionPolicy::default(),
+            operation: BooleanOperation::Difference,
+        },
+        &CancellationToken::new(),
+    )
+    .unwrap_or_else(|error| panic!("x0 = {x0}: {:?}", error.diagnostics));
+    (outcome.snapshot, outcome.report.rung)
+}
+
+/// Where two planes meet, the exact engine drew their line a million units
+/// either way of the point on it nearest the world origin, so a body far out
+/// along the line lay off the end of it. The line is now drawn across the
+/// face it is clipped to.
+#[test]
+fn a_boolean_far_along_a_plane_crossing_matches_one_at_the_origin() {
+    let (near, near_rung) = tilted_bar_cut(0.0);
+    let (far, far_rung) = tilted_bar_cut(3.0e6);
+    let report = NativeKernel::validate(&far, ValidationProfile::Solid);
+    assert!(report.valid, "{:?}", report.diagnostics);
+    assert_eq!(near_rung, far_rung);
+    assert!(
+        (near.measures().volume - far.measures().volume).abs() <= 1.0e-6,
+        "{} near, {} far",
+        near.measures().volume,
+        far.measures().volume
+    );
+    assert!(
+        near.measures().volume < 1000.0 - 80.0,
+        "the bar cuts the cube"
+    );
 }

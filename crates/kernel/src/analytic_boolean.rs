@@ -61,17 +61,18 @@ pub(crate) fn build_analytic_boolean(
     precision: PrecisionPolicy,
 ) -> Result<Topology, AnalyticBooleanError> {
     let mut pieces = Vec::new();
+    let (target, tool) = (OperandFaces::new(target), OperandFaces::new(tool));
     collect_operand_pieces(
-        target,
-        tool,
+        &target,
+        &tool,
         operation,
         OperandSide::Target,
         precision,
         &mut pieces,
     )?;
     collect_operand_pieces(
-        tool,
-        target,
+        &tool,
+        &target,
         operation,
         OperandSide::Tool,
         precision,
@@ -108,19 +109,62 @@ fn keep_rule(side: OperandSide, operation: BooleanOperation) -> (BooleanOperatio
     }
 }
 
+/// One operand's faces with each one's parameter region and model-space
+/// extent, built once. Every face of one operand meets every face of the
+/// other, so building them per pair rebuilt and rewelded each region once
+/// for every face across the way.
+struct OperandFaces<'a> {
+    topology: &'a Topology,
+    regions: Vec<Option<Vec<Vec<Segment>>>>,
+    extents: Vec<Option<FaceExtent>>,
+}
+
+impl<'a> OperandFaces<'a> {
+    fn new(topology: &'a Topology) -> Self {
+        let regions = topology
+            .faces
+            .iter()
+            .map(|face| face_region(topology, &face.value).ok())
+            .collect::<Vec<_>>();
+        let extents = topology
+            .faces
+            .iter()
+            .zip(&regions)
+            .map(|(face, region)| {
+                region
+                    .as_deref()
+                    .and_then(|region| face_extent(&face.value, region))
+            })
+            .collect();
+        Self {
+            topology,
+            regions,
+            extents,
+        }
+    }
+
+    fn region(&self, index: usize) -> Result<&[Vec<Segment>], AnalyticBooleanError> {
+        self.regions[index]
+            .as_deref()
+            .ok_or(AnalyticBooleanError::DomainUnsupported)
+    }
+}
+
 fn collect_operand_pieces(
-    own: &Topology,
-    other: &Topology,
+    own_faces: &OperandFaces<'_>,
+    other: &OperandFaces<'_>,
     operation: BooleanOperation,
     side: OperandSide,
     precision: PrecisionPolicy,
     pieces: &mut Vec<SewFace>,
 ) -> Result<(), AnalyticBooleanError> {
     let (operation_2d, reverse) = keep_rule(side, operation);
-    for face in &own.faces {
-        let region = face_region(own, &face.value)?;
-        let section = section_on_face(&face.value, &region, other, precision)?;
-        let overlays = coincident_overlays(&face.value, &region, other, precision)?;
+    let own = own_faces.topology;
+    for (index, face) in own.faces.iter().enumerate() {
+        let region = own_faces.region(index)?;
+        let own_extent = own_faces.extents[index];
+        let section = section_on_face(&face.value, region, own_extent, other, precision)?;
+        let overlays = coincident_overlays(&face.value, region, own_extent, other, precision)?;
         let own_region = ProfileRegion {
             outer: region[0].clone(),
             holes: region[1..].to_vec(),
@@ -160,7 +204,8 @@ fn collect_operand_pieces(
             };
             if section.is_empty() {
                 // Untouched face: wholesale in-or-out of the other solid.
-                let inside = face_sample_inside(own, &face.value, &piece_loops, other, precision)?;
+                let inside =
+                    face_sample_inside(own, &face.value, &piece_loops, other.topology, precision)?;
                 let keep = match operation_2d {
                     BooleanOperation::Difference => !inside,
                     BooleanOperation::Intersection => inside,
@@ -438,14 +483,10 @@ fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
 /// needs. Unknown extents keep the refusal.
 fn faces_apart(
     own: Option<FaceExtent>,
-    other: &Topology,
-    other_face: &Face,
+    other: Option<FaceExtent>,
     precision: PrecisionPolicy,
 ) -> bool {
-    let (Some(own), Ok(region)) = (own, face_region(other, other_face)) else {
-        return false;
-    };
-    let Some(other) = face_extent(other_face, &region) else {
+    let (Some(own), Some(other)) = (own, other) else {
         return false;
     };
     let scale = [own.min, own.max, other.min, other.max]
@@ -480,13 +521,13 @@ struct CoincidentOverlay {
 fn coincident_overlays(
     face: &Face,
     own_region: &[Vec<Segment>],
-    other: &Topology,
+    own_extent: Option<FaceExtent>,
+    other: &OperandFaces<'_>,
     precision: PrecisionPolicy,
 ) -> Result<Vec<CoincidentOverlay>, AnalyticBooleanError> {
-    let own_extent = face_extent(face, own_region);
     let mut overlays = Vec::new();
-    for other_face in &other.faces {
-        if faces_apart(own_extent, other, &other_face.value, precision) {
+    for (index, other_face) in other.topology.faces.iter().enumerate() {
+        if faces_apart(own_extent, other.extents[index], precision) {
             continue;
         }
         let outcome =
@@ -500,10 +541,11 @@ fn coincident_overlays(
             continue;
         }
         let window = azimuth_window(own_region);
-        let loops = face_region(other, &other_face.value)?
-            .into_iter()
+        let loops = other
+            .region(index)?
+            .iter()
             .map(|segments| {
-                reparameterize_loop(&other_face.value.surface, &segments, &face.surface, window)
+                reparameterize_loop(&other_face.value.surface, segments, &face.surface, window)
                     .ok_or(AnalyticBooleanError::DomainUnsupported)
                     .and_then(|segments| {
                         welded(&segments, precision)
@@ -544,19 +586,19 @@ fn coincident_overlays(
 fn section_on_face(
     face: &Face,
     own_region: &[Vec<Segment>],
-    other: &Topology,
+    own_extent: Option<FaceExtent>,
+    other: &OperandFaces<'_>,
     precision: PrecisionPolicy,
 ) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
-    let own_extent = face_extent(face, own_region);
     let mut pieces: Vec<Segment> = Vec::new();
-    for other_face in &other.faces {
+    for (index, other_face) in other.topology.faces.iter().enumerate() {
         // The section is closed by pieces from every face the carrier
         // crosses, near this face or not, so a pair the matrix answers is
         // always taken. Only a pair it refuses is asked whether the two
         // faces could meet at all.
         let outcome = match intersect(face.surface, other_face.value.surface, precision) {
             Ok(outcome) => outcome,
-            Err(_) if faces_apart(own_extent, other, &other_face.value, precision) => continue,
+            Err(_) if faces_apart(own_extent, other.extents[index], precision) => continue,
             Err(_) => {
                 return Err(AnalyticBooleanError::CarrierPair(Box::new([
                     face.surface,
@@ -573,16 +615,17 @@ fn section_on_face(
             SurfaceIntersection::Coincident => continue,
             SurfaceIntersection::Curves(curves) => curves,
         };
-        let other_region = face_region(other, &other_face.value)?;
+        let other_region = other.region(index)?;
         for curve in curves {
             // Clip the carrier curve to the other face's own extent, in the
             // other face's parameter space, then re-express the kept pieces
             // in this face's parameter space.
-            let Some(other_chords) = curve_chords(&other_face.value.surface, curve) else {
+            let Some(other_chords) = curve_chords(&other_face.value.surface, curve, other_region)
+            else {
                 return Err(AnalyticBooleanError::DomainUnsupported);
             };
             for chord in other_chords {
-                let clipped = chord_region_pieces(chord, &other_region, precision)
+                let clipped = chord_region_pieces(chord, other_region, precision)
                     .map_err(|_| AnalyticBooleanError::DomainUnsupported)?;
                 for piece in clipped {
                     pieces.push(
@@ -1236,6 +1279,29 @@ fn nest_section_loops(
     Ok(regions.into_iter().map(|(_, region)| region).collect())
 }
 
+/// The middle of a face's parameter box and the reach from it to any
+/// corner, counting every arc as its whole circle. `None` for an empty or
+/// non-finite region.
+fn region_box(region: &[Vec<Segment>]) -> Option<(Point2, f64)> {
+    let mut low = Point2::new(f64::INFINITY, f64::INFINITY);
+    let mut high = Point2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut include = |point: Point2, grow: f64| {
+        low = Point2::new(low.x.min(point.x - grow), low.y.min(point.y - grow));
+        high = Point2::new(high.x.max(point.x + grow), high.y.max(point.y + grow));
+    };
+    for segment in region.iter().flatten() {
+        include(segment.start(), 0.0);
+        include(segment.end(), 0.0);
+        if let Segment::Arc { center, radius, .. } = *segment {
+            include(center, radius.abs());
+        }
+    }
+    let reach = (high.x - low.x).hypot(high.y - low.y) / 2.0;
+    let middle = Point2::new(low.x.midpoint(high.x), low.y.midpoint(high.y));
+    (reach.is_finite() && middle.x.is_finite() && middle.y.is_finite())
+        .then_some((middle, reach.max(1.0e-6)))
+}
+
 fn reverse_chain(segments: &[Segment]) -> Vec<Segment> {
     segments
         .iter()
@@ -1244,14 +1310,24 @@ fn reverse_chain(segments: &[Segment]) -> Vec<Segment> {
         .collect()
 }
 
-/// An intersection curve as chords in the given surface's parameter space.
+/// An intersection curve as chords in the given surface's parameter space,
+/// long enough to cross `region`, the face they are to be clipped to.
 ///
-/// Lines map to long line chords; circles map to two semicircle arcs on a
-/// plane, or to horizontal ring chords on a cylinder. `None` marks a curve
-/// the surface's parameter space cannot carry with lines and arcs — a helix
-/// from a skewed line, for instance — which refuses the operation.
-fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segment>> {
+/// Lines map to line chords across the face; circles map to two semicircle
+/// arcs on a plane, or to horizontal ring chords on a cylinder. `None` marks
+/// a curve the surface's parameter space cannot carry with lines and arcs —
+/// a helix from a skewed line, for instance — which refuses the operation.
+fn curve_chords(
+    surface: &Surface,
+    curve: IntersectionCurve,
+    region: &[Vec<Segment>],
+) -> Option<Vec<Segment>> {
+    // A line is drawn through the middle of the face's parameter box and
+    // out past it on both sides. Drawn a fixed length about the point
+    // nearest the world origin instead, it missed a face far out along it,
+    // and it cost a long chord's precision everywhere else.
     const SPAN: f64 = 1.0e6;
+    let (middle, reach) = region_box(region).unwrap_or((Point2::new(0.0, 0.0), SPAN));
     match (surface, curve) {
         (Surface::Plane(plane), IntersectionCurve::Line { origin, direction }) => {
             let local = |point: Point3| {
@@ -1260,9 +1336,25 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
                     (point - plane.origin).dot(plane.v),
                 )
             };
-            let start = local(origin + direction * -SPAN);
-            let end = local(origin + direction * SPAN);
-            Some(vec![Segment::Line { start, end }])
+            let base = local(origin);
+            let along = Point2::new(direction.dot(plane.u), direction.dot(plane.v));
+            let length_squared = along.x.mul_add(along.x, along.y * along.y);
+            if !length_squared.is_finite() || length_squared <= f64::EPSILON {
+                return None;
+            }
+            let centre = ((middle.x - base.x).mul_add(along.x, (middle.y - base.y) * along.y))
+                / length_squared;
+            let half = 2.0 * reach / length_squared.sqrt();
+            let at = |parameter: f64| {
+                Point2::new(
+                    along.x.mul_add(parameter, base.x),
+                    along.y.mul_add(parameter, base.y),
+                )
+            };
+            Some(vec![Segment::Line {
+                start: at(centre - half),
+                end: at(centre + half),
+            }])
         }
         (
             Surface::Plane(plane),
@@ -1403,6 +1495,9 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
             let u = cylinder.angular_sign * angle;
             let base = offset.dot(axis);
             let along = direction.dot(axis);
+            // Across the face's height range, whichever way the line runs.
+            let centre = (middle.y - base) / along;
+            let half = 2.0 * reach / along.abs();
             // On every turn a bounded face window can reach, as a ring or a
             // harmonic is: the arctangent hands back the principal azimuth,
             // and a face whose window is the other half turn would otherwise
@@ -1414,8 +1509,8 @@ fn curve_chords(surface: &Surface, curve: IntersectionCurve) -> Option<Vec<Segme
                     .map(|turns: f64| {
                         let at = turns.mul_add(tau, u);
                         Segment::Line {
-                            start: Point2::new(at, along.mul_add(-SPAN, base)),
-                            end: Point2::new(at, along.mul_add(SPAN, base)),
+                            start: Point2::new(at, along.mul_add(centre - half, base)),
+                            end: Point2::new(at, along.mul_add(centre + half, base)),
                         }
                     })
                     .collect(),

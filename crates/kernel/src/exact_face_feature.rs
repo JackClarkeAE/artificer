@@ -454,8 +454,10 @@ fn resolve_common_exit(
         }
     }
     exits.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
+    // A cut that stops short of the exit by less than the smallest feature
+    // would leave a floor too thin to be one; it goes through instead.
     if let Some((depth, index)) = exits.first().copied()
-        && requested_distance >= depth - linear_tolerance
+        && requested_distance >= depth - minimum.max(linear_tolerance)
     {
         return Ok((depth, Some(index)));
     }

@@ -2507,8 +2507,11 @@ fn heal_planar_boundary_cycles(
         let fallback = (!directed)
             .then(|| find_undirected_boundary_cycle(&boundary, &unused, seed))
             .flatten();
+        // An edge that closes no cycle is left open for the validator; the
+        // edges after it may still close theirs.
         if !directed && fallback.is_none() {
-            break;
+            unused.remove(&seed);
+            continue;
         }
         if let Some((fallback_path, _)) = &fallback {
             path.clone_from(fallback_path);
@@ -3251,6 +3254,27 @@ fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
         unique.entry(key).or_insert(*point);
     }
     let candidates = unique.into_values().collect::<Vec<_>>();
+    // A vertex that lands on an edge lies within the reach of it, so it is
+    // inside the edge's box grown by that reach. The candidates are indexed
+    // along each axis, and each edge scans only the thinnest slab its box
+    // cuts through, rather than every vertex of the result.
+    let reach = epsilon * 8.0;
+    let coordinate = |point: Point3, axis: usize| match axis {
+        0 => point.x,
+        1 => point.y,
+        _ => point.z,
+    };
+    let slabs = [0, 1, 2].map(|axis| {
+        let mut order = (0..candidates.len()).collect::<Vec<_>>();
+        order.sort_by(|left, right| {
+            coordinate(candidates[*left], axis).total_cmp(&coordinate(candidates[*right], axis))
+        });
+        let keys = order
+            .iter()
+            .map(|index| coordinate(candidates[*index], axis))
+            .collect::<Vec<_>>();
+        (order, keys)
+    });
     for polygon in &mut polygons {
         let original = std::mem::take(&mut polygon.vertices);
         let mut conformed = Vec::new();
@@ -3259,24 +3283,49 @@ fn conform_polygon_edges(mut polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
             let end = original[(index + 1) % original.len()];
             let direction = end - start;
             let denominator = direction.dot(direction);
-            let mut points = vec![(0.0_f64, start)];
+            // Each point with its parameter and its place among the
+            // candidates, which settles a tie in parameter as the candidates'
+            // own order always did.
+            let mut points = vec![(0.0_f64, 0_usize, start)];
             if denominator > epsilon * epsilon {
-                for candidate in &candidates {
-                    let parameter = (*candidate - start).dot(direction) / denominator;
+                let low = [0, 1, 2]
+                    .map(|axis| coordinate(start, axis).min(coordinate(end, axis)) - reach);
+                let high = [0, 1, 2]
+                    .map(|axis| coordinate(start, axis).max(coordinate(end, axis)) + reach);
+                let ranges = [0, 1, 2].map(|axis| {
+                    let keys = &slabs[axis].1;
+                    (
+                        keys.partition_point(|key| *key < low[axis]),
+                        keys.partition_point(|key| *key <= high[axis]),
+                    )
+                });
+                let axis = (0..3)
+                    .min_by_key(|axis| ranges[*axis].1.saturating_sub(ranges[*axis].0))
+                    .unwrap_or(0);
+                let (first, last) = ranges[axis];
+                for index in slabs[axis].0[first..last.max(first)].iter().copied() {
+                    let candidate = candidates[index];
+                    if !(0..3).all(|other| {
+                        let value = coordinate(candidate, other);
+                        value >= low[other] && value <= high[other]
+                    }) {
+                        continue;
+                    }
+                    let parameter = (candidate - start).dot(direction) / denominator;
                     if parameter <= 1.0e-9 || parameter >= 1.0 - 1.0e-9 {
                         continue;
                     }
                     let closest = start + direction * parameter;
-                    if closest.distance(*candidate) <= epsilon * 8.0 {
-                        points.push((parameter, *candidate));
+                    if closest.distance(candidate) <= reach {
+                        points.push((parameter, index, candidate));
                     }
                 }
             }
-            points.sort_by(|left, right| left.0.total_cmp(&right.0));
+            points.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
             points.dedup_by(|left, right| {
-                quantized_key(left.1, epsilon) == quantized_key(right.1, epsilon)
+                quantized_key(left.2, epsilon) == quantized_key(right.2, epsilon)
             });
-            conformed.extend(points.into_iter().map(|(_, point)| point));
+            conformed.extend(points.into_iter().map(|(_, _, point)| point));
         }
         polygon.vertices = conformed;
     }

@@ -10,7 +10,9 @@ use std::collections::BTreeSet;
 
 use artificer_protocol::{EntityKind, EntityRef, PrecisionPolicy, SnapshotId};
 
-use crate::topology::{CoedgeKey, Curve2, Curve3, EdgeKey, FaceKey, Topology, Vector3, VertexKey};
+use crate::topology::{
+    CoedgeKey, Curve2, Curve3, EdgeKey, FaceKey, Point3, Topology, Vector3, VertexKey,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FacePushPullInputError {
@@ -25,6 +27,8 @@ pub(crate) enum FacePushPullInputError {
     NonDistinctDistance,
     FeatureTooSmall,
     SupportContact,
+    /// Moving the cap in would take it past other geometry under it.
+    InteriorContact,
     CoordinateLimit,
     NumericallyUnrepresentable,
 }
@@ -307,6 +311,39 @@ pub(crate) fn validate_face_push_pull_input(
     if distance.is_sign_negative() && support_depth + distance <= minimum {
         return Err(FacePushPullInputError::SupportContact);
     }
+    // Moving in, the cap must stay clear of everything else under it: a
+    // pocket cut up from below, whose ceiling would otherwise poke out
+    // through the new cap. Every face is planar with straight edges, and
+    // nothing crosses the side walls, so anything in the cap's column shows
+    // as a vertex inside its footprint.
+    if distance.is_sign_negative() {
+        let across = |point: Point3| {
+            let offset = point.as_vector() - outward_normal * point.as_vector().dot(outward_normal);
+            (offset.dot(target_plane.u), offset.dot(target_plane.v))
+        };
+        let mut footprint = Vec::with_capacity(target_loop.value.coedges.len());
+        for coedge_key in target_loop.value.coedges.iter().copied() {
+            let coedge = topology
+                .coedge(coedge_key)
+                .ok_or(FacePushPullInputError::TargetNotExtrusionCap)?;
+            let (vertices, _) = topology
+                .oriented_edge_vertices(&coedge.value)
+                .ok_or(FacePushPullInputError::TargetNotExtrusionCap)?;
+            let start = topology
+                .vertex(vertices[0])
+                .ok_or(FacePushPullInputError::TargetNotExtrusionCap)?;
+            footprint.push(across(start.value.point));
+        }
+        let new_cap = target_coordinate + distance;
+        if topology.vertices.iter().enumerate().any(|(index, vertex)| {
+            let point = vertex.value.point;
+            !moved_vertices.contains(&VertexKey(index))
+                && point.as_vector().dot(outward_normal) > new_cap - minimum
+                && inside_polygon(across(point), &footprint)
+        }) {
+            return Err(FacePushPullInputError::InteriorContact);
+        }
+    }
     let delta = outward_normal * distance;
     for vertex_key in &moved_vertices {
         let moved = topology
@@ -390,6 +427,21 @@ pub(crate) fn build_face_push_pull(source: &Topology, input: &ValidatedFacePushP
         );
     }
     candidate
+}
+
+/// Whether `point` lies strictly inside the polygon, by crossings.
+fn inside_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for (index, start) in polygon.iter().enumerate() {
+        let end = polygon[(index + 1) % polygon.len()];
+        if (start.1 > point.1) != (end.1 > point.1) {
+            let x = (end.0 - start.0).mul_add((point.1 - start.1) / (end.1 - start.1), start.0);
+            if x > point.0 {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 fn face_owners_of_edge(
