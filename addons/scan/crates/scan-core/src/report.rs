@@ -58,6 +58,10 @@ pub struct ReverseOptions {
     /// Joint solve for shared parameter entities: one axis for coaxial
     /// features, shared directions and radii (consolidation rung 3).
     pub shared_parameters: bool,
+    /// B-spline patches over what the analytic surfaces leave: freeform
+    /// regions, and analytic facets strained across a curved surface.
+    /// `None` leaves freeform as measured mesh, as before splines.
+    pub splines: Option<crate::freeform::SplineOptions>,
 }
 
 impl Default for ReverseOptions {
@@ -75,6 +79,7 @@ impl Default for ReverseOptions {
             finalize: true,
             consolidate: true,
             shared_parameters: true,
+            splines: Some(crate::freeform::SplineOptions::default()),
         }
     }
 }
@@ -154,6 +159,11 @@ pub struct ReverseReport {
     /// The tolerance the run was performed at, so later stages (rebuild)
     /// can reason in the same noise units rather than re-guessing.
     pub tolerance: f64,
+    /// B-spline patches, each describing one freeform feature, in the
+    /// datum frame when there is one.
+    pub splines: Vec<crate::freeform::SplinePatch>,
+    /// Regions offered a patch that did not get one, and why.
+    pub spline_notes: Vec<String>,
 }
 
 /// Segments the mesh, fits analytic surfaces, and canonicalizes the result.
@@ -566,6 +576,33 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             record_stage(&mut stages, "ring-patterns", &features);
         }
     }
+    // What the analytic vocabulary could not carry, carried as B-spline
+    // patches — last among the recognition stages, so every analytic
+    // surface has had its chance, and before the shared-parameter solve
+    // so that solve is not asked to reconcile facets of a curved surface.
+    let mut splines: Vec<crate::freeform::SplinePatch> = Vec::new();
+    let mut spline_notes: Vec<String> = Vec::new();
+    if let Some(spline_options) = &options.splines {
+        let outcome = crate::freeform::fit_freeform_patches(
+            mesh,
+            &mut features,
+            datum.as_ref(),
+            options.tolerance,
+            noise_sigma,
+            spline_options,
+        );
+        splines = outcome.patches;
+        spline_notes = outcome.refusals;
+        if outcome.small_regions > 0 {
+            spline_notes.push(format!(
+                "{} freeform region(s) under {:.0} mm^2, {:.0} mm^2 in total, stay measured",
+                outcome.small_regions, spline_options.min_area, outcome.small_area
+            ));
+        }
+        // The list was re-sorted and renumbered.
+        restamp_profiles(&mut master_profiles, &features);
+        record_stage(&mut stages, "spline-fit", &features);
+    }
     let mut parameters: Vec<String> = std::mem::take(&mut frame_notes);
     parameters.append(&mut parameters_late);
     if options.shared_parameters {
@@ -599,13 +636,27 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
             Some(alignment),
             options.tolerance,
         );
-        // A bag of operations is not a model. Order them.
+        // A bag of operations is not a model. Order them. Freeform a
+        // B-spline patch carries is a designed surface, not a measured
+        // one, and the tree says which is which.
+        let carried =
+            |feature: &FeatureRecord| splines.iter().any(|patch| patch.feature == feature.id);
         let organic: f64 = features
             .iter()
-            .filter(|feature| matches!(feature.surface, SurfaceClass::Freeform))
+            .filter(|feature| {
+                matches!(feature.surface, SurfaceClass::Freeform) && !carried(feature)
+            })
             .map(|feature| feature.area)
             .sum();
-        plan.tree = crate::tree::order_tree(mesh, &features, &plan, Some(alignment), organic);
+        let spline_area: f64 = splines.iter().map(|patch| patch.area).sum();
+        plan.tree = crate::tree::order_tree(
+            mesh,
+            &features,
+            &plan,
+            Some(alignment),
+            organic,
+            spline_area,
+        );
         plan
     });
     // Every stage above that moved a surface — snapping, harmonizing, the
@@ -638,6 +689,8 @@ pub fn reverse_engineer(mesh: &TriangleMesh, options: &ReverseOptions) -> Revers
         datum,
         plan,
         tolerance: options.tolerance,
+        splines,
+        spline_notes,
     }
 }
 
@@ -826,6 +879,81 @@ pub fn report_to_json(report: &ReverseReport) -> String {
         push_escaped(&mut out, parameter);
     }
     out.push(']');
+    // Each patch in full — knots, control net, trim loops in its own
+    // parameters — so a consumer rebuilds the exact surface rather than
+    // a picture of it.
+    out.push_str(",\"splines\":[");
+    for (index, patch) in report.splines.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let surface = &patch.fit.surface;
+        let numbers = |values: &[f64]| {
+            values
+                .iter()
+                .map(|v| format!("{v:.9}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        out.push_str(&format!(
+            "{{\"feature\":{},\"area\":{:.6},\"chart\":\"{}\",\"degree\":[{},{}],\"net\":[{},{}],\
+             \"rms\":{:.6},\"max\":{:.6},\"inlier_rms\":{:.6},\"samples\":{},\"outliers\":{},\
+             \"rounds\":{},\"corrections\":{},\"reclaimed\":{},\"reclaimed_area\":{:.6},\
+             \"reclaimed_rms\":{:.6},\"bridged_holes\":{},\"pinholes\":{},\"outward\":{},\
+             \"knots_u\":[{}],\"knots_v\":[{}],\"control\":[",
+            patch.feature,
+            patch.area,
+            patch.fit.chart.kind(),
+            surface.degree_u,
+            surface.degree_v,
+            surface.count_u,
+            surface.count_v,
+            patch.fit.deviation.rms,
+            patch.fit.deviation.max_abs,
+            patch.fit.inlier_rms,
+            patch.fit.samples,
+            patch.fit.outliers,
+            patch.fit.rounds,
+            patch.fit.corrections,
+            patch.reclaimed,
+            patch.reclaimed_area,
+            patch.reclaimed_rms,
+            patch.bridged_holes,
+            patch.pinholes,
+            patch.outward,
+            numbers(&surface.knots_u),
+            numbers(&surface.knots_v),
+        ));
+        for (slot, point) in surface.control.iter().enumerate() {
+            if slot > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!("[{:.6},{:.6},{:.6}]", point.x, point.y, point.z));
+        }
+        out.push_str("],\"loops\":[");
+        for (slot, ring) in patch.loops.iter().enumerate() {
+            if slot > 0 {
+                out.push(',');
+            }
+            out.push('[');
+            for (k, (u, v)) in ring.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                out.push_str(&format!("[{u:.6},{v:.6}]"));
+            }
+            out.push(']');
+        }
+        out.push_str("]}");
+    }
+    out.push_str("],\"spline_refusals\":[");
+    for (index, note) in report.spline_notes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_escaped(&mut out, note);
+    }
+    out.push(']');
     if let Some(plan) = &report.plan {
         out.push_str(",\"reconstruction\":");
         out.push_str(&plan_to_history_json(plan));
@@ -956,6 +1084,40 @@ pub fn report_summary(report: &ReverseReport) -> String {
         out.push_str(&format!(
             "  ... and {fragments} recovered fragment(s) under {FRAGMENT_AREA:.0} mm^2,              {fragment_area:.0} mm^2 in total (in the model, folded here)\n"
         ));
+    }
+    if report.splines.is_empty() && !report.spline_notes.is_empty() {
+        out.push_str("B-spline patches: none\n");
+    } else if !report.splines.is_empty() {
+        let area: f64 = report.splines.iter().map(|patch| patch.area).sum();
+        let reclaimed: usize = report.splines.iter().map(|patch| patch.reclaimed).sum();
+        let reclaimed_area: f64 = report
+            .splines
+            .iter()
+            .map(|patch| patch.reclaimed_area)
+            .sum();
+        out.push_str(&format!(
+            "B-spline patches: {} over {:.0} mm^2 ({:.1}% of the surface), {} strained analytic \
+             facet(s) over {:.0} mm^2 replaced; --step writes them as trimmed \
+             B_SPLINE_SURFACE_WITH_KNOTS faces in open shells, not yet sewn to the analytic faces\n",
+            report.splines.len(),
+            area,
+            100.0 * area / report.total_area.max(1e-9),
+            reclaimed,
+            reclaimed_area
+        ));
+    }
+    if !report.splines.is_empty() || !report.spline_notes.is_empty() {
+        for patch in &report.splines {
+            out.push_str(&format!(
+                "  #{:<3} {:.1} mm^2: {}\n",
+                patch.feature,
+                patch.area,
+                patch.describe()
+            ));
+        }
+        for note in &report.spline_notes {
+            out.push_str(&format!("  - no patch: {note}\n"));
+        }
     }
     if let Some(plan) = &report.plan {
         out.push_str(&plan_summary(plan));

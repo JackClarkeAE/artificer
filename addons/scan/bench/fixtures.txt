@@ -29,3 +29,17 @@ name=spacer-n003 source=bench/parts/wheel-spacer.step density=0.25 smooth=0.35 n
 name=rail-n003 source=bench/parts/din-rail-200mm.step density=0.4 smooth=0 noise=0.03 seed=7 bores=0 bore_d=0
 name=spacer-n003-sharp source=bench/parts/wheel-spacer.step density=0.25 smooth=0 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
 name=spacer-fast-sharp source=bench/parts/wheel-spacer.step density=0.6 smooth=0 noise=0.03 seed=7 bores=4 bore_d=10.0 bore_tol=0.15
+
+# Synthetic parts, built in code (synth:NAME), so these rows run on any
+# machine with nothing but the repository. The plate with boss is the
+# all-analytic control: nothing on it is freeform, so any change that
+# takes area from its planes and cylinder has regressed. The freeform
+# block's top is a known bump-and-saddle height field (synth.rs), and
+# the bench scores the rebuild against that surface directly: truth-rms
+# and truth-max are the model's distance from it, cad% how much of it
+# arrives as a surface rather than as measured mesh. The -holes row adds
+# heavier noise and scanner dropout across the freeform top.
+name=plate-n002 source=synth:plate-with-boss density=0.4 smooth=0.35 noise=0.02 seed=7 bores=0 bore_d=0
+name=plate-n007 source=synth:plate-with-boss density=0.4 smooth=0.35 noise=0.07 seed=7 bores=0 bore_d=0
+name=freeform-n002 source=synth:freeform-block density=0.4 smooth=0.35 noise=0.02 seed=7 bores=0 bore_d=0
+name=freeform-n005-holes source=synth:freeform-block density=0.4 smooth=0.35 noise=0.05 dropout=4 dropout_size=5 seed=11 bores=0 bore_d=0

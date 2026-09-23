@@ -1249,6 +1249,295 @@ pub fn read_step(bytes: &[u8], chord: f64) -> Result<(TriangleMesh, Vec<String>)
     Ok((mesh, notes))
 }
 
+/// The AP214 schema identifier a written file claims.
+const SCHEMA: &str = "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }";
+
+/// A Part 21 file under construction: header and product structure
+/// fixed, entities numbered as they are added. The same framing the
+/// kernel's exact export writes, so the two read alike.
+struct StepWriter {
+    data: String,
+    next: u64,
+    context: u64,
+    shape: u64,
+}
+
+impl StepWriter {
+    fn new(product: &str) -> Self {
+        let mut file = Self {
+            data: String::new(),
+            next: 1,
+            context: 0,
+            shape: 0,
+        };
+        let name = quoted(product);
+        let application = file.entity("APPLICATION_CONTEXT('automotive design')".to_owned());
+        let product_context =
+            file.entity(format!("PRODUCT_CONTEXT('',#{application},'mechanical')"));
+        let product_id = file.entity(format!("PRODUCT({name},{name},'',(#{product_context}))"));
+        let formation = file.entity(format!("PRODUCT_DEFINITION_FORMATION('','',#{product_id})"));
+        let definition_context = file.entity(format!(
+            "PRODUCT_DEFINITION_CONTEXT('part definition',#{application},'design')"
+        ));
+        let definition = file.entity(format!(
+            "PRODUCT_DEFINITION('design','',#{formation},#{definition_context})"
+        ));
+        file.shape = file.entity(format!("PRODUCT_DEFINITION_SHAPE('','',#{definition})"));
+        let length = file.entity("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))".to_owned());
+        let angle = file.entity("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))".to_owned());
+        let solid_angle =
+            file.entity("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())".to_owned());
+        let uncertainty = file.entity(format!(
+            "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-6),#{length},\
+             'distance_accuracy_value','confusion accuracy')"
+        ));
+        file.context = file.entity(format!(
+            "(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{uncertainty}))\
+             GLOBAL_UNIT_ASSIGNED_CONTEXT((#{length},#{angle},#{solid_angle}))\
+             REPRESENTATION_CONTEXT('',''))"
+        ));
+        file
+    }
+
+    fn entity(&mut self, body: String) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.data.push_str(&format!("#{id}={body};\n"));
+        id
+    }
+
+    fn point(&mut self, point: Point3) -> u64 {
+        self.entity(format!(
+            "CARTESIAN_POINT('',({},{},{}))",
+            real(point.x),
+            real(point.y),
+            real(point.z)
+        ))
+    }
+
+    fn finish(mut self, items: &[u64], representation: &str, description: &str) -> String {
+        let origin = self.entity("CARTESIAN_POINT('',(0.,0.,0.))".to_owned());
+        let z = self.entity("DIRECTION('',(0.,0.,1.))".to_owned());
+        let x = self.entity("DIRECTION('',(1.,0.,0.))".to_owned());
+        let placement = self.entity(format!("AXIS2_PLACEMENT_3D('',#{origin},#{z},#{x})"));
+        let mut listed = vec![placement];
+        listed.extend_from_slice(items);
+        let representation = self.entity(format!(
+            "{representation}('',({}),#{})",
+            ids(&listed),
+            self.context
+        ));
+        self.entity(format!(
+            "SHAPE_DEFINITION_REPRESENTATION(#{},#{representation})",
+            self.shape
+        ));
+        let mut file = String::with_capacity(self.data.len() + 512);
+        file.push_str("ISO-10303-21;\nHEADER;\n");
+        file.push_str(&format!(
+            "FILE_DESCRIPTION(({}),'2;1');\n",
+            quoted(description)
+        ));
+        file.push_str(
+            "FILE_NAME('Artificer.step','',('Artificer'),(''),'Artificer scan','Artificer','');\n",
+        );
+        file.push_str(&format!("FILE_SCHEMA(('{SCHEMA}'));\n"));
+        file.push_str("ENDSEC;\nDATA;\n");
+        file.push_str(&self.data);
+        file.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+        file
+    }
+}
+
+fn ids(ids: &[u64]) -> String {
+    ids.iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A Part 21 string literal: apostrophes doubled, non-ASCII replaced.
+fn quoted(text: &str) -> String {
+    let body: String = text
+        .chars()
+        .map(|character| {
+            if character == '\'' {
+                "''".to_owned()
+            } else if character.is_ascii_graphic() || character == ' ' {
+                character.to_string()
+            } else {
+                "_".to_owned()
+            }
+        })
+        .collect();
+    format!("'{body}'")
+}
+
+/// A Part 21 real: the shortest digits that read back to the same float,
+/// always with a decimal point, and an uppercase exponent when there is
+/// one.
+fn real(value: f64) -> String {
+    if !value.is_finite() {
+        return "0.".to_owned();
+    }
+    let text = format!("{value:?}");
+    let (mantissa, exponent) = match text.split_once('e') {
+        Some((mantissa, exponent)) => (mantissa.to_owned(), Some(exponent.to_owned())),
+        None => (text, None),
+    };
+    let mantissa = if mantissa.contains('.') {
+        mantissa
+    } else {
+        format!("{mantissa}.")
+    };
+    match exponent {
+        Some(exponent) => format!("{mantissa}E{exponent}"),
+        None => mantissa,
+    }
+}
+
+/// A clamped knot vector as STEP carries it: distinct values and how many
+/// times each repeats.
+fn knot_multiplicities(knots: &[f64]) -> (Vec<usize>, Vec<f64>) {
+    let (mut counts, mut values): (Vec<usize>, Vec<f64>) = (Vec::new(), Vec::new());
+    for &knot in knots {
+        match values.last() {
+            Some(&last) if (knot - last).abs() <= 1e-12 * last.abs().max(1.0) => {
+                *counts.last_mut().expect("paired with values") += 1;
+            }
+            _ => {
+                counts.push(1);
+                values.push(knot);
+            }
+        }
+    }
+    (counts, values)
+}
+
+/// Writes B-spline patches as an AP214 surface model: each patch one
+/// `ADVANCED_FACE` on a `B_SPLINE_SURFACE_WITH_KNOTS`, bounded by its
+/// trim loops, in an `OPEN_SHELL` of its own, all gathered in one
+/// `SHELL_BASED_SURFACE_MODEL`.
+///
+/// Open shells and not a solid, deliberately. Nothing is yet sewn to a
+/// patch — the analytic faces around it close only a fraction of their
+/// own edges (see the rebuild's shell) — so a `MANIFOLD_SOLID_BREP` would
+/// be a claim the model cannot back. The patches go out as the trimmed
+/// surfaces they are, for a receiving system to knit to its own solid.
+///
+/// Each trim loop is split into a few `EDGE_CURVE`s over `POLYLINE`s whose
+/// points are the loop's parameters evaluated on the surface, so every
+/// trim point lies on its face exactly. The face's sense and its bounds'
+/// orientation both follow the patch's material side.
+pub fn write_spline_patches(patches: &[crate::freeform::SplinePatch], product: &str) -> String {
+    /// Edges per trim loop: more than one so no edge is closed on itself,
+    /// which some readers handle poorly; few, so the topology stays small.
+    const EDGES_PER_LOOP: usize = 4;
+    let mut file = StepWriter::new(product);
+    let mut shells = Vec::new();
+    for patch in patches {
+        let surface = &patch.fit.surface;
+        let rows: Vec<String> = (0..surface.count_u)
+            .map(|i| {
+                let row: Vec<u64> = (0..surface.count_v)
+                    .map(|j| file.point(surface.control[i * surface.count_v + j]))
+                    .collect();
+                format!("({})", ids(&row))
+            })
+            .collect();
+        let (mults_u, knots_u) = knot_multiplicities(&surface.knots_u);
+        let (mults_v, knots_v) = knot_multiplicities(&surface.knots_v);
+        let list = |values: &[usize]| {
+            values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let reals = |values: &[f64]| {
+            values
+                .iter()
+                .map(|&v| real(v))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let surface_id = file.entity(format!(
+            "B_SPLINE_SURFACE_WITH_KNOTS('',{},{},({}),.UNSPECIFIED.,.F.,.F.,.F.,({}),({}),({}),({}),\
+             .UNSPECIFIED.)",
+            surface.degree_u,
+            surface.degree_v,
+            rows.join(","),
+            list(&mults_u),
+            list(&mults_v),
+            reals(&knots_u),
+            reals(&knots_v),
+        ));
+        let mut bounds = Vec::new();
+        for (index, ring) in patch.loops.iter().enumerate() {
+            if ring.len() < 3 {
+                continue;
+            }
+            let points: Vec<Point3> = ring.iter().map(|&(u, v)| surface.evaluate(u, v)).collect();
+            let pieces = EDGES_PER_LOOP.min(points.len());
+            let breaks: Vec<usize> = (0..pieces).map(|k| k * points.len() / pieces).collect();
+            let vertices: Vec<u64> = breaks
+                .iter()
+                .map(|&at| {
+                    let point = file.point(points[at]);
+                    file.entity(format!("VERTEX_POINT('',#{point})"))
+                })
+                .collect();
+            let mut oriented = Vec::new();
+            for k in 0..pieces {
+                let (start, end) = (
+                    breaks[k],
+                    breaks.get(k + 1).copied().unwrap_or(points.len()),
+                );
+                let run: Vec<u64> = (start..=end)
+                    .map(|at| file.point(points[at % points.len()]))
+                    .collect();
+                let polyline = file.entity(format!("POLYLINE('',({}))", ids(&run)));
+                let edge = file.entity(format!(
+                    "EDGE_CURVE('',#{},#{},#{polyline},.T.)",
+                    vertices[k],
+                    vertices[(k + 1) % pieces]
+                ));
+                oriented.push(file.entity(format!("ORIENTED_EDGE('',*,*,#{edge},.T.)")));
+            }
+            let edge_loop = file.entity(format!("EDGE_LOOP('',({}))", ids(&oriented)));
+            let kind = if index == 0 {
+                "FACE_OUTER_BOUND"
+            } else {
+                "FACE_BOUND"
+            };
+            let sense = if patch.outward { ".T." } else { ".F." };
+            bounds.push(file.entity(format!("{kind}('',#{edge_loop},{sense})")));
+        }
+        if bounds.is_empty() {
+            continue;
+        }
+        let face = file.entity(format!(
+            "ADVANCED_FACE({},({}),#{surface_id},{})",
+            quoted(&format!("freeform #{}", patch.feature)),
+            ids(&bounds),
+            if patch.outward { ".T." } else { ".F." }
+        ));
+        shells.push(file.entity(format!(
+            "OPEN_SHELL({},(#{face}))",
+            quoted(&format!("freeform #{}", patch.feature))
+        )));
+    }
+    let model = file.entity(format!(
+        "SHELL_BASED_SURFACE_MODEL({},({}))",
+        quoted(product),
+        ids(&shells)
+    ));
+    file.finish(
+        &[model],
+        "MANIFOLD_SURFACE_SHAPE_REPRESENTATION",
+        "Artificer scan-to-CAD freeform surfaces: trimmed B-spline faces, not a solid",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1647,162 @@ mod tests {
             (area - expected).abs() < 0.05 * expected,
             "band area {area} vs {expected}"
         );
+    }
+
+    #[test]
+    fn reals_carry_a_point_and_an_uppercase_exponent() {
+        assert_eq!(real(1.0), "1.0");
+        assert_eq!(real(-0.5), "-0.5");
+        assert_eq!(real(1.0e-7), "1.E-7");
+        assert_eq!(real(f64::NAN), "0.");
+        let (counts, values) = knot_multiplicities(&[0.0, 0.0, 0.0, 0.0, 2.5, 5.0, 5.0, 5.0, 5.0]);
+        assert_eq!(counts, vec![4, 1, 4]);
+        assert_eq!(values, vec![0.0, 2.5, 5.0]);
+    }
+
+    /// A trimmed patch written out and read back: every reference
+    /// resolves, the surface evaluates exactly as the one written, and
+    /// every trim point lies on it.
+    #[test]
+    fn spline_patches_write_as_trimmed_bspline_faces_that_read_back_exactly() {
+        use crate::bspline::{BSplineSurface, SplineFitOptions, fit_surface};
+        let bump = |x: f64, y: f64| 3.0 * (-(x * x + y * y) / 100.0).exp() + 0.02 * x;
+        let at = |i: usize, j: usize| {
+            let (x, y) = (-20.0 + i as f64, -15.0 + j as f64);
+            Point3::new(x, y, bump(x, y))
+        };
+        let mut points = Vec::new();
+        let mut faces = Vec::new();
+        for i in 0..=40 {
+            for j in 0..=30 {
+                points.push(at(i, j));
+                if i < 40 && j < 30 {
+                    for [a, b, c] in [
+                        [at(i, j), at(i + 1, j), at(i + 1, j + 1)],
+                        [at(i, j), at(i + 1, j + 1), at(i, j + 1)],
+                    ] {
+                        let cross = (b - a).cross(c - a);
+                        faces.push((a, cross / cross.length(), cross.length() / 2.0));
+                    }
+                }
+            }
+        }
+        let fit = fit_surface(&points, &faces, 0.05, 0.0, &SplineFitOptions::default())
+            .expect("a bump fits");
+        let ((u0, u1), (v0, v1)) = fit.surface.domain();
+        let (cu, cv) = ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
+        let outer = vec![
+            (u0 + 1.0, v0 + 1.0),
+            (u1 - 1.0, v0 + 1.0),
+            (u1 - 1.0, v1 - 1.0),
+            (u0 + 1.0, v1 - 1.0),
+        ];
+        let hole = vec![
+            (cu - 3.0, cv - 3.0),
+            (cu - 3.0, cv + 3.0),
+            (cu + 3.0, cv + 3.0),
+            (cu + 3.0, cv - 3.0),
+        ];
+        let patch = crate::freeform::SplinePatch::new(3, 1200.0, fit, vec![outer, hole], true);
+        let text = write_spline_patches(std::slice::from_ref(&patch), "bump");
+        assert!(text.starts_with("ISO-10303-21;"));
+        let graph = parse_graph(text.as_bytes()).expect("the file parses");
+        fn references(value: &Value, out: &mut Vec<u64>) {
+            match value {
+                Value::Ref(id) => out.push(*id),
+                Value::List(items) => items.iter().for_each(|item| references(item, out)),
+                _ => {}
+            }
+        }
+        for (id, entity) in &graph.entities {
+            let mut found = Vec::new();
+            entity
+                .args
+                .iter()
+                .for_each(|arg| references(arg, &mut found));
+            for target in found {
+                assert!(
+                    graph.entities.contains_key(&target) || text.contains(&format!("#{target}=(")),
+                    "#{id} {} refers to missing #{target}",
+                    entity.kind
+                );
+            }
+        }
+        let count = |kind: &str| graph.entities.values().filter(|e| e.kind == kind).count();
+        assert_eq!(count("ADVANCED_FACE"), 1);
+        assert_eq!(count("B_SPLINE_SURFACE_WITH_KNOTS"), 1);
+        assert_eq!(count("FACE_OUTER_BOUND"), 1);
+        assert_eq!(count("FACE_BOUND"), 1);
+        assert_eq!(count("EDGE_LOOP"), 2);
+        assert_eq!(count("OPEN_SHELL"), 1);
+        assert_eq!(count("SHELL_BASED_SURFACE_MODEL"), 1);
+        // Read the surface back from nothing but the file.
+        let entity = graph
+            .entities
+            .values()
+            .find(|e| e.kind == "B_SPLINE_SURFACE_WITH_KNOTS")
+            .expect("written");
+        let number = |value: &Value| value.as_num().expect("a number");
+        let (degree_u, degree_v) = (
+            number(entity.arg(1)) as usize,
+            number(entity.arg(2)) as usize,
+        );
+        let rows = entity.arg(3).as_list().expect("a net");
+        let mut control = Vec::new();
+        for row in rows {
+            for point in row.as_list().expect("a row") {
+                control.push(
+                    graph
+                        .point(point.as_ref().expect("a point"))
+                        .expect("resolves"),
+                );
+            }
+        }
+        let expand = |mults: &Value, knots: &Value| -> Vec<f64> {
+            let mults = mults.as_list().expect("multiplicities");
+            let knots = knots.as_list().expect("knots");
+            mults
+                .iter()
+                .zip(knots)
+                .flat_map(|(m, k)| std::iter::repeat_n(number(k), number(m) as usize))
+                .collect()
+        };
+        let read = BSplineSurface {
+            degree_u,
+            degree_v,
+            knots_u: expand(entity.arg(8), entity.arg(10)),
+            knots_v: expand(entity.arg(9), entity.arg(11)),
+            count_u: rows.len(),
+            count_v: control.len() / rows.len(),
+            control,
+        };
+        let written = &patch.fit.surface;
+        for i in 0..=10 {
+            for j in 0..=10 {
+                let u = u0 + (u1 - u0) * i as f64 / 10.0;
+                let v = v0 + (v1 - v0) * j as f64 / 10.0;
+                let gap = (read.evaluate(u, v) - written.evaluate(u, v)).length();
+                assert!(
+                    gap < 1e-9,
+                    "read-back surface differs by {gap} at ({u}, {v})"
+                );
+            }
+        }
+        // The trim lies on the face it bounds.
+        for polyline in graph.entities.values().filter(|e| e.kind == "POLYLINE") {
+            for point in polyline.arg(1).as_list().expect("points") {
+                let p = graph
+                    .point(point.as_ref().expect("a point"))
+                    .expect("resolves");
+                let landed = read.closest_point(p);
+                assert!(
+                    landed.distance.abs() < 1e-7,
+                    "trim point {:?} off by {}",
+                    p,
+                    landed.distance
+                );
+            }
+        }
     }
 
     /// The wheel-spacer STEP the importer was scoped against, when it
