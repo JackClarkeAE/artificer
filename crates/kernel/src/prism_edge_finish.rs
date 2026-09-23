@@ -468,8 +468,14 @@ fn blend_loops(
                 let shared = shared_segment(*first_vertex, *second_vertex, count);
                 if let Some(shared) = shared {
                     let original = segment_length(segments[shared]);
-                    let consumed = consumed_length(segments[shared], *first_vertex, first_blend)
-                        + consumed_length(segments[shared], *second_vertex, second_blend);
+                    let consumed =
+                        consumed_length(segments[shared], shared, *first_vertex, first_blend)
+                            + consumed_length(
+                                segments[shared],
+                                shared,
+                                *second_vertex,
+                                second_blend,
+                            );
                     if consumed > original - precision.min_feature_size {
                         return Err(PrismEdgeFinishError::DistanceInvalid);
                     }
@@ -493,18 +499,24 @@ fn shared_segment(first_vertex: usize, second_vertex: usize, count: usize) -> Op
     }
 }
 
-/// How much of `segment` a blend at `vertex` consumes.
-fn consumed_length(segment: Segment, vertex: usize, blend: &CornerBlend) -> f64 {
-    // A corner blend trims the end of its incoming neighbour and the start of
-    // its outgoing one; whichever role this segment plays, the consumed length
-    // is the difference from the original.
-    let original = segment_length(segment);
-    let incoming_left = segment_length(blend.trimmed_incoming);
-    let outgoing_left = segment_length(blend.trimmed_outgoing);
-    let _ = vertex;
-    (original - incoming_left)
-        .abs()
-        .min((original - outgoing_left).abs())
+/// How much of `segment`, the loop's segment `index`, a blend at `vertex`
+/// consumes.
+///
+/// A corner blend trims the end of its incoming neighbour and the start of
+/// its outgoing one. The segment starting at `vertex` is the outgoing one,
+/// and any other segment this is asked about is the incoming one, so the
+/// consumed length is the original less that neighbour's trimmed length —
+/// and only that neighbour's. Taking whichever difference came out smaller
+/// could subtract the *other* neighbour's remnant from this segment's
+/// length, and a long neighbour's remnant can land close to it, so two
+/// blends that overlap on a short segment passed as though they fit.
+fn consumed_length(segment: Segment, index: usize, vertex: usize, blend: &CornerBlend) -> f64 {
+    let trimmed = if index == vertex {
+        blend.trimmed_outgoing
+    } else {
+        blend.trimmed_incoming
+    };
+    (segment_length(segment) - segment_length(trimmed)).max(0.0)
 }
 
 /// Applies every resolved blend to one loop in order.
@@ -626,4 +638,37 @@ fn protocol_point(point: Point3) -> artificer_protocol::Point3 {
 
 fn protocol_vector(vector: Vector3) -> ProtocolVector3 {
     ProtocolVector3::new(vector.x, vector.y, vector.z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::corner_blend::ConsumedNeighbours;
+
+    fn line(start: (f64, f64), end: (f64, f64)) -> Segment {
+        Segment::Line {
+            start: Point2::new(start.0, start.1),
+            end: Point2::new(end.0, end.1),
+        }
+    }
+
+    #[test]
+    fn a_shared_segment_is_charged_its_own_trim_and_no_other() {
+        // Corner 1 of the loop (0,0) → (4,0) → (4,5): a chamfer setting back
+        // 2.5 along both neighbours. The outgoing neighbour, (4,0) → (4,5),
+        // keeps 2.5 of its 5; the incoming one, 4 long, keeps 1.5.
+        let incoming = line((0.0, 0.0), (4.0, 0.0));
+        let outgoing = line((4.0, 0.0), (4.0, 5.0));
+        let blend = CornerBlend {
+            trimmed_incoming: line((0.0, 0.0), (1.5, 0.0)),
+            trimmed_outgoing: line((4.0, 2.5), (4.0, 5.0)),
+            connector: line((1.5, 0.0), (4.0, 2.5)),
+            consumed: ConsumedNeighbours::default(),
+        };
+        // Segment 0 is the incoming one and gives up 2.5 of its 4. The
+        // outgoing neighbour's remnant, 2.5 long, is 1.5 short of it, and
+        // that smaller difference is what used to be charged instead.
+        assert!((consumed_length(incoming, 0, 1, &blend) - 2.5).abs() < 1.0e-12);
+        assert!((consumed_length(outgoing, 1, 1, &blend) - 2.5).abs() < 1.0e-12);
+    }
 }
