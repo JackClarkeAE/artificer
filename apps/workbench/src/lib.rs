@@ -32687,6 +32687,59 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// A drilled rim and a straight block edge picked for one fillet.
+    ///
+    /// The two kinds cannot share a feature, so the preview's kernel ladder
+    /// reaches the faceted tier. Its removal volume used to grow without bound
+    /// there — minutes of work and then a stack overflow, taking the window
+    /// with it while the user was only choosing edges. The tier now declines
+    /// at once, the preview comes back from the rungs past it, and the panel
+    /// still says why the pair cannot commit.
+    #[test]
+    fn a_drilled_rim_and_a_block_edge_preview_promptly_and_explain_themselves() {
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().expect("a body").get());
+        let top = app
+            .displayed
+            .as_ref()
+            .expect("a body")
+            .scene
+            .triangles
+            .iter()
+            .find(|triangle| triangle.role == FaceRole::PositiveZ)
+            .expect("a top face")
+            .source_face;
+        app.select_model_face(viewport::DocumentFaceSelection { body, face: top }, false);
+        app.stage_preset_feature(SolidFeaturePreset::Hole);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().expect("a body").get());
+        let (rim, straight) = a_rim_and_a_straight_edge(&app);
+        app.clear_model_entity_selection();
+        app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body,
+                edge: straight,
+            },
+            true,
+        );
+        app.edge_finish_distance = 0.2;
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(app.pending_operation.is_some());
+        let started = Instant::now();
+        let preview = app.current_edge_finish_preview();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the preview took {:?}",
+            started.elapsed()
+        );
+        assert!(preview.is_some(), "a refused set still previews");
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::MixedRimAndStraight
+        );
+    }
+
     /// The bootstrap block, and the three edges meeting at one of its corners.
     fn block_corner_edges(app: &KernelLabApp) -> Vec<EntityRef> {
         let scene = &app.displayed.as_ref().expect("the bootstrap body").scene;

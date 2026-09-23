@@ -317,6 +317,18 @@ impl BspNode {
         polygons
     }
 
+    /// How many polygons the tree holds, without cloning them.
+    fn polygon_count(&self) -> usize {
+        let mut count = 0;
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(node) = pending.pop() {
+            count += node.polygons.len();
+            pending.extend(node.front.as_deref());
+            pending.extend(node.back.as_deref());
+        }
+        count
+    }
+
     fn build(&mut self, polygons: Vec<Polygon>) {
         let mut pending: Vec<(&mut Self, Vec<Polygon>)> = vec![(self, polygons)];
         while let Some((node, polygons)) = pending.pop() {
@@ -410,6 +422,20 @@ fn union(mut left: BspNode, mut right: BspNode) -> BspNode {
 /// input this tier is known to have certified.
 const MAX_SOURCE_POLYGONS: usize = 4_096;
 
+/// The largest removal volume this tier will build, in polygons, counted both
+/// as the sweeps arrive and as their union grows.
+///
+/// A curved edge is swept one display chord at a time, and neighbouring
+/// sweeps overlap by design, so every union splits the volume so far along
+/// the next sweep's near-coplanar walls. On a drilled rim beside a block edge
+/// that fragmentation added some two hundred polygons per sweep and grew
+/// without bound — past forty thousand polygons and three minutes with no end
+/// in sight, and before the iterative walks, a stack overflow that took the
+/// process with it. A removal volume larger than the body it is cut from buys
+/// nothing, so the tier declines past the body limit, and the ladder publishes
+/// the reason the exact rungs gave.
+const MAX_CUTTER_POLYGONS: usize = MAX_SOURCE_POLYGONS;
+
 pub(crate) fn finish_edges(
     source_topology: Option<&Topology>,
     scene: &DebugScene,
@@ -483,8 +509,9 @@ pub(crate) fn finish_edges(
     // union has material to build the mitre from. Everywhere else that overlap
     // buys nothing.
     let shared_endpoints = shared_selection_endpoints(scene, targets, epsilon);
+    let mut sweeps = Vec::new();
     for target in targets {
-        for polygons in edge_finish_cutters(
+        sweeps.extend(edge_finish_cutters(
             scene,
             targets,
             *target,
@@ -493,13 +520,21 @@ pub(crate) fn finish_edges(
             cutter_precision,
             epsilon,
             &shared_endpoints,
-        )? {
-            let cutter = BspNode::from_polygons(polygons, epsilon);
-            cutters = Some(match cutters {
-                None => cutter,
-                Some(current) => union(current, cutter),
-            });
+        )?);
+    }
+    if sweeps.iter().map(Vec::len).sum::<usize>() > MAX_CUTTER_POLYGONS {
+        return None;
+    }
+    for polygons in sweeps {
+        let cutter = BspNode::from_polygons(polygons, epsilon);
+        let joined = match cutters {
+            None => cutter,
+            Some(current) => union(current, cutter),
+        };
+        if joined.polygon_count() > MAX_CUTTER_POLYGONS {
+            return None;
         }
+        cutters = Some(joined);
     }
     let result = subtract(BspNode::from_polygons(source_polygons, epsilon), cutters?);
     let conformed = conform_polygon_edges(result.all_polygons(), epsilon);
