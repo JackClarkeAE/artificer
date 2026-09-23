@@ -11,6 +11,11 @@ pub type ParsedArgs = (Vec<(String, Expression)>, Vec<Expression>);
 /// hundred lines of feature calls, never a deeply nested term; the limit
 /// exists so that a hostile `((((...` over the wire is an error rather than
 /// a stack overflow that takes the whole server with it.
+///
+/// Every link of a chain — each operator in `a + b + c`, each `.method` or
+/// `[index]` after a value — counts as a level too. The parser reads a
+/// chain in a loop, but the tree it builds is as deep as the chain is
+/// long, and evaluating or even dropping that tree recurses through it.
 pub const MAX_EXPRESSION_DEPTH: usize = 64;
 
 /// The deepest nesting of blocks — loop bodies and function bodies — the
@@ -400,21 +405,34 @@ impl Parser {
     }
 
     pub fn parse_expression(&mut self) -> Result<Expression, String> {
-        if self.depth >= MAX_EXPRESSION_DEPTH {
-            let (line, col) = self.current_span();
-            return Err(format!(
-                "Expression nested deeper than {MAX_EXPRESSION_DEPTH} levels at {line}:{col}"
-            ));
-        }
-        self.depth += 1;
+        self.deepen()?;
         let result = self.parse_add_sub();
         self.depth -= 1;
         result
     }
 
+    /// Goes one level deeper, refusing past [`MAX_EXPRESSION_DEPTH`]. The
+    /// caller gives the level back when it is done with it.
+    fn deepen(&mut self) -> Result<(), String> {
+        if self.depth >= MAX_EXPRESSION_DEPTH {
+            let (line, col) = self.current_span();
+            return Err(format!(
+                "Expression nested deeper than {MAX_EXPRESSION_DEPTH} levels (brackets, calls, arrays and every link of an operator or method chain each count as one) at {line}:{col}"
+            ));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    // The chain parsers below take a level for every link and give them all
+    // back when the chain ends. On an error nothing is given back: the
+    // parse stops there, and the parser with it.
+
     fn parse_add_sub(&mut self) -> Result<Expression, String> {
+        let depth = self.depth;
         let mut left = self.parse_mul_div()?;
         while matches!(self.peek(), Token::Plus | Token::Minus) {
+            self.deepen()?;
             let op = match self.advance() {
                 Token::Plus => BinaryOperator::Add,
                 Token::Minus => BinaryOperator::Sub,
@@ -427,12 +445,15 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth = depth;
         Ok(left)
     }
 
     fn parse_mul_div(&mut self) -> Result<Expression, String> {
+        let depth = self.depth;
         let mut left = self.parse_unary()?;
         while matches!(self.peek(), Token::Star | Token::Slash) {
+            self.deepen()?;
             let op = match self.advance() {
                 Token::Star => BinaryOperator::Mul,
                 Token::Slash => BinaryOperator::Div,
@@ -445,6 +466,7 @@ impl Parser {
                 right: Box::new(right),
             };
         }
+        self.depth = depth;
         Ok(left)
     }
 
@@ -462,10 +484,12 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Result<Expression, String> {
+        let depth = self.depth;
         let mut expr = self.parse_primary()?;
 
         loop {
             if self.peek() == &Token::Dot {
+                self.deepen()?;
                 self.advance(); // '.'
                 let (line, col) = self.current_span();
                 let method = self.expect_ident("a method name")?;
@@ -485,6 +509,7 @@ impl Parser {
                     col,
                 };
             } else if self.peek() == &Token::LBracket {
+                self.deepen()?;
                 let (line, col) = self.current_span();
                 self.advance(); // '['
                 let index = self.parse_expression()?;
@@ -500,6 +525,7 @@ impl Parser {
             }
         }
 
+        self.depth = depth;
         Ok(expr)
     }
 

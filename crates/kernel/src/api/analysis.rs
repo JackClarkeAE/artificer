@@ -531,18 +531,33 @@ pub fn study_session_steps(
     ))
 }
 
+/// The most subjects one study of a session may name. Every pair is
+/// measured, so the work grows with the square of the count, and the study
+/// holds the session while it runs; an assembly of a few dozen parts is
+/// what a study is for, and one past this is a batch job, not a request.
+pub const MAX_STUDY_SUBJECTS: usize = 64;
+
 /// The subjects named steps of a session stand for, at the identity.
 ///
 /// Two is the minimum: one body has nothing to be measured against, and a
 /// study of it would be a study of nothing. Nothing is implied by the
 /// session's current body, so the refusal lists the steps that could be
-/// named.
+/// named. [`MAX_STUDY_SUBJECTS`] is the maximum.
 pub fn session_subjects(
     session: &crate::api::session::Session,
     steps: &[String],
 ) -> Result<Vec<Subject>, crate::api::debug::ApiError> {
     use crate::api::debug::{ApiError, ApiErrorCode};
 
+    if steps.len() > MAX_STUDY_SUBJECTS {
+        return Err(ApiError::new(
+            ApiErrorCode::InvalidInput,
+            format!(
+                "A study measures at most {MAX_STUDY_SUBJECTS} subjects, every pair of them; this one names {}",
+                steps.len()
+            ),
+        ));
+    }
     if steps.len() < 2 {
         let available = if session.step_order.is_empty() {
             "this session has no steps yet".to_owned()

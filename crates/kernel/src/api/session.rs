@@ -780,12 +780,21 @@ impl Session {
                 height,
                 ..
             } => {
+                // An axis with no direction, or one that is not a number,
+                // is refused rather than read as +Z: a cylinder standing
+                // some other way than the one asked for is a wrong part
+                // that nothing downstream would notice.
                 let norm = (axis.x * axis.x + axis.y * axis.y + axis.z * axis.z).sqrt();
-                let axis_unit = if norm > 1e-9 {
-                    Vector3::new(axis.x / norm, axis.y / norm, axis.z / norm)
-                } else {
-                    Vector3::new(0.0, 0.0, 1.0)
-                };
+                if !norm.is_finite() || norm <= 1e-9 {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        format!(
+                            "A cylinder's axis must be a finite, non-zero direction; got [{}, {}, {}]",
+                            axis.x, axis.y, axis.z
+                        ),
+                    ));
+                }
+                let axis_unit = Vector3::new(axis.x / norm, axis.y / norm, axis.z / norm);
 
                 // Any world axis not parallel to the cylinder axis seeds the
                 // frame; projecting its component along the axis away makes
@@ -1414,13 +1423,24 @@ impl Session {
             })
     }
 
+    /// Re-executes the step most recently undone.
+    ///
+    /// Executing a command clears the redo stack, as a new edit must: the
+    /// steps undone before it no longer follow from the session. A redo is
+    /// not a new edit, so the steps still to redo are set aside while it
+    /// runs and put back after it, and a redo that fails keeps its step on
+    /// the stack rather than losing it.
     pub fn redo(&mut self) -> Result<(), ApiError> {
-        if let Some(entry) = self.redo_stack.pop() {
-            self.execute(entry.command, &CancellationToken::default())?;
-            Ok(())
-        } else {
-            Err(ApiError::new(ApiErrorCode::SessionError, "Nothing to redo"))
+        let Some(entry) = self.redo_stack.pop() else {
+            return Err(ApiError::new(ApiErrorCode::SessionError, "Nothing to redo"));
+        };
+        let pending = std::mem::take(&mut self.redo_stack);
+        let outcome = self.execute(entry.command.clone(), &CancellationToken::default());
+        self.redo_stack = pending;
+        if outcome.is_err() {
+            self.redo_stack.push(entry);
         }
+        outcome.map(|_| ())
     }
 
     pub fn export_journal(&self) -> Result<String, ApiError> {

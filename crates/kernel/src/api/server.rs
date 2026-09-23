@@ -515,6 +515,13 @@ impl SharedSession {
                     },
                     (None, fit) => fit,
                 };
+                // Sized before anything is built: the sweep holds the
+                // session for as long as it runs.
+                if let Err(message) =
+                    crate::api::sweep::check_sweep_size(request.subjects.len(), request.steps.len())
+                {
+                    return JsonRpcResponse::err(id, INVALID_PARAMS, message);
+                }
                 let subjects =
                     match crate::api::analysis::session_subjects(&session, &request.subjects) {
                         Ok(subjects) => subjects,
@@ -805,10 +812,18 @@ pub fn serve_stdio() -> io::Result<()> {
 
 /// The server loop itself, on whatever thread calls it.
 fn serve_stdio_here() -> io::Result<()> {
+    serve_lines(io::stdin().lock(), io::stdout())
+}
+
+/// Runs the JSON-RPC server over any line-oriented stream, on the calling
+/// thread, with a session of its own: one request per line of `input`, one
+/// response per line of `output`, until `input` ends.
+///
+/// [`serve_stdio`] is this over standard input and output, on a thread
+/// with the stack the evaluator needs; a host serving another stream gives
+/// its thread the same.
+pub fn serve_lines(mut input: impl BufRead, mut output: impl Write) -> io::Result<()> {
     let session = SharedSession::new();
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut input = stdin.lock();
     let mut line = Vec::new();
 
     loop {
@@ -820,11 +835,14 @@ fn serve_stdio_here() -> io::Result<()> {
         if read == 0 {
             break;
         }
-        let response = if line.len() > MAX_REQUEST_BYTES {
-            // Drain the rest of the oversized line so the next request
+        // A line is too long when more than the limit comes before its
+        // newline. A request of exactly the limit and its newline is
+        // `MAX_REQUEST_BYTES + 1` bytes read and is not too long.
+        let complete = line.last() == Some(&b'\n');
+        let response = if !complete && line.len() > MAX_REQUEST_BYTES {
+            // Discard the rest of the oversized line so the next request
             // starts on a boundary, then refuse this one.
-            let mut rest = Vec::new();
-            input.read_until(b'\n', &mut rest)?;
+            discard_line(&mut input)?;
             let response = JsonRpcResponse::err(
                 None,
                 INVALID_REQUEST,
@@ -850,10 +868,39 @@ fn serve_stdio_here() -> io::Result<()> {
             )
         };
         if let Some(response) = response {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
+            writeln!(output, "{response}")?;
+            output.flush()?;
         }
     }
 
     Ok(())
+}
+
+/// Discards input up to and including the next newline, or to the end.
+///
+/// The rest of a line is skipped a buffer at a time and never collected,
+/// so a line of any length costs no more memory than the reader's own
+/// buffer: gathering it to throw it away would be the out-of-memory the
+/// request limit exists to prevent.
+fn discard_line(input: &mut impl BufRead) -> io::Result<()> {
+    loop {
+        let buffer = match input.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                input.consume(newline + 1);
+                return Ok(());
+            }
+            None => {
+                let length = buffer.len();
+                input.consume(length);
+            }
+        }
+    }
 }

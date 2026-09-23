@@ -11,7 +11,10 @@
 //! Every builtin below maps onto one API command, so anything the JSON-RPC
 //! server can do a script can do: primitives, sketches on a plane or a face
 //! with extrusions and revolves, drills, push-pulls, fillets and chamfers,
-//! mirrors, patterns, and the three Booleans. Angles are degrees throughout.
+//! mirrors, patterns, and the three Booleans. Angles are degrees throughout;
+//! an arc also takes its ends in radians, as `start_radians` and
+//! `end_radians`, which is how a decompiled script writes an angle that no
+//! number of degrees converts to exactly.
 //!
 //! Reusable geometry lives in functions, which take typed values, faces and
 //! bodies, build steps under labels scoped to the call, and return a body
@@ -181,7 +184,7 @@ pub fn script_parameters(source: &str) -> Result<Vec<ScriptParameter>, ScriptErr
     let ast_nodes = parser.parse_program().map_err(ScriptError::parse)?;
     let overrides = BTreeMap::new();
     let mut interp = Interp::new(&overrides, &NoModules);
-    let mut env = prelude();
+    let mut env = Env::over(Rc::new(prelude()));
     let mut parameters = Vec::new();
     for node in ast_nodes {
         if let AstNode::ParamDecl {
@@ -433,6 +436,33 @@ pub const MAX_ARRAY_ELEMENTS: usize = 100_000;
 /// makes a handful of edges under one role, not thousands.
 pub const MAX_EDGE_SELECTORS: usize = 4096;
 
+/// How deeply array values may nest. A literal is bounded by the parser's
+/// nesting limit, but an array wrapped in an array through a variable, a
+/// level per statement or per loop iteration, is bounded by nothing else;
+/// past this, a value would be too deep to check or even to drop.
+pub const MAX_ARRAY_DEPTH: usize = 32;
+
+/// The deepest the evaluator goes. Every expression inside another, every
+/// block inside another and every function body inside the call that runs
+/// it is one level. The parser bounds each construct on its own, but a
+/// chain of functions each nesting expressions multiplies those bounds;
+/// this one bounds them together, which is what keeps a compilation inside
+/// a thread's default stack wherever it runs. At this depth the evaluator
+/// takes about half a megabyte of stack at worst in an optimised build and
+/// under a megabyte and a half in an unoptimised one, so it fits the two
+/// megabytes a spawned thread gets and the one a Windows main thread does.
+/// The evaluator's own functions are kept small for the same reason.
+pub const MAX_EVALUATION_DEPTH: usize = 256;
+
+/// The most work one compilation may do, in steps. Every expression
+/// evaluated and every block run is a step; so is every item, at every
+/// level, of an array a call receives or `edges(count:)` makes, and every
+/// byte of text a call receives or a literal or a join makes. The loop,
+/// call-depth and size limits each allow their pieces; this bounds what
+/// the pieces multiply to, such as a function calling the next ten times
+/// a level, or one large array handed to every iteration of a loop.
+pub const MAX_EVALUATION_STEPS: usize = 10_000_000;
+
 /// Evaluates a `.art` script with optional parameter overrides, returning
 /// its commands and the selector names it bound. Modules are not loaded.
 pub fn compile_program(
@@ -454,13 +484,32 @@ pub fn compile_program_with(
     let ast_nodes = parser.parse_program().map_err(ScriptError::parse)?;
 
     let mut interp = Interp::new(param_overrides, modules);
-    let mut env = prelude();
+    let mut env = Env::over(Rc::clone(&interp.globals));
     interp.run_block(&ast_nodes, &mut env, Scope::TopLevel)?;
-    Ok(interp.program)
+    let mut program = interp.program;
+    keep_last_binding(&mut program.names);
+    Ok(program)
+}
+
+/// Keeps, for every name bound more than once, only its last binding, in
+/// the order of those last bindings: a rebinding replaces the name rather
+/// than listing it twice. Done once at the end rather than at every `let`,
+/// which would cost the whole list per binding.
+fn keep_last_binding(names: &mut Vec<(String, EntitySelector)>) {
+    let mut last = BTreeMap::new();
+    for (index, (name, _)) in names.iter().enumerate() {
+        last.insert(name.clone(), index);
+    }
+    let mut index = 0;
+    names.retain(|(name, _)| {
+        let keep = last.get(name) == Some(&index);
+        index += 1;
+        keep
+    });
 }
 
 /// The names every script starts with.
-fn prelude() -> BTreeMap<String, Value> {
+fn prelude() -> Names {
     let mut env = BTreeMap::new();
     env.insert("pi".to_owned(), Value::Number(std::f64::consts::PI));
     env
@@ -511,7 +560,42 @@ const BUILTINS: &[&str] = &[
     "clamp",
 ];
 
-type Env = BTreeMap<String, Value>;
+/// Names and the values they hold.
+type Names = BTreeMap<String, Value>;
+
+/// The names a block sees: its own, and beneath them the script's top-level
+/// names, shared between every block that sees them rather than copied into
+/// each. A function body or a module sees the top-level names as of the
+/// last completed statement; at the top level itself, `local` holds only
+/// what the statement being run has bound, and it is folded into `shared`
+/// when the statement completes.
+#[derive(Clone, Debug)]
+struct Env {
+    /// Names bound in this block: a function's parameters and lets, a
+    /// module's constants, or the top-level names the current statement
+    /// has bound so far.
+    local: Names,
+    /// The names beneath.
+    shared: Rc<Names>,
+}
+
+impl Env {
+    /// A block with no names of its own over `shared`.
+    fn over(shared: Rc<Names>) -> Self {
+        Self {
+            local: Names::new(),
+            shared,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&Value> {
+        self.local.get(name).or_else(|| self.shared.get(name))
+    }
+
+    fn insert(&mut self, name: String, value: Value) {
+        self.local.insert(name, value);
+    }
+}
 
 /// Where a block runs: the script itself, a module's top level, or the
 /// body of a function or loop.
@@ -536,11 +620,15 @@ struct Interp<'a> {
     modules: &'a dyn ModuleResolver,
     program: ScriptProgram,
     budget: usize,
+    /// How many levels deep evaluation is: see [`MAX_EVALUATION_DEPTH`].
+    depth: usize,
+    /// The steps left to take: see [`MAX_EVALUATION_STEPS`].
+    steps: usize,
     /// Every user function by name, with the module that declared it.
     functions: BTreeMap<String, (Rc<FnDecl>, String)>,
     /// The top-level names as of the last completed statement: what a
     /// function body sees beside its own parameters.
-    globals: Env,
+    globals: Rc<Names>,
     /// The label prefix of the call being run, innermost last.
     scopes: Vec<String>,
     /// The functions being run, outermost first, for recursion refusals.
@@ -564,8 +652,10 @@ impl<'a> Interp<'a> {
                 parameters: BTreeMap::new(),
             },
             budget: MAX_LOOP_ITERATIONS,
+            depth: 0,
+            steps: MAX_EVALUATION_STEPS,
             functions: BTreeMap::new(),
-            globals: prelude(),
+            globals: Rc::new(prelude()),
             scopes: Vec::new(),
             call_stack: Vec::new(),
             call_counts: BTreeMap::new(),
@@ -581,23 +671,73 @@ impl<'a> Interp<'a> {
         scoped(self.scopes.last().map(String::as_str), raw)
     }
 
+    /// Takes `steps` from the work budget, refusing once it is spent.
+    fn charge(&mut self, steps: usize) -> Result<(), ScriptError> {
+        if let Some(left) = self.steps.checked_sub(steps) {
+            self.steps = left;
+            return Ok(());
+        }
+        self.steps = 0;
+        Err(ScriptError::eval(format!(
+            "The script takes more than {MAX_EVALUATION_STEPS} steps to evaluate; a step is an expression evaluated, a block run, or an item or byte of text a call receives or a join builds"
+        )))
+    }
+
+    /// Goes one level deeper, refusing past [`MAX_EVALUATION_DEPTH`], and
+    /// pays the step. Every `descend` is matched by `self.depth -= 1` when
+    /// the level is left, whether it succeeded or not.
+    fn descend(&mut self) -> Result<(), ScriptError> {
+        if self.depth >= MAX_EVALUATION_DEPTH {
+            return Err(ScriptError::eval(format!(
+                "The script nests expressions, blocks and function calls more than {MAX_EVALUATION_DEPTH} levels deep"
+            )));
+        }
+        self.charge(1)?;
+        self.depth += 1;
+        Ok(())
+    }
+
     fn run_block(
         &mut self,
         nodes: &[AstNode],
         env: &mut Env,
         scope: Scope,
     ) -> Result<Flow, ScriptError> {
+        self.descend()?;
+        let mut flow = Ok(Flow::Next);
         for node in nodes {
-            let flow = self.run_node(node, env, scope)?;
-            if scope == Scope::TopLevel {
-                self.globals = env.clone();
+            flow = self.run_node(node, env, scope);
+            if scope == Scope::TopLevel && flow.is_ok() {
+                self.commit(env);
             }
-            if let Flow::Return(value) = flow {
-                return Ok(Flow::Return(value));
+            if !matches!(flow, Ok(Flow::Next)) {
+                break;
             }
         }
-        Ok(Flow::Next)
+        self.depth -= 1;
+        flow
     }
+
+    /// Folds what a completed top-level statement bound into the shared
+    /// names, which function bodies see from here on. The names are shared
+    /// by nothing else between statements, so once the interpreter lets go
+    /// of its own handle they take the new bindings in place: a statement
+    /// costs what it bound, not the size of everything bound before it.
+    fn commit(&mut self, env: &mut Env) {
+        self.globals = Rc::default();
+        if !env.local.is_empty() {
+            let shared = Rc::make_mut(&mut env.shared);
+            for (name, value) in std::mem::take(&mut env.local) {
+                shared.insert(name, value);
+            }
+        }
+        self.globals = Rc::clone(&env.shared);
+    }
+
+    // Most functions from here to `build_builtin` recurse into one another
+    // as deep as a script nests. Each does one thing and hands the rest to a
+    // function of its own, so the frames on that path stay small even in an
+    // unoptimised build, where every local of a function has its own slot.
 
     fn run_node(
         &mut self,
@@ -614,72 +754,17 @@ impl<'a> Interp<'a> {
                 range,
                 description: _,
                 line,
-            } => {
-                if scope == Scope::Body {
-                    return Err(ScriptError::Eval {
-                        message:
-                            "A `param` is declared at the top of the script, not inside a loop or a function"
-                                .to_owned(),
-                        location: Some((*line, 1)),
-                    });
-                }
-                let value = self
-                    .param_value(name, param_type, default_value, range.as_ref(), env)
-                    .map_err(|error| error.at(*line, 1))?;
-                match &value {
-                    Value::Number(number) => {
-                        self.program.parameters.insert(name.clone(), *number);
-                    }
-                    Value::Bool(flag) => {
-                        self.program
-                            .parameters
-                            .insert(name.clone(), f64::from(u8::from(*flag)));
-                    }
-                    _ => {}
-                }
-                env.insert(name.clone(), value);
-            }
-            AstNode::LetBinding { name, value } => {
-                let evaluated = self.eval_expr(value, env)?;
-                match &evaluated {
-                    Value::Command(cmd) => {
-                        if scope == Scope::Module {
-                            return Err(module_builds_nothing(cmd.label()));
-                        }
-                        self.program.commands.push(cmd.clone());
-                        env.insert(name.clone(), Value::Step(StepLabel(cmd.label().to_owned())));
-                    }
-                    Value::Selector(selector) => {
-                        if scope == Scope::TopLevel {
-                            self.program.names.retain(|(existing, _)| existing != name);
-                            self.program.names.push((name.clone(), selector.clone()));
-                        }
-                        env.insert(name.clone(), evaluated);
-                    }
-                    Value::Body { faces, .. } => {
-                        if scope == Scope::TopLevel {
-                            for (face, selector) in faces {
-                                let full = format!("{name}.{face}");
-                                self.program.names.retain(|(existing, _)| existing != &full);
-                                self.program.names.push((full, selector.clone()));
-                            }
-                        }
-                        env.insert(name.clone(), evaluated);
-                    }
-                    _ => {
-                        env.insert(name.clone(), evaluated);
-                    }
-                }
-            }
-            AstNode::Statement(expr) => {
-                let evaluated = self.eval_expr(expr, env)?;
-                if let Value::Command(cmd) = evaluated {
-                    if scope == Scope::Module {
-                        return Err(module_builds_nothing(cmd.label()));
-                    }
-                    self.program.commands.push(cmd);
-                }
-            }
+            } => self.run_param(
+                name,
+                param_type,
+                default_value,
+                range.as_ref(),
+                *line,
+                env,
+                scope,
+            ),
+            AstNode::LetBinding { name, value } => self.run_let(name, value, env, scope),
+            AstNode::Statement(expr) => self.run_statement(expr, env, scope),
             AstNode::For {
                 variable,
                 start,
@@ -687,119 +772,280 @@ impl<'a> Interp<'a> {
                 body,
                 line,
                 col,
-            } => {
-                let at = |error: ScriptError| error.at(*line, *col);
-                if scope == Scope::Module {
-                    return Err(at(ScriptError::eval(
-                        "A module builds nothing at its top level; put the loop in a function",
-                    )));
-                }
-                let start = self
-                    .eval_expr(start, env)
-                    .map_err(at)?
-                    .as_number()
-                    .map_err(at)?;
-                let end = self
-                    .eval_expr(end, env)
-                    .map_err(at)?
-                    .as_number()
-                    .map_err(at)?;
-                if start.fract() != 0.0 || end.fract() != 0.0 {
-                    return Err(at(ScriptError::eval(format!(
-                        "A `for` range counts whole numbers; got {start}..{end}"
-                    ))));
-                }
-                let mut index = start;
-                while index < end {
-                    if self.budget == 0 {
-                        return Err(at(ScriptError::eval(format!(
-                            "The script runs more than {MAX_LOOP_ITERATIONS} loop iterations"
-                        ))));
-                    }
-                    self.budget -= 1;
-                    env.insert(variable.clone(), Value::Number(index));
-                    if let Flow::Return(value) = self.run_block(body, env, Scope::Body)? {
-                        return Ok(Flow::Return(value));
-                    }
-                    index += 1.0;
-                }
-            }
-            AstNode::FnDecl(decl) => {
-                let at = |error: ScriptError| error.at(decl.line, decl.col);
-                if scope == Scope::Body {
-                    return Err(at(ScriptError::eval(format!(
-                        "Declare fn {} at the top level, not inside a loop or another function",
-                        decl.name
-                    ))));
-                }
-                let module = self
-                    .loading
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| "the script".to_owned());
-                self.declare_function(decl, module).map_err(at)?;
-            }
+            } => self.run_for(variable, start, end, body, (*line, *col), env, scope),
+            AstNode::FnDecl(decl) => self.run_fn_decl(decl, scope),
             AstNode::Return {
                 value,
                 faces,
                 line,
                 col,
-            } => {
-                let at = |error: ScriptError| error.at(*line, *col);
-                if scope != Scope::Body || self.call_stack.is_empty() {
-                    return Err(at(ScriptError::eval("`return` belongs inside a function")));
-                }
-                let mut returned = match value {
-                    Some(expression) => self.eval_expr(expression, env)?,
-                    None => Value::Unit,
-                };
-                if !faces.is_empty() {
-                    let step = returned.as_step().map_err(|_| {
-                        at(ScriptError::eval(
-                            "`with faces` exports faces of a body; return a step or a body before it",
-                        ))
-                    })?;
-                    let mut exported = BTreeMap::new();
-                    for (name, expression) in faces {
-                        let selector =
-                            self.eval_expr(expression, env)?
-                                .as_selector()
-                                .map_err(|error| {
-                                    at(ScriptError::eval(format!(
-                                        "exported face `{name}`: {}",
-                                        error.message()
-                                    )))
-                                })?;
-                        exported.insert(name.clone(), selector);
-                    }
-                    // A body returned from an inner function keeps the
-                    // faces it already exports, under the new ones.
-                    if let Value::Body { faces: inner, .. } = &returned {
-                        for (name, selector) in inner {
-                            exported
-                                .entry(name.clone())
-                                .or_insert_with(|| selector.clone());
-                        }
-                    }
-                    returned = Value::Body {
-                        step,
-                        faces: exported,
-                    };
-                }
-                return Ok(Flow::Return(returned));
+            } => self.run_return(value.as_ref(), faces, *line, *col, env, scope),
+            AstNode::Use { path, line, col } => self.run_use(path, (*line, *col), env, scope),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_param(
+        &mut self,
+        name: &str,
+        param_type: &str,
+        default_value: &Expression,
+        range: Option<&(Expression, Expression)>,
+        line: usize,
+        env: &mut Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        if scope == Scope::Body {
+            return Err(ScriptError::Eval {
+                message:
+                    "A `param` is declared at the top of the script, not inside a loop or a function"
+                        .to_owned(),
+                location: Some((line, 1)),
+            });
+        }
+        let value = self
+            .param_value(name, param_type, default_value, range, env)
+            .map_err(|error| error.at(line, 1))?;
+        match &value {
+            Value::Number(number) => {
+                self.program.parameters.insert(name.to_owned(), *number);
             }
-            AstNode::Use { path, line, col } => {
-                let at = |error: ScriptError| error.at(*line, *col);
-                if scope == Scope::Body {
-                    return Err(at(ScriptError::eval(
-                        "`use` belongs at the top of the script, not inside a loop or a function",
-                    )));
+            Value::Bool(flag) => {
+                self.program
+                    .parameters
+                    .insert(name.to_owned(), f64::from(u8::from(*flag)));
+            }
+            _ => {}
+        }
+        env.insert(name.to_owned(), value);
+        Ok(Flow::Next)
+    }
+
+    fn run_let(
+        &mut self,
+        name: &str,
+        value: &Expression,
+        env: &mut Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        let evaluated = self.eval_expr(value, env)?;
+        self.bind(name, evaluated, env, scope)?;
+        Ok(Flow::Next)
+    }
+
+    /// Binds a `let`: a feature call becomes a step of the program and the
+    /// name its label; a selector or a body's exported faces become names
+    /// a host can show.
+    fn bind(
+        &mut self,
+        name: &str,
+        evaluated: Value,
+        env: &mut Env,
+        scope: Scope,
+    ) -> Result<(), ScriptError> {
+        match evaluated {
+            Value::Command(cmd) => {
+                if scope == Scope::Module {
+                    return Err(module_builds_nothing(cmd.label()));
                 }
-                let importer = self.loading.last().cloned();
-                let constants = self.import(path, importer.as_deref()).map_err(at)?;
-                for (name, value) in constants {
-                    env.entry(name).or_insert(value);
+                let step = Value::Step(StepLabel(cmd.label().to_owned()));
+                self.program.commands.push(Rc::unwrap_or_clone(cmd));
+                env.insert(name.to_owned(), step);
+            }
+            Value::Selector(selector) => {
+                if scope == Scope::TopLevel {
+                    self.program.names.push((name.to_owned(), selector.clone()));
                 }
+                env.insert(name.to_owned(), Value::Selector(selector));
+            }
+            Value::Body { step, faces } => {
+                if scope == Scope::TopLevel {
+                    for (face, selector) in faces.iter() {
+                        self.program
+                            .names
+                            .push((format!("{name}.{face}"), selector.clone()));
+                    }
+                }
+                env.insert(name.to_owned(), Value::Body { step, faces });
+            }
+            other => {
+                env.insert(name.to_owned(), other);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_statement(
+        &mut self,
+        expr: &Expression,
+        env: &Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        let evaluated = self.eval_expr(expr, env)?;
+        if let Value::Command(cmd) = evaluated {
+            if scope == Scope::Module {
+                return Err(module_builds_nothing(cmd.label()));
+            }
+            self.program.commands.push(Rc::unwrap_or_clone(cmd));
+        }
+        Ok(Flow::Next)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_for(
+        &mut self,
+        variable: &str,
+        start: &Expression,
+        end: &Expression,
+        body: &[AstNode],
+        (line, col): (usize, usize),
+        env: &mut Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        let (mut index, end) = self
+            .loop_range(start, end, env, scope)
+            .map_err(|error| error.at(line, col))?;
+        while index < end {
+            self.take_iteration().map_err(|error| error.at(line, col))?;
+            env.insert(variable.to_owned(), Value::Number(index));
+            if let Flow::Return(value) = self.run_block(body, env, Scope::Body)? {
+                return Ok(Flow::Return(value));
+            }
+            index += 1.0;
+        }
+        Ok(Flow::Next)
+    }
+
+    /// The whole numbers a `for` counts through, as `start..end`.
+    fn loop_range(
+        &mut self,
+        start: &Expression,
+        end: &Expression,
+        env: &Env,
+        scope: Scope,
+    ) -> Result<(f64, f64), ScriptError> {
+        if scope == Scope::Module {
+            return Err(ScriptError::eval(
+                "A module builds nothing at its top level; put the loop in a function",
+            ));
+        }
+        let start = self.eval_expr(start, env)?.as_number()?;
+        let end = self.eval_expr(end, env)?.as_number()?;
+        if start.fract() != 0.0 || end.fract() != 0.0 {
+            return Err(ScriptError::eval(format!(
+                "A `for` range counts whole numbers; got {start}..{end}"
+            )));
+        }
+        Ok((start, end))
+    }
+
+    /// Takes one loop iteration from the script's allowance.
+    fn take_iteration(&mut self) -> Result<(), ScriptError> {
+        if self.budget == 0 {
+            return Err(ScriptError::eval(format!(
+                "The script runs more than {MAX_LOOP_ITERATIONS} loop iterations"
+            )));
+        }
+        self.budget -= 1;
+        Ok(())
+    }
+
+    fn run_fn_decl(&mut self, decl: &FnDecl, scope: Scope) -> Result<Flow, ScriptError> {
+        if scope == Scope::Body {
+            return Err(ScriptError::eval(format!(
+                "Declare fn {} at the top level, not inside a loop or another function",
+                decl.name
+            ))
+            .at(decl.line, decl.col));
+        }
+        let module = self
+            .loading
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "the script".to_owned());
+        self.declare_function(decl, module)
+            .map_err(|error| error.at(decl.line, decl.col))?;
+        Ok(Flow::Next)
+    }
+
+    fn run_return(
+        &mut self,
+        value: Option<&Expression>,
+        faces: &[(String, Expression)],
+        line: usize,
+        col: usize,
+        env: &Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        let at = |error: ScriptError| error.at(line, col);
+        if scope != Scope::Body || self.call_stack.is_empty() {
+            return Err(at(ScriptError::eval("`return` belongs inside a function")));
+        }
+        let returned = match value {
+            Some(expression) => self.eval_expr(expression, env)?,
+            None => Value::Unit,
+        };
+        if faces.is_empty() {
+            return Ok(Flow::Return(returned));
+        }
+        let step = returned.as_step().map_err(|_| {
+            at(ScriptError::eval(
+                "`with faces` exports faces of a body; return a step or a body before it",
+            ))
+        })?;
+        // A feature call returned with faces is built here. The body it
+        // becomes is no longer a command, so the caller that binds it would
+        // not build it, and every later step naming the body would reach
+        // for a step that was never made.
+        if let Value::Command(command) = &returned {
+            self.program.commands.push((**command).clone());
+        }
+        let mut exported = BTreeMap::new();
+        for (name, expression) in faces {
+            let selector = self
+                .eval_expr(expression, env)?
+                .as_selector()
+                .map_err(|error| {
+                    at(ScriptError::eval(format!(
+                        "exported face `{name}`: {}",
+                        error.message()
+                    )))
+                })?;
+            exported.insert(name.clone(), selector);
+        }
+        // A body returned from an inner function keeps the faces it already
+        // exports, under the new ones.
+        if let Value::Body { faces: inner, .. } = &returned {
+            for (name, selector) in inner.iter() {
+                exported
+                    .entry(name.clone())
+                    .or_insert_with(|| selector.clone());
+            }
+        }
+        Ok(Flow::Return(Value::Body {
+            step,
+            faces: Rc::new(exported),
+        }))
+    }
+
+    fn run_use(
+        &mut self,
+        path: &str,
+        (line, col): (usize, usize),
+        env: &mut Env,
+        scope: Scope,
+    ) -> Result<Flow, ScriptError> {
+        let at = |error: ScriptError| error.at(line, col);
+        if scope == Scope::Body {
+            return Err(at(ScriptError::eval(
+                "`use` belongs at the top of the script, not inside a loop or a function",
+            )));
+        }
+        let importer = self.loading.last().cloned();
+        let constants = self.import(path, importer.as_deref()).map_err(at)?;
+        for (name, value) in constants {
+            if env.get(&name).is_none() {
+                env.insert(name, value);
             }
         }
         Ok(Flow::Next)
@@ -817,6 +1063,14 @@ impl<'a> Interp<'a> {
     ) -> Result<Value, ScriptError> {
         let param_type = canonical_param_type(param_type)?;
         let value = match self.overrides.get(name) {
+            // An override comes from outside the script, where nothing
+            // has checked it: NaN passes every comparison a range makes
+            // and infinity is no dimension, so neither is taken.
+            Some(&override_value) if !override_value.is_finite() => {
+                return Err(ScriptError::eval(format!(
+                    "Parameter `{name}`: the override {override_value} is not a finite number"
+                )));
+            }
             Some(&override_value) => match param_type.as_str() {
                 "f64" => Value::Number(override_value),
                 "int" => {
@@ -857,7 +1111,9 @@ impl<'a> Interp<'a> {
                     "Parameter `{name}` has a range, so it must be a number"
                 ))
             })?;
-            if number < low || number > high {
+            // Written as "not inside" rather than "below or above", so a
+            // value no comparison holds for is outside rather than in.
+            if !(low..=high).contains(&number) {
                 return Err(ScriptError::eval(format!(
                     "Parameter `{name}` is {number}, outside its range {low}..{high}"
                 )));
@@ -895,7 +1151,7 @@ impl<'a> Interp<'a> {
 
     /// Loads a module and everything it imports, declaring its functions
     /// and returning its constants.
-    fn import(&mut self, path: &str, importer: Option<&str>) -> Result<Env, ScriptError> {
+    fn import(&mut self, path: &str, importer: Option<&str>) -> Result<Names, ScriptError> {
         let module = self
             .modules
             .load(path, importer)
@@ -909,7 +1165,7 @@ impl<'a> Interp<'a> {
             )));
         }
         if self.loaded.contains(&module.name) {
-            return Ok(Env::new());
+            return Ok(Names::new());
         }
         if self.loading.len() >= MAX_IMPORT_DEPTH {
             let mut chain = self.loading.clone();
@@ -932,8 +1188,7 @@ impl<'a> Interp<'a> {
             ScriptError::eval(format!("In module {}: {message}", module.name))
         })?;
         self.loading.push(module.name.clone());
-        let mut env = self.globals.clone();
-        let before: BTreeSet<String> = env.keys().cloned().collect();
+        let mut env = Env::over(Rc::clone(&self.globals));
         let result = self.run_block(&nodes, &mut env, Scope::Module);
         self.loading.pop();
         result.map_err(|error| {
@@ -947,107 +1202,54 @@ impl<'a> Interp<'a> {
             ))
         })?;
         self.loaded.insert(module.name);
-        let constants: Env = env
+        // The module's constants are the names it bound that were not
+        // already names when it started; a module's own `let pi` shadows
+        // the script's inside the module and goes no further.
+        let Env { local, shared } = env;
+        let constants: Names = local
             .into_iter()
             .filter(|(name, value)| {
-                !before.contains(name) && !matches!(value, Value::Command(_) | Value::Step(_))
+                !shared.contains_key(name) && !matches!(value, Value::Command(_) | Value::Step(_))
             })
             .collect();
-        self.globals.extend(constants.clone());
+        drop(shared);
+        if !constants.is_empty() {
+            if Rc::strong_count(&self.globals) > 1 {
+                self.charge(self.globals.len())?;
+            }
+            let globals = Rc::make_mut(&mut self.globals);
+            for (name, value) in &constants {
+                globals.insert(name.clone(), value.clone());
+            }
+        }
         Ok(constants)
     }
 
     fn eval_expr(&mut self, expr: &Expression, env: &Env) -> Result<Value, ScriptError> {
+        self.descend()?;
+        let result = self.eval_expr_here(expr, env);
+        self.depth -= 1;
+        result
+    }
+
+    fn eval_expr_here(&mut self, expr: &Expression, env: &Env) -> Result<Value, ScriptError> {
         match expr {
             Expression::Number(n) => Ok(Value::Number(*n)),
             Expression::Bool(flag) => Ok(Value::Bool(*flag)),
-            Expression::String(s) => Ok(Value::String(s.clone())),
+            Expression::String(text) => self.eval_string(text),
             Expression::Identifier { name, line, col } => {
-                env.get(name).cloned().ok_or_else(|| ScriptError::Eval {
-                    message: format!(
-                        "Undefined identifier `{name}`{}",
-                        if self.functions.contains_key(name) {
-                            "; it is a function, call it with ( )"
-                        } else {
-                            ""
-                        }
-                    ),
-                    location: Some((*line, *col)),
-                })
+                self.eval_identifier(name, *line, *col, env)
             }
-            Expression::Array(elements) => {
-                if elements.len() > MAX_ARRAY_ELEMENTS {
-                    return Err(ScriptError::eval(format!(
-                        "An array may hold at most {MAX_ARRAY_ELEMENTS} elements; this one has {}",
-                        elements.len()
-                    )));
-                }
-                let mut arr = Vec::new();
-                for el in elements {
-                    arr.push(self.eval_expr(el, env)?);
-                }
-                Ok(Value::Array(arr))
-            }
-            Expression::UnaryOp { op, operand } => {
-                let val = self.eval_expr(operand, env)?.as_number()?;
-                match op {
-                    UnaryOperator::Neg => Ok(Value::Number(-val)),
-                }
-            }
-            Expression::BinaryOp { left, op, right } => {
-                let left = self.eval_expr(left, env)?;
-                let right = self.eval_expr(right, env)?;
-                // `+` joins text: a string with a string or a number, either
-                // way round, which is how a loop builds its labels.
-                if *op == BinaryOperator::Add
-                    && matches!(left, Value::String(_)) | matches!(right, Value::String(_))
-                {
-                    let text = |value: &Value| -> Result<String, ScriptError> {
-                        match value {
-                            Value::String(text) => Ok(text.clone()),
-                            Value::Number(number) => Ok(number_text(*number)),
-                            other => Err(ScriptError::eval(format!(
-                                "`+` joins strings and numbers, got {}",
-                                other.describe()
-                            ))),
-                        }
-                    };
-                    let (left, right) = (text(&left)?, text(&right)?);
-                    // Checked before the join, so a string that has already
-                    // doubled itself to the limit is refused rather than
-                    // built one more time.
-                    if left.len() + right.len() > MAX_STRING_BYTES {
-                        return Err(ScriptError::eval(format!(
-                            "A string may hold at most {MAX_STRING_BYTES} bytes; joining these makes {}",
-                            left.len() + right.len()
-                        )));
-                    }
-                    return Ok(Value::String(format!("{left}{right}")));
-                }
-                let l = left.as_number()?;
-                let r = right.as_number()?;
-                let res = match op {
-                    BinaryOperator::Add => l + r,
-                    BinaryOperator::Sub => l - r,
-                    BinaryOperator::Mul => l * r,
-                    BinaryOperator::Div => {
-                        if r.abs() < 1e-12 {
-                            return Err(ScriptError::eval("Division by zero"));
-                        }
-                        l / r
-                    }
-                };
-                Ok(Value::Number(res))
-            }
+            Expression::Array(elements) => self.eval_array(elements, env),
+            Expression::UnaryOp { op, operand } => self.eval_unary(*op, operand, env),
+            Expression::BinaryOp { left, op, right } => self.eval_binary(left, *op, right, env),
             Expression::FunctionCall {
                 name,
                 named_args,
                 positional_args,
                 line,
                 col,
-            } => self
-                .eval_function_call(name, named_args, positional_args, env, *line, *col)
-                .map_err(|error| error.at(*line, *col)),
+            } => self.eval_function_call(name, named_args, positional_args, env, *line, *col),
             Expression::MethodCall {
                 target,
                 method,
@@ -1055,34 +1257,160 @@ impl<'a> Interp<'a> {
                 positional_args,
                 line,
                 col,
-            } => self
-                .eval_method_call(target, method, named_args, positional_args, env)
-                .map_err(|error| error.at(*line, *col)),
+            } => self.eval_method_call(
+                target,
+                method,
+                named_args,
+                positional_args,
+                env,
+                *line,
+                *col,
+            ),
             Expression::Index {
                 target,
                 index,
                 line,
                 col,
-            } => {
-                let at = |error: ScriptError| error.at(*line, *col);
-                let target = self.eval_expr(target, env)?;
-                let index = self.eval_expr(index, env)?.as_number().map_err(at)?;
-                let Value::Array(items) = target else {
-                    return Err(at(ScriptError::eval(format!(
-                        "Only an array can be indexed, got {}",
-                        target.describe()
-                    ))));
-                };
-                if index.fract() != 0.0 || index < 0.0 || index as usize >= items.len() {
-                    return Err(at(ScriptError::eval(format!(
-                        "Index {} is outside the array of {} items",
-                        number_text(index),
-                        items.len()
-                    ))));
-                }
-                Ok(items[index as usize].clone())
-            }
+            } => self.eval_index(target, index, *line, *col, env),
         }
+    }
+
+    fn eval_string(&mut self, text: &str) -> Result<Value, ScriptError> {
+        self.charge(text.len())?;
+        Ok(Value::String(Rc::from(text)))
+    }
+
+    fn eval_identifier(
+        &self,
+        name: &str,
+        line: usize,
+        col: usize,
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        if let Some(value) = env.get(name) {
+            return Ok(value.clone());
+        }
+        Err(ScriptError::Eval {
+            message: format!(
+                "Undefined identifier `{name}`{}",
+                if self.functions.contains_key(name) {
+                    "; it is a function, call it with ( )"
+                } else {
+                    ""
+                }
+            ),
+            location: Some((line, col)),
+        })
+    }
+
+    fn eval_array(&mut self, elements: &[Expression], env: &Env) -> Result<Value, ScriptError> {
+        if elements.len() > MAX_ARRAY_ELEMENTS {
+            return Err(ScriptError::eval(format!(
+                "An array may hold at most {MAX_ARRAY_ELEMENTS} elements; this one has {}",
+                elements.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(elements.len());
+        for element in elements {
+            values.push(self.eval_expr(element, env)?);
+        }
+        Value::array(values)
+    }
+
+    fn eval_unary(
+        &mut self,
+        op: UnaryOperator,
+        operand: &Expression,
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let value = self.eval_expr(operand, env)?.as_number()?;
+        match op {
+            UnaryOperator::Neg => Ok(Value::Number(-value)),
+        }
+    }
+
+    fn eval_binary(
+        &mut self,
+        left: &Expression,
+        op: BinaryOperator,
+        right: &Expression,
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let left = self.eval_expr(left, env)?;
+        let right = self.eval_expr(right, env)?;
+        self.binary(&left, op, &right)
+    }
+
+    fn eval_index(
+        &mut self,
+        target: &Expression,
+        index: &Expression,
+        line: usize,
+        col: usize,
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let target = self.eval_expr(target, env)?;
+        let index = self.eval_expr(index, env)?;
+        index_into(&target, &index).map_err(|error| error.at(line, col))
+    }
+
+    /// `left op right`, both already evaluated.
+    fn binary(
+        &mut self,
+        left: &Value,
+        op: BinaryOperator,
+        right: &Value,
+    ) -> Result<Value, ScriptError> {
+        // `+` joins text: a string with a string or a number, either way
+        // round, which is how a loop builds its labels.
+        if op == BinaryOperator::Add
+            && matches!(left, Value::String(_)) | matches!(right, Value::String(_))
+        {
+            let text = |value: &Value| -> Result<String, ScriptError> {
+                match value {
+                    Value::String(text) => Ok(text.to_string()),
+                    Value::Number(number) => Ok(number_text(*number)),
+                    other => Err(ScriptError::eval(format!(
+                        "`+` joins strings and numbers, got {}",
+                        other.describe()
+                    ))),
+                }
+            };
+            let (left, right) = (text(left)?, text(right)?);
+            // Checked before the join, so a string that has already
+            // doubled itself to the limit is refused rather than built one
+            // more time.
+            if left.len() + right.len() > MAX_STRING_BYTES {
+                return Err(ScriptError::eval(format!(
+                    "A string may hold at most {MAX_STRING_BYTES} bytes; joining these makes {}",
+                    left.len() + right.len()
+                )));
+            }
+            self.charge(left.len() + right.len())?;
+            return Ok(Value::String(Rc::from(format!("{left}{right}"))));
+        }
+        let l = left.as_number()?;
+        let r = right.as_number()?;
+        let (res, symbol) = match op {
+            BinaryOperator::Add => (l + r, "+"),
+            BinaryOperator::Sub => (l - r, "-"),
+            BinaryOperator::Mul => (l * r, "*"),
+            BinaryOperator::Div => {
+                if r.abs() < 1e-12 {
+                    return Err(ScriptError::eval("Division by zero"));
+                }
+                (l / r, "/")
+            }
+        };
+        // Every number a script holds is finite, so only an overflow can
+        // leave one that is not; it would reach a step as a dimension no
+        // body has, and a journal that cannot be written.
+        if !res.is_finite() {
+            return Err(ScriptError::eval(format!(
+                "`{symbol}` overflows: {l:e} {symbol} {r:e} is not a finite number"
+            )));
+        }
+        Ok(Value::Number(res))
     }
 
     fn eval_function_call(
@@ -1094,13 +1422,57 @@ impl<'a> Interp<'a> {
         line: usize,
         col: usize,
     ) -> Result<Value, ScriptError> {
-        if let Some(value) = self.math_call(name, positional_args, env)? {
-            return Ok(value);
+        let result = if MATH_FUNCTIONS.contains(&name) {
+            self.eval_math(name, positional_args, env)
+        } else if let Some(decl) = self.functions.get(name).map(|(decl, _)| Rc::clone(decl)) {
+            self.call_user_function(&decl, named_args, positional_args, env, line, col)
+        } else {
+            self.eval_builtin(name, named_args, positional_args, env)
+        };
+        result.map_err(|error| error.at(line, col))
+    }
+
+    fn eval_math(
+        &mut self,
+        name: &str,
+        positional_args: &[Expression],
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let mut numbers = Vec::with_capacity(positional_args.len());
+        for expression in positional_args {
+            numbers.push(self.eval_expr(expression, env)?.as_number()?);
         }
-        if let Some((decl, _)) = self.functions.get(name).cloned() {
-            return self.call_user_function(&decl, named_args, positional_args, env, line, col);
-        }
-        self.eval_builtin(name, named_args, positional_args, env)
+        math(name, &numbers).map(Value::Number)
+    }
+
+    /// Evaluates everything a builtin reads before it builds anything, so
+    /// the frame that assembles the command, which is large, is never on
+    /// the stack while another expression is being evaluated.
+    fn eval_builtin(
+        &mut self,
+        name: &str,
+        named_args: &[(String, Expression)],
+        positional_args: &[Expression],
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let args = Args::new(name, named_args, env, self)?;
+        // A selector spelling is the one positional argument a builtin
+        // takes.
+        let spelling = match positional_args.first() {
+            Some(expression) if matches!(name, "faces" | "edges") => {
+                Some(self.eval_argument(expression, env)?)
+            }
+            _ => None,
+        };
+        self.build_builtin(name, &args, spelling.as_ref())
+    }
+
+    /// An argument a call receives, paid for by its weight: what checking
+    /// it against a type or copying it into a command costs.
+    fn eval_argument(&mut self, expression: &Expression, env: &Env) -> Result<Value, ScriptError> {
+        let value = self.eval_expr(expression, env)?;
+        self.charge(value.weight())?;
+        Ok(value)
     }
 
     /// Runs a user function: binds and checks its arguments, scopes the
@@ -1115,6 +1487,27 @@ impl<'a> Interp<'a> {
         line: usize,
         col: usize,
     ) -> Result<Value, ScriptError> {
+        self.check_call(decl)?;
+        let mut callee_env = self.bind_arguments(decl, named_args, positional_args, env)?;
+
+        // The call's label scopes every step the body builds: the `label`
+        // argument when the function has one, else the function's name and
+        // its call count.
+        self.enter_call(decl, &callee_env);
+        let result = self.run_block(&decl.body, &mut callee_env, Scope::Body);
+        self.call_stack.pop();
+        self.scopes.pop();
+
+        let returned = match result? {
+            Flow::Return(value) => value,
+            Flow::Next => Value::Unit,
+        };
+        self.check_return(decl, &returned, line, col)?;
+        Ok(returned)
+    }
+
+    /// Refuses a call that would recurse or nest too deep.
+    fn check_call(&self, decl: &FnDecl) -> Result<(), ScriptError> {
         let name = &decl.name;
         if self.call_stack.iter().any(|active| active == name) {
             let mut chain = self.call_stack.clone();
@@ -1129,9 +1522,20 @@ impl<'a> Interp<'a> {
                 "Function calls nested deeper than {MAX_CALL_DEPTH} levels"
             )));
         }
+        Ok(())
+    }
 
-        // Bind the arguments: positional ones in declaration order, named
-        // ones by name, each exactly once.
+    /// The names a function body starts with: its parameters, bound
+    /// positionally in declaration order or by name, each exactly once,
+    /// defaults filling the rest, every one checked against its type.
+    fn bind_arguments(
+        &mut self,
+        decl: &FnDecl,
+        named_args: &[(String, Expression)],
+        positional_args: &[Expression],
+        env: &Env,
+    ) -> Result<Env, ScriptError> {
+        let name = &decl.name;
         let mut bound: BTreeMap<String, Value> = BTreeMap::new();
         if positional_args.len() > decl.params.len() {
             return Err(ScriptError::eval(format!(
@@ -1142,7 +1546,8 @@ impl<'a> Interp<'a> {
             )));
         }
         for (param, expression) in decl.params.iter().zip(positional_args) {
-            bound.insert(param.name.clone(), self.eval_expr(expression, env)?);
+            let value = self.eval_argument(expression, env)?;
+            bound.insert(param.name.clone(), value);
         }
         for (arg_name, expression) in named_args {
             if !decl.params.iter().any(|param| &param.name == arg_name) {
@@ -1160,14 +1565,15 @@ impl<'a> Interp<'a> {
                     "{name}(): argument `{arg_name}` is given twice"
                 )));
             }
-            bound.insert(arg_name.clone(), self.eval_expr(expression, env)?);
+            let value = self.eval_argument(expression, env)?;
+            bound.insert(arg_name.clone(), value);
         }
-        let mut callee_env = self.globals.clone();
+        let mut callee_env = Env::over(Rc::clone(&self.globals));
         for param in &decl.params {
             let value = match bound.remove(&param.name) {
                 Some(value) => value,
                 None => match &param.default {
-                    Some(default) => self.eval_expr(default, &callee_env)?,
+                    Some(default) => self.eval_argument(default, &callee_env)?,
                     None => {
                         return Err(ScriptError::eval(format!(
                             "{name}() requires `{}`",
@@ -1186,159 +1592,59 @@ impl<'a> Interp<'a> {
             }
             callee_env.insert(param.name.clone(), value);
         }
+        Ok(callee_env)
+    }
 
-        // The call's label scopes every step the body builds: the `label`
-        // argument when the function has one, else the function's name and
-        // its call count.
+    /// Opens the label scope of a call and marks the function as running.
+    fn enter_call(&mut self, decl: &FnDecl, callee_env: &Env) {
+        let name = &decl.name;
         let count = self.call_counts.entry(name.clone()).or_insert(0);
         *count += 1;
         let raw_scope = match callee_env.get("label") {
-            Some(Value::String(label)) => label.clone(),
+            Some(Value::String(label)) => label.to_string(),
             _ => format!("{name}_{count}"),
         };
         let scope = self.scoped_label(&raw_scope);
         self.scopes.push(scope);
         self.call_stack.push(name.clone());
-        let result = self.run_block(&decl.body, &mut callee_env, Scope::Body);
-        self.call_stack.pop();
-        self.scopes.pop();
-
-        let returned = match result? {
-            Flow::Return(value) => value,
-            Flow::Next => Value::Unit,
-        };
-        if let Some(return_type) = &decl.return_type
-            && !type_matches(&returned, return_type)
-        {
-            return Err(ScriptError::Eval {
-                message: format!(
-                    "fn {name} is declared to return {}, but returned {}",
-                    return_type.describe(),
-                    returned.describe()
-                ),
-                location: Some((line, col)),
-            });
-        }
-        Ok(returned)
     }
 
-    fn math_call(
+    /// Checks what a function returned against the type it declares,
+    /// paying for the check by the value's weight.
+    fn check_return(
         &mut self,
-        name: &str,
-        positional_args: &[Expression],
-        env: &Env,
-    ) -> Result<Option<Value>, ScriptError> {
-        if !matches!(
-            name,
-            "sqrt"
-                | "abs"
-                | "floor"
-                | "ceil"
-                | "round"
-                | "sin"
-                | "cos"
-                | "tan"
-                | "asin"
-                | "acos"
-                | "atan"
-                | "atan2"
-                | "pow"
-                | "hypot"
-                | "min"
-                | "max"
-                | "clamp"
-        ) {
-            return Ok(None);
-        }
-        let mut numbers = Vec::new();
-        for expression in positional_args {
-            numbers.push(self.eval_expr(expression, env)?.as_number()?);
-        }
-        let one = |numbers: &[f64]| -> Result<f64, ScriptError> {
-            match numbers {
-                [value] => Ok(*value),
-                _ => Err(ScriptError::eval(format!("{name}() takes one number"))),
-            }
+        decl: &FnDecl,
+        returned: &Value,
+        line: usize,
+        col: usize,
+    ) -> Result<(), ScriptError> {
+        let Some(return_type) = &decl.return_type else {
+            return Ok(());
         };
-        let two = |numbers: &[f64]| -> Result<(f64, f64), ScriptError> {
-            match numbers {
-                [a, b] => Ok((*a, *b)),
-                _ => Err(ScriptError::eval(format!("{name}() takes two numbers"))),
-            }
-        };
-        let value = match name {
-            "sqrt" => {
-                let value = one(&numbers)?;
-                if value < 0.0 {
-                    return Err(ScriptError::eval("sqrt() of a negative number"));
-                }
-                value.sqrt()
-            }
-            "abs" => one(&numbers)?.abs(),
-            "floor" => one(&numbers)?.floor(),
-            "ceil" => one(&numbers)?.ceil(),
-            "round" => one(&numbers)?.round(),
-            "sin" => one(&numbers)?.to_radians().sin(),
-            "cos" => one(&numbers)?.to_radians().cos(),
-            "tan" => one(&numbers)?.to_radians().tan(),
-            "asin" => one(&numbers)?.asin().to_degrees(),
-            "acos" => one(&numbers)?.acos().to_degrees(),
-            "atan" => one(&numbers)?.atan().to_degrees(),
-            "atan2" => {
-                let (y, x) = two(&numbers)?;
-                y.atan2(x).to_degrees()
-            }
-            "pow" => {
-                let (base, exponent) = two(&numbers)?;
-                base.powf(exponent)
-            }
-            "hypot" => {
-                let (a, b) = two(&numbers)?;
-                a.hypot(b)
-            }
-            "min" | "max" => {
-                if numbers.is_empty() {
-                    return Err(ScriptError::eval(format!(
-                        "{name}() takes at least one number"
-                    )));
-                }
-                numbers.iter().copied().fold(
-                    if name == "min" {
-                        f64::INFINITY
-                    } else {
-                        f64::NEG_INFINITY
-                    },
-                    |acc, x| {
-                        if name == "min" {
-                            acc.min(x)
-                        } else {
-                            acc.max(x)
-                        }
-                    },
-                )
-            }
-            "clamp" => match numbers.as_slice() {
-                [value, low, high] => value.clamp(*low, *high),
-                _ => return Err(ScriptError::eval("clamp() takes a value, a low and a high")),
-            },
-            _ => unreachable!("matched above"),
-        };
-        if !value.is_finite() {
-            return Err(ScriptError::eval(format!(
-                "{name}() did not produce a finite number"
-            )));
+        self.charge(returned.weight())?;
+        if type_matches(returned, return_type) {
+            return Ok(());
         }
-        Ok(Some(Value::Number(value)))
+        Err(ScriptError::Eval {
+            message: format!(
+                "fn {} is declared to return {}, but returned {}",
+                decl.name,
+                return_type.describe(),
+                returned.describe()
+            ),
+            location: Some((line, col)),
+        })
     }
 
-    fn eval_builtin(
-        &mut self,
+    /// The command, sketch entity, plane, axis or selector a builtin makes
+    /// from arguments already evaluated. It evaluates nothing itself.
+    #[inline(never)]
+    fn build_builtin(
+        &self,
         name: &str,
-        named_args: &[(String, Expression)],
-        positional_args: &[Expression],
-        env: &Env,
+        args: &Args<'_>,
+        spelling: Option<&Value>,
     ) -> Result<Value, ScriptError> {
-        let args = Args::new(name, named_args, env, self)?;
         let origin = Point3::new(0.0, 0.0, 0.0);
         let up = Vector3::new(0.0, 0.0, 1.0);
 
@@ -1346,13 +1652,13 @@ impl<'a> Interp<'a> {
             // ---- primitives -------------------------------------------------
             "box" => {
                 let size = args.required("size")?.as_point3()?;
-                Ok(Value::Command(ApiCommand::MakeBox {
+                Ok(Value::command(ApiCommand::MakeBox {
                     label: args.label()?,
                     origin: args.point3_or("origin", origin)?,
                     size: [size.x, size.y, size.z],
                 }))
             }
-            "cylinder" => Ok(Value::Command(ApiCommand::MakeCylinder {
+            "cylinder" => Ok(Value::command(ApiCommand::MakeCylinder {
                 label: args.label()?,
                 center: args.point3_or("center", origin)?,
                 axis: args.vector3_or("axis", up)?,
@@ -1360,25 +1666,25 @@ impl<'a> Interp<'a> {
                 height: args.number("height")?,
             })),
             // ---- sketches and what grows from them --------------------------
-            "line" => Ok(Value::Entity(SketchEntity::Line {
+            "line" => Ok(Value::entity(SketchEntity::Line {
                 start: args.required("start")?.as_point2()?,
                 end: args.required("end")?.as_point2()?,
             })),
-            "circle" => Ok(Value::Entity(SketchEntity::Circle {
+            "circle" => Ok(Value::entity(SketchEntity::Circle {
                 center: args
                     .values
                     .get("center")
                     .map_or(Ok(Point2::new(0.0, 0.0)), Value::as_point2)?,
                 radius: args.radius()?,
             })),
-            "arc" => Ok(Value::Entity(SketchEntity::Arc {
+            "arc" => Ok(Value::entity(SketchEntity::Arc {
                 center: args
                     .values
                     .get("center")
                     .map_or(Ok(Point2::new(0.0, 0.0)), Value::as_point2)?,
                 radius: args.radius()?,
-                start_angle: args.number("start_angle")?.to_radians(),
-                end_angle: args.number("end_angle")?.to_radians(),
+                start_angle: args.arc_angle("start")?,
+                end_angle: args.arc_angle("end")?,
             })),
             // A spline through fit points, or by its control points
             // (ADR 0050).
@@ -1403,7 +1709,7 @@ impl<'a> Interp<'a> {
                     }
                 };
                 match (args.values.get("points"), args.values.get("control_points")) {
-                    (Some(fit), None) => Ok(Value::Entity(SketchEntity::Spline {
+                    (Some(fit), None) => Ok(Value::entity(SketchEntity::Spline {
                         points: points(fit)?,
                         closed,
                     })),
@@ -1414,7 +1720,7 @@ impl<'a> Interp<'a> {
                                 "spline(): `degree` is a whole number from 1 to 5",
                             ));
                         }
-                        Ok(Value::Entity(SketchEntity::ControlSpline {
+                        Ok(Value::entity(SketchEntity::ControlSpline {
                             control_points: points(control)?,
                             degree: degree as usize,
                             closed,
@@ -1437,19 +1743,19 @@ impl<'a> Interp<'a> {
                     }
                     (None, None) => Point2::new(-width / 2.0, -height / 2.0),
                 };
-                Ok(Value::Entity(SketchEntity::Rectangle {
+                Ok(Value::entity(SketchEntity::Rectangle {
                     origin,
                     width,
                     height,
                 }))
             }
-            "sketch" => Ok(Value::Command(ApiCommand::Sketch {
+            "sketch" => Ok(Value::command(ApiCommand::Sketch {
                 label: args.label()?,
                 on: sketch_plane(args.required("on")?)?,
                 entities: sketch_entities(args.required("entities")?)?,
                 constraints: Vec::<SketchConstraint>::new(),
             })),
-            "extrude" => Ok(Value::Command(ApiCommand::Extrude {
+            "extrude" => Ok(Value::command(ApiCommand::Extrude {
                 label: args.label()?,
                 sketch: args.required("sketch")?.as_step()?,
                 regions: args.regions()?,
@@ -1470,14 +1776,14 @@ impl<'a> Interp<'a> {
                         )));
                     }
                 };
-                Ok(Value::Command(ApiCommand::Loft {
+                Ok(Value::command(ApiCommand::Loft {
                     label: args.label()?,
                     sections,
                     operation: args.operation()?,
                 }))
             }
-            "plane" => script_plane(&args).map(Value::Plane),
-            "axis" => script_axis(&args).map(Value::Axis),
+            "plane" => script_plane(args).map(Value::Plane),
+            "axis" => script_axis(args).map(Value::Axis),
             "revolve" => {
                 // `axis` is a direction through `axis_origin`, or an
                 // axis(...) that says where it runs itself.
@@ -1499,7 +1805,7 @@ impl<'a> Interp<'a> {
                         None,
                     ),
                 };
-                Ok(Value::Command(ApiCommand::Revolve {
+                Ok(Value::command(ApiCommand::Revolve {
                     label: args.label()?,
                     sketch: args.required("sketch")?.as_step()?,
                     regions: args.regions()?,
@@ -1511,7 +1817,7 @@ impl<'a> Interp<'a> {
                 }))
             }
             // ---- face and edge features ------------------------------------
-            "drill" => Ok(Value::Command(ApiCommand::DrillHole {
+            "drill" => Ok(Value::command(ApiCommand::DrillHole {
                 label: args.label()?,
                 face: args.required("face")?.as_selector()?,
                 center: args
@@ -1521,22 +1827,22 @@ impl<'a> Interp<'a> {
                 diameter: args.radius()? * 2.0,
                 depth: args.number("depth")?,
             })),
-            "push_pull" => Ok(Value::Command(ApiCommand::PushPull {
+            "push_pull" => Ok(Value::command(ApiCommand::PushPull {
                 label: args.label()?,
                 face: args.required("face")?.as_selector()?,
                 distance: args.number("distance")?,
             })),
-            "fillet" => Ok(Value::Command(ApiCommand::Fillet {
+            "fillet" => Ok(Value::command(ApiCommand::Fillet {
                 label: args.label()?,
                 edges: args.required("edges")?.as_selectors()?,
                 radius: args.number("radius")?,
             })),
-            "chamfer" => Ok(Value::Command(ApiCommand::Chamfer {
+            "chamfer" => Ok(Value::command(ApiCommand::Chamfer {
                 label: args.label()?,
                 edges: args.required("edges")?.as_selectors()?,
                 distance: args.number("distance")?,
             })),
-            "shell" => Ok(Value::Command(ApiCommand::Shell {
+            "shell" => Ok(Value::command(ApiCommand::Shell {
                 label: args.label()?,
                 open: match args.values.get("open") {
                     None => Vec::new(),
@@ -1545,7 +1851,7 @@ impl<'a> Interp<'a> {
                 wall: args.number("wall")?,
             })),
             // ---- whole-body operations -------------------------------------
-            "mirror" => Ok(Value::Command(ApiCommand::Mirror {
+            "mirror" => Ok(Value::command(ApiCommand::Mirror {
                 label: args.label()?,
                 plane_origin: args.point3_or("origin", origin)?,
                 plane_normal: args.required("normal")?.as_vector3()?,
@@ -1579,49 +1885,43 @@ impl<'a> Interp<'a> {
                             "pattern(step: ...) takes `axis:` (with `axis_origin:` and `angle:`) for a circular array, or `direction:` and `spacing:` for a row",
                         ));
                     };
-                    return Ok(Value::Command(ApiCommand::FeaturePattern {
+                    return Ok(Value::command(ApiCommand::FeaturePattern {
                         label: args.label()?,
                         step,
                         placement,
                     }));
                 }
-                Ok(Value::Command(ApiCommand::LinearPattern {
+                Ok(Value::command(ApiCommand::LinearPattern {
                     label: args.label()?,
                     direction: args.required("direction")?.as_vector3()?,
                     spacing: args.number("spacing")?,
                     count: count as u16,
                 }))
             }
-            "union" => Ok(Value::Command(ApiCommand::BooleanUnion {
+            "union" => Ok(Value::command(ApiCommand::BooleanUnion {
                 label: args.label()?,
                 target: args.required("target")?.as_step()?,
                 tool: args.required("tool")?.as_step()?,
             })),
-            "difference" => Ok(Value::Command(ApiCommand::BooleanDifference {
+            "difference" => Ok(Value::command(ApiCommand::BooleanDifference {
                 label: args.label()?,
                 target: args.required("target")?.as_step()?,
                 tool: args.required("tool")?.as_step()?,
             })),
-            "intersection" => Ok(Value::Command(ApiCommand::BooleanIntersection {
+            "intersection" => Ok(Value::command(ApiCommand::BooleanIntersection {
                 label: args.label()?,
                 target: args.required("target")?.as_step()?,
                 tool: args.required("tool")?.as_step()?,
             })),
             // ---- selectors --------------------------------------------------
-            "faces" => {
-                if positional_args.is_empty() {
-                    return named_selector(EntityKind::Face, &args).map(Value::Selector);
-                }
-                let spec = self.positional_string("faces", positional_args, env, "\">Z\"")?;
-                Ok(Value::Selector(face_selector(&spec)?))
-            }
-            "edges" => {
-                if positional_args.is_empty() {
-                    return named_selector(EntityKind::Edge, &args).map(Value::Selector);
-                }
-                let spec = self.positional_string("edges", positional_args, env, "\"|Z\"")?;
-                Ok(Value::Selector(edge_selector(&spec)?))
-            }
+            "faces" => match spelling {
+                None => named_selector(EntityKind::Face, args).map(Value::Selector),
+                Some(spelling) => Ok(Value::Selector(face_selector(spelling.as_string()?)?)),
+            },
+            "edges" => match spelling {
+                None => named_selector(EntityKind::Edge, args).map(Value::Selector),
+                Some(spelling) => Ok(Value::Selector(edge_selector(spelling.as_string()?)?)),
+            },
             "edge_between" => Ok(Value::Selector(EntitySelector::ByGeometry {
                 selector: GeometricSelector::EdgeBetween {
                     face_a: Box::new(args.required("a")?.as_selector()?),
@@ -1665,22 +1965,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The one positional argument a selector call takes.
-    fn positional_string(
-        &mut self,
-        name: &str,
-        positional_args: &[Expression],
-        env: &Env,
-        example: &str,
-    ) -> Result<String, ScriptError> {
-        match positional_args.first() {
-            Some(expression) => Ok(self.eval_expr(expression, env)?.as_string()?.to_owned()),
-            None => Err(ScriptError::eval(format!(
-                "{name}() requires a selector string, e.g. {example}"
-            ))),
-        }
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn eval_method_call(
         &mut self,
         target_expr: &Expression,
@@ -1688,133 +1973,343 @@ impl<'a> Interp<'a> {
         named_args: &[(String, Expression)],
         positional_args: &[Expression],
         env: &Env,
+        line: usize,
+        col: usize,
     ) -> Result<Value, ScriptError> {
-        let target = self.eval_expr(target_expr, env)?;
-        let (step_label, exported) = match target {
-            Value::Step(s) => (s, BTreeMap::new()),
-            Value::Command(cmd) => (StepLabel(cmd.label().to_owned()), BTreeMap::new()),
-            Value::Body { step, faces } => (step, faces),
-            // A face selector names its edges: `faces(">Z").edges()` is every
-            // edge bounding that face, holes included; `.rim()` is the outer
-            // loop alone. Either resolves when the step using it runs.
-            Value::Selector(face) => {
-                if !named_args.is_empty() || !positional_args.is_empty() {
-                    return Err(ScriptError::eval(format!(
-                        "`.{method}` on a face selector takes no arguments"
-                    )));
-                }
-                return match method {
-                    "edges" => Ok(Value::Selector(EntitySelector::edges_of_face(face))),
-                    "rim" => Ok(Value::Selector(EntitySelector::rim_of_face(face))),
-                    other => Err(ScriptError::eval(format!(
-                        "Unknown method `.{other}` on a face selector; use .edges() for every edge of the face or .rim() for its outer loop"
-                    ))),
-                };
-            }
-            other => {
-                return Err(ScriptError::eval(format!(
-                    "`.{method}` is used on a step, a body or a face selector, got {}",
-                    other.describe()
-                )));
-            }
-        };
-        // `body.top` is the face the function exported as `top`.
-        if named_args.is_empty()
-            && positional_args.is_empty()
-            && let Some(selector) = exported.get(method)
-        {
-            return Ok(Value::Selector(selector.clone()));
-        }
-        let args = Args::new(method, named_args, env, self)?;
-        let role = |interp: &mut Self, default: &str| -> Result<String, ScriptError> {
-            if let Some(expression) = positional_args.first() {
-                Ok(interp.eval_expr(expression, env)?.as_string()?.to_owned())
-            } else if let Some(role) = args.values.get("role") {
-                Ok(role.as_string()?.to_owned())
-            } else {
-                Ok(default.to_owned())
-            }
-        };
-        let ordinal = args
-            .values
-            .get("ordinal")
-            .map(|value| value.as_number().map(|number| number as u32))
-            .transpose()?;
-
-        match method {
-            "face" => {
-                let role = role(self, "top_face")?;
-                // An exported face by name first; a history role otherwise.
-                if let Some(selector) = exported.get(&role) {
-                    return Ok(Value::Selector(selector.clone()));
-                }
-                Ok(Value::Selector(EntitySelector::ByHistory {
-                    from_step: step_label,
-                    kind: EntityKind::Face,
-                    role,
-                    ordinal,
-                }))
-            }
-            "edge" => Ok(Value::Selector(EntitySelector::ByHistory {
-                from_step: step_label,
-                kind: EntityKind::Edge,
-                role: role(self, "edge")?,
-                ordinal,
-            })),
-            "edges" => {
-                // With nothing named, every edge the step made whatever its
-                // role, as a set, so `cyl.edges()` is a cylinder's rims.
-                if positional_args.is_empty()
-                    && !args.values.contains_key("role")
-                    && !args.values.contains_key("count")
-                {
-                    return Ok(Value::Selector(EntitySelector::history_edges(step_label.0)));
-                }
-                // Every edge the step produced under the role, by ordinal; the
-                // session ignores ordinals the step never made.
-                let role = role(self, "edge")?;
-                let count = args
-                    .values
-                    .get("count")
-                    .map_or(Ok(12.0), Value::as_number)?;
-                if !(count.is_finite() && count >= 0.0 && count.fract() == 0.0) {
-                    return Err(ScriptError::eval(format!(
-                        "`edges(count:)` takes a whole number of edges, got {count}"
-                    )));
-                }
-                if count > MAX_EDGE_SELECTORS as f64 {
-                    return Err(ScriptError::eval(format!(
-                        "`edges(count:)` spells out at most {MAX_EDGE_SELECTORS} edges, not {count}"
-                    )));
-                }
-                let count = count as u32;
-                Ok(Value::Array(
-                    (0..count)
-                        .map(|index| {
-                            Value::Selector(EntitySelector::history_edge_ordinal(
-                                step_label.0.clone(),
-                                role.clone(),
-                                index,
-                            ))
-                        })
-                        .collect(),
-                ))
-            }
-            other => {
-                let exports = if exported.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "; the body exports {}",
-                        exported.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
-                };
-                Err(ScriptError::eval(format!(
-                    "Unknown method `.{other}` on a step; use .face(\"role\"), .edge(\"role\") or .edges(\"role\"){exports}"
-                )))
-            }
+        let at = |error: ScriptError| error.at(line, col);
+        let target = self.eval_expr(target_expr, env).map_err(at)?;
+        let has_args = !named_args.is_empty() || !positional_args.is_empty();
+        match method_receiver(target, method, has_args).map_err(at)? {
+            Receiver::Done(value) => Ok(value),
+            Receiver::Step { step, exported } => self
+                .apply_method(&step, &exported, method, named_args, positional_args, env)
+                .map_err(at),
         }
     }
+
+    /// A method on a step or a body. As for a builtin, everything is
+    /// evaluated before the selector is made: the arguments, then the role
+    /// written positionally.
+    fn apply_method(
+        &mut self,
+        step: &StepLabel,
+        exported: &BTreeMap<String, EntitySelector>,
+        method: &str,
+        named_args: &[(String, Expression)],
+        positional_args: &[Expression],
+        env: &Env,
+    ) -> Result<Value, ScriptError> {
+        let args = Args::new(method, named_args, env, self)?;
+        let role = match positional_args.first() {
+            Some(expression) if matches!(method, "face" | "faces" | "edge" | "edges") => {
+                Some(self.eval_argument(expression, env)?)
+            }
+            _ => None,
+        };
+        let value = build_method(step, exported, method, &args, role.as_ref())?;
+        // `edges(count:)` spells out an array of selectors from one number.
+        self.charge(value.weight())?;
+        Ok(value)
+    }
+}
+
+/// What a method is called on, once the target is evaluated.
+enum Receiver {
+    /// The method is already answered: a method on a face selector, or a
+    /// face a body exports by the method's name.
+    Done(Value),
+    /// A step or a body, whose method still has arguments to evaluate.
+    Step {
+        step: StepLabel,
+        exported: Rc<BTreeMap<String, EntitySelector>>,
+    },
+}
+
+fn method_receiver(target: Value, method: &str, has_args: bool) -> Result<Receiver, ScriptError> {
+    let (step, exported) = match target {
+        Value::Step(step) => (step, Rc::default()),
+        Value::Command(cmd) => (StepLabel(cmd.label().to_owned()), Rc::default()),
+        Value::Body { step, faces } => (step, faces),
+        Value::Selector(face) => {
+            return face_selector_method(face, method, has_args).map(Receiver::Done);
+        }
+        other => {
+            return Err(ScriptError::eval(format!(
+                "`.{method}` is used on a step, a body or a face selector, got {}",
+                other.describe()
+            )));
+        }
+    };
+    // `body.top` is the face the function exported as `top`.
+    if !has_args && let Some(selector) = exported.get(method) {
+        return Ok(Receiver::Done(Value::Selector(selector.clone())));
+    }
+    Ok(Receiver::Step { step, exported })
+}
+
+/// A method on a face selector: `faces(">Z").edges()` is every edge
+/// bounding that face, holes included; `.rim()` is the outer loop alone.
+/// Either resolves when the step using it runs.
+fn face_selector_method(
+    face: EntitySelector,
+    method: &str,
+    has_args: bool,
+) -> Result<Value, ScriptError> {
+    if has_args {
+        return Err(ScriptError::eval(format!(
+            "`.{method}` on a face selector takes no arguments"
+        )));
+    }
+    match method {
+        "edges" => Ok(Value::Selector(EntitySelector::edges_of_face(face))),
+        "rim" => Ok(Value::Selector(EntitySelector::rim_of_face(face))),
+        other => Err(ScriptError::eval(format!(
+            "Unknown method `.{other}` on a face selector; use .edges() for every edge of the face or .rim() for its outer loop"
+        ))),
+    }
+}
+
+/// The selector a method on a step or a body makes from arguments already
+/// evaluated: `.face(...)`, `.faces()`, `.edge(...)` or `.edges(...)`. It
+/// evaluates nothing itself.
+#[inline(never)]
+fn build_method(
+    step_label: &StepLabel,
+    exported: &BTreeMap<String, EntitySelector>,
+    method: &str,
+    args: &Args<'_>,
+    positional_role: Option<&Value>,
+) -> Result<Value, ScriptError> {
+    let role = |default: &str| -> Result<String, ScriptError> {
+        if let Some(role) = positional_role {
+            Ok(role.as_string()?.to_owned())
+        } else if let Some(role) = args.values.get("role") {
+            Ok(role.as_string()?.to_owned())
+        } else {
+            Ok(default.to_owned())
+        }
+    };
+    let ordinal = args
+        .values
+        .get("ordinal")
+        .map(|value| index_value(value, "`ordinal`"))
+        .transpose()?;
+
+    match method {
+        "face" => {
+            let role = role("top_face")?;
+            // An exported face by name first; a history role otherwise.
+            if let Some(selector) = exported.get(&role) {
+                return Ok(Value::Selector(selector.clone()));
+            }
+            Ok(Value::Selector(EntitySelector::ByHistory {
+                from_step: step_label.clone(),
+                kind: EntityKind::Face,
+                role,
+                ordinal,
+            }))
+        }
+        // Every face the step made whatever its role, as a set: the face
+        // counterpart of `.edges()`, and how a decompiled script writes a
+        // selector for every face of a step.
+        "faces" => {
+            if positional_role.is_some() || !args.values.is_empty() {
+                return Err(ScriptError::eval(
+                    "`.faces()` takes no arguments; name one face with .face(\"role\", ordinal: n)",
+                ));
+            }
+            Ok(Value::Selector(EntitySelector::history_faces(
+                step_label.0.clone(),
+            )))
+        }
+        "edge" => Ok(Value::Selector(EntitySelector::ByHistory {
+            from_step: step_label.clone(),
+            kind: EntityKind::Edge,
+            role: role("edge")?,
+            ordinal,
+        })),
+        "edges" => {
+            // With nothing named, every edge the step made whatever its
+            // role, as a set, so `cyl.edges()` is a cylinder's rims.
+            if positional_role.is_none()
+                && !args.values.contains_key("role")
+                && !args.values.contains_key("count")
+            {
+                return Ok(Value::Selector(EntitySelector::history_edges(
+                    step_label.0.clone(),
+                )));
+            }
+            // Every edge the step produced under the role, by ordinal; the
+            // session ignores ordinals the step never made.
+            let role = role("edge")?;
+            let count = args
+                .values
+                .get("count")
+                .map_or(Ok(12.0), Value::as_number)?;
+            if !(count.is_finite() && count >= 0.0 && count.fract() == 0.0) {
+                return Err(ScriptError::eval(format!(
+                    "`edges(count:)` takes a whole number of edges, got {count}"
+                )));
+            }
+            if count > MAX_EDGE_SELECTORS as f64 {
+                return Err(ScriptError::eval(format!(
+                    "`edges(count:)` spells out at most {MAX_EDGE_SELECTORS} edges, not {count}"
+                )));
+            }
+            let count = count as u32;
+            Value::array(
+                (0..count)
+                    .map(|index| {
+                        Value::Selector(EntitySelector::history_edge_ordinal(
+                            step_label.0.clone(),
+                            role.clone(),
+                            index,
+                        ))
+                    })
+                    .collect(),
+            )
+        }
+        other => {
+            let exports = if exported.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; the body exports {}",
+                    exported.keys().cloned().collect::<Vec<_>>().join(", ")
+                )
+            };
+            Err(ScriptError::eval(format!(
+                "Unknown method `.{other}` on a step; use .face(\"role\"), .faces(), .edge(\"role\") or .edges(\"role\"){exports}"
+            )))
+        }
+    }
+}
+
+/// The math functions, which take their numbers positionally.
+const MATH_FUNCTIONS: &[&str] = &[
+    "sqrt", "abs", "floor", "ceil", "round", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "pow", "hypot", "min", "max", "clamp",
+];
+
+/// A math function applied to numbers already evaluated.
+fn math(name: &str, numbers: &[f64]) -> Result<f64, ScriptError> {
+    let one = |numbers: &[f64]| -> Result<f64, ScriptError> {
+        match numbers {
+            [value] => Ok(*value),
+            _ => Err(ScriptError::eval(format!("{name}() takes one number"))),
+        }
+    };
+    let two = |numbers: &[f64]| -> Result<(f64, f64), ScriptError> {
+        match numbers {
+            [a, b] => Ok((*a, *b)),
+            _ => Err(ScriptError::eval(format!("{name}() takes two numbers"))),
+        }
+    };
+    let value = match name {
+        "sqrt" => {
+            let value = one(numbers)?;
+            if value < 0.0 {
+                return Err(ScriptError::eval("sqrt() of a negative number"));
+            }
+            value.sqrt()
+        }
+        "abs" => one(numbers)?.abs(),
+        "floor" => one(numbers)?.floor(),
+        "ceil" => one(numbers)?.ceil(),
+        "round" => one(numbers)?.round(),
+        "sin" => one(numbers)?.to_radians().sin(),
+        "cos" => one(numbers)?.to_radians().cos(),
+        "tan" => one(numbers)?.to_radians().tan(),
+        "asin" => one(numbers)?.asin().to_degrees(),
+        "acos" => one(numbers)?.acos().to_degrees(),
+        "atan" => one(numbers)?.atan().to_degrees(),
+        "atan2" => {
+            let (y, x) = two(numbers)?;
+            y.atan2(x).to_degrees()
+        }
+        "pow" => {
+            let (base, exponent) = two(numbers)?;
+            base.powf(exponent)
+        }
+        "hypot" => {
+            let (a, b) = two(numbers)?;
+            a.hypot(b)
+        }
+        "min" | "max" => {
+            if numbers.is_empty() {
+                return Err(ScriptError::eval(format!(
+                    "{name}() takes at least one number"
+                )));
+            }
+            numbers.iter().copied().fold(
+                if name == "min" {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                },
+                |acc, x| {
+                    if name == "min" {
+                        acc.min(x)
+                    } else {
+                        acc.max(x)
+                    }
+                },
+            )
+        }
+        "clamp" => match numbers {
+            // `f64::clamp` panics when the bounds are the wrong way round.
+            [_, low, high] if low > high => {
+                return Err(ScriptError::eval(format!(
+                    "clamp(): the low {} is above the high {}",
+                    number_text(*low),
+                    number_text(*high)
+                )));
+            }
+            [value, low, high] => value.clamp(*low, *high),
+            _ => return Err(ScriptError::eval("clamp() takes a value, a low and a high")),
+        },
+        other => unreachable!("{other} is not among the math functions"),
+    };
+    if !value.is_finite() {
+        return Err(ScriptError::eval(format!(
+            "{name}() did not produce a finite number"
+        )));
+    }
+    Ok(value)
+}
+
+/// `target[index]`, both already evaluated.
+fn index_into(target: &Value, index: &Value) -> Result<Value, ScriptError> {
+    let index = index.as_number()?;
+    let Value::Array(items) = target else {
+        return Err(ScriptError::eval(format!(
+            "Only an array can be indexed, got {}",
+            target.describe()
+        )));
+    };
+    if index.fract() != 0.0 || index < 0.0 || index as usize >= items.len() {
+        return Err(ScriptError::eval(format!(
+            "Index {} is outside the array of {} items",
+            number_text(index),
+            items.len()
+        )));
+    }
+    Ok(items[index as usize].clone())
+}
+
+/// A value that must be a whole number from zero up, such as an ordinal or
+/// a region index. A fraction or a negative number is refused rather than
+/// cut to the whole number below it, which would name a different entity
+/// than the one written.
+fn index_value(value: &Value, what: &str) -> Result<u32, ScriptError> {
+    let number = value.as_number()?;
+    if number.fract() != 0.0 || number < 0.0 || number > f64::from(u32::MAX) {
+        return Err(ScriptError::eval(format!(
+            "{what} is a whole number from 0 up, got {}",
+            number_text(number)
+        )));
+    }
+    Ok(number as u32)
 }
 
 fn module_builds_nothing(label: &str) -> ScriptError {
@@ -1823,13 +2318,21 @@ fn module_builds_nothing(label: &str) -> ScriptError {
     ))
 }
 
-/// A step label under a call's label prefix. A label that already begins
-/// with the prefix is left alone, so `label + "_boss"` inside a function
-/// with a `label` argument does not double up.
+/// A step label under a call's label prefix. A label already under the
+/// prefix — the prefix and a slash — is left alone, so it does not double
+/// up. A label that merely begins with the prefix's letters is not under
+/// it: `base` in a call labelled `b` is `b/base`, or a call labelled `b`
+/// and one labelled `ba` would both build a step `base`.
 fn scoped(prefix: Option<&str>, raw: &str) -> String {
     match prefix {
         None => raw.to_owned(),
-        Some(prefix) if raw.starts_with(prefix) => raw.to_owned(),
+        Some(prefix)
+            if raw
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/')) =>
+        {
+            raw.to_owned()
+        }
         // The step that carries the call's own label is the call's step:
         // `label: label` inside `fn boss(label: str)` names `.../boss`,
         // not `.../boss/boss`.
@@ -1896,22 +2399,27 @@ fn type_matches(value: &Value, expected: &TypeSpec) -> bool {
     }
 }
 
+/// A script value. Text, arrays and exported faces are shared rather than
+/// copied when a value is: reading a variable, indexing an array, or
+/// passing either to a call costs the same however large the value is.
 #[derive(Clone, Debug, PartialEq)]
 enum Value {
     Number(f64),
     Bool(bool),
-    String(String),
-    Array(Vec<Value>),
+    String(Rc<str>),
+    Array(Items),
     Selector(EntitySelector),
     Step(StepLabel),
-    Command(ApiCommand),
+    /// A feature call. It is by far the largest value, and behind a
+    /// pointer every value on the evaluator's stack is smaller for it.
+    Command(Rc<ApiCommand>),
     /// A sketch entity awaiting a `sketch(...)` call to gather it.
-    Entity(SketchEntity),
+    Entity(Rc<SketchEntity>),
     /// What a function returns with `with faces`: a step and the faces it
     /// exports by name.
     Body {
         step: StepLabel,
-        faces: BTreeMap<String, EntitySelector>,
+        faces: Rc<BTreeMap<String, EntitySelector>>,
     },
     /// A plane named by `plane(...)`, for `sketch(on: ...)`: a frame in
     /// space, or a plane placed by the body's faces and edges, which is
@@ -1934,7 +2442,91 @@ enum ScriptAxis {
     Placed(AxisPlacement),
 }
 
+/// An array value's items, shared between every value that holds them, with
+/// the two measures the limits need, worked out once when the array is made
+/// rather than by walking it each time they are asked.
+#[derive(Clone, Debug, PartialEq)]
+struct Items {
+    values: Rc<[Value]>,
+    /// How many arrays deep the value nests: one for an array of numbers.
+    depth: usize,
+    /// What a call that receives the array pays for it: see
+    /// [`Value::weight`].
+    weight: usize,
+}
+
+impl std::ops::Deref for Items {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        &self.values
+    }
+}
+
 impl Value {
+    fn command(command: ApiCommand) -> Self {
+        Self::Command(Rc::new(command))
+    }
+
+    fn entity(entity: SketchEntity) -> Self {
+        Self::Entity(Rc::new(entity))
+    }
+
+    /// An array of `values`, refused past [`MAX_ARRAY_ELEMENTS`] items or
+    /// [`MAX_ARRAY_DEPTH`] levels of nesting.
+    fn array(values: Vec<Self>) -> Result<Self, ScriptError> {
+        if values.len() > MAX_ARRAY_ELEMENTS {
+            return Err(ScriptError::eval(format!(
+                "An array may hold at most {MAX_ARRAY_ELEMENTS} elements; this one has {}",
+                values.len()
+            )));
+        }
+        let depth = 1 + values.iter().map(Self::depth).max().unwrap_or(0);
+        if depth > MAX_ARRAY_DEPTH {
+            return Err(ScriptError::eval(format!(
+                "Arrays may nest at most {MAX_ARRAY_DEPTH} deep"
+            )));
+        }
+        let weight = values
+            .iter()
+            .map(Self::weight)
+            .fold(values.len(), usize::saturating_add);
+        Ok(Self::Array(Items {
+            values: values.into(),
+            depth,
+            weight,
+        }))
+    }
+
+    /// How many arrays deep the value nests; zero for anything else.
+    fn depth(&self) -> usize {
+        match self {
+            Self::Array(items) => items.depth,
+            _ => 0,
+        }
+    }
+
+    /// The work a call receiving the value does with it at most: checking
+    /// it against a type, or copying it into a command. One for a single
+    /// value, one for every byte of text and every point of a spline, and
+    /// for an array one for every item on top of its items' own weights.
+    /// Arrays share their items, so the weight can far outgrow the memory a
+    /// value holds; it saturates rather than overflows.
+    fn weight(&self) -> usize {
+        match self {
+            Self::String(text) => text.len().max(1),
+            Self::Array(items) => items.weight,
+            Self::Body { faces, .. } => faces.len().saturating_add(1),
+            // A spline is copied into its sketch point by point.
+            Self::Entity(entity) => match &**entity {
+                SketchEntity::Spline { points, .. } => points.len().max(1),
+                SketchEntity::ControlSpline { control_points, .. } => control_points.len().max(1),
+                _ => 1,
+            },
+            _ => 1,
+        }
+    }
+
     fn describe(&self) -> String {
         match self {
             Self::Number(number) => format!("the number {number}"),
@@ -1964,7 +2556,7 @@ impl Value {
         match self {
             Self::Number(number) => number_text(*number),
             Self::Bool(flag) => flag.to_string(),
-            Self::String(text) => text.clone(),
+            Self::String(text) => text.to_string(),
             other => other.describe(),
         }
     }
@@ -1981,7 +2573,7 @@ impl Value {
 
     fn as_string(&self) -> Result<&str, ScriptError> {
         match self {
-            Self::String(s) => Ok(s.as_str()),
+            Self::String(s) => Ok(s),
             other => Err(ScriptError::eval(format!(
                 "Expected a string, got {}",
                 other.describe()
@@ -2035,7 +2627,7 @@ impl Value {
             Self::Step(label) => Ok(label.clone()),
             Self::Command(command) => Ok(StepLabel(command.label().to_owned())),
             Self::Body { step, .. } => Ok(step.clone()),
-            Self::String(label) if !label.is_empty() => Ok(StepLabel(label.clone())),
+            Self::String(label) if !label.is_empty() => Ok(StepLabel(label.to_string())),
             other => Err(ScriptError::eval(format!(
                 "Expected a step (a `let` bound to a feature call, or its label as a string) or a body, got {}",
                 other.describe()
@@ -2073,7 +2665,12 @@ impl<'a> Args<'a> {
     ) -> Result<Self, ScriptError> {
         let mut values = BTreeMap::new();
         for (key, expression) in named_args {
-            values.insert(key.as_str(), interp.eval_expr(expression, env)?);
+            let value = interp.eval_expr(expression, env)?;
+            // What the call may copy into its command is paid for here, so
+            // one large array handed to every iteration of a loop costs
+            // what it would take to build that many.
+            interp.charge(value.weight())?;
+            values.insert(key.as_str(), value);
         }
         Ok(Self {
             call,
@@ -2113,6 +2710,31 @@ impl<'a> Args<'a> {
         Ok(scoped(self.scope.as_deref(), &raw))
     }
 
+    /// One end angle of an arc, in the radians the arc holds: `start_angle`
+    /// or `end_angle` in degrees, as scripts write angles, or
+    /// `start_radians` or `end_radians` as they are. Not every angle in
+    /// radians is some number of degrees converted, so a decompiled script
+    /// writes the radians where no degree value gives them back exactly.
+    fn arc_angle(&self, end: &str) -> Result<f64, ScriptError> {
+        let degrees = format!("{end}_angle");
+        let radians = format!("{end}_radians");
+        match (
+            self.values.get(degrees.as_str()),
+            self.values.get(radians.as_str()),
+        ) {
+            (Some(value), None) => Ok(value.as_number()?.to_radians()),
+            (None, Some(value)) => value.as_number(),
+            (Some(_), Some(_)) => Err(ScriptError::eval(format!(
+                "{}(): give `{degrees}` or `{radians}`, not both",
+                self.call
+            ))),
+            (None, None) => Err(ScriptError::eval(format!(
+                "{}() requires `{degrees}`",
+                self.call
+            ))),
+        }
+    }
+
     /// A radius given directly or as a diameter.
     fn radius(&self) -> Result<f64, ScriptError> {
         if let Some(radius) = self.values.get("radius") {
@@ -2143,13 +2765,13 @@ impl<'a> Args<'a> {
     }
 
     fn regions(&self) -> Result<Vec<u32>, ScriptError> {
+        let what = format!("{}(): a region index", self.call);
         match self.values.get("regions") {
             None => Ok(Vec::new()),
-            Some(Value::Array(items)) => items
-                .iter()
-                .map(|item| item.as_number().map(|number| number as u32))
-                .collect(),
-            Some(Value::Number(number)) => Ok(vec![*number as u32]),
+            Some(Value::Array(items)) => {
+                items.iter().map(|item| index_value(item, &what)).collect()
+            }
+            Some(number @ Value::Number(_)) => Ok(vec![index_value(number, &what)?]),
             Some(other) => Err(ScriptError::eval(format!(
                 "{}(): `regions` is an array of region indices, got {}",
                 self.call,
@@ -2592,7 +3214,7 @@ fn world_plane(args: &Args<'_>) -> Result<PlanarFrame3, ScriptError> {
 
 fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
     let items = match value {
-        Value::Array(items) => items.as_slice(),
+        Value::Array(items) => &items[..],
         Value::Entity(_) => std::slice::from_ref(value),
         other => {
             return Err(ScriptError::eval(format!(
@@ -2604,7 +3226,7 @@ fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
     items
         .iter()
         .map(|item| match item {
-            Value::Entity(entity) => Ok(entity.clone()),
+            Value::Entity(entity) => Ok((**entity).clone()),
             other => Err(ScriptError::eval(format!(
                 "sketch(): every entity is a line(), circle(), arc(), rect() or spline(), got {}",
                 other.describe()
