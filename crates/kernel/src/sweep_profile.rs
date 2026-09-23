@@ -41,6 +41,12 @@ const FRAME_STEPS: usize = 16;
 /// The most copies of the profile a skinned sweep may be built from.
 const MAX_SECTIONS: usize = 257;
 
+/// The most copies a skinned sweep starts from: half the most it may use, so
+/// that refining where the skin misses its budget always has room to work.
+/// A path of many spline spans asks for more; they are spread over it
+/// instead, and the refinement places more where the skin needs them.
+const INITIAL_SECTIONS: usize = MAX_SECTIONS.div_ceil(2);
+
 /// How closely two path tangents must agree, in radians, for a junction to
 /// be smooth rather than a corner.
 const TANGENT_AGREEMENT: f64 = 1.0e-6;
@@ -71,6 +77,9 @@ pub(crate) enum SweepInputError {
     /// The profile reaches past the path's centre of curvature somewhere, so
     /// the wall would fold there.
     ProfileTooWide,
+    /// The path comes back within the profile's reach of a stretch of itself
+    /// it had left, so the swept profile would pass through itself there.
+    SelfIntersecting,
     /// The copies along the path could not be lofted.
     Loft(LoftSectionsError),
     /// Even the most copies did not bring the skin within the budget.
@@ -223,29 +232,30 @@ fn skinned(
     precision: PrecisionPolicy,
     tolerance: f64,
 ) -> Result<Swept, SweepInputError> {
-    // Where each copy stands along the path: piece index plus the fraction
-    // of that piece, so a copy always stands at every join.
-    // The copies start about evenly spaced along the whole path: a smooth
-    // skin through copies far apart beside copies close together overshoots
-    // and folds.
-    let spacing = pieces.iter().map(|piece| piece.length()).sum::<f64>() / 12.0;
-    let mut positions = Vec::new();
-    for (index, piece) in pieces.iter().enumerate() {
-        let even = (piece.length() / spacing).ceil() as usize;
-        let spans = piece
-            .spans()
-            .max(even)
-            .max(if pieces.len() == 1 { 2 } else { 1 });
-        let first = usize::from(index > 0);
-        positions.extend((first..=spans).map(|step| index as f64 + step as f64 / spans as f64));
+    let cut_profile = circles_halved(profile);
+    let hull = hull_points(profile)
+        .into_iter()
+        .map(|point| placed.origin + placed.u * point[0] + placed.v * point[1])
+        .collect::<Vec<_>>();
+    let mut positions = first_positions(pieces);
+    // Every join needs a copy of its own, so a path of more pieces than
+    // copies allowed cannot be skinned at all. The wire format and the model
+    // hold a path to fewer segments than that; this is the kernel's own
+    // guard.
+    if positions.len() > MAX_SECTIONS {
+        return Err(SweepInputError::ToleranceUnmet {
+            deviation: f64::INFINITY,
+            tolerance,
+        });
     }
     loop {
         let stations = stations(pieces, &positions);
         let frames = carry_frames(&stations, placed, orientation)
             .ok_or(SweepInputError::PathInvalid { segment: 0 })?;
         if orientation == SweepOrientation::RotationMinimising {
-            check_width(&stations, &frames, samples)?;
+            check_width(&stations, &frames, samples, placed.normal)?;
         }
+        check_clear_of_itself(&stations, &frames, &hull, placed.normal)?;
         let origin = stations[0].point;
         let sections = (0..positions.len())
             .map(|index| {
@@ -258,7 +268,7 @@ fn skinned(
                         |point| stations[station].point + turn.apply(point - origin),
                         |vector| turn.apply(vector),
                     ),
-                    profile: profile.clone(),
+                    profile: cut_profile.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -340,6 +350,58 @@ fn skinned(
         next.push(positions[positions.len() - 1]);
         positions = next;
     }
+}
+
+/// Where the first copies stand along the path: piece index plus the
+/// fraction of that piece, so a copy always stands at every join.
+///
+/// The copies start about evenly spaced along the whole path — a smooth
+/// skin through copies far apart beside copies close together overshoots
+/// and folds — and at least as closely as each piece's own shape asks, but
+/// never more than [`INITIAL_SECTIONS`] of them while the joins allow.
+fn first_positions(pieces: &[Piece]) -> Vec<f64> {
+    let spacing = pieces.iter().map(|piece| piece.length()).sum::<f64>() / 12.0;
+    let least = if pieces.len() == 1 { 2 } else { 1 };
+    let wanted = pieces
+        .iter()
+        .map(|piece| {
+            let even = (piece.length() / spacing).ceil() as usize;
+            piece.spans().max(even).max(least)
+        })
+        .collect::<Vec<_>>();
+    let mut positions = Vec::new();
+    for (index, spans) in spread(&wanted, INITIAL_SECTIONS - 1, least)
+        .into_iter()
+        .enumerate()
+    {
+        let first = usize::from(index > 0);
+        positions.extend((first..=spans).map(|step| index as f64 + step as f64 / spans as f64));
+    }
+    positions
+}
+
+/// The spans each piece starts with: as many as it wants while together they
+/// come to no more than `most`, and otherwise each piece's share of `most`
+/// in proportion to what it wanted above `least`, never fewer than `least`.
+///
+/// A spline asks for two copies to each of its knot spans, and one of a
+/// thousand control points would otherwise start from two thousand copies —
+/// past the most a sweep may use before its first skin, each one a row of
+/// every wall's net and a stretch of every check along it.
+fn spread(wanted: &[usize], most: usize, least: usize) -> Vec<usize> {
+    if wanted.iter().sum::<usize>() <= most {
+        return wanted.to_vec();
+    }
+    let spare = most.saturating_sub(least * wanted.len());
+    let above = wanted
+        .iter()
+        .map(|count| count.saturating_sub(least))
+        .sum::<usize>()
+        .max(1);
+    wanted
+        .iter()
+        .map(|count| least + count.saturating_sub(least) * spare / above)
+        .collect()
 }
 
 /// Every span cut in two.
@@ -538,6 +600,19 @@ fn parse_path(
                 if to.partial_cmp(&from) != Some(std::cmp::Ordering::Greater) {
                     return Err(invalid);
                 }
+                // A spline no longer than the feature floor, or one whose
+                // rate vanishes somewhere — a cusp, or an end whose first
+                // two control points coincide — has no tangent there for a
+                // frame to follow, and is refused as the segment it is
+                // rather than by whatever the frames that fail on it upset.
+                let length = curve.length(from, to);
+                if !length.is_finite() || length <= minimum {
+                    return Err(invalid);
+                }
+                let least = curve.least_speed();
+                if least.is_nan() || least <= 1.0e-6 * length / (to - from) {
+                    return Err(invalid);
+                }
                 Piece::Spline { curve, from, to }
             }
         };
@@ -688,12 +763,28 @@ fn reflected(from: Station, reference: Vector3, to: Station) -> Option<Vector3> 
 
 /// Refuses a profile that reaches past the path's centre of curvature
 /// anywhere: the wall would fold back through itself there.
+///
+/// Turned by the rotation-minimising frame, the profile turns about the
+/// binormal `B` at the path's curvature `κ`, so a point of it at `y` from the
+/// path moves at `T + κ·B × y`. The profile sweeps forward there while that
+/// motion has a part along the profile's normal `n`, faced along the path:
+/// while `κ·y·(B × n) < n·T`. Where it has none the copies stop advancing
+/// and the wall folds. For a profile square to the path, `n = T` and
+/// `B × T = N`, and this is the familiar `κ·(y·N) < 1`, the profile inside
+/// the centre of curvature; a profile leaning on the path folds sooner on
+/// the side it leans back from. The frame keeps `n·T` as it started.
 fn check_width(
     stations: &[Station],
     frames: &[Turn],
     samples: &[Point3],
+    normal: Vector3,
 ) -> Result<(), SweepInputError> {
     let origin = stations[0].point;
+    let facing = if normal.dot(stations[0].tangent) < 0.0 {
+        normal * -1.0
+    } else {
+        normal
+    };
     for (station, turn) in stations.iter().zip(frames) {
         let speed = station.first.length();
         if speed <= 1.0e-12 {
@@ -704,10 +795,166 @@ fn check_width(
         let Some(inward) = unit(bend).filter(|_| curvature > 1.0e-12) else {
             continue;
         };
+        let facing_here = turn.apply(facing);
+        let ahead = facing_here.dot(station.tangent);
+        let across = station.tangent.cross(inward).cross(facing_here);
         for sample in samples {
-            let reach = turn.apply(*sample - origin).dot(inward);
-            if reach * curvature >= 1.0 - 1.0e-9 {
+            let reach = turn.apply(*sample - origin).dot(across);
+            if reach * curvature >= ahead * (1.0 - 1.0e-9) {
                 return Err(SweepInputError::ProfileTooWide);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a sweep that would pass through itself: the path coming back,
+/// further on, to within the profile's reach of a stretch it had left.
+///
+/// Every copy of the profile lies inside the ball of radius `reach` about
+/// where its frame carries the centre of the profile's hull, so two copies
+/// can meet only where the line those centres trace comes within `2·reach`
+/// of itself. Copies near each other along it are the width check's to
+/// judge; this is for copies further apart along it than half a turn about
+/// the profile's reach, `π·reach`, which no path bent as gently as the width
+/// check allows brings together without coming back on itself. Stretches
+/// that do come that close are then judged by what they hold: the hulls of
+/// the profile at either end of each, widened by half the furthest a hull
+/// point moves between them, and the stretches are clear only when some
+/// direction — the one between them, either profile's normal, or one square
+/// to two of those — has the two sets of points wholly apart along it. A
+/// path that turns back through the solid it has already swept, or comes so
+/// near it that neither can be shown apart, is refused.
+fn check_clear_of_itself(
+    stations: &[Station],
+    frames: &[Turn],
+    hull: &[Point3],
+    normal: Vector3,
+) -> Result<(), SweepInputError> {
+    let Some(first) = hull.first() else {
+        return Ok(());
+    };
+    let (low, high) = hull.iter().fold((*first, *first), |(low, high), point| {
+        (
+            Point3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z)),
+            Point3::new(
+                high.x.max(point.x),
+                high.y.max(point.y),
+                high.z.max(point.z),
+            ),
+        )
+    });
+    let middle = low + (high - low) * 0.5;
+    let reach = hull
+        .iter()
+        .map(|point| point.distance(middle))
+        .fold(0.0, f64::max);
+    if reach.is_nan() || reach <= 0.0 {
+        return Ok(());
+    }
+    let origin = stations[0].point;
+    let carried = |station: usize, point: Point3| {
+        stations[station].point + frames[station].apply(point - origin)
+    };
+    let centres = (0..stations.len())
+        .map(|station| carried(station, middle))
+        .collect::<Vec<_>>();
+    let mut walked = vec![0.0; centres.len()];
+    for index in 1..centres.len() {
+        walked[index] = walked[index - 1] + centres[index].distance(centres[index - 1]);
+    }
+    let (apart, near) = (std::f64::consts::PI * reach, 2.0 * reach);
+
+    // Whether the swept stretches from station `i` to the next and from `j`
+    // to the next can be shown apart.
+    let hulls = |from: usize| -> Vec<Point3> {
+        hull.iter()
+            .flat_map(|point| [carried(from, *point), carried(from + 1, *point)])
+            .collect()
+    };
+    let separated = |i: usize, j: usize| {
+        let (first, second) = (hulls(i), hulls(j));
+        let spread = |points: &[Point3]| {
+            points
+                .chunks(2)
+                .map(|pair| pair[0].distance(pair[1]))
+                .fold(0.0, f64::max)
+        };
+        let margin = 0.5 * (spread(&first) + spread(&second));
+        let between = (centres[j] - centres[i]) + (centres[j + 1] - centres[i + 1]);
+        let (facing_i, facing_j) = (frames[i].apply(normal), frames[j].apply(normal));
+        [
+            between,
+            facing_i,
+            facing_j,
+            facing_i.cross(facing_j),
+            between.cross(facing_i),
+            between.cross(facing_j),
+        ]
+        .into_iter()
+        .filter_map(unit)
+        .any(|axis| {
+            let extent = |points: &[Point3]| {
+                points
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+                        let along = point.as_vector().dot(axis);
+                        (low.min(along), high.max(along))
+                    })
+            };
+            let ((first_low, first_high), (second_low, second_high)) =
+                (extent(&first), extent(&second));
+            second_low - first_high > margin || first_low - second_high > margin
+        })
+    };
+
+    // The stretches in runs of `FRAME_STEPS`, one run to a span between
+    // copies, each run boxed so that runs far apart are passed over whole.
+    let segments = centres.len() - 1;
+    let runs = (0..segments)
+        .step_by(FRAME_STEPS)
+        .map(|start| {
+            let end = (start + FRAME_STEPS).min(segments);
+            let (low, high) = centres[start..=end].iter().fold(
+                (centres[start], centres[start]),
+                |(low, high), point| {
+                    (
+                        Point3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z)),
+                        Point3::new(
+                            high.x.max(point.x),
+                            high.y.max(point.y),
+                            high.z.max(point.z),
+                        ),
+                    )
+                },
+            );
+            (start, end, low, high)
+        })
+        .collect::<Vec<_>>();
+    for (index, &(start, end, low, high)) in runs.iter().enumerate() {
+        for &(other_start, other_end, other_low, other_high) in &runs[index..] {
+            let gap = Vector3::new(
+                (other_low.x - high.x).max(low.x - other_high.x).max(0.0),
+                (other_low.y - high.y).max(low.y - other_high.y).max(0.0),
+                (other_low.z - high.z).max(low.z - other_high.z).max(0.0),
+            );
+            if gap.length() > near || walked[other_end] - walked[start] <= apart {
+                continue;
+            }
+            for i in start..end {
+                for j in other_start.max(i + 1)..other_end {
+                    if walked[j] - walked[i + 1] <= apart
+                        || loft_sections::segment_distance(
+                            (centres[i], centres[i + 1]),
+                            (centres[j], centres[j + 1]),
+                        ) > near
+                    {
+                        continue;
+                    }
+                    if !separated(i, j) {
+                        return Err(SweepInputError::SelfIntersecting);
+                    }
+                }
             }
         }
     }
@@ -721,7 +968,12 @@ fn check_width(
 ///
 /// Each sample is found on the skin once, by a search; after that each
 /// station starts from where the one before it landed, so the rest are a few
-/// Newton steps each.
+/// Newton steps each. A walk that ends on the edge of its wall may have
+/// crossed a seam — a sample on a rung, carried a little to one side of it —
+/// and is then asked of every other wall too, from the edge the seam would
+/// bring it in at: without that, a sample that drifted onto the next wall
+/// would be measured from the edge of the one it left, further the further it
+/// went.
 fn departures(
     topology: &Topology,
     stations: &[Station],
@@ -768,7 +1020,8 @@ fn departures(
                         })
                         .min_by(|left, right| left.0.total_cmp(&right.0))
                         .map(|(_, wall, parameters)| (wall, parameters))
-                });
+                })
+                .map(|(wall, parameters)| across_seam(&walls, wall, parameters, truth));
             let distance = found.map_or(f64::INFINITY, |(wall, parameters)| {
                 (walls[wall].evaluate(parameters) - truth).length()
             });
@@ -780,6 +1033,84 @@ fn departures(
         }
     }
     worst
+}
+
+/// The nearest point to `truth` on wall `wall` at `parameters`, or on
+/// another wall when that point is on the wall's edge and another is nearer:
+/// each other wall is walked from its opposite edge at the same height,
+/// where a seam would bring the point onto it.
+fn across_seam(
+    walls: &[SplineSurface],
+    wall: usize,
+    parameters: crate::topology::Point2,
+    truth: Point3,
+) -> (usize, crate::topology::Point2) {
+    let (u_min, u_max, _, _) = walls[wall].domain();
+    if parameters.x > u_min && parameters.x < u_max {
+        return (wall, parameters);
+    }
+    let distance = |wall: usize, parameters| (walls[wall].evaluate(parameters) - truth).length();
+    let mut best = (distance(wall, parameters), wall, parameters);
+    for (other, surface) in walls.iter().enumerate().filter(|(other, _)| *other != wall) {
+        let (low, high, _, _) = surface.domain();
+        let edge = if parameters.x <= u_min { high } else { low };
+        let seed = crate::topology::Point2::new(edge, parameters.y);
+        if let Some(found) = surface.invert(truth, Some(seed)) {
+            let candidate = distance(other, found);
+            if candidate < best.0 {
+                best = (candidate, other, found);
+            }
+        }
+    }
+    (best.1, best.2)
+}
+
+/// The profile with every whole circle written as its two halves, cut where
+/// the profile's own `u` axis leaves the centre and at the opposite point.
+///
+/// A loft through circles alone has no vertex to start them from and must
+/// choose where to cut each one. A sweep need not choose: every copy is the
+/// profile carried rigidly by its frame, so a cut made in the profile is
+/// carried with it, and the rungs through the cuts are the paths the cut
+/// points really sweep. They neither twist nor depend on the rounding of a
+/// direction that a turning copy stands almost edge-on to.
+fn circles_halved(profile: &PlanarProfile2) -> PlanarProfile2 {
+    let mut halved = profile.clone();
+    for curves in halved.regions.iter_mut().flat_map(|region| {
+        std::iter::once(&mut region.outer)
+            .chain(&mut region.holes)
+            .map(|profile_loop| &mut profile_loop.curves)
+    }) {
+        *curves = curves
+            .iter()
+            .flat_map(|curve| match *curve {
+                PlanarCurve2::Circle {
+                    center,
+                    radius,
+                    direction,
+                } => {
+                    let east = ProtocolPoint2::new(center.x + radius, center.y);
+                    let west = ProtocolPoint2::new(center.x - radius, center.y);
+                    vec![
+                        PlanarCurve2::CircularArc {
+                            center,
+                            start: east,
+                            end: west,
+                            direction,
+                        },
+                        PlanarCurve2::CircularArc {
+                            center,
+                            start: west,
+                            end: east,
+                            direction,
+                        },
+                    ]
+                }
+                ref other => vec![other.clone()],
+            })
+            .collect();
+    }
+    halved
 }
 
 /// Points on every curve of the profile, in its own coordinates.
@@ -805,19 +1136,7 @@ fn profile_samples(profile: &PlanarProfile2) -> Vec<[f64; 2]> {
                     end,
                     direction,
                 } => {
-                    let radius = (start.x - center.x).hypot(start.y - center.y);
-                    let from = (start.y - center.y).atan2(start.x - center.x);
-                    let to = (end.y - center.y).atan2(end.x - center.x);
-                    let sweep = match direction {
-                        artificer_protocol::ArcDirection::CounterClockwise => {
-                            let turn = (to - from).rem_euclid(TAU);
-                            if turn == 0.0 { TAU } else { turn }
-                        }
-                        artificer_protocol::ArcDirection::Clockwise => {
-                            let turn = (from - to).rem_euclid(TAU);
-                            -(if turn == 0.0 { TAU } else { turn })
-                        }
-                    };
+                    let (radius, from, sweep) = arc_angles(*center, *start, *end, *direction);
                     for step in 0..8 {
                         let angle = sweep.mul_add(f64::from(step) / 8.0, from);
                         samples.push([
@@ -872,6 +1191,96 @@ fn profile_samples(profile: &PlanarProfile2) -> Vec<[f64; 2]> {
         }
     }
     samples
+}
+
+/// An arc's radius, the angle it starts at and the signed angle it turns
+/// through, positive counter-clockwise; a whole turn where it ends where it
+/// starts.
+fn arc_angles(
+    center: ProtocolPoint2,
+    start: ProtocolPoint2,
+    end: ProtocolPoint2,
+    direction: artificer_protocol::ArcDirection,
+) -> (f64, f64, f64) {
+    let radius = (start.x - center.x).hypot(start.y - center.y);
+    let from = (start.y - center.y).atan2(start.x - center.x);
+    let to = (end.y - center.y).atan2(end.x - center.x);
+    let sweep = match direction {
+        artificer_protocol::ArcDirection::CounterClockwise => {
+            let turn = (to - from).rem_euclid(TAU);
+            if turn == 0.0 { TAU } else { turn }
+        }
+        artificer_protocol::ArcDirection::Clockwise => {
+            let turn = (from - to).rem_euclid(TAU);
+            -(if turn == 0.0 { TAU } else { turn })
+        }
+    };
+    (radius, from, sweep)
+}
+
+/// Points whose convex hull holds every curve of the profile, in its own
+/// coordinates: a line's ends, a spline's control points — a spline lies in
+/// the hull of its control polygon — and for a circle or an arc the corners
+/// of a polygon drawn about it, every edge touching it, in steps of at most
+/// a sixteenth of a turn.
+fn hull_points(profile: &PlanarProfile2) -> Vec<[f64; 2]> {
+    fn about(
+        points: &mut Vec<[f64; 2]>,
+        center: ProtocolPoint2,
+        radius: f64,
+        from: f64,
+        sweep: f64,
+    ) {
+        let steps = ((sweep.abs() / (TAU / 16.0)).ceil() as usize).max(1);
+        let step = sweep / steps as f64;
+        // The tangents at two neighbouring points meet at the middle angle,
+        // `1/cos(step/2)` of the radius out.
+        let out = radius / (0.5 * step).cos();
+        for index in 0..=steps {
+            let angle = step.mul_add(index as f64, from);
+            points.push([
+                radius.mul_add(angle.cos(), center.x),
+                radius.mul_add(angle.sin(), center.y),
+            ]);
+            if index < steps {
+                let middle = angle + 0.5 * step;
+                points.push([
+                    out.mul_add(middle.cos(), center.x),
+                    out.mul_add(middle.sin(), center.y),
+                ]);
+            }
+        }
+    }
+    let mut points = Vec::new();
+    for region in &profile.regions {
+        for curve in std::iter::once(&region.outer)
+            .chain(&region.holes)
+            .flat_map(|profile_loop| &profile_loop.curves)
+        {
+            match curve {
+                PlanarCurve2::Line { start, end } => {
+                    points.push([start.x, start.y]);
+                    points.push([end.x, end.y]);
+                }
+                PlanarCurve2::CircularArc {
+                    center,
+                    start,
+                    end,
+                    direction,
+                } => {
+                    let (radius, from, sweep) = arc_angles(*center, *start, *end, *direction);
+                    about(&mut points, *center, radius, from, sweep);
+                }
+                PlanarCurve2::Circle { center, radius, .. } => {
+                    about(&mut points, *center, *radius, 0.0, TAU);
+                }
+                PlanarCurve2::Bspline { control_points, .. } => {
+                    points.extend(control_points.iter().map(|point| [point.x, point.y]));
+                }
+            }
+        }
+    }
+    points
 }
 
 /// The profile frame moved by a rigid motion: `place` takes a point, `turn` a
@@ -981,6 +1390,215 @@ mod tests {
             (reference - expected).length() < 1.0e-5,
             "{reference:?} against {expected:?}"
         );
+    }
+
+    fn disc(radius: f64) -> PlanarProfile2 {
+        PlanarProfile2 {
+            regions: vec![artificer_protocol::PlanarRegion2 {
+                outer: artificer_protocol::PlanarLoop2 {
+                    curves: vec![PlanarCurve2::Circle {
+                        center: ProtocolPoint2::new(0.0, 0.0),
+                        radius,
+                        direction: artificer_protocol::ArcDirection::CounterClockwise,
+                    }],
+                },
+                holes: vec![],
+            }],
+        }
+    }
+
+    /// The self-intersection check alone, for a disc of radius one swept
+    /// from the origin, square to the path, by its rotation-minimising
+    /// frame: the path sampled as the skinned route first samples it.
+    fn clear_of_itself(segments: Vec<SweepSegment3>) -> Result<(), SweepInputError> {
+        let precision = PrecisionPolicy::default();
+        let pieces = parse_path(&SweepPath3 { segments }, precision)?;
+        let (point, first, _) = pieces[0].jet(0.0);
+        let tangent = unit(first).expect("a sound start");
+        let seed = if tangent.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        let u = unit(seed - tangent * seed.dot(tangent)).expect("square to the path");
+        let v = tangent.cross(u);
+        let placed = Frame {
+            origin: point,
+            u,
+            v,
+            normal: tangent,
+        };
+        let positions = (0..=pieces.len() * 24)
+            .map(|step| step as f64 / 24.0)
+            .collect::<Vec<_>>();
+        let stations = stations(&pieces, &positions);
+        let frames =
+            carry_frames(&stations, placed, SweepOrientation::RotationMinimising).expect("frames");
+        let hull = hull_points(&disc(1.0))
+            .into_iter()
+            .map(|point| placed.origin + placed.u * point[0] + placed.v * point[1])
+            .collect::<Vec<_>>();
+        check_clear_of_itself(&stations, &frames, &hull, placed.normal)
+    }
+
+    fn line(start: [f64; 3], end: [f64; 3]) -> SweepSegment3 {
+        SweepSegment3::Line {
+            start: ProtocolPoint3::new(start[0], start[1], start[2]),
+            end: ProtocolPoint3::new(end[0], end[1], end[2]),
+        }
+    }
+
+    /// A quarter turn and a half of radius `bend` about `y`, from the top of
+    /// a line up the `z` axis.
+    fn hook(bend: f64) -> SweepSegment3 {
+        SweepSegment3::Arc {
+            center: ProtocolPoint3::new(bend, 0.0, 5.0),
+            start: ProtocolPoint3::new(0.0, 0.0, 5.0),
+            normal: ProtocolVector3::new(0.0, 1.0, 0.0),
+            sweep: 1.5 * std::f64::consts::PI,
+        }
+    }
+
+    /// A helix of `turns` about `z` as a cubic through points on it.
+    fn spring(radius: f64, pitch: f64, turns: f64) -> SweepSegment3 {
+        let count = (turns * 12.0).ceil() as usize + 1;
+        let points = (0..count)
+            .map(|index| {
+                let angle = turns * TAU * index as f64 / (count - 1) as f64;
+                ProtocolPoint3::new(
+                    radius * angle.cos(),
+                    radius * angle.sin(),
+                    pitch * angle / TAU,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut knots = vec![0.0; 4];
+        knots.extend((1..count - 3).map(|index| index as f64 / (count - 3) as f64));
+        knots.extend([1.0; 4]);
+        SweepSegment3::Spline {
+            degree: 3,
+            knots,
+            points,
+        }
+    }
+
+    /// A path that comes back through the solid it has swept is refused,
+    /// and one that comes back only near it — a tight hook, a spring whose
+    /// coils clear each other — is not, however tightly it bends.
+    #[test]
+    fn a_path_back_through_itself_is_refused_and_one_that_only_passes_near_is_not() {
+        let up = || line([0.0, 0.0, 0.0], [0.0, 0.0, 5.0]);
+        // Up, three quarters round a bend of 1.5 and back through the way
+        // up.
+        assert_eq!(
+            clear_of_itself(vec![
+                up(),
+                hook(1.5),
+                line([1.5, 0.0, 3.5], [-3.0, 0.0, 3.5]),
+            ]),
+            Err(SweepInputError::SelfIntersecting)
+        );
+        // Coils 1.5 apart, of a wire 2 across.
+        assert_eq!(
+            clear_of_itself(vec![spring(5.0, 1.5, 1.5)]),
+            Err(SweepInputError::SelfIntersecting)
+        );
+        // The same hook of radius 1.3 stops short: its end is 0.3 clear of
+        // the way up, and the bend never meets itself.
+        assert_eq!(clear_of_itself(vec![up(), hook(1.3)]), Ok(()));
+        // Coils 2.4 apart, wound on a radius only half again the wire's.
+        assert_eq!(clear_of_itself(vec![spring(1.5, 2.4, 1.5)]), Ok(()));
+    }
+
+    /// The fold condition holds a profile leaning on the path to the side
+    /// it leans back from: a disc of radius 2 round a bend of radius 3 is
+    /// clear square to the path, and folds leaning sixty degrees back.
+    #[test]
+    fn a_leaning_profile_folds_sooner() {
+        let segments = vec![
+            line([0.0, 0.0, 0.0], [0.0, 0.0, 5.0]),
+            SweepSegment3::Arc {
+                center: ProtocolPoint3::new(3.0, 0.0, 5.0),
+                start: ProtocolPoint3::new(0.0, 0.0, 5.0),
+                normal: ProtocolVector3::new(0.0, 1.0, 0.0),
+                sweep: 0.5 * std::f64::consts::PI,
+            },
+        ];
+        let pieces =
+            parse_path(&SweepPath3 { segments }, PrecisionPolicy::default()).expect("a sound path");
+        let positions = (0..=48)
+            .map(|step| f64::from(step) / 24.0)
+            .collect::<Vec<_>>();
+        let stations = stations(&pieces, &positions);
+        let width = |lean: f64| {
+            let (sin, cos) = lean.sin_cos();
+            // Leaning back about `y`, away from the bend's centre at `+x`.
+            let u = Vector3::new(cos, 0.0, -sin);
+            let v = Vector3::new(0.0, 1.0, 0.0);
+            let placed = Frame {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                u,
+                v,
+                normal: u.cross(v),
+            };
+            let frames = carry_frames(&stations, placed, SweepOrientation::RotationMinimising)
+                .expect("frames");
+            let samples = (0..16)
+                .map(|step| {
+                    let angle = TAU * f64::from(step) / 16.0;
+                    placed.origin + u * (2.0 * angle.cos()) + v * (2.0 * angle.sin())
+                })
+                .collect::<Vec<_>>();
+            check_width(&stations, &frames, &samples, placed.normal)
+        };
+        assert_eq!(width(0.0), Ok(()));
+        assert_eq!(
+            width(std::f64::consts::FRAC_PI_3),
+            Err(SweepInputError::ProfileTooWide)
+        );
+    }
+
+    /// Where spline spans would ask for more copies than a sweep may start
+    /// from, they are spread over the path in proportion, every piece
+    /// keeping its floor. A spline of four hundred control points asked for
+    /// two copies to each of its 397 spans, 795 in all, past the most a
+    /// sweep may use at all; it now starts from half that most.
+    #[test]
+    fn many_spans_are_spread_over_the_first_copies() {
+        assert_eq!(spread(&[4, 8, 2], 128, 1), vec![4, 8, 2]);
+        let spread_out = spread(&[794, 4, 1], 128, 1);
+        assert!(spread_out.iter().sum::<usize>() <= 128, "{spread_out:?}");
+        assert!(spread_out.iter().all(|spans| *spans >= 1));
+        assert!(spread_out[0] > 100);
+        assert_eq!(spread(&[2; 300], 128, 1), vec![1; 300]);
+
+        // A wave of four hundred control points rising along `z`.
+        let count = 400;
+        let mut knots = vec![0.0; 4];
+        knots.extend((1..count - 3).map(|index| f64::from(index) / f64::from(count - 3)));
+        knots.extend([1.0; 4]);
+        let wave = SweepSegment3::Spline {
+            degree: 3,
+            knots,
+            points: (0..count)
+                .map(|index| {
+                    let t = f64::from(index) / f64::from(count - 1);
+                    ProtocolPoint3::new(3.0 * (4.0 * std::f64::consts::PI * t).sin(), 0.0, 60.0 * t)
+                })
+                .collect(),
+        };
+        let pieces = parse_path(
+            &SweepPath3 {
+                segments: vec![wave],
+            },
+            PrecisionPolicy::default(),
+        )
+        .expect("a sound wave");
+        assert_eq!(pieces[0].spans(), 2 * 397);
+        let positions = first_positions(&pieces);
+        assert_eq!(positions.len(), INITIAL_SECTIONS);
+        assert_eq!((positions[0], positions[positions.len() - 1]), (0.0, 1.0));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     /// Along a straight line the frame does not turn at all.

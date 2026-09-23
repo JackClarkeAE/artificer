@@ -7670,6 +7670,10 @@ fn sweep_input_error(snapshot: SnapshotId, reason: sweep_profile::SweepInputErro
             "SWEEP_PROFILE_TOO_WIDE".to_owned(),
             "The profile reaches past the path's centre of curvature where the path bends most tightly, so the swept wall would fold through itself.".to_owned(),
         ),
+        SweepInputError::SelfIntersecting => (
+            "SWEEP_SELF_INTERSECTS".to_owned(),
+            "The path comes back within the profile's reach of a stretch of itself it had already left, so the swept solid would pass through itself.".to_owned(),
+        ),
         SweepInputError::ToleranceUnmet {
             deviation,
             tolerance,
