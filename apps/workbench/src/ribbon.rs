@@ -794,7 +794,7 @@ impl KernelLabApp {
                 }
                 CommandAvailability::Enabled
             }
-            ModelCommand::ConstructionPlane => {
+            ModelCommand::ConstructionPlane | ModelCommand::ConstructionAxis => {
                 if let Some(blocked) = free(self) {
                     return blocked;
                 }
@@ -1146,6 +1146,7 @@ impl KernelLabApp {
             // other operation does.
             ModelCommand::InsertPart => self.open_part_library(),
             ModelCommand::ConstructionPlane => self.stage_construction_plane(),
+            ModelCommand::ConstructionAxis => self.stage_construction_axis(),
             ModelCommand::Extrude => {
                 let eligibility = self.sketch_extrusion_eligibility();
                 if self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick()

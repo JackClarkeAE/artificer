@@ -1,10 +1,11 @@
 # ADR 0055: Revolve and sweep are features
 
-Status: accepted. Phases R1, R2 and R3 are implemented: Revolve is a
-history feature that turns a sketch profile about a centreline, the
-sketch's own axes or an origin axis, a full turn or through an angle that
-can follow a variable, as a new body or added to or cut from the active
-one. The later phases are planned below.
+Status: accepted. Phases R1, R2 and R3 are implemented, with construction
+axes: Revolve is a history feature that turns a sketch profile about a
+centreline, the sketch's own axes, an origin axis or a construction axis, a
+full turn or through an angle that can follow a variable, as a new body or
+added to or cut from the active one. The sweep phases are planned below;
+the sketch side of S1 is built.
 
 - Date: 2026-09-23
 - Decision owners: Artificer project
@@ -408,3 +409,63 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
   - Each refusal, STEP export for each carrier, and the exact partial cut.
   - The model's angle link, and the card's and the real widgets' angle
     typed over a variable.
+
+## As built (construction axes)
+
+The owner's first decision asked for every axis source, a construction axis
+among them. It is a feature in the history, on the pattern of the
+construction plane (ADR 0048).
+
+- **Model** (`crates/model/src/datum_axis.rs`).
+  - `DatumAxisRecipe` records its base, a flip, the line it last resolved
+    to (a cache, as a plane's frame is), and whether it is shown.
+  - `DatumAxisBase` is one of:
+    - an origin axis;
+    - a straight edge (`Edge`);
+    - a curved face (`Face`), whose cylinder, cone, torus or sphere axis it
+      takes;
+    - two planes (`Planes`), each an origin plane, a flat face or a
+      construction plane;
+    - a line that names nothing (`Fixed`).
+  - `DatumAxisResolver` answers what an edge, a face or a plane is at the
+    moment of replay.
+  - The feature is `FeatureKind::DatumAxis`, with
+    `ReplayAction::DatumAxis`, and runs nothing.
+  - It names its body, and any construction plane it reads, as inputs.
+  - It stays in document version 10 (`DATUM_AXIS_DOCUMENT_VERSION`).
+- **Revolve.** `RevolveAxis::DatumAxis { axis }` turns right-handed about
+  the axis the way it runs.
+  - The axis must lie in the sketch's plane (`line_in_frame`, which origin
+    axes now use too).
+  - The axis is an input of the revolve, so moving it rebuilds the revolve,
+    and it cannot be deleted from under it.
+  - `resolve_with_datums` reads the axis where the rebuild has just placed
+    it. `resolve_sketch_regions_with_datums` carries both planes and axes.
+- **Kernel.** `NativeKernel::face_axis` returns a curved face's axis. The
+  axis is centred on, and drawn over, the stretch of it the face covers.
+- **Workbench** (`apps/workbench/src/construction_axis.rs`).
+  - The Axis button in the Create group stages an axis from what is
+    picked: a straight edge, a curved face, two flat faces, or a flat face
+    with a construction plane.
+  - The CONSTRUCTION AXIS card flips it. Confirming commits "Axis N" with a
+    chip of its own. The chip's menu edits the axis or deletes it, and the
+    delete is refused while something is built on it.
+  - A rebuild places each axis again against the bodies as they now stand.
+    If its base no longer resolves, the axis holds its place and says so
+    (" · held"), as a plane does.
+  - Axes are drawn as dashed lines, with the end they run towards marked.
+  - The revolve card lists every construction axis by name. An axis
+    standing out of the sketch's plane is listed but disabled, with the
+    reason.
+- **Not yet.** An axis cannot be picked in the viewport, is not listed in
+  the Browser, and has no scripting form. The revolve card is where it is
+  chosen.
+- **Tests.**
+  - Model: each base, flip, the refusals, and a round trip through JSON.
+  - Model: a revolve about an axis follows where a rebuild placed it, and
+    the axis cannot be deleted under it.
+  - Kernel: `face_axis` on a revolved tube.
+  - Workbench:
+    - an axis along the block's edge that a revolve turns about exactly;
+    - an axis where two faces meet, flipped in its editor and deleted;
+    - a flat face alone is refused.

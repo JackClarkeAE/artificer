@@ -16,6 +16,7 @@ use std::f32::consts::TAU;
 pub enum CommandIcon {
     Sketch,
     Plane,
+    Axis,
     Section,
     Interference,
     Extrude,
@@ -214,6 +215,12 @@ impl IconPainter<'_> {
             CommandIcon::Plane => {
                 self.closed_path(&[(0.10, 0.62), (0.44, 0.80), (0.90, 0.56), (0.56, 0.38)]);
                 self.dashed((0.50, 0.09), (0.50, 0.44));
+            }
+            CommandIcon::Axis => {
+                // A dashed line through space, with the way it runs marked.
+                self.dashed((0.16, 0.86), (0.80, 0.22));
+                self.arrowhead((0.86, 0.16), (0.64, -0.64), 0.14);
+                self.dot((0.16, 0.86), 0.05);
             }
             CommandIcon::Section => {
                 // A block with its near half cut away, the cut face hatched.

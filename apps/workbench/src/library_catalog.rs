@@ -568,6 +568,7 @@ fn bind_recipe_command(
         | ReplayAction::SketchRegionExtrusion(_)
         | ReplayAction::Boolean(_)
         | ReplayAction::DatumPlane(_)
+        | ReplayAction::DatumAxis(_)
         | ReplayAction::SketchLoft(_)
         | ReplayAction::SketchRevolve(_)
         | ReplayAction::KernelChain(_) => Err(LibraryCatalogError::RecipeContract(

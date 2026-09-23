@@ -32,7 +32,10 @@ use crate::parameters::{EvaluatedParameters, ParameterExpression, ParameterValue
 use crate::sketch_region::{
     MAX_SELECTED_SKETCH_REGIONS, SketchRegionResolveError, compile_sketch_regions,
 };
-use crate::{FeatureId, ModelDocument, ParameterId, ReplayAction, ResolvedDatumPlane, SketchId};
+use crate::{
+    DatumAxisRecipe, FeatureId, ModelDocument, ParameterId, ReplayAction, ResolvedDatumAxis,
+    ResolvedDatumPlane, SketchId,
+};
 
 /// Schema written for newly created revolve recipes.
 pub const CURRENT_SKETCH_REVOLVE_RECIPE_VERSION: u32 = 1;
@@ -93,6 +96,10 @@ pub enum RevolveAxis {
     /// plane: the X axis serves a sketch on the XY or XZ plane, but not one
     /// on the YZ plane or on a plane lifted off the origin.
     OriginAxis { axis: OriginAxis },
+    /// A construction axis, named by its feature. It has to lie in the
+    /// sketch's plane too, and the revolve turns right-handed about it the
+    /// way it runs.
+    DatumAxis { axis: FeatureId },
 }
 
 /// Which way a revolve that stops short of a full turn goes from its sketch.
@@ -301,6 +308,19 @@ impl SketchRevolve {
         precision: PrecisionPolicy,
         planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
     ) -> Result<ReplayAction, SketchRegionResolveError> {
+        self.resolve_with_datums(document, precision, planes, &BTreeMap::new())
+    }
+
+    /// As [`Self::resolve_with_planes`], turning about a construction axis
+    /// where `axes` holds it — a rebuild passes the axes it has resolved so
+    /// far — and otherwise where its recipe last put it.
+    pub fn resolve_with_datums(
+        &self,
+        document: &ModelDocument,
+        precision: PrecisionPolicy,
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+        axes: &BTreeMap<FeatureId, ResolvedDatumAxis>,
+    ) -> Result<ReplayAction, SketchRegionResolveError> {
         self.validate()
             .map_err(SketchRegionResolveError::InvalidRevolve)?;
         let (profile, drawn_frame) =
@@ -308,8 +328,21 @@ impl SketchRevolve {
         let frame = section_plane(document, self.sketch, planes)
             .or_else(|| document.sketch_frame(self.sketch))
             .unwrap_or(drawn_frame);
-        let axis = resolve_axis(document, self.sketch, self.axis, frame, precision)
-            .map_err(SketchRegionResolveError::InvalidRevolve)?;
+        let axis = match self.axis {
+            RevolveAxis::DatumAxis { axis } => {
+                let line = axes
+                    .get(&axis)
+                    .copied()
+                    .or_else(|| document.datum_axis(axis).map(DatumAxisRecipe::cached))
+                    .ok_or(SketchRevolveError::MissingDatumAxis { axis })
+                    .map_err(SketchRegionResolveError::InvalidRevolve)?;
+                line_in_frame(line.origin, line.direction, frame, precision)
+                    .ok_or(SketchRevolveError::DatumAxisOffSketchPlane { axis })
+                    .map_err(SketchRegionResolveError::InvalidRevolve)?
+            }
+            other => resolve_axis(document, self.sketch, other, frame, precision)
+                .map_err(SketchRegionResolveError::InvalidRevolve)?,
+        };
         Ok(ReplayAction::Kernel(KernelCommand::RevolvePlanarProfile {
             frame,
             profile,
@@ -362,6 +395,14 @@ pub fn resolve_axis(
             }
         }),
         RevolveAxis::OriginAxis { axis } => origin_axis_in_frame(axis, frame, precision),
+        RevolveAxis::DatumAxis { axis } => {
+            let line = document
+                .datum_axis(axis)
+                .map(DatumAxisRecipe::cached)
+                .ok_or(SketchRevolveError::MissingDatumAxis { axis })?;
+            line_in_frame(line.origin, line.direction, frame, precision)
+                .ok_or(SketchRevolveError::DatumAxisOffSketchPlane { axis })
+        }
     }
 }
 
@@ -372,6 +413,24 @@ pub fn origin_axis_in_frame(
     frame: PlanarFrame3,
     precision: PrecisionPolicy,
 ) -> Result<PlanarAxis2, SketchRevolveError> {
+    line_in_frame(
+        artificer_protocol::Point3::new(0.0, 0.0, 0.0),
+        axis.direction(),
+        frame,
+        precision,
+    )
+    .ok_or(SketchRevolveError::AxisOffSketchPlane { axis })
+}
+
+/// A line in space in a sketch plane's coordinates, if it lies in that
+/// plane: through `origin`, running along `direction`.
+#[must_use]
+pub fn line_in_frame(
+    origin: artificer_protocol::Point3,
+    direction: Vector3,
+    frame: PlanarFrame3,
+    precision: PrecisionPolicy,
+) -> Option<PlanarAxis2> {
     let dot = |a: Vector3, b: Vector3| a.x * b.x + a.y * b.y + a.z * b.z;
     let normal = Vector3::new(
         frame.u.y * frame.v.z - frame.u.z * frame.v.y,
@@ -379,23 +438,33 @@ pub fn origin_axis_in_frame(
         frame.u.x * frame.v.y - frame.u.y * frame.v.x,
     );
     let length = dot(normal, normal).sqrt();
-    if !(length.is_finite() && length > 0.0) {
-        return Err(SketchRevolveError::AxisOffSketchPlane { axis });
+    let reach = dot(direction, direction).sqrt();
+    if !(length.is_finite() && length > 0.0 && reach.is_finite() && reach > 0.0) {
+        return None;
     }
-    // The world origin, seen from the frame's origin.
-    let relative = Vector3::new(-frame.origin.x, -frame.origin.y, -frame.origin.z);
-    let direction = axis.direction();
+    // The line's point, seen from the frame's origin.
+    let relative = Vector3::new(
+        origin.x - frame.origin.x,
+        origin.y - frame.origin.y,
+        origin.z - frame.origin.z,
+    );
     let off_plane = (dot(relative, normal) / length).abs();
-    let tilt = (dot(direction, normal) / length).abs();
-    if off_plane > precision.linear_agreement || tilt > 1.0e-9 {
-        return Err(SketchRevolveError::AxisOffSketchPlane { axis });
+    let tilt = (dot(direction, normal) / (length * reach)).abs();
+    let scale = relative
+        .x
+        .abs()
+        .max(relative.y.abs())
+        .max(relative.z.abs())
+        .max(1.0);
+    if off_plane > precision.linear_agreement * scale || tilt > 1.0e-9 {
+        return None;
     }
     let start = Point2::new(dot(relative, frame.u), dot(relative, frame.v));
-    Ok(PlanarAxis2::new(
+    Some(PlanarAxis2::new(
         start,
         Point2::new(
-            start.x + dot(direction, frame.u),
-            start.y + dot(direction, frame.v),
+            start.x + dot(direction, frame.u) / reach,
+            start.y + dot(direction, frame.v) / reach,
         ),
     ))
 }
@@ -423,6 +492,10 @@ pub enum SketchRevolveError {
     AxisNotALine { entity: SketchEntityId },
     #[error("the {} does not lie in the sketch's plane", axis.label())]
     AxisOffSketchPlane { axis: OriginAxis },
+    #[error("construction axis {axis} is not in the history")]
+    MissingDatumAxis { axis: FeatureId },
+    #[error("construction axis {axis} does not lie in the sketch's plane")]
+    DatumAxisOffSketchPlane { axis: FeatureId },
     #[error("a revolve's angle must be more than nothing and less than a full turn")]
     InvalidAngle,
     #[error("a full-turn revolve has no angle to follow a variable")]

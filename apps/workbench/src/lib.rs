@@ -13,6 +13,7 @@ pub mod assembly;
 mod browser;
 mod command_icons;
 pub mod commands;
+mod construction_axis;
 mod development_log;
 pub mod document_replay;
 pub mod documents;
@@ -469,6 +470,11 @@ enum PendingOperation {
         /// The committed plane this editor was reopened on, when it was.
         editing: Option<FeatureId>,
     },
+    /// An axis in its editor (ADR 0055); its values live in `staged_axis`.
+    StageAxis {
+        /// The committed axis this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
     /// A loft in its editor. The picked sections are not `Copy`, so they
     /// live in `staged_loft` beside the operation, as a plane's values do.
     StageLoft {
@@ -614,6 +620,8 @@ impl PendingOperation {
             },
             Self::StagePlane { editing: None } => "Create construction plane",
             Self::StagePlane { editing: Some(_) } => "Edit construction plane",
+            Self::StageAxis { editing: None } => "Create construction axis",
+            Self::StageAxis { editing: Some(_) } => "Edit construction axis",
             Self::StageLoft { editing: None } => "Loft",
             Self::StageLoft { editing: Some(_) } => "Edit loft",
             Self::StageRevolve { editing: None } => "Revolve",
@@ -672,6 +680,12 @@ impl PendingOperation {
             }
             Self::StagePlane { editing: Some(_) } => {
                 "Confirm to rewrite the plane and replay everything built on it"
+            }
+            Self::StageAxis { editing: None } => {
+                "Flip it if it should run the other way, then confirm to add the axis to the history"
+            }
+            Self::StageAxis { editing: Some(_) } => {
+                "Confirm to rewrite the axis and replay everything built on it"
             }
             Self::StageLoft { editing: None } => {
                 "Click a profile in each sketch in order, then confirm to build the loft"
@@ -743,6 +757,7 @@ impl PendingOperation {
                 object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
             Self::StagePlane { editing }
+            | Self::StageAxis { editing }
             | Self::StageLoft { editing }
             | Self::StageRevolve { editing } => {
                 if let Some(feature) = editing {
@@ -1372,6 +1387,8 @@ enum FeaturePreviewKind {
     Loft,
     /// A revolve of a sketch profile, named by its feature (ADR 0055).
     Revolve,
+    /// A construction axis, named by its feature (ADR 0055).
+    Axis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1405,6 +1422,10 @@ impl FeaturePreviewEntry {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Plane {}", self.ordinal)),
+            FeaturePreviewKind::Axis => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Axis {}", self.ordinal)),
             FeaturePreviewKind::BaseBody => "Base body".to_owned(),
             FeaturePreviewKind::Component => format!("Component {}", self.ordinal),
             FeaturePreviewKind::Sketch => {
@@ -2188,6 +2209,10 @@ enum TimelineContextCommand {
     Restore,
     /// Delete a construction plane nothing is built on.
     DeletePlane,
+    /// Reopen a construction axis's editor (ADR 0055).
+    EditAxis,
+    /// Delete a construction axis nothing is built on.
+    DeleteAxis,
 }
 
 impl TimelineContextCommand {
@@ -2201,6 +2226,8 @@ impl TimelineContextCommand {
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
             Self::DeletePlane => "Delete this plane",
+            Self::EditAxis => "Edit this axis",
+            Self::DeleteAxis => "Delete this axis",
         }
     }
 }
@@ -2657,6 +2684,11 @@ pub struct KernelLabApp {
     selected_construction_plane: Option<u64>,
     /// The plane editor's working values while `StagePlane` is pending.
     staged_plane: Option<StagedPlane>,
+    /// The committed construction axes (ADR 0055), and the one in its editor.
+    construction_axes: Vec<construction_axis::ConstructionAxis>,
+    staged_axis: Option<construction_axis::StagedAxis>,
+    /// Axes whose base did not resolve on the last rebuild.
+    stale_axes: BTreeSet<FeatureId>,
     /// A loft in its editor (ADR 0051), beside `PendingOperation::StageLoft`.
     staged_loft: Option<loft::StagedLoft>,
     /// A plane being renamed from the history or the Browser, and its text.
@@ -2975,6 +3007,9 @@ impl Default for KernelLabApp {
             construction_planes: Vec::new(),
             selected_construction_plane: None,
             staged_plane: None,
+            construction_axes: Vec::new(),
+            staged_axis: None,
+            stale_axes: BTreeSet::new(),
             staged_loft: None,
             plane_rename: None,
             stale_planes: BTreeSet::new(),
@@ -5272,6 +5307,7 @@ impl KernelLabApp {
                 | PendingOperation::RemoveParameter { .. }
                 | PendingOperation::AddUserParameter { .. }
                 | PendingOperation::StagePlane { .. }
+                | PendingOperation::StageAxis { .. }
                 | PendingOperation::StageLoft { .. }
                 | PendingOperation::StageRevolve { .. }
                 | PendingOperation::BooleanBodies { .. }
@@ -5393,6 +5429,9 @@ impl KernelLabApp {
         self.construction_planes.clear();
         self.selected_construction_plane = None;
         self.staged_plane = None;
+        self.construction_axes.clear();
+        self.staged_axis = None;
+        self.stale_axes.clear();
         self.plane_rename = None;
         self.displayed = None;
         self.bodies.clear();
@@ -5540,9 +5579,10 @@ impl KernelLabApp {
                 FeatureKind::Boolean => ModelBodyKind::Boolean,
                 FeatureKind::Loft => ModelBodyKind::Lofted,
                 FeatureKind::Revolve => ModelBodyKind::Revolved,
-                FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch => {
-                    previous_kind
-                }
+                FeatureKind::Origin
+                | FeatureKind::DatumPlane
+                | FeatureKind::DatumAxis
+                | FeatureKind::Sketch => previous_kind,
             };
             for body in &result.branches {
                 body_kinds.insert(*body, kind);
@@ -5918,7 +5958,9 @@ impl KernelLabApp {
             .last()
             .map(|feature| feature.id);
         self.stale_planes.clear();
+        self.stale_axes.clear();
         self.sync_construction_planes_from_document();
+        self.sync_construction_axes_from_document();
         self.sync_feature_preview_from_document();
         self.frame_visible_document();
         self.last_attempt = Attempt::Accepted {
@@ -6262,6 +6304,7 @@ impl KernelLabApp {
         match kind {
             FeatureKind::Origin => "Origin".to_owned(),
             FeatureKind::DatumPlane => format!("Plane {ordinal}"),
+            FeatureKind::DatumAxis => format!("Axis {ordinal}"),
             FeatureKind::BaseBody => "Base body".to_owned(),
             FeatureKind::Sketch => format!("Sketch {ordinal}"),
             FeatureKind::Extrude => format!("Extrude {ordinal}"),
@@ -6459,6 +6502,7 @@ impl KernelLabApp {
             let kind = match feature.kind {
                 FeatureKind::Origin => FeaturePreviewKind::Origin,
                 FeatureKind::DatumPlane => FeaturePreviewKind::Plane,
+                FeatureKind::DatumAxis => FeaturePreviewKind::Axis,
                 FeatureKind::BaseBody if feature.component_instance.is_some() => {
                     FeaturePreviewKind::Component
                 }
@@ -6511,7 +6555,10 @@ impl KernelLabApp {
                 }
                 _ => None,
             };
-            let group = if matches!(kind, FeaturePreviewKind::Origin | FeaturePreviewKind::Plane) {
+            let group = if matches!(
+                kind,
+                FeaturePreviewKind::Origin | FeaturePreviewKind::Plane | FeaturePreviewKind::Axis
+            ) {
                 0
             } else if matches!(kind, FeaturePreviewKind::Sketch) {
                 feature.id.get()
@@ -6548,6 +6595,11 @@ impl KernelLabApp {
                 // was, and its chip says so (ADR 0048).
                 name: match kind {
                     FeaturePreviewKind::Plane => Some(if self.stale_planes.contains(&feature.id) {
+                        format!("{} · held", feature.label)
+                    } else {
+                        feature.label.clone()
+                    }),
+                    FeaturePreviewKind::Axis => Some(if self.stale_axes.contains(&feature.id) {
                         format!("{} · held", feature.label)
                     } else {
                         feature.label.clone()
@@ -6699,6 +6751,7 @@ impl KernelLabApp {
         self.selected_faces.clear();
         self.history_scrub_position = self.document.history_position();
         self.sync_construction_planes_from_document();
+        self.sync_construction_axes_from_document();
         self.sync_feature_preview_from_document();
     }
 
@@ -6847,6 +6900,8 @@ impl KernelLabApp {
         // cached frames are refreshed (ADR 0048).
         let mut plane_frames = BTreeMap::<FeatureId, ResolvedDatumPlane>::new();
         let mut stale_planes = BTreeSet::<FeatureId>::new();
+        let mut axis_lines = BTreeMap::<FeatureId, artificer_model::ResolvedDatumAxis>::new();
+        let mut stale_axes = BTreeSet::<FeatureId>::new();
 
         while let Some(step) = transaction.next_executable_step().cloned() {
             debug_assert_eq!(step.disposition, ReplayDisposition::Execute);
@@ -6939,10 +6994,36 @@ impl KernelLabApp {
                 };
                 plane_frames.insert(feature, placed);
             }
-            let action = match action.resolve_sketch_regions_with_planes(
+            // An axis is found again the same way, and holds its place when
+            // its base no longer resolves.
+            if let ReplayAction::DatumAxis(recipe) = &action {
+                let resolver = ModelPlaneResolver::new(
+                    &self.document,
+                    &reports,
+                    std::iter::once(&input)
+                        .chain(rebuilt_bodies.iter().rev().map(|body| &body.body.snapshot))
+                        .chain(self.bodies.iter().map(|body| &body.body.snapshot)),
+                    &plane_frames,
+                );
+                let placed = match recipe.resolve(&resolver) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        let label = self
+                            .document
+                            .feature(feature)
+                            .map_or_else(|| "An axis".to_owned(), |node| node.label.clone());
+                        lost_targets.push(format!("{label} stayed where it was because {error}"));
+                        stale_axes.insert(feature);
+                        recipe.cached()
+                    }
+                };
+                axis_lines.insert(feature, placed);
+            }
+            let action = match action.resolve_sketch_regions_with_datums(
                 &self.document,
                 input.precision_policy().unwrap_or_default(),
                 &plane_frames,
+                &axis_lines,
             ) {
                 Ok(action) => action,
                 Err(error) => {
@@ -6959,7 +7040,9 @@ impl KernelLabApp {
                 Boolean(artificer_model::BooleanFeatureRecipe),
             }
             let dispatch = match action {
-                ReplayAction::Marker | ReplayAction::DatumPlane(_) => RebuildDispatch::Marker,
+                ReplayAction::Marker | ReplayAction::DatumPlane(_) | ReplayAction::DatumAxis(_) => {
+                    RebuildDispatch::Marker
+                }
                 ReplayAction::Kernel(command) => RebuildDispatch::Commands(vec![command]),
                 ReplayAction::KernelChain(chain) => RebuildDispatch::Commands(chain),
                 ReplayAction::TargetedKernel(targeted) => {
@@ -7070,7 +7153,12 @@ impl KernelLabApp {
                     Some(FeatureKind::Boolean) => ModelBodyKind::Boolean,
                     Some(FeatureKind::Loft) => ModelBodyKind::Lofted,
                     Some(FeatureKind::Revolve) => ModelBodyKind::Revolved,
-                    Some(FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch)
+                    Some(
+                        FeatureKind::Origin
+                        | FeatureKind::DatumPlane
+                        | FeatureKind::DatumAxis
+                        | FeatureKind::Sketch,
+                    )
                     | None => ModelBodyKind::Cuboid,
                 };
                 let archived = ArchivedBody {
@@ -7177,6 +7265,15 @@ impl KernelLabApp {
                 self.stale_planes.insert(*plane);
             } else {
                 self.stale_planes.remove(plane);
+            }
+        }
+        // And the lines it found its axes on become their cached lines.
+        self.document.refresh_datum_axis_lines(&axis_lines);
+        for axis in axis_lines.keys() {
+            if stale_axes.contains(axis) {
+                self.stale_axes.insert(*axis);
+            } else {
+                self.stale_axes.remove(axis);
             }
         }
         for rebuilt in rebuilt_bodies {
@@ -12133,6 +12230,7 @@ impl KernelLabApp {
                 }
             }
             PendingOperation::StagePlane { editing } => self.commit_staged_plane(editing),
+            PendingOperation::StageAxis { editing } => self.commit_staged_axis(editing),
             PendingOperation::StageLoft { editing } => self.commit_staged_loft(editing),
             PendingOperation::StageRevolve { editing } => self.commit_staged_revolve(editing),
             PendingOperation::BooleanBodies {
@@ -12309,6 +12407,7 @@ impl KernelLabApp {
             }
             PendingOperation::RemoveParameter { .. }
             | PendingOperation::AddUserParameter { .. } => self.pending_operation = None,
+            PendingOperation::StageAxis { editing } => self.cancel_staged_axis(editing),
             PendingOperation::StagePlane { editing } => {
                 self.staged_plane = None;
                 self.pending_operation = None;
@@ -16934,6 +17033,8 @@ impl KernelLabApp {
         if self.feature_has_an_editor(feature) {
             commands.push(if plane {
                 TimelineContextCommand::EditPlane
+            } else if node.kind == FeatureKind::DatumAxis {
+                TimelineContextCommand::EditAxis
             } else if node.kind == FeatureKind::Loft {
                 TimelineContextCommand::EditLoft
             } else if node.kind == FeatureKind::Revolve {
@@ -16951,6 +17052,9 @@ impl KernelLabApp {
             });
             if node.kind == FeatureKind::DatumPlane {
                 commands.push(TimelineContextCommand::DeletePlane);
+            }
+            if node.kind == FeatureKind::DatumAxis {
+                commands.push(TimelineContextCommand::DeleteAxis);
             }
         }
         commands
@@ -16980,6 +17084,12 @@ impl KernelLabApp {
             }
             TimelineContextCommand::DeletePlane => {
                 self.delete_construction_plane(feature);
+            }
+            TimelineContextCommand::EditAxis => {
+                self.begin_axis_edit(feature);
+            }
+            TimelineContextCommand::DeleteAxis => {
+                self.delete_construction_axis(feature);
             }
         }
     }
@@ -17035,6 +17145,7 @@ impl KernelLabApp {
         match self.document.rename_feature(feature, label) {
             Ok(_) => {
                 self.sync_construction_planes_from_document();
+                self.sync_construction_axes_from_document();
                 self.sync_feature_preview_from_document();
                 self.document_status = Some(format!("Renamed to {label}"));
             }
@@ -17209,6 +17320,7 @@ impl KernelLabApp {
                     node.action,
                     ReplayAction::SketchRegionExtrusion(_)
                         | ReplayAction::DatumPlane(_)
+                        | ReplayAction::DatumAxis(_)
                         | ReplayAction::SketchLoft(_)
                         | ReplayAction::SketchRevolve(_)
                 ) && !node.state.read_only
@@ -20155,6 +20267,15 @@ impl KernelLabApp {
                 }
 
                 if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageAxis { .. }))
+                {
+                    card(ui, "construction_axis", "CONSTRUCTION AXIS", &mut |ui| {
+                        self.axis_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::PendingOperation)
                     && matches!(self.pending_operation, Some(PendingOperation::StageLoft { .. }))
                 {
                     card(ui, "loft", "LOFT", &mut |ui| {
@@ -22041,6 +22162,7 @@ impl KernelLabApp {
             sketch_overlays.push(overlay);
         }
         sketch_overlays.extend(self.visible_reference_plane_overlays());
+        sketch_overlays.extend(self.construction_axis_overlays());
         // While a loft is staged, its sections are what is picked.
         let selected_sketch_regions = if self.loft_pick_active() {
             self.loft_region_selections()
@@ -23026,6 +23148,7 @@ impl KernelLabApp {
                     FeaturePreviewKind::Origin
                         | FeaturePreviewKind::Sketch
                         | FeaturePreviewKind::Plane
+                        | FeaturePreviewKind::Axis
                 )
             });
             let mut requested_mode = None;
@@ -23100,6 +23223,12 @@ impl KernelLabApp {
                                     "Construction plane · what it was built on no longer resolves, so it stands where it last was. Right-click to edit it."
                                 } else {
                                     "Construction plane · right-click to edit, rename, suppress or delete it"
+                                })
+                            } else if entry.kind == FeaturePreviewKind::Axis {
+                                response.on_hover_text(if entry.label().ends_with(" · held") {
+                                    "Construction axis · what it was built on no longer resolves, so it stands where it last was. Right-click to edit it."
+                                } else {
+                                    "Construction axis · a revolve can turn about it · right-click to edit, rename or delete it"
                                 })
                             } else if sketch_entry {
                                 response.on_hover_text(if !active_sketch_support_current {

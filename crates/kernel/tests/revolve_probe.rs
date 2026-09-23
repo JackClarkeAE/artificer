@@ -816,3 +816,37 @@ fn a_partial_revolve_cuts_a_block_exactly() {
     assert_eq!(cut.report.rung.as_deref(), Some("revolve/boolean-prism"));
     assert_eq!(cut.report.tier(), Tier::Exact);
 }
+
+/// A construction axis through a curved face takes the face's own axis,
+/// drawn over the stretch the face covers; a flat face has none.
+#[test]
+fn a_curved_face_reports_its_axis_and_a_flat_one_none() {
+    let tube = revolve(
+        polygon(&[(2.0, 0.0), (5.0, 0.0), (5.0, 3.0), (2.0, 3.0)]),
+        "revolve-face-axis",
+    )
+    .expect("a tube revolves");
+    let faces = NativeKernel::debug_scene(&tube)
+        .triangles
+        .iter()
+        .map(|triangle| triangle.source_face)
+        .collect::<std::collections::BTreeSet<_>>();
+    let (mut curved, mut flat) = (0, 0);
+    for face in faces {
+        match NativeKernel::face_axis(&tube, face).expect("a face of the tube") {
+            Some(axis) => {
+                curved += 1;
+                assert!((axis.direction.z.abs() - 1.0).abs() < 1.0e-12, "{axis:?}");
+                assert!(axis.origin.x.abs() < 1.0e-12 && axis.origin.y.abs() < 1.0e-12);
+                assert!((axis.origin.z - 1.5).abs() < 1.0e-12, "{axis:?}");
+                assert!((axis.half_length - 1.5).abs() < 1.0e-12, "{axis:?}");
+            }
+            None => flat += 1,
+        }
+    }
+    assert_eq!(
+        (curved, flat),
+        (4, 2),
+        "two walls of two halves, two washers"
+    );
+}

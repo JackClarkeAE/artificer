@@ -741,6 +741,18 @@ pub struct StraightEdgeOnFace {
     pub into_face: ProtocolVector3,
 }
 
+/// The axis of a curved face, as a construction axis through it sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceAxis {
+    /// The middle of the stretch of the axis the face covers.
+    pub origin: ProtocolPoint3,
+    /// The unit direction of the face's carrier axis.
+    pub direction: ProtocolVector3,
+    /// Half that stretch; zero for a face that covers none of it, such as a
+    /// flat ring of a torus.
+    pub half_length: f64,
+}
+
 /// Exact read-only placement and boundary for a planar B-rep face.
 ///
 /// Sketches may use this local two-dimensional frame without treating debug
@@ -2736,6 +2748,51 @@ impl NativeKernel {
             return Ok(None);
         }
         Ok(Some(edge.endpoints().map(protocol_point)))
+    }
+
+    /// Returns the axis of a cylindrical, conical, toroidal or spherical
+    /// face, centred on and reaching over the stretch of the axis the face's
+    /// boundary covers, or `None` for a face with no axis (ADR 0055: a
+    /// construction axis through a curved face).
+    pub fn face_axis(
+        snapshot: &Snapshot,
+        face: EntityRef,
+    ) -> Result<Option<FaceAxis>, KernelError> {
+        let record = resolve_measure_entity(snapshot, face, EntityKind::Face, "face")?;
+        let topology = &snapshot.topology;
+        let value = &topology.faces[record].value;
+        let (origin, axis) = match value.surface {
+            topology::Surface::Cylinder(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Cone(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Torus(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Sphere(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Plane(_)
+            | topology::Surface::Ruled(_)
+            | topology::Surface::Bspline(_) => return Ok(None),
+        };
+        let length = axis.length();
+        if !(length.is_finite() && length > 1.0e-12) {
+            return Ok(None);
+        }
+        let axis = axis / length;
+        // How far along the axis the face's boundary reaches, either way.
+        let (low, high) = value
+            .loops()
+            .filter_map(|loop_key| topology.loop_record(loop_key))
+            .flat_map(|record| record.value.coedges.iter())
+            .filter_map(|coedge| topology.coedge(*coedge))
+            .filter_map(|coedge| topology.edge(coedge.value.edge))
+            .flat_map(|edge| edge.value.vertices)
+            .map(|vertex| (topology.vertices[vertex.0].value.point - origin).dot(axis))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), along| {
+                (low.min(along), high.max(along))
+            });
+        let (low, high) = if low <= high { (low, high) } else { (0.0, 0.0) };
+        Ok(Some(FaceAxis {
+            origin: protocol_point(origin + axis * f64::midpoint(low, high)),
+            direction: ProtocolVector3::new(axis.x, axis.y, axis.z),
+            half_length: (high - low) * 0.5,
+        }))
     }
 
     /// Returns the faces on either side of one edge, in topology order: two

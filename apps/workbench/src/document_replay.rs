@@ -374,7 +374,7 @@ pub fn hydrate_model_document(
             // A plane runs nothing on load: a saved document's planes are
             // where its recipes last resolved them, and the sketches drawn on
             // them were replayed in those frames above.
-            ReplayAction::Marker | ReplayAction::DatumPlane(_) => (
+            ReplayAction::Marker | ReplayAction::DatumPlane(_) | ReplayAction::DatumAxis(_) => (
                 SnapshotAssociation::new(input.id(), input.id(), input.semantic_digest()),
                 None,
                 None,

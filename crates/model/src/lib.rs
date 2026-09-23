@@ -10,6 +10,7 @@
 pub mod assembly;
 pub mod components;
 pub mod datum;
+pub mod datum_axis;
 pub mod kinematics;
 pub mod loft;
 pub mod parameterized;
@@ -39,6 +40,10 @@ pub use datum::{
     CURRENT_DATUM_PLANE_RECIPE_VERSION, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef,
     DatumPlaneBase, DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, OriginPlane,
     ResolvedDatumPlane,
+};
+pub use datum_axis::{
+    CURRENT_DATUM_AXIS_RECIPE_VERSION, DatumAxisBase, DatumAxisError, DatumAxisPlane,
+    DatumAxisRecipe, DatumAxisResolver, ORIGIN_AXIS_HALF_LENGTH, ResolvedDatumAxis,
 };
 pub use loft::{
     CURRENT_SKETCH_LOFT_RECIPE_VERSION, SketchLoft, SketchLoftError, SketchLoftSection,
@@ -79,7 +84,7 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 /// Version 8 adds the loft between sketch sections (ADR 0051). Version 9
 /// lets an extrusion's distance follow a variable and a library part replay
 /// as the chain of kernel commands it was built from. Version 10 adds the
-/// revolve feature (ADR 0055).
+/// revolve feature and the construction axis (ADR 0055).
 pub const CURRENT_DOCUMENT_VERSION: u32 = 10;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
@@ -98,6 +103,8 @@ pub const SKETCH_LOFT_DOCUMENT_VERSION: u32 = 8;
 pub const LINKED_PARAMETER_DOCUMENT_VERSION: u32 = 9;
 /// First native schema that can hold a revolve feature.
 pub const SKETCH_REVOLVE_DOCUMENT_VERSION: u32 = 10;
+/// First native schema that can hold a construction axis.
+pub const DATUM_AXIS_DOCUMENT_VERSION: u32 = 10;
 /// The longest chain of kernel commands one feature may replay.
 pub const MAX_KERNEL_CHAIN_COMMANDS: usize = 1_024;
 /// Oldest native document schema this version can migrate in memory.
@@ -157,6 +164,7 @@ stable_id!(JointId, "joint:");
 pub enum FeatureKind {
     Origin,
     DatumPlane,
+    DatumAxis,
     BaseBody,
     Sketch,
     Extrude,
@@ -248,6 +256,9 @@ pub enum ReplayAction {
     /// A construction plane. It runs no kernel command; replay resolves where
     /// its base now puts it (ADR 0048).
     DatumPlane(DatumPlaneRecipe),
+    /// A construction axis (ADR 0055): its recipe, resolved against the model
+    /// as a rebuild reaches it. Like a plane it runs nothing.
+    DatumAxis(DatumAxisRecipe),
     /// A loft whose sections are resolved from their sketches, on their
     /// planes, immediately before replay (ADR 0051).
     SketchLoft(SketchLoft),
@@ -267,7 +278,10 @@ impl ReplayAction {
     /// kernel, so its feature's input and output snapshots are the same.
     #[must_use]
     pub const fn is_document_only(&self) -> bool {
-        matches!(self, Self::Marker | Self::DatumPlane(_))
+        matches!(
+            self,
+            Self::Marker | Self::DatumPlane(_) | Self::DatumAxis(_)
+        )
     }
 
     /// Resolves typed scalar bindings into an ordinary replay action.
@@ -292,6 +306,7 @@ impl ReplayAction {
             | Self::Kernel(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
             | Self::SketchLoft(_)
             | Self::KernelChain(_) => Ok(self.clone()),
         }
@@ -310,6 +325,7 @@ impl ReplayAction {
             | Self::Kernel(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
             | Self::SketchLoft(_)
             | Self::KernelChain(_) => false,
         }
@@ -334,6 +350,20 @@ impl ReplayAction {
         precision: artificer_protocol::PrecisionPolicy,
         planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
     ) -> Result<Self, SketchRegionResolveError> {
+        self.resolve_sketch_regions_with_datums(document, precision, planes, &BTreeMap::new())
+    }
+
+    /// Resolves as [`Self::resolve_sketch_regions_with_planes`] does, and
+    /// turns a revolve about a construction axis where `axes` holds it. A
+    /// rebuild passes the planes and axes it has resolved so far; any other
+    /// is read where its recipe last put it.
+    pub fn resolve_sketch_regions_with_datums(
+        &self,
+        document: &ModelDocument,
+        precision: artificer_protocol::PrecisionPolicy,
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+        axes: &BTreeMap<FeatureId, ResolvedDatumAxis>,
+    ) -> Result<Self, SketchRegionResolveError> {
         match self {
             Self::SketchRegionExtrusion(recipe) => {
                 let frame = document
@@ -347,13 +377,16 @@ impl ReplayAction {
                 recipe.resolve_in_frame(document, precision, frame)
             }
             Self::SketchLoft(recipe) => recipe.resolve_with_planes(document, precision, planes),
-            Self::SketchRevolve(recipe) => recipe.resolve_with_planes(document, precision, planes),
+            Self::SketchRevolve(recipe) => {
+                recipe.resolve_with_datums(document, precision, planes, axes)
+            }
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::ParameterizedKernel(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
             | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
@@ -1158,6 +1191,62 @@ impl ModelDocument {
         })
     }
 
+    /// Whether `id` is a construction axis.
+    #[must_use]
+    pub fn is_datum_axis(&self, id: FeatureId) -> bool {
+        self.feature(id)
+            .is_some_and(|feature| feature.kind == FeatureKind::DatumAxis)
+    }
+
+    /// A construction axis's recipe.
+    #[must_use]
+    pub fn datum_axis(&self, id: FeatureId) -> Option<&DatumAxisRecipe> {
+        self.feature(id).and_then(|feature| match &feature.action {
+            ReplayAction::DatumAxis(recipe) if feature.kind == FeatureKind::DatumAxis => {
+                Some(recipe)
+            }
+            _ => None,
+        })
+    }
+
+    /// Writes where a rebuild found each construction axis into its recipe's
+    /// cache, as [`Self::refresh_datum_plane_frames`] does for planes.
+    /// Returns whether anything moved.
+    pub fn refresh_datum_axis_lines(
+        &mut self,
+        resolved: &BTreeMap<FeatureId, ResolvedDatumAxis>,
+    ) -> bool {
+        let changed = self.state.features.iter().any(|feature| {
+            matches!(&feature.action, ReplayAction::DatumAxis(recipe)
+                if resolved.get(&feature.id).is_some_and(|axis| recipe.cached() != *axis))
+        });
+        if !changed {
+            return false;
+        }
+        for feature in &mut self.state.features {
+            if let ReplayAction::DatumAxis(recipe) = &mut feature.action
+                && let Some(axis) = resolved.get(&feature.id)
+            {
+                recipe.origin = axis.origin;
+                recipe.direction = axis.direction;
+                recipe.half_length = axis.half_length;
+            }
+        }
+        // The lines are what the committed rebuild used, so this shares the
+        // rebuild's revision bump rather than being an edit of its own.
+        self.bump_revision();
+        true
+    }
+
+    /// Deletes a construction axis nothing is built on, as
+    /// [`Self::remove_datum_plane`] deletes a plane.
+    pub fn remove_datum_axis(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        if !self.is_datum_axis(id) {
+            return Err(DocumentError::NotADatumAxis(id));
+        }
+        self.remove_construction_feature(id)
+    }
+
     /// The features that depend on `id` directly.
     #[must_use]
     pub fn dependents_of(&self, id: FeatureId) -> Vec<FeatureId> {
@@ -1300,11 +1389,17 @@ impl ModelDocument {
     /// is built on cannot change any result. A plane something depends on is
     /// refused with the first dependent's identity.
     pub fn remove_datum_plane(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
-        let index = self.feature_index(id)?;
-        let feature = &self.state.features[index];
-        if feature.kind != FeatureKind::DatumPlane {
+        if !self.is_datum_plane(id) {
             return Err(DocumentError::NotADatumPlane(id));
         }
+        self.remove_construction_feature(id)
+    }
+
+    /// Removes a plane or an axis: it produces no body and no snapshot, so
+    /// removing one nothing is built on changes no result.
+    fn remove_construction_feature(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
         if feature.state.read_only {
             return Err(DocumentError::ReadOnlyFeature(id));
         }
@@ -1563,6 +1658,9 @@ impl ModelDocument {
             && (!matches!(draft.action, ReplayAction::DatumPlane(_)) || !draft.outputs.is_empty())
         {
             return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
+        if draft.kind == FeatureKind::DatumAxis && !draft.outputs.is_empty() {
+            return Err(DocumentError::InvalidDatumAxisFeature);
         }
         validate_label(&draft.label)?;
         // A sketch reads exactly the variables its values follow.
@@ -3184,6 +3282,12 @@ pub enum DocumentError {
     InvalidDatumPlaneFeature,
     #[error("{0} is not a construction plane")]
     NotADatumPlane(FeatureId),
+    #[error("invalid construction axis: {0}")]
+    DatumAxis(#[from] DatumAxisError),
+    #[error("a construction axis must be a construction-axis feature with an axis recipe")]
+    InvalidDatumAxisFeature,
+    #[error("{0} is not a construction axis")]
+    NotADatumAxis(FeatureId),
     #[error("an extrusion's end plane {0} must be declared as a feature input")]
     EndPlaneMustBeInput(FeatureId),
     #[error("{dependent} depends on {feature}")]
@@ -3333,6 +3437,7 @@ pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), Docume
             Err(DocumentError::InvalidBooleanFeature)
         }
         ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::DatumAxis(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchRevolve(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::KernelChain(commands) => {
@@ -3352,6 +3457,9 @@ pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), Docume
 fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), DocumentError> {
     if matches!(action, ReplayAction::DatumPlane(_)) && kind != FeatureKind::DatumPlane {
         return Err(DocumentError::InvalidDatumPlaneFeature);
+    }
+    if matches!(action, ReplayAction::DatumAxis(_)) != (kind == FeatureKind::DatumAxis) {
+        return Err(DocumentError::InvalidDatumAxisFeature);
     }
     // A loft is the only thing that can build a loft feature, and the other
     // way round: the history names features by what they are.
@@ -3422,6 +3530,7 @@ fn validate_action_parameter_inputs(
         | ReplayAction::Kernel(_)
         | ReplayAction::Boolean(_)
         | ReplayAction::DatumPlane(_)
+        | ReplayAction::DatumAxis(_)
         | ReplayAction::SketchLoft(_)
         | ReplayAction::KernelChain(_) => {}
     }
@@ -3497,6 +3606,31 @@ fn validate_action_feature_inputs(
         {
             return Err(DocumentError::InvalidDatumPlaneFeature);
         }
+    }
+    // An axis reads the body its base names, and any plane it is the
+    // meeting of, as a plane does.
+    if let ReplayAction::DatumAxis(recipe) = action {
+        if let Some(body) = recipe.base.bodies().first()
+            && !feature_inputs.contains(&FeatureInput::Body(*body))
+        {
+            return Err(DocumentError::InvalidDatumAxisFeature);
+        }
+        if recipe
+            .base
+            .planes()
+            .into_iter()
+            .any(|plane| !feature_inputs.contains(&FeatureInput::Feature(plane)))
+        {
+            return Err(DocumentError::InvalidDatumAxisFeature);
+        }
+    }
+    // A revolve about a construction axis reads that axis, so moving the
+    // axis rebuilds it and the axis cannot be deleted from under it.
+    if let ReplayAction::SketchRevolve(recipe) = action
+        && let RevolveAxis::DatumAxis { axis } = recipe.axis
+        && !feature_inputs.contains(&FeatureInput::Feature(axis))
+    {
+        return Err(DocumentError::InvalidRevolveFeature);
     }
     Ok(())
 }

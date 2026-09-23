@@ -361,6 +361,28 @@ impl KernelLabApp {
                 unavailable,
             });
         }
+        // Every construction axis, by name: one that stands out of the
+        // sketch's plane is offered but cannot be chosen.
+        for axis in &self.construction_axes {
+            let unavailable = frame.map_or_else(
+                || Some("The sketch has no plane yet".to_owned()),
+                |frame| {
+                    artificer_model::revolve::line_in_frame(
+                        axis.line.origin,
+                        axis.line.direction,
+                        frame,
+                        PrecisionPolicy::default(),
+                    )
+                    .is_none()
+                    .then(|| format!("{} does not lie in the sketch's plane", axis.name))
+                },
+            );
+            choices.push(RevolveAxisChoice {
+                axis: RevolveAxis::DatumAxis { axis: axis.feature },
+                label: axis.name.clone(),
+                unavailable,
+            });
+        }
         choices
     }
 
@@ -642,6 +664,11 @@ impl KernelLabApp {
         )
         .with_commit(association)
         .with_input(FeatureInput::Sketch(sketch));
+        // A construction axis it turns about is an input: moving the axis
+        // rebuilds the revolve, and the axis cannot be deleted under it.
+        if let RevolveAxis::DatumAxis { axis } = preview.recipe.axis {
+            draft = draft.with_input(FeatureInput::Feature(axis));
+        }
         // An angle that follows variables reads them, so changing one
         // rebuilds the revolve and none can be deleted from under it.
         for parameter in preview.recipe.parameter_references() {
@@ -824,6 +851,9 @@ impl KernelLabApp {
         self.staged_revolve = None;
         self.pending_operation = None;
         let mut inputs = vec![FeatureInput::Sketch(recipe.sketch)];
+        if let RevolveAxis::DatumAxis { axis } = recipe.axis {
+            inputs.push(FeatureInput::Feature(axis));
+        }
         // The body a revolve changes is its branch, which an edit keeps.
         let original_target = self.document.feature(feature).and_then(|node| {
             node.inputs.iter().find_map(|input| match input {

@@ -543,7 +543,10 @@ fn clamp_extent(extent: [f64; 2]) -> [f64; 2] {
     })
 }
 
-fn check_reference(reference: &PersistentRef, kind: EntityKind) -> Result<(), DatumPlaneError> {
+pub(crate) fn check_reference(
+    reference: &PersistentRef,
+    kind: EntityKind,
+) -> Result<(), DatumPlaneError> {
     if reference.kind != kind {
         return Err(match kind {
             EntityKind::Edge => DatumPlaneError::EdgeReferenceRequired,
@@ -565,11 +568,11 @@ fn check_reference(reference: &PersistentRef, kind: EntityKind) -> Result<(), Da
     Ok(())
 }
 
-fn normal(frame: PlanarFrame3) -> Vector3 {
+pub(crate) fn normal(frame: PlanarFrame3) -> Vector3 {
     cross(frame.u, frame.v)
 }
 
-const fn sub(end: Point3, start: Point3) -> Vector3 {
+pub(crate) const fn sub(end: Point3, start: Point3) -> Vector3 {
     Vector3::new(end.x - start.x, end.y - start.y, end.z - start.z)
 }
 
@@ -577,24 +580,24 @@ const fn sub_vector(left: Vector3, right: Vector3) -> Vector3 {
     Vector3::new(left.x - right.x, left.y - right.y, left.z - right.z)
 }
 
-const fn add(left: Vector3, right: Vector3) -> Vector3 {
+pub(crate) const fn add(left: Vector3, right: Vector3) -> Vector3 {
     Vector3::new(left.x + right.x, left.y + right.y, left.z + right.z)
 }
 
-const fn translate(point: Point3, by: Vector3) -> Point3 {
+pub(crate) const fn translate(point: Point3, by: Vector3) -> Point3 {
     Point3::new(point.x + by.x, point.y + by.y, point.z + by.z)
 }
 
-const fn scale(vector: Vector3, factor: f64) -> Vector3 {
+pub(crate) const fn scale(vector: Vector3, factor: f64) -> Vector3 {
     Vector3::new(vector.x * factor, vector.y * factor, vector.z * factor)
 }
 
-fn dot(left: Vector3, right: Vector3) -> f64 {
+pub(crate) fn dot(left: Vector3, right: Vector3) -> f64 {
     left.x
         .mul_add(right.x, left.y.mul_add(right.y, left.z * right.z))
 }
 
-fn cross(left: Vector3, right: Vector3) -> Vector3 {
+pub(crate) fn cross(left: Vector3, right: Vector3) -> Vector3 {
     Vector3::new(
         left.y * right.z - left.z * right.y,
         left.z * right.x - left.x * right.z,
@@ -602,11 +605,11 @@ fn cross(left: Vector3, right: Vector3) -> Vector3 {
     )
 }
 
-fn length(vector: Vector3) -> f64 {
+pub(crate) fn length(vector: Vector3) -> f64 {
     dot(vector, vector).sqrt()
 }
 
-fn unit(vector: Vector3) -> Option<Vector3> {
+pub(crate) fn unit(vector: Vector3) -> Option<Vector3> {
     let length = length(vector);
     (length.is_finite() && length > f64::EPSILON).then(|| scale(vector, 1.0 / length))
 }

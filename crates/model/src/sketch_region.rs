@@ -1886,6 +1886,165 @@ mod tests {
         );
     }
 
+    /// A construction axis is a feature a revolve can turn about: the revolve
+    /// reads it as an input, finds it where a rebuild placed it, and the
+    /// axis cannot be deleted from under it.
+    #[test]
+    fn a_revolve_turns_about_a_construction_axis() {
+        use crate::{
+            DatumAxisBase, DatumAxisRecipe, OriginAxis, ResolvedDatumAxis, RevolveAxis,
+            RevolveExtent, SketchRevolve,
+        };
+        use artificer_protocol::{PlanarAxis2, Point2, Point3, SolidOperation, Vector3};
+        let (mut document, sketch, signature) = document_with_rectangle();
+        let marker = SnapshotAssociation::new(
+            SnapshotId::ZERO,
+            SnapshotId::ZERO,
+            SemanticDigest::new([0; 32]),
+        );
+        // The origin Y axis, which lies in this XY sketch.
+        let recipe = DatumAxisRecipe::new(
+            DatumAxisBase::Origin {
+                axis: OriginAxis::Y,
+            },
+            ResolvedDatumAxis {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                direction: Vector3::new(0.0, 1.0, 0.0),
+                half_length: 25.0,
+            },
+        );
+        assert!(
+            document
+                .clone()
+                .append_feature(FeatureDraft::new(
+                    FeatureKind::Extrude,
+                    "Axis 1",
+                    ReplayAction::DatumAxis(recipe.clone()),
+                ))
+                .is_err(),
+            "an axis recipe is only ever an axis feature"
+        );
+        let axis = document
+            .append_feature(
+                FeatureDraft::new(
+                    FeatureKind::DatumAxis,
+                    "Axis 1",
+                    ReplayAction::DatumAxis(recipe),
+                )
+                .with_commit(marker),
+            )
+            .expect("the axis is appended")
+            .feature;
+        assert!(document.is_datum_axis(axis));
+
+        let revolve = SketchRevolve::new(
+            sketch,
+            vec![signature],
+            RevolveAxis::DatumAxis { axis },
+            RevolveExtent::FullTurn,
+            SolidOperation::New,
+        )
+        .unwrap();
+        let draft = |inputs: &[FeatureInput]| {
+            let mut draft = FeatureDraft::new(
+                FeatureKind::Revolve,
+                "Revolve 1",
+                ReplayAction::SketchRevolve(revolve.clone()),
+            )
+            .with_commit(marker)
+            .with_output(OutputDraft::CreateBody {
+                label: "Body 1".into(),
+            });
+            for input in inputs {
+                draft = draft.with_input(*input);
+            }
+            draft
+        };
+        assert_eq!(
+            document
+                .clone()
+                .append_feature(draft(&[FeatureInput::Sketch(sketch)]))
+                .unwrap_err(),
+            crate::DocumentError::InvalidRevolveFeature,
+            "the axis must be an input"
+        );
+        document
+            .append_feature(draft(&[
+                FeatureInput::Sketch(sketch),
+                FeatureInput::Feature(axis),
+            ]))
+            .expect("the revolve is appended");
+
+        let resolved_axis =
+            |axes: &std::collections::BTreeMap<FeatureId, ResolvedDatumAxis>| match revolve
+                .resolve_with_datums(
+                    &document,
+                    PrecisionPolicy::default(),
+                    &std::collections::BTreeMap::new(),
+                    axes,
+                ) {
+                Ok(ReplayAction::Kernel(KernelCommand::RevolvePlanarProfile { axis, .. })) => {
+                    Ok(axis)
+                }
+                Ok(other) => panic!("not a revolve: {other:?}"),
+                Err(error) => Err(error.to_string()),
+            };
+        assert_eq!(
+            resolved_axis(&std::collections::BTreeMap::new()),
+            Ok(PlanarAxis2::new(
+                Point2::new(0.0, 0.0),
+                Point2::new(0.0, 1.0)
+            ))
+        );
+        // Where a rebuild has just put it, not where its cache says.
+        let moved = std::collections::BTreeMap::from([(
+            axis,
+            ResolvedDatumAxis {
+                origin: Point3::new(4.0, 0.0, 0.0),
+                direction: Vector3::new(0.0, -2.0, 0.0),
+                half_length: 25.0,
+            },
+        )]);
+        assert_eq!(
+            resolved_axis(&moved),
+            Ok(PlanarAxis2::new(
+                Point2::new(4.0, 0.0),
+                Point2::new(4.0, -1.0)
+            ))
+        );
+        // Standing out of the sketch's plane, it cannot be turned about.
+        let upright = std::collections::BTreeMap::from([(
+            axis,
+            ResolvedDatumAxis {
+                origin: Point3::new(0.0, 0.0, 0.0),
+                direction: Vector3::new(0.0, 0.0, 1.0),
+                half_length: 25.0,
+            },
+        )]);
+        assert!(
+            resolved_axis(&upright)
+                .unwrap_err()
+                .contains("does not lie in the sketch's plane")
+        );
+
+        assert!(matches!(
+            document.clone().remove_datum_axis(axis),
+            Err(crate::DocumentError::FeatureInUse { .. })
+        ));
+        assert!(document.refresh_datum_axis_lines(&moved));
+        assert_eq!(
+            document.datum_axis(axis).unwrap().cached().origin,
+            Point3::new(4.0, 0.0, 0.0)
+        );
+        let json = serde_json::to_string(&document.to_native()).unwrap();
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            restored.datum_axis(axis),
+            document.datum_axis(axis),
+            "the axis survives the file"
+        );
+    }
+
     /// A revolve typed through `sweep` keeps following it: the feature reads
     /// the variable, replay takes the angle from it — a whole turn making a
     /// full turn — and a length cannot stand in for it.
