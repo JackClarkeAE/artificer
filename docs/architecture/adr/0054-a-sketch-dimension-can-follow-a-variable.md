@@ -1,9 +1,11 @@
 # ADR 0054: A sketch dimension can follow a variable
 
 Status: implemented — a sketch value typed as an expression over document
-variables stays linked to them. Changing a variable reshapes every sketch
-that follows it and rebuilds what was made from those sketches, and a
-library part places at the sketch sizes it is given.
+variables stays linked to them. This covers a recipe field (a rectangle's
+width, a circle's diameter) and a dimension drawn between two objects.
+Changing a variable reshapes every sketch that follows it and rebuilds what
+was made from those sketches, and a library part places at the sketch sizes
+it is given.
 
 - Date: 2026-09-23
 - Decision owners: Artificer project
@@ -30,13 +32,18 @@ express `depth / 2 + 5mm`.
 ### The sketch keeps the entry beside the number
 
 `SketchDefinition` gains `value_links`: a list of `SketchValueLink`s, one per
-recipe field that follows the variables. Each link records:
+value that follows the variables. Each link records a target and the entry
+the value was typed as. The target is one of:
 
-- the operation,
-- the recipe field's key (`width`, `diameter`, `angle`, …),
-- the entry the field was typed as.
+- **a recipe field** (`SketchValueTarget::RecipeField`): an operation and a
+  recipe field's key (`width`, `diameter`, `angle`, …);
+- **a relation** (`SketchValueTarget::Relation`): the measurement of a
+  dimension drawn between objects, which the sketch holds as a relation
+  rather than a recipe number. This covers a distance between two points,
+  from a point to an edge or to its midpoint, and between two parallel
+  edges.
 
-The list is ordered by operation and field, with one link per field.
+The list is ordered by target, with one link per value.
 
 - **The recipe still holds the number.** The recipe is unchanged: it holds
   the number the entry came to, so a sketch replays exactly without any
@@ -50,13 +57,18 @@ The list is ordered by operation and field, with one link per field.
   typed its value (`SketchTransaction::set_value_link`). It is confirmed,
   cancelled and undone with that value, and the journal's snapshots carry
   it.
-- **A link retires with its operation.** Committing drops the links of
-  operations that are no longer active.
-- **Links are validated.** A link must be on an operation the sketch has,
-  must read, and must name at least one variable. Validation also bounds how
-  many links a sketch has and how long each one is.
+- **A link retires with its value.** Committing drops the links of
+  operations that are no longer active, and removing a relation removes its
+  link.
+- **Links are validated.** A link must be on a value the sketch has: an
+  operation it holds, or a relation that holds a measurement. It must read
+  and must name at least one variable. Validation also bounds how many links
+  a sketch has and how long each one is.
+- **A link can change on its own.** Typing an entry that comes to the value
+  already held changes nothing in the geometry, but still links it
+  (`stage_value_link`).
 
-The sketch never evaluates a link. It keeps each link with its operation,
+The sketch never evaluates a link. It keeps each link with its value,
 through edits, undo and saving.
 
 ### The canvas records, shows and follows links
@@ -70,6 +82,9 @@ through edits, undo and saving.
 - **Showing.** A linked field shows the entry rather than the number. The
   panel adds that the value follows its variables and that a plain number
   unlinks it.
+- **Distances between objects.** A dimension drawn between two objects,
+  typed over a variable, keeps the entry the same way. Its box reopens on
+  the entry, and the plate shows the entry under the value.
 - **Links typed while drawing.** A dimension box typed over a variable while
   drawing becomes a link on the operation the draft inserts. A box and a
   recipe field do not always hold the same number. For example, a two-point
@@ -83,6 +98,10 @@ through edits, undo and saving.
      when that preference is on;
   3. commits the result.
 
+  Relations are solved over what the recipes place, so relation links
+  follow after the recipe links. Each one is restated the way retyping its
+  dimension would restate it, holding the end it is measured from.
+
   The outcome is a sketch the canvas itself could have produced. If a link
   no longer reads, names a variable that is not there, or comes to a value
   its field refuses, the call returns an error naming the field and changes
@@ -90,6 +109,8 @@ through edits, undo and saving.
 - **The live canvas.** The canvas follows the named values it is given
   whenever they change, and again after a local undo or redo, which restores
   values from before. The selection stays on the operation it was on.
+  While a sketch is open, Undo steps back through the sketch's own edits,
+  not through the document's variable changes, just as it did before.
 
 ### The document knows what a sketch reads
 
@@ -146,7 +167,8 @@ freezing the value (ADR 0052). Sketch links join it.
   entry back with the fewest parentheses, writing units in, listing names,
   and renaming. The model and the sketch still read entries with the same
   grammar.
-- Relations drawn as dimensions (`Distance` constraints between two points)
-  are not recipe fields and cannot follow a variable yet.
+- A relation that moves its far end past what that end's own geometry can
+  take (a line folded to nothing) cannot rewrite the geometry it pulls. The
+  solver then places both ends, as it already did for a typed value.
 - A value that follows a variable can still be retyped at any time. Typing
   a number unlinks it, and typing another expression relinks it.

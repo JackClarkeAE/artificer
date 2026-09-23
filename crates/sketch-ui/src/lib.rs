@@ -41,7 +41,7 @@ use artificer_sketch::{
     SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
     SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
-    SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
+    SketchValue as CoreValue, SketchValueTarget, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
     select_trim_span,
 };
@@ -2736,7 +2736,9 @@ fn polygon_driven_diameter(
 /// Why a sketch's linked values could not follow the document variables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinkedValueError {
-    pub operation: CoreOperationId,
+    /// The operation whose recipe field could not follow, or `None` for a
+    /// relation's measurement.
+    pub operation: Option<CoreOperationId>,
     pub field: String,
     pub text: String,
     pub reason: String,
@@ -2776,11 +2778,17 @@ pub fn regenerate_linked_values(
     keep_points_connected: bool,
 ) -> Result<Option<CoreSketchDefinition>, LinkedValueError> {
     let mut linked: BTreeMap<CoreOperationId, Vec<(String, String)>> = BTreeMap::new();
+    let mut relations = Vec::new();
     for link in authoring.value_links() {
-        linked
-            .entry(link.operation)
-            .or_default()
-            .push((link.field.clone(), link.text.clone()));
+        match &link.target {
+            SketchValueTarget::RecipeField { operation, field } => linked
+                .entry(*operation)
+                .or_default()
+                .push((field.clone(), link.text.clone())),
+            SketchValueTarget::Relation { constraint } => {
+                relations.push((*constraint, link.text.clone()));
+            }
+        }
     }
     let mut working = authoring.clone();
     let mut changed = false;
@@ -2797,7 +2805,7 @@ pub fn regenerate_linked_values(
         );
         for (field, text) in &links {
             let refuse = |reason: String| LinkedValueError {
-                operation,
+                operation: Some(operation),
                 field: field.clone(),
                 text: text.clone(),
                 reason,
@@ -2820,7 +2828,7 @@ pub fn regenerate_linked_values(
             parameter.value = Some(value);
         }
         let refuse = |reason: &str| LinkedValueError {
-            operation,
+            operation: Some(operation),
             field: links[0].0.clone(),
             text: links[0].1.clone(),
             reason: reason.to_owned(),
@@ -2844,7 +2852,66 @@ pub fn regenerate_linked_values(
             .map_err(|_| refuse("the sketch cannot be rebuilt with it"))?;
         changed = true;
     }
+    // Relations are solved over what the recipes place, so they follow
+    // after them, each restated the way retyping its dimension would.
+    for (constraint, text) in relations {
+        let Some(kind) = working
+            .constraints()
+            .get(&constraint)
+            .map(|record| record.kind.clone())
+        else {
+            continue;
+        };
+        let refuse = |reason: String| LinkedValueError {
+            operation: None,
+            field: "distance".to_owned(),
+            text: text.clone(),
+            reason,
+        };
+        let value = evaluate_entry(&text, FieldUnit::length(1.0), &|name| {
+            names.get(name).copied()
+        })
+        .map_err(|error| refuse(error.to_string()))?;
+        let value =
+            relation_measurement(value).map_err(|error| refuse(error.label().to_owned()))?;
+        let transaction = match working.stage_relation_measurement(
+            constraint,
+            value,
+            relation_held_point(&kind),
+            "Follow variables",
+            PrecisionPolicy::default(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(artificer_sketch::SketchTransactionError::NoChange) => continue,
+            Err(error) => return Err(refuse(error.to_string())),
+        };
+        working
+            .commit(transaction, CoreConfirmationSource::GreenTick)
+            .map_err(|error| refuse(error.to_string()))?;
+        changed = true;
+    }
     Ok(changed.then_some(working))
+}
+
+/// The end a retyped relation holds still: a distance between two points is
+/// measured from its first, as its dimension box does; a distance measured
+/// from an edge holds that edge itself, whatever is named here.
+fn relation_held_point(kind: &CoreConstraintKind) -> Option<CorePointId> {
+    match *kind {
+        CoreConstraintKind::Distance { first, .. } => Some(first),
+        _ => kind.referenced_points().first().copied(),
+    }
+}
+
+/// A relation's measurement as its dimension box would take it.
+fn relation_measurement(value: f64) -> Result<f64, DimensionInputError> {
+    if !value.is_finite() {
+        Err(DimensionInputError::NonFinite)
+    } else if value <= MIN_ENTITY_LENGTH {
+        Err(DimensionInputError::NonPositive)
+    } else {
+        Ok(value)
+    }
 }
 
 fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, ()> {
@@ -10054,13 +10121,25 @@ impl SketchCanvasState {
         else {
             return false;
         };
+        // A distance that follows a variable opens on the entry it follows.
+        let text = self.authoring.relation_link(constraint).map_or_else(
+            || self.length_unit.format_value(dimension.value),
+            str::to_owned,
+        );
         self.relation_dimension_edit = Some(RelationDimensionEdit {
             constraint,
-            text: self.length_unit.format_value(dimension.value),
+            text,
             focus_wanted: true,
             error: None,
         });
         true
+    }
+
+    /// The entry a dimension drawn between points follows, if it follows
+    /// one (ADR 0054).
+    #[must_use]
+    pub fn relation_dimension_follows(&self, constraint: CoreConstraintId) -> Option<&str> {
+        self.authoring.relation_link(constraint)
     }
 
     /// The dimension currently open for typing, with its text and any refusal.
@@ -10113,17 +10192,42 @@ impl SketchCanvasState {
                 return None;
             }
         };
-        let transaction = match self.authoring.stage_relation_measurement(
-            constraint,
-            value,
-            Some(dimension.first),
-            "Dimension",
-            PrecisionPolicy::default(),
-        ) {
+        // Typed over a variable, the distance keeps following it; a plain
+        // number is a plain number again.
+        let link = value_link_for_entry(
+            &text,
+            FieldUnit::length(self.length_unit.millimetres_per_unit()),
+        );
+        let staged = self
+            .authoring
+            .stage_relation_measurement(
+                constraint,
+                value,
+                Some(dimension.first),
+                "Dimension",
+                PrecisionPolicy::default(),
+            )
+            .and_then(|mut transaction| {
+                transaction.set_relation_link(constraint, link.clone())?;
+                Ok(transaction)
+            });
+        let transaction = match staged {
             Ok(transaction) => transaction,
+            // The entry came to the distance already held: only the link, if
+            // it changed, is an edit.
             Err(artificer_sketch::SketchTransactionError::NoChange) => {
-                self.relation_dimension_edit = None;
-                return None;
+                match self.authoring.stage_value_link(
+                    SketchValueTarget::Relation { constraint },
+                    link,
+                    "Dimension",
+                    PrecisionPolicy::default(),
+                ) {
+                    Ok(transaction) => transaction,
+                    Err(_) => {
+                        self.relation_dimension_edit = None;
+                        return None;
+                    }
+                }
             }
             Err(error) => {
                 if let Some(edit) = self.relation_dimension_edit.as_mut() {
@@ -14832,6 +14936,16 @@ fn show_point_to_point_dimensions(
                 FontId::monospace(10.0),
                 colours.dimension.gamma_multiply(0.85),
             );
+            // A distance that follows a variable says which, under its value.
+            if let Some(follows) = state.authoring.relation_link(*constraint) {
+                ui.painter().text(
+                    layout.rect.center_bottom() + Vec2::new(0.0, 2.0),
+                    Align2::CENTER_TOP,
+                    format!("= {follows}"),
+                    FontId::monospace(9.0),
+                    colours.dimension.gamma_multiply(0.7),
+                );
+            }
             if armed {
                 let response =
                     ui.interact(layout.rect, layout.id.with("pick"), egui::Sense::click());
@@ -21461,6 +21575,81 @@ mod tests {
             state.pending().is_some(),
             "a dimension is a sketch edit and waits at the confirmation gate"
         );
+    }
+
+    /// A distance between two objects typed over a variable keeps following
+    /// it (ADR 0054): the box reopens on the entry, the canvas moves the far
+    /// end when the variable changes, and a plain number unlinks it.
+    #[test]
+    fn a_distance_between_objects_follows_the_variable_it_is_typed_over() {
+        use artificer_sketch::expression::Dimension;
+        let names = |gap: f64| {
+            BTreeMap::from([(
+                "gap".to_owned(),
+                NamedQuantity {
+                    canonical: gap,
+                    dimension: Dimension::LENGTH,
+                },
+            )])
+        };
+        let (mut state, first, second) = two_separate_lines();
+        state.set_named_values(names(3.0));
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
+        state.commit_pending().expect("the dimension commits");
+        let constraint = state.point_to_point_dimensions()[0].constraint;
+
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("gap * 2".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the new distance commits");
+        assert_eq!(
+            state.relation_dimension_follows(constraint),
+            Some("gap * 2")
+        );
+        let separation = |state: &SketchCanvasState| state.point_to_point_dimensions()[0].value;
+        assert!((separation(&state) - 6.0).abs() < 1.0e-9);
+        assert!(state.begin_relation_dimension_edit(constraint));
+        assert_eq!(state.relation_dimension_editor().unwrap().1, "gap * 2");
+        state.cancel_relation_dimension_edit();
+
+        // The variable changes and the distance follows it, from the end it
+        // is measured from.
+        let from = state.point_to_point_dimensions()[0].from;
+        assert!(state.set_named_values(names(5.0)));
+        assert!((separation(&state) - 10.0).abs() < 1.0e-9);
+        assert_eq!(state.point_to_point_dimensions()[0].from, from);
+        let regenerated = regenerate_linked_values(state.authoring(), &names(1.5), true)
+            .expect("the distance follows")
+            .expect("and changes");
+        let distance = regenerated
+            .constraints()
+            .get(&constraint)
+            .and_then(|record| record.kind.measurement())
+            .expect("a measured relation");
+        assert!((distance - 3.0).abs() < 1.0e-9);
+        assert!(
+            regenerate_linked_values(state.authoring(), &names(-1.0), true).is_err(),
+            "a negative distance is refused"
+        );
+
+        // Typing the value it already holds, as a variable, links it without
+        // moving anything; typing a number unlinks it.
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("10".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the unlink commits");
+        assert_eq!(state.relation_dimension_follows(constraint), None);
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("gap * 2".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the link commits");
+        assert_eq!(
+            state.relation_dimension_follows(constraint),
+            Some("gap * 2")
+        );
+        assert!((separation(&state) - 10.0).abs() < 1.0e-9);
     }
 
     /// A click that lands on no point is still a question about the object

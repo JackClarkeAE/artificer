@@ -501,13 +501,17 @@ fn a_link_the_sketch_cannot_keep_does_not_load() {
         .commit(transaction, ConfirmationSource::GreenTick)
         .expect("commit");
     let mut json: serde_json::Value = serde_json::to_value(&sketch).expect("serialize");
+    let field = |operation: u64, field: &str, text: &str| {
+        serde_json::json!({
+            "target": { "kind": "recipe_field", "operation": operation, "field": field },
+            "text": text,
+        })
+    };
     for links in [
-        serde_json::json!([{ "operation": 9, "field": "length", "text": "width" }]),
-        serde_json::json!([{ "operation": 1, "field": "length", "text": "12" }]),
-        serde_json::json!([
-            { "operation": 1, "field": "length", "text": "width" },
-            { "operation": 1, "field": "angle", "text": "tilt" }
-        ]),
+        serde_json::json!([field(9, "length", "width")]),
+        serde_json::json!([field(1, "length", "12")]),
+        serde_json::json!([field(1, "length", "width"), field(1, "angle", "tilt")]),
+        serde_json::json!([{ "target": { "kind": "relation", "constraint": 4 }, "text": "width" }]),
     ] {
         json["value_links"] = links.clone();
         let loaded: SketchDefinition = serde_json::from_value(json.clone()).expect("decode");
@@ -516,4 +520,77 @@ fn a_link_the_sketch_cannot_keep_does_not_load() {
             "{links}"
         );
     }
+}
+
+#[test]
+fn a_relation_measurement_can_follow_a_variable_and_leaves_with_its_relation() {
+    let mut sketch = SketchDefinition::new();
+    let transaction = sketch
+        .stage(line((0.0, 0.0), (10.0, 0.0)), "Line")
+        .expect("stage");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    let operation = &sketch.operations()[0];
+    let point = |role| match operation.outputs.get(&OutputRole::Point(role)) {
+        Some(SketchOutputRef::Point(point)) => *point,
+        other => panic!("no point for {role:?}: {other:?}"),
+    };
+    let (start, end) = (point(PointOutputRole::Start), point(PointOutputRole::End));
+    let relation = sketch
+        .add_constraint(
+            artificer_sketch::SketchConstraintKind::Distance {
+                first: start,
+                second: end,
+                distance: 10.0,
+            },
+            PrecisionPolicy::default(),
+        )
+        .expect("a distance the line already has");
+
+    let mut transaction = sketch
+        .stage_relation_measurement(
+            relation,
+            20.0,
+            Some(start),
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the new distance");
+    assert_eq!(
+        transaction.set_relation_link(relation, Some("width * 2".to_owned())),
+        Ok(true)
+    );
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    assert_eq!(sketch.relation_link(relation), Some("width * 2"));
+    let json = serde_json::to_string(&sketch).expect("serialize");
+    let restored: SketchDefinition = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(restored, sketch);
+    restored
+        .validate(PrecisionPolicy::default())
+        .expect("a kept relation link validates");
+
+    // A relation that holds no number cannot be linked.
+    let mut transaction = sketch
+        .stage(line((0.0, 5.0), (10.0, 5.0)), "Second line")
+        .expect("stage");
+    assert!(
+        transaction
+            .set_relation_link(
+                artificer_sketch::SketchConstraintId::new(99).expect("an id"),
+                Some("width".to_owned())
+            )
+            .is_err()
+    );
+    let _ = transaction.cancel();
+
+    // Removing the relation removes its link.
+    let mut removed = sketch.clone();
+    assert!(removed.remove_constraint(relation));
+    assert_eq!(removed.relation_link(relation), None);
+    removed
+        .validate(PrecisionPolicy::default())
+        .expect("no link is left behind");
 }

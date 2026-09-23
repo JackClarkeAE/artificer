@@ -25,25 +25,40 @@ pub const MAX_VALUE_LINK_FIELD_BYTES: usize = 64;
 /// Longest entry a value link may keep, in bytes.
 pub const MAX_VALUE_LINK_TEXT_BYTES: usize = 1_024;
 
-/// One recipe value that follows the document's variables.
+/// One value in a sketch that follows the document's variables.
 ///
 /// A dimension typed as `width / 2` is worked out when it is typed, and the
-/// recipe keeps the number that came out. On its own that is a copy: change
+/// sketch keeps the number that came out. On its own that is a copy: change
 /// `width` and the sketch keeps its old size. A link is what makes it stay
-/// linked. It names the operation and the recipe field the entry was typed
-/// into, and keeps the entry itself, written with its units
-/// ([`crate::expression::written_entry`]) so it reads the same whatever unit
-/// the document is later shown in. Whoever owns the variables works the
-/// entry out again when one changes and replaces the recipe with the answer.
+/// linked. It names the value the entry was typed into and keeps the entry
+/// itself, written with its units ([`crate::expression::written_entry`]) so
+/// it reads the same whatever unit the document is later shown in. Whoever
+/// owns the variables works the entry out again when one changes and sets
+/// the value to the answer.
 ///
-/// The sketch never evaluates a link itself; it only keeps it with the
-/// operation it belongs to, through edits, undo and saving, and drops it
-/// when that operation is retired.
+/// The sketch never evaluates a link itself; it only keeps it with the value
+/// it belongs to, through edits, undo and saving, and drops it when that
+/// value goes: its operation retired, or its relation removed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SketchValueLink {
-    pub operation: SketchOperationId,
-    pub field: String,
+    pub target: SketchValueTarget,
     pub text: String,
+}
+
+/// The value a link sets.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SketchValueTarget {
+    /// One field of an operation's recipe: a rectangle's `width`, a
+    /// circle's `diameter`, a line's `angle`.
+    RecipeField {
+        operation: SketchOperationId,
+        field: String,
+    },
+    /// The measurement a relation holds: a dimension drawn between two
+    /// points, from a point to an edge or its midpoint, or between two
+    /// parallel edges.
+    Relation { constraint: SketchConstraintId },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -296,8 +311,8 @@ pub struct SketchDefinition {
     /// definition so a replay closes exactly the regions the canvas did.
     #[serde(default)]
     pub(crate) support_curves: Vec<EvaluatedCurve2>,
-    /// The recipe values that follow document variables, ordered by
-    /// operation and field, at most one per field.
+    /// The values that follow document variables, ordered by target, at
+    /// most one per value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) value_links: Vec<SketchValueLink>,
 }
@@ -477,8 +492,12 @@ impl SketchDefinition {
         Ok(())
     }
 
+    /// Removes a relation, and with it the link its measurement followed.
     pub fn remove_constraint(&mut self, id: SketchConstraintId) -> bool {
         let removed = self.constraints.remove(&id).is_some();
+        if removed {
+            self.set_value_link(SketchValueTarget::Relation { constraint: id }, None);
+        }
         if removed && let Some(next) = self.revision.checked_next() {
             self.revision = next;
         }
@@ -630,7 +649,7 @@ impl SketchDefinition {
         &self.support_curves
     }
 
-    /// Every recipe value that follows a document variable.
+    /// Every value that follows a document variable.
     #[must_use]
     pub fn value_links(&self) -> &[SketchValueLink] {
         &self.value_links
@@ -640,23 +659,34 @@ impl SketchDefinition {
     #[must_use]
     pub fn value_link(&self, operation: SketchOperationId, field: &str) -> Option<&str> {
         self.value_links
-            .binary_search_by(|link| (link.operation, link.field.as_str()).cmp(&(operation, field)))
-            .ok()
-            .map(|index| self.value_links[index].text.as_str())
+            .iter()
+            .find(|link| {
+                matches!(&link.target, SketchValueTarget::RecipeField { operation: linked, field: named }
+                    if *linked == operation && named == field)
+            })
+            .map(|link| link.text.as_str())
     }
 
-    /// Links or unlinks one recipe field, keeping the list in order. Returns
+    /// The entry a relation's measurement follows, if it follows one.
+    #[must_use]
+    pub fn relation_link(&self, constraint: SketchConstraintId) -> Option<&str> {
+        self.value_links
+            .iter()
+            .find(|link| link.target == SketchValueTarget::Relation { constraint })
+            .map(|link| link.text.as_str())
+    }
+
+    /// Links or unlinks one value, keeping the list in order. Returns
     /// whether anything changed. The revision is the caller's to advance:
     /// a link is set as part of the edit that typed it.
     pub(crate) fn set_value_link(
         &mut self,
-        operation: SketchOperationId,
-        field: &str,
+        target: SketchValueTarget,
         text: Option<String>,
     ) -> bool {
-        let found = self.value_links.binary_search_by(|link| {
-            (link.operation, link.field.as_str()).cmp(&(operation, field))
-        });
+        let found = self
+            .value_links
+            .binary_search_by(|link| link.target.cmp(&target));
         match (found, text) {
             (Ok(index), Some(text)) => {
                 if self.value_links[index].text == text {
@@ -667,28 +697,26 @@ impl SketchDefinition {
             (Ok(index), None) => {
                 self.value_links.remove(index);
             }
-            (Err(index), Some(text)) => self.value_links.insert(
-                index,
-                SketchValueLink {
-                    operation,
-                    field: field.to_owned(),
-                    text,
-                },
-            ),
+            (Err(index), Some(text)) => self
+                .value_links
+                .insert(index, SketchValueLink { target, text }),
             (Err(_), None) => return false,
         }
         true
     }
 
-    /// Drops the links of operations that are no longer active: whatever
-    /// they drove has been retired with them.
+    /// Drops the links whose value is gone: an operation no longer active,
+    /// or a relation removed.
     pub(crate) fn prune_value_links(&mut self) {
         let active: BTreeSet<SketchOperationId> = self
             .active_operations()
             .map(|operation| operation.id)
             .collect();
-        self.value_links
-            .retain(|link| active.contains(&link.operation));
+        let constraints = &self.constraints;
+        self.value_links.retain(|link| match &link.target {
+            SketchValueTarget::RecipeField { operation, .. } => active.contains(operation),
+            SketchValueTarget::Relation { constraint } => constraints.contains_key(constraint),
+        });
     }
 
     /// Renames a variable in every link that uses it. Returns whether any
@@ -942,19 +970,21 @@ impl SketchDefinition {
 
         for (index, link) in self.value_links.iter().enumerate() {
             let invalid = SketchValidationError::InvalidValueLink {
-                operation: link.operation,
+                target: link.target.clone(),
             };
-            let ordered = index == 0 || {
-                let previous = &self.value_links[index - 1];
-                (previous.operation, previous.field.as_str())
-                    < (link.operation, link.field.as_str())
+            let ordered = index == 0 || self.value_links[index - 1].target < link.target;
+            let target_exists = match &link.target {
+                SketchValueTarget::RecipeField { operation, field } => {
+                    operation_positions.contains_key(operation)
+                        && !field.is_empty()
+                        && field.len() <= MAX_VALUE_LINK_FIELD_BYTES
+                }
+                SketchValueTarget::Relation { constraint } => self
+                    .constraints
+                    .get(constraint)
+                    .is_some_and(|record| record.kind.measurement().is_some()),
             };
-            if !ordered
-                || !operation_positions.contains_key(&link.operation)
-                || link.field.is_empty()
-                || link.field.len() > MAX_VALUE_LINK_FIELD_BYTES
-                || link.text.len() > MAX_VALUE_LINK_TEXT_BYTES
-            {
+            if !ordered || !target_exists || link.text.len() > MAX_VALUE_LINK_TEXT_BYTES {
                 return Err(invalid);
             }
             match crate::expression::entry_names(&link.text) {
@@ -1353,10 +1383,10 @@ pub enum SketchValidationError {
     },
     InvalidConstraint,
     ConstraintSystemConflict,
-    /// A value link out of order, on an operation the sketch does not have,
-    /// or whose entry does not read or names no variable.
+    /// A value link out of order, on a value the sketch does not have, or
+    /// whose entry does not read or names no variable.
     InvalidValueLink {
-        operation: SketchOperationId,
+        target: SketchValueTarget,
     },
 }
 
@@ -1498,10 +1528,16 @@ impl fmt::Display for SketchValidationError {
             Self::ConstraintSystemConflict => {
                 formatter.write_str("sketch constraint system is conflicting")
             }
-            Self::InvalidValueLink { operation } => write!(
-                formatter,
-                "a value of operation {operation} is linked to an entry that cannot be kept"
-            ),
+            Self::InvalidValueLink { target } => match target {
+                SketchValueTarget::RecipeField { operation, field } => write!(
+                    formatter,
+                    "the {field} of operation {operation} is linked to an entry that cannot be kept"
+                ),
+                SketchValueTarget::Relation { constraint } => write!(
+                    formatter,
+                    "the measurement of relation {constraint} is linked to an entry that cannot be kept"
+                ),
+            },
         }
     }
 }

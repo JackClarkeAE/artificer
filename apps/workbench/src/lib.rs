@@ -4599,6 +4599,18 @@ impl KernelLabApp {
         self.sketch.point_to_point_dimensions()
     }
 
+    /// The entry a dimension drawn between points follows, if it was typed
+    /// over a variable (ADR 0054).
+    #[must_use]
+    pub fn sketch_relation_dimension_follows(
+        &self,
+        constraint: artificer_sketch::SketchConstraintId,
+    ) -> Option<String> {
+        self.sketch
+            .relation_dimension_follows(constraint)
+            .map(str::to_owned)
+    }
+
     /// The point-to-point dimension open for typing: its text, and why the last
     /// entry was refused if it was.
     #[must_use]

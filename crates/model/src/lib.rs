@@ -6291,8 +6291,10 @@ mod tests {
         let authoring = payload.authoring.as_ref().expect("an editable sketch");
         let operation = authoring.operations()[0].id;
         let mut json = serde_json::to_value(authoring).expect("the sketch encodes");
-        json["value_links"] =
-            serde_json::json!([{ "operation": operation, "field": "width", "text": entry }]);
+        json["value_links"] = serde_json::json!([{
+            "target": { "kind": "recipe_field", "operation": operation, "field": "width" },
+            "text": entry,
+        }]);
         payload.authoring = Some(serde_json::from_value(json).expect("the sketch decodes"));
         payload
             .validate()

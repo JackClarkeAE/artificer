@@ -404,3 +404,87 @@ fn an_extrusion_typed_as_a_variable_follows_it() {
         volume(&reopened)
     );
 }
+
+fn click_sketch_point(harness: &mut Harness<'static, KernelLabApp>, point: SketchPoint) {
+    let position = harness
+        .state()
+        .sketch_point_screen_position(harness.get_by_label("Sketch viewport").rect(), point);
+    click_at(harness, position);
+}
+
+/// A dimension drawn between two objects follows a variable too (ADR 0054):
+/// typed as `gap / 2`, it keeps the entry and moves the far object, from
+/// the end it is measured from, when `gap` changes.
+#[test]
+fn a_distance_between_two_objects_follows_the_variable_it_is_typed_over() {
+    let mut harness = harness();
+    harness.run();
+    create_length_variable(&mut harness);
+    replace_text_input(&mut harness, "Variable name Length1", "gap");
+
+    click_button(&mut harness, "XY Plane");
+    click_button(&mut harness, "Sketch mode");
+    for (start, end) in [((-8.0, 0.0), (-4.0, 0.0)), ((0.0, 0.0), (4.0, 0.0))] {
+        click_button(&mut harness, "Single line");
+        click_sketch_point(&mut harness, SketchPoint::new(start.0, start.1));
+        click_sketch_point(&mut harness, SketchPoint::new(end.0, end.1));
+    }
+    click_button(&mut harness, "Sketch dimension");
+    click_sketch_point(&mut harness, SketchPoint::new(-4.0, 0.0));
+    click_sketch_point(&mut harness, SketchPoint::new(0.0, 0.0));
+    let separation_box = "Distance between points";
+    assert!(
+        harness
+            .get_by_role_and_label(Role::TextInput, separation_box)
+            .is_focused()
+    );
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness
+        .get_by_role_and_label(Role::TextInput, separation_box)
+        .type_text("gap / 2");
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+
+    let distance = |harness: &Harness<'static, KernelLabApp>| {
+        let dimensions = harness.state().sketch_point_to_point_dimensions();
+        assert_eq!(dimensions.len(), 1, "one dimension throughout");
+        (dimensions[0].to.u - dimensions[0].from.u).hypot(dimensions[0].to.v - dimensions[0].from.v)
+    };
+    assert!(
+        (distance(&harness) - 5.0).abs() < 1.0e-6,
+        "{}",
+        distance(&harness)
+    );
+    let constraint = harness.state().sketch_point_to_point_dimensions()[0].constraint;
+    assert_eq!(
+        harness
+            .state()
+            .sketch_relation_dimension_follows(constraint),
+        Some("gap / 2".to_owned())
+    );
+
+    // The far line is three long, so a gap that moves its start by more than
+    // that would fold it; 12 moves it by one.
+    replace_text_input(&mut harness, "Variable value gap", "12");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert!(
+        (distance(&harness) - 6.0).abs() < 1.0e-6,
+        "{} · {:?}",
+        distance(&harness),
+        harness.state().document_status_text()
+    );
+    let from = harness.state().sketch_point_to_point_dimensions()[0].from;
+    assert!(
+        (from.u + 4.0).abs() < 1.0e-6,
+        "the end it is measured from stays put"
+    );
+
+    assert_eq!(
+        harness
+            .state()
+            .sketch_relation_dimension_follows(constraint),
+        Some("gap / 2".to_owned()),
+        "it still follows the variable after following it"
+    );
+}

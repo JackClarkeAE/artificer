@@ -8,7 +8,7 @@ use crate::{
     SketchConstraintId, SketchConstraintKind, SketchDefinition, SketchEntityId, SketchEntityRecord,
     SketchInputValues, SketchOperationId, SketchOutputOwner, SketchOutputRef, SketchPoint2,
     SketchPointId, SketchPointRecord, SketchRecipe, SketchRevision, SketchValidationError,
-    evaluate_recipe, instantiate_curve,
+    SketchValueTarget, evaluate_recipe, instantiate_curve,
 };
 
 /// Visible confirmation path used to publish an atomic sketch edit.
@@ -87,8 +87,33 @@ impl SketchTransaction {
         field: &str,
         text: Option<String>,
     ) -> Result<bool, SketchTransactionError> {
+        self.set_link(
+            SketchValueTarget::RecipeField {
+                operation,
+                field: field.to_owned(),
+            },
+            text,
+        )
+    }
+
+    /// Links the measurement a relation holds — a dimension between two
+    /// points, from a point to an edge, between two edges — to an entry over
+    /// document variables, or unlinks it with `None`, as part of this edit.
+    pub fn set_relation_link(
+        &mut self,
+        constraint: SketchConstraintId,
+        text: Option<String>,
+    ) -> Result<bool, SketchTransactionError> {
+        self.set_link(SketchValueTarget::Relation { constraint }, text)
+    }
+
+    fn set_link(
+        &mut self,
+        target: SketchValueTarget,
+        text: Option<String>,
+    ) -> Result<bool, SketchTransactionError> {
         let mut candidate = self.candidate.clone();
-        if !candidate.set_value_link(operation, field, text) {
+        if !candidate.set_value_link(target, text) {
             return Ok(false);
         }
         candidate.validate_with_inputs(&self.inputs, self.precision)?;
@@ -788,6 +813,33 @@ impl SketchDefinition {
             precision,
         };
         Ok(pull_followers(transaction, anchored, precision))
+    }
+
+    /// Stages an edit that only links or unlinks a value: what was typed
+    /// came to the number the value already holds, so nothing moves, but
+    /// from now on it follows the entry (or no longer does).
+    pub fn stage_value_link(
+        &self,
+        target: SketchValueTarget,
+        text: Option<String>,
+        label: impl Into<String>,
+        precision: PrecisionPolicy,
+    ) -> Result<SketchTransaction, SketchTransactionError> {
+        let label = checked_label(label)?;
+        let mut candidate = self.clone();
+        if !candidate.set_value_link(target, text) {
+            return Err(SketchTransactionError::NoChange);
+        }
+        candidate.set_revision(next_revision(self.revision())?);
+        candidate.validate_with_inputs(&SketchInputValues::default(), precision)?;
+        Ok(SketchTransaction {
+            expected_revision: self.revision(),
+            label,
+            candidate,
+            impact: SketchImpactReport::default(),
+            inputs: SketchInputValues::default(),
+            precision,
+        })
     }
 
     pub fn stage_retire_operation(
