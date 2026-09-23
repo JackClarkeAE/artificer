@@ -260,14 +260,12 @@ impl Expression {
             },
             Self::Name(name) => TypedExpression::Name(name),
             Self::Negate(operand) => TypedExpression::Negate(Box::new(operand.assign(role))),
-            Self::Add(left, right) => TypedExpression::Add(
-                Box::new(left.assign(role)),
-                Box::new(right.assign(role)),
-            ),
-            Self::Subtract(left, right) => TypedExpression::Subtract(
-                Box::new(left.assign(role)),
-                Box::new(right.assign(role)),
-            ),
+            Self::Add(left, right) => {
+                TypedExpression::Add(Box::new(left.assign(role)), Box::new(right.assign(role)))
+            }
+            Self::Subtract(left, right) => {
+                TypedExpression::Subtract(Box::new(left.assign(role)), Box::new(right.assign(role)))
+            }
             Self::Multiply(left, right) => {
                 let (left_role, right_role) = match (left.is_dimensioned(), right.is_dimensioned())
                 {
@@ -342,7 +340,8 @@ impl TypedExpression {
                 }
             },
             Self::Name(name) => {
-                let named = resolve(name).ok_or_else(|| ExpressionError::UnknownName(name.clone()))?;
+                let named =
+                    resolve(name).ok_or_else(|| ExpressionError::UnknownName(name.clone()))?;
                 (named.canonical, named.dimension)
             }
             Self::Negate(operand) => {
@@ -388,7 +387,9 @@ pub fn evaluate_entry(
     field: FieldUnit,
     resolve: &dyn Fn(&str) -> Option<NamedQuantity>,
 ) -> Result<f64, ExpressionError> {
-    parse_expression(text)?.assign_roles().evaluate(field, resolve)
+    parse_expression(text)?
+        .assign_roles()
+        .evaluate(field, resolve)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -663,8 +664,14 @@ mod tests {
             40.0 + 25.4,
         );
         // `width * 2` doubles, `width / 2` halves.
-        close(evaluate_entry("width * 2", inches, &variables).unwrap(), 80.0);
-        close(evaluate_entry("width / 2", inches, &variables).unwrap(), 20.0);
+        close(
+            evaluate_entry("width * 2", inches, &variables).unwrap(),
+            80.0,
+        );
+        close(
+            evaluate_entry("width / 2", inches, &variables).unwrap(),
+            20.0,
+        );
         // A written unit always wins.
         close(
             evaluate_entry("width + 5mm", inches, &variables).unwrap(),
@@ -674,7 +681,10 @@ mod tests {
             evaluate_entry("width + 5 mm", inches, &variables).unwrap(),
             45.0,
         );
-        close(evaluate_entry("2 * 3", inches, &variables).unwrap(), 6.0 * 25.4);
+        close(
+            evaluate_entry("2 * 3", inches, &variables).unwrap(),
+            6.0 * 25.4,
+        );
     }
 
     #[test]
@@ -688,10 +698,7 @@ mod tests {
             evaluate_entry("tilt / 3 + 15", degrees, &variables).unwrap(),
             30.0_f64.to_radians(),
         );
-        close(
-            evaluate_entry("0.5rad", degrees, &variables).unwrap(),
-            0.5,
-        );
+        close(evaluate_entry("0.5rad", degrees, &variables).unwrap(), 0.5);
     }
 
     #[test]
