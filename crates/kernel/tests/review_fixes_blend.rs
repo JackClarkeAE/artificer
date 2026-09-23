@@ -302,23 +302,18 @@ fn drilled_l_block() -> Snapshot {
 #[test]
 fn a_reflex_edge_is_never_finished_by_cutting_material_away() {
     let body = drilled_l_block();
-    let before = body.measures().volume;
     let edge = vertical_edge(&body, 6.0, 4.0);
     // A fillet in a reflex corner adds its corner region; it never removes
-    // anything. The standing-apart cut only ever removes, so it must not be
-    // the rung that answers — it used to, taking 64.5 out of the body where
-    // the fillet adds 1.5. How closely a later, approximate rung lands on the
-    // added corner is that rung's own affair; that it removes nothing is
-    // this one's.
-    if let Ok(outcome) = finish(&body, vec![edge], EdgeFinishKind::Fillet, 1.0, false) {
-        assert_ne!(
-            outcome.report.rung.as_deref(),
-            Some("edge-finish/standing-apart")
-        );
-        let added = outcome.snapshot.measures().volume - before;
-        assert!(
-            added > -1.0e-6 && added < 2.0 * fillet_corner(1.0, 7.0),
-            "a reflex fillet adds at most its corner region, not {added}"
+    // anything. The standing-apart cut only ever removes, and it used to
+    // answer, taking 64.5 out of the body where the fillet adds 1.5. The
+    // faceted tier only ever removes too, and published the body all but
+    // unchanged as the fillet. No route here adds the corner, so the finish
+    // is refused by name.
+    for kind in [EdgeFinishKind::Fillet, EdgeFinishKind::Chamfer] {
+        assert_refused(
+            finish(&body, vec![edge], kind, 1.0, false),
+            "EDGE_FINISH_REFLEX_UNSUPPORTED",
+            &format!("a {kind:?} of a reflex edge"),
         );
     }
     // Asked for by name, the standing-apart route refuses the edge rather

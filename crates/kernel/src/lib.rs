@@ -4944,6 +4944,19 @@ fn regularized_edge_finish(
         return Ok((topology, "edge-finish/standing-apart"));
     }
 
+    // The faceted tier only ever cuts a finish's sweep away from the body,
+    // and a finish of a reflex edge adds the corner it rounds. Handed one, it
+    // cut into air and published the body all but unchanged as a fillet.
+    if targets.iter().any(|target| {
+        edge_finish_apart::edge_is_reflex(&input.topology, *target, precision) == Some(true)
+    }) {
+        return Err(simple_invalid_input(
+            input.id,
+            "EDGE_FINISH_REFLEX_UNSUPPORTED",
+            "That edge is concave: a fillet or chamfer there adds material to the corner rather              than removing it, and no route in this kernel builds that finish on such a body yet.              Round the corner in the sketch the body was made from instead.",
+        ));
+    }
+
     let scene = NativeKernel::authoritative_scene(input);
     let faceted = faceted_boolean::finish_edges(
         Some(&input.topology),

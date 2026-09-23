@@ -249,6 +249,9 @@ fn validate_geometry(
             ));
         }
         let curve_frame_error = match edge.value.curve {
+            // A line of no length passes: it is the one degenerate edge a
+            // pole of a sphere or a cone stands in for its whole singular
+            // iso-line with (see `section_revolve`).
             Curve3::Line { endpoints } => {
                 let length = endpoints[0].distance(endpoints[1]);
                 if length > linear_tolerance {
@@ -262,10 +265,11 @@ fn validate_geometry(
                 .max((v.length() - 1.0).abs())
                 .max(u.dot(v).abs())
                 .max((u.cross(v).length() - 1.0).abs())
+                // A circle of no radius is no circle; nothing stands in one.
                 .max(if radius > linear_tolerance {
                     0.0
                 } else {
-                    linear_tolerance - radius
+                    f64::INFINITY
                 }),
             Curve3::Ellipse {
                 u,
@@ -281,7 +285,7 @@ fn validate_geometry(
                 .max(if minor_radius > linear_tolerance {
                     0.0
                 } else {
-                    linear_tolerance - minor_radius
+                    f64::INFINITY
                 })
                 // The major axis is the first one by construction.
                 .max((minor_radius - major_radius).max(0.0)),
@@ -4285,6 +4289,27 @@ mod review_fixes {
         );
         let whole = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 2.0, 2.0));
         assert!(validate(&whole, TOLERANCE).is_valid());
+    }
+
+    #[test]
+    fn a_circle_of_no_radius_is_reported() {
+        let mut topology = build_cuboid(Point3::new(0.0, 0.0, 0.0), Vector3::new(2.0, 3.0, 4.0));
+        let id = topology.edges[0].id;
+        topology.edges[0].value.curve = Curve3::Circle {
+            center: Point3::new(0.0, 0.0, 0.0),
+            u: Vector3::new(1.0, 0.0, 0.0),
+            v: Vector3::new(0.0, 1.0, 0.0),
+            radius: 0.0,
+        };
+        let report = validate(&topology, TOLERANCE);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == DiagnosticCode::CurveFrameInvalid
+                    && diagnostic.path == format!("edge/{}/curve", id.get())
+            }),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     #[test]

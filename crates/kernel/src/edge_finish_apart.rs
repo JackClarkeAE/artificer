@@ -183,6 +183,53 @@ pub(crate) fn edges_run_out_of_the_body(
     })
 }
 
+/// Whether a straight edge between two flat faces is reflex: its dihedral
+/// through the material more than a half turn, so that a finish of it adds
+/// material rather than taking it away. `None` for an edge this cannot
+/// read — curved, or not between two flat faces.
+pub(crate) fn edge_is_reflex(
+    topology: &Topology,
+    target: EntityRef,
+    precision: PrecisionPolicy,
+) -> Option<bool> {
+    let edge = topology
+        .edges
+        .iter()
+        .position(|edge| edge.id.get() == target.entity.0)?;
+    let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
+        return None;
+    };
+    let along = difference(endpoints[1], endpoints[0]);
+    let length = magnitude(along);
+    if !length.is_finite() || length <= precision.linear_agreement {
+        return None;
+    }
+    let along = scale(along, 1.0 / length);
+    let faces = oriented_faces_of_edge(topology, edge)?;
+    let [Some(forward), Some(reverse)] =
+        faces.map(|face| topology.faces[face].value.surface.as_plane())
+    else {
+        return None;
+    };
+    let unit = |vector: Vector3| {
+        let span = magnitude(vector);
+        (span.is_finite() && span > f64::EPSILON).then(|| scale(vector, 1.0 / span))
+    };
+    let normals = [unit(forward.normal)?, unit(reverse.normal)?];
+    let into = [
+        unit(cross(normals[0], along))?,
+        unit(cross(normals[1], scale(along, -1.0)))?,
+    ];
+    let sine = -dot(normals[0], into[1]);
+    let cosine = dot(into[0], into[1]);
+    let interior = sine.atan2(cosine).rem_euclid(std::f64::consts::TAU);
+    let angle_tolerance = precision.angular_agreement_radians.max(1.0e-9);
+    Some(
+        interior > std::f64::consts::PI + angle_tolerance
+            && interior < std::f64::consts::TAU - angle_tolerance,
+    )
+}
+
 /// The material wedge at a straight edge between two flat faces, read from
 /// the topology rather than guessed from the geometry.
 struct Wedge {
