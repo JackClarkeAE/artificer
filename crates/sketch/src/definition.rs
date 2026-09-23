@@ -570,64 +570,32 @@ impl SketchDefinition {
         &self,
         entity: SketchEntityId,
     ) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
-        let record = self
-            .entities
-            .get(&entity)
-            .filter(|record| record.active)
-            .ok_or(SketchValidationError::MissingEntity { entity })?;
+        self.evaluated_curves(&[entity])
+            .map(|mut curves| curves.remove(0))
+    }
+
+    /// Resolves several active curves at once, in the order asked, solving
+    /// the constraints once for all of them.
+    pub fn evaluated_curves(
+        &self,
+        entities: &[SketchEntityId],
+    ) -> Result<Vec<crate::EvaluatedCurve2>, SketchValidationError> {
+        let records = entities
+            .iter()
+            .map(|entity| {
+                self.entities
+                    .get(entity)
+                    .filter(|record| record.active)
+                    .ok_or(SketchValidationError::MissingEntity { entity: *entity })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let solved = self
             .solve_constraints(PrecisionPolicy::default())
             .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
-        let point = |id: SketchPointId| {
-            solved
-                .positions
-                .get(&id)
-                .copied()
-                .ok_or(SketchValidationError::InactivePointReference { point: id })
-        };
-        Ok(match record.geometry {
-            SketchCurve2::Line { start, end } => crate::EvaluatedCurve2::Line {
-                start: point(start)?,
-                end: point(end)?,
-            },
-            SketchCurve2::CircularArc {
-                center,
-                start,
-                end,
-                direction,
-            } => crate::EvaluatedCurve2::CircularArc {
-                center: point(center)?,
-                start: point(start)?,
-                end: point(end)?,
-                direction,
-            },
-            SketchCurve2::Circle {
-                center,
-                radius,
-                direction,
-            } => crate::EvaluatedCurve2::Circle {
-                center: point(center)?,
-                radius,
-                direction,
-            },
-            SketchCurve2::Bspline {
-                ref control_points,
-                degree,
-                ref knots,
-                ref weights,
-            } => {
-                let mut evaluated_cps = Vec::with_capacity(control_points.len());
-                for &cp in control_points {
-                    evaluated_cps.push(point(cp)?);
-                }
-                crate::EvaluatedCurve2::Bspline {
-                    control_points: evaluated_cps,
-                    degree,
-                    knots: knots.clone(),
-                    weights: weights.clone(),
-                }
-            }
-        })
+        records
+            .into_iter()
+            .map(|record| evaluate_record(record, &solved.positions))
+            .collect()
     }
 
     /// Produces exact profile-only inputs for the planar arrangement in stable
@@ -1559,4 +1527,60 @@ pub struct SketchTombstones {
     pub points: BTreeSet<SketchPointId>,
     pub operations: BTreeSet<SketchOperationId>,
     pub entities: BTreeSet<SketchEntityId>,
+}
+
+/// One record's curve at solved point positions.
+fn evaluate_record(
+    record: &SketchEntityRecord,
+    positions: &std::collections::BTreeMap<SketchPointId, crate::SketchPoint2>,
+) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
+    let point = |id: SketchPointId| {
+        positions
+            .get(&id)
+            .copied()
+            .ok_or(SketchValidationError::InactivePointReference { point: id })
+    };
+    Ok(match record.geometry {
+        SketchCurve2::Line { start, end } => crate::EvaluatedCurve2::Line {
+            start: point(start)?,
+            end: point(end)?,
+        },
+        SketchCurve2::CircularArc {
+            center,
+            start,
+            end,
+            direction,
+        } => crate::EvaluatedCurve2::CircularArc {
+            center: point(center)?,
+            start: point(start)?,
+            end: point(end)?,
+            direction,
+        },
+        SketchCurve2::Circle {
+            center,
+            radius,
+            direction,
+        } => crate::EvaluatedCurve2::Circle {
+            center: point(center)?,
+            radius,
+            direction,
+        },
+        SketchCurve2::Bspline {
+            ref control_points,
+            degree,
+            ref knots,
+            ref weights,
+        } => {
+            let mut evaluated_cps = Vec::with_capacity(control_points.len());
+            for &cp in control_points {
+                evaluated_cps.push(point(cp)?);
+            }
+            crate::EvaluatedCurve2::Bspline {
+                control_points: evaluated_cps,
+                degree,
+                knots: knots.clone(),
+                weights: weights.clone(),
+            }
+        }
+    })
 }
