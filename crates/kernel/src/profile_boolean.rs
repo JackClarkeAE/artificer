@@ -1902,11 +1902,16 @@ pub(crate) fn weld_aligned(pieces: Vec<Segment>, weld: f64) -> Vec<Segment> {
 /// boundary touches itself — the pinch between the two lobes of a Steinmetz
 /// seam is the case that brought this about — several pieces leave the same
 /// point and "the next one" has to be decided by direction rather than by
-/// being the only one. Material lies to the left of every piece, so the walk
-/// takes the first piece clockwise from the way it came in: that is the turn
-/// that keeps the material it is bounding on the same side, and it closes each
-/// touching lobe as its own loop instead of welding them into a figure of
-/// eight no region can own.
+/// being the only one. The walk takes the first piece anticlockwise from the
+/// way it came in, the sharpest turn to the right.
+///
+/// That turn keeps two holes that touch at a point apart, as two loops. Two
+/// outer lobes that touch at a point it carries on from one round the
+/// other, into one loop that passes the point twice: the half-walls of a
+/// Steinmetz crossing are each bounded so, one face apiece, and the sewn
+/// solid validates. A caller that needs simple loops — a revolve, where the
+/// point would sweep a circle of contact — refuses such a loop at its own
+/// self-intersection check.
 fn chain_pieces(pieces: Vec<Piece>) -> Result<Vec<Vec<Segment>>, ProfileBooleanError> {
     use std::collections::BTreeMap;
     let mut outgoing: BTreeMap<(u64, u64), Vec<usize>> = BTreeMap::new();
@@ -2004,10 +2009,14 @@ fn nest_loops(
         .map(|segments| evaluate(segments[0], 0.5))
         .collect();
     let areas: Vec<f64> = loops.iter().map(|chain| loop_signed_area(chain)).collect();
-    if areas
-        .iter()
-        .any(|area| !area.is_finite() || area.abs() < tolerances.minimum * tolerances.minimum)
-    {
+    // A sliver has little area, or little width for its length however long
+    // it runs: twice the area over the perimeter is the width of a strip.
+    if areas.iter().zip(&loops).any(|(area, chain)| {
+        let perimeter = chain.iter().copied().map(segment_length).sum::<f64>();
+        !area.is_finite()
+            || area.abs() < tolerances.minimum * tolerances.minimum
+            || 2.0 * area.abs() < tolerances.minimum * perimeter
+    }) {
         return Err(ProfileBooleanError::Unsupported);
     }
 
@@ -2140,6 +2149,25 @@ mod tests {
     ) -> Vec<ProfileRegion> {
         profile_boolean(first, second, operation, PrecisionPolicy::default())
             .expect("the operation is inside the regularized domain")
+    }
+
+    /// A difference that leaves a strip narrower than the minimum feature
+    /// is a sliver however long it is, and is refused.
+    #[test]
+    fn a_long_strip_narrower_than_the_minimum_feature_is_a_sliver() {
+        let minimum = PrecisionPolicy::default().min_feature_size;
+        let first = region(rectangle((0.0, 0.0), (100.0, 10.0)));
+        let second = region(rectangle((-1.0, -1.0), (101.0, 10.0 - minimum / 4.0)));
+        let outcome = profile_boolean(
+            &first,
+            &second,
+            BooleanOperation::Difference,
+            PrecisionPolicy::default(),
+        );
+        assert!(
+            matches!(outcome, Err(ProfileBooleanError::Unsupported)),
+            "{outcome:?}"
+        );
     }
 
     #[test]

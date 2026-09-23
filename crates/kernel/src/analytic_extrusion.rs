@@ -1077,7 +1077,7 @@ fn directed_sweep(start: f64, end: f64, direction: ArcDirection) -> f64 {
     }
 }
 
-fn validate_hole_nesting(
+pub(crate) fn validate_hole_nesting(
     loops: &[AnalyticLoop],
     minimum: f64,
 ) -> Result<(), PlanarProfileInputError> {
@@ -1601,10 +1601,23 @@ fn validate_disjoint_regions(
     regions: &[ValidatedAnalyticRegionExtrusion],
     minimum: f64,
 ) -> Result<(), PlanarProfileInputError> {
+    let loops = regions
+        .iter()
+        .map(|region| region.loops.as_slice())
+        .collect::<Vec<_>>();
+    validate_disjoint_loop_regions(&loops, minimum)
+}
+
+/// Refuses regions, each its outer loop then its holes, that touch, come
+/// within `minimum` of one another, or lie one inside another's material.
+pub(crate) fn validate_disjoint_loop_regions(
+    regions: &[&[AnalyticLoop]],
+    minimum: f64,
+) -> Result<(), PlanarProfileInputError> {
     for left in 0..regions.len() {
         for right in left + 1..regions.len() {
-            if regions[left].loops.iter().any(|first| {
-                regions[right].loops.iter().any(|second| {
+            if regions[left].iter().any(|first| {
+                regions[right].iter().any(|second| {
                     first.segments.iter().any(|left| {
                         second
                             .segments
@@ -1612,13 +1625,9 @@ fn validate_disjoint_regions(
                             .any(|right| segment_clearance(*left, *right) <= minimum)
                     })
                 })
-            }) || point_in_material(
-                regions[left].loops[0].segments[0].start(),
-                &regions[right].loops,
-            ) || point_in_material(
-                regions[right].loops[0].segments[0].start(),
-                &regions[left].loops,
-            ) {
+            }) || point_in_material(regions[left][0].segments[0].start(), regions[right])
+                || point_in_material(regions[right][0].segments[0].start(), regions[left])
+            {
                 return Err(PlanarProfileInputError::OverlappingRegions);
             }
         }
@@ -1760,7 +1769,7 @@ fn arc_progress(angle: f64, start: f64, sweep: f64) -> f64 {
     }
 }
 
-fn angle_on_arc(angle: f64, start: f64, sweep: f64, tolerance: f64) -> bool {
+pub(crate) fn angle_on_arc(angle: f64, start: f64, sweep: f64, tolerance: f64) -> bool {
     let progress = arc_progress(angle, start, sweep);
     progress >= -tolerance && progress <= 1.0 + tolerance
 }

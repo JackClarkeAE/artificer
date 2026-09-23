@@ -326,9 +326,36 @@ fn prism_boolean_along(
             true
         }
         BooleanOperation::Difference => {
+            // The target republished as it is: what a difference that meets
+            // no material leaves.
+            let unchanged = || {
+                build_stacked_pocket(
+                    target,
+                    &[target.outer.clone()]
+                        .into_iter()
+                        .chain(target.holes.iter().cloned())
+                        .map(|segments| welded(&segments, precision))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| PrismBooleanError::DomainUnsupported)?,
+                    &[],
+                    &[],
+                    target.height,
+                    precision,
+                )
+            };
+            // A tool wholly above the top cap or below the bottom one, or
+            // only touching it, takes nothing away. Left to the tests below,
+            // one standing on the top would read as piercing it and build a
+            // pocket whose floor lies above the target.
+            if offset >= target.height - agreement || offset + tool.height <= agreement {
+                return unchanged();
+            }
             let covers = offset <= agreement && offset + tool.height >= target.height - agreement;
             if !covers {
-                let pierces_top = offset + tool.height >= target.height - agreement;
+                // A pocket's floor must be at least one feature thick; a
+                // thinner one is a sliver no reduction here should publish.
+                let pierces_top = offset + tool.height >= target.height - agreement
+                    && offset >= precision.min_feature_size;
                 let floor_inside = offset >= precision.min_feature_size
                     && target.height - offset >= precision.min_feature_size;
                 let interior = floor_inside
@@ -369,19 +396,7 @@ fn prism_boolean_along(
                     Err(ProfileBooleanError::EmptyResult) => {
                         // The tool never touches the profile: the difference
                         // is the identity, republished as the target prism.
-                        return build_stacked_pocket(
-                            target,
-                            &[target.outer.clone()]
-                                .into_iter()
-                                .chain(target.holes.iter().cloned())
-                                .map(|segments| welded(&segments, precision))
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|_| PrismBooleanError::DomainUnsupported)?,
-                            &[],
-                            &[],
-                            target.height,
-                            precision,
-                        );
+                        return unchanged();
                     }
                     Err(ProfileBooleanError::Unsupported) => {
                         return Err(PrismBooleanError::DomainUnsupported);

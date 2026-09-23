@@ -1682,7 +1682,7 @@ fn sweep_section(
                 // of zero major radius instead would be a carrier whose
                 // parameterization collapses onto its own spine.
                 let origin = section.center + section.axis * arc_center.y;
-                let surface = if arc_center.x <= axis_agreement(section) {
+                let surface = if arc_center.x.abs() <= axis_agreement(section) {
                     Surface::Sphere(Sphere {
                         origin,
                         axis: section.axis,

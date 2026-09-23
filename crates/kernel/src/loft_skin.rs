@@ -227,8 +227,14 @@ pub(crate) fn validate_skinned_loft(
 /// it is turned to start at whichever of its vertices makes it lie closest to
 /// the loop before, and a whole circle is cut where its neighbour toward that
 /// loop starts; circles before it are cut the same way working back. If every
-/// loop is a whole circle they are cut at one direction from their centres,
-/// as two circles are. Then every loop is cut at every position along its
+/// loop is a whole circle each is cut in the direction from its centre that
+/// the one before it was cut in, as seen in its own plane: on parallel planes
+/// that is one direction for all of them, as for two circles, and where the
+/// planes turn — a sweep's copies along a bending path — the cut turns with
+/// them, section by section. Cut at one fixed direction instead, a circle
+/// whose plane had turned a quarter away would be cut wherever the rounding
+/// of that direction's all but vanished shadow on it fell, and its rungs
+/// would twist. Then every loop is cut at every position along its
 /// length — a fraction of the length from its start — where any loop has a
 /// vertex, a position within `snap` of one of its own counting as that one,
 /// so that all come out with as many pieces. `None` when they do not.
@@ -238,9 +244,8 @@ fn correspond_all(loops: &[SectionLoop], snap: f64) -> Option<Vec<Vec<Piece>>> {
     match loops.iter().position(|section| !section.full_circle) {
         None => {
             aligned[0] = loops[0].pieces.clone();
-            let origin = arc_center(loops[0].pieces[0])?;
-            let reach = aligned[0][0].start() - origin;
             for index in 1..count {
+                let reach = aligned[index - 1][0].start() - arc_center(aligned[index - 1][0])?;
                 let center = arc_center(loops[index].pieces[0])?;
                 aligned[index] = vec![rebased(loops[index].pieces[0], center + reach)];
             }

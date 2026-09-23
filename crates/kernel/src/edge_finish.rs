@@ -36,7 +36,7 @@ pub(crate) fn build_edge_finishes(
     distance: f64,
     precision: PrecisionPolicy,
 ) -> Result<Topology, EdgeFinishError> {
-    if targets.is_empty() || targets.len() > 64 {
+    if targets.is_empty() {
         return Err(EdgeFinishError::TargetInvalid);
     }
     if targets
@@ -54,13 +54,15 @@ pub(crate) fn build_edge_finishes(
     if target_ids.len() != targets.len() {
         return Err(EdgeFinishError::TargetInvalid);
     }
-    if topology.solids.len() != 1
-        || topology.faces.len() != 6
-        || topology
-            .faces
-            .iter()
-            .any(|face| !matches!(face.value.surface, Surface::Plane(_)))
-    {
+    // A cuboid has twelve edges, so a selection of more than sixty-four is
+    // certainly not this rung's to answer. Saying so as a domain refusal lets
+    // the ladder carry it on — a rim of seventy edges is the rim-loop blend's
+    // business — where calling it an invalid target would stop there with a
+    // reason that is not true.
+    if targets.len() > 64 {
+        return Err(EdgeFinishError::DomainUnsupported);
+    }
+    if !is_axis_aligned_cuboid(topology, precision) {
         return Err(EdgeFinishError::DomainUnsupported);
     }
     let edge = topology
@@ -228,6 +230,74 @@ pub(crate) fn build_edge_finishes(
     let validated = validate_analytic_profile_extrusion(frame, &profile, edge_length, precision)
         .map_err(|_| EdgeFinishError::ConstructionFailed)?;
     Ok(build_analytic_extrusion(&validated))
+}
+
+/// Whether the body is exactly the box its vertices span, with its faces on
+/// the world axes.
+///
+/// This rung rebuilds the finished body from that box, so six planar faces are
+/// not enough: a trapezoid prism has six too, and rebuilding it from its
+/// bounding box fillets a body that was never there. Eight vertices, one on
+/// each corner of the box, and six faces each square to an axis leave nothing
+/// else a body could be.
+fn is_axis_aligned_cuboid(topology: &Topology, precision: PrecisionPolicy) -> bool {
+    if topology.solids.len() != 1
+        || topology.faces.len() != 6
+        || topology.vertices.len() != 8
+        || topology.edges.len() != 12
+    {
+        return false;
+    }
+    let angular = precision.angular_agreement_radians.max(1.0e-12);
+    let faces_on_axes = topology.faces.iter().all(|face| {
+        let Surface::Plane(plane) = face.value.surface else {
+            return false;
+        };
+        let length = plane.normal.length();
+        if !length.is_finite() || length <= f64::EPSILON {
+            return false;
+        }
+        let normal = [plane.normal.x, plane.normal.y, plane.normal.z].map(|value| value / length);
+        normal
+            .iter()
+            .filter(|component| component.abs() > angular)
+            .count()
+            == 1
+    });
+    if !faces_on_axes {
+        return false;
+    }
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for vertex in &topology.vertices {
+        let point = vertex.value.point;
+        for (axis, value) in [point.x, point.y, point.z].into_iter().enumerate() {
+            min[axis] = min[axis].min(value);
+            max[axis] = max[axis].max(value);
+        }
+    }
+    let tolerance = precision.linear_agreement;
+    if (0..3).any(|axis| max[axis] - min[axis] <= tolerance) {
+        return false;
+    }
+    // Each vertex names one corner by which end of each axis it sits at; a
+    // box has all eight, once each.
+    let mut corners = [false; 8];
+    for vertex in &topology.vertices {
+        let point = vertex.value.point;
+        let mut corner = 0;
+        for (axis, value) in [point.x, point.y, point.z].into_iter().enumerate() {
+            if near(value, max[axis], tolerance) {
+                corner |= 1 << axis;
+            } else if !near(value, min[axis], tolerance) {
+                return false;
+            }
+        }
+        if std::mem::replace(&mut corners[corner], true) {
+            return false;
+        }
+    }
+    true
 }
 
 fn intervals_cover_extent(

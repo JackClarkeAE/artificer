@@ -386,6 +386,15 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
   start that is not finite or is beyond a turn, or a sweep or remaining gap
   narrower than the minimum feature at the profile's outermost radius.
   A section point within agreement of the axis is now put on it exactly.
+  `REVOLVE_PROFILE_PINCHED_ON_AXIS`: the profile meets the axis at a single
+  point — a corner, a place the chain closes, or an arc's tangency —
+  rather than along an edge on it, so the solid would be pinched to a
+  point. `REVOLVE_ARC_CENTRE_ACROSS_AXIS`: an arc centred on the far side of
+  the axis would turn into the inner lemon of a spindle torus, a carrier
+  the kernel does not certify. The profile is checked as an extrusion's
+  is (holes nested and apart, regions disjoint, coordinates within the
+  limit), an arc's bulge counts when deciding which side of the axis the
+  profile lies, and a loop may start anywhere along its run on the axis.
 - **Downstream.** As first landed, `extract_rz_section` refused a wedge
   face, so a partial revolve took no rim blend or section shell. Both now
   work; see "Finishing a partial revolve" below. It combines: a quarter
@@ -532,10 +541,18 @@ construction plane (ADR 0048).
     - `SWEEP_PROFILE_ALONG_PATH`, for a start within about five degrees of
       the profile's plane;
     - `SWEEP_PROFILE_TOO_WIDE`, for a profile that reaches past the path's
-      centre of curvature.
+      centre of curvature, the lean of a tilted profile included;
+    - `SWEEP_SELF_INTERSECTS`, for a path that comes back through its own
+      solid: two stretches of the sweep whose bounding spheres meet, and
+      whose profile hulls no separating axis parts, are taken to cross.
+      The test is conservative, so a sweep that only comes very close to
+      itself can be refused too; a spring whose coils sit closer than the
+      wire is thick is refused, one with room between them builds.
 
-    The plan's sampled check for a wall crossing itself elsewhere was not
-    built. A path that comes back through its own solid is not refused.
+    A path spline whose segment stalls or is shorter than the modelling
+    resolution is `SWEEP_PATH_INVALID` when the path is read. A skinned
+    sweep starts from at most 129 copies spread along the path, and its
+    interpolation is a banded solve.
   - **Add and cut** go through `tool_boolean` with the `SWEEP_BOOLEAN`
     labels.
     - A straight sweep cuts exactly through `sweep/boolean-prism`.

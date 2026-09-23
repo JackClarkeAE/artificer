@@ -10,6 +10,7 @@
 //! ADR 0026 made normative for an ellipse's arc length, and the spline STEP
 //! needs beside the surface is fitted to a stated tolerance.
 
+use crate::bspline::settled_length;
 use crate::topology::{Curve3, ParameterRange, Point2, Point3, Vector2, Vector3};
 
 /// The curve a ruled surface is spanned from: the conics of the edge
@@ -314,9 +315,15 @@ impl RuledSurface {
                 return Some(current);
             };
             let moved = (next.x - current.x).abs().max((next.y - current.y).abs());
+            // Far from the origin the point is only known to the rounding of
+            // its coordinates, and a step within that is noise: the walk has
+            // settled there as surely as where the parameters stop moving,
+            // or where a step no longer brings the point nearer.
+            let carried = (along * (next.x - current.x) + rung * (next.y - current.y)).length();
+            let stalled = next_value >= value;
             current = next;
             value = next_value;
-            if moved <= 4.0 * f64::EPSILON {
+            if moved <= 4.0 * f64::EPSILON || stalled || carried <= settled_length(point) {
                 return Some(current);
             }
         }

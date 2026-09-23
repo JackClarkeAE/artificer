@@ -41,7 +41,7 @@ use artificer_protocol::{
 };
 
 use crate::Snapshot;
-use crate::topology::{Curve3, Point3, Topology, Vector3};
+use crate::topology::{Curve3, Orientation, Point3, Topology, Vector3};
 
 /// Why a finish could not be stood apart from the corner it reaches.
 #[derive(Clone, Debug)]
@@ -139,14 +139,6 @@ pub(crate) fn build_edge_finishes_apart(
     Ok(body.topology)
 }
 
-/// Far enough that a tool built at this size covers everything the body can
-/// put behind one bevel plane.
-///
-/// The bounding box's diagonal is the longest run anything in the body can
-/// make, so twice it, plus the setback, reaches past every corner from
-/// anywhere on the bevel line. Making it larger than that does not buy
-/// accuracy — the regularized Boolean's arithmetic, not the tool's size, is
-/// what the last digits come from.
 /// Whether every selected edge, carried on past each of its ends, leaves the
 /// body at once.
 ///
@@ -159,6 +151,9 @@ pub(crate) fn build_edge_finishes_apart(
 /// what lets the ladder take the stand-apart construction unasked for a
 /// corner the owned blend cannot write, and refuse it where it would cut
 /// more than the finish.
+///
+/// A concave edge is never one of these: this construction only ever
+/// removes material, and a finish of a reflex corner adds it.
 pub(crate) fn edges_run_out_of_the_body(
     topology: &Topology,
     targets: &[EntityRef],
@@ -172,61 +167,203 @@ pub(crate) fn edges_run_out_of_the_body(
         else {
             return false;
         };
-        let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
+        let Ok(wedge) = read_wedge(topology, edge, PrecisionPolicy::default()) else {
             return false;
         };
-        let along = difference(endpoints[1], endpoints[0]);
-        let length = magnitude(along);
-        if length <= f64::EPSILON {
-            return false;
-        }
-        let along = scale(along, 1.0 / length);
-        let Some(faces) = faces_of_edge(topology, edge) else {
-            return false;
-        };
-        let [Some(first), Some(second)] =
-            faces.map(|face| topology.faces[face].value.surface.as_plane())
-        else {
-            return false;
-        };
-        let into = |normal: Vector3, other: Vector3| {
-            let across = cross(normal, along);
-            let span = magnitude(across);
-            if span <= f64::EPSILON {
-                return None;
-            }
-            let across = scale(across, 1.0 / span);
-            Some(if dot(across, other) < 0.0 {
-                across
-            } else {
-                scale(across, -1.0)
-            })
-        };
-        let (Some(out_first), Some(out_second)) = (
-            into(first.normal, second.normal),
-            into(second.normal, first.normal),
-        ) else {
-            return false;
-        };
-        let sum = Vector3::new(
-            out_first.x + out_second.x,
-            out_first.y + out_second.y,
-            out_first.z + out_second.z,
-        );
-        let span = magnitude(sum);
-        if span <= f64::EPSILON {
-            return false;
-        }
-        let inward = scale(sum, distance * 0.25 / span);
-        [(endpoints[0], -distance), (endpoints[1], distance)]
-            .into_iter()
-            .all(|(end, step)| {
-                let probe = offset(offset(end, scale(along, step)), inward);
-                crate::analytic_boolean::point_in_solid(topology, probe) == Some(false)
-            })
+        let inward = scale(wedge.bisector, distance * 0.25);
+        [
+            (wedge.endpoints[0], -distance),
+            (wedge.endpoints[1], distance),
+        ]
+        .into_iter()
+        .all(|(end, step)| {
+            let probe = offset(offset(end, scale(wedge.along, step)), inward);
+            crate::analytic_boolean::point_in_solid(topology, probe) == Some(false)
+        })
     })
 }
 
+/// Whether a straight edge between two flat faces is reflex: its dihedral
+/// through the material more than a half turn, so that a finish of it adds
+/// material rather than taking it away. `None` for an edge this cannot
+/// read — curved, or not between two flat faces.
+pub(crate) fn edge_is_reflex(
+    topology: &Topology,
+    target: EntityRef,
+    precision: PrecisionPolicy,
+) -> Option<bool> {
+    let edge = topology
+        .edges
+        .iter()
+        .position(|edge| edge.id.get() == target.entity.0)?;
+    let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
+        return None;
+    };
+    let along = difference(endpoints[1], endpoints[0]);
+    let length = magnitude(along);
+    if !length.is_finite() || length <= precision.linear_agreement {
+        return None;
+    }
+    let along = scale(along, 1.0 / length);
+    let faces = oriented_faces_of_edge(topology, edge)?;
+    let [Some(forward), Some(reverse)] =
+        faces.map(|face| topology.faces[face].value.surface.as_plane())
+    else {
+        return None;
+    };
+    let unit = |vector: Vector3| {
+        let span = magnitude(vector);
+        (span.is_finite() && span > f64::EPSILON).then(|| scale(vector, 1.0 / span))
+    };
+    let normals = [unit(forward.normal)?, unit(reverse.normal)?];
+    let into = [
+        unit(cross(normals[0], along))?,
+        unit(cross(normals[1], scale(along, -1.0)))?,
+    ];
+    let sine = -dot(normals[0], into[1]);
+    let cosine = dot(into[0], into[1]);
+    let interior = sine.atan2(cosine).rem_euclid(std::f64::consts::TAU);
+    let angle_tolerance = precision.angular_agreement_radians.max(1.0e-9);
+    Some(
+        interior > std::f64::consts::PI + angle_tolerance
+            && interior < std::f64::consts::TAU - angle_tolerance,
+    )
+}
+
+/// The material wedge at a straight edge between two flat faces, read from
+/// the topology rather than guessed from the geometry.
+struct Wedge {
+    endpoints: [Point3; 2],
+    length: f64,
+    /// The edge's own direction, unit.
+    along: Vector3,
+    /// The outward normals of the face whose coedge walks the edge forward
+    /// and of the one that walks it in reverse, unit.
+    normals: [Vector3; 2],
+    /// The way into each of those faces from the edge, square to it and
+    /// pointing at the material.
+    into: [Vector3; 2],
+    /// Halfway between the two, into the material.
+    bisector: Vector3,
+    /// The interior dihedral, measured through the material; below a half
+    /// turn, since only a convex edge is read.
+    interior: f64,
+}
+
+/// Reads the wedge at one edge, or says why it is not one this route cuts.
+///
+/// Which way each face lies from the edge is the left of the coedge that
+/// walks it, seen from outside: `n × t` for the face that walks the edge's
+/// own direction and `n × −t` for the other. That holds at every edge,
+/// convex or reflex. Picking instead the direction that leans away from the
+/// other face's normal is right only at a convex edge, and at a reflex one
+/// it turns both directions round: the tool then takes the wedge of air
+/// between the faces for material and cuts into the body behind it.
+fn read_wedge(
+    topology: &Topology,
+    edge: usize,
+    precision: PrecisionPolicy,
+) -> Result<Wedge, ApartRefusal> {
+    let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "Standing a bevel apart takes a straight edge. A rim or an arc is finished by its own \
+             exact route, which owns its corners.",
+        ));
+    };
+    let along = difference(endpoints[1], endpoints[0]);
+    let length = magnitude(along);
+    if length <= precision.linear_agreement {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "That edge is too short to bevel.",
+        ));
+    }
+    let along = scale(along, 1.0 / length);
+    let faces = oriented_faces_of_edge(topology, edge).ok_or_else(|| {
+        refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "That edge does not separate exactly two faces.",
+        )
+    })?;
+    let [Some(forward), Some(reverse)] =
+        faces.map(|face| topology.faces[face].value.surface.as_plane())
+    else {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "Standing a bevel apart takes an edge between two flat faces. Where one of them is a \
+             blend or a hole wall, join the finish that already shapes this corner instead.",
+        ));
+    };
+    let unit = |vector: Vector3| {
+        let span = magnitude(vector);
+        (span.is_finite() && span > f64::EPSILON).then(|| scale(vector, 1.0 / span))
+    };
+    let lies_along = || {
+        refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "That edge runs along one of its own faces, which leaves no direction to set back in.",
+        )
+    };
+    let normals = [
+        unit(forward.normal).ok_or_else(lies_along)?,
+        unit(reverse.normal).ok_or_else(lies_along)?,
+    ];
+    let into = [
+        unit(cross(normals[0], along)).ok_or_else(lies_along)?,
+        unit(cross(normals[1], scale(along, -1.0))).ok_or_else(lies_along)?,
+    ];
+    // `sin θ` and `cos θ` of the interior dihedral, as the owned blend reads
+    // them, so the two routes agree on which edges are convex. The angle is
+    // named in `[0, 2π)`: a reflex edge's comes out of the arctangent
+    // negative, and read as it stands it would pass for a sliver.
+    let sine = -dot(normals[0], into[1]);
+    let cosine = dot(into[0], into[1]);
+    let interior = sine.atan2(cosine).rem_euclid(std::f64::consts::TAU);
+    let angle_tolerance = precision.angular_agreement_radians.max(1.0e-9);
+    if interior <= angle_tolerance || interior >= std::f64::consts::TAU - angle_tolerance {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "The two faces at that edge fold back on each other, which leaves no wedge to finish.",
+        ));
+    }
+    if interior >= std::f64::consts::PI - angle_tolerance {
+        return Err(refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "That edge is concave, or its faces lie flat against each other. A finish standing \
+             apart is cut away from the body, and a reflex corner is finished by adding material \
+             to it, so this route has nothing to cut there.",
+        ));
+    }
+    let bisector = unit(Vector3::new(
+        into[0].x + into[1].x,
+        into[0].y + into[1].y,
+        into[0].z + into[1].z,
+    ))
+    .ok_or_else(|| {
+        refuse(
+            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
+            "The two faces at that edge fold back on each other, which leaves no wedge to finish.",
+        )
+    })?;
+    Ok(Wedge {
+        endpoints,
+        length,
+        along,
+        normals,
+        into,
+        bisector,
+        interior,
+    })
+}
+
+/// Far enough that a tool swept along an edge runs out past the body at
+/// both ends.
+///
+/// The bounding box's diagonal is the longest run anything in the body can
+/// make, so twice it, plus the setback, reaches past every end from anywhere
+/// on the edge. It is spent only along the edge: sideways the tool stays
+/// within the corner it finishes (see [`removal_tool`]).
 fn body_reach(topology: &Topology, distance: f64) -> f64 {
     let mut low = [f64::INFINITY; 3];
     let mut high = [f64::NEG_INFINITY; 3];
@@ -248,8 +385,14 @@ fn body_reach(topology: &Topology, distance: f64) -> f64 {
 /// plane that cuts both its faces back by `distance`.
 ///
 /// It is a prism swept along the edge, whose section is a triangle with one
-/// side on the bevel line and an apex far outside the body, oversized at both
+/// side on the bevel line and an apex outside the body, oversized at both
 /// ends so nothing but that one side ever meets the body.
+///
+/// Only its length is oversized. Sideways the section stays within a couple
+/// of setbacks of the edge: behind the bevel line and inside the wedge there
+/// is nothing but the corner being cut, so that much covers it, and a section
+/// sized to the whole body would take whatever else stands beside the edge —
+/// the other post of a U, a boss across a pocket — along with it.
 fn removal_tool(
     topology: &Topology,
     target: EntityRef,
@@ -268,66 +411,20 @@ fn removal_tool(
                 "That edge is not part of this body.",
             )
         })?;
-    let Curve3::Line { endpoints } = topology.edges[edge].value.curve else {
-        return Err(refuse(
-            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "Standing a bevel apart takes a straight edge. A rim or an arc is finished by its own \
-             exact route, which owns its corners.",
-        ));
-    };
-    let along = difference(endpoints[1], endpoints[0]);
-    let length = magnitude(along);
-    if length <= precision.linear_agreement {
-        return Err(refuse(
-            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "That edge is too short to bevel.",
-        ));
-    }
-    let along = scale(along, 1.0 / length);
-    let faces = faces_of_edge(topology, edge).ok_or_else(|| {
-        refuse(
-            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "That edge does not separate exactly two faces.",
-        )
-    })?;
-    let normals = faces.map(|face| topology.faces[face].value.surface.as_plane());
-    let ([Some(first), Some(second)], _) = (normals, ()) else {
-        return Err(refuse(
-            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "Standing a bevel apart takes an edge between two flat faces. Where one of them is a \
-             blend or a hole wall, join the finish that already shapes this corner instead.",
-        ));
-    };
-    // The way into each face from the edge, square to it and pointing at the
-    // material: the one of the two that leans away from the other face.
-    let into = |normal: Vector3, other: Vector3| {
-        let across = cross(normal, along);
-        let span = magnitude(across);
-        if span <= f64::EPSILON {
-            return None;
-        }
-        let across = scale(across, 1.0 / span);
-        Some(if dot(across, other) < 0.0 {
-            across
-        } else {
-            scale(across, -1.0)
-        })
-    };
-    let (Some(out_first), Some(out_second)) = (
-        into(first.normal, second.normal),
-        into(second.normal, first.normal),
-    ) else {
-        return Err(refuse(
-            "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-            "That edge runs along one of its own faces, which leaves no direction to set back in.",
-        ));
-    };
+    let Wedge {
+        endpoints,
+        length,
+        along,
+        normals: [first_normal, second_normal],
+        into: [out_first, out_second],
+        bisector,
+        interior,
+    } = read_wedge(topology, edge, precision)?;
     let anchor = endpoints[0];
     // How wide the material wedge is at this edge. A fillet's circle is
     // inscribed in it, so the angle sets both how far from the edge the band
     // touches each face and how deep its axis sits.
-    let opening = dot(out_first, out_second).clamp(-1.0, 1.0).acos();
-    let half = opening / 2.0;
+    let half = interior / 2.0;
     if half.sin().abs() <= precision.angular_agreement_radians.max(1.0e-12) {
         return Err(refuse(
             "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
@@ -335,25 +432,14 @@ fn removal_tool(
              width.",
         ));
     }
-    let bisector = {
-        let sum = Vector3::new(
-            out_first.x + out_second.x,
-            out_first.y + out_second.y,
-            out_first.z + out_second.z,
-        );
-        let span = magnitude(sum);
-        if span <= f64::EPSILON {
-            return Err(refuse(
-                "EDGE_FINISH_APART_EDGE_UNSUPPORTED",
-                "The two faces at that edge fold back on each other, which leaves no wedge to \
-                 finish.",
-            ));
-        }
-        scale(sum, 1.0 / span)
-    };
     // Where the band's axis runs: on the bisector, far enough in that the
     // circle of this radius touches both walls.
     let axis = offset(anchor, scale(bisector, distance / half.sin()));
+    // How far the section runs out past the corner it removes. Everything the
+    // finish takes lies within `distance` of the bevel line or the band's
+    // tangency points, so twice that leaves a clear margin in the air around
+    // the corner without reaching anything else beside the edge.
+    let lateral = 2.0 * distance;
     // A chamfer sets back along each face by the distance itself. A fillet
     // touches each face at the foot of the perpendicular from its axis, and
     // that is where it is taken from rather than from `r/tan(θ/2)` along the
@@ -367,8 +453,8 @@ fn removal_tool(
             offset(anchor, scale(out_second, distance)),
         ),
         EdgeFinishKind::Fillet => (
-            offset(axis, scale(first.normal, distance)),
-            offset(axis, scale(second.normal, distance)),
+            offset(axis, scale(first_normal, distance)),
+            offset(axis, scale(second_normal, distance)),
         ),
     };
     let base = difference(heel, toe);
@@ -418,30 +504,32 @@ fn removal_tool(
         ProtocolVector3::new(v.x, v.y, v.z),
     );
     let outer = match kind {
-        // A triangle with one side on the bevel line and an apex far behind
-        // it: everything the flat cut takes away, and more, safely outside.
+        // A triangle with one side on the bevel line and an apex behind it:
+        // everything the flat cut takes away, and a margin of air round it.
+        // The edge sits `distance·cos(θ/2)` behind the bevel line, never more
+        // than `distance`, so an apex twice that far back encloses it.
         EdgeFinishKind::Chamfer => {
-            let apex = offset(midpoint(toe, heel), scale(backward, reach));
+            let apex = offset(midpoint(toe, heel), scale(backward, lateral));
             wound(vec![
-                straight(plane(offset(toe, scale(base, -reach))), plane(apex)),
-                straight(plane(apex), plane(offset(heel, scale(base, reach)))),
+                straight(plane(offset(toe, scale(base, -lateral))), plane(apex)),
+                straight(plane(apex), plane(offset(heel, scale(base, lateral)))),
                 straight(
-                    plane(offset(heel, scale(base, reach))),
-                    plane(offset(toe, scale(base, -reach))),
+                    plane(offset(heel, scale(base, lateral))),
+                    plane(offset(toe, scale(base, -lateral))),
                 ),
             ])
         }
         // The curvilinear triangle between the two walls and the band: the
         // corner the rolling ball cannot reach. Its two straight sides run
-        // out past the body so nothing but the arc is ever in contact — and
-        // the arc is tangent to each wall, which is what a fillet means and
-        // what the Boolean now takes.
+        // out into the air past each wall so nothing but the arc is ever in
+        // contact — and the arc is tangent to each wall, which is what a
+        // fillet means and what the Boolean now takes.
         EdgeFinishKind::Fillet => {
-            let behind_first = offset(heel, scale(out_first, -reach));
-            let behind_second = offset(toe, scale(out_second, -reach));
+            let behind_first = offset(heel, scale(out_first, -lateral));
+            let behind_second = offset(toe, scale(out_second, -lateral));
             let far = offset(
-                offset(anchor, scale(out_first, -reach)),
-                scale(out_second, -reach),
+                offset(anchor, scale(out_first, -lateral)),
+                scale(out_second, -lateral),
             );
             wound(vec![
                 straight(plane(far), plane(behind_first)),
@@ -569,24 +657,32 @@ fn wound(curves: Vec<PlanarCurve2>) -> PlanarLoop2 {
     }
 }
 
-/// The two faces an edge separates, if it separates exactly two.
-fn faces_of_edge(topology: &Topology, edge: usize) -> Option<[usize; 2]> {
-    let mut found = Vec::new();
+/// The two faces an edge separates, if it separates exactly two: the one
+/// whose coedge walks the edge's own direction, then the one that walks it in
+/// reverse. A seam one face uses both ways round is not such an edge.
+fn oriented_faces_of_edge(topology: &Topology, edge: usize) -> Option<[usize; 2]> {
+    let mut forward = None;
+    let mut reverse = None;
     for (index, face) in topology.faces.iter().enumerate() {
         for loop_key in face.value.loops() {
             let record = topology.loop_record(loop_key)?;
             for coedge_key in &record.value.coedges {
                 let coedge = topology.coedge(*coedge_key)?;
-                if coedge.value.edge.0 == edge && !found.contains(&index) {
-                    found.push(index);
+                if coedge.value.edge.0 != edge {
+                    continue;
+                }
+                let slot = match coedge.value.orientation {
+                    Orientation::Forward => &mut forward,
+                    Orientation::Reverse => &mut reverse,
+                };
+                if slot.replace(index).is_some() {
+                    return None;
                 }
             }
         }
     }
-    match found.as_slice() {
-        [first, second] => Some([*first, *second]),
-        _ => None,
-    }
+    let (forward, reverse) = (forward?, reverse?);
+    (forward != reverse).then_some([forward, reverse])
 }
 
 fn difference(to: Point3, from: Point3) -> Vector3 {

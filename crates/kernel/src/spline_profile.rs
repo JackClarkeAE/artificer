@@ -356,25 +356,23 @@ fn check_loop_contacts(
     let count = pieces.len();
     let patches = pieces
         .iter()
-        .map(|piece| piece.patches())
+        .map(|piece| boxed(piece.patches()))
         .collect::<Vec<_>>();
-    let mut budget = CLASH_BUDGET;
     for (index, piece) in pieces.iter().enumerate() {
         if let ProfilePiece::Spline(_) = piece {
             let segments = &patches[index];
             for first in 0..segments.len() {
                 for second in first + 1..segments.len() {
                     let shared = if second == first + 1 {
-                        vec![segments[first].end()]
+                        vec![segments[first].patch.end()]
                     } else {
                         Vec::new()
                     };
-                    resolve(clash(
+                    resolve(pair_clash(
                         &segments[first],
                         &segments[second],
                         agreement,
                         &shared,
-                        &mut budget,
                     ))?;
                 }
             }
@@ -409,7 +407,7 @@ fn check_loop_contacts(
             let threshold = if adjacent { agreement } else { minimum };
             for left in &patches[first] {
                 for right in &patches[second] {
-                    resolve(clash(left, right, threshold, &shared, &mut budget))?;
+                    resolve(pair_clash(left, right, threshold, &shared))?;
                 }
             }
         }
@@ -432,10 +430,19 @@ fn loops_clear(
     second: &SplineLoop,
     minimum: f64,
 ) -> Result<bool, SplineProfileError> {
-    let mut budget = CLASH_BUDGET;
-    for left in first.pieces.iter().flat_map(|piece| piece.patches()) {
-        for right in second.pieces.iter().flat_map(|piece| piece.patches()) {
-            match clash(&left, &right, minimum, &[], &mut budget) {
+    let patches = |spline_loop: &SplineLoop| {
+        boxed(
+            spline_loop
+                .pieces
+                .iter()
+                .flat_map(|piece| piece.patches())
+                .collect(),
+        )
+    };
+    let (lefts, rights) = (patches(first), patches(second));
+    for left in &lefts {
+        for right in &rights {
+            match pair_clash(left, right, minimum, &[]) {
                 Clash::Clear => {}
                 Clash::Contact => return Ok(false),
                 Clash::Unknown => return Err(SplineProfileError::Indeterminate),
@@ -487,10 +494,44 @@ fn flatten(patch: &Patch, flatness: f64, polygon: &mut Vec<Point2>, depth: usize
 // Certified contact by subdivision
 // ---------------------------------------------------------------------------
 
-/// How many pair tests one clearance question may spend before it gives up
-/// and refuses: far more than any two curves that are either clearly apart or
-/// clearly touching need.
+/// How many pair tests the question about one pair of patches may spend
+/// before it gives up and refuses: far more than any two curves that are
+/// either clearly apart or clearly touching need.
 const CLASH_BUDGET: usize = 1 << 18;
+
+/// A patch and the box it lies in, found once for the many pairs it is
+/// asked about.
+struct Boxed {
+    patch: Patch,
+    bounds: (Point2, Point2),
+}
+
+fn boxed(patches: Vec<Patch>) -> Vec<Boxed> {
+    patches
+        .into_iter()
+        .map(|patch| Boxed {
+            bounds: patch.bounds(),
+            patch,
+        })
+        .collect()
+}
+
+/// [`clash`] for one pair of patches, with a budget of its own.
+///
+/// A loop of a thousand Bézier segments has half a million pairs of them,
+/// nearly all far apart. Those whose boxes are further apart than the
+/// threshold are clear at once, as the subdivision's first step would find
+/// them, and cost nothing; each pair left is its own question, which the
+/// number of other pairs in the loop makes no harder. Shared out of one
+/// budget, the pairs of a long spline would spend it on each other's first
+/// steps, and a loop that is plainly clear would be refused as undecided.
+fn pair_clash(first: &Boxed, second: &Boxed, threshold: f64, shared: &[Point2]) -> Clash {
+    if box_gap(first.bounds, second.bounds) > threshold {
+        return Clash::Clear;
+    }
+    let mut budget = CLASH_BUDGET;
+    clash(&first.patch, &second.patch, threshold, shared, &mut budget)
+}
 
 /// A piece of a piece, inside a box and within [`Patch::flatness`] of its
 /// own chord.
@@ -1305,4 +1346,48 @@ fn push_spline_wall(
             role,
         },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A closed cubic of `count` control points spaced evenly round a circle
+    /// of radius ten, its first and last the same point.
+    fn ring(count: usize) -> PlanarLoop2 {
+        let mut points = (0..count - 1)
+            .map(|index| {
+                let angle = std::f64::consts::TAU * index as f64 / (count - 1) as f64;
+                ProtocolPoint2::new(10.0 * angle.cos(), 10.0 * angle.sin())
+            })
+            .collect::<Vec<_>>();
+        points.push(points[0]);
+        PlanarLoop2 {
+            curves: vec![PlanarCurve2::Bspline {
+                degree: 3,
+                knots: crate::bspline::clamped_uniform_knots(count, 3),
+                control_points: points,
+                weights: None,
+            }],
+        }
+    }
+
+    /// Eight hundred control points make some three hundred thousand pairs
+    /// of Bézier segments, all but a handful far apart. Shared out of one
+    /// budget, their first steps alone spent it and the loop was refused as
+    /// undecided; judged pair by pair, with the far ones passed over by
+    /// their boxes, it is clear.
+    #[test]
+    fn a_long_closed_spline_is_judged_pair_by_pair() {
+        let policy = PrecisionPolicy::default();
+        let minimum = policy.modeling_resolution.max(policy.min_feature_size);
+        let parsed = parse_spline_loop(&ring(800), minimum, policy.linear_agreement)
+            .expect("a long ring is clear of itself");
+        let area = 100.0 * std::f64::consts::PI;
+        assert!(
+            (parsed.signed_area - area).abs() < 1.0e-3 * area,
+            "{}",
+            parsed.signed_area
+        );
+    }
 }

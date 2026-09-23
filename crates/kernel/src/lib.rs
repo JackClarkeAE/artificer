@@ -1243,6 +1243,10 @@ impl NativeKernel {
                 distance,
                 operation,
             } if spline_profile::profile_contains_splines(profile) => {
+                let outward = outward_face_sketch(&input.topology, *target_face, *frame, profile);
+                let (frame, profile) = outward
+                    .as_ref()
+                    .map_or((frame, profile), |(frame, profile)| (frame, profile));
                 let (topology, answered) = spline_face_feature(
                     input,
                     *target_face,
@@ -1263,6 +1267,10 @@ impl NativeKernel {
                 distance,
                 operation,
             } => {
+                let outward = outward_face_sketch(&input.topology, *target_face, *frame, profile);
+                let (frame, profile) = outward
+                    .as_ref()
+                    .map_or((frame, profile), |(frame, profile)| (frame, profile));
                 let feature = validate_exact_face_feature(
                     input.id,
                     &input.topology,
@@ -1328,23 +1336,9 @@ impl NativeKernel {
                         // through a face as an ellipse, not as facets.
                         let outward = plane.normal / normal_length;
                         // The tool occupies the space below the face and
-                        // extrudes back up to it, so its frame must wind
-                        // with the outward normal whichever way the sketch
-                        // frame happens to.
-                        let frame_normal = ProtocolVector3::new(
-                            frame.u.y * frame.v.z - frame.u.z * frame.v.y,
-                            frame.u.z * frame.v.x - frame.u.x * frame.v.z,
-                            frame.u.x * frame.v.y - frame.u.y * frame.v.x,
-                        );
-                        let winds_outward = frame_normal.x * outward.x
-                            + frame_normal.y * outward.y
-                            + frame_normal.z * outward.z
-                            > 0.0;
-                        let (tool_u, tool_v) = if winds_outward {
-                            (frame.u, frame.v)
-                        } else {
-                            (frame.v, frame.u)
-                        };
+                        // extrudes back up to it, along the frame, which
+                        // `outward_face_sketch` has turned to face out.
+                        let (tool_u, tool_v) = (frame.u, frame.v);
                         // The tool overshoots the face a little so its cap
                         // never lies on the face's own plane, which the
                         // engine would refuse as coincident contact; the
@@ -1436,6 +1430,7 @@ impl NativeKernel {
                                 certify_faceted_change(
                                     input.id,
                                     &input.topology,
+                                    &scene,
                                     &topology,
                                     *operation,
                                     request.precision,
@@ -1619,6 +1614,7 @@ impl NativeKernel {
                                     certify_faceted_change(
                                         input.id,
                                         &input.topology,
+                                        &scene,
                                         &topology,
                                         *operation,
                                         request.precision,
@@ -1762,11 +1758,14 @@ impl NativeKernel {
             } => {
                 validate_transform_source(input)?;
                 let normal = Vector3::new(plane_normal.x, plane_normal.y, plane_normal.z);
-                if normal.length() <= request.precision.angular_agreement_radians {
+                if !plane_origin.is_finite()
+                    || !normal.length().is_finite()
+                    || normal.length() <= request.precision.angular_agreement_radians
+                {
                     return Err(simple_invalid_input(
                         input.id,
                         "MIRROR_DOMAIN_UNSUPPORTED",
-                        "Mirror requires a non-zero plane normal.",
+                        "Mirror requires a finite plane origin and a finite, non-zero plane normal.",
                     ));
                 }
                 // A reflection is exact on every carrier: the body is
@@ -1777,6 +1776,8 @@ impl NativeKernel {
                         .map_err(|reason| {
                             simple_invalid_input(input.id, "MIRROR_FAILED", reason.message())
                         })?;
+                // A plane far from the body reflects it past the limit.
+                ensure_candidate_within_envelope(input.id, &topology, request.precision)?;
                 rung = "mirror/exact";
                 (topology, HistoryMode::OneToOne)
             }
@@ -2021,6 +2022,8 @@ impl NativeKernel {
                         );
                         topology = pattern::merge_disjoint(&topology, &moved);
                     }
+                    // The last copy may lie past the limit the body was in.
+                    ensure_candidate_within_envelope(input.id, &topology, request.precision)?;
                     rung = "pattern/exact-instances";
                     (topology, HistoryMode::Generated)
                 } else {
@@ -2304,6 +2307,19 @@ impl NativeKernel {
                     request.operation,
                     request.precision,
                 )
+                // A prism candidate that does not validate is not the answer;
+                // the rungs below may still find it, as the tool Booleans'
+                // ladder lets them.
+                .and_then(|topology| {
+                    if validator::validate(&topology, request.precision.linear_agreement)
+                        .diagnostics
+                        .is_empty()
+                    {
+                        Ok(topology)
+                    } else {
+                        Err(prism_boolean::PrismBooleanError::DomainUnsupported)
+                    }
+                })
             }
         );
         if matches!(analytic, Err(prism_boolean::PrismBooleanError::EmptyResult)) {
@@ -4270,19 +4286,28 @@ fn certify_faceted_candidate(
 /// tessellated rebuild can be perfectly closed around the wrong material —
 /// which is a wrong answer published as an approximation, the one failure a
 /// kernel must not have. Volume is the cheapest invariant that catches it.
+///
+/// The rebuild starts from `operand`, the body's tessellation, whose chords
+/// sit inside convex walls and outside concave ones: a body with many bores
+/// is fuller as facets than it is exactly, by more than a small cut takes
+/// away. The change is measured against both, and only one that goes the
+/// wrong way from each is refused.
 fn certify_faceted_change(
     snapshot: SnapshotId,
     before: &Topology,
+    operand: &DebugScene,
     after: &Topology,
     operation: FaceExtrusionOperation,
     precision: PrecisionPolicy,
 ) -> Result<(), KernelError> {
-    let was = validator::calculate_measures(before).signed_volume.abs();
+    let exact = validator::calculate_measures(before).signed_volume.abs();
+    let faceted = scene_volume(operand);
+    let was = exact.max(faceted);
     let is = validator::calculate_measures(after).signed_volume.abs();
     let slack = precision.approximation_budget.max(1.0e-9) * was.max(1.0);
     let (wrong_way, verb, direction) = match operation {
         FaceExtrusionOperation::Cut => (is > was + slack, "cut", "more"),
-        FaceExtrusionOperation::Add => (is < was - slack, "add", "less"),
+        FaceExtrusionOperation::Add => (is < exact.min(faceted) - slack, "add", "less"),
     };
     if !wrong_way {
         return Ok(());
@@ -4302,6 +4327,24 @@ fn certify_faceted_change(
             &message,
         )],
     ))
+}
+
+/// The volume a closed, outward-wound triangle scene encloses.
+fn scene_volume(scene: &DebugScene) -> f64 {
+    let sextuple = scene
+        .triangles
+        .iter()
+        .map(|triangle| {
+            let [a, b, c] = triangle.vertices;
+            let (a, b, c) = (
+                Vector3::new(a.x, a.y, a.z),
+                Vector3::new(b.x, b.y, b.z),
+                Vector3::new(c.x, c.y, c.z),
+            );
+            a.dot(b.cross(c))
+        })
+        .sum::<f64>();
+    (sextuple / 6.0).abs()
 }
 
 fn faceted_candidate_refusal(
@@ -4553,32 +4596,29 @@ fn tool_boolean(
             boolean_precision,
         )
     };
-    let topology = faceted_boolean::combine_bodies(
-        &scene_of(&input.topology),
-        &scene_of(&tool),
-        add,
-        precision,
-    )
-    .ok_or_else(|| {
-        declined(error(
-            KernelErrorCode::Unsupported,
-            KernelStage::Construction,
-            input.id,
-            format!("the faceted tier could not combine the {noun} with the body"),
-            vec![simple_diagnostic(
-                labels.unresolved,
+    let target_scene = scene_of(&input.topology);
+    let topology = faceted_boolean::combine_bodies(&target_scene, &scene_of(&tool), add, precision)
+        .ok_or_else(|| {
+            declined(error(
+                KernelErrorCode::Unsupported,
                 KernelStage::Construction,
-                &format!(
-                    "The {noun} and the body were rebuilt from their tessellations, but the \
+                input.id,
+                format!("the faceted tier could not combine the {noun} with the body"),
+                vec![simple_diagnostic(
+                    labels.unresolved,
+                    KernelStage::Construction,
+                    &format!(
+                        "The {noun} and the body were rebuilt from their tessellations, but the \
                      rebuilt shell did not close within the approximation budget."
-                ),
-            )],
-        ))
-    })?;
+                    ),
+                )],
+            ))
+        })?;
     certify_faceted_candidate(input.id, &topology, precision).map_err(declined)?;
     certify_faceted_change(
         input.id,
         &input.topology,
+        &target_scene,
         &topology,
         face_operation,
         precision,
@@ -4902,6 +4942,19 @@ fn regularized_edge_finish(
             .is_empty()
     {
         return Ok((topology, "edge-finish/standing-apart"));
+    }
+
+    // The faceted tier only ever cuts a finish's sweep away from the body,
+    // and a finish of a reflex edge adds the corner it rounds. Handed one, it
+    // cut into air and published the body all but unchanged as a fillet.
+    if targets.iter().any(|target| {
+        edge_finish_apart::edge_is_reflex(&input.topology, *target, precision) == Some(true)
+    }) {
+        return Err(simple_invalid_input(
+            input.id,
+            "EDGE_FINISH_REFLEX_UNSUPPORTED",
+            "That edge is concave: a fillet or chamfer there adds material to the corner rather              than removing it, and no route in this kernel builds that finish on such a body yet.              Round the corner in the sketch the body was made from instead.",
+        ));
     }
 
     let scene = NativeKernel::authoritative_scene(input);
@@ -7670,6 +7723,10 @@ fn sweep_input_error(snapshot: SnapshotId, reason: sweep_profile::SweepInputErro
             "SWEEP_PROFILE_TOO_WIDE".to_owned(),
             "The profile reaches past the path's centre of curvature where the path bends most tightly, so the swept wall would fold through itself.".to_owned(),
         ),
+        SweepInputError::SelfIntersecting => (
+            "SWEEP_SELF_INTERSECTS".to_owned(),
+            "The path comes back within the profile's reach of a stretch of itself it had already left, so the swept solid would pass through itself.".to_owned(),
+        ),
         SweepInputError::ToleranceUnmet {
             deviation,
             tolerance,
@@ -7716,6 +7773,97 @@ fn sweep_approximation_warning(approximation: sweep_profile::Approximation) -> P
     warning
 }
 
+/// A face sketch whose frame faces into the body, re-expressed in the
+/// frame that faces out of it: `v` reversed and every profile point mirrored
+/// to match, so each lies where it was drawn. `None` when the frame already
+/// faces out, or the target is not a planar face of the body.
+///
+/// A sketch frame may face either way (ADR 0041); the exact feature and the
+/// Boolean fallbacks all extrude along the frame's own normal, so they are
+/// handed the outward one.
+fn outward_face_sketch(
+    topology: &Topology,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    profile: &PlanarProfile2,
+) -> Option<(PlanarFrame3, PlanarProfile2)> {
+    let face = topology
+        .faces
+        .iter()
+        .find(|face| face.id.get() == target_face.entity.0)?;
+    let plane = face.value.surface.as_plane()?;
+    let (u, v) = (frame.u, frame.v);
+    let normal = Vector3::new(
+        u.y.mul_add(v.z, -(u.z * v.y)),
+        u.z.mul_add(v.x, -(u.x * v.z)),
+        u.x.mul_add(v.y, -(u.y * v.x)),
+    );
+    if normal.dot(plane.normal) >= 0.0 {
+        return None;
+    }
+    let flip = |point: ProtocolPoint2| ProtocolPoint2::new(point.x, -point.y);
+    let turn = |direction: ArcDirection| match direction {
+        ArcDirection::Clockwise => ArcDirection::CounterClockwise,
+        ArcDirection::CounterClockwise => ArcDirection::Clockwise,
+    };
+    let mirrored = |profile_loop: &PlanarLoop2| PlanarLoop2 {
+        curves: profile_loop
+            .curves
+            .iter()
+            .map(|curve| match curve {
+                PlanarCurve2::Line { start, end } => PlanarCurve2::Line {
+                    start: flip(*start),
+                    end: flip(*end),
+                },
+                PlanarCurve2::CircularArc {
+                    center,
+                    start,
+                    end,
+                    direction,
+                } => PlanarCurve2::CircularArc {
+                    center: flip(*center),
+                    start: flip(*start),
+                    end: flip(*end),
+                    direction: turn(*direction),
+                },
+                PlanarCurve2::Circle {
+                    center,
+                    radius,
+                    direction,
+                } => PlanarCurve2::Circle {
+                    center: flip(*center),
+                    radius: *radius,
+                    direction: turn(*direction),
+                },
+                PlanarCurve2::Bspline {
+                    degree,
+                    control_points,
+                    knots,
+                    weights,
+                } => PlanarCurve2::Bspline {
+                    degree: *degree,
+                    control_points: control_points.iter().copied().map(flip).collect(),
+                    knots: knots.clone(),
+                    weights: weights.clone(),
+                },
+            })
+            .collect(),
+    };
+    Some((
+        PlanarFrame3::new(frame.origin, u, ProtocolVector3::new(-v.x, -v.y, -v.z)),
+        PlanarProfile2 {
+            regions: profile
+                .regions
+                .iter()
+                .map(|region| PlanarRegion2 {
+                    outer: mirrored(&region.outer),
+                    holes: region.holes.iter().map(mirrored).collect(),
+                })
+                .collect(),
+        },
+    ))
+}
+
 fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError) -> KernelError {
     let (diagnostic, message) = match reason {
         revolve::RevolveInputError::Profile(reason) => {
@@ -7736,6 +7884,14 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
         revolve::RevolveInputError::SectionNotContiguous => (
             "REVOLVE_SECTION_NOT_CONTIGUOUS",
             "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",
+        ),
+        revolve::RevolveInputError::PinchedOnAxis => (
+            "REVOLVE_PROFILE_PINCHED_ON_AXIS",
+            "The profile touches the axis at a single point, a corner or a curve's tangency, rather than along an edge on it; turned, the solid would be pinched to a point there. Run the profile along the axis where it meets it, or keep it clear of the axis.",
+        ),
+        revolve::RevolveInputError::ArcCentreAcrossAxis => (
+            "REVOLVE_ARC_CENTRE_ACROSS_AXIS",
+            "An arc in the profile is centred on the far side of the axis; turned, it would be the inner part of a self-crossing torus, a surface outside the certified domain. Use an arc centred on the profile's side of the axis, or on it.",
         ),
         revolve::RevolveInputError::AngleInvalid => (
             "REVOLVE_ANGLE_INVALID",
@@ -7811,6 +7967,11 @@ fn face_push_pull_input_error(snapshot: SnapshotId, reason: FacePushPullInputErr
             KernelErrorCode::Unsupported,
             "FACE_PUSH_PULL_SUPPORT_CONTACT",
             "the requested inward move would contact or cross the cap support plane",
+        ),
+        FacePushPullInputError::InteriorContact => (
+            KernelErrorCode::Unsupported,
+            "FACE_PUSH_PULL_INTERIOR_CONTACT",
+            "the requested inward move would take the cap past other geometry under it, such as a pocket's ceiling",
         ),
         FacePushPullInputError::CoordinateLimit => (
             KernelErrorCode::ResourceLimitExceeded,
@@ -7891,6 +8052,17 @@ fn validate_transform_candidate(
     input: &Topology,
     candidate: &Topology,
     transform: Similarity,
+    precision: PrecisionPolicy,
+) -> Result<(), KernelError> {
+    ensure_candidate_within_envelope(snapshot, candidate, precision)?;
+    validate_transform_scale(snapshot, input, candidate, transform, precision)
+}
+
+/// Refuses a moved, mirrored or copied body any of whose world or surface
+/// coordinates is non-finite or past the active limit.
+fn ensure_candidate_within_envelope(
+    snapshot: SnapshotId,
+    candidate: &Topology,
     precision: PrecisionPolicy,
 ) -> Result<(), KernelError> {
     let coordinate_limit = precision.max_abs_coordinate;
@@ -7999,7 +8171,16 @@ fn validate_transform_candidate(
             )],
         ));
     }
+    Ok(())
+}
 
+fn validate_transform_scale(
+    snapshot: SnapshotId,
+    input: &Topology,
+    candidate: &Topology,
+    transform: Similarity,
+    precision: PrecisionPolicy,
+) -> Result<(), KernelError> {
     let minimum = precision
         .modeling_resolution
         .max(precision.min_feature_size);

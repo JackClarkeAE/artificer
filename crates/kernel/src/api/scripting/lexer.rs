@@ -213,6 +213,14 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
             let num: f64 = s
                 .parse()
                 .map_err(|e| format!("Invalid number at {line}:{start_col}: {e}"))?;
+            // `1e400` parses as infinity. Every number a script holds is
+            // finite, so a literal past the largest float is refused here
+            // rather than carried into a dimension.
+            if !num.is_finite() {
+                return Err(format!(
+                    "The number {s} is too large to be a finite number at {line}:{start_col}"
+                ));
+            }
             tokens.push(SpannedToken {
                 token: Token::Number(num),
                 line,
@@ -222,31 +230,46 @@ pub fn tokenize(source: &str) -> Result<Vec<SpannedToken>, String> {
         }
 
         if ch == '"' {
+            let start_line = line;
             chars.next();
             col += 1;
             let mut s = String::new();
-            while let Some(&c) = chars.peek() {
+            let mut closed = false;
+            // A newline inside a string is part of it, and the line after
+            // it is still a new line for every position reported past it.
+            let advance = |line: &mut usize, col: &mut usize, c: char| {
+                if c == '\n' {
+                    *line += 1;
+                    *col = 1;
+                } else {
+                    *col += 1;
+                }
+            };
+            while let Some(c) = chars.next() {
+                advance(&mut line, &mut col, c);
                 if c == '"' {
-                    chars.next();
-                    col += 1;
+                    closed = true;
                     break;
                 } else if c == '\\' {
-                    chars.next();
-                    col += 1;
-                    if let Some(&escaped) = chars.peek() {
+                    if let Some(escaped) = chars.next() {
+                        advance(&mut line, &mut col, escaped);
                         s.push(escaped);
-                        chars.next();
-                        col += 1;
                     }
                 } else {
                     s.push(c);
-                    chars.next();
-                    col += 1;
                 }
+            }
+            // A string that runs to the end of the file swallowed the rest
+            // of the script; reading on as though it had closed would
+            // report whatever came next, or nothing at all.
+            if !closed {
+                return Err(format!(
+                    "A string never closes: the end of the file at {line}:{col} comes before its closing `\"`; the string starts at {start_line}:{start_col}"
+                ));
             }
             tokens.push(SpannedToken {
                 token: Token::StringLit(s),
-                line,
+                line: start_line,
                 col: start_col,
             });
             continue;

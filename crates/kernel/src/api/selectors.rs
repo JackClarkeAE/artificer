@@ -54,6 +54,18 @@ impl EntitySelector {
         }
     }
 
+    /// Every face the step produced, under any role: what `step.faces()`
+    /// means in a script.
+    #[must_use]
+    pub fn history_faces(step: impl Into<String>) -> Self {
+        Self::ByHistory {
+            from_step: StepLabel(step.into()),
+            kind: EntityKind::Face,
+            role: ANY_ROLE.to_owned(),
+            ordinal: None,
+        }
+    }
+
     /// Every crease edge bounding the face `face` names, holes included:
     /// `face.edges()` in a script.
     #[must_use]
@@ -946,21 +958,7 @@ fn resolve_geometric_selector(
                     }
                 }
                 EntityKind::Edge => {
-                    for edge in &scene.edges {
-                        let mid = Point3::new(
-                            (edge.endpoints[0].x + edge.endpoints[1].x) * 0.5,
-                            (edge.endpoints[0].y + edge.endpoints[1].y) * 0.5,
-                            (edge.endpoints[0].z + edge.endpoints[1].z) * 0.5,
-                        );
-                        let dx = mid.x - point.x;
-                        let dy = mid.y - point.y;
-                        let dz = mid.z - point.z;
-                        let d2 = dx * dx + dy * dy + dz * dz;
-                        if d2 < best_dist_sq {
-                            best_dist_sq = d2;
-                            best_entity = Some(edge.source_edge.entity);
-                        }
-                    }
+                    best_entity = nearest_edge(&scene, *point);
                 }
                 EntityKind::Vertex => {
                     for v in &scene.vertices {
@@ -998,6 +996,18 @@ fn resolve_geometric_selector(
         GeometricSelector::EdgeBetween { face_a, face_b } => {
             let ref_a = resolve_selector(face_a, current_snapshot, step_order, step_reports)?;
             let ref_b = resolve_selector(face_b, current_snapshot, step_order, step_reports)?;
+            // Both selectors naming one face is a mistake, not a question:
+            // every edge of that face would have it on both sides, so the
+            // answer would be whichever edge came first.
+            if ref_a.entity == ref_b.entity {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidInput,
+                    format!(
+                        "EdgeBetween names face {:?} as both faces; an edge lies between two different faces",
+                        ref_a.entity
+                    ),
+                ));
+            }
 
             for edge in &scene.edges {
                 let incidents = edge.incident_faces;
@@ -1143,6 +1153,63 @@ fn resolve_geometric_selector(
             exactly_one(winners, &format!("{extremum:?} {metric:?} {kind:?}"))
         }
     }
+}
+
+/// The edge that passes closest to `point`, measured to every chord of it
+/// rather than to its middle: a point beside the end of a long edge is
+/// nearer that edge than a short one whose middle happens to be closer.
+///
+/// A point on a vertex is as near every edge that meets there, and one on
+/// a closed rim split in two is as near both halves where they join. Edges
+/// that tie that way, to within the noise of their chords, are told apart
+/// as they always were: by the chord whose middle is nearest, and then by
+/// the order the scene lists them in.
+fn nearest_edge(scene: &crate::DebugScene, point: Point3) -> Option<EntityId> {
+    const TIE: f64 = 1.0e-9;
+    // Per edge, in scene order: the distance to the edge itself, and the
+    // distance to the nearest middle of one of its chords.
+    let mut order: Vec<EntityId> = Vec::new();
+    let mut distances: BTreeMap<EntityId, (f64, f64)> = BTreeMap::new();
+    for edge in &scene.edges {
+        let [a, b] = edge.endpoints;
+        let along = point_segment_distance_sq(point, a, b).sqrt();
+        let middle = Point3::new((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5);
+        let to_middle = point_segment_distance_sq(point, middle, middle).sqrt();
+        let entry = distances.entry(edge.source_edge.entity).or_insert_with(|| {
+            order.push(edge.source_edge.entity);
+            (f64::INFINITY, f64::INFINITY)
+        });
+        entry.0 = entry.0.min(along);
+        entry.1 = entry.1.min(to_middle);
+    }
+    let mut best: Option<(EntityId, f64, f64)> = None;
+    for entity in order {
+        let (along, to_middle) = distances[&entity];
+        let better = best.is_none_or(|(_, best_along, best_middle)| {
+            along < best_along - TIE || (along <= best_along + TIE && to_middle < best_middle)
+        });
+        if better {
+            best = Some((entity, along, to_middle));
+        }
+    }
+    best.map(|(entity, _, _)| entity)
+}
+
+/// Squared distance from a point to the segment from `a` to `b`: to the
+/// nearest point along it, or to an end.
+fn point_segment_distance_sq(p: Point3, a: Point3, b: Point3) -> f64 {
+    let ab = Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z);
+    let ap = Vector3::new(p.x - a.x, p.y - a.y, p.z - a.z);
+    let length_sq = ab.x * ab.x + ab.y * ab.y + ab.z * ab.z;
+    let t = if length_sq > 0.0 {
+        ((ap.x * ab.x + ap.y * ab.y + ap.z * ab.z) / length_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let dx = ap.x - ab.x * t;
+    let dy = ap.y - ab.y * t;
+    let dz = ap.z - ab.z * t;
+    dx * dx + dy * dy + dz * dz
 }
 
 /// Squared distance from a point to a triangle, on the triangle's interior,

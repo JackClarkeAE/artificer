@@ -23,7 +23,7 @@
 
 use artificer_protocol::{EdgeFinishKind, EntityKind, EntityRef, PrecisionPolicy, SnapshotId};
 
-use crate::analytic_extrusion::Segment;
+use crate::analytic_extrusion::{AnalyticLoop, Segment, point_inside_loop, segment_clearance};
 use crate::loop_offset::{LoopOffsetError, ReflexPolicy, SpineLoop, mitred_inward_offset};
 use crate::prism_edge_finish::{PrismProfile, extract_prism};
 use crate::topology::{
@@ -92,6 +92,7 @@ pub(crate) fn build_rim_loop_blend(
             LoopOffsetError::Degenerate => RimLoopBlendError::DomainUnsupported,
         },
     )?;
+    certify_clear_of_passive_loops(&loops, &spine.segments, precision)?;
     let blended = match kind {
         EdgeFinishKind::Chamfer => {
             build_chamfered_prism(prism, &loops, &spine, distance, precision)
@@ -105,6 +106,62 @@ pub(crate) fn build_rim_loop_blend(
         // roles so the caps keep the extrusion's own sense.
         swap_cap_roles(blended)
     })
+}
+
+/// Confirms the finished cap still holds every loop the finish passes by.
+///
+/// The spine is the finished cap's new boundary, and the offset certifies it
+/// only against itself. The cap's other loops pass through untouched, so
+/// each must keep clear of it and stay on its own side: a hole inside the
+/// shrunk outer boundary, the outer boundary around a grown hole, and every
+/// other hole outside it. A hole the spine crosses would cut the band, and a
+/// cap written with the hole's loop across its boundary is not a face at all
+/// — which nothing after this builder is placed to notice.
+fn certify_clear_of_passive_loops(
+    loops: &BlendLoops<'_>,
+    spine: &[Segment],
+    precision: PrecisionPolicy,
+) -> Result<(), RimLoopBlendError> {
+    // Each loop is placed by a point partway along its first segment rather
+    // than by its start. A start is a seam, where two arcs meet only to
+    // within rounding; a ray cast from the seam of one loop can graze the
+    // seam of another and slip between its ends, and then count a hole
+    // beside the finish as inside it.
+    let sample = |segments: &[Segment]| segments.first().map(|segment| segment.point_at(0.371));
+    let Some(spine_start) = sample(spine) else {
+        return Err(RimLoopBlendError::DomainUnsupported);
+    };
+    let as_loop = |segments: &[Segment]| AnalyticLoop {
+        segments: segments.to_vec(),
+        signed_area: 0.0,
+    };
+    let spine_loop = as_loop(spine);
+    for (passive, is_outer) in &loops.passive {
+        let Some(passive_start) = sample(passive) else {
+            return Err(RimLoopBlendError::DomainUnsupported);
+        };
+        let crowded = spine.iter().any(|spine_segment| {
+            passive.iter().any(|passive_segment| {
+                segment_clearance(*spine_segment, *passive_segment) < precision.min_feature_size
+            })
+        });
+        if crowded {
+            return Err(RimLoopBlendError::DistanceInvalid);
+        }
+        let passive_loop = as_loop(passive);
+        let on_its_side = if loops.target_is_outer {
+            point_inside_loop(passive_start, &spine_loop)
+        } else if *is_outer {
+            point_inside_loop(spine_start, &passive_loop)
+        } else {
+            !point_inside_loop(passive_start, &spine_loop)
+                && !point_inside_loop(spine_start, &passive_loop)
+        };
+        if !on_its_side {
+            return Err(RimLoopBlendError::DistanceInvalid);
+        }
+    }
+    Ok(())
 }
 
 /// Exchanges the two cap roles of a mirrored build.

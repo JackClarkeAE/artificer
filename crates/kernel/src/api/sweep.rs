@@ -35,6 +35,36 @@ use crate::{CancellationToken, ChordDeviation, DebugScene, NativeKernel};
 /// The shape of the document this module publishes.
 pub const SWEEP_SCHEMA_VERSION: u32 = 1;
 
+/// The most positions one sweep request may step through. A mechanism's
+/// travel is sampled at tens or hundreds of positions; a request past this
+/// is a mistake or an attack, and the sweep holds the session while it
+/// runs.
+pub const MAX_SWEEP_STEPS: usize = 10_000;
+
+/// The most pair measurements one sweep request may make: the pairs of its
+/// subjects times its positions. Each is a clearance between two faceted
+/// bodies, so this, rather than either count alone, is what bounds the
+/// time a request can hold the session.
+pub const MAX_SWEEP_MEASUREMENTS: usize = 200_000;
+
+/// Refuses a sweep of `subjects` bodies through `steps` positions that is
+/// larger than one request may ask for, saying which limit it passes.
+pub fn check_sweep_size(subjects: usize, steps: usize) -> Result<(), String> {
+    if steps > MAX_SWEEP_STEPS {
+        return Err(format!(
+            "A sweep steps through at most {MAX_SWEEP_STEPS} positions; this one has {steps}"
+        ));
+    }
+    let pairs = subjects.saturating_mul(subjects.saturating_sub(1)) / 2;
+    let measurements = pairs.saturating_mul(steps);
+    if measurements > MAX_SWEEP_MEASUREMENTS {
+        return Err(format!(
+            "A sweep makes at most {MAX_SWEEP_MEASUREMENTS} pair measurements; {pairs} pairs through {steps} positions is {measurements}"
+        ));
+    }
+    Ok(())
+}
+
 /// One position of the mechanism: where every subject sits, in subject
 /// order, and the driver values that put it there.
 #[derive(Clone, Debug, PartialEq)]

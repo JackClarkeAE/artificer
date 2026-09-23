@@ -66,7 +66,10 @@ pub(crate) fn validate_linear_profile_extrusion(
     precision: PrecisionPolicy,
 ) -> Result<ValidatedLinearProfileExtrusion, PlanarProfileInputError> {
     let regions = extract_linear_regions(profile)?;
-    if linear_regions_overlap(&regions) {
+    let minimum = precision
+        .modeling_resolution
+        .max(precision.min_feature_size);
+    if linear_regions_overlap(&regions, minimum) {
         return Err(PlanarProfileInputError::OverlappingRegions);
     }
     let mut topologies = Vec::with_capacity(regions.len());
@@ -242,7 +245,10 @@ fn linear_loop_vertices(
     Ok(lines.into_iter().map(|(start, _)| start).collect())
 }
 
-fn linear_regions_overlap(regions: &[LinearRegion]) -> bool {
+/// Whether any two regions overlap, touch, or come within `clearance` of
+/// one another: two solids closer than the smallest feature are one solid
+/// with a crack in it.
+fn linear_regions_overlap(regions: &[LinearRegion], clearance: f64) -> bool {
     for left in 0..regions.len() {
         for right in left + 1..regions.len() {
             let left_boundaries = std::iter::once(regions[left].outer.as_slice())
@@ -253,7 +259,7 @@ fn linear_regions_overlap(regions: &[LinearRegion]) -> bool {
             if left_boundaries.clone().any(|first| {
                 right_boundaries
                     .iter()
-                    .any(|second| loops_intersect(first, second))
+                    .any(|second| loops_within(first, second, clearance))
             }) {
                 return true;
             }
@@ -267,17 +273,37 @@ fn linear_regions_overlap(regions: &[LinearRegion]) -> bool {
     false
 }
 
-fn loops_intersect(first: &[ProtocolPoint2], second: &[ProtocolPoint2]) -> bool {
+fn loops_within(first: &[ProtocolPoint2], second: &[ProtocolPoint2], clearance: f64) -> bool {
     (0..first.len()).any(|first_index| {
         (0..second.len()).any(|second_index| {
-            segments_intersect(
-                first[first_index],
-                first[(first_index + 1) % first.len()],
+            let (first_start, first_end) =
+                (first[first_index], first[(first_index + 1) % first.len()]);
+            let (second_start, second_end) = (
                 second[second_index],
                 second[(second_index + 1) % second.len()],
-            )
+            );
+            segments_intersect(first_start, first_end, second_start, second_end)
+                || point_segment_distance(first_start, second_start, second_end) <= clearance
+                || point_segment_distance(first_end, second_start, second_end) <= clearance
+                || point_segment_distance(second_start, first_start, first_end) <= clearance
+                || point_segment_distance(second_end, first_start, first_end) <= clearance
         })
     })
+}
+
+fn point_segment_distance(
+    point: ProtocolPoint2,
+    start: ProtocolPoint2,
+    end: ProtocolPoint2,
+) -> f64 {
+    let (dx, dy) = (end.x - start.x, end.y - start.y);
+    let length_squared = dx.mul_add(dx, dy * dy);
+    let along = if length_squared > 0.0 {
+        ((point.x - start.x).mul_add(dx, (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (point.x - dx.mul_add(along, start.x)).hypot(point.y - dy.mul_add(along, start.y))
 }
 
 fn segments_intersect(
@@ -462,18 +488,36 @@ mod tests {
 
     #[test]
     fn collinear_but_separated_region_edges_do_not_intersect() {
-        assert!(!linear_regions_overlap(&[
-            rectangle(0.0, 0.0, 1.0, 1.0),
-            rectangle(3.0, 0.0, 4.0, 1.0),
-        ]));
+        assert!(!linear_regions_overlap(
+            &[rectangle(0.0, 0.0, 1.0, 1.0), rectangle(3.0, 0.0, 4.0, 1.0),],
+            1.0e-5
+        ));
     }
 
     #[test]
     fn region_boundaries_that_t_touch_are_rejected() {
-        assert!(linear_regions_overlap(&[
-            rectangle(0.0, 0.0, 2.0, 2.0),
-            rectangle(2.0, 0.5, 3.0, 1.5),
-        ]));
+        assert!(linear_regions_overlap(
+            &[rectangle(0.0, 0.0, 2.0, 2.0), rectangle(2.0, 0.5, 3.0, 1.5),],
+            1.0e-5
+        ));
+    }
+
+    /// Two regions a hair apart would extrude into two solids closer than
+    /// any feature; they were accepted because only an exact intersection
+    /// counted.
+    #[test]
+    fn regions_closer_than_the_clearance_are_rejected() {
+        let apart = |gap: f64| {
+            linear_regions_overlap(
+                &[
+                    rectangle(0.0, 0.0, 2.0, 2.0),
+                    rectangle(2.0 + gap, 0.5, 3.0, 1.5),
+                ],
+                1.0e-5,
+            )
+        };
+        assert!(apart(1.0e-7));
+        assert!(!apart(1.0e-3));
     }
 
     #[test]
