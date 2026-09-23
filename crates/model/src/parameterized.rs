@@ -318,6 +318,12 @@ pub enum ParameterizedKernelError {
     InvalidPersistentTarget,
     #[error("every bindable kernel length in the retained template must be finite and positive")]
     InvalidTemplateLength,
+    #[error("the distance expression did not evaluate: {0}")]
+    DistanceExpression(String),
+    #[error("the distance expression does not come to a length")]
+    DistanceNotALength,
+    #[error("the distance expression comes to zero or a non-finite length")]
+    InvalidDistanceValue,
 }
 
 fn canonical_length(

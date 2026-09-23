@@ -227,3 +227,84 @@ fn an_angle_variable_fills_a_sketch_angle_box_in_degrees() {
         angle.value
     );
 }
+
+/// An extrusion's distance typed as a variable stays linked to it: the body
+/// follows the variable when it changes, and the link is in the file.
+#[test]
+fn an_extrusion_typed_as_a_variable_follows_it() {
+    let mut harness = harness();
+    harness.run();
+    create_length_variable(&mut harness);
+    replace_text_input(&mut harness, "Variable name Length1", "length");
+    replace_text_input(&mut harness, "Variable value length", "25");
+    click_button(&mut harness, CONFIRM_OPERATION);
+
+    click_button(&mut harness, "XY Plane");
+    click_button(&mut harness, "Sketch mode");
+    click_button(&mut harness, "Two-point rectangle");
+    for point in [SketchPoint::new(-2.0, -1.0), SketchPoint::new(2.0, 1.0)] {
+        let position = harness
+            .state()
+            .sketch_point_screen_position(harness.get_by_label("Sketch viewport").rect(), point);
+        click_at(&mut harness, position);
+    }
+    click_button(&mut harness, "Extrude");
+    replace_text_input(&mut harness, "Extrusion distance expression", "length");
+    // Tab leaves the field, which reads it; Enter would also confirm.
+    harness.key_press(egui::Key::Tab);
+    harness.run();
+    assert_eq!(
+        harness.state().extrusion_distance_follows(),
+        Some("length"),
+        "status: {:?}",
+        harness.state().document_status_text()
+    );
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert_eq!(harness.state().last_error_code(), None);
+    let area = 4.0 * 2.0;
+    let volume = |harness: &Harness<'static, KernelLabApp>| {
+        harness
+            .state()
+            .displayed_measures()
+            .expect("the extrusion measures")
+            .volume
+    };
+    assert!(
+        (volume(&harness) - area * 25.0).abs() < 1.0e-6,
+        "{}",
+        volume(&harness)
+    );
+
+    // The variable changes; the extrusion follows.
+    click_button(&mut harness, "Parametric ribbon tab");
+    if harness
+        .query_by_role_and_label(Role::TextInput, "Variable value length")
+        .is_none()
+    {
+        click_button(&mut harness, "Variables");
+    }
+    replace_text_input(&mut harness, "Variable value length", "40");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    assert!(
+        (volume(&harness) - area * 40.0).abs() < 1.0e-6,
+        "{}",
+        volume(&harness)
+    );
+
+    // The file keeps the link: reopened, it still follows.
+    let saved = harness.state().native_document_json().unwrap();
+    assert!(saved.contains("distance_expression"));
+    let mut reopened = self::harness();
+    reopened.run();
+    reopened
+        .state_mut()
+        .load_native_document_json(&saved)
+        .expect("the linked document opens");
+    reopened.run();
+    assert!(reopened.state().features_suppressed_on_open().is_empty());
+    assert!(
+        (volume(&reopened) - area * 40.0).abs() < 1.0e-6,
+        "{}",
+        volume(&reopened)
+    );
+}

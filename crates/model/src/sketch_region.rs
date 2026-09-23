@@ -20,7 +20,10 @@ use thiserror::Error;
 use crate::persistent::{
     CURRENT_PERSISTENT_REF_VERSION, MAX_PERSISTENT_LINEAGE_DEPTH, PersistentRef, TargetedKernel,
 };
-use crate::{FeatureId, ModelDocument, ReplayAction, SketchId};
+use crate::{
+    EvaluatedParameters, FeatureId, ModelDocument, ParameterExpression, ParameterValue,
+    ParameterizedKernelError, QuantityKind, ReplayAction, SketchId,
+};
 
 /// Schema written for newly-created sketch-region replay recipes.
 pub const CURRENT_SKETCH_REGION_RECIPE_VERSION: u32 = 1;
@@ -259,6 +262,12 @@ pub struct SketchRegionExtrusion {
     /// The second side's plane, as `up_to_plane` is the first side's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub second_up_to_plane: Option<FeatureId>,
+    /// The first side's distance follows this expression over document
+    /// variables: `length`, `depth * 2`. Replay evaluates it and uses its
+    /// value, sign and all, as `distance`, which holds what it last came to.
+    /// A side that ends at a face or a plane has no distance to follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance_expression: Option<ParameterExpression>,
 }
 
 fn is_zero(value: &f64) -> bool {
@@ -321,9 +330,59 @@ impl SketchRegionExtrusion {
             second_up_to_face: None,
             up_to_plane: None,
             second_up_to_plane: None,
+            distance_expression: None,
         };
         recipe.validate()?;
         Ok(recipe)
+    }
+
+    /// Makes the first side's distance follow an expression over document
+    /// variables, or stop following one. `distance` should hold what the
+    /// expression evaluates to now.
+    pub fn with_distance_expression(
+        mut self,
+        expression: Option<ParameterExpression>,
+    ) -> Result<Self, SketchRegionRecipeError> {
+        self.distance_expression = expression;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The variables the recipe reads, which its feature lists as parameter
+    /// inputs so that changing one rebuilds it.
+    #[must_use]
+    pub fn parameter_references(&self) -> std::collections::BTreeSet<crate::ParameterId> {
+        self.distance_expression
+            .as_ref()
+            .map(ParameterExpression::referenced_parameters)
+            .unwrap_or_default()
+    }
+
+    /// The recipe with its distance taken from the evaluated variables. A
+    /// recipe that follows no expression is returned as it is.
+    pub fn resolve_parameters(
+        &self,
+        parameters: &EvaluatedParameters,
+    ) -> Result<Self, ParameterizedKernelError> {
+        let Some(expression) = &self.distance_expression else {
+            return Ok(self.clone());
+        };
+        let value = expression
+            .evaluate_with(parameters)
+            .map_err(|error| ParameterizedKernelError::DistanceExpression(error.to_string()))?;
+        let ParameterValue::Quantity { value } = value else {
+            return Err(ParameterizedKernelError::DistanceNotALength);
+        };
+        if value.unit.quantity_kind() != QuantityKind::Length {
+            return Err(ParameterizedKernelError::DistanceNotALength);
+        }
+        // Canonical lengths are millimetres, the recipe's unit.
+        if !value.magnitude.is_finite() || value.magnitude == 0.0 {
+            return Err(ParameterizedKernelError::InvalidDistanceValue);
+        }
+        let mut resolved = self.clone();
+        resolved.distance = value.magnitude;
+        Ok(resolved)
     }
 
     /// Gives the extrusion a second side, `second_distance` behind the
@@ -467,6 +526,16 @@ impl SketchRegionExtrusion {
         if self.end_planes().any(|plane| plane.get() == 0) {
             return Err(SketchRegionRecipeError::InvalidPlaneTarget);
         }
+        if let Some(expression) = &self.distance_expression {
+            if self.up_to_face.is_some() || self.up_to_plane.is_some() {
+                return Err(SketchRegionRecipeError::ExpressionOnAnEndedSide);
+            }
+            if expression.validate_bounds().is_err()
+                || expression.referenced_parameters().is_empty()
+            {
+                return Err(SketchRegionRecipeError::InvalidDistanceExpression);
+            }
+        }
         for face in [&self.up_to_face, &self.second_up_to_face]
             .into_iter()
             .flatten()
@@ -604,6 +673,12 @@ pub enum SketchRegionRecipeError {
     InvalidPlaneTarget,
     #[error("persistent face lineage exceeds the depth limit of {limit}")]
     FaceLineageTooDeep { limit: usize },
+    #[error("a side that ends at a face or a plane has no distance to follow a variable")]
+    ExpressionOnAnEndedSide,
+    #[error(
+        "a distance expression must name at least one variable and stay within the size limits"
+    )]
+    InvalidDistanceExpression,
 }
 
 /// Failure while resolving current sketch geometry during rebuild.
@@ -851,6 +926,167 @@ mod tests {
             )
             .unwrap();
         (document, appended.created_sketches[0], regions[0].clone())
+    }
+
+    fn length_variable(
+        document: &mut ModelDocument,
+        key: &str,
+        millimetres: f64,
+    ) -> crate::ParameterId {
+        document
+            .add_parameter(
+                crate::ParameterSpec::new(
+                    key,
+                    key,
+                    crate::ParameterType::Quantity(QuantityKind::Length),
+                )
+                .with_display_unit(crate::ParameterUnit::Millimeter),
+                crate::ParameterBinding::literal(ParameterValue::quantity(
+                    millimetres,
+                    crate::ParameterUnit::Millimeter,
+                )),
+            )
+            .unwrap()
+    }
+
+    /// An extrusion typed as `length` keeps following it: the feature reads
+    /// the variable, replay takes the distance from it, changing it marks
+    /// the extrusion for rebuilding, and it cannot be deleted from under the
+    /// extrusion.
+    #[test]
+    fn an_extrusion_distance_follows_the_variable_it_names() {
+        let (mut document, sketch, signature) = document_with_rectangle();
+        let length = length_variable(&mut document, "length", 40.0);
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature], 40.0)
+            .unwrap()
+            .with_distance_expression(Some(ParameterExpression::reference(length)))
+            .unwrap();
+        let draft = |parameters: &[crate::ParameterId]| {
+            let mut draft = FeatureDraft::new(
+                FeatureKind::Extrude,
+                "Extrude",
+                ReplayAction::SketchRegionExtrusion(recipe.clone()),
+            )
+            .with_input(FeatureInput::Sketch(sketch))
+            .with_output(OutputDraft::CreateBody {
+                label: "Body".into(),
+            });
+            for parameter in parameters {
+                draft = draft.with_parameter(*parameter);
+            }
+            draft
+        };
+        assert!(
+            document.clone().append_feature(draft(&[])).is_err(),
+            "a feature must declare the variables its distance reads"
+        );
+        let appended = document.append_feature(draft(&[length])).unwrap();
+        let feature = appended.feature;
+
+        let evaluated = document
+            .evaluate_parameters(&crate::ParameterOverrides::default())
+            .unwrap();
+        let ReplayAction::SketchRegionExtrusion(resolved) = document
+            .feature(feature)
+            .unwrap()
+            .action
+            .resolve_parameters(&evaluated)
+            .unwrap()
+        else {
+            panic!("the extrusion stays an extrusion until its regions resolve");
+        };
+        assert_eq!(resolved.distance, 40.0);
+        assert!(document.feature(feature).unwrap().action.reads_parameters());
+
+        document
+            .set_parameter_binding(
+                length,
+                crate::ParameterBinding::literal(ParameterValue::quantity(
+                    3.0,
+                    crate::ParameterUnit::Centimeter,
+                )),
+            )
+            .unwrap();
+        assert_eq!(
+            document.feature(feature).unwrap().state.rebuild,
+            RebuildState::Dirty
+        );
+        let evaluated = document
+            .evaluate_parameters(&crate::ParameterOverrides::default())
+            .unwrap();
+        let ReplayAction::SketchRegionExtrusion(resolved) = document
+            .feature(feature)
+            .unwrap()
+            .action
+            .resolve_parameters(&evaluated)
+            .unwrap()
+        else {
+            panic!("still an extrusion");
+        };
+        assert!((resolved.distance - 30.0).abs() < 1.0e-12);
+        assert!(document.remove_parameter(length).is_err());
+
+        // The link survives the file.
+        let json = serde_json::to_string(&document.to_native()).unwrap();
+        assert!(json.contains("distance_expression"));
+        let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
+        assert_eq!(
+            restored.feature(feature).unwrap().action,
+            document.feature(feature).unwrap().action
+        );
+        assert_eq!(
+            restored.to_native().version(),
+            crate::LINKED_PARAMETER_DOCUMENT_VERSION
+        );
+    }
+
+    #[test]
+    fn a_distance_expression_must_come_to_a_length_and_not_end_at_a_face() {
+        let (mut document, sketch, signature) = document_with_rectangle();
+        let angle = document
+            .add_parameter(
+                crate::ParameterSpec::new(
+                    "tilt",
+                    "tilt",
+                    crate::ParameterType::Quantity(QuantityKind::Angle),
+                )
+                .with_display_unit(crate::ParameterUnit::Degree),
+                crate::ParameterBinding::literal(ParameterValue::quantity(
+                    30.0,
+                    crate::ParameterUnit::Degree,
+                )),
+            )
+            .unwrap();
+        let recipe = SketchRegionExtrusion::new_body(sketch, vec![signature.clone()], 5.0)
+            .unwrap()
+            .with_distance_expression(Some(ParameterExpression::reference(angle)))
+            .unwrap();
+        let draft = FeatureDraft::new(
+            FeatureKind::Extrude,
+            "Extrude",
+            ReplayAction::SketchRegionExtrusion(recipe),
+        )
+        .with_input(FeatureInput::Sketch(sketch))
+        .with_parameter(angle)
+        .with_output(OutputDraft::CreateBody {
+            label: "Body".into(),
+        });
+        assert!(
+            document.append_feature(draft).is_err(),
+            "an angle is not a distance"
+        );
+
+        let length = length_variable(&mut document, "length", 10.0);
+        let ended = SketchRegionExtrusion::new_body(sketch, vec![signature], 5.0)
+            .unwrap()
+            .with_up_to_planes(Some(FeatureId::from_allocated(9)), None)
+            .unwrap()
+            .with_distance_expression(Some(ParameterExpression::reference(length)));
+        assert_eq!(
+            ended.err(),
+            Some(SketchRegionRecipeError::ExpressionOnAnEndedSide)
+        );
+        assert!(crate::validate_replay_action(&ReplayAction::KernelChain(Vec::new())).is_err());
     }
 
     /// A two-sided new body sweeps once, from behind the plane to in front
@@ -1605,7 +1841,7 @@ mod tests {
         // A loft document is written in the schema that knows lofts, and
         // reads back to the same recipe.
         let native = document.to_native();
-        assert_eq!(native.version(), crate::SKETCH_LOFT_DOCUMENT_VERSION);
+        assert!(native.version() >= crate::SKETCH_LOFT_DOCUMENT_VERSION);
         let json = serde_json::to_string(&native).unwrap();
         let restored = ModelDocument::from_native(serde_json::from_str(&json).unwrap()).unwrap();
         assert_eq!(

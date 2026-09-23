@@ -579,7 +579,7 @@ fn a_part_saved_into_the_library_keeps_a_picture_and_its_size() {
 
     click_button(&mut harness, "Library");
     harness.get_by_role_and_label(Role::Image, "Picture of 20 × 20 Aluminium Extrusion");
-    harness.get_by_label("v1.8.0");
+    harness.get_by_label(&format!("v1.{CURRENT_DOCUMENT_VERSION}.0"));
     harness.get_by_label("20 × 20 mm × Length");
 
     // A kept picture is what a later start shows: replace it with a marked

@@ -326,7 +326,51 @@ impl ParameterExpression {
         }
     }
 
-    fn validate_bounds(&self) -> Result<(), ParameterError> {
+    /// The parameters the expression reads, each once, in ID order.
+    #[must_use]
+    pub fn referenced_parameters(&self) -> BTreeSet<ParameterId> {
+        let mut output = BTreeSet::new();
+        self.references(&mut output);
+        output
+    }
+
+    /// Evaluates the expression over values already evaluated for a table.
+    /// Every parameter it reads must be among them.
+    pub fn evaluate_with(
+        &self,
+        evaluated: &EvaluatedParameters,
+    ) -> Result<ParameterValue, ParameterError> {
+        match self {
+            Self::Literal { value } => value.canonical(),
+            Self::Reference { parameter } => evaluated
+                .get(*parameter)
+                .cloned()
+                .ok_or(ParameterError::MissingValue(*parameter)),
+            Self::Negate { operand } => negate(operand.evaluate_with(evaluated)?),
+            Self::Add { left, right } => arithmetic(
+                Arithmetic::Add,
+                left.evaluate_with(evaluated)?,
+                right.evaluate_with(evaluated)?,
+            ),
+            Self::Subtract { left, right } => arithmetic(
+                Arithmetic::Subtract,
+                left.evaluate_with(evaluated)?,
+                right.evaluate_with(evaluated)?,
+            ),
+            Self::Multiply { left, right } => arithmetic(
+                Arithmetic::Multiply,
+                left.evaluate_with(evaluated)?,
+                right.evaluate_with(evaluated)?,
+            ),
+            Self::Divide { left, right } => arithmetic(
+                Arithmetic::Divide,
+                left.evaluate_with(evaluated)?,
+                right.evaluate_with(evaluated)?,
+            ),
+        }
+    }
+
+    pub(crate) fn validate_bounds(&self) -> Result<(), ParameterError> {
         fn visit(
             expression: &ParameterExpression,
             depth: usize,
@@ -472,6 +516,21 @@ impl ParameterTable {
     #[must_use]
     pub fn get_by_key(&self, key: &str) -> Option<&ParameterRecord> {
         self.parameters.iter().find(|record| record.spec.key == key)
+    }
+
+    /// The type `expression` evaluates to over this table's parameters, with
+    /// its size and depth checked as a stored binding's would be.
+    pub fn expression_type(
+        &self,
+        expression: &ParameterExpression,
+    ) -> Result<ParameterType, ParameterError> {
+        expression.validate_bounds()?;
+        let by_id = self
+            .parameters
+            .iter()
+            .map(|record| (record.id, record))
+            .collect::<BTreeMap<_, _>>();
+        infer_type(expression, &by_id)
     }
 
     /// Parameters directly or transitively derived from `source`, including

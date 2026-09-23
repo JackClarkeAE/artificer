@@ -71,8 +71,10 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 /// kernel recipes. Version 5 adds the persistent assembly joint forest.
 /// Version 6 adds authoritative editable sketch-operation graphs. Version 7
 /// makes a construction plane a recipe rather than a marker (ADR 0048).
-/// Version 8 adds the loft between sketch sections (ADR 0051).
-pub const CURRENT_DOCUMENT_VERSION: u32 = 8;
+/// Version 8 adds the loft between sketch sections (ADR 0051). Version 9
+/// lets an extrusion's distance follow a variable and a library part replay
+/// as the chain of kernel commands it was built from.
+pub const CURRENT_DOCUMENT_VERSION: u32 = 9;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
 /// First native schema with a persistent assembly hierarchy and joint graph.
@@ -85,6 +87,11 @@ pub const EDITABLE_SKETCH_DOCUMENT_VERSION: u32 = 6;
 pub const DATUM_PLANE_DOCUMENT_VERSION: u32 = 7;
 /// First native schema that can hold a loft feature.
 pub const SKETCH_LOFT_DOCUMENT_VERSION: u32 = 8;
+/// First native schema whose extrusion distances can follow a variable and
+/// whose features can replay a chain of kernel commands.
+pub const LINKED_PARAMETER_DOCUMENT_VERSION: u32 = 9;
+/// The longest chain of kernel commands one feature may replay.
+pub const MAX_KERNEL_CHAIN_COMMANDS: usize = 1_024;
 /// Oldest native document schema this version can migrate in memory.
 pub const MIN_SUPPORTED_DOCUMENT_VERSION: u32 = 1;
 /// Hard ceiling for one document's ordered feature timeline.
@@ -232,6 +239,12 @@ pub enum ReplayAction {
     /// A loft whose sections are resolved from their sketches, on their
     /// planes, immediately before replay (ADR 0051).
     SketchLoft(SketchLoft),
+    /// Kernel commands run in order, each on the result of the one before,
+    /// from the feature's input: a library part as its own recipe built it,
+    /// at the values it was inserted with. A command may name an entity of
+    /// a result made earlier in the chain, which the chain itself makes
+    /// again, so it needs no persistent target.
+    KernelChain(Vec<KernelCommand>),
 }
 
 impl ReplayAction {
@@ -253,13 +266,33 @@ impl ReplayAction {
     ) -> Result<Self, ParameterizedKernelError> {
         match self {
             Self::ParameterizedKernel(recipe) => recipe.resolve(parameters),
+            Self::SketchRegionExtrusion(recipe) => recipe
+                .resolve_parameters(parameters)
+                .map(Self::SketchRegionExtrusion),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
-            | Self::SketchRegionExtrusion(_)
             | Self::Boolean(_)
             | Self::DatumPlane(_)
-            | Self::SketchLoft(_) => Ok(self.clone()),
+            | Self::SketchLoft(_)
+            | Self::KernelChain(_) => Ok(self.clone()),
+        }
+    }
+
+    /// Whether replay must evaluate the document's variables first, because
+    /// a value in the recipe follows one.
+    #[must_use]
+    pub const fn reads_parameters(&self) -> bool {
+        match self {
+            Self::ParameterizedKernel(_) => true,
+            Self::SketchRegionExtrusion(recipe) => recipe.distance_expression.is_some(),
+            Self::Marker
+            | Self::TargetedKernel(_)
+            | Self::Kernel(_)
+            | Self::Boolean(_)
+            | Self::DatumPlane(_)
+            | Self::SketchLoft(_)
+            | Self::KernelChain(_) => false,
         }
     }
 
@@ -300,7 +333,8 @@ impl ReplayAction {
             | Self::Kernel(_)
             | Self::ParameterizedKernel(_)
             | Self::Boolean(_)
-            | Self::DatumPlane(_) => Ok(self.clone()),
+            | Self::DatumPlane(_)
+            | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
 }
@@ -1895,8 +1929,32 @@ impl ModelDocument {
         action: ReplayAction,
         inputs: Vec<FeatureInput>,
     ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let parameter_inputs = self.state.features[index].parameter_inputs.clone();
+        self.replace_feature_recipe(id, action, inputs, parameter_inputs)
+    }
+
+    /// Replaces a feature's action, its feature inputs, and the variables it
+    /// reads — an extrusion whose distance now follows a variable, or no
+    /// longer does. The rules for inputs are those of
+    /// [`Self::replace_feature_action_and_inputs`]; the variables must be
+    /// exactly the ones the action names.
+    pub fn replace_feature_recipe(
+        &mut self,
+        id: FeatureId,
+        action: ReplayAction,
+        inputs: Vec<FeatureInput>,
+        parameter_inputs: Vec<ParameterId>,
+    ) -> Result<bool, DocumentError> {
         validate_replay_action(&action)?;
         let index = self.feature_index(id)?;
+        validate_reference_count("parameter inputs", parameter_inputs.len())?;
+        if let Some(unknown) = parameter_inputs
+            .iter()
+            .find(|parameter| self.state.parameters.get(**parameter).is_none())
+        {
+            return Err(DocumentError::UnknownParameter(*unknown));
+        }
         let feature = &self.state.features[index];
         if feature.state.read_only {
             return Err(DocumentError::ReadOnlyFeature(id));
@@ -1940,13 +1998,12 @@ impl ModelDocument {
                 Some(_) => {}
             }
         }
-        validate_action_parameter_inputs(
-            &action,
-            &feature.parameter_inputs,
-            &self.state.parameters,
-        )?;
+        validate_action_parameter_inputs(&action, &parameter_inputs, &self.state.parameters)?;
         validate_action_feature_inputs(&action, &inputs)?;
-        if feature.action == action && feature.inputs == inputs {
+        if feature.action == action
+            && feature.inputs == inputs
+            && feature.parameter_inputs == parameter_inputs
+        {
             return Ok(false);
         }
         let mut dependencies = feature
@@ -1963,6 +2020,7 @@ impl ModelDocument {
         let node = &mut self.state.features[index];
         node.action = action;
         node.inputs = inputs;
+        node.parameter_inputs = parameter_inputs;
         node.dependencies = dependencies;
         self.mark_branch_dirty(index);
         self.finish_user_edit(previous);
@@ -3019,6 +3077,8 @@ pub enum DocumentError {
     SketchLoft(#[from] SketchLoftError),
     #[error("a loft feature must carry a loft recipe, and a loft recipe must be a loft feature")]
     InvalidLoftFeature,
+    #[error("a kernel chain must hold between one and {MAX_KERNEL_CHAIN_COMMANDS} commands")]
+    InvalidKernelChain,
     #[error("a construction plane must be a construction-plane feature with a plane recipe")]
     InvalidDatumPlaneFeature,
     #[error("{0} is not a construction plane")]
@@ -3153,7 +3213,7 @@ fn validate_label(label: &str) -> Result<(), DocumentError> {
     }
 }
 
-fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
+pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
     match action {
         ReplayAction::Kernel(
             KernelCommand::ExtrudeFaceProfile { .. }
@@ -3173,6 +3233,13 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
         }
         ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::KernelChain(commands) => {
+            if commands.is_empty() || commands.len() > MAX_KERNEL_CHAIN_COMMANDS {
+                Err(DocumentError::InvalidKernelChain)
+            } else {
+                Ok(())
+            }
+        }
         ReplayAction::Marker
         | ReplayAction::Kernel(_)
         | ReplayAction::TargetedKernel(_)
@@ -3197,8 +3264,40 @@ fn validate_action_parameter_inputs(
     parameter_inputs: &[ParameterId],
     parameters: &ParameterTable,
 ) -> Result<(), DocumentError> {
-    if let ReplayAction::ParameterizedKernel(recipe) = action {
-        recipe.validate_parameter_inputs(parameter_inputs, parameters)?;
+    match action {
+        ReplayAction::ParameterizedKernel(recipe) => {
+            recipe.validate_parameter_inputs(parameter_inputs, parameters)?;
+        }
+        // An extrusion reads exactly the variables its distance names, so
+        // changing any of them rebuilds it and none can be deleted under it.
+        ReplayAction::SketchRegionExtrusion(recipe) => {
+            let declared = parameter_inputs.iter().copied().collect::<BTreeSet<_>>();
+            if declared.len() != parameter_inputs.len() {
+                return Err(ParameterizedKernelError::DuplicateParameterInput.into());
+            }
+            if declared != recipe.parameter_references() {
+                return Err(ParameterizedKernelError::ParameterInputMismatch.into());
+            }
+            if let Some(expression) = &recipe.distance_expression {
+                match parameters.expression_type(expression) {
+                    Ok(ParameterType::Quantity(QuantityKind::Length)) => {}
+                    Ok(_) => return Err(ParameterizedKernelError::DistanceNotALength.into()),
+                    Err(error) => {
+                        return Err(ParameterizedKernelError::DistanceExpression(
+                            error.to_string(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        ReplayAction::Marker
+        | ReplayAction::TargetedKernel(_)
+        | ReplayAction::Kernel(_)
+        | ReplayAction::Boolean(_)
+        | ReplayAction::DatumPlane(_)
+        | ReplayAction::SketchLoft(_)
+        | ReplayAction::KernelChain(_) => {}
     }
     Ok(())
 }

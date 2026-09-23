@@ -48,6 +48,11 @@ pub struct HydratedFeature {
     pub association: SnapshotAssociation,
     pub report: Option<OperationReport>,
     pub provenance: HydratedProvenance,
+    /// The kernel commands the feature ran, in order, with every value and
+    /// target resolved: what replaying it again would run. Empty for a
+    /// feature that runs no command and for a Boolean, which combines two
+    /// results rather than running one.
+    pub commands: Vec<artificer_protocol::KernelCommand>,
 }
 
 /// Why an active feature produced no runtime result.
@@ -294,7 +299,7 @@ pub fn hydrate_model_document(
     let evaluated_parameters = document
         .active_features()
         .iter()
-        .any(|feature| matches!(feature.action, ReplayAction::ParameterizedKernel(_)))
+        .any(|feature| feature.action.reads_parameters())
         .then(|| document.evaluate_parameters(&ParameterOverrides::default()))
         .transpose()
         .map_err(|error| DocumentHydrationError::ParameterEvaluation(error.to_string()))?;
@@ -340,19 +345,20 @@ pub fn hydrate_model_document(
                     snapshot: input_id,
                 })?;
 
-        let action = match &feature.action {
-            ReplayAction::ParameterizedKernel(_) => feature
+        let action = if feature.action.reads_parameters() {
+            feature
                 .action
                 .resolve_parameters(
                     evaluated_parameters
                         .as_ref()
-                        .expect("parameterized actions require evaluated document parameters"),
+                        .expect("actions that read parameters require evaluated parameters"),
                 )
                 .map_err(|error| DocumentHydrationError::ParameterizedAction {
                     feature: feature.id,
                     message: error.to_string(),
-                })?,
-            _ => feature.action.clone(),
+                })?
+        } else {
+            feature.action.clone()
         };
         let action = action
             .resolve_sketch_regions(
@@ -363,6 +369,7 @@ pub fn hydrate_model_document(
                 feature: feature.id,
                 error,
             })?;
+        let mut commands = Vec::new();
         let (association, report, output_snapshot) = match action {
             // A plane runs nothing on load: a saved document's planes are
             // where its recipes last resolved them, and the sketches drawn on
@@ -373,9 +380,23 @@ pub fn hydrate_model_document(
                 None,
             ),
             ReplayAction::Kernel(command) => {
+                commands.push(command.clone());
                 let outcome = execute_feature(feature.id, input, command, options.root_precision)?;
                 let association = association_from_report(&outcome.report);
                 (association, Some(outcome.report), Some(outcome.snapshot))
+            }
+            ReplayAction::KernelChain(chain) => {
+                let outcome = execute_chain(feature.id, input, &chain, options.root_precision)?;
+                commands = chain;
+                (
+                    SnapshotAssociation::new(
+                        input.id(),
+                        outcome.report.output_snapshot,
+                        outcome.report.semantic_digest,
+                    ),
+                    Some(outcome.report),
+                    Some(outcome.snapshot),
+                )
             }
             ReplayAction::TargetedKernel(targeted) => {
                 let ordered_reports = features
@@ -402,6 +423,7 @@ pub fn hydrate_model_document(
                         });
                     }
                 };
+                commands.push(command.clone());
                 let outcome = execute_feature(feature.id, input, command, options.root_precision)?;
                 let association = association_from_report(&outcome.report);
                 (association, Some(outcome.report), Some(outcome.snapshot))
@@ -460,6 +482,7 @@ pub fn hydrate_model_document(
             association,
             report,
             provenance,
+            commands,
         });
     }
 
@@ -488,6 +511,34 @@ fn execute_feature(
     };
     NativeKernel::execute(input, &request, &CancellationToken::new())
         .map_err(|error| DocumentHydrationError::Kernel { feature, error })
+}
+
+/// Runs a chain of kernel commands from `input`, each on the result of the
+/// one before, and returns the last outcome.
+pub fn execute_chain(
+    feature: FeatureId,
+    input: &Snapshot,
+    chain: &[artificer_protocol::KernelCommand],
+    root_precision: PrecisionPolicy,
+) -> Result<artificer_kernel::ExecutionOutcome, DocumentHydrationError> {
+    let (first, rest) = chain
+        .split_first()
+        .ok_or_else(|| DocumentHydrationError::Kernel {
+            feature,
+            error: KernelError {
+                code: artificer_protocol::KernelErrorCode::InvalidInput,
+                stage: artificer_protocol::KernelStage::Preflight,
+                input_snapshot: input.id(),
+                message: "a kernel chain holds no commands".into(),
+                diagnostics: Vec::new(),
+                details: BTreeMap::new(),
+            },
+        })?;
+    let mut outcome = execute_feature(feature, input, first.clone(), root_precision)?;
+    for command in rest {
+        outcome = execute_feature(feature, &outcome.snapshot, command.clone(), root_precision)?;
+    }
+    Ok(outcome)
 }
 
 fn association_from_report(report: &OperationReport) -> SnapshotAssociation {

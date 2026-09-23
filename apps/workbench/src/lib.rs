@@ -59,13 +59,14 @@ use artificer_model::{
     ComponentInstanceRecord, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef, DatumPlaneBase,
     DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, FeatureDraft, FeatureId, FeatureInput,
     FeatureKind, FeatureOutput, JointAxis, JointDraft, JointKind, JointOrigin, JointParent,
-    ModelDocument, OutputDraft, ParameterBinding, ParameterExposure, ParameterId,
-    ParameterMetadata, ParameterOverrides, ParameterSpec, ParameterType, ParameterUnit,
-    ParameterValue, QuantityKind, RebuildState, ReplayAction, ReplayDisposition,
-    ResolvedDatumPlane, RigidComponentPose, SketchId, SketchPayload, SketchRegionExtrusion,
-    SketchRegionExtrusionTarget, SketchRegionRecipeError, SketchSupportRecipe, SnapshotAssociation,
-    extrusion_frame_is_reversed, frame_moved_along_normal, plane_height_above_frame,
-    reflected_profile_across_u, reversed_extrusion_direction,
+    ModelDocument, OutputDraft, ParameterBinding, ParameterExposure, ParameterExpression,
+    ParameterId, ParameterMetadata, ParameterOverrides, ParameterSpec, ParameterType,
+    ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, RebuildState, ReplayAction,
+    ReplayDisposition, ResolvedDatumPlane, RigidComponentPose, SketchId, SketchPayload,
+    SketchRegionExtrusion, SketchRegionExtrusionTarget, SketchRegionRecipeError,
+    SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
+    format_parameter_binding, frame_moved_along_normal, parse_parameter_entry,
+    plane_height_above_frame, reflected_profile_across_u, reversed_extrusion_direction,
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
@@ -658,7 +659,7 @@ impl PendingOperation {
                 "Replace the current workspace from the verified native document file"
             }
             Self::SetParameterBindingEntry { .. } => {
-                "Set the variable and the variables written in terms of it; numbers already typed into sketches and features keep their values"
+                "Set the variable, the variables written in terms of it, and the extrusions whose distance follows it; numbers typed into sketches keep their values"
             }
             Self::RemoveParameter { .. } => {
                 "Delete the variable; a variable a feature or expression still uses is refused"
@@ -984,6 +985,28 @@ pub enum ExtrusionMode {
     Cut,
 }
 
+/// An extrusion distance typed as an expression over document variables.
+#[derive(Clone, Debug, PartialEq)]
+struct DistanceLink {
+    /// What was typed, shown back in the field.
+    text: String,
+    expression: ParameterExpression,
+    /// What the expression came to when it was typed, in millimetres.
+    value: f64,
+}
+
+/// The variables-panel unit a bare number in a length field is read in.
+const fn parameter_unit_for(unit: units::LengthUnit) -> ParameterUnit {
+    match unit {
+        units::LengthUnit::Micrometre => ParameterUnit::Micrometer,
+        units::LengthUnit::Millimetre => ParameterUnit::Millimeter,
+        units::LengthUnit::Centimetre => ParameterUnit::Centimeter,
+        units::LengthUnit::Metre => ParameterUnit::Meter,
+        units::LengthUnit::Inch => ParameterUnit::Inch,
+        units::LengthUnit::Foot => ParameterUnit::Foot,
+    }
+}
+
 /// What a committed extrusion records, beyond the one depth the kernel
 /// command carries: the side it was asked to grow, what it does to the body,
 /// the second side, and the persistent faces a side was told to reach.
@@ -991,6 +1014,8 @@ pub enum ExtrusionMode {
 pub struct ExtrusionRecord {
     /// The first side, signed: the sign is the direction the sweep goes.
     signed_distance: f64,
+    /// The variable expression the first side follows, if it follows one.
+    distance_expression: Option<ParameterExpression>,
     mode: ExtrusionMode,
     second_distance: Option<f64>,
     up_to_faces: [Option<PersistentRef>; 2],
@@ -2634,6 +2659,11 @@ pub struct KernelLabApp {
     variable_name_drafts: BTreeMap<u64, String>,
     /// Text typed into the extrusion distance expression field.
     extrusion_expression_draft: String,
+    /// The variable expression the extrusion's distance follows, when it was
+    /// typed as one (`length`, `depth * 2`), and the value it came to. The
+    /// link holds only while the distance is still that value: dragging or
+    /// typing a number over it lets it go.
+    extrusion_distance_link: Option<DistanceLink>,
     /// The Theme tab's colour editor window.
     theme_editor_open: bool,
     /// Where the theme choice and edited palettes are written; `None` in
@@ -2920,6 +2950,7 @@ impl Default for KernelLabApp {
             variable_value_drafts: BTreeMap::new(),
             variable_name_drafts: BTreeMap::new(),
             extrusion_expression_draft: String::new(),
+            extrusion_distance_link: None,
             theme_editor_open: false,
             theme_preferences_path: None,
             user_preferences_path: None,
@@ -4374,6 +4405,49 @@ impl KernelLabApp {
         // A new body reads its sign the same way a face feature does: which
         // side of the sketch plane the material goes on. Only zero is invalid.
         self.extrusion_distance.is_finite() && self.extrusion_distance.abs() > f64::EPSILON
+    }
+
+    /// The link a distance field's text makes, when the text names document
+    /// variables: `length`, `depth * 2 + 5mm`. A plain number makes none.
+    fn distance_link_for(&self, text: &str, value: f64) -> Option<DistanceLink> {
+        let names = self
+            .document
+            .parameters()
+            .records()
+            .iter()
+            .map(|record| (record.spec.key.clone(), record.id))
+            .collect::<BTreeMap<_, _>>();
+        match parse_parameter_entry(
+            text,
+            parameter_unit_for(self.length_unit()),
+            &|name: &str| names.get(name).copied(),
+        ) {
+            Ok(ParsedParameterEntry::Expression(expression))
+                if !expression.referenced_parameters().is_empty() =>
+            {
+                Some(DistanceLink {
+                    text: text.trim().to_owned(),
+                    expression,
+                    value,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The distance link, while the distance is still what it came to.
+    fn live_distance_link(&self, distance: f64) -> Option<&DistanceLink> {
+        self.extrusion_distance_link
+            .as_ref()
+            .filter(|link| (link.value - distance).abs() <= 1.0e-9)
+    }
+
+    /// Which variables the extrusion distance follows, as typed, while it
+    /// follows any.
+    #[must_use]
+    pub fn extrusion_distance_follows(&self) -> Option<&str> {
+        self.live_distance_link(self.extrusion_distance)
+            .map(|link| link.text.as_str())
     }
 
     fn set_extrusion_distance_intent(&mut self, distance: f64) {
@@ -6373,7 +6447,7 @@ impl KernelLabApp {
             .plan()
             .steps
             .iter()
-            .any(|step| matches!(step.action, ReplayAction::ParameterizedKernel(_)))
+            .any(|step| step.action.reads_parameters())
         {
             match self
                 .document
@@ -6451,10 +6525,10 @@ impl KernelLabApp {
                 return false;
             };
             let action = match step.action {
-                parameterized @ ReplayAction::ParameterizedKernel(_) => {
+                parameterized if parameterized.reads_parameters() => {
                     let parameters = evaluated_parameters
                         .as_ref()
-                        .expect("parameterized rebuild steps require evaluated parameters");
+                        .expect("rebuild steps that read parameters require evaluated parameters");
                     match parameterized.resolve_parameters(parameters) {
                         Ok(action) => action,
                         Err(error) => {
@@ -6531,12 +6605,13 @@ impl KernelLabApp {
             };
             enum RebuildDispatch {
                 Marker,
-                Command(KernelCommand),
+                Commands(Vec<KernelCommand>),
                 Boolean(artificer_model::BooleanFeatureRecipe),
             }
             let dispatch = match action {
                 ReplayAction::Marker | ReplayAction::DatumPlane(_) => RebuildDispatch::Marker,
-                ReplayAction::Kernel(command) => RebuildDispatch::Command(command),
+                ReplayAction::Kernel(command) => RebuildDispatch::Commands(vec![command]),
+                ReplayAction::KernelChain(chain) => RebuildDispatch::Commands(chain),
                 ReplayAction::TargetedKernel(targeted) => {
                     let ordered = self
                         .document
@@ -6550,7 +6625,7 @@ impl KernelLabApp {
                         .collect::<Vec<_>>();
                     match targeted.rebind(&ordered, input.id()) {
                         PersistentResolution::Resolved(command) => {
-                            RebuildDispatch::Command(command)
+                            RebuildDispatch::Commands(vec![command])
                         }
                         PersistentResolution::Missing(missing) => {
                             let message =
@@ -6578,22 +6653,29 @@ impl KernelLabApp {
                 }
                 ReplayAction::Boolean(recipe) => RebuildDispatch::Boolean(recipe),
             };
-            let association = if let RebuildDispatch::Command(command) = &dispatch {
-                self.request_serial = self.request_serial.saturating_add(1);
-                let request = ExecuteRequest {
-                    protocol_version: CURRENT_PROTOCOL_VERSION,
-                    request_id: RequestId::new(format!(
-                        "workbench-{}-rebuild-{}",
-                        self.request_serial,
-                        feature.get()
-                    )),
-                    expected_snapshot: input.id(),
-                    precision: input.precision_policy().unwrap_or_default(),
-                    command: command.clone(),
-                };
-                let outcome =
-                    match NativeKernel::execute(&input, &request, &CancellationToken::new()) {
-                        Ok(outcome) => outcome,
+            let association = if let RebuildDispatch::Commands(commands) = &dispatch {
+                // One command, or a library part's chain: each runs on the
+                // result of the one before.
+                let mut step_input = input.clone();
+                let mut last = None;
+                for command in commands {
+                    self.request_serial = self.request_serial.saturating_add(1);
+                    let request = ExecuteRequest {
+                        protocol_version: CURRENT_PROTOCOL_VERSION,
+                        request_id: RequestId::new(format!(
+                            "workbench-{}-rebuild-{}",
+                            self.request_serial,
+                            feature.get()
+                        )),
+                        expected_snapshot: step_input.id(),
+                        precision: step_input.precision_policy().unwrap_or_default(),
+                        command: command.clone(),
+                    };
+                    match NativeKernel::execute(&step_input, &request, &CancellationToken::new()) {
+                        Ok(outcome) => {
+                            step_input = outcome.snapshot.clone();
+                            last = Some(outcome);
+                        }
                         Err(error) => {
                             let message = format!("kernel replay failed: {error}");
                             let _ = transaction.record_failure(feature, message.clone());
@@ -6601,7 +6683,15 @@ impl KernelLabApp {
                             self.document_status = Some(format!("Rebuild rolled back: {message}"));
                             return false;
                         }
-                    };
+                    }
+                }
+                let Some(outcome) = last else {
+                    let message = "a kernel chain holds no commands".to_owned();
+                    let _ = transaction.record_failure(feature, message.clone());
+                    let _ = self.document.rollback_rebuild(transaction);
+                    self.document_status = Some(format!("Rebuild rolled back: {message}"));
+                    return false;
+                };
                 let feature_node = self.document.feature(feature);
                 let is_push_pull = feature_node.is_some_and(|node| {
                     matches!(
@@ -6642,7 +6732,7 @@ impl KernelLabApp {
                 reports.push((feature, outcome.report.clone()));
                 rebuilt_bodies.push(archived);
                 SnapshotAssociation::new(
-                    outcome.report.input_snapshot,
+                    input.id(),
                     outcome.report.output_snapshot,
                     outcome.report.semantic_digest,
                 )
@@ -7957,6 +8047,18 @@ impl KernelLabApp {
             }
             _ => ReplayAction::Kernel(command),
         };
+        // A distance typed as variables stays with them: the recipe carries
+        // the expression and the feature reads the variables it names.
+        let (action, parameters) = match (action, &record.distance_expression) {
+            (ReplayAction::SketchRegionExtrusion(recipe), Some(expression)) => {
+                let recipe = recipe
+                    .with_distance_expression(Some(expression.clone()))
+                    .map_err(|error| format!("invalid linked extrusion distance: {error}"))?;
+                let parameters = recipe.parameter_references();
+                (ReplayAction::SketchRegionExtrusion(recipe), parameters)
+            }
+            (action, _) => (action, BTreeSet::new()),
+        };
         let mut draft = FeatureDraft::new(
             kind,
             Self::next_document_feature_label(document, kind),
@@ -7999,6 +8101,9 @@ impl KernelLabApp {
         end_planes.dedup();
         for plane in end_planes {
             draft = draft.with_input(FeatureInput::Feature(plane));
+        }
+        for parameter in parameters {
+            draft = draft.with_parameter(parameter);
         }
         match mode {
             ExtrusionMode::NewBody => {
@@ -12121,6 +12226,10 @@ impl KernelLabApp {
                 };
                 let record = ExtrusionRecord {
                     signed_distance: distance,
+                    distance_expression: self
+                        .live_distance_link(distance)
+                        .filter(|_| up_to_faces[0].is_none() && up_to_planes[0].is_none())
+                        .map(|link| link.expression.clone()),
                     mode: record_mode,
                     second_distance,
                     up_to_faces: up_to_faces.map(|face| {
@@ -12177,6 +12286,10 @@ impl KernelLabApp {
                 self.clear_transform_preview();
                 self.pending_operation = None;
                 self.selected_faces.clear();
+                // So does the variable the distance followed: the next
+                // extrusion starts from a plain number.
+                self.extrusion_distance_link = None;
+                self.extrusion_expression_draft.clear();
                 // The extents belonged to the extrusion that just committed,
                 // and the recipe carries them now. Leaving them set handed the
                 // next extrusion a face it never asked for, which then
@@ -16804,6 +16917,32 @@ impl KernelLabApp {
     /// Puts the editor's own fields where the recipe says the feature stands.
     fn seed_extrusion_editor_from_recipe(&mut self, recipe: &SketchRegionExtrusion) {
         self.extrusion_distance = recipe.distance;
+        // A distance that follows variables reopens as the expression, so
+        // confirming the edit keeps the link rather than freezing a number.
+        self.extrusion_distance_link = recipe.distance_expression.as_ref().map(|expression| {
+            let names = self
+                .document
+                .parameters()
+                .records()
+                .iter()
+                .map(|record| (record.id, record.spec.key.clone()))
+                .collect::<BTreeMap<_, _>>();
+            DistanceLink {
+                text: format_parameter_binding(
+                    &ParameterBinding::Expression {
+                        expression: expression.clone(),
+                    },
+                    &|id| names.get(&id).cloned(),
+                ),
+                expression: expression.clone(),
+                value: recipe.distance,
+            }
+        });
+        self.extrusion_expression_draft = self
+            .extrusion_distance_link
+            .as_ref()
+            .map(|link| link.text.clone())
+            .unwrap_or_default();
         self.extrusion_draft_degrees = recipe.draft_degrees;
         self.extrusion_second_distance = recipe.second_distance;
         self.extrusion_symmetric = recipe
@@ -16939,6 +17078,9 @@ impl KernelLabApp {
         let mut edited = original.clone();
         edited.distance = self.extrusion_distance;
         edited.draft_degrees = self.extrusion_draft_degrees;
+        edited.distance_expression = self
+            .live_distance_link(self.extrusion_distance)
+            .map(|link| link.expression.clone());
         edited.second_distance = self
             .extrusion_second_distance
             .filter(|_| self.sketch_support.target_face().is_none());
@@ -16961,10 +17103,18 @@ impl KernelLabApp {
         if !regions.is_empty() {
             edited.regions = regions;
         }
+        if edited.up_to_face.is_some() || edited.up_to_plane.is_some() {
+            // A side that ends at a face has no distance to follow.
+            edited.distance_expression = None;
+        }
         if let Err(error) = edited.validate() {
             self.document_status = Some(format!("That change is not a valid extrusion: {error}"));
             return;
         }
+        let parameter_inputs = edited
+            .parameter_references()
+            .into_iter()
+            .collect::<Vec<_>>();
 
         self.pending_operation = None;
         self.reset_extrusion_extents();
@@ -16989,10 +17139,13 @@ impl KernelLabApp {
                     })
             })
             .unwrap_or_default();
-        match self.document.replace_feature_action_and_inputs(
+        self.extrusion_distance_link = None;
+        self.extrusion_expression_draft.clear();
+        match self.document.replace_feature_recipe(
             feature,
             ReplayAction::SketchRegionExtrusion(edited),
             inputs,
+            parameter_inputs,
         ) {
             Ok(_) => {
                 self.move_history_cursor(self.document.features().len());
@@ -20172,7 +20325,8 @@ impl KernelLabApp {
             }
             // The same field, written as arithmetic over document variables:
             // `depth`, `plate_width / 2`. Evaluated on Enter into the drag
-            // value above, so what commits is always a plain number.
+            // value above; an entry that names variables stays linked to
+            // them, so the extrusion follows when they change.
             let expression = ui.add(
                 egui::TextEdit::singleline(&mut self.extrusion_expression_draft)
                     .desired_width(ui.available_width().min(190.0))
@@ -20185,6 +20339,15 @@ impl KernelLabApp {
                     "Extrusion distance expression",
                 )
             });
+            if let Some(follows) = self.extrusion_distance_follows() {
+                ui.label(
+                    RichText::new(format!(
+                        "Follows {follows} · changing the variable rebuilds this extrusion"
+                    ))
+                    .small()
+                    .color(theme::accent()),
+                );
+            }
             if expression.lost_focus() && !self.extrusion_expression_draft.trim().is_empty() {
                 match self
                     .sketch
@@ -20192,6 +20355,8 @@ impl KernelLabApp {
                 {
                     Some(value) if (-1_000.0..=1_000.0).contains(&value) => {
                         self.extrusion_distance = value;
+                        self.extrusion_distance_link =
+                            self.distance_link_for(&self.extrusion_expression_draft, value);
                         intent_changed = true;
                     }
                     Some(value) => {

@@ -206,9 +206,10 @@ impl KernelLabApp {
                 ui.label(
                     RichText::new(
                         "A variable can be an expression over others, such as width * 2 + 5mm, \
-                         and follows them when they change. Typed into a sketch dimension or a \
-                         feature's value, a name is read once: the field keeps the number it \
-                         gave, and changing the variable later does not move it.",
+                         and follows them when they change. An extrusion distance typed as a \
+                         variable follows it too, and rebuilds when it changes. Typed into a \
+                         sketch dimension, a name is read once: the dimension keeps the number \
+                         it gave.",
                     )
                     .small()
                     .color(theme::muted()),
