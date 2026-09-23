@@ -7737,6 +7737,14 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
             "REVOLVE_SECTION_NOT_CONTIGUOUS",
             "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",
         ),
+        revolve::RevolveInputError::PinchedOnAxis => (
+            "REVOLVE_PROFILE_PINCHED_ON_AXIS",
+            "The profile touches the axis at a single point, a corner or a curve's tangency, rather than along an edge on it; turned, the solid would be pinched to a point there. Run the profile along the axis where it meets it, or keep it clear of the axis.",
+        ),
+        revolve::RevolveInputError::ArcCentreAcrossAxis => (
+            "REVOLVE_ARC_CENTRE_ACROSS_AXIS",
+            "An arc in the profile is centred on the far side of the axis; turned, it would be the inner part of a self-crossing torus, a surface outside the certified domain. Use an arc centred on the profile's side of the axis, or on it.",
+        ),
         revolve::RevolveInputError::AngleInvalid => (
             "REVOLVE_ANGLE_INVALID",
             "A partial revolve turns through more than nothing and less than a full turn, from a start within one turn, and both the turn and the gap it leaves must be wider than the minimum feature at the profile's outermost radius; use a full turn to close the gap.",

@@ -29,7 +29,7 @@ use artificer_protocol::{PlanarAxis2, RevolveAngle};
 use crate::analytic_extrusion::{Segment, topology_loop_segments};
 use crate::loop_offset::{LoopOffsetError, ReflexPolicy, mitred_inward_offset};
 use crate::section_revolve::{extract_rz_section, wedge_direction};
-use crate::topology::{Plane, Point2, Point3, Surface, Topology, Vector3};
+use crate::topology::{Face, Plane, Point2, Point3, Surface, Topology, Vector3};
 
 /// Why a shell was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,6 +464,46 @@ enum Run {
     Axis,
 }
 
+/// The radii a cap square to the axis spans: out to its farthest boundary
+/// point, and in to its nearest — a hole's rim, or the axis for a disc. A
+/// full turn's disc has only its rim on its boundary, all at one radius, so
+/// it reaches in to the axis.
+fn cap_radial_span(
+    topology: &Topology,
+    face: &Face,
+    center: Point3,
+    axis: Vector3,
+    partial: bool,
+) -> Option<(f64, f64)> {
+    let Surface::Plane(plane) = face.surface else {
+        return None;
+    };
+    let radii = |loop_key| -> Option<Vec<f64>> {
+        let loop_record = topology.loop_record(loop_key)?;
+        let mut radii = Vec::new();
+        for coedge_key in &loop_record.value.coedges {
+            let coedge = topology.coedge(*coedge_key)?.value;
+            for point in coedge.pcurve_endpoints() {
+                let offset = plane.origin + plane.u * point.x + plane.v * point.y - center;
+                radii.push((offset - axis * offset.dot(axis)).length());
+            }
+        }
+        Some(radii)
+    };
+    let outer_radii = radii(face.outer_loop)?;
+    let outer = outer_radii.iter().copied().fold(0.0_f64, f64::max);
+    let nearest = outer_radii.iter().copied().fold(outer, f64::min);
+    let mut inner = if !partial && outer - nearest <= 1.0e-9 * outer.max(1.0) {
+        0.0
+    } else {
+        nearest
+    };
+    for hole in &face.inner_loops {
+        inner = radii(*hole)?.into_iter().fold(inner, f64::max);
+    }
+    Some((inner, outer))
+}
+
 /// The revolved reading: the section offset one wall inward and turned
 /// about the same axis, as the core to take away.
 ///
@@ -507,7 +547,9 @@ fn plan_revolved_shell(
             return Err(ShellError::OpenFacesUnsupported);
         }
         if plane.normal.cross(axis).length() <= agreement * length {
-            heights.push((plane.origin - center).dot(axis));
+            let span = cap_radial_span(topology, face, center, axis, partial)
+                .ok_or(ShellError::OpenFacesUnsupported)?;
+            heights.push(((plane.origin - center).dot(axis), span));
             continue;
         }
         // A wedge face holds the axis. Which of the two it is shows in the
@@ -549,24 +591,28 @@ fn plan_revolved_shell(
         return Err(ShellError::BlendUnsupported);
     }
 
+    // A cap run opens when an open face stands at its height and over its
+    // span of radii: two caps at one height, a disc and a ring about a
+    // groove, are two faces, and opening one leaves the other a wall.
     let mut runs: Vec<(Segment, Run)> = Vec::with_capacity(section.segments().len() + 1);
-    let mut opened = 0;
+    let mut matched = vec![false; heights.len()];
     for segment in section.segments() {
-        let cap_height = match segment {
-            Segment::Line { start, end } if (start.y - end.y).abs() <= agreement => Some(start.y),
-            _ => None,
-        };
-        let open = cap_height.is_some_and(|height| {
-            heights
-                .iter()
-                .any(|wanted| (wanted - height).abs() <= agreement)
-        });
-        if open {
-            opened += 1;
+        let mut open = false;
+        if let Segment::Line { start, end } = segment
+            && (start.y - end.y).abs() <= agreement
+        {
+            let (inner, outer) = (start.x.min(end.x), start.x.max(end.x));
+            for (index, (height, (face_inner, face_outer))) in heights.iter().enumerate() {
+                let overlap = outer.min(*face_outer) - inner.max(*face_inner);
+                if (height - start.y).abs() <= agreement && overlap > agreement {
+                    matched[index] = true;
+                    open = true;
+                }
+            }
         }
         runs.push((*segment, if open { Run::Open } else { Run::Wall }));
     }
-    if opened < heights.len() {
+    if matched.contains(&false) {
         return Err(ShellError::OpenFacesUnsupported);
     }
 
