@@ -7,6 +7,7 @@
 mod arrangement;
 mod constraints;
 mod definition;
+pub mod expression;
 mod geometry;
 mod ids;
 mod intersections;

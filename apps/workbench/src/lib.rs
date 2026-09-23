@@ -22647,15 +22647,15 @@ impl eframe::App for KernelLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sketch_dimension_keys = DimensionKeyClaims::default();
         // Dimension and recipe fields accept document variables by name, so
-        // the canvas carries the current evaluated table, with lengths in the
-        // document unit so that `plate_width / 2` means what `40 / 2` does.
+        // the canvas carries the current evaluated table, canonical and
+        // knowing what each value measures.
         let unit = self.length_unit();
         self.sketch.set_length_unit(unit);
         self.part_library.set_length_unit(unit);
         let named_values = if self.document.parameters().is_empty() {
             BTreeMap::new()
         } else {
-            self.evaluated_variable_values(unit)
+            self.evaluated_variable_values()
         };
         self.sketch.set_named_values(named_values);
         let operation_at_frame_start = self.pending_operation;

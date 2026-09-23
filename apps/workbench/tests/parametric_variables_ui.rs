@@ -64,9 +64,9 @@ fn create_length_variable(harness: &mut Harness<'static, KernelLabApp>) {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
+            .evaluated_variable_values()
             .get("Length1")
-            .copied(),
+            .map(|value| value.canonical),
         Some(10.0),
         "a confirmed new length starts at its 10 mm default"
     );
@@ -87,9 +87,9 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
+            .evaluated_variable_values()
             .get("Length1")
-            .copied(),
+            .map(|value| value.canonical),
         Some(25.0)
     );
 
@@ -101,9 +101,9 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     assert_eq!(
         harness
             .state()
-            .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre)
+            .evaluated_variable_values()
             .get("Length2")
-            .copied(),
+            .map(|value| value.canonical),
         Some(55.0),
         "expressions evaluate through the typed parameter table"
     );
@@ -111,11 +111,12 @@ fn variables_are_created_valued_and_derived_through_the_panel() {
     // Renaming the source re-renders the derived expression by its new name
     // and keeps evaluating: references are by identity, not by text.
     replace_text_input(&mut harness, "Variable name Length1", "depth");
-    let values = harness
-        .state()
-        .evaluated_variable_values(artificer_workbench::DisplayLengthUnit::Millimetre);
-    assert_eq!(values.get("depth").copied(), Some(25.0));
-    assert_eq!(values.get("Length2").copied(), Some(55.0));
+    let values = harness.state().evaluated_variable_values();
+    assert_eq!(values.get("depth").map(|value| value.canonical), Some(25.0));
+    assert_eq!(
+        values.get("Length2").map(|value| value.canonical),
+        Some(55.0)
+    );
 }
 
 /// The point of the whole feature: a sketch dimension driven by a variable's
@@ -165,5 +166,64 @@ fn a_sketch_dimension_accepts_a_variable_expression() {
     assert_eq!(
         width, "20",
         "depth * 2 with depth = 10 mm must commit 20 mm"
+    );
+}
+
+/// An angle variable is an angle wherever it is typed. A new angle variable
+/// is 45°; typed by name into a line's angle box it must give 45°, not the
+/// 0.785 radians it is stored as.
+#[test]
+fn an_angle_variable_fills_a_sketch_angle_box_in_degrees() {
+    let mut harness = harness();
+    harness.run();
+    click_button(&mut harness, "Parametric ribbon tab");
+    click_button(&mut harness, "New angle variable");
+    click_button(&mut harness, CONFIRM_OPERATION);
+    replace_text_input(&mut harness, "Variable name Angle1", "tilt");
+    let tilt = harness.state().evaluated_variable_values()["tilt"];
+    assert!((tilt.canonical - 45.0_f64.to_radians()).abs() < 1.0e-12);
+
+    click_button(&mut harness, "XY Plane");
+    click_button(&mut harness, "Sketch mode");
+    assert_eq!(harness.state().workbench_mode(), WorkbenchMode::Sketch);
+    click_button(&mut harness, "Single line");
+    assert_eq!(harness.state().active_sketch_tool_label(), "Single line");
+    let viewport = harness.get_by_label("Sketch viewport").rect();
+    let start = harness
+        .state()
+        .sketch_point_screen_position(viewport, SketchPoint::new(0.0, 0.0));
+    click_at(&mut harness, start);
+    let towards = harness
+        .state()
+        .sketch_point_screen_position(viewport, SketchPoint::new(2.0, 0.5));
+    harness.hover_at(towards);
+    harness.step();
+    harness.step();
+
+    // Tab walks the draft's boxes: the length first, then the angle.
+    for (label, value) in [("Line length", "3"), ("Line angle", "tilt")] {
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        let field = harness.get_by_role_and_label(Role::TextInput, label);
+        assert!(field.is_focused(), "{label} should hold the caret");
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness
+            .get_by_role_and_label(Role::TextInput, label)
+            .type_text(value);
+        harness.run();
+    }
+    assert_eq!(harness.state().sketch_dimension_error(), None);
+    let angle = harness
+        .state()
+        .sketch_dimension_readouts()
+        .into_iter()
+        .find(|readout| {
+            readout.kind == artificer_workbench::sketch::SketchDimensionKind::AngleDegrees
+        })
+        .expect("the line draft shows its angle");
+    assert!(
+        (angle.value - 45.0).abs() < 1.0e-9,
+        "tilt must read as 45°, got {}",
+        angle.value
     );
 }

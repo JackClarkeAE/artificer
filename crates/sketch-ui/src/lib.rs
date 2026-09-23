@@ -21,6 +21,7 @@ use artificer_protocol::{
     MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES, MAX_PLANAR_PROFILE_LOOPS,
     MAX_PLANAR_PROFILE_REGIONS, PlanarProfile2, PrecisionPolicy,
 };
+use artificer_sketch::expression::{FieldUnit, NamedQuantity, evaluate_entry};
 use artificer_sketch::{
     Angle as CoreAngle, ArrangementCell as CoreArrangementCell,
     ArrangementDiagnostic as CoreArrangementDiagnostic, ArrangementLimits as CoreArrangementLimits,
@@ -1792,6 +1793,11 @@ impl RetainedRecipeParameter {
 
     const fn is_text(&self) -> bool {
         matches!(self.domain, ToolNumberDomain::Text)
+    }
+
+    /// Whether the value is an angle, shown and read in degrees.
+    fn is_angle(&self) -> bool {
+        self.unit == "°"
     }
 
     fn view(&self) -> SelectedRecipeParameter {
@@ -3865,201 +3871,52 @@ fn dimension_phase_accepts_geometry(phase: DimensionPhase, geometry: SketchGeome
     )
 }
 
-/// Evaluates a plain arithmetic entry over named document variables.
-///
-/// The grammar mirrors the parametric table's textual form minus units:
-/// numbers, names, `+ - * /`, parentheses, unary minus. Everything here is a
-/// bare magnitude — lengths in millimetres — because that is what dimension
-/// fields hold. Returns `None` for anything that fails to parse or divide.
-fn evaluate_named_expression(text: &str, names: &BTreeMap<String, f64>) -> Option<f64> {
-    struct Evaluator<'entry> {
-        tokens: Vec<NamedToken>,
-        cursor: usize,
-        names: &'entry BTreeMap<String, f64>,
-    }
-    #[derive(Clone, Debug, PartialEq)]
-    enum NamedToken {
-        Number(f64),
-        Name(String),
-        Plus,
-        Minus,
-        Star,
-        Slash,
-        Open,
-        Close,
-    }
-    fn tokenize(text: &str) -> Option<Vec<NamedToken>> {
-        let mut tokens = Vec::new();
-        let mut characters = text.chars().peekable();
-        while let Some(&character) = characters.peek() {
-            match character {
-                ' ' | '\t' => {
-                    characters.next();
-                }
-                '+' => {
-                    characters.next();
-                    tokens.push(NamedToken::Plus);
-                }
-                '-' => {
-                    characters.next();
-                    tokens.push(NamedToken::Minus);
-                }
-                '*' => {
-                    characters.next();
-                    tokens.push(NamedToken::Star);
-                }
-                '/' => {
-                    characters.next();
-                    tokens.push(NamedToken::Slash);
-                }
-                '(' => {
-                    characters.next();
-                    tokens.push(NamedToken::Open);
-                }
-                ')' => {
-                    characters.next();
-                    tokens.push(NamedToken::Close);
-                }
-                '0'..='9' | '.' => {
-                    let mut digits = String::new();
-                    while let Some(&digit) = characters.peek() {
-                        if digit.is_ascii_digit() || digit == '.' {
-                            digits.push(digit);
-                            characters.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    // An exponent: `1e3`, `2.5E-2`. The `e` belongs to the
-                    // number only when a digit follows it, directly or after
-                    // one sign; otherwise it starts a name as it always did.
-                    if let Some(&marker) = characters.peek()
-                        && matches!(marker, 'e' | 'E')
-                    {
-                        let mut ahead = characters.clone();
-                        ahead.next();
-                        let sign = ahead.next_if(|piece| *piece == '+' || *piece == '-');
-                        if ahead.peek().is_some_and(char::is_ascii_digit) {
-                            digits.push(marker);
-                            characters.next();
-                            if let Some(sign) = sign {
-                                digits.push(sign);
-                                characters.next();
-                            }
-                            while let Some(&piece) = characters.peek() {
-                                if piece.is_ascii_digit() {
-                                    digits.push(piece);
-                                    characters.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    tokens.push(NamedToken::Number(digits.parse().ok()?));
-                }
-                letter if letter.is_alphabetic() || letter == '_' => {
-                    let mut name = String::new();
-                    while let Some(&piece) = characters.peek() {
-                        if piece.is_alphanumeric() || piece == '_' {
-                            name.push(piece);
-                            characters.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    tokens.push(NamedToken::Name(name));
-                }
-                _ => return None,
-            }
-        }
-        Some(tokens)
-    }
-    impl Evaluator<'_> {
-        fn expression(&mut self) -> Option<f64> {
-            let mut left = self.term()?;
-            loop {
-                match self.tokens.get(self.cursor) {
-                    Some(NamedToken::Plus) => {
-                        self.cursor += 1;
-                        left += self.term()?;
-                    }
-                    Some(NamedToken::Minus) => {
-                        self.cursor += 1;
-                        left -= self.term()?;
-                    }
-                    _ => return Some(left),
-                }
-            }
-        }
-        fn term(&mut self) -> Option<f64> {
-            let mut left = self.factor()?;
-            loop {
-                match self.tokens.get(self.cursor) {
-                    Some(NamedToken::Star) => {
-                        self.cursor += 1;
-                        left *= self.factor()?;
-                    }
-                    Some(NamedToken::Slash) => {
-                        self.cursor += 1;
-                        let divisor = self.factor()?;
-                        left /= divisor;
-                    }
-                    _ => return Some(left),
-                }
-            }
-        }
-        fn factor(&mut self) -> Option<f64> {
-            let token = self.tokens.get(self.cursor)?.clone();
-            self.cursor += 1;
-            match token {
-                NamedToken::Minus => Some(-self.factor()?),
-                NamedToken::Plus => self.factor(),
-                NamedToken::Number(value) => Some(value),
-                NamedToken::Name(name) => self.names.get(&name).copied(),
-                NamedToken::Open => {
-                    let inner = self.expression()?;
-                    match self.tokens.get(self.cursor) {
-                        Some(NamedToken::Close) => {
-                            self.cursor += 1;
-                            Some(inner)
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-    }
-    let tokens = tokenize(text)?;
-    // A bare number is not this evaluator's business, and an entry with no
-    // name in it gains nothing from it either; requiring a name keeps plain
-    // typo'd numbers reporting "not a number" rather than evaluating oddly.
-    if !tokens
-        .iter()
-        .any(|token| matches!(token, NamedToken::Name(_)))
-    {
-        return None;
-    }
-    let mut evaluator = Evaluator {
-        tokens,
-        cursor: 0,
-        names,
-    };
-    let value = evaluator.expression()?;
-    (evaluator.cursor == evaluator.tokens.len() && value.is_finite()).then_some(value)
+/// Evaluates an entry that names document variables, with the grammar every
+/// numeric field shares ([`artificer_sketch::expression`]), for a field of
+/// `field`'s unit. The answer is canonical — millimetres for a length,
+/// radians for an angle, the number itself otherwise — and `None` stands for
+/// an entry that does not read, names nothing defined, or mixes units.
+fn evaluate_named_expression(
+    text: &str,
+    names: &BTreeMap<String, NamedQuantity>,
+    field: FieldUnit,
+) -> Option<f64> {
+    evaluate_entry(text, field, &|name| names.get(name).copied()).ok()
+}
+
+/// Reads a length entry: a number in `unit` or in the unit it carries, or an
+/// expression over named variables whose bare terms are in `unit`. Returns
+/// millimetres.
+fn parse_length_entry(
+    unit: LengthUnit,
+    text: &str,
+    names: &BTreeMap<String, NamedQuantity>,
+) -> Result<f64, LengthParseError> {
+    unit.parse_entry(text, |text| {
+        evaluate_named_expression(text, names, FieldUnit::length(unit.millimetres_per_unit()))
+    })
+}
+
+/// Reads an angle entry in degrees: a plain number, or an expression over
+/// named variables whose bare terms are degrees — an angle variable counts
+/// as the angle it is, whatever unit it was defined in. Returns degrees.
+fn parse_degrees_entry(text: &str, names: &BTreeMap<String, NamedQuantity>) -> Option<f64> {
+    let text = text.trim();
+    text.parse::<f64>().ok().or_else(|| {
+        evaluate_named_expression(text, names, FieldUnit::degrees()).map(f64::to_degrees)
+    })
 }
 
 /// What a typed dimension is read against: the document variables it may
 /// name, and the unit a bare length is in.
 #[derive(Clone, Copy)]
 struct DimensionEntry<'a> {
-    names: &'a BTreeMap<String, f64>,
+    names: &'a BTreeMap<String, NamedQuantity>,
     unit: LengthUnit,
 }
 
 #[cfg(test)]
-static NO_NAMED_VALUES: BTreeMap<String, f64> = BTreeMap::new();
+static NO_NAMED_VALUES: BTreeMap<String, NamedQuantity> = BTreeMap::new();
 
 #[cfg(test)]
 impl DimensionEntry<'static> {
@@ -4084,14 +3941,9 @@ fn parse_dimension_value(
     // An angle is degrees, typed or computed. A length is read in the
     // entry's unit, or the unit it carries, and comes back in millimetres.
     let value = if kind.is_angle() {
-        text.parse::<f64>().map_or_else(
-            |_| evaluate_named_expression(text, entry.names).ok_or(DimensionInputError::NotANumber),
-            Ok,
-        )?
+        parse_degrees_entry(text, entry.names).ok_or(DimensionInputError::NotANumber)?
     } else {
-        entry
-            .unit
-            .parse_entry(text, |text| evaluate_named_expression(text, entry.names))
+        parse_length_entry(entry.unit, text, entry.names)
             .map_err(|_| DimensionInputError::NotANumber)?
     };
     if !value.is_finite() {
@@ -5621,7 +5473,7 @@ pub struct SketchCanvasState {
     /// (millimetres for lengths). Dimension and recipe fields accept these
     /// names in arithmetic entries: `width`, `width / 2 + 5`. The workbench
     /// refreshes the map from the document's parameter table.
-    named_values: BTreeMap<String, f64>,
+    named_values: BTreeMap<String, NamedQuantity>,
 }
 
 impl Default for SketchCanvasState {
@@ -6231,26 +6083,23 @@ impl SketchCanvasState {
 
     /// Publishes the document's evaluated variables for numeric entries: a
     /// dimension box or recipe field can then name them in arithmetic, so a
-    /// rectangle's width can be `plate_width / 2`. Lengths arrive in the
-    /// canvas's length unit, so that arithmetic means what a typed number
-    /// beside it means; angles are degrees.
-    pub fn set_named_values(&mut self, values: BTreeMap<String, f64>) {
+    /// rectangle's width can be `plate_width / 2`. Each value is canonical —
+    /// millimetres for a length, radians for an angle — and says what it
+    /// measures, so an angle variable in an angle box reads as the angle it
+    /// is and a length in an angle box is refused rather than misread.
+    pub fn set_named_values(&mut self, values: BTreeMap<String, NamedQuantity>) {
         if self.named_values != values {
             self.named_values = values;
         }
     }
 
-    /// Evaluates one numeric entry over the published document variables —
-    /// the same arithmetic the dimension boxes accept. A bare number, or an
-    /// expression's answer, is in the canvas's length unit; a suffix names
-    /// its own unit; millimetres come back.
+    /// Evaluates one length entry over the published document variables —
+    /// the same arithmetic the dimension boxes accept. A bare number, or a
+    /// bare term in an expression, is in the canvas's length unit; a suffix
+    /// names its own unit; millimetres come back.
     #[must_use]
     pub fn evaluate_value_entry(&self, text: &str) -> Option<f64> {
-        self.length_unit
-            .parse_entry(text, |text| {
-                evaluate_named_expression(text, &self.named_values)
-            })
-            .ok()
+        parse_length_entry(self.length_unit, text, &self.named_values).ok()
     }
 
     /// Publishes the sketch support's analytic curves as snap references.
@@ -6833,14 +6682,17 @@ impl SketchCanvasState {
             // length is read in the document unit, or the unit it carries,
             // and judged in millimetres.
             let evaluated = if parameter.length {
-                unit.parse_entry(&parameter.text, |text| {
-                    evaluate_named_expression(text, named_values)
-                })
-                .map_err(tool_input_error_for_length)
-                .and_then(|millimetres| validate_tool_value(millimetres, domain))
+                parse_length_entry(unit, &parameter.text, named_values)
+                    .map_err(tool_input_error_for_length)
+                    .and_then(|millimetres| validate_tool_value(millimetres, domain))
             } else {
                 validate_tool_number(&parameter.text, domain).or_else(|error| {
-                    evaluate_named_expression(&parameter.text, named_values)
+                    let named = if parameter.is_angle() {
+                        parse_degrees_entry(&parameter.text, named_values)
+                    } else {
+                        evaluate_named_expression(&parameter.text, named_values, FieldUnit::SCALAR)
+                    };
+                    named
                         .ok_or(error)
                         .and_then(|value| validate_tool_value(value, domain))
                 })
@@ -22074,6 +21926,7 @@ mod tests {
 #[cfg(test)]
 mod length_unit_tests {
     use super::*;
+    use artificer_sketch::expression::Dimension;
 
     #[test]
     fn a_value_entry_is_read_in_the_canvas_unit_unless_it_says_otherwise() {
@@ -22083,10 +21936,94 @@ mod length_unit_tests {
         assert_eq!(state.evaluate_value_entry("1"), Some(25.4));
         assert_eq!(state.evaluate_value_entry("10mm"), Some(10.0));
         assert_eq!(state.evaluate_value_entry("1e-1"), Some(2.54));
-        // Variables are published in the canvas unit, so arithmetic on them
-        // means the same as arithmetic on a typed number.
-        state.set_named_values(BTreeMap::from([("width".to_owned(), 2.0)]));
-        assert_eq!(state.evaluate_value_entry("width / 2"), Some(25.4));
+        // Variables are published canonical, in millimetres; a bare term
+        // beside one is in the canvas unit, a bare factor is a number.
+        state.set_named_values(BTreeMap::from([(
+            "width".to_owned(),
+            NamedQuantity {
+                canonical: 50.8,
+                dimension: Dimension::LENGTH,
+            },
+        )]));
+        for (entry, millimetres) in [
+            ("width / 2", 25.4),
+            ("width + 1", 76.2),
+            ("width + 5mm", 55.8),
+        ] {
+            let value = state.evaluate_value_entry(entry).expect(entry);
+            assert!((value - millimetres).abs() < 1.0e-9, "{entry}: {value}");
+        }
+    }
+
+    fn document_variables() -> BTreeMap<String, NamedQuantity> {
+        BTreeMap::from([
+            (
+                "depth".to_owned(),
+                NamedQuantity {
+                    canonical: 20.0,
+                    dimension: Dimension::LENGTH,
+                },
+            ),
+            (
+                "tilt".to_owned(),
+                NamedQuantity {
+                    canonical: 45.0_f64.to_radians(),
+                    dimension: Dimension::ANGLE,
+                },
+            ),
+        ])
+    }
+
+    /// An angle variable is an angle, not a number of radians: in a degree
+    /// box it reads as the degrees it is, and it cannot stand in for a
+    /// length.
+    #[test]
+    fn an_angle_variable_reads_as_its_angle_in_a_degree_box() {
+        let names = document_variables();
+        let entry = DimensionEntry {
+            names: &names,
+            unit: LengthUnit::Millimetre,
+        };
+        let degrees = parse_dimension_value(SketchDimensionKind::AngleDegrees, "tilt", entry)
+            .expect("an angle variable fills an angle box");
+        assert!((degrees - 45.0).abs() < 1.0e-9, "{degrees}");
+        let degrees =
+            parse_dimension_value(SketchDimensionKind::AngleDegrees, "tilt / 3 + 15", entry)
+                .expect("bare terms beside an angle are degrees");
+        assert!((degrees - 30.0).abs() < 1.0e-9, "{degrees}");
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "tilt", entry),
+            Err(DimensionInputError::NotANumber),
+            "an angle is not a length"
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::AngleDegrees, "depth", entry),
+            Err(DimensionInputError::NotANumber),
+            "a length is not an angle"
+        );
+    }
+
+    /// Units written in an expression mean what they say, as they do in the
+    /// Variables panel: `depth + 5mm` is 25 mm in an inch document.
+    #[test]
+    fn a_unit_written_in_an_expression_is_honoured() {
+        let names = document_variables();
+        let inches = DimensionEntry {
+            names: &names,
+            unit: LengthUnit::Inch,
+        };
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth + 5mm", inches),
+            Ok(25.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth * 2", inches),
+            Ok(40.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth + 1", inches),
+            Ok(45.4)
+        );
     }
 
     #[test]

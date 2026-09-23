@@ -244,10 +244,12 @@ impl LengthUnit {
     }
 
     /// Reads a typed entry that is either a number with an optional unit
-    /// symbol, or anything else `evaluate` can turn into a number in this
-    /// unit: an arithmetic expression, a variable name. Returns millimetres.
-    /// The error is the one the number reading gave, so a bad expression is
-    /// reported as the not-a-number it also is.
+    /// symbol, or anything else `evaluate` can turn into millimetres: an
+    /// arithmetic expression, a variable name. Returns millimetres. The
+    /// evaluator is told nothing of this unit; it reads bare numbers in it
+    /// itself, since whether `2` in `width * 2` is two inches or a factor of
+    /// two is the grammar's call. The error is the one the number reading
+    /// gave, so a bad expression is reported as the not-a-number it also is.
     pub fn parse_entry(
         self,
         text: &str,
@@ -258,7 +260,6 @@ impl LengthUnit {
             Err(LengthParseError::Empty) => Err(LengthParseError::Empty),
             Err(error) => evaluate(text.trim())
                 .filter(|value| value.is_finite())
-                .map(|value| self.to_millimetres(value))
                 .ok_or(error),
         }
     }
@@ -449,10 +450,10 @@ mod readout_and_entry_tests {
         };
         assert_eq!(LengthUnit::Inch.parse_entry("2", evaluate), Ok(50.8));
         assert_eq!(LengthUnit::Inch.parse_entry("10mm", evaluate), Ok(10.0));
-        // The expression's answer is in the field's unit, like a bare number.
+        // The evaluator answers in millimetres.
         assert_eq!(
             LengthUnit::Inch.parse_entry("width / 2", evaluate),
-            Ok(508.0)
+            Ok(20.0)
         );
         assert_eq!(
             LengthUnit::Inch.parse_entry("", evaluate),

@@ -13,6 +13,7 @@ use artificer_model::{
     ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, QuantityValue,
     format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
+use artificer_sketch::expression::{Dimension, NamedQuantity};
 use eframe::egui;
 use egui::{Frame, Margin, RichText, Stroke};
 
@@ -111,16 +112,12 @@ impl KernelLabApp {
         }
     }
 
-    /// Every variable name with its evaluated canonical value in millimetres,
-    /// radians, or a bare scalar — the lookup sketch dimension fields consume.
-    #[must_use]
     /// The evaluated variables by name, for the sketch canvas's arithmetic:
-    /// lengths in `unit`, so a variable and a typed number beside it mean
-    /// the same thing; angles and scalars as evaluated.
-    pub fn evaluated_variable_values(
-        &self,
-        unit: crate::units::LengthUnit,
-    ) -> std::collections::BTreeMap<String, f64> {
+    /// each canonical — millimetres, radians, or a bare number — and saying
+    /// what it measures, so an angle variable fills a degree box as the angle
+    /// it is and cannot be typed where a length belongs.
+    #[must_use]
+    pub fn evaluated_variable_values(&self) -> std::collections::BTreeMap<String, NamedQuantity> {
         let Ok(evaluated) = self
             .document
             .evaluate_parameters(&ParameterOverrides::default())
@@ -136,12 +133,18 @@ impl KernelLabApp {
                 let ParameterValue::Quantity { value } = value else {
                     return None;
                 };
-                let magnitude = if value.unit.quantity_kind() == QuantityKind::Length {
-                    unit.from_millimetres(value.magnitude)
-                } else {
-                    value.magnitude
+                let dimension = match value.unit.quantity_kind() {
+                    QuantityKind::Length => Dimension::LENGTH,
+                    QuantityKind::Angle => Dimension::ANGLE,
+                    QuantityKind::Scalar => Dimension::SCALAR,
                 };
-                Some((record.spec.key.clone(), magnitude))
+                Some((
+                    record.spec.key.clone(),
+                    NamedQuantity {
+                        canonical: value.magnitude,
+                        dimension,
+                    },
+                ))
             })
             .collect()
     }
