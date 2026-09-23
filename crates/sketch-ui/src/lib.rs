@@ -8481,6 +8481,27 @@ impl SketchCanvasState {
         self.certified_profile = analysis.status;
         self.profile_analysis = analysis;
         self.refresh_analytic_regions();
+        // The certified path draws its loops from lines, arcs and circles, so
+        // a sketch with a spline in it is read from the exact arrangement
+        // instead, which bounds regions with splines as it does with any
+        // other curve: closed where it has cells, open where it has none.
+        if self.certified_profile == CertifiedProfileStatus::CurvesNeedCertification
+            && let Some(arrangement) = &self.analytic_regions.arrangement
+        {
+            let cells = &arrangement.cells;
+            let holes = cells.iter().map(|cell| cell.holes.len()).sum::<usize>();
+            self.certified_profile = if cells.is_empty() {
+                CertifiedProfileStatus::Open
+            } else {
+                CertifiedProfileStatus::ClosedRegions {
+                    regions: cells.len(),
+                    loops: cells.len() + holes,
+                    holes,
+                    analytic: true,
+                }
+            };
+            self.profile_analysis.status = self.certified_profile;
+        }
     }
 
     #[must_use]
@@ -17501,6 +17522,11 @@ mod tests {
         assert!(state.polyline_vertices.is_empty());
         state.commit_pending().expect("the spline commits");
         assert_eq!(state.entities().len(), 1);
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::Open,
+            "an open spline bounds nothing"
+        );
     }
 
     #[test]
@@ -17528,6 +17554,16 @@ mod tests {
             arrangement.cells.len(),
             1,
             "a closed spline bounds one region"
+        );
+        // The profile card reads it as the closed exact region it is.
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::ClosedRegions {
+                regions: 1,
+                loops: 1,
+                holes: 0,
+                analytic: true,
+            }
         );
     }
 
