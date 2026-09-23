@@ -692,3 +692,33 @@ fn a_boolean_far_along_a_plane_crossing_matches_one_at_the_origin() {
         "the bar cuts the cube"
     );
 }
+
+/// A fillet on one bore's rim in a plate with two bores. The rim-loop rung's
+/// check that the other loops stay on their side of the finished rim cast
+/// its ray from each loop's seam, where two arcs meet only to within
+/// rounding; from one bore's seam it slipped through the other's and read
+/// the bore beside the finish as inside it, refusing a fillet with room to
+/// spare.
+#[test]
+fn a_bore_rim_beside_another_bore_fillets() {
+    let session = run("let s = sketch(on: \"XY\", label: \"s\", entities: [
+    rect(origin: [-10, -6], width: 20, height: 12),
+    circle(center: [-5, 0], radius: 4),
+    circle(center: [5, 0], radius: 4),
+]);
+let plate = extrude(sketch: s, distance: 3, label: \"plate\");
+fillet(edges: [nearest(point: [5, 4, 3], kind: \"edge\"), nearest(point: [5, -4, 3], kind: \"edge\")], radius: 0.4, label: \"f\");
+");
+    // The fillet takes the corner square of side r less its quarter disc,
+    // turned about the bore's axis at its centroid's radius (Pappus).
+    let (bore, r) = (4.0_f64, 0.4_f64);
+    let square = r * r;
+    let quarter = PI * r * r / 4.0;
+    let moment = square * (bore + r / 2.0) - quarter * (bore + r - 4.0 * r / (3.0 * PI));
+    let removed = 2.0 * PI * moment;
+    assert_close(
+        session.snapshot.measures().volume,
+        (240.0 - 2.0 * PI * 16.0) * 3.0 - removed,
+        "plate less one filleted rim",
+    );
+}

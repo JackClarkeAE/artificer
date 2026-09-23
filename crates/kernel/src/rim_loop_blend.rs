@@ -122,7 +122,13 @@ fn certify_clear_of_passive_loops(
     spine: &[Segment],
     precision: PrecisionPolicy,
 ) -> Result<(), RimLoopBlendError> {
-    let Some(spine_start) = spine.first().map(|segment| segment.start()) else {
+    // Each loop is placed by a point partway along its first segment rather
+    // than by its start. A start is a seam, where two arcs meet only to
+    // within rounding; a ray cast from the seam of one loop can graze the
+    // seam of another and slip between its ends, and then count a hole
+    // beside the finish as inside it.
+    let sample = |segments: &[Segment]| segments.first().map(|segment| segment.point_at(0.371));
+    let Some(spine_start) = sample(spine) else {
         return Err(RimLoopBlendError::DomainUnsupported);
     };
     let as_loop = |segments: &[Segment]| AnalyticLoop {
@@ -131,7 +137,7 @@ fn certify_clear_of_passive_loops(
     };
     let spine_loop = as_loop(spine);
     for (passive, is_outer) in &loops.passive {
-        let Some(passive_start) = passive.first().map(|segment| segment.start()) else {
+        let Some(passive_start) = sample(passive) else {
             return Err(RimLoopBlendError::DomainUnsupported);
         };
         let crowded = spine.iter().any(|spine_segment| {
