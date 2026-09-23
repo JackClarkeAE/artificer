@@ -205,8 +205,10 @@ impl KernelLabApp {
             .show(context, |ui| {
                 ui.label(
                     RichText::new(
-                        "Name a value once, then type its name in any dimension or value \
-                         field. Values accept expressions over other variables: width * 2 + 5mm.",
+                        "A variable can be an expression over others, such as width * 2 + 5mm, \
+                         and follows them when they change. Typed into a sketch dimension or a \
+                         feature's value, a name is read once: the field keeps the number it \
+                         gave, and changing the variable later does not move it.",
                     )
                     .small()
                     .color(theme::muted()),

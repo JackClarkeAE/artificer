@@ -454,15 +454,6 @@ enum PendingOperation {
         staging_id: u64,
     },
     LoadDefaultDocument,
-    SetParameterLiteral {
-        parameter: ParameterId,
-        base: ParameterLiteralDraft,
-        value: ParameterLiteralDraft,
-    },
-    AddUserLengthParameter {
-        ordinal: u32,
-        value_mm: f64,
-    },
     /// The parsed binding is not `Copy`, so it stages beside the operation in
     /// `staged_parameter_binding`, exactly as a Boolean's tool picks do.
     SetParameterBindingEntry {
@@ -611,8 +602,6 @@ impl PendingOperation {
             Self::RunCase { case, .. } => case.title(),
             Self::LibraryInsertion { .. } => "Insert library component",
             Self::LoadDefaultDocument => "Open saved document",
-            Self::SetParameterLiteral { .. } => "Update document parameter",
-            Self::AddUserLengthParameter { .. } => "Add document parameter",
             Self::SetParameterBindingEntry { .. } => "Update variable",
             Self::RemoveParameter { .. } => "Delete variable",
             Self::AddUserParameter { kind, .. } => match kind {
@@ -666,14 +655,8 @@ impl PendingOperation {
             Self::LoadDefaultDocument => {
                 "Replace the current workspace from the verified native document file"
             }
-            Self::SetParameterLiteral { .. } => {
-                "Publish the new typed value and rebuild every consuming feature"
-            }
-            Self::AddUserLengthParameter { .. } => {
-                "Create one named, reusable length parameter in this document"
-            }
             Self::SetParameterBindingEntry { .. } => {
-                "Publish the new value or expression and rebuild every consuming feature"
+                "Set the variable and the variables written in terms of it; numbers already typed into sketches and features keep their values"
             }
             Self::RemoveParameter { .. } => {
                 "Delete the variable; a variable a feature or expression still uses is refused"
@@ -737,16 +720,6 @@ impl PendingOperation {
             }
             Self::LibraryInsertion { staging_id } => {
                 object.insert("staging_id".to_owned(), serde_json::json!(staging_id));
-            }
-            Self::SetParameterLiteral { parameter, .. } => {
-                object.insert(
-                    "parameter_id".to_owned(),
-                    serde_json::json!(parameter.to_string()),
-                );
-            }
-            Self::AddUserLengthParameter { ordinal, value_mm } => {
-                object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
-                object.insert("value_mm".to_owned(), serde_json::json!(value_mm));
             }
             Self::SetParameterBindingEntry { parameter } | Self::RemoveParameter { parameter } => {
                 object.insert(
@@ -996,35 +969,6 @@ impl SolidFeaturePreset {
             Self::Fillet => {
                 "Finish one or more compatible cuboid edges with exact cylindrical fillets"
             }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ParameterLiteralDraft {
-    Quantity { magnitude: f64, unit: ParameterUnit },
-    Integer(i64),
-    Boolean(bool),
-}
-
-impl ParameterLiteralDraft {
-    fn from_value(value: &ParameterValue) -> Option<Self> {
-        match value {
-            ParameterValue::Quantity { value } => Some(Self::Quantity {
-                magnitude: value.magnitude,
-                unit: value.unit,
-            }),
-            ParameterValue::Integer { value } => Some(Self::Integer(*value)),
-            ParameterValue::Boolean { value } => Some(Self::Boolean(*value)),
-            ParameterValue::Choice { .. } => None,
-        }
-    }
-
-    fn into_value(self) -> ParameterValue {
-        match self {
-            Self::Quantity { magnitude, unit } => ParameterValue::quantity(magnitude, unit),
-            Self::Integer(value) => ParameterValue::integer(value),
-            Self::Boolean(value) => ParameterValue::boolean(value),
         }
     }
 }
@@ -4880,8 +4824,6 @@ impl KernelLabApp {
                 | PendingOperation::RunCase { .. }
                 | PendingOperation::LibraryInsertion { .. }
                 | PendingOperation::LoadDefaultDocument
-                | PendingOperation::SetParameterLiteral { .. }
-                | PendingOperation::AddUserLengthParameter { .. }
                 | PendingOperation::SetParameterBindingEntry { .. }
                 | PendingOperation::RemoveParameter { .. }
                 | PendingOperation::AddUserParameter { .. }
@@ -11560,54 +11502,6 @@ impl KernelLabApp {
                     self.document_status = Some(format!("Open failed: {error}"));
                 }
             }
-            PendingOperation::SetParameterLiteral {
-                parameter, value, ..
-            } => {
-                match self
-                    .document
-                    .set_parameter_binding(parameter, ParameterBinding::literal(value.into_value()))
-                {
-                    Ok(_) => {
-                        self.pending_operation = None;
-                        self.rebuild_after_parameter_change();
-                    }
-                    Err(error) => {
-                        self.document_status = Some(format!("Parameter update rejected: {error}"));
-                    }
-                }
-            }
-            PendingOperation::AddUserLengthParameter { ordinal, value_mm } => {
-                let key = format!("UserLength{ordinal}");
-                let metadata = ParameterMetadata {
-                    exposure: ParameterExposure::UserInput,
-                    description: Some("Reusable document length".to_owned()),
-                    ..ParameterMetadata::default()
-                };
-                let spec = ParameterSpec::new(
-                    key.clone(),
-                    format!("User length {ordinal}"),
-                    ParameterType::Quantity(QuantityKind::Length),
-                )
-                .with_display_unit(ParameterUnit::Millimeter)
-                .with_metadata(metadata);
-                match self.document.add_parameter(
-                    spec,
-                    ParameterBinding::literal(ParameterValue::quantity(
-                        value_mm,
-                        ParameterUnit::Millimeter,
-                    )),
-                ) {
-                    Ok(_) => {
-                        self.pending_operation = None;
-                        self.history_scrub_position = self.document.history_position();
-                        self.document_status = Some(format!("Parameter {key} added"));
-                    }
-                    Err(error) => {
-                        self.document_status =
-                            Some(format!("Parameter creation rejected: {error}"));
-                    }
-                }
-            }
             PendingOperation::SetParameterBindingEntry { parameter } => {
                 match self
                     .staged_parameter_binding
@@ -11856,9 +11750,7 @@ impl KernelLabApp {
                 self.boolean_tools.clear();
                 self.pending_operation = None;
             }
-            PendingOperation::SetParameterLiteral { .. }
-            | PendingOperation::AddUserLengthParameter { .. }
-            | PendingOperation::RemoveParameter { .. }
+            PendingOperation::RemoveParameter { .. }
             | PendingOperation::AddUserParameter { .. } => self.pending_operation = None,
             PendingOperation::StagePlane { editing } => {
                 self.staged_plane = None;
@@ -17126,8 +17018,6 @@ impl KernelLabApp {
     /// floating inspector. Keeping them out also keeps the inspector short
     /// enough that its tail never scrolls out of reach.
     fn workspace_settings_cards(&mut self, ui: &mut egui::Ui) {
-        self.document_parameter_controls(ui);
-        ui.add_space(5.0);
         collapsible_card(ui, "navigation_scheme", "NAVIGATION", true, |ui| {
             self.navigation_card(ui);
         });
@@ -19712,124 +19602,6 @@ impl KernelLabApp {
     fn display_coordinate(value: f64) -> f64 {
         let rounded = (value * 1000.0).round() / 1000.0;
         if rounded == 0.0 { 0.0 } else { rounded }
-    }
-
-    fn document_parameter_controls(&mut self, ui: &mut egui::Ui) {
-        let records = self.document.parameters().records().to_vec();
-        collapsible_card(ui, "document_parameters", "PARAMETERS", false, |ui| {
-            if records.is_empty() {
-                ui.label(
-                    RichText::new("No document parameters yet")
-                        .small()
-                        .color(theme::muted()),
-                );
-            }
-            for record in records {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&record.spec.label).color(theme::text()));
-                        ui.label(
-                            RichText::new(&record.spec.key)
-                                .small()
-                                .monospace()
-                                .color(theme::muted()),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let staged = match self.pending_operation {
-                            Some(PendingOperation::SetParameterLiteral {
-                                parameter,
-                                value,
-                                ..
-                            }) if parameter == record.id => Some(value),
-                            _ => None,
-                        };
-                        match &record.binding {
-                            ParameterBinding::Literal { value } => {
-                                let Some(base) = ParameterLiteralDraft::from_value(value) else {
-                                    ui.label(RichText::new("choice").small().color(theme::muted()));
-                                    return;
-                                };
-                                let mut edited = staged.unwrap_or(base);
-                                let enabled = self.pending_operation.is_none() || staged.is_some();
-                                let changed = match &mut edited {
-                                    ParameterLiteralDraft::Quantity { magnitude, unit } => {
-                                        let suffix = match unit {
-                                            ParameterUnit::Micrometer => " µm",
-                                            ParameterUnit::Millimeter => " mm",
-                                            ParameterUnit::Centimeter => " cm",
-                                            ParameterUnit::Meter => " m",
-                                            ParameterUnit::Inch => " in",
-                                            ParameterUnit::Foot => " ft",
-                                            ParameterUnit::Radian => " rad",
-                                            ParameterUnit::Degree => "°",
-                                            ParameterUnit::Scalar => "",
-                                        };
-                                        ui.add_enabled(
-                                            enabled,
-                                            egui::DragValue::new(magnitude)
-                                                .speed(0.1)
-                                                .max_decimals(4)
-                                                .suffix(suffix),
-                                        )
-                                        .changed()
-                                    }
-                                    ParameterLiteralDraft::Integer(value) => ui
-                                        .add_enabled(enabled, egui::DragValue::new(value))
-                                        .changed(),
-                                    ParameterLiteralDraft::Boolean(value) => ui
-                                        .add_enabled(enabled, egui::Checkbox::without_text(value))
-                                        .changed(),
-                                };
-                                if changed {
-                                    self.pending_operation =
-                                        Some(PendingOperation::SetParameterLiteral {
-                                            parameter: record.id,
-                                            base,
-                                            value: edited,
-                                        });
-                                }
-                            }
-                            ParameterBinding::Expression { .. } => {
-                                ui.label(
-                                    RichText::new("expression").small().color(theme::accent()),
-                                );
-                            }
-                            ParameterBinding::Unresolved => {
-                                ui.label(RichText::new("required").small().color(theme::warn()));
-                            }
-                        }
-                    });
-                });
-                ui.separator();
-            }
-            let can_add = self.pending_operation.is_none() && self.history_is_at_end();
-            let add = ui.add_enabled(
-                can_add,
-                egui::Button::new("+ Length parameter")
-                    .min_size(egui::vec2(ui.available_width(), 28.0)),
-            );
-            if add.clicked() {
-                let mut ordinal = self.document.parameters().len() as u32 + 1;
-                while self
-                    .document
-                    .parameters()
-                    .get_by_key(&format!("UserLength{ordinal}"))
-                    .is_some()
-                {
-                    ordinal = ordinal.saturating_add(1);
-                }
-                self.pending_operation = Some(PendingOperation::AddUserLengthParameter {
-                    ordinal,
-                    value_mm: 10.0,
-                });
-            }
-            ui.label(
-                RichText::new("Changes remain staged until Enter or the green tick")
-                    .small()
-                    .color(theme::good()),
-            );
-        });
     }
 
     fn rebuild_after_parameter_change(&mut self) {
@@ -30620,76 +30392,6 @@ mod extrusion_workbench_tests {
         assert!(app.handle_redo());
         assert_eq!(app.workbench_mode, WorkbenchMode::Sketch);
         assert_eq!(app.sketch.entities().len(), 2);
-    }
-
-    #[test]
-    fn document_parameter_creation_waits_for_visible_confirmation() {
-        let mut app = KernelLabApp::default();
-        let before = app.document.parameters().len();
-        app.pending_operation = Some(PendingOperation::AddUserLengthParameter {
-            ordinal: 1,
-            value_mm: 12.5,
-        });
-        assert_eq!(app.document.parameters().len(), before);
-        assert!(app.confirm_pending_operation());
-        assert_eq!(app.document.parameters().len(), before + 1);
-        let record = app
-            .document
-            .parameters()
-            .get_by_key("UserLength1")
-            .expect("confirmed parameter");
-        assert_eq!(
-            record.binding,
-            ParameterBinding::literal(ParameterValue::quantity(12.5, ParameterUnit::Millimeter))
-        );
-    }
-
-    #[test]
-    fn document_parameter_edit_can_be_cancelled_or_confirmed_atomically() {
-        let mut app = KernelLabApp::default();
-        let parameter = app
-            .document
-            .add_parameter(
-                ParameterSpec::new(
-                    "Width",
-                    "Width",
-                    ParameterType::Quantity(QuantityKind::Length),
-                )
-                .with_display_unit(ParameterUnit::Millimeter),
-                ParameterBinding::literal(ParameterValue::quantity(4.0, ParameterUnit::Millimeter)),
-            )
-            .expect("parameter");
-        let base = ParameterLiteralDraft::Quantity {
-            magnitude: 4.0,
-            unit: ParameterUnit::Millimeter,
-        };
-        app.pending_operation = Some(PendingOperation::SetParameterLiteral {
-            parameter,
-            base,
-            value: ParameterLiteralDraft::Quantity {
-                magnitude: 9.0,
-                unit: ParameterUnit::Millimeter,
-            },
-        });
-        assert!(app.cancel_pending_operation());
-        assert_eq!(
-            app.document.parameter(parameter).unwrap().binding,
-            ParameterBinding::literal(ParameterValue::quantity(4.0, ParameterUnit::Millimeter))
-        );
-
-        app.pending_operation = Some(PendingOperation::SetParameterLiteral {
-            parameter,
-            base,
-            value: ParameterLiteralDraft::Quantity {
-                magnitude: 9.0,
-                unit: ParameterUnit::Millimeter,
-            },
-        });
-        assert!(app.confirm_pending_operation());
-        assert_eq!(
-            app.document.parameter(parameter).unwrap().binding,
-            ParameterBinding::literal(ParameterValue::quantity(9.0, ParameterUnit::Millimeter))
-        );
     }
 
     /// Appends one committed cuboid body to the workspace and its history.

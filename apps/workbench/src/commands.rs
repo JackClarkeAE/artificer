@@ -838,7 +838,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         CommandSize::Large,
         "Variables",
         "Variables",
-        "Open the variables panel: name values once and drive dimensions with them everywhere.",
+        "Open the variables panel: name values once and type them by name into any dimension.",
         None,
     ),
     command(
@@ -850,7 +850,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         CommandSize::Small,
         "Length",
         "New length variable",
-        "Create a named length in millimetres, ready to reference from any dimension.",
+        "Create a named length in millimetres, ready to type by name into any dimension.",
         None,
     ),
     command(
@@ -862,7 +862,7 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         CommandSize::Small,
         "Angle",
         "New angle variable",
-        "Create a named angle in degrees, ready to reference from any dimension.",
+        "Create a named angle in degrees, ready to type by name into any angle.",
         None,
     ),
     command(
