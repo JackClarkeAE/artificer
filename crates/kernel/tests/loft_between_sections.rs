@@ -713,15 +713,6 @@ fn a_loft_refuses_by_name_what_it_cannot_build() {
         ]),
         ["LOFT_SECTIONS_COPLANAR"]
     );
-    // Three sections need a surface smooth across the middle one.
-    assert_eq!(
-        refusal(vec![
-            section(level(0.0), square(), vec![]),
-            section(level(10.0), square(), vec![]),
-            section(level(20.0), square(), vec![]),
-        ]),
-        ["LOFT_MULTI_SECTION_UNSUPPORTED"]
-    );
     // One section is not a loft.
     assert_eq!(
         refusal(vec![section(level(0.0), square(), vec![])]),
@@ -764,35 +755,6 @@ fn a_loft_refuses_by_name_what_it_cannot_build() {
         ]),
         ["LOFT_SECTION_CROSSES_PLANE"]
     );
-    // A section drawn with a spline: K-B.
-    assert_eq!(
-        refusal(vec![
-            section(level(0.0), square(), vec![]),
-            section(
-                level(10.0),
-                PlanarLoop2 {
-                    curves: vec![
-                        PlanarCurve2::Bspline {
-                            degree: 2,
-                            control_points: vec![
-                                Point2::new(-5.0, 0.0),
-                                Point2::new(0.0, 8.0),
-                                Point2::new(5.0, 0.0),
-                            ],
-                            knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-                            weights: None,
-                        },
-                        PlanarCurve2::Line {
-                            start: Point2::new(5.0, 0.0),
-                            end: Point2::new(-5.0, 0.0),
-                        },
-                    ],
-                },
-                vec![],
-            ),
-        ]),
-        ["LOFT_SECTION_SPLINE_UNSUPPORTED"]
-    );
     // Two regions in one section.
     assert_eq!(
         refusal(vec![
@@ -815,6 +777,67 @@ fn a_loft_refuses_by_name_what_it_cannot_build() {
         ]),
         ["LOFT_SECTION_REGIONS_UNSUPPORTED"]
     );
+}
+
+/// Two things this stage refused are built since ADR 0050, and each is
+/// pinned here to its answer rather than its old refusal: a loft through
+/// three sections, and a section drawn with a spline. The first is three
+/// equal squares, whose smooth loft is the prism through them; the second a
+/// square lofted to a spline arch closed by a line, measured independently
+/// in `bspline_surfaces.rs` and here only built, exact and valid.
+#[test]
+fn what_this_stage_refused_is_built_by_the_next() {
+    let square = || polygon(&rectangle(20.0, 20.0, 0.0));
+    let outcome = execute(
+        &NativeKernel::empty(),
+        vec![
+            section(level(0.0), square(), vec![]),
+            section(level(10.0), square(), vec![]),
+            section(level(20.0), square(), vec![]),
+        ],
+        LoftOperation::New,
+    )
+    .expect("three sections loft");
+    assert_eq!(outcome.report.rung.as_deref(), Some("loft/skinned"));
+    assert_eq!(outcome.report.tier(), Tier::Exact);
+    assert_valid(&outcome.snapshot);
+    assert_relative(
+        outcome.snapshot.measures().volume,
+        8_000.0,
+        1.0e-9,
+        "the prism through three squares",
+    );
+
+    let arch = PlanarLoop2 {
+        curves: vec![
+            PlanarCurve2::Bspline {
+                degree: 2,
+                control_points: vec![
+                    Point2::new(-5.0, 0.0),
+                    Point2::new(0.0, 8.0),
+                    Point2::new(5.0, 0.0),
+                ],
+                knots: vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                weights: None,
+            },
+            PlanarCurve2::Line {
+                start: Point2::new(5.0, 0.0),
+                end: Point2::new(-5.0, 0.0),
+            },
+        ],
+    };
+    let outcome = execute(
+        &NativeKernel::empty(),
+        vec![
+            section(level(0.0), square(), vec![]),
+            section(level(10.0), arch, vec![]),
+        ],
+        LoftOperation::New,
+    )
+    .expect("a spline section lofts");
+    assert_eq!(outcome.report.rung.as_deref(), Some("loft/sections"));
+    assert_eq!(outcome.report.tier(), Tier::Exact);
+    assert_valid(&outcome.snapshot);
 }
 
 // ---------------------------------------------------------------------------

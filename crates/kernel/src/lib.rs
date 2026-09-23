@@ -26,6 +26,7 @@ mod hole_rim_blend;
 #[allow(dead_code)]
 mod loft;
 mod loft_sections;
+mod loft_skin;
 mod loop_offset;
 mod mirror;
 mod pattern;
@@ -1074,12 +1075,20 @@ impl NativeKernel {
                 if *operation == LoftOperation::New {
                     validate_extrusion_source(input)?;
                 }
-                let loft = loft_sections::validate_loft_sections(sections, request.precision)
-                    .map_err(|reason| loft_sections_error(input.id, reason))?;
-                let tool = loft_sections::build_loft_sections(&loft);
+                // Two sections are ruled (ADR 0049); three or more are
+                // skinned by one smooth B-spline wall per column (ADR 0050).
+                let (tool, built) = if sections.len() > 2 {
+                    let loft = loft_skin::validate_skinned_loft(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_skin::build_skinned_loft(&loft), "loft/skinned")
+                } else {
+                    let loft = loft_sections::validate_loft_sections(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_sections::build_loft_sections(&loft), "loft/sections")
+                };
                 match operation {
                     LoftOperation::New => {
-                        rung = "loft/sections";
+                        rung = built;
                         (tool, HistoryMode::Generated)
                     }
                     LoftOperation::Add | LoftOperation::Cut => {
@@ -7061,15 +7070,7 @@ fn loft_sections_error(
             snapshot,
             KernelErrorCode::InvalidInput,
             "LOFT_TOO_FEW_SECTIONS",
-            "a loft needs two sections",
-        ),
-        LoftSectionsError::MultiSection => planar_profile_error(
-            snapshot,
-            KernelErrorCode::Unsupported,
-            "LOFT_MULTI_SECTION_UNSUPPORTED",
-            "a loft through more than two sections needs a surface that stays smooth across the \
-             middle sections, a B-spline surface, which arrives with B-spline curves and \
-             surfaces (ADR 0049, K-B). Loft two sections at a time for now.",
+            "a loft needs at least two sections",
         ),
         LoftSectionsError::RegionCount => planar_profile_error(
             snapshot,
@@ -7078,13 +7079,7 @@ fn loft_sections_error(
             "each loft section must be exactly one region: one outer loop, with any holes \
              inside it",
         ),
-        LoftSectionsError::SplineCurve => planar_profile_error(
-            snapshot,
-            KernelErrorCode::Unsupported,
-            "LOFT_SECTION_SPLINE_UNSUPPORTED",
-            "a loft section carries a B-spline curve; B-spline curves enter the vocabulary with \
-             ADR 0049's K-B stage. Draw the section from lines, arcs and circles.",
-        ),
+        LoftSectionsError::Spline(reason) => spline_profile_error(snapshot, reason),
         LoftSectionsError::Coplanar => planar_profile_error(
             snapshot,
             KernelErrorCode::InvalidInput,
@@ -7119,6 +7114,14 @@ fn loft_sections_error(
             "LOFT_WALL_DEGENERATE",
             "a wall between the sections pinches to a point or folds flat: somewhere its rung \
              runs along its rails, and a wall there has no side to face",
+        ),
+        LoftSectionsError::SkinFolds => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SKIN_FOLDS",
+            "the smooth surface through the sections turns back on itself between two of them: \
+             somewhere it runs against the direction the sections are stacked in. Space the \
+             sections more evenly, or loft them two at a time.",
         ),
     }
 }

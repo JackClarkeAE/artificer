@@ -1,16 +1,22 @@
-//! A loft between two planar sections (ADR 0049, stage K-A).
+//! A loft between two planar sections (ADR 0049, stage K-A; ADR 0050).
 //!
 //! Each section is one region on a plane of its own. The loops of the two
 //! sections are put into correspondence segment for segment — each loop cut
 //! exactly where the other has corners it lacks — and every pair of
 //! segments spans one wall: a plane, a cylinder or a cone where one of those
-//! is exact, and a ruled surface otherwise. The rungs between walls are
-//! straight lines, and the two sections are the caps.
+//! is exact, a ruled surface where the pair is lines and arcs, and a B-spline
+//! surface of degree `p` by one where a spline takes part. The rungs between
+//! walls are straight lines, and the two sections are the caps.
 //!
-//! Nothing here approximates. A split is at an exact angle of an arc or an
-//! exact point of a line, every wall's carrier holds its own rails exactly,
-//! and a loft that would pass through itself or pinch a wall to a point is
-//! refused by name before anything is built.
+//! Nothing here approximates the carriers it builds. A split is at an exact
+//! angle of an arc, an exact point of a line or an exact knot of a spline,
+//! every wall's carrier holds its own rails exactly, and a loft that would
+//! pass through itself or pinch a wall to a point is refused by name before
+//! anything is built. The one place a curve is represented rather than kept
+//! is an arc paired with a spline: a B-spline wall needs both its rows to be
+//! B-splines, and an arc is one only with weights, which the kernel does not
+//! carry (ADR 0050). The arc is then its cubic fit within the model's linear
+//! agreement, and that fit is the section's edge there.
 
 use artificer_protocol::{LoftSection, PlanarCurve2, PrecisionPolicy};
 
@@ -18,8 +24,10 @@ use crate::analytic_extrusion::{
     AnalyticLoop, BoundaryUse, Frame, Segment, allocate_id, push_cap_face, push_edge, push_loop,
     push_vertex, validate_analytic_profile_extrusion,
 };
+use crate::bspline::{SplineCurve3, SplineSurface, arc_curve, array3, common_basis, line_curve};
 use crate::planar_profile::PlanarProfileInputError;
 use crate::ruled::{RailCurve, RuledRail, RuledSurface};
+use crate::spline_profile::{ProfilePiece, SplineProfileError, validate_spline_profile_extrusion};
 use crate::topology::{
     Cone, Curve2, Curve3, Cylinder, Edge, EdgeKey, Face, FaceKey, FaceRole, Orientation,
     ParameterRange, Plane, Point2, Point3, Record, Shell, ShellKey, Solid, Surface, Topology,
@@ -31,15 +39,12 @@ use crate::topology::{
 pub(crate) enum LoftSectionsError {
     /// Fewer than two sections.
     TooFewSections,
-    /// More than two: a smooth loft through the middle sections needs a
-    /// B-spline surface, which K-B brings.
-    MultiSection,
     /// A section's profile failed the ordinary planar-profile checks.
     Profile(PlanarProfileInputError),
+    /// A section's profile failed the checks a profile with splines gets.
+    Spline(SplineProfileError),
     /// A section is not exactly one region.
     RegionCount,
-    /// A section carries a B-spline curve.
-    SplineCurve,
     /// Both sections lie on one plane.
     Coplanar,
     /// A section reaches onto or through the other section's plane.
@@ -51,11 +56,14 @@ pub(crate) enum LoftSectionsError {
     /// A wall's normal vanishes somewhere: it pinches to a point or folds
     /// flat.
     WallDegenerate,
+    /// The smooth surface through several sections turns back on itself
+    /// between two of them: somewhere it runs against the loft's direction.
+    SkinFolds,
 }
 
 /// One boundary piece of a section, in model space.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Piece {
+pub(crate) enum Piece {
     Line {
         start: Point3,
         end: Point3,
@@ -69,11 +77,20 @@ enum Piece {
         from: f64,
         to: f64,
     },
+    /// A B-spline in the section's plane, walked over its whole domain
+    /// (ADR 0050).
+    Spline {
+        curve: SplineCurve3,
+    },
 }
 
 impl Piece {
-    fn curve(self) -> (Curve3, ParameterRange) {
+    pub(crate) fn curve(self) -> (Curve3, ParameterRange) {
         match self {
+            Self::Spline { curve } => {
+                let (start, end) = curve.domain();
+                (Curve3::Bspline { curve }, ParameterRange::new(start, end))
+            }
             Self::Line { start, end } => Curve3::line_segment([start, end]),
             Self::Arc {
                 center,
@@ -94,27 +111,65 @@ impl Piece {
         }
     }
 
-    fn start(self) -> Point3 {
+    pub(crate) fn start(self) -> Point3 {
         let (curve, range) = self.curve();
         curve.evaluate(range.start)
     }
 
-    fn end(self) -> Point3 {
+    pub(crate) fn end(self) -> Point3 {
         let (curve, range) = self.curve();
         curve.evaluate(range.end)
     }
 
-    fn length(self) -> f64 {
+    pub(crate) fn length(self) -> f64 {
         match self {
             Self::Line { start, end } => start.distance(end),
             Self::Arc {
                 radius, from, to, ..
             } => radius * (to - from).abs(),
+            Self::Spline { curve } => {
+                let (start, end) = curve.domain();
+                curve.length(start, end)
+            }
         }
+    }
+
+    /// The point `fraction` of the way along the piece's own parameter —
+    /// its length for a line, its angle for an arc, its domain for a spline.
+    pub(crate) fn point_at(self, fraction: f64) -> Point3 {
+        let (curve, range) = self.curve();
+        curve.evaluate((range.end - range.start).mul_add(fraction, range.start))
+    }
+
+    /// The piece as a B-spline over `[0, 1]` with its ends exactly the
+    /// piece's own: a line as itself, a spline reparameterised, and an arc
+    /// as its cubic fit within `tolerance`.
+    pub(crate) fn spline(self, tolerance: f64) -> Option<SplineCurve3> {
+        let curve = match self {
+            Self::Line { start, end } => line_curve(start, end)?,
+            Self::Arc {
+                center,
+                u,
+                v,
+                radius,
+                from,
+                to,
+            } => arc_curve(center, u, v, radius, from, to, tolerance)?,
+            Self::Spline { curve } => curve.reparameterized(0.0, 1.0)?,
+        };
+        curve.with_ends(array3(self.start()), array3(self.end()))
     }
 
     fn rail(self) -> RuledRail {
         match self {
+            // A spline is never a rail: a wall with one is a B-spline wall,
+            // and nothing asks for its rails. Its chord stands in.
+            Self::Spline { .. } => RuledRail {
+                curve: RailCurve::Line {
+                    endpoints: [self.start(), self.end()],
+                },
+                range: ParameterRange::new(0.0, 1.0),
+            },
             Self::Line { start, end } => RuledRail {
                 curve: RailCurve::Line {
                     endpoints: [start, end],
@@ -142,9 +197,26 @@ impl Piece {
 
     /// The piece cut at rising fractions of its own parameter, which for an
     /// arc is its angle and for a line its length: exact points of the
-    /// carrier either way.
-    fn split(self, fractions: &[f64]) -> Vec<Self> {
+    /// carrier either way. A spline is cut at the fractions of its length,
+    /// each an exact knot inserted where the length reaches it.
+    pub(crate) fn split(self, fractions: &[f64]) -> Vec<Self> {
         match self {
+            Self::Spline { curve } => {
+                let parameters = fractions
+                    .iter()
+                    .map(|fraction| curve.parameter_at_fraction(*fraction))
+                    .collect::<Vec<_>>();
+                let mut pieces = Vec::with_capacity(fractions.len() + 1);
+                let mut rest = curve;
+                for parameter in parameters {
+                    if let Some((left, right)) = rest.split(parameter) {
+                        pieces.push(Self::Spline { curve: left });
+                        rest = right;
+                    }
+                }
+                pieces.push(Self::Spline { curve: rest });
+                pieces
+            }
             Self::Line { start, end } => {
                 let mut points = vec![start];
                 points.extend(fractions.iter().map(|fraction| {
@@ -193,8 +265,11 @@ impl Piece {
         }
     }
 
-    fn reversed(self) -> Self {
+    pub(crate) fn reversed(self) -> Self {
         match self {
+            Self::Spline { curve } => Self::Spline {
+                curve: curve.reversed(),
+            },
             Self::Line { start, end } => Self::Line {
                 start: end,
                 end: start,
@@ -219,11 +294,11 @@ impl Piece {
 
     /// Points along the piece for the coarse geometric checks: its two ends,
     /// and for an arc enough between to follow it.
-    fn samples(self, count: usize) -> Vec<Point3> {
+    pub(crate) fn samples(self, count: usize) -> Vec<Point3> {
         let (curve, range) = self.curve();
         let steps = match self {
             Self::Line { .. } => 1,
-            Self::Arc { .. } => count.max(1),
+            Self::Arc { .. } | Self::Spline { .. } => count.max(1),
         };
         (0..=steps)
             .map(|index| {
@@ -238,16 +313,16 @@ impl Piece {
 /// One closed boundary of a section, walked about the loft's direction:
 /// counter-clockwise for the outer loop, clockwise for a hole.
 #[derive(Clone, Debug)]
-struct SectionLoop {
-    pieces: Vec<Piece>,
+pub(crate) struct SectionLoop {
+    pub(crate) pieces: Vec<Piece>,
     /// A whole circle, held as one piece that starts where it ends until
     /// the correspondence decides where to cut it.
-    full_circle: bool,
-    centroid: Point3,
+    pub(crate) full_circle: bool,
+    pub(crate) centroid: Point3,
 }
 
 impl SectionLoop {
-    fn reversed(&self) -> Self {
+    pub(crate) fn reversed(&self) -> Self {
         Self {
             pieces: self
                 .pieces
@@ -262,17 +337,17 @@ impl SectionLoop {
 }
 
 #[derive(Clone, Debug)]
-struct ParsedSection {
-    frame: Frame,
-    outer: SectionLoop,
-    holes: Vec<SectionLoop>,
+pub(crate) struct ParsedSection {
+    pub(crate) frame: Frame,
+    pub(crate) outer: SectionLoop,
+    pub(crate) holes: Vec<SectionLoop>,
 }
 
 /// A cap: the plane it lies on, written so its normal points out of the
 /// material.
 #[derive(Clone, Copy, Debug)]
-struct Cap {
-    plane: Plane,
+pub(crate) struct Cap {
+    pub(crate) plane: Plane,
 }
 
 /// The wall between two corresponding pieces.
@@ -285,6 +360,35 @@ enum Wall {
     /// angle it sweeps and its height.
     Revolved(Surface, f64, f64),
     Ruled(RuledSurface),
+    /// A B-spline surface over the unit square, linear along `v` between
+    /// its two rows (ADR 0050).
+    Spline(SplineSurface),
+}
+
+impl Wall {
+    /// The edge curves along the bottom and top of the wall.
+    fn edges(self, bottom: Piece, top: Piece) -> [(Curve3, ParameterRange); 2] {
+        match self {
+            Self::Spline(surface) => [
+                section_edge(bottom, surface, 0),
+                section_edge(top, surface, surface.counts()[1] - 1),
+            ],
+            _ => [bottom.curve(), top.curve()],
+        }
+    }
+}
+
+/// A section edge along row `row` of a B-spline wall: a line piece keeps its
+/// line, anything else is the row itself over the unit interval.
+pub(crate) fn section_edge(
+    piece: Piece,
+    wall: SplineSurface,
+    row: usize,
+) -> (Curve3, ParameterRange) {
+    match (piece, wall.row(row)) {
+        (Piece::Line { .. }, _) | (_, None) => piece.curve(),
+        (_, Some(curve)) => (Curve3::Bspline { curve }, ParameterRange::new(0.0, 1.0)),
+    }
 }
 
 /// Two loops put into correspondence: `bottom[i]` and `top[i]` span wall `i`.
@@ -307,10 +411,8 @@ pub(crate) fn validate_loft_sections(
     sections: &[LoftSection],
     precision: PrecisionPolicy,
 ) -> Result<ValidatedLoftSections, LoftSectionsError> {
-    match sections.len() {
-        0 | 1 => return Err(LoftSectionsError::TooFewSections),
-        2 => {}
-        _ => return Err(LoftSectionsError::MultiSection),
+    if sections.len() != 2 {
+        return Err(LoftSectionsError::TooFewSections);
     }
     let minimum = precision
         .modeling_resolution
@@ -348,15 +450,8 @@ pub(crate) fn validate_loft_sections(
     // the loft runs toward it. Parallel planes pass by being apart; planes
     // that meet pass only where the sections keep clear of the line they
     // meet in, and a loft whose sections reach across it would fold.
-    let beyond = |section: &ParsedSection, plane: &ParsedSection, normal: Vector3, sign: f64| {
-        std::iter::once(&section.outer)
-            .chain(&section.holes)
-            .flat_map(|section_loop| section_loop.pieces.iter())
-            .flat_map(|piece| piece.samples(32))
-            .all(|point| sign * (point - plane.frame.origin).dot(normal) > minimum)
-    };
-    if !beyond(&parsed[1], &parsed[0], toward[0], 1.0)
-        || !beyond(&parsed[0], &parsed[1], toward[1], -1.0)
+    if !beyond(&parsed[1], &parsed[0], toward[0], 1.0, minimum)
+        || !beyond(&parsed[0], &parsed[1], toward[1], -1.0, minimum)
     {
         return Err(LoftSectionsError::CrossesPlane);
     }
@@ -407,12 +502,31 @@ pub(crate) fn validate_loft_sections(
     Ok(ValidatedLoftSections { caps, loops })
 }
 
+/// Whether every point of `section` lies strictly beyond the plane of
+/// `plane`, on the side `sign·normal` points to.
+pub(crate) fn beyond(
+    section: &ParsedSection,
+    plane: &ParsedSection,
+    normal: Vector3,
+    sign: f64,
+    minimum: f64,
+) -> bool {
+    std::iter::once(&section.outer)
+        .chain(&section.holes)
+        .flat_map(|section_loop| section_loop.pieces.iter())
+        .flat_map(|piece| piece.samples(32))
+        .all(|point| sign * (point - plane.frame.origin).dot(normal) > minimum)
+}
+
 /// A section's frame, loops and centroids, checked as any planar profile is.
-fn parse_section(
+pub(crate) fn parse_section(
     section: &LoftSection,
     precision: PrecisionPolicy,
 ) -> Result<ParsedSection, LoftSectionsError> {
     let profile = &section.profile;
+    if profile.regions.len() != 1 {
+        return Err(LoftSectionsError::RegionCount);
+    }
     if profile
         .regions
         .iter()
@@ -420,10 +534,7 @@ fn parse_section(
         .flat_map(|profile_loop| &profile_loop.curves)
         .any(|curve| matches!(curve, PlanarCurve2::Bspline { .. }))
     {
-        return Err(LoftSectionsError::SplineCurve);
-    }
-    if profile.regions.len() != 1 {
-        return Err(LoftSectionsError::RegionCount);
+        return parse_spline_section(section, precision);
     }
     // The extrusion checks run with a height of their own smallest: they
     // certify the profile and its frame, and the height is only there to
@@ -460,6 +571,117 @@ fn parse_section(
         outer,
         holes: loops,
     })
+}
+
+/// A section with splines, checked as a spline profile is (ADR 0050). A
+/// spline that closes on itself comes back as its two halves, and those two
+/// are the loop's pieces: the correspondence starts from their ends as it
+/// does from any vertex.
+fn parse_spline_section(
+    section: &LoftSection,
+    precision: PrecisionPolicy,
+) -> Result<ParsedSection, LoftSectionsError> {
+    let minimum = precision
+        .modeling_resolution
+        .max(precision.min_feature_size);
+    let regions = validate_spline_profile_extrusion(
+        section.frame,
+        &section.profile,
+        2.0 * minimum,
+        precision,
+    )
+    .map_err(LoftSectionsError::Spline)?;
+    let Some(region) = regions.into_iter().next() else {
+        return Err(LoftSectionsError::RegionCount);
+    };
+    let frame = region.frame;
+    let mut loops = region
+        .loops
+        .iter()
+        .map(|profile_loop| {
+            let mut pieces = Vec::with_capacity(profile_loop.pieces.len());
+            for piece in &profile_loop.pieces {
+                pieces.push(match *piece {
+                    ProfilePiece::Segment(Segment::Line { start, end }) => Piece::Line {
+                        start: frame.point(start, 0.0),
+                        end: frame.point(end, 0.0),
+                    },
+                    ProfilePiece::Segment(Segment::Arc {
+                        center,
+                        radius,
+                        start_angle,
+                        sweep,
+                        ..
+                    }) => Piece::Arc {
+                        center: frame.point(center, 0.0),
+                        u: frame.u,
+                        v: frame.v,
+                        radius,
+                        from: start_angle,
+                        to: start_angle + sweep,
+                    },
+                    ProfilePiece::Segment(_) => return None,
+                    ProfilePiece::Spline(curve) => Piece::Spline {
+                        curve: curve.mapped(|point| {
+                            array3(frame.point(crate::bspline::point2(point), 0.0))
+                        })?,
+                    },
+                });
+            }
+            let centroid = pieces_centroid(frame, &pieces)?;
+            Some(SectionLoop {
+                pieces: harmonised(pieces),
+                full_circle: false,
+                centroid,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or(LoftSectionsError::Profile(
+            PlanarProfileInputError::AnalyticCurve,
+        ))?;
+    let outer = loops.remove(0);
+    Ok(ParsedSection {
+        frame,
+        outer,
+        holes: loops,
+    })
+}
+
+/// The area centroid of a loop of model-space pieces lying in `frame`'s
+/// plane, from a fine polygon of it.
+fn pieces_centroid(frame: Frame, pieces: &[Piece]) -> Option<Point3> {
+    let points = pieces
+        .iter()
+        .flat_map(|piece| {
+            let steps = match piece {
+                Piece::Line { .. } => 1,
+                _ => 64,
+            };
+            (0..steps).map(move |index| piece.point_at(index as f64 / steps as f64))
+        })
+        .map(|point| {
+            let relative = point - frame.origin;
+            Point2::new(relative.dot(frame.u), relative.dot(frame.v))
+        })
+        .collect::<Vec<_>>();
+    let anchor = *points.first()?;
+    let (mut area, mut x, mut y) = (0.0, 0.0, 0.0);
+    for (index, start) in points.iter().enumerate() {
+        let end = points[(index + 1) % points.len()];
+        let (ax, ay) = (start.x - anchor.x, start.y - anchor.y);
+        let (bx, by) = (end.x - anchor.x, end.y - anchor.y);
+        let cross = ax.mul_add(by, -(ay * bx));
+        area += cross;
+        x += (ax + bx) * cross;
+        y += (ay + by) * cross;
+    }
+    if !area.is_finite() || area == 0.0 {
+        return None;
+    }
+    Some(frame.point(
+        Point2::new(anchor.x + x / (3.0 * area), anchor.y + y / (3.0 * area)),
+        0.0,
+    ))
 }
 
 /// A validated profile loop as model-space pieces, a whole circle as one.
@@ -558,9 +780,9 @@ fn loop_centroid(frame: Frame, analytic: &AnalyticLoop) -> Option<Point3> {
     ))
 }
 
-/// Lines take their ends from the arcs beside them, so every vertex of a
-/// loop is exactly the point its carriers evaluate there.
-fn harmonised(mut pieces: Vec<Piece>) -> Vec<Piece> {
+/// Lines take their ends from the arcs and splines beside them, so every
+/// vertex of a loop is exactly the point its carriers evaluate there.
+pub(crate) fn harmonised(mut pieces: Vec<Piece>) -> Vec<Piece> {
     let count = pieces.len();
     if count < 2 {
         return pieces;
@@ -569,10 +791,10 @@ fn harmonised(mut pieces: Vec<Piece>) -> Vec<Piece> {
         let previous = pieces[(index + count - 1) % count];
         let next = pieces[(index + 1) % count];
         if let Piece::Line { start, end } = &mut pieces[index] {
-            if matches!(previous, Piece::Arc { .. }) {
+            if !matches!(previous, Piece::Line { .. }) {
                 *start = previous.end();
             }
-            if matches!(next, Piece::Arc { .. }) {
+            if !matches!(next, Piece::Line { .. }) {
                 *end = next.start();
             }
         }
@@ -650,7 +872,7 @@ fn correspond(bottom: &SectionLoop, top: &SectionLoop, snap: f64) -> (Vec<Piece>
 }
 
 /// A whole circle restarted at the point of it nearest `target`.
-fn rebased(piece: Piece, target: Point3) -> Piece {
+pub(crate) fn rebased(piece: Piece, target: Point3) -> Piece {
     let Piece::Arc {
         center,
         u,
@@ -679,7 +901,7 @@ fn rebased(piece: Piece, target: Point3) -> Piece {
     }
 }
 
-fn rotated(pieces: &[Piece], offset: usize) -> Vec<Piece> {
+pub(crate) fn rotated(pieces: &[Piece], offset: usize) -> Vec<Piece> {
     let count = pieces.len();
     (0..count)
         .map(|index| pieces[(index + offset) % count])
@@ -687,7 +909,7 @@ fn rotated(pieces: &[Piece], offset: usize) -> Vec<Piece> {
 }
 
 /// The summed squared length of the rungs two equal lists of pieces imply.
-fn rung_cost(bottom: &[Piece], top: &[Piece]) -> f64 {
+pub(crate) fn rung_cost(bottom: &[Piece], top: &[Piece]) -> f64 {
     bottom
         .iter()
         .zip(top)
@@ -699,7 +921,7 @@ fn rung_cost(bottom: &[Piece], top: &[Piece]) -> f64 {
 }
 
 /// Where each vertex of a loop sits along it, as a fraction of its length.
-fn positions(pieces: &[Piece]) -> (Vec<f64>, Vec<f64>) {
+pub(crate) fn positions(pieces: &[Piece]) -> (Vec<f64>, Vec<f64>) {
     let lengths = pieces
         .iter()
         .map(|piece| piece.length())
@@ -750,7 +972,7 @@ fn cut_to_common(dense: &[Piece], sparse: &[Piece], snap: f64) -> Option<(Vec<Pi
 }
 
 /// A loop cut at rising positions along it.
-fn cut_at(pieces: &[Piece], cuts: &[f64]) -> Vec<Piece> {
+pub(crate) fn cut_at(pieces: &[Piece], cuts: &[f64]) -> Vec<Piece> {
     let (starts, shares) = positions(pieces);
     let mut result = Vec::with_capacity(pieces.len() + cuts.len());
     let mut next = 0;
@@ -772,6 +994,9 @@ fn cut_at(pieces: &[Piece], cuts: &[f64]) -> Vec<Piece> {
 /// cylinder or a cone where one of those is exact, a ruled surface
 /// otherwise, and a refusal where the wall would pinch.
 fn wall(bottom: Piece, top: Piece, precision: PrecisionPolicy) -> Result<Wall, LoftSectionsError> {
+    if matches!(bottom, Piece::Spline { .. }) || matches!(top, Piece::Spline { .. }) {
+        return spline_wall(bottom, top, precision);
+    }
     let ruled = RuledSurface {
         rails: [bottom.rail(), top.rail()],
     };
@@ -786,6 +1011,33 @@ fn wall(bottom: Piece, top: Piece, precision: PrecisionPolicy) -> Result<Wall, L
         return Ok(revolved);
     }
     Ok(Wall::Ruled(ruled))
+}
+
+/// The wall between two pieces at least one of which is a spline: the
+/// B-spline surface of degree `p` by one whose rows are the two pieces on
+/// one basis (ADR 0050). Each row is the piece as a B-spline over the unit
+/// interval — a spline reparameterised, a line as itself, an arc as its
+/// cubic fit within the linear agreement — raised to one degree and refined
+/// to one knot vector, so the rulings pair equal parameters. Refused where
+/// the wall pinches, as a ruled wall is.
+fn spline_wall(
+    bottom: Piece,
+    top: Piece,
+    precision: PrecisionPolicy,
+) -> Result<Wall, LoftSectionsError> {
+    let tolerance = precision.linear_agreement;
+    let rows = bottom
+        .spline(tolerance)
+        .zip(top.spline(tolerance))
+        .and_then(|(low, high)| common_basis(&[low, high]))
+        .ok_or(LoftSectionsError::WallDegenerate)?;
+    let surface =
+        SplineSurface::ruled(rows[0], rows[1]).ok_or(LoftSectionsError::WallDegenerate)?;
+    let scale = surface.scale().max(1.0);
+    if surface.least_normal(surface.domain()) <= precision.linear_agreement * scale {
+        return Err(LoftSectionsError::WallDegenerate);
+    }
+    Ok(Wall::Spline(surface))
 }
 
 /// Two straight rails in one plane span that plane.
@@ -946,9 +1198,14 @@ fn walls_clear(
                 pair.bottom
                     .iter()
                     .zip(&pair.top)
-                    .flat_map(|(low, high)| {
+                    .zip(&pair.walls)
+                    .flat_map(|((low, high), wall)| {
                         let surface = RuledSurface {
                             rails: [low.rail(), high.rail()],
+                        };
+                        let spline = match wall {
+                            Wall::Spline(surface) => Some(*surface),
+                            _ => None,
                         };
                         let steps =
                             if matches!((low, high), (Piece::Line { .. }, Piece::Line { .. })) {
@@ -957,8 +1214,9 @@ fn walls_clear(
                                 16
                             };
                         (0..steps).map(move |index| {
-                            let point =
-                                surface.evaluate(Point2::new(index as f64 / steps as f64, v));
+                            let at = Point2::new(index as f64 / steps as f64, v);
+                            let point = spline
+                                .map_or_else(|| surface.evaluate(at), |spline| spline.evaluate(at));
                             Point2::new(point.as_vector().dot(across), point.as_vector().dot(up))
                         })
                     })
@@ -989,7 +1247,12 @@ fn walls_clear(
 
 /// Whether two closed polygons have edges that come within `minimum` of each
 /// other; for a polygon against itself, only edges that are not neighbours.
-fn polygon_crosses(first: &[Point2], second: &[Point2], same: bool, minimum: f64) -> bool {
+pub(crate) fn polygon_crosses(
+    first: &[Point2],
+    second: &[Point2],
+    same: bool,
+    minimum: f64,
+) -> bool {
     let (n, m) = (first.len(), second.len());
     for i in 0..n {
         let a = (first[i], first[(i + 1) % n]);
@@ -1006,7 +1269,7 @@ fn polygon_crosses(first: &[Point2], second: &[Point2], same: bool, minimum: f64
     false
 }
 
-fn point_in_polygon(point: Point2, polygon: &[Point2]) -> bool {
+pub(crate) fn point_in_polygon(point: Point2, polygon: &[Point2]) -> bool {
     let mut inside = false;
     for index in 0..polygon.len() {
         let a = polygon[index];
@@ -1030,7 +1293,7 @@ fn segment_distance_2d(first: (Point2, Point2), second: (Point2, Point2)) -> f64
 }
 
 /// The distance between two segments in space.
-fn segment_distance(first: (Point3, Point3), second: (Point3, Point3)) -> f64 {
+pub(crate) fn segment_distance(first: (Point3, Point3), second: (Point3, Point3)) -> f64 {
     let d1 = first.1 - first.0;
     let d2 = second.1 - second.0;
     let r = first.0 - second.0;
@@ -1068,7 +1331,7 @@ fn segment_distance(first: (Point3, Point3), second: (Point3, Point3)) -> f64 {
 }
 
 /// A cap's plane through the section frame, facing `outward`.
-fn cap(frame: Frame, outward: Vector3) -> Cap {
+pub(crate) fn cap(frame: Frame, outward: Vector3) -> Cap {
     let plane = if frame.normal.dot(outward) > 0.0 {
         Plane::new(frame.origin, frame.u, frame.v)
     } else {
@@ -1099,12 +1362,13 @@ pub(crate) fn build_loft_sections(loft: &ValidatedLoftSections) -> Topology {
             .iter()
             .map(|piece| push_vertex(&mut topology, &mut next_id, piece.start()))
             .collect::<Vec<_>>();
-        let mut edges_of = |pieces: &[Piece], vertices: &[VertexKey]| {
+        let mut edges_of = |pieces: &[Piece], vertices: &[VertexKey], row: usize| {
             pieces
                 .iter()
                 .enumerate()
-                .map(|(index, piece)| {
-                    let (curve, parameter_range) = piece.curve();
+                .map(|(index, _)| {
+                    let (curve, parameter_range) =
+                        pair.walls[index].edges(pair.bottom[index], pair.top[index])[row];
                     push_edge(
                         &mut topology,
                         &mut next_id,
@@ -1117,8 +1381,8 @@ pub(crate) fn build_loft_sections(loft: &ValidatedLoftSections) -> Topology {
                 })
                 .collect::<Vec<_>>()
         };
-        let bottom_edges = edges_of(&pair.bottom, &bottom_vertices);
-        let top_edges = edges_of(&pair.top, &top_vertices);
+        let bottom_edges = edges_of(&pair.bottom, &bottom_vertices, 0);
+        let top_edges = edges_of(&pair.top, &top_vertices, 1);
         let rungs = (0..count)
             .map(|index| {
                 push_edge(
@@ -1148,18 +1412,21 @@ pub(crate) fn build_loft_sections(loft: &ValidatedLoftSections) -> Topology {
             .iter()
             .zip(&keys)
             .map(|(pair, keys)| {
-                let (pieces, edges) = if cap_index == 0 {
-                    (&pair.bottom, &keys.bottom_edges)
+                let edges = if cap_index == 0 {
+                    &keys.bottom_edges
                 } else {
-                    (&pair.top, &keys.top_edges)
+                    &keys.top_edges
                 };
-                let mut uses = pieces
+                let mut uses = edges
                     .iter()
-                    .zip(edges)
-                    .map(|(piece, edge)| BoundaryUse {
+                    .enumerate()
+                    .map(|(index, edge)| BoundaryUse {
                         edge: *edge,
                         orientation: Orientation::Forward,
-                        curve: cap_pcurve(plane, *piece),
+                        curve: cap_pcurve(
+                            plane,
+                            pair.walls[index].edges(pair.bottom[index], pair.top[index])[cap_index],
+                        ),
                     })
                     .collect::<Vec<_>>();
                 if cap_index == 0 {
@@ -1265,22 +1532,29 @@ fn wall_pcurves(wall: Wall) -> (Surface, [[Point2; 2]; 4]) {
                 Point2::new(0.0, 1.0),
             ]),
         ),
+        Wall::Spline(surface) => (
+            Surface::Bspline(surface),
+            loop_of([
+                Point2::new(0.0, 0.0),
+                Point2::new(1.0, 0.0),
+                Point2::new(1.0, 1.0),
+                Point2::new(0.0, 1.0),
+            ]),
+        ),
     }
 }
 
-/// A section piece as a curve in a cap's plane, walked as the edge is.
-fn cap_pcurve(plane: Plane, piece: Piece) -> (Curve2, ParameterRange) {
-    match piece {
-        Piece::Line { start, end } => {
-            Curve2::line_segment([plane.project(start), plane.project(end)])
-        }
-        Piece::Arc {
+/// A section edge's curve in a cap's plane, walked as the edge is.
+pub(crate) fn cap_pcurve(
+    plane: Plane,
+    (curve, range): (Curve3, ParameterRange),
+) -> (Curve2, ParameterRange) {
+    match curve {
+        Curve3::Circle {
             center,
             u,
             v,
             radius,
-            from,
-            to,
         } => (
             Curve2::Circle {
                 center: plane.project(center),
@@ -1288,12 +1562,25 @@ fn cap_pcurve(plane: Plane, piece: Piece) -> (Curve2, ParameterRange) {
                 v: Vector2::new(v.dot(plane.u), v.dot(plane.v)),
                 radius,
             },
-            ParameterRange::new(from, to),
+            range,
         ),
+        Curve3::Bspline { curve } => match crate::bspline::plane_pcurve(curve, plane) {
+            Some(pcurve) => (Curve2::Bspline { curve: pcurve }, range),
+            None => Curve2::line_segment([
+                plane.project(curve.point(range.start)),
+                plane.project(curve.point(range.end)),
+            ]),
+        },
+        _ => Curve2::line_segment([
+            plane.project(curve.evaluate(range.start)),
+            plane.project(curve.evaluate(range.end)),
+        ]),
     }
 }
 
-fn reversed_pcurve((curve, range): (Curve2, ParameterRange)) -> (Curve2, ParameterRange) {
+pub(crate) fn reversed_pcurve(
+    (curve, range): (Curve2, ParameterRange),
+) -> (Curve2, ParameterRange) {
     match curve {
         Curve2::Line { endpoints } => Curve2::line_segment([endpoints[1], endpoints[0]]),
         other => (other, range.reversed()),
