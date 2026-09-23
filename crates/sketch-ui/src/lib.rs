@@ -712,9 +712,128 @@ pub enum SketchGeometry {
         start: SketchPoint,
         end: SketchPoint,
     },
+    /// A B-spline from `start` to `end`. The exact curve is the authoring
+    /// graph's; this names its drawn shape (see [`SplineShape`]).
+    Spline {
+        start: SketchPoint,
+        end: SketchPoint,
+        shape: SplineShape,
+    },
 }
 
 const MAX_DISPLAY_CURVE_SEGMENTS: usize = 64;
+
+/// The drawn shape of one spline, named so the `Copy` geometry above can
+/// carry it.
+///
+/// A spline's exact definition lives in the authoring graph; the canvas only
+/// ever draws, measures and hit-tests a sampled outline of it. The outlines
+/// live in a bounded memo keyed by the curve's exact data, so an identical
+/// curve is sampled once and an edit that makes a new curve makes a new key.
+/// A key whose outline has been evicted draws as its chord until the entity
+/// is next derived from the graph, which every refresh does.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SplineShape(u64);
+
+/// Outlines held at once. A sketch rarely holds more than a few dozen
+/// splines; the rest of the room is for the shapes a live edit passes
+/// through.
+const SPLINE_SHAPE_CAPACITY: usize = 4096;
+/// Samples per knot span, so a long spline is drawn as finely as a short one.
+const SPLINE_SAMPLES_PER_SPAN: usize = 24;
+
+type SplineShapeMemo = std::collections::BTreeMap<u64, (u64, std::sync::Arc<[SketchPoint]>)>;
+
+fn spline_shape_memo() -> &'static std::sync::Mutex<(u64, SplineShapeMemo)> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<(u64, SplineShapeMemo)>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new((0, SplineShapeMemo::new())))
+}
+
+impl SplineShape {
+    /// Samples a core B-spline into the memo and returns its key, or `None`
+    /// for a curve that is not a B-spline or cannot be evaluated.
+    fn of(curve: &CoreEvaluatedCurve2) -> Option<Self> {
+        let CoreEvaluatedCurve2::Bspline {
+            control_points,
+            degree,
+            knots,
+            weights,
+        } = curve
+        else {
+            return None;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(degree, &mut hasher);
+        for point in control_points {
+            std::hash::Hash::hash(&point.u.to_bits(), &mut hasher);
+            std::hash::Hash::hash(&point.v.to_bits(), &mut hasher);
+        }
+        for knot in knots {
+            std::hash::Hash::hash(&knot.to_bits(), &mut hasher);
+        }
+        for weight in weights.iter().flatten() {
+            std::hash::Hash::hash(&weight.to_bits(), &mut hasher);
+        }
+        let key = std::hash::Hasher::finish(&hasher);
+        let mut memo = spline_shape_memo().lock().ok()?;
+        let (clock, shapes) = &mut *memo;
+        *clock += 1;
+        let stamp = *clock;
+        if let Some(entry) = shapes.get_mut(&key) {
+            entry.0 = stamp;
+            return Some(Self(key));
+        }
+        let spans = knots
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0])
+            .count()
+            .max(1);
+        let samples = (spans * SPLINE_SAMPLES_PER_SPAN).clamp(16, 1024);
+        let points = (0..=samples)
+            .map(|index| curve.evaluate(index as f64 / samples as f64).ok())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(|point| SketchPoint::new(point.u, point.v))
+            .collect::<std::sync::Arc<[SketchPoint]>>();
+        if shapes.len() >= SPLINE_SHAPE_CAPACITY {
+            // Forget the quarter used longest ago.
+            let mut stamps = shapes.values().map(|(stamp, _)| *stamp).collect::<Vec<_>>();
+            stamps.sort_unstable();
+            let cutoff = stamps[stamps.len() / 4];
+            shapes.retain(|_, (stamp, _)| *stamp > cutoff);
+        }
+        shapes.insert(key, (stamp, points));
+        Some(Self(key))
+    }
+
+    /// The same outline moved by `(delta_u, delta_v)`, under a key of its
+    /// own, for a drag preview.
+    fn translated(self, delta_u: f64, delta_v: f64) -> Option<Self> {
+        let points = self.points()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.0, &mut hasher);
+        std::hash::Hash::hash(&delta_u.to_bits(), &mut hasher);
+        std::hash::Hash::hash(&delta_v.to_bits(), &mut hasher);
+        let key = std::hash::Hasher::finish(&hasher);
+        let moved = points
+            .iter()
+            .map(|point| SketchPoint::new(point.u + delta_u, point.v + delta_v))
+            .collect::<std::sync::Arc<[SketchPoint]>>();
+        let mut memo = spline_shape_memo().lock().ok()?;
+        let (clock, shapes) = &mut *memo;
+        *clock += 1;
+        shapes.insert(key, (*clock, moved));
+        Some(Self(key))
+    }
+
+    /// The sampled outline, first point to last, if it is still held.
+    #[must_use]
+    pub fn points(self) -> Option<std::sync::Arc<[SketchPoint]>> {
+        let memo = spline_shape_memo().lock().ok()?;
+        memo.1.get(&self.0).map(|(_, points)| points.clone())
+    }
+}
 
 /// Deterministic, renderer-neutral outline for displaying a sketch entity.
 ///
@@ -792,6 +911,7 @@ impl SketchGeometry {
                     && center.distance_squared(end).is_finite()
                     && arc_sweep(center, start, end).is_finite()
             }
+            Self::Spline { start, end, .. } => start.is_finite() && end.is_finite(),
         }
     }
 
@@ -814,6 +934,15 @@ impl SketchGeometry {
                     || center.distance_squared(end) <= MIN_ENTITY_LENGTH.powi(2)
                     || arc_sweep(center, start, end) <= 1.0e-9
             }
+            // A closed spline starts where it ends, so its length, not its
+            // ends, says whether it is anything at all.
+            Self::Spline { shape, .. } => shape.points().is_some_and(|points| {
+                points
+                    .windows(2)
+                    .map(|pair| pair[0].distance_squared(pair[1]).sqrt())
+                    .sum::<f64>()
+                    <= MIN_ENTITY_LENGTH
+            }),
         }
     }
 
@@ -890,6 +1019,20 @@ impl SketchGeometry {
                     .collect();
                 (points, false)
             }
+            Self::Spline { start, end, shape } => {
+                let mut points = shape
+                    .points()
+                    .map_or_else(|| vec![start, end], |points| points.to_vec());
+                // A closed spline repeats its first point at the end; the
+                // outline states the closure instead.
+                let closed = points.len() > 2
+                    && points[0].distance_squared(points[points.len() - 1])
+                        <= MIN_ENTITY_LENGTH.powi(2);
+                if closed {
+                    points.pop();
+                }
+                (points, closed)
+            }
         };
         Some(SketchDisplayPolyline { points, closed })
     }
@@ -909,6 +1052,15 @@ impl SketchGeometry {
             )),
             Self::Circle { center, .. } => Some(center),
             Self::Arc { center, .. } => Some(center),
+            Self::Spline { start, end, shape } => shape
+                .points()
+                .and_then(|points| points.get(points.len() / 2).copied())
+                .or_else(|| {
+                    Some(SketchPoint::new(
+                        (start.u + end.u) * 0.5,
+                        (start.v + end.v) * 0.5,
+                    ))
+                }),
         }
     }
 
@@ -933,6 +1085,11 @@ impl SketchGeometry {
                 center: SketchPoint::new(center.u + delta_u, center.v + delta_v),
                 start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
                 end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+            },
+            Self::Spline { start, end, shape } => Self::Spline {
+                start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
+                end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+                shape: shape.translated(delta_u, delta_v).unwrap_or(shape),
             },
         }
     }
@@ -1079,6 +1236,11 @@ impl SketchGeometry {
     fn control_points(self) -> GeometryPoints {
         match self {
             Self::Point(point) => GeometryPoints::one(point),
+            // A spline's handles are its ends and the point halfway along;
+            // its shape is edited through its own points, not by stretching.
+            Self::Spline { start, end, .. } => {
+                GeometryPoints::three(start, end, self.center().unwrap_or(start))
+            }
             Self::Segment { start, end } => {
                 let mid = SketchPoint::new((start.u + end.u) * 0.5, (start.v + end.v) * 0.5);
                 GeometryPoints::three(start, end, mid)
@@ -1161,7 +1323,7 @@ pub fn hit_test_drag_handle(
     hit_radius: f32,
 ) -> SketchDragHandle {
     match geometry {
-        SketchGeometry::Point(_) => SketchDragHandle::Translate,
+        SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => SketchDragHandle::Translate,
         SketchGeometry::Segment { start, end } => {
             let start_pos = view.sketch_to_screen(rect, start);
             let end_pos = view.sketch_to_screen(rect, end);
@@ -3001,7 +3163,9 @@ struct DimensionSession {
 impl DimensionSession {
     fn from_geometry(target: DimensionTarget, geometry: SketchGeometry, serial: u64) -> Self {
         let phase = match geometry {
-            SketchGeometry::Point(_) => DimensionPhase::Point,
+            // A spline has no typed dimensions of its own yet: the point
+            // phase offers none for it.
+            SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => DimensionPhase::Point,
             SketchGeometry::Segment { .. } => DimensionPhase::Line,
             SketchGeometry::Rectangle { .. } => DimensionPhase::Rectangle,
             SketchGeometry::Circle { .. } => DimensionPhase::Circle,
@@ -3441,6 +3605,7 @@ impl DimensionSession {
             return;
         }
         self.geometry = match self.geometry {
+            spline @ SketchGeometry::Spline { .. } => spline,
             SketchGeometry::Point(_) => SketchGeometry::point(SketchPoint::new(
                 self.value(SketchDimensionKind::U),
                 self.value(SketchDimensionKind::V),
@@ -3671,7 +3836,7 @@ fn dimension_fields_for_geometry(
 
 fn dimension_phase_for_geometry(geometry: SketchGeometry) -> DimensionPhase {
     match geometry {
-        SketchGeometry::Point(_) => DimensionPhase::Point,
+        SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => DimensionPhase::Point,
         SketchGeometry::Segment { .. } => DimensionPhase::Line,
         SketchGeometry::Rectangle { .. } => DimensionPhase::Rectangle,
         SketchGeometry::Circle { .. } => DimensionPhase::Circle,
@@ -4105,6 +4270,7 @@ fn sketch_insert_label(entity: SketchEntity) -> &'static str {
         SketchGeometry::Rectangle { .. } => "Add sketch rectangle",
         SketchGeometry::Circle { .. } => "Add sketch circle",
         SketchGeometry::Arc { .. } => "Add sketch arc",
+        SketchGeometry::Spline { .. } => "Add spline",
     }
 }
 
@@ -4115,6 +4281,9 @@ const fn core_point(point: SketchPoint) -> CorePoint2 {
 fn core_recipe_for_entity(entity: SketchEntity) -> Option<CoreRecipe> {
     let point_input = |point| CorePointInput::Position(core_point(point));
     match entity.geometry {
+        // A spline is only ever staged from its own recipe; its drawn
+        // outline is not a definition to rebuild one from.
+        SketchGeometry::Spline { .. } => None,
         SketchGeometry::Point(position) => Some(CoreRecipe::Point {
             position: core_point(position),
         }),
@@ -4438,13 +4607,18 @@ fn legacy_geometry_from_core(curve: CoreEvaluatedCurve2) -> SketchGeometry {
             let center = point(center);
             SketchGeometry::circle(center, SketchPoint::new(center.u + radius, center.v))
         }
-        CoreEvaluatedCurve2::Bspline { control_points, .. } => {
+        ref spline @ CoreEvaluatedCurve2::Bspline {
+            ref control_points, ..
+        } => {
             let start = control_points
                 .first()
                 .map(|p| point(*p))
                 .unwrap_or_default();
             let end = control_points.last().map(|p| point(*p)).unwrap_or_default();
-            SketchGeometry::segment(start, end)
+            match SplineShape::of(spline) {
+                Some(shape) => SketchGeometry::Spline { start, end, shape },
+                None => SketchGeometry::segment(start, end),
+            }
         }
     }
 }
@@ -5673,10 +5847,10 @@ impl SketchCanvasState {
             u8::try_from(self.exact_tool.descriptor().acquisition_phases.len()).unwrap_or(u8::MAX);
         let completed_points = if self.pending.is_some() {
             required_points
-        } else if self.exact_tool == ToolVariant::ChainedPolyline {
+        } else if self.exact_tool == ToolVariant::ChainedPolyline || self.draws_a_spline() {
             // A polyline's second acquisition phase is intentionally
-            // repeatable. Keep the palette on that phase until the complete
-            // local chain is staged as one operation.
+            // repeatable, and so is a spline's. Keep the palette on that
+            // phase until the complete local chain is staged as one operation.
             u8::from(!self.polyline_vertices.is_empty())
         } else if matches!(
             self.exact_tool,
@@ -7592,6 +7766,176 @@ impl SketchCanvasState {
         Ok(subject)
     }
 
+    /// Whether the active tool draws a spline, through fit points or on a
+    /// control polygon. Its accepted points share the polyline's store: one
+    /// tool is live at a time, and clearing a draft clears either.
+    #[must_use]
+    pub const fn draws_a_spline(&self) -> bool {
+        matches!(
+            self.exact_tool,
+            ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline
+        )
+    }
+
+    /// Whether the spline being drawn has points enough to finish.
+    #[must_use]
+    pub fn spline_draft_can_finish(&self) -> bool {
+        self.draws_a_spline() && self.pending.is_none() && self.polyline_vertices.len() >= 2
+    }
+
+    /// Stages the spline drawn so far as one exact recipe, left open.
+    pub fn finish_spline_draft(&mut self) -> Result<SketchEntityId, SketchEditError> {
+        self.stage_spline_draft(false)
+    }
+
+    /// The degree a spline through `count` points is drawn at: cubic when
+    /// there are points enough, and as high as they allow when there are not.
+    const fn spline_degree(count: usize) -> usize {
+        if count > 3 {
+            3
+        } else if count > 1 {
+            count - 1
+        } else {
+            1
+        }
+    }
+
+    fn spline_recipe(&self, points: &[SketchPoint], closed: bool) -> Option<CoreRecipe> {
+        let inputs = points
+            .iter()
+            .copied()
+            .map(|point| CorePointInput::Position(core_point(point)))
+            .collect::<Vec<_>>();
+        match self.exact_tool {
+            ToolVariant::FitPointSpline => Some(CoreRecipe::FitPointSpline {
+                degree: Self::spline_degree(points.len() + usize::from(closed)),
+                fit_points: inputs,
+                closed,
+            }),
+            ToolVariant::ControlVertexSpline => {
+                // A closed polygon returns to its first vertex, which the
+                // recipe adds; the knots are for the polygon as closed.
+                let count = points.len() + usize::from(closed);
+                let degree = Self::spline_degree(count);
+                Some(CoreRecipe::ControlVertexSpline {
+                    control_points: inputs,
+                    degree,
+                    knots: artificer_sketch::clamped_uniform_knots(count, degree),
+                    weights: None,
+                    closed,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn stage_spline_draft(&mut self, closed: bool) -> Result<SketchEntityId, SketchEditError> {
+        if !self.draws_a_spline() {
+            return Err(SketchEditError::NoPendingEdit);
+        }
+        let minimum = if closed { 3 } else { 2 };
+        if self.polyline_vertices.len() < minimum {
+            return Err(SketchEditError::DegenerateGeometry);
+        }
+        let points = self.polyline_vertices.clone();
+        let recipe = self
+            .spline_recipe(&points, closed)
+            .ok_or(SketchEditError::NoPendingEdit)?;
+        let subject = self.stage_recipe(recipe, "Add spline")?;
+        self.clear_creation_draft();
+        Ok(subject)
+    }
+
+    /// Takes one click of a spline: a new point, or — on the first point,
+    /// with three or more down — the close that finishes it as a loop.
+    fn accept_spline_point(&mut self, pointer: SketchPoint) -> Option<SketchEntityId> {
+        if self.pending.is_some() || !self.draws_a_spline() {
+            return None;
+        }
+        if self.polyline_vertices.len() >= 3
+            && polyline_points_coincident(pointer, self.polyline_vertices[0])
+        {
+            return self.stage_spline_draft(true).ok();
+        }
+        if self
+            .polyline_vertices
+            .iter()
+            .any(|existing| polyline_points_coincident(*existing, pointer))
+        {
+            return None;
+        }
+        self.polyline_vertices.push(pointer);
+        None
+    }
+
+    fn finish_spline_at_pointer(&mut self, point: SketchPoint) -> Option<SketchEntityId> {
+        // As with a chain, the first click of a double-click has already
+        // placed this point; take one here only if there are too few.
+        if self.polyline_vertices.len() < 2
+            && let Some(subject) = self.accept_spline_point(point)
+        {
+            return Some(subject);
+        }
+        self.finish_spline_draft().ok()
+    }
+
+    /// The spline a tool would draw through its points and `pointer`, for
+    /// the preview. A control-vertex spline shows its clamped curve.
+    fn spline_preview_curve(&self, pointer: Option<SketchPoint>) -> Option<CoreEvaluatedCurve2> {
+        if !self.draws_a_spline() {
+            return None;
+        }
+        let mut points = self
+            .polyline_vertices
+            .iter()
+            .copied()
+            .map(core_point)
+            .collect::<Vec<_>>();
+        if let Some(pointer) = pointer
+            && !self
+                .polyline_vertices
+                .iter()
+                .any(|existing| polyline_points_coincident(*existing, pointer))
+        {
+            points.push(core_point(pointer));
+        }
+        if points.len() < 2 {
+            return None;
+        }
+        let degree = Self::spline_degree(points.len());
+        match self.exact_tool {
+            ToolVariant::FitPointSpline => {
+                artificer_sketch::fit_point_spline_curve(&points, degree, false).ok()
+            }
+            ToolVariant::ControlVertexSpline => Some(CoreEvaluatedCurve2::Bspline {
+                knots: artificer_sketch::clamped_uniform_knots(points.len(), degree),
+                control_points: points,
+                degree,
+                weights: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Escape abandons a spline being drawn; the sketch is left as it was.
+    fn cancel_spline_layer(&mut self) -> bool {
+        if self.pending.is_some() || !self.draws_a_spline() || self.polyline_vertices.is_empty() {
+            return false;
+        }
+        self.clear_creation_draft();
+        true
+    }
+
+    /// Backspace takes back the last point of a spline being drawn.
+    fn backspace_spline_point(&mut self) -> bool {
+        if self.pending.is_some() || !self.draws_a_spline() || self.polyline_vertices.is_empty() {
+            return false;
+        }
+        self.polyline_vertices.pop();
+        self.pointer_preview = None;
+        true
+    }
+
     fn begin_polyline_segment(&mut self, start: SketchPoint) {
         self.creation_anchor = Some(start);
         self.polyline_current_segment_active = true;
@@ -7962,6 +8306,7 @@ impl SketchCanvasState {
                 SketchGeometry::Rectangle { .. } => result.closed_rectangles += 1,
                 SketchGeometry::Circle { .. } => result.closed_circles += 1,
                 SketchGeometry::Arc { .. } => result.open_arcs += 1,
+                SketchGeometry::Spline { .. } => result.open_segments += 1,
             }
         }
         let diagnostics = self.profile_analysis.diagnostics;
@@ -8150,7 +8495,7 @@ impl SketchCanvasState {
         }
 
         let model_radius = f64::from(self.snap.endpoint_radius_points) / self.view.points_per_unit;
-        if self.exact_tool == ToolVariant::ChainedPolyline
+        if (self.exact_tool == ToolVariant::ChainedPolyline || self.draws_a_spline())
             && self.polyline_vertices.len() >= 3
             && let Some(first) = self.polyline_vertices.first().copied()
             && self
@@ -8434,9 +8779,7 @@ impl SketchCanvasState {
             | ToolVariant::PerpendicularRelation
             | ToolVariant::EqualLengthRelation
             | ToolVariant::TangentRelation
-            | ToolVariant::CollinearRelation
-            | ToolVariant::FitPointSpline
-            | ToolVariant::ControlVertexSpline => None,
+            | ToolVariant::CollinearRelation => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
             ToolVariant::Text => {
                 if self.active_tool_parameter_issue().is_some() {
@@ -8469,6 +8812,9 @@ impl SketchCanvasState {
                 }
             }
             ToolVariant::ChainedPolyline => self.accept_polyline_vertex(point),
+            ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline => {
+                self.accept_spline_point(point)
+            }
             ToolVariant::Centreline => {
                 if let Some(start) = self.creation_anchor.take() {
                     self.update_dimension_pointer(point);
@@ -10744,7 +11090,8 @@ fn analyze_profile_entities(entities: &[SketchEntity]) -> ProfileAnalysis {
             SketchGeometry::Rectangle { .. } => 4,
             SketchGeometry::Segment { .. }
             | SketchGeometry::Circle { .. }
-            | SketchGeometry::Arc { .. } => 1,
+            | SketchGeometry::Arc { .. }
+            | SketchGeometry::Spline { .. } => 1,
         })
     });
     if authored_curve_count > MAX_PLANAR_PROFILE_CURVES {
@@ -10756,13 +11103,25 @@ fn analyze_profile_entities(entities: &[SketchEntity]) -> ProfileAnalysis {
         );
     }
 
+    // A spline bounds regions in the authoring graph, but this certified
+    // path draws its profiles from lines, arcs and circles only; a sketch
+    // with one says its curves need certification rather than guessing.
+    if entities
+        .iter()
+        .any(|entity| matches!(entity.geometry, SketchGeometry::Spline { .. }))
+    {
+        return ProfileAnalysis::status(
+            CertifiedProfileStatus::CurvesNeedCertification,
+            diagnostics,
+        );
+    }
     let mut seeds = Vec::new();
     let mut loops = Vec::<CertifiedSketchLoop>::new();
     for entity in entities {
         match entity.geometry {
             // Standalone points are not profile edges. They remain visible
             // sketch geometry without changing the closed-region selection.
-            SketchGeometry::Point(_) => {}
+            SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => {}
             SketchGeometry::Segment { start, end } => seeds.push(ProfileCurveSeed {
                 source: entity.id,
                 subindex: 0,
@@ -12102,6 +12461,8 @@ pub fn show_with_context(
                         && primary_finish_click
                     {
                         state.finish_polyline_at_pointer(point)
+                    } else if state.draws_a_spline() && primary_finish_click {
+                        state.finish_spline_at_pointer(point)
                     } else {
                         state.handle_creation_click(point)
                     };
@@ -13275,6 +13636,11 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         paint_snap_marker(painter, rect, state);
         return;
     }
+    if state.draws_a_spline() && !state.polyline_vertices.is_empty() {
+        paint_spline_draft(painter, rect, state);
+        paint_snap_marker(painter, rect, state);
+        return;
+    }
     if state.exact_tool == ToolVariant::ChainedPolyline && !state.polyline_vertices.is_empty() {
         for vertices in state.polyline_vertices.windows(2) {
             paint_geometry(
@@ -13405,6 +13771,49 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
     paint_snap_marker(painter, rect, state);
 }
 
+/// A spline being drawn: the curve through the points so far and the
+/// pointer, the points themselves, and for a control-vertex spline the
+/// polygon that shapes it.
+fn paint_spline_draft(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
+    let pending = sketch_colours().pending;
+    let pointer = state.pointer_preview.map(|snap| snap.point);
+    let to_screen = |point: SketchPoint| state.view.sketch_to_screen(rect, point);
+    if state.exact_tool == ToolVariant::ControlVertexSpline {
+        let polygon = state
+            .polyline_vertices
+            .iter()
+            .copied()
+            .chain(pointer)
+            .map(to_screen)
+            .collect::<Vec<_>>();
+        for pair in polygon.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(1.0, pending.gamma_multiply(0.45)),
+            );
+        }
+    }
+    if let Some(curve) = state.spline_preview_curve(pointer) {
+        const SAMPLES: usize = 128;
+        let points = (0..=SAMPLES)
+            .filter_map(|index| curve.evaluate(index as f64 / SAMPLES as f64).ok())
+            .map(|point| to_screen(SketchPoint::new(point.u, point.v)))
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, pending));
+        }
+    }
+    for (index, point) in state.polyline_vertices.iter().copied().enumerate() {
+        let screen = to_screen(point);
+        if index == 0 {
+            // The first point is the close target once there are three.
+            painter.circle_stroke(screen, 5.0, Stroke::new(1.5, pending));
+        } else {
+            painter.circle_filled(screen, 3.5, pending);
+        }
+    }
+}
+
 fn paint_snap_marker(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
     let Some(snap) = state.pointer_preview else {
         return;
@@ -13490,6 +13899,29 @@ fn paint_geometry(
     stroke: Stroke,
 ) {
     match geometry {
+        SketchGeometry::Spline { start, end, shape } => {
+            let points = shape.points();
+            let points = points.as_deref().unwrap_or(&[]);
+            if points.len() >= 2 {
+                for pair in points.windows(2) {
+                    painter.line_segment(
+                        [
+                            view.sketch_to_screen(rect, pair[0]),
+                            view.sketch_to_screen(rect, pair[1]),
+                        ],
+                        stroke,
+                    );
+                }
+            } else {
+                painter.line_segment(
+                    [
+                        view.sketch_to_screen(rect, start),
+                        view.sketch_to_screen(rect, end),
+                    ],
+                    stroke,
+                );
+            }
+        }
         SketchGeometry::Point(point) => {
             painter.circle_filled(view.sketch_to_screen(rect, point), 3.5, stroke.color);
         }
@@ -14882,7 +15314,7 @@ fn show_dimension_widgets(
 
     let mut pending_created = None;
     let polyline_gesture_owned = canvas_owned_keyboard
-        || (state.exact_tool == ToolVariant::ChainedPolyline
+        || ((state.exact_tool == ToolVariant::ChainedPolyline || state.draws_a_spline())
             && !state.polyline_vertices.is_empty()
             && !ui.ctx().egui_wants_keyboard_input());
     let tab_owned = if active_at_start.is_some() {
@@ -14944,7 +15376,7 @@ fn show_dimension_widgets(
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && backspace_pressed
-        && state.backspace_polyline_segment()
+        && (state.backspace_polyline_segment() || state.backspace_spline_point())
     {
         ui.input_mut(|input| {
             input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
@@ -14952,9 +15384,17 @@ fn show_dimension_widgets(
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && escape_pressed
-        && state.cancel_polyline_layer()
+        && (state.cancel_polyline_layer() || state.cancel_spline_layer())
     {
         claims.escape = true;
+    } else if active_at_start.is_none()
+        && polyline_gesture_owned
+        && enter_pressed
+        && state.draws_a_spline()
+        && !state.polyline_vertices.is_empty()
+    {
+        claims.enter = true;
+        pending_created = state.finish_spline_draft().ok();
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && enter_pressed
@@ -15179,6 +15619,28 @@ fn geometry_screen_distance(
     position: Pos2,
 ) -> f32 {
     match geometry {
+        SketchGeometry::Spline { start, end, shape } => {
+            let points = shape.points();
+            let points = points.as_deref().unwrap_or(&[]);
+            if points.len() >= 2 {
+                points
+                    .windows(2)
+                    .map(|pair| {
+                        point_segment_distance(
+                            position,
+                            view.sketch_to_screen(rect, pair[0]),
+                            view.sketch_to_screen(rect, pair[1]),
+                        )
+                    })
+                    .fold(f32::INFINITY, f32::min)
+            } else {
+                point_segment_distance(
+                    position,
+                    view.sketch_to_screen(rect, start),
+                    view.sketch_to_screen(rect, end),
+                )
+            }
+        }
         SketchGeometry::Point(point) => view.sketch_to_screen(rect, point).distance(position),
         SketchGeometry::Segment { start, end } => point_segment_distance(
             position,
@@ -15255,6 +15717,9 @@ fn semantic_target(
     canvas_rect: Rect,
 ) -> Option<(Pos2, &'static str)> {
     let (point, kind) = match geometry {
+        spline @ SketchGeometry::Spline { start, .. } => {
+            (spline.center().unwrap_or(start), "spline")
+        }
         SketchGeometry::Point(point) => (point, "point"),
         SketchGeometry::Segment { start, end } => (
             SketchPoint::new(
@@ -16983,6 +17448,139 @@ mod tests {
 
         state.finish_polyline_draft().expect("stage open chain");
         assert!(!state.polyline_draft_can_finish());
+    }
+
+    fn staged_recipe(state: &SketchCanvasState) -> CoreRecipe {
+        let transaction = state
+            .pending()
+            .expect("a staged preview")
+            .core_transaction
+            .as_ref()
+            .expect("exact transaction");
+        transaction
+            .impact()
+            .inserted_operations
+            .iter()
+            .next()
+            .and_then(|id| transaction.preview().operation(*id))
+            .expect("one operation")
+            .recipe
+            .clone()
+    }
+
+    #[test]
+    fn a_fit_point_spline_is_drawn_through_its_clicks_and_finished_with_enter() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        assert!(state.draws_a_spline());
+        let fit = [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(2.0, 1.5),
+            SketchPoint::new(4.0, -0.5),
+            SketchPoint::new(6.0, 1.0),
+        ];
+        for point in fit {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        // The preview runs through every point placed so far.
+        let preview = state.spline_preview_curve(None).expect("a preview curve");
+        let start = preview.evaluate(0.0).unwrap();
+        let end = preview.evaluate(1.0).unwrap();
+        assert!((start.u - 0.0).abs() < 1.0e-9 && (start.v - 0.0).abs() < 1.0e-9);
+        assert!((end.u - 6.0).abs() < 1.0e-9 && (end.v - 1.0).abs() < 1.0e-9);
+        assert!(state.spline_draft_can_finish());
+        state.finish_spline_draft().expect("the spline stages");
+        assert!(matches!(
+            staged_recipe(&state),
+            CoreRecipe::FitPointSpline {
+                ref fit_points,
+                degree: 3,
+                closed: false,
+            } if fit_points.len() == 4
+        ));
+        assert!(state.polyline_vertices.is_empty());
+        state.commit_pending().expect("the spline commits");
+        assert_eq!(state.entities().len(), 1);
+    }
+
+    #[test]
+    fn clicking_a_spline_s_first_point_closes_it_into_a_region() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(4.0, 0.0),
+            SketchPoint::new(4.0, 3.0),
+            SketchPoint::new(0.0, 3.0),
+        ] {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        state
+            .handle_creation_click(SketchPoint::new(0.0, 0.0))
+            .expect("the first point closes the spline");
+        assert!(matches!(
+            staged_recipe(&state),
+            CoreRecipe::FitPointSpline { closed: true, .. }
+        ));
+        state.commit_pending().expect("the loop commits");
+        let arrangement = state.refreshed_arrangement().expect("an arrangement");
+        assert_eq!(
+            arrangement.cells.len(),
+            1,
+            "a closed spline bounds one region"
+        );
+    }
+
+    #[test]
+    fn a_control_vertex_spline_is_clamped_to_its_polygon() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::ControlVertexSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(1.0, 2.0),
+            SketchPoint::new(3.0, 2.0),
+            SketchPoint::new(4.0, 0.0),
+            SketchPoint::new(6.0, 1.0),
+        ] {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        state.finish_spline_draft().expect("the spline stages");
+        let CoreRecipe::ControlVertexSpline {
+            control_points,
+            degree,
+            knots,
+            weights,
+            closed,
+        } = staged_recipe(&state)
+        else {
+            panic!("a control-vertex recipe");
+        };
+        assert_eq!(control_points.len(), 5);
+        assert_eq!(degree, 3);
+        assert_eq!(knots, vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(weights, None);
+        assert!(!closed);
+        state.commit_pending().expect("the spline commits");
+        assert_eq!(state.entities().len(), 1);
+    }
+
+    #[test]
+    fn backspace_takes_back_a_spline_point_and_escape_abandons_it() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(2.0, 1.0),
+            SketchPoint::new(4.0, 0.0),
+        ] {
+            state.handle_creation_click(point);
+        }
+        assert!(state.backspace_spline_point());
+        assert_eq!(state.polyline_vertices.len(), 2);
+        assert!(state.cancel_spline_layer());
+        assert!(state.polyline_vertices.is_empty());
+        assert!(state.pending().is_none());
+        assert!(state.entities().is_empty());
     }
 
     #[test]

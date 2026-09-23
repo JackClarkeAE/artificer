@@ -268,7 +268,7 @@ fn explicit_finish_chain_commits_one_atomic_polyline() {
     enter_xy_sketch(&mut harness);
     click_button(
         &mut harness,
-        "Choose line type; current default: Single line.",
+        "Choose line or spline type; current default: Single line.",
     );
     click_button(&mut harness, "Chained polyline");
 

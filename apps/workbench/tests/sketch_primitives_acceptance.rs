@@ -198,7 +198,7 @@ fn centreline_is_construction_and_escape_is_revision_and_id_neutral() {
     enter_xy_sketch(&mut harness);
     choose_variant(
         &mut harness,
-        "Choose line type; current default: Single line.",
+        "Choose line or spline type; current default: Single line.",
         "Centreline",
     );
 

@@ -112,7 +112,7 @@ fn compact_toolbar_is_a_uniform_seven_by_two_grid_with_contained_variant_chooser
     }
 
     for label in [
-        "Choose line type; current default: Single line.",
+        "Choose line or spline type; current default: Single line.",
         "Choose rectangle type; current default: Two-point rectangle.",
         "Choose circle type; current default: Centre-point circle.",
         "Choose arc type; current default: Centre-start-end arc.",

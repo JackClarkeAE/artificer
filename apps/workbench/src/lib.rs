@@ -18712,6 +18712,39 @@ impl KernelLabApp {
                         }
                     }
 
+                    if matches!(
+                        self.active_sketch_tool,
+                        ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline
+                    ) && !progress.awaiting_confirmation
+                    {
+                        let can_finish = self.sketch.spline_draft_can_finish();
+                        let response = ui.add_enabled(
+                            can_finish,
+                            egui::Button::new("Finish spline").corner_radius(5),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                can_finish,
+                                "Finish spline",
+                            )
+                        });
+                        let response = if can_finish {
+                            response.on_hover_text(
+                                "Stage the spline through the points placed so far; the green tick or Enter then commits it. Click the first point instead to close it into a loop.",
+                            )
+                        } else {
+                            response.on_disabled_hover_text(
+                                "Place at least two distinct points before finishing the spline.",
+                            )
+                        };
+                        if response.clicked()
+                            && let Ok(subject) = self.sketch.finish_spline_draft()
+                        {
+                            self.commit_sketch_stroke(subject);
+                        }
+                    }
+
                     self.sketch_active_tool_inputs(ui, descriptor);
                 });
 
@@ -23863,6 +23896,18 @@ fn sketch_export_curves_from_entities(entities: &[SketchEntity]) -> Vec<export::
     let mut curves = Vec::new();
     for entity in entities {
         match entity.geometry {
+            // Presentation entities keep only a spline's drawn outline, so
+            // the outline is what this fallback can write.
+            SketchGeometry::Spline { .. } => {
+                if let Some(outline) = entity.geometry.display_polyline() {
+                    for [start, end] in outline.segments() {
+                        curves.push(export::SketchExportCurve::Line {
+                            start: [start.u, start.v],
+                            end: [end.u, end.v],
+                        });
+                    }
+                }
+            }
             SketchGeometry::Segment { start, end } => {
                 curves.push(export::SketchExportCurve::Line {
                     start: [start.u, start.v],
