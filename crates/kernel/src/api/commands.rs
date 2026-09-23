@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::selectors::EntitySelector;
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn is_zero(value: &f64) -> bool {
     *value == 0.0
 }
@@ -118,6 +123,22 @@ pub enum SketchEntity {
         origin: Point2,
         width: f64,
         height: f64,
+    },
+    /// A spline through fit points (ADR 0050), drawn as the sketch's
+    /// fit-point tool draws it: cubic when there are four points or more,
+    /// and back to the first point, smooth there, when `closed`.
+    Spline {
+        points: Vec<Point2>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        closed: bool,
+    },
+    /// A spline by its control points (ADR 0050): clamped and uniform, of
+    /// `degree`, and ending on its first control point when `closed`.
+    ControlSpline {
+        control_points: Vec<Point2>,
+        degree: usize,
+        #[serde(default, skip_serializing_if = "is_false")]
+        closed: bool,
     },
 }
 

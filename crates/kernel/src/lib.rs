@@ -7,6 +7,7 @@
 mod analytic_extrusion;
 pub mod api;
 pub mod brep;
+mod bspline;
 mod corner_blend;
 mod cuboid;
 mod cylinder_trace;
@@ -25,6 +26,7 @@ mod hole_rim_blend;
 #[allow(dead_code)]
 mod loft;
 mod loft_sections;
+mod loft_skin;
 mod loop_offset;
 mod mirror;
 mod pattern;
@@ -39,6 +41,7 @@ mod ruled;
 mod section_revolve;
 mod sew;
 mod shell;
+mod spline_profile;
 mod step_export;
 mod surface_intersection;
 mod topology;
@@ -268,7 +271,16 @@ pub enum DisplaySurface {
     /// v·C₁(u)`. It has no revolved frame: [`Self::frame`] reports none, and
     /// its silhouette comes from [`Self::ruled_silhouette`].
     Ruled { rails: [DisplayRail; 2] },
+    /// A B-spline surface (ADR 0050). It has no revolved frame either, and
+    /// its silhouette comes from [`Self::spline_silhouette`].
+    Bspline { surface: DisplaySpline },
 }
+
+/// The surface of a B-spline display carrier: a handle the kernel evaluates
+/// for presentation, and nothing a consumer can build or take apart. Two are
+/// equal when their surfaces are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplaySpline(bspline::SplineSurface);
 
 /// One rail of a ruled display carrier: a conic walked from `start` to `end`
 /// in its own parameter as `u` runs from zero to one.
@@ -370,6 +382,9 @@ impl DisplaySurface {
             };
             return protocol_point(surface.evaluate(topology::Point2::new(u, v)));
         }
+        if let Self::Bspline { surface } = self {
+            return protocol_point(surface.0.evaluate(topology::Point2::new(u, v)));
+        }
         let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
         let angle = angular_sign * u;
         let (sin, cos) = topology::seam_snapped_sin_cos(angle);
@@ -398,7 +413,7 @@ impl DisplaySurface {
                     minor_radius * sin_v,
                 )
             }
-            Self::Ruled { .. } => (0.0, 0.0),
+            Self::Ruled { .. } | Self::Bspline { .. } => (0.0, 0.0),
         };
         ProtocolPoint3::new(
             radial.x.mul_add(ring, axis.x.mul_add(lift, origin.x)),
@@ -453,11 +468,92 @@ impl DisplaySurface {
                 angular_sign,
                 ..
             } => (origin, axis, radial_u, radial_v, angular_sign),
-            Self::Ruled { .. } => {
+            Self::Ruled { .. } | Self::Bspline { .. } => {
                 let zero = ProtocolVector3::new(0.0, 0.0, 0.0);
                 (ProtocolPoint3::new(0.0, 0.0, 0.0), zero, zero, zero, 0.0)
             }
         }
+    }
+
+    /// The chords along which a B-spline carrier turns away from a viewer
+    /// looking along `view`, within `domain`; empty for any other carrier.
+    ///
+    /// Presentation samples (ADR 0026, rule 3). The sign of `n · view` is
+    /// read on a grid over every span cell, and each grid cell where it
+    /// changes contributes the chord between the points on its sides where
+    /// the linear reading of it vanishes — the marching-squares contour of
+    /// the silhouette, as fine as the grid.
+    #[must_use]
+    pub fn spline_silhouette(
+        self,
+        domain: [[f64; 2]; 2],
+        view: [f64; 3],
+    ) -> Vec<[ProtocolPoint3; 2]> {
+        let Self::Bspline { surface } = self else {
+            return Vec::new();
+        };
+        let surface = surface.0;
+        let [[u_min, u_max], [v_min, v_max]] = domain;
+        if !(u_min < u_max && v_min < v_max) {
+            return Vec::new();
+        }
+        let view = Vector3::new(view[0], view[1], view[2]);
+        let samples = |direction: usize, from: f64, to: f64| {
+            let spans = surface.spans(direction, from, to);
+            let per_span = (96 / spans.len().max(1)).clamp(2, 16);
+            let mut samples = vec![from];
+            for (low, high) in spans {
+                for step in 1..=per_span {
+                    samples.push((high - low).mul_add(step as f64 / per_span as f64, low));
+                }
+            }
+            samples
+        };
+        let us = samples(0, u_min, u_max);
+        let vs = samples(1, v_min, v_max);
+        let facing = |u: f64, v: f64| {
+            let normal = surface.normal(topology::Point2::new(u, v));
+            let value = normal.dot(view);
+            if value.abs() <= 1.0e-12 * normal.length() * view.length() {
+                0.0
+            } else {
+                value
+            }
+        };
+        let values = us
+            .iter()
+            .map(|u| vs.iter().map(|v| facing(*u, *v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let crossing = |from: f64, to: f64| {
+            ((from < 0.0) != (to < 0.0))
+                .then(|| from / (from - to))
+                .filter(|fraction| fraction.is_finite())
+        };
+        let mut chords = Vec::new();
+        for i in 0..us.len() - 1 {
+            for j in 0..vs.len() - 1 {
+                let corners = [
+                    (us[i], vs[j], values[i][j]),
+                    (us[i + 1], vs[j], values[i + 1][j]),
+                    (us[i + 1], vs[j + 1], values[i + 1][j + 1]),
+                    (us[i], vs[j + 1], values[i][j + 1]),
+                ];
+                let mut points = Vec::with_capacity(4);
+                for side in 0..4 {
+                    let (u0, v0, f0) = corners[side];
+                    let (u1, v1, f1) = corners[(side + 1) % 4];
+                    if let Some(t) = crossing(f0, f1) {
+                        points.push(((u1 - u0).mul_add(t, u0), (v1 - v0).mul_add(t, v0)));
+                    }
+                }
+                for pair in points.chunks_exact(2) {
+                    chords.push([pair[0], pair[1]].map(|(u, v)| {
+                        protocol_point(surface.evaluate(topology::Point2::new(u, v)))
+                    }));
+                }
+            }
+        }
+        chords
     }
 
     /// The chords along which a ruled carrier turns away from a viewer
@@ -886,7 +982,20 @@ impl NativeKernel {
                 distance,
             } => {
                 validate_extrusion_source(input)?;
-                if profile_contains_analytic_curves(profile) {
+                if spline_profile::profile_contains_splines(profile) {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "extrusion/spline-profile";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if profile_contains_analytic_curves(profile) {
                     let extrusion = validate_analytic_profile_extrusion(
                         *frame,
                         profile,
@@ -920,7 +1029,32 @@ impl NativeKernel {
                     .precision
                     .modeling_resolution
                     .max(request.precision.min_feature_size);
-                if offset.abs() <= minimum {
+                let splines = spline_profile::profile_contains_splines(profile);
+                if splines && offset.abs() <= minimum {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "loft/straight";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if splines {
+                    // The offset of a spline is not a spline of any degree,
+                    // so the drafted section would have no exact carrier.
+                    return Err(planar_profile_error(
+                        input.id,
+                        KernelErrorCode::Unsupported,
+                        "LOFT_OFFSET_SPLINE_UNSUPPORTED",
+                        "a drafted loft offsets its section, and the offset of a B-spline is not \
+                         a B-spline, so a profile with splines cannot be drafted. Loft between \
+                         the profile and a scaled copy of it instead.",
+                    ));
+                } else if offset.abs() <= minimum {
                     // No draft is a straight extrusion; build it as one so the
                     // walls are the cylinders and planes an extrusion makes.
                     let extrusion = validate_analytic_profile_extrusion(
@@ -952,12 +1086,20 @@ impl NativeKernel {
                 if *operation == LoftOperation::New {
                     validate_extrusion_source(input)?;
                 }
-                let loft = loft_sections::validate_loft_sections(sections, request.precision)
-                    .map_err(|reason| loft_sections_error(input.id, reason))?;
-                let tool = loft_sections::build_loft_sections(&loft);
+                // Two sections are ruled (ADR 0049); three or more are
+                // skinned by one smooth B-spline wall per column (ADR 0050).
+                let (tool, built) = if sections.len() > 2 {
+                    let loft = loft_skin::validate_skinned_loft(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_skin::build_skinned_loft(&loft), "loft/skinned")
+                } else {
+                    let loft = loft_sections::validate_loft_sections(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_sections::build_loft_sections(&loft), "loft/sections")
+                };
                 match operation {
                     LoftOperation::New => {
-                        rung = "loft/sections";
+                        rung = built;
                         (tool, HistoryMode::Generated)
                     }
                     LoftOperation::Add | LoftOperation::Cut => {
@@ -1007,6 +1149,26 @@ impl NativeKernel {
                         exit_face,
                     },
                 )
+            }
+            KernelCommand::ExtrudeFacePlanarProfile {
+                target_face,
+                frame,
+                profile,
+                distance,
+                operation,
+            } if spline_profile::profile_contains_splines(profile) => {
+                let (topology, answered) = spline_face_feature(
+                    input,
+                    *target_face,
+                    *frame,
+                    profile,
+                    *distance,
+                    *operation,
+                    request.precision,
+                    &mut warnings,
+                )?;
+                rung = answered;
+                (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::ExtrudeFacePlanarProfile {
                 target_face,
@@ -2681,6 +2843,17 @@ impl NativeKernel {
                     )
                 });
             }
+            Surface::Bspline(surface) => {
+                return spline_face_area(&snapshot.topology, face, surface).ok_or_else(|| {
+                    error(
+                        KernelErrorCode::InvalidInput,
+                        KernelStage::Preflight,
+                        snapshot.id,
+                        "the requested B-spline face area could not be evaluated",
+                        Vec::new(),
+                    )
+                });
+            }
         };
         Ok(parameter_area * jacobian)
     }
@@ -2883,6 +3056,23 @@ impl NativeKernel {
                             });
                         }
                     }
+                    // So does the B-spline tessellator's.
+                    Surface::Bspline(surface) => {
+                        for (vertices, normals) in tessellate_spline_face(
+                            &snapshot.topology,
+                            &face.value,
+                            surface,
+                            budget,
+                            precision,
+                        ) {
+                            triangles.push(DebugTriangle {
+                                vertices: vertices.map(protocol_point),
+                                normals: normals.map(protocol_vector),
+                                source_face,
+                                role: snapshot.topology.faces[index].value.role,
+                            });
+                        }
+                    }
                 }
                 triangles
             },
@@ -3063,6 +3253,9 @@ fn display_carriers(snapshot: &Snapshot) -> Vec<DisplayCarrier> {
                 },
                 Surface::Ruled(ruled) => DisplaySurface::Ruled {
                     rails: ruled.rails.map(DisplayRail::from_internal),
+                },
+                Surface::Bspline(surface) => DisplaySurface::Bspline {
+                    surface: DisplaySpline(surface),
                 },
             };
             Some(DisplayCarrier {
@@ -3414,7 +3607,9 @@ fn presentation_edge_classification(
         .evaluate((edge.parameter_range.start + edge.parameter_range.end) * 0.5);
     let first_surface = topology.faces[*first].value.surface;
     let second_surface = topology.faces[*second].value.surface;
-    if matches!(first_surface, Surface::Ruled(_)) || matches!(second_surface, Surface::Ruled(_)) {
+    let along_whole_edge =
+        |surface: Surface| matches!(surface, Surface::Ruled(_) | Surface::Bspline(_));
+    if along_whole_edge(first_surface) || along_whole_edge(second_surface) {
         return ruled_edge_classification(topology, [*first, *second], edge_index)
             .unwrap_or_else(hard);
     }
@@ -3472,7 +3667,7 @@ fn presentation_edge_classification(
                 relative - cylinder.axis * (relative.dot(cylinder.axis) / axis_denominator)
             }
             // Classified along the whole edge by `ruled_edge_classification`.
-            Surface::Ruled(_) => return None,
+            Surface::Ruled(_) | Surface::Bspline(_) => return None,
         };
         let length = normal.length();
         (length > f64::EPSILON).then(|| normal / length)
@@ -3661,7 +3856,7 @@ fn ruled_edge_classification(
     let normal_at = |face_index: usize, fraction: f64| -> Option<Vector3> {
         let face = &topology.faces.get(face_index)?.value;
         match face.surface {
-            Surface::Ruled(ruled) => {
+            Surface::Ruled(_) | Surface::Bspline(_) => {
                 let coedge = face
                     .loops()
                     .filter_map(|loop_key| topology.loop_record(loop_key))
@@ -3677,7 +3872,11 @@ fn ruled_edge_classification(
                 let parameters = coedge
                     .pcurve
                     .evaluate((span.end - span.start).mul_add(along, span.start));
-                ruled.unit_normal(parameters)
+                match face.surface {
+                    Surface::Ruled(ruled) => ruled.unit_normal(parameters),
+                    Surface::Bspline(surface) => surface.unit_normal(parameters),
+                    _ => None,
+                }
             }
             surface => {
                 let point = edge
@@ -3703,6 +3902,9 @@ fn ruled_edge_classification(
                     && (left.range.end - left.range.start) == (right.range.end - right.range.start)
             })
         }
+        // Two faces on one stored surface are one carrier split along an
+        // isocurve: equal handles are equal content.
+        (Surface::Bspline(first), Surface::Bspline(second)) => first == second,
         _ => false,
     };
     let low_dihedral = worst >= 15.0_f64.to_radians().cos();
@@ -3927,15 +4129,50 @@ fn faceted_candidate_refusal(
     ))
 }
 
-/// A loft added to or cut from a body, through the Boolean ladder: the prism
-/// reduction, then the analytic engine where it carries both operands, then
-/// the faceted tier with its label. Returns the body and the rung that
-/// answered.
-///
-/// The loft is certified as a solid before it meets the body, so an invalid
-/// tool never reaches any tier. A loft whose walls all came out as planes,
-/// cylinders or cones — a frustum, say — is inside the exact engines' reach;
-/// a ruled wall is not (ADR 0049), and the engines decline it by name.
+/// How one feature that builds a tool body and combines it with the body
+/// names the rungs of the Boolean ladder and its own refusals and warnings.
+struct ToolBoolean {
+    /// What the tool is, in the messages: "loft" or "spline profile".
+    noun: &'static str,
+    empty: &'static str,
+    declined: &'static str,
+    unresolved: &'static str,
+    approximation: &'static str,
+    /// The rungs, in order: the prism reduction, the analytic engine, the
+    /// faceted tier.
+    rungs: [&'static str; 3],
+}
+
+/// A loft added to or cut from a body (ADR 0049).
+const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "loft",
+    empty: "LOFT_TARGET_EMPTY",
+    declined: "LOFT_EXACT_ROUTE_DECLINED",
+    unresolved: "LOFT_FACETED_UNRESOLVED",
+    approximation: "LOFT_FACETED_APPROXIMATION",
+    rungs: [
+        "loft/boolean-prism",
+        "loft/boolean-analytic",
+        "loft/faceted",
+    ],
+};
+
+/// A spline profile added to or cut from a face (ADR 0050), which answers
+/// as every other face feature does.
+const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "spline profile",
+    empty: "FACE_FEATURE_TARGET_MISSING",
+    declined: "FACE_FEATURE_EXACT_ROUTE_DECLINED",
+    unresolved: "FACE_FEATURE_FACETED_UNRESOLVED",
+    approximation: "FACE_FEATURE_FACETED_APPROXIMATION",
+    rungs: [
+        "face-feature/exact-prism",
+        "face-feature/analytic-boolean",
+        "face-feature/faceted",
+    ],
+};
+
+/// A loft added to or cut from a body, through the Boolean ladder.
 fn loft_boolean(
     input: &Snapshot,
     tool: Topology,
@@ -3943,11 +4180,43 @@ fn loft_boolean(
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
 ) -> Result<(Topology, &'static str), KernelError> {
+    tool_boolean(input, tool, add, precision, warnings, &LOFT_BOOLEAN)
+}
+
+/// A tool body added to or cut from a body, through the Boolean ladder: the
+/// prism reduction, then the analytic engine where it carries both operands,
+/// then the faceted tier with its label. Returns the body and the rung that
+/// answered.
+///
+/// The tool is certified as a solid before it meets the body, so an invalid
+/// tool never reaches any tier. A tool whose walls are all planes, cylinders
+/// or cones — a frustum, say — is inside the exact engines' reach; a ruled
+/// wall (ADR 0049) or a B-spline wall (ADR 0050) is not, and the engines
+/// decline it by name.
+fn tool_boolean(
+    input: &Snapshot,
+    tool: Topology,
+    add: bool,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+    labels: &ToolBoolean,
+) -> Result<(Topology, &'static str), KernelError> {
+    let noun = labels.noun;
     if input.topology.solids.is_empty() {
-        return Err(simple_invalid_input(
+        let message = format!(
+            "An add or cut {noun} needs a body to combine with; a {noun} of its own is a new \
+             body."
+        );
+        return Err(error(
+            KernelErrorCode::InvalidInput,
+            KernelStage::Preflight,
             input.id,
-            "LOFT_TARGET_EMPTY",
-            "An add or cut loft needs a body to combine with; a loft of its own is a new body.",
+            message.clone(),
+            vec![simple_diagnostic(
+                labels.empty,
+                KernelStage::Preflight,
+                &message,
+            )],
         ));
     }
     let tool_validation = validator::validate(&tool, precision.linear_agreement);
@@ -3956,7 +4225,7 @@ fn loft_boolean(
             KernelErrorCode::ValidationFailed,
             KernelStage::Validation,
             input.id,
-            "the loft failed solid validation before it was combined with the body",
+            format!("the {noun} failed solid validation before it was combined with the body"),
             protocol_validation(input.id, ValidationProfile::Solid, &tool_validation).diagnostics,
         ));
     }
@@ -3971,14 +4240,14 @@ fn loft_boolean(
             .diagnostics
             .is_empty()
     {
-        return Ok((topology, "loft/boolean-prism"));
+        return Ok((topology, labels.rungs[0]));
     }
     let decline = if analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool) {
         match analytic_boolean::build_analytic_boolean(&input.topology, &tool, operation, precision)
             .map_err(ExactRouteDecline::from_engine)
             .and_then(|topology| exact_candidate(topology, precision))
         {
-            Ok(topology) => return Ok((topology, "loft/boolean-analytic")),
+            Ok(topology) => return Ok((topology, labels.rungs[1])),
             Err(decline) => decline,
         }
     } else {
@@ -3987,16 +4256,16 @@ fn loft_boolean(
     let declined = |mut refusal: KernelError| {
         for diagnostic in &mut refusal.diagnostics {
             if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
-                diagnostic.code = ProtocolDiagnosticCode::new("LOFT_FACETED_UNRESOLVED");
+                diagnostic.code = ProtocolDiagnosticCode::new(labels.unresolved);
             }
         }
         refusal.diagnostics.insert(
             0,
-            decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Error),
+            decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Error),
         );
         refusal
     };
-    // The faceted tier works on the body and the loft as tessellated at a
+    // The faceted tier works on the body and the tool as tessellated at a
     // bounded budget, as the face-feature tier does: a dense tessellation is
     // an unsuitable Boolean operand.
     let mut boolean_precision = precision;
@@ -4022,12 +4291,14 @@ fn loft_boolean(
             KernelErrorCode::Unsupported,
             KernelStage::Construction,
             input.id,
-            "the faceted tier could not combine the loft with the body",
+            format!("the faceted tier could not combine the {noun} with the body"),
             vec![simple_diagnostic(
-                "LOFT_FACETED_UNRESOLVED",
+                labels.unresolved,
                 KernelStage::Construction,
-                "The loft and the body were rebuilt from their tessellations, but the rebuilt \
-                 shell did not close within the approximation budget.",
+                &format!(
+                    "The {noun} and the body were rebuilt from their tessellations, but the \
+                     rebuilt shell did not close within the approximation budget."
+                ),
             )],
         ))
     })?;
@@ -4041,15 +4312,164 @@ fn loft_boolean(
     )
     .map_err(declined)?;
     warnings.push(approximation_warning(
-        "LOFT_FACETED_APPROXIMATION",
-        "The exact Boolean engines do not carry this loft's walls, so the loft and the body \
-         were combined from their tessellations. The result's faces, edges and measures \
-         approximate the true solid rather than certifying it. Why the exact route stood aside \
-         is the LOFT_EXACT_ROUTE_DECLINED diagnostic beside this one.",
+        labels.approximation,
+        &format!(
+            "The exact Boolean engines do not carry this {noun}'s walls, so the {noun} and the \
+             body were combined from their tessellations. The result's faces, edges and \
+             measures approximate the true solid rather than certifying it. Why the exact route \
+             stood aside is the {} diagnostic beside this one.",
+            labels.declined
+        ),
     ));
-    warnings
-        .push(decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Warning));
-    Ok((topology, "loft/faceted"))
+    warnings.push(decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Warning));
+    Ok((topology, labels.rungs[2]))
+}
+
+/// A spline profile added to or cut from a planar face (ADR 0050): the
+/// profile swept into a tool body standing on the face — below it for a cut,
+/// overshooting the face so no cap lies on its plane, and above it for an
+/// add — and combined with the body through the Boolean ladder. A B-spline
+/// wall is outside the exact engines' vocabulary, so the ladder answers on
+/// its faceted tier, with its label, as it does for a ruled wall.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_feature(
+    input: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    profile: &PlanarProfile2,
+    distance: f64,
+    operation: FaceExtrusionOperation,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<(Topology, &'static str), KernelError> {
+    let refuse = |reason: FaceFeatureInputError| {
+        planar_profile_input_error(input.id, PlanarProfileInputError::FaceFeature(reason))
+    };
+    if target_face.snapshot != input.id {
+        return Err(refuse(FaceFeatureInputError::TargetSnapshotMismatch));
+    }
+    if target_face.kind != EntityKind::Face {
+        return Err(refuse(FaceFeatureInputError::TargetNotFace));
+    }
+    let target = input
+        .topology
+        .faces
+        .iter()
+        .find(|face| face.id.get() == target_face.entity.0)
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetMissing))?;
+    let plane = target
+        .value
+        .surface
+        .as_plane()
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetNotPlanar))?;
+    let normal_length = plane.normal.length();
+    if !normal_length.is_finite() || normal_length <= f64::EPSILON {
+        return Err(refuse(FaceFeatureInputError::TargetDegenerate));
+    }
+    let outward = plane.normal / normal_length;
+    let normalized = analytic_extrusion::normalize_frame(frame, precision)
+        .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+    // The sketch lies in the face's plane and faces out of it, as every
+    // face feature's does.
+    let off_plane = (normalized.origin - plane.origin).dot(outward).abs();
+    if normalized.normal.dot(outward) < 1.0 - precision.angular_agreement_radians.max(1.0e-12)
+        || off_plane > precision.modeling_resolution
+    {
+        return Err(refuse(FaceFeatureInputError::FrameOffTargetPlane));
+    }
+    let add = operation == FaceExtrusionOperation::Add;
+    // A cut's tool starts below the face and rises through it; an add's
+    // stands on it.
+    let overshoot = if add {
+        0.0
+    } else {
+        (distance * 0.01).max(precision.min_feature_size * 8.0)
+    };
+    let origin = if add {
+        frame.origin
+    } else {
+        ProtocolPoint3::new(
+            frame.origin.x - outward.x * distance,
+            frame.origin.y - outward.y * distance,
+            frame.origin.z - outward.z * distance,
+        )
+    };
+    let regions = spline_profile::validate_spline_profile_extrusion(
+        PlanarFrame3::new(origin, frame.u, frame.v),
+        profile,
+        distance + overshoot,
+        precision,
+    )
+    .map_err(|reason| spline_profile_error(input.id, reason))?;
+    let tool = spline_profile::build_spline_extrusion(&regions);
+    tool_boolean(input, tool, add, precision, warnings, &SPLINE_FACE_BOOLEAN)
+}
+
+/// The named refusal for a profile with splines.
+fn spline_profile_error(
+    snapshot: SnapshotId,
+    reason: spline_profile::SplineProfileError,
+) -> KernelError {
+    use spline_profile::SplineProfileError;
+    match reason {
+        SplineProfileError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        SplineProfileError::Spline(reason) => bspline_input_error(snapshot, reason),
+        SplineProfileError::Degenerate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_CURVE_DEGENERATE",
+            "a spline in the profile stalls — its rate vanishes at a cusp, or at an end whose \
+             first two control points coincide — so a wall swept from it would have no side to \
+             face there",
+        ),
+        SplineProfileError::Indeterminate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::NumericallyIndeterminate,
+            "BSPLINE_CLEARANCE_INDETERMINATE",
+            "two curves of the profile come so close that subdividing them could not settle \
+             whether they stay the feature floor apart; move them apart or join them",
+        ),
+    }
+}
+
+/// The named refusal for a spline the kernel does not carry.
+fn bspline_input_error(snapshot: SnapshotId, reason: bspline::SplineError) -> KernelError {
+    use bspline::SplineError;
+    match reason {
+        SplineError::Degree => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_DEGREE_UNSUPPORTED",
+            "the kernel carries B-splines of degree one to five; the quadrature its measures use \
+             is exact on every knot span up to degree five",
+        ),
+        SplineError::Rational => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_RATIONAL_UNSUPPORTED",
+            "the spline carries weights that differ, which makes it a rational spline; the \
+             kernel carries non-rational B-splines only (ADR 0050)",
+        ),
+        SplineError::Unclamped => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_UNCLAMPED_UNSUPPORTED",
+            "the spline's knot vector is not clamped: each end must repeat degree + 1 times, so \
+             the curve starts and ends on its end control points",
+        ),
+        SplineError::Knots => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_KNOTS_INVALID",
+            "the spline's knot vector does not match its control points: it must have control \
+             points + degree + 1 knots, never falling, with no interior knot repeated more than \
+             the degree",
+        ),
+        SplineError::NonFinite => planar_profile_input_error(
+            snapshot,
+            PlanarProfileInputError::Extrusion(ExtrusionInputError::NonFinite),
+        ),
+    }
 }
 
 /// The edge-finish ladder beyond the six-plane cuboid: each exact rung runs
@@ -4602,6 +5022,10 @@ fn chord_deviations(
             Curve3::Trace { host, other, .. } => {
                 sagitta(host.radius.abs().min(other.radius.abs()), sweep)
             }
+            // The tessellator's own figure for a B-spline edge.
+            Curve3::Bspline { curve } => {
+                spline_curve_deviation(curve, edge.parameter_range, budget, precision)
+            }
         }
     };
     topology
@@ -4639,6 +5063,9 @@ fn chord_deviations(
                 // twist a quad of the band can stand off its two triangles.
                 (Surface::Ruled(ruled), Some(domain)) => {
                     ruled_columns(ruled, domain, budget, precision).1
+                }
+                (Surface::Bspline(surface), Some(domain)) => {
+                    spline_surface_deviation(topology, face, surface, domain, budget, precision)
                 }
             };
             let rim = face
@@ -4685,6 +5112,13 @@ fn sampled_edge_segments(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 2]> {
+    if let Curve3::Bspline { curve } = edge.curve {
+        let samples = spline_curve_samples(curve, edge.parameter_range, budget, precision);
+        return samples
+            .windows(2)
+            .map(|pair| [curve.point(pair[0]), curve.point(pair[1])])
+            .collect();
+    }
     let subdivisions = match edge.curve {
         Curve3::Line { .. } => 1,
         Curve3::Circle { radius, .. } => arc_subdivisions(
@@ -4706,6 +5140,7 @@ fn sampled_edge_segments(
             budget,
             precision,
         ),
+        Curve3::Bspline { .. } => unreachable!("sampled above"),
     };
     (0..subdivisions)
         .map(|index| {
@@ -4768,6 +5203,21 @@ fn sampled_loop_polygon(
         let coedge = topology.coedge(*coedge_key)?.value;
         let edge = topology.edge(coedge.edge)?.value;
         let range = edge.parameter_range;
+        // A B-spline edge is walked at the parameters its own chords end on,
+        // the same list the edge tessellation takes, forwards or backwards.
+        if let Curve3::Bspline { curve } = edge.curve {
+            let samples = spline_curve_samples(curve, range, budget, precision);
+            let last = samples.len() - 1;
+            match coedge.orientation {
+                Orientation::Forward => {
+                    polygon.extend(samples[..last].iter().map(|t| curve.point(*t)));
+                }
+                Orientation::Reverse => {
+                    polygon.extend(samples[1..].iter().rev().map(|t| curve.point(*t)));
+                }
+            }
+            continue;
+        }
         let subdivisions = match edge.curve {
             Curve3::Line { .. } => 1,
             Curve3::Circle { radius, .. } => {
@@ -4782,6 +5232,7 @@ fn sampled_loop_polygon(
                 budget,
                 precision,
             ),
+            Curve3::Bspline { .. } => unreachable!("walked above"),
         };
         // Sample in the edge's own forward parameterization and reverse the
         // resulting points, rather than reversing the interval and sampling
@@ -4877,8 +5328,9 @@ fn face_frame_loop_curves(
                     end,
                 }
             }
-            // Nor for a trace, which is not planar at all.
-            Curve3::Trace { .. } => return None,
+            // Nor for a trace, which is not planar at all, nor yet for a
+            // B-spline.
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => return None,
         };
         if curve.is_finite() {
             curves.push(curve);
@@ -5343,6 +5795,302 @@ fn tessellate_ruled_face(
     triangles
 }
 
+/// Area of a B-spline face over its rectangular parameter domain, by the
+/// same quadrature the body's measures use (ADR 0050).
+fn spline_face_area(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+) -> Option<f64> {
+    let domain = face_parameter_bounds(topology, face)?;
+    let area = surface
+        .measures(domain, bspline::point3(surface.points()[0]))
+        .area;
+    area.is_finite().then_some(area)
+}
+
+/// The most steps any one knot span is cut into by the tessellators.
+fn spline_steps_per_span(precision: PrecisionPolicy) -> usize {
+    1_usize << precision.max_subdivisions.min(8)
+}
+
+/// The parameters a B-spline edge is tessellated at, from the start of its
+/// range to the end: every knot, and between knots the power of two of
+/// equal steps the span's second-derivative bound asks for.
+fn spline_curve_samples(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve.samples(
+        range.start,
+        range.end,
+        tolerance,
+        spline_steps_per_span(precision),
+    )
+}
+
+/// How far the chords of a B-spline edge can sit from it: on each span, its
+/// second-derivative bound times the square of the step, over eight.
+fn spline_curve_deviation(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve
+        .spans(range.start, range.end)
+        .into_iter()
+        .map(|(low, high)| {
+            let bound = curve.curvature_bound(low, high);
+            let steps = bspline::span_steps(
+                bound,
+                high - low,
+                tolerance,
+                spline_steps_per_span(precision),
+            );
+            let step = (high - low) / steps as f64;
+            bound * step * step / 8.0
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The parameters along one direction of a B-spline face: the surface's own
+/// sampling of every span, merged with every parameter the face's boundary
+/// edges along that direction are sampled at, so each edge's chords end on
+/// vertices of the face. Both samplings cut a span into a power of two of
+/// equal steps from the same two knots, so where they meet they meet to the
+/// bit.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_samples(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    direction: usize,
+    (from, to): (f64, f64),
+    (across_from, across_to): (f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance = budget.tolerance(surface.scale().max(precision.min_feature_size), precision);
+    let most = spline_steps_per_span(precision);
+    let mut samples = vec![from];
+    for span in surface.spans(direction, from, to) {
+        // The surface bends along this direction by its second derivative,
+        // and a cell's twist bends its two triangles off it too.
+        let bound = surface
+            .spans(1 - direction, across_from, across_to)
+            .into_iter()
+            .map(|across| {
+                let (u_span, v_span) = if direction == 0 {
+                    (span, across)
+                } else {
+                    (across, span)
+                };
+                let [along_u, along_v, twist] = surface.curvature_bounds(u_span, v_span);
+                let along = if direction == 0 { along_u } else { along_v };
+                along + twist * (across.1 - across.0)
+            })
+            .fold(0.0, f64::max);
+        let steps = bspline::span_steps(bound, span.1 - span.0, tolerance, most);
+        for step in 1..=steps {
+            samples.push(if step == steps {
+                span.1
+            } else {
+                (span.1 - span.0).mul_add(step as f64 / steps as f64, span.0)
+            });
+        }
+    }
+    // Every boundary edge along this direction whose curve is a B-spline,
+    // read into the surface's parameter through the pcurve's affine map.
+    for loop_key in face.loops() {
+        let Some(loop_record) = topology.loop_record(loop_key) else {
+            continue;
+        };
+        for coedge_key in &loop_record.value.coedges {
+            let Some(coedge) = topology.coedge(*coedge_key) else {
+                continue;
+            };
+            let Some(edge) = topology.edge(coedge.value.edge) else {
+                continue;
+            };
+            let Curve3::Bspline { curve } = edge.value.curve else {
+                continue;
+            };
+            let [start, end] = coedge.value.pcurve_endpoints();
+            let fixed = if direction == 0 {
+                start.y == end.y
+            } else {
+                start.x == end.x
+            };
+            if !fixed {
+                continue;
+            }
+            let (first, last) = match coedge.value.orientation {
+                Orientation::Forward => (start, end),
+                Orientation::Reverse => (end, start),
+            };
+            let (first, last) = if direction == 0 {
+                (first.x, last.x)
+            } else {
+                (first.y, last.y)
+            };
+            let range = edge.value.parameter_range;
+            let width = range.end - range.start;
+            if width == 0.0 {
+                continue;
+            }
+            let alpha = (last - first) / width;
+            let beta = alpha.mul_add(-range.start, first);
+            for t in spline_curve_samples(curve, range, budget, precision) {
+                // Exact when the edge's parameter is the surface's, or its
+                // negation after a mirror.
+                samples.push(if alpha == 1.0 && beta == 0.0 {
+                    t
+                } else if alpha == -1.0 && beta == 0.0 {
+                    -t
+                } else {
+                    alpha.mul_add(t, beta)
+                });
+            }
+        }
+    }
+    samples.retain(|sample| *sample >= from && *sample <= to);
+    samples.sort_by(f64::total_cmp);
+    let floor = 1.0e-12 * (to - from).abs();
+    samples.dedup_by(|second, first| (*second - *first).abs() <= floor);
+    samples
+}
+
+/// How far the facets of a B-spline face can sit from it: over every span
+/// cell, the bilinear interpolation error of a cell of its steps,
+/// `(|S_uu|·du² + 2|S_uv|·du·dv + |S_vv|·dv²)/8`.
+fn spline_surface_deviation(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    domain: (f64, f64, f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let (u_min, u_max, v_min, v_max) = domain;
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let widest = |samples: &[f64], low: f64, high: f64| {
+        samples
+            .windows(2)
+            .filter(|pair| pair[0] >= low && pair[1] <= high)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0, f64::max)
+    };
+    let mut worst = 0.0_f64;
+    for u_span in surface.spans(0, u_min, u_max) {
+        let du = widest(&us, u_span.0, u_span.1);
+        for v_span in surface.spans(1, v_min, v_max) {
+            let dv = widest(&vs, v_span.0, v_span.1);
+            let [uu, vv, uv] = surface.curvature_bounds(u_span, v_span);
+            worst = worst.max((uu * du * du + 2.0 * uv * du * dv + vv * dv * dv) / 8.0);
+        }
+    }
+    worst
+}
+
+/// A grid of quads over a B-spline face's parameter rectangle, each vertex
+/// with the surface's own normal at its parameters.
+fn tessellate_spline_face(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<([Point3; 3], [Vector3; 3])> {
+    let Some((u_min, u_max, v_min, v_max)) = face_parameter_bounds(topology, face) else {
+        return Vec::new();
+    };
+    // A loop walked clockwise in the parameters faces the other way.
+    let flipped = validator::face_parameter_area_and_moment(topology, face)
+        .is_some_and(|(area, _)| area < 0.0);
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let grid = us
+        .iter()
+        .map(|u| {
+            vs.iter()
+                .map(|v| {
+                    let parameters = topology::Point2::new(*u, *v);
+                    let normal = surface
+                        .unit_normal(parameters)
+                        .map(|normal| if flipped { normal * -1.0 } else { normal });
+                    (surface.evaluate(parameters), normal)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(2 * us.len() * vs.len());
+    for i in 0..us.len().saturating_sub(1) {
+        for j in 0..vs.len().saturating_sub(1) {
+            let quad = [
+                grid[i][j],
+                grid[i + 1][j],
+                grid[i + 1][j + 1],
+                grid[i][j + 1],
+            ];
+            for corners in [[0, 1, 2], [0, 2, 3]] {
+                let mut vertices = corners.map(|corner| quad[corner].0);
+                if flipped {
+                    vertices.swap(1, 2);
+                }
+                let facet = facet_normal(vertices);
+                let mut normals = corners.map(|corner| quad[corner].1.unwrap_or(facet));
+                if flipped {
+                    normals.swap(1, 2);
+                }
+                triangles.push((vertices, normals));
+            }
+        }
+    }
+    triangles
+}
+
 fn tessellate_cylinder_face(
     topology: &Topology,
     face: &topology::Face,
@@ -5461,6 +6209,7 @@ fn tessellate_harmonic_cylinder_face(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Bspline { .. } => return None,
                 Curve2::Trace { .. } => {
                     // Where the piece crosses this azimuth. On the face that
                     // holds the parameter the abscissa is the parameter and
@@ -6438,15 +7187,7 @@ fn loft_sections_error(
             snapshot,
             KernelErrorCode::InvalidInput,
             "LOFT_TOO_FEW_SECTIONS",
-            "a loft needs two sections",
-        ),
-        LoftSectionsError::MultiSection => planar_profile_error(
-            snapshot,
-            KernelErrorCode::Unsupported,
-            "LOFT_MULTI_SECTION_UNSUPPORTED",
-            "a loft through more than two sections needs a surface that stays smooth across the \
-             middle sections, a B-spline surface, which arrives with B-spline curves and \
-             surfaces (ADR 0049, K-B). Loft two sections at a time for now.",
+            "a loft needs at least two sections",
         ),
         LoftSectionsError::RegionCount => planar_profile_error(
             snapshot,
@@ -6455,13 +7196,7 @@ fn loft_sections_error(
             "each loft section must be exactly one region: one outer loop, with any holes \
              inside it",
         ),
-        LoftSectionsError::SplineCurve => planar_profile_error(
-            snapshot,
-            KernelErrorCode::Unsupported,
-            "LOFT_SECTION_SPLINE_UNSUPPORTED",
-            "a loft section carries a B-spline curve; B-spline curves enter the vocabulary with \
-             ADR 0049's K-B stage. Draw the section from lines, arcs and circles.",
-        ),
+        LoftSectionsError::Spline(reason) => spline_profile_error(snapshot, reason),
         LoftSectionsError::Coplanar => planar_profile_error(
             snapshot,
             KernelErrorCode::InvalidInput,
@@ -6496,6 +7231,14 @@ fn loft_sections_error(
             "LOFT_WALL_DEGENERATE",
             "a wall between the sections pinches to a point or folds flat: somewhere its rung \
              runs along its rails, and a wall there has no side to face",
+        ),
+        LoftSectionsError::SkinFolds => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SKIN_FOLDS",
+            "the smooth surface through the sections turns back on itself between two of them: \
+             somewhere it runs against the direction the sections are stacked in. Space the \
+             sections more evenly, or loft them two at a time.",
         ),
     }
 }
@@ -6548,6 +7291,14 @@ fn planar_profile_input_error(
             KernelErrorCode::Unsupported,
             "PLANAR_PROFILE_ANALYTIC_ROUTE_REQUIRED",
             "the profile contains analytic curves that require the native analytic extrusion path",
+        ),
+        PlanarProfileInputError::SplineCurve => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "PLANAR_PROFILE_SPLINE_UNSUPPORTED",
+            "the profile carries a B-spline curve, and this operation does not: a spline profile \
+             can be extruded, added or cut on a face, and lofted (ADR 0050), but not revolved \
+             or drafted",
         ),
         PlanarProfileInputError::OverlappingRegions => planar_profile_error(
             snapshot,
@@ -6783,6 +7534,7 @@ fn validate_transform_candidate(
                 Surface::Cone(cone) => cone.origin,
                 Surface::Sphere(sphere) => sphere.origin,
                 Surface::Ruled(ruled) => ruled.rails[0].point(0.0),
+                Surface::Bspline(surface) => bspline::point3(surface.points()[0]),
             };
             [point.x, point.y, point.z]
         }))
@@ -6839,6 +7591,13 @@ fn validate_transform_candidate(
                 other.origin.x.abs() + other.origin.y.abs() + other.origin.z.abs(),
                 branch,
             ],
+            // The control polygon holds the curve, so its reach is the
+            // curve's.
+            Curve2::Bspline { curve } => curve
+                .points()
+                .iter()
+                .flat_map(|point| [point[0].abs(), point[1].abs()])
+                .collect(),
         };
         endpoints.into_iter().chain(carrier)
     });
@@ -6870,7 +7629,7 @@ fn validate_transform_candidate(
                 endpoints[0].distance(endpoints[1])
             }
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => edge.value.length(),
-            Curve3::Trace { .. } => edge.value.length(),
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => edge.value.length(),
         };
         shortest = shortest.min(represented);
     }
@@ -6913,7 +7672,7 @@ fn validate_transform_candidate(
                     endpoints[0].distance(endpoints[1])
                 }
                 Curve3::Circle { .. } | Curve3::Ellipse { .. } => after.value.length(),
-                Curve3::Trace { .. } => after.value.length(),
+                Curve3::Trace { .. } | Curve3::Bspline { .. } => after.value.length(),
             };
             (represented - expected).abs()
         })
@@ -8625,6 +9384,14 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             hash_f64(&mut hasher, edge.value.parameter_range.start);
             hash_f64(&mut hasher, edge.value.parameter_range.end);
         }
+        // The content of the spline, never the handle to it: the handle's
+        // address depends on the order splines were made in.
+        if let Curve3::Bspline { curve } = edge.value.curve {
+            hasher.update(b"bspline-curve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
+            hash_f64(&mut hasher, edge.value.parameter_range.start);
+            hash_f64(&mut hasher, edge.value.parameter_range.end);
+        }
     }
     hash_collection_header(&mut hasher, b"coedges", topology.coedges.len());
     for coedge in &topology.coedges {
@@ -8686,6 +9453,12 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             ] {
                 hash_f64(&mut hasher, value);
             }
+            hash_f64(&mut hasher, coedge.value.parameter_range.start);
+            hash_f64(&mut hasher, coedge.value.parameter_range.end);
+        }
+        if let Curve2::Bspline { curve } = coedge.value.pcurve {
+            hasher.update(b"bspline-pcurve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
             hash_f64(&mut hasher, coedge.value.parameter_range.start);
             hash_f64(&mut hasher, coedge.value.parameter_range.end);
         }
@@ -8802,6 +9575,29 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
                     hash_f64(&mut hasher, rail.range.end);
                 }
             }
+            Surface::Bspline(surface) => {
+                hasher.update(b"bspline-surface-v0");
+                let [degree_u, degree_v] = surface.degree();
+                let [count_u, count_v] = surface.counts();
+                let [knots_u, knots_v] = surface.knots();
+                hash_u64(&mut hasher, degree_u as u64);
+                hash_u64(&mut hasher, degree_v as u64);
+                hash_u64(&mut hasher, count_u as u64);
+                hash_u64(&mut hasher, count_v as u64);
+                hash_collection_header(&mut hasher, b"knots-u", knots_u.len());
+                for knot in knots_u {
+                    hash_f64(&mut hasher, *knot);
+                }
+                hash_collection_header(&mut hasher, b"knots-v", knots_v.len());
+                for knot in knots_v {
+                    hash_f64(&mut hasher, *knot);
+                }
+                for point in surface.points() {
+                    for component in point {
+                        hash_f64(&mut hasher, *component);
+                    }
+                }
+            }
         }
         hash_u64(&mut hasher, face.value.outer_loop.0 as u64);
         // Preserve established digests for the pre-hole representation while
@@ -8861,6 +9657,26 @@ fn hash_precision(hasher: &mut Sha256, precision: PrecisionPolicy) {
     }
     hash_u64(hasher, u64::from(precision.max_iterations));
     hash_u64(hasher, u64::from(precision.max_subdivisions));
+}
+
+/// A B-spline curve's content: degree, knots and control points, in order.
+fn hash_spline_curve<const D: usize>(
+    hasher: &mut Sha256,
+    degree: usize,
+    knots: &[f64],
+    points: &[[f64; D]],
+) {
+    hash_u64(hasher, degree as u64);
+    hash_collection_header(hasher, b"knots", knots.len());
+    for knot in knots {
+        hash_f64(hasher, *knot);
+    }
+    hash_collection_header(hasher, b"points", points.len());
+    for point in points {
+        for component in point {
+            hash_f64(hasher, *component);
+        }
+    }
 }
 
 fn hash_point(hasher: &mut Sha256, point: Point3) {
@@ -9483,7 +10299,8 @@ mod tests {
                         | Surface::Torus(_)
                         | Surface::Cone(_)
                         | Surface::Sphere(_)
-                        | Surface::Ruled(_) => None,
+                        | Surface::Ruled(_)
+                        | Surface::Bspline(_) => None,
                     })
                     .collect::<Vec<_>>();
                 (incident.len() == 2

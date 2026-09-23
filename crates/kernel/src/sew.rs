@@ -677,7 +677,11 @@ pub(crate) fn ray_face_crossings(
             }
             Some(crossings)
         }
-        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => None,
+        Surface::Torus(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Ruled(_)
+        | Surface::Bspline(_) => None,
     }
 }
 
@@ -784,7 +788,11 @@ fn surface_point(surface: Surface, point: Point2) -> Option<Point3> {
     match surface {
         Surface::Plane(plane) => Some(plane.evaluate(point)),
         Surface::Cylinder(cylinder) => Some(cylinder.evaluate(point)),
-        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => None,
+        Surface::Torus(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Ruled(_)
+        | Surface::Bspline(_) => None,
     }
 }
 

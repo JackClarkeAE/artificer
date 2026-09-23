@@ -1,8 +1,11 @@
 # ADR 0049: Ruled and spline surfaces enter the vocabulary
 
-Status: accepted — K-A is implemented: the ruled surface is a carrier of the
-kernel, and a loft between two planar sections is exact through the kernel,
-the protocol and `.art` scripting. K-B and K-C are the plan.
+Status: accepted — K-A and K-B are implemented: the ruled surface and the
+B-spline curve and surface are carriers of the kernel, and a loft between
+two planar sections, a smooth loft through several, and an extruded spline
+profile are exact through the kernel, the protocol and `.art` scripting
+([0050](0050-b-spline-curves-and-surfaces-as-carriers.md) records K-B). K-C
+is the plan.
 
 - Date: 2026-09-22
 - Decision owners: Artificer project

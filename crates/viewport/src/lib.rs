@@ -3900,6 +3900,10 @@ fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[P
     if let DisplaySurface::Ruled { .. } = carrier.surface {
         return carrier.surface.ruled_silhouette(carrier.domain, view);
     }
+    // Nor has a B-spline wall; the kernel contours `n · view` over it.
+    if let DisplaySurface::Bspline { .. } = carrier.surface {
+        return carrier.surface.spline_silhouette(carrier.domain, view);
+    }
     let (_, axis, radial_u, radial_v, angular_sign) = carrier.surface.frame();
     let [[u_min, u_max], [v_min, v_max]] = carrier.domain;
     if !(u_min < u_max && v_min < v_max) || angular_sign == 0.0 {
@@ -3964,7 +3968,7 @@ fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[P
             }
             chords
         }
-        DisplaySurface::Ruled { .. } => Vec::new(),
+        DisplaySurface::Ruled { .. } | DisplaySurface::Bspline { .. } => Vec::new(),
     }
 }
 

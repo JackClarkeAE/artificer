@@ -11,8 +11,9 @@ use artificer_protocol::{Point3, Vector3};
 
 /// The fixture set: every surface kind, seams, a blend with toric and
 /// spherical faces, a cone from a drafted extrusion, an elliptical edge
-/// from an oblique cylinder section, a body with a cavity, and bores of
-/// unequal radius crossing in the quartic two cylinders share.
+/// from an oblique cylinder section, a body with a cavity, bores of unequal
+/// radius crossing in the quartic two cylinders share, and B-spline curves
+/// and surfaces from a spline profile and a smooth loft (ADR 0050).
 fn fixtures() -> Vec<(&'static str, String)> {
     vec![
         (
@@ -59,6 +60,14 @@ fn fixtures() -> Vec<(&'static str, String)> {
         (
             "crossing_bores",
             include_str!("../examples/three_holes_and_cut.art").to_owned(),
+        ),
+        (
+            "spline_extrusion",
+            "let s = sketch(on: \"XY\", entities: [spline(points: [[20, 0], [5, 14], [-18, 6], [-12, -12], [8, -15]], closed: true)], label: \"s\");\nlet e = extrude(sketch: s, distance: 12, label: \"e\");\n".to_owned(),
+        ),
+        (
+            "smooth_loft",
+            "let a = sketch(on: \"XY\", entities: [rect(width: 20, height: 20)], label: \"a\");\nlet b = sketch(on: plane(from: \"XY\", offset: 15), entities: [spline(points: [[-9, -8], [9, -8], [9, 8], [-9, 8]], closed: true)], label: \"b\");\nlet c = sketch(on: plane(from: \"XY\", offset: 30), entities: [circle(radius: 6)], label: \"c\");\nlet l = loft(sections: [a, b, c], label: \"l\");\n".to_owned(),
         ),
     ]
 }
@@ -411,6 +420,7 @@ fn kernel_face_centre(
         "CONICAL_SURFACE" => "cone",
         "SPHERICAL_SURFACE" => "sphere",
         "TOROIDAL_SURFACE" => "torus",
+        "B_SPLINE_SURFACE_WITH_KNOTS" => "bspline",
         other => panic!("unexpected surface {other}"),
     };
     // The kernel faces whose carrier is this surface: same kind, centre on
@@ -423,7 +433,11 @@ fn kernel_face_centre(
     );
     let mut candidates: Vec<&artificer_kernel::FaceDescription> = described
         .values()
-        .filter(|description| description.geometry.surface_kind() == kind)
+        .filter(|description| {
+            let described = description.geometry.surface_kind();
+            // A ruled wall is written as the B-spline surface it is.
+            described == kind || (kind == "bspline" && described == "ruled")
+        })
         .filter(|description| {
             on_surface(
                 reader,
@@ -450,6 +464,9 @@ fn kernel_face_centre(
 
 /// Whether a point lies on the STEP surface, within tolerance.
 fn on_surface(reader: &Reader, surface: &Entity, point: [f64; 3]) -> bool {
+    if surface.kind == "B_SPLINE_SURFACE_WITH_KNOTS" {
+        return SplineSurface::read(reader, surface).project(point).2 < 1.0e-6;
+    }
     let (origin, axis, _) = reader.placement(reference(&surface.args[1]));
     let relative = sub(point, origin);
     match surface.kind.as_str() {
@@ -484,6 +501,11 @@ fn on_surface(reader: &Reader, surface: &Entity, point: [f64; 3]) -> bool {
 
 /// The STEP surface's own normal at a point on it.
 fn natural_normal(reader: &Reader, surface: &Entity, point: [f64; 3]) -> [f64; 3] {
+    if surface.kind == "B_SPLINE_SURFACE_WITH_KNOTS" {
+        let spline = SplineSurface::read(reader, surface);
+        let (u, v, _) = spline.project(point);
+        return spline.normal(u, v);
+    }
     let (origin, axis, _) = reader.placement(reference(&surface.args[1]));
     let relative = sub(point, origin);
     match surface.kind.as_str() {
@@ -600,7 +622,7 @@ fn check_edge_geometry(name: &str, reader: &Reader, edge: &Entity) {
             for window in distinct.windows(2) {
                 for step in 0..=16 {
                     let t = window[0] + (window[1] - window[0]) * f64::from(step) / 16.0;
-                    let point = de_boor(&knots, &points, t);
+                    let point = de_boor(3, &knots, &points, t);
                     for surface in &surfaces {
                         let (origin, axis, _) = reader.placement(reference(&surface.args[1]));
                         let radius: f64 = surface.args[2].parse().unwrap();
@@ -615,24 +637,57 @@ fn check_edge_geometry(name: &str, reader: &Reader, edge: &Entity) {
                 }
             }
         }
+        // The kernel's own B-spline (ADR 0050), written as itself: its
+        // knot vector fits its control points and degree, and its first and
+        // last control points are the edge's vertices, in the edge's sense.
+        "B_SPLINE_CURVE_WITH_KNOTS" => {
+            let degree: usize = curve.args[1].parse().unwrap();
+            let points: Vec<[f64; 3]> = references(&curve.args[2])
+                .into_iter()
+                .map(|id| reader.point(id))
+                .collect();
+            let knots = full_knots(&curve.args[6], &curve.args[7]);
+            assert_eq!(knots.len(), points.len() + degree + 1, "{name}: knot count");
+            let (first, last) = (points[0], points[points.len() - 1]);
+            let (first, last) = if edge.args[4] == ".T." {
+                (first, last)
+            } else {
+                (last, first)
+            };
+            assert!(norm(sub(start, first)) < 1.0e-9, "{name}: spline start");
+            assert!(norm(sub(end, last)) < 1.0e-9, "{name}: spline end");
+        }
         other => panic!("{name}: unexpected curve {other}"),
     }
 }
 
-/// A cubic B-spline's point at `t`, by de Boor's recursion.
-fn de_boor(knots: &[f64], points: &[[f64; 3]], t: f64) -> [f64; 3] {
-    const DEGREE: usize = 3;
+/// A full knot vector from STEP's distinct knots and their multiplicities.
+fn full_knots(multiplicities: &str, values: &str) -> Vec<f64> {
+    let list = |text: &str| -> Vec<String> {
+        split_args(text.trim().trim_start_matches('(').trim_end_matches(')'))
+    };
+    list(values)
+        .iter()
+        .zip(list(multiplicities))
+        .flat_map(|(value, count)| {
+            std::iter::repeat_n(value.parse::<f64>().unwrap(), count.parse().unwrap())
+        })
+        .collect()
+}
+
+/// A B-spline's point at `t`, by de Boor's recursion.
+fn de_boor(degree: usize, knots: &[f64], points: &[[f64; 3]], t: f64) -> [f64; 3] {
     let last = points.len() - 1;
     // The span `[knots[k], knots[k + 1])` holding `t`, the final one closed.
-    let span = (DEGREE..=last)
+    let span = (degree..=last)
         .rev()
         .find(|&k| knots[k] <= t && knots[k] < knots[k + 1])
-        .unwrap_or(DEGREE);
-    let mut local: Vec<[f64; 3]> = (0..=DEGREE).map(|j| points[span - DEGREE + j]).collect();
-    for r in 1..=DEGREE {
-        for j in (r..=DEGREE).rev() {
-            let index = span - DEGREE + j;
-            let alpha = (t - knots[index]) / (knots[index + DEGREE + 1 - r] - knots[index]);
+        .unwrap_or(degree);
+    let mut local: Vec<[f64; 3]> = (0..=degree).map(|j| points[span - degree + j]).collect();
+    for r in 1..=degree {
+        for j in (r..=degree).rev() {
+            let index = span - degree + j;
+            let alpha = (t - knots[index]) / (knots[index + degree + 1 - r] - knots[index]);
             local[j] = [
                 (1.0 - alpha) * local[j - 1][0] + alpha * local[j][0],
                 (1.0 - alpha) * local[j - 1][1] + alpha * local[j][1],
@@ -640,7 +695,117 @@ fn de_boor(knots: &[f64], points: &[[f64; 3]], t: f64) -> [f64; 3] {
             ];
         }
     }
-    local[DEGREE]
+    local[degree]
+}
+
+/// A `B_SPLINE_SURFACE_WITH_KNOTS` read back: its degrees, its control net
+/// row by row along `u`, and its two full knot vectors.
+struct SplineSurface {
+    degrees: [usize; 2],
+    net: Vec<Vec<[f64; 3]>>,
+    knots: [Vec<f64>; 2],
+}
+
+impl SplineSurface {
+    fn read(reader: &Reader, surface: &Entity) -> Self {
+        let net = split_args(
+            surface.args[3]
+                .trim()
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+                .unwrap(),
+        )
+        .iter()
+        .map(|row| {
+            references(row)
+                .into_iter()
+                .map(|id| reader.point(id))
+                .collect()
+        })
+        .collect();
+        Self {
+            degrees: [
+                surface.args[1].parse().unwrap(),
+                surface.args[2].parse().unwrap(),
+            ],
+            net,
+            knots: [
+                full_knots(&surface.args[8], &surface.args[10]),
+                full_knots(&surface.args[9], &surface.args[11]),
+            ],
+        }
+    }
+
+    fn domain(&self, direction: usize) -> (f64, f64) {
+        let knots = &self.knots[direction];
+        (
+            knots[self.degrees[direction]],
+            knots[knots.len() - 1 - self.degrees[direction]],
+        )
+    }
+
+    fn point(&self, u: f64, v: f64) -> [f64; 3] {
+        let along: Vec<[f64; 3]> = self
+            .net
+            .iter()
+            .map(|row| de_boor(self.degrees[1], &self.knots[1], row, v))
+            .collect();
+        de_boor(self.degrees[0], &self.knots[0], &along, u)
+    }
+
+    /// `∂S/∂u` and `∂S/∂v`, by central differences inside the domain.
+    fn rates(&self, u: f64, v: f64) -> [[f64; 3]; 2] {
+        let difference = |direction: usize| {
+            let (low, high) = self.domain(direction);
+            let step = 1.0e-6 * (high - low);
+            let at = if direction == 0 { u } else { v };
+            let (before, after) = ((at - step).max(low), (at + step).min(high));
+            let (a, b) = if direction == 0 {
+                (self.point(before, v), self.point(after, v))
+            } else {
+                (self.point(u, before), self.point(u, after))
+            };
+            scale(sub(b, a), 1.0 / (after - before))
+        };
+        [difference(0), difference(1)]
+    }
+
+    fn normal(&self, u: f64, v: f64) -> [f64; 3] {
+        let [along_u, along_v] = self.rates(u, v);
+        unit(cross(along_u, along_v))
+    }
+
+    /// The parameters of the surface point nearest `target` and its
+    /// distance: the best of a grid, then Gauss–Newton steps.
+    fn project(&self, target: [f64; 3]) -> (f64, f64, f64) {
+        let (u_low, u_high) = self.domain(0);
+        let (v_low, v_high) = self.domain(1);
+        let mut best = (u_low, v_low, f64::INFINITY);
+        for i in 0..=32 {
+            for j in 0..=32 {
+                let u = u_low + (u_high - u_low) * f64::from(i) / 32.0;
+                let v = v_low + (v_high - v_low) * f64::from(j) / 32.0;
+                let gap = norm(sub(self.point(u, v), target));
+                if gap < best.2 {
+                    best = (u, v, gap);
+                }
+            }
+        }
+        let (mut u, mut v, _) = best;
+        for _ in 0..40 {
+            let offset = sub(target, self.point(u, v));
+            let [a, b] = self.rates(u, v);
+            let (aa, ab, bb) = (dot(a, a), dot(a, b), dot(b, b));
+            let (ra, rb) = (dot(a, offset), dot(b, offset));
+            let determinant = aa * bb - ab * ab;
+            if determinant.abs() < 1.0e-300 {
+                break;
+            }
+            u = (u + (bb * ra - ab * rb) / determinant).clamp(u_low, u_high);
+            v = (v + (aa * rb - ab * ra) / determinant).clamp(v_low, v_high);
+        }
+        (u, v, norm(sub(self.point(u, v), target)))
+    }
 }
 
 #[test]
@@ -652,17 +817,22 @@ fn every_fixture_exports_as_a_closed_manifold_brep_with_the_kernel_orientation()
         let snapshot = build(&source);
         let step = export_step(&snapshot, name).unwrap_or_else(|error| panic!("{name}: {error}"));
         check_brep(name, &snapshot, &step);
-        for entity in parse(&step).values() {
+        let entities = parse(&step);
+        for entity in entities.values() {
             match entity.kind.as_str() {
                 "PLANE"
                 | "CYLINDRICAL_SURFACE"
                 | "CONICAL_SURFACE"
                 | "SPHERICAL_SURFACE"
-                | "TOROIDAL_SURFACE" => {
+                | "TOROIDAL_SURFACE"
+                | "B_SPLINE_SURFACE_WITH_KNOTS" => {
                     kinds.insert(entity.kind.clone());
                 }
-                "LINE" | "CIRCLE" | "ELLIPSE" | "INTERSECTION_CURVE" => {
-                    curves.insert(entity.kind.clone());
+                // The curves edges are written on, which is where a spline
+                // of the kernel's own shows, rather than inside an
+                // intersection curve.
+                "EDGE_CURVE" => {
+                    curves.insert(entities[&reference(&entity.args[3])].kind.clone());
                 }
                 "BREP_WITH_VOIDS" => voids += 1,
                 _ => {}
@@ -670,8 +840,8 @@ fn every_fixture_exports_as_a_closed_manifold_brep_with_the_kernel_orientation()
         }
     }
     // The fixture set covers the whole vocabulary.
-    assert_eq!(kinds.len(), 5, "{kinds:?}");
-    assert_eq!(curves.len(), 4, "{curves:?}");
+    assert_eq!(kinds.len(), 6, "{kinds:?}");
+    assert_eq!(curves.len(), 5, "{curves:?}");
     assert!(voids >= 1, "a cavity fixture");
 }
 

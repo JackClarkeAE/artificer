@@ -314,6 +314,12 @@
         "BOOLEAN_STALE_OPERAND",
         "BOOLEAN_SURFACE_PAIR_UNSUPPORTED",
         "BOOLEAN_TRACE_NOT_CLOSED",
+        "BSPLINE_CLEARANCE_INDETERMINATE",
+        "BSPLINE_CURVE_DEGENERATE",
+        "BSPLINE_DEGREE_UNSUPPORTED",
+        "BSPLINE_KNOTS_INVALID",
+        "BSPLINE_RATIONAL_UNSUPPORTED",
+        "BSPLINE_UNCLAMPED_UNSUPPORTED",
         "COEDGE_USE_COUNT",
         "COORDINATE_LIMIT_EXCEEDED",
         "CUBOID_EXTENT_TOO_SMALL",
@@ -404,8 +410,8 @@
         "LOFT_FACETED_APPROXIMATION",
         "LOFT_FACETED_UNRESOLVED",
         "LOFT_HOLE_COUNT_MISMATCH",
-        "LOFT_MULTI_SECTION_UNSUPPORTED",
         "LOFT_OFFSET_NON_FINITE",
+        "LOFT_OFFSET_SPLINE_UNSUPPORTED",
         "LOFT_RUNGS_CROSS",
         "LOFT_SECTIONS_COPLANAR",
         "LOFT_SECTION_COLLAPSES",
@@ -414,7 +420,7 @@
         "LOFT_SECTION_DEGENERATE",
         "LOFT_SECTION_REGIONS_UNSUPPORTED",
         "LOFT_SECTION_SELF_INTERSECTS",
-        "LOFT_SECTION_SPLINE_UNSUPPORTED",
+        "LOFT_SKIN_FOLDS",
         "LOFT_TARGET_EMPTY",
         "LOFT_TOO_FEW_SECTIONS",
         "LOFT_WALL_DEGENERATE",
@@ -434,6 +440,7 @@
         "PLANAR_PROFILE_LOOP_DISCONNECTED",
         "PLANAR_PROFILE_LOOP_EMPTY",
         "PLANAR_PROFILE_REGIONS_OVERLAP",
+        "PLANAR_PROFILE_SPLINE_UNSUPPORTED",
         "PLANAR_PROFILE_TOO_MANY_CURVES",
         "PLANAR_PROFILE_TOO_MANY_LOOPS",
         "PLANAR_PROFILE_TOO_MANY_REGIONS",
@@ -812,6 +819,39 @@
           ],
           "additionalProperties": true,
           "description": "The straight lines between two exact rails (ADR 0049): the wall of a loft between unlike sections. Reported by its rails, each walked in the direction the rulings pair them."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "bspline"
+            },
+            "degree_u": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "degree_v": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "control_points_u": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "control_points_v": {
+              "type": "integer",
+              "minimum": 2
+            }
+          },
+          "required": [
+            "surface",
+            "degree_u",
+            "degree_v",
+            "control_points_u",
+            "control_points_v"
+          ],
+          "additionalProperties": true,
+          "description": "A non-rational B-spline surface (ADR 0050): the wall swept from a spline or skinned through several loft sections. Reported by its degree in each parameter and the size of its control net."
         }
       ]
     },
@@ -855,7 +895,8 @@
             "cone",
             "sphere",
             "torus",
-            "ruled"
+            "ruled",
+            "bspline"
           ]
         },
         "origin": {
@@ -890,6 +931,22 @@
         },
         "second_rail": {
           "$ref": "#/$defs/rail"
+        },
+        "degree_u": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "degree_v": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "control_points_u": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "control_points_v": {
+          "type": "integer",
+          "minimum": 2
         },
         "area": {
           "type": "number",
@@ -944,9 +1001,10 @@
             "line",
             "circular_arc",
             "elliptical_arc",
-            "surface_trace"
+            "surface_trace",
+            "bspline"
           ],
-          "description": "surface_trace: where two cylinders meet in a curve no line, circle or ellipse describes (ADR 0047). It has no frame, so it is reported by its ends and the radii of the two cylinders that generate it."
+          "description": "surface_trace: where two cylinders meet in a curve no line, circle or ellipse describes (ADR 0047). It has no frame, so it is reported by its ends and the radii of the two cylinders that generate it. bspline: a non-rational B-spline curve (ADR 0050), reported by its ends, its degree and how many control points it has."
         },
         "start": {
           "$ref": "#/$defs/point"
@@ -979,6 +1037,16 @@
         "other_radius": {
           "type": "number",
           "description": "surface_trace: radius of the other cylinder."
+        },
+        "degree": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "bspline: the curve's degree."
+        },
+        "control_points": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "bspline: how many control points the curve has."
         },
         "length": {
           "type": "number",
@@ -1033,6 +1101,10 @@
           "minimum": 0
         },
         "ruled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bspline": {
           "type": "integer",
           "minimum": 0
         }

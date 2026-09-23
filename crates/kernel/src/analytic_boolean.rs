@@ -422,7 +422,11 @@ fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
                 ));
             }
         }
-        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => {
+        Surface::Torus(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Ruled(_)
+        | Surface::Bspline(_) => {
             return None;
         }
     }

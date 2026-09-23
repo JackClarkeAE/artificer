@@ -269,6 +269,28 @@ impl Writer<'_> {
                             number(*width),
                             number(*height)
                         ),
+                        SketchEntity::Spline { points, closed } => format!(
+                            "spline(points: [{}]{})",
+                            points
+                                .iter()
+                                .map(|point| point2(*point))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            if *closed { ", closed: true" } else { "" }
+                        ),
+                        SketchEntity::ControlSpline {
+                            control_points,
+                            degree,
+                            closed,
+                        } => format!(
+                            "spline(control_points: [{}], degree: {degree}{})",
+                            control_points
+                                .iter()
+                                .map(|point| point2(*point))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            if *closed { ", closed: true" } else { "" }
+                        ),
                     })
                     .collect::<Vec<_>>();
                 format!(

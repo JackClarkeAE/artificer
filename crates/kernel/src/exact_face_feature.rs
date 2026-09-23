@@ -574,9 +574,11 @@ fn sweep_contacts_source(
                 }
                 // A blend band cannot be split or rebuilt by the local
                 // prismatic rewrite; any potential contact rejects.
-                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => {
-                    true
-                }
+                Surface::Torus(_)
+                | Surface::Cone(_)
+                | Surface::Sphere(_)
+                | Surface::Ruled(_)
+                | Surface::Bspline(_) => true,
                 Surface::Cylinder(cylinder) => {
                     let Some(axis) = robust_unit(cylinder.axis) else {
                         return true;
@@ -1483,6 +1485,26 @@ fn cap_pcurve_from_edge(edge: Edge, plane: Plane, reverse: bool) -> (Curve2, Par
         // An ellipse never bounds a planar cap in this vocabulary: it is the
         // seam of two cylinders. Should one arrive here, the chord keeps the
         // loop closed and the validator's locus check names the mismatch.
+        // A B-spline edge in the plane is the same spline in the plane's
+        // coordinates, its control points projected.
+        Curve3::Bspline { curve } => match crate::bspline::plane_pcurve(curve, plane) {
+            Some(pcurve) => (
+                Curve2::Bspline { curve: pcurve },
+                if reverse {
+                    edge.parameter_range.reversed()
+                } else {
+                    edge.parameter_range
+                },
+            ),
+            None => {
+                let endpoints = edge.endpoints();
+                Curve2::line_segment(if reverse {
+                    [plane.project(endpoints[1]), plane.project(endpoints[0])]
+                } else {
+                    endpoints.map(|point| plane.project(point))
+                })
+            }
+        },
         Curve3::Ellipse { .. } | Curve3::Trace { .. } => {
             let endpoints = edge.endpoints();
             Curve2::line_segment(if reverse {

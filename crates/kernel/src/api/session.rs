@@ -1368,6 +1368,21 @@ fn moved_entities(
                 start_angle: start_angle + rotation_degrees.to_radians(),
                 end_angle: end_angle + rotation_degrees.to_radians(),
             }),
+            // A fit is carried by a similarity: the fit through moved
+            // points is the moved fit.
+            SketchEntity::Spline { points, closed } => moved.push(SketchEntity::Spline {
+                points: points.iter().map(|point| map(*point)).collect(),
+                closed: *closed,
+            }),
+            SketchEntity::ControlSpline {
+                control_points,
+                degree,
+                closed,
+            } => moved.push(SketchEntity::ControlSpline {
+                control_points: control_points.iter().map(|point| map(*point)).collect(),
+                degree: *degree,
+                closed: *closed,
+            }),
             SketchEntity::Rectangle {
                 origin,
                 width,
@@ -1444,6 +1459,14 @@ fn footprint_points(entities: &[SketchEntity]) -> Vec<Point2> {
                 Point2::new(origin.x + width, origin.y + height),
                 Point2::new(origin.x, origin.y + height),
             ]),
+            // A spline lies inside its control polygon.
+            SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
+                if let Ok(Some((PlanarCurve2::Bspline { control_points, .. }, _))) =
+                    entity_spline(entity)
+                {
+                    points.extend(control_points);
+                }
+            }
         }
     }
     points
@@ -1494,8 +1517,91 @@ fn set_endpoint(curve: &mut PlanarCurve2, at_start: bool, point: Point2) {
                 *end = point;
             }
         }
-        PlanarCurve2::Circle { .. } | PlanarCurve2::Bspline { .. } => {}
+        // A clamped spline starts and ends on its end control points.
+        PlanarCurve2::Bspline { control_points, .. } => {
+            let slot = if at_start {
+                control_points.first_mut()
+            } else {
+                control_points.last_mut()
+            };
+            if let Some(slot) = slot {
+                *slot = point;
+            }
+        }
+        PlanarCurve2::Circle { .. } => {}
     }
+}
+
+/// The B-spline a fit-point `spline(...)` draws through `points` (ADR 0050),
+/// as the sketch's own fit-point tool draws it: cubic when there are four
+/// points or more, and closed back to the first point, smooth there, when
+/// `closed`. `None` when the points are too few or two neighbours coincide.
+#[must_use]
+pub fn fit_point_spline(points: &[Point2], closed: bool) -> Option<PlanarCurve2> {
+    let data = points
+        .iter()
+        .map(|point| [point.x, point.y])
+        .collect::<Vec<_>>();
+    let curve = crate::bspline::fit_points(&data, closed)?;
+    Some(PlanarCurve2::Bspline {
+        degree: curve.degree(),
+        control_points: curve
+            .points()
+            .iter()
+            .map(|point| Point2::new(point[0], point[1]))
+            .collect(),
+        knots: curve.knots().to_vec(),
+        weights: None,
+    })
+}
+
+/// A spline given by its control points: clamped, on a uniform knot vector,
+/// returning to its first control point when `closed`.
+fn control_point_spline(control_points: &[Point2], degree: usize, closed: bool) -> PlanarCurve2 {
+    let mut points = control_points.to_vec();
+    if closed && let Some(first) = control_points.first() {
+        points.push(*first);
+    }
+    let degree = degree.min(points.len().saturating_sub(1)).max(1);
+    PlanarCurve2::Bspline {
+        degree,
+        knots: crate::bspline::clamped_uniform_knots(points.len(), degree),
+        control_points: points,
+        weights: None,
+    }
+}
+
+/// The spline of a sketch entity, or why there is none.
+fn entity_spline(entity: &SketchEntity) -> Result<Option<(PlanarCurve2, bool)>, ApiError> {
+    Ok(match entity {
+        SketchEntity::Spline { points, closed } => {
+            let curve = fit_point_spline(points, *closed).ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidInput,
+                    "A fit-point spline needs at least two distinct points, three when closed, \
+                     and no two neighbours at one place",
+                )
+            })?;
+            Some((curve, *closed))
+        }
+        SketchEntity::ControlSpline {
+            control_points,
+            degree,
+            closed,
+        } => {
+            if control_points.len() < 2 {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidInput,
+                    "A control-point spline needs at least two control points",
+                ));
+            }
+            Some((
+                control_point_spline(control_points, *degree, *closed),
+                *closed,
+            ))
+        }
+        _ => None,
+    })
 }
 
 fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, ApiError> {
@@ -1533,6 +1639,17 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
                 start: *start,
                 end: *end,
             }),
+            // A closed spline is a loop of its own; an open one joins the
+            // lines and arcs it meets end to end.
+            SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
+                if let Some((curve, closed)) = entity_spline(entity)? {
+                    if closed {
+                        loops.push(vec![curve]);
+                    } else {
+                        open.push(curve);
+                    }
+                }
+            }
             SketchEntity::Arc {
                 center,
                 radius,
@@ -1586,6 +1703,42 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
                     ArcDirection::Clockwise => ArcDirection::CounterClockwise,
                 },
             },
+            // The same locus walked the other way: the control points in
+            // reverse, on the knots reflected in the middle of the domain,
+            // with the ends kept exact.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => {
+                let (first, last) = (
+                    knots.first().copied().unwrap_or(0.0),
+                    knots.last().copied().unwrap_or(1.0),
+                );
+                let count = knots.len();
+                PlanarCurve2::Bspline {
+                    degree: *degree,
+                    control_points: control_points.iter().rev().copied().collect(),
+                    knots: knots
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(index, knot)| {
+                            if index <= *degree {
+                                first
+                            } else if index + degree + 1 >= count {
+                                last
+                            } else {
+                                first + last - knot
+                            }
+                        })
+                        .collect(),
+                    weights: weights
+                        .as_ref()
+                        .map(|weights| weights.iter().rev().copied().collect()),
+                }
+            }
             other => other.clone(),
         }
     };
@@ -1674,9 +1827,29 @@ fn loop_polygon(curves: &[PlanarCurve2]) -> Vec<Point2> {
                     ));
                 }
             }
-            PlanarCurve2::Bspline { control_points, .. } => {
-                polygon.extend(control_points.iter().copied());
-            }
+            // The curve itself, finely, where the kernel carries it; its
+            // control polygon, which holds it, where it does not.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => match crate::spline_profile::spline_from_protocol(
+                *degree,
+                control_points,
+                knots,
+                weights.as_deref(),
+            ) {
+                Ok(spline) => {
+                    let (start, end) = spline.domain();
+                    for index in 0..64 {
+                        let point =
+                            spline.point((end - start).mul_add(f64::from(index) / 64.0, start));
+                        polygon.push(Point2::new(point.x, point.y));
+                    }
+                }
+                Err(_) => polygon.extend(control_points.iter().copied()),
+            },
         }
     }
     polygon

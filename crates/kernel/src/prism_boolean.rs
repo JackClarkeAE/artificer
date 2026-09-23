@@ -151,7 +151,11 @@ fn extract_slab(topology: &Topology, axis: Vector3, precision: PrecisionPolicy) 
                 plane.normal.dot(axis).abs() <= angular * length
             }
             Surface::Cylinder(cylinder) => cylinder.axis.cross(axis).length() <= angular,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => false,
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => false,
         };
         if !along {
             return None;
@@ -786,7 +790,11 @@ fn reverse_face_orientation(
                 cylinder.angular_sign = -cylinder.angular_sign;
                 |point: Point2| Point2::new(-point.x, point.y)
             }
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => {
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => {
                 return Err(PrismBooleanError::DomainUnsupported);
             }
         }
@@ -829,7 +837,7 @@ fn reverse_face_orientation(
                     // A prism reduction never builds one, and reversing a
                     // body that already carries one belongs to the general
                     // engine rather than here.
-                    Curve2::Trace { .. } => {
+                    Curve2::Trace { .. } | Curve2::Bspline { .. } => {
                         return Err(PrismBooleanError::DomainUnsupported);
                     }
                     Curve2::Harmonic {

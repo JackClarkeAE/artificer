@@ -941,66 +941,7 @@ pub(crate) fn parse_loop(
 
     let mut segments = Vec::with_capacity(profile_loop.curves.len());
     for curve in &profile_loop.curves {
-        let segment = match *curve {
-            PlanarCurve2::Line { start, end } => {
-                let start = Point2::new(start.x, start.y);
-                let end = Point2::new(end.x, end.y);
-                if (end.x - start.x).hypot(end.y - start.y) <= minimum {
-                    return Err(PlanarProfileInputError::Extrusion(
-                        ExtrusionInputError::FeatureTooSmall,
-                    ));
-                }
-                Segment::Line { start, end }
-            }
-            PlanarCurve2::CircularArc {
-                center,
-                start,
-                end,
-                direction,
-            } => {
-                let center = Point2::new(center.x, center.y);
-                let start = Point2::new(start.x, start.y);
-                let end = Point2::new(end.x, end.y);
-                let start_radius = (start.x - center.x).hypot(start.y - center.y);
-                let end_radius = (end.x - center.x).hypot(end.y - center.y);
-                if start_radius <= minimum || end_radius <= minimum {
-                    return Err(PlanarProfileInputError::Extrusion(
-                        ExtrusionInputError::FeatureTooSmall,
-                    ));
-                }
-                if (start_radius - end_radius).abs() > agreement {
-                    return Err(PlanarProfileInputError::Extrusion(
-                        ExtrusionInputError::NumericallyIndeterminate,
-                    ));
-                }
-                let radius = 0.5 * (start_radius + end_radius);
-                let start_angle = (start.y - center.y).atan2(start.x - center.x);
-                let end_angle = (end.y - center.y).atan2(end.x - center.x);
-                let sweep = directed_sweep(start_angle, end_angle, direction);
-                if !sweep.is_finite()
-                    || sweep.abs() <= agreement / radius
-                    || sweep.abs() >= std::f64::consts::TAU
-                    || radius * sweep.abs() <= minimum
-                {
-                    return Err(PlanarProfileInputError::Extrusion(
-                        ExtrusionInputError::FeatureTooSmall,
-                    ));
-                }
-                Segment::Arc {
-                    center,
-                    start,
-                    end,
-                    radius,
-                    start_angle,
-                    sweep,
-                }
-            }
-            PlanarCurve2::Circle { .. } => unreachable!(),
-            PlanarCurve2::Bspline { .. } => {
-                return Err(PlanarProfileInputError::AnalyticCurve);
-            }
-        };
-        segments.push(segment);
+        segments.push(parse_curve(curve, minimum, agreement)?);
     }
     if (0..segments.len())
         .any(|index| segments[index].end() != segments[(index + 1) % segments.len()].start())
@@ -1046,6 +987,79 @@ pub(crate) fn parse_loop(
     Ok(AnalyticLoop {
         segments,
         signed_area,
+    })
+}
+
+/// One line or circular arc of a profile loop as an exact segment, checked
+/// against the feature floor. A B-spline is not a segment: this path refuses
+/// it by name, and the spline profile path (ADR 0050) is the one that
+/// carries it.
+pub(crate) fn parse_curve(
+    curve: &PlanarCurve2,
+    minimum: f64,
+    agreement: f64,
+) -> Result<Segment, PlanarProfileInputError> {
+    Ok(match *curve {
+        PlanarCurve2::Line { start, end } => {
+            let start = Point2::new(start.x, start.y);
+            let end = Point2::new(end.x, end.y);
+            if (end.x - start.x).hypot(end.y - start.y) <= minimum {
+                return Err(PlanarProfileInputError::Extrusion(
+                    ExtrusionInputError::FeatureTooSmall,
+                ));
+            }
+            Segment::Line { start, end }
+        }
+        PlanarCurve2::CircularArc {
+            center,
+            start,
+            end,
+            direction,
+        } => {
+            let center = Point2::new(center.x, center.y);
+            let start = Point2::new(start.x, start.y);
+            let end = Point2::new(end.x, end.y);
+            let start_radius = (start.x - center.x).hypot(start.y - center.y);
+            let end_radius = (end.x - center.x).hypot(end.y - center.y);
+            if start_radius <= minimum || end_radius <= minimum {
+                return Err(PlanarProfileInputError::Extrusion(
+                    ExtrusionInputError::FeatureTooSmall,
+                ));
+            }
+            if (start_radius - end_radius).abs() > agreement {
+                return Err(PlanarProfileInputError::Extrusion(
+                    ExtrusionInputError::NumericallyIndeterminate,
+                ));
+            }
+            let radius = 0.5 * (start_radius + end_radius);
+            let start_angle = (start.y - center.y).atan2(start.x - center.x);
+            let end_angle = (end.y - center.y).atan2(end.x - center.x);
+            let sweep = directed_sweep(start_angle, end_angle, direction);
+            if !sweep.is_finite()
+                || sweep.abs() <= agreement / radius
+                || sweep.abs() >= std::f64::consts::TAU
+                || radius * sweep.abs() <= minimum
+            {
+                return Err(PlanarProfileInputError::Extrusion(
+                    ExtrusionInputError::FeatureTooSmall,
+                ));
+            }
+            Segment::Arc {
+                center,
+                start,
+                end,
+                radius,
+                start_angle,
+                sweep,
+            }
+        }
+        // A whole circle is its own loop, parsed before any curve is.
+        PlanarCurve2::Circle { .. } => {
+            return Err(PlanarProfileInputError::DisconnectedLoop);
+        }
+        PlanarCurve2::Bspline { .. } => {
+            return Err(PlanarProfileInputError::SplineCurve);
+        }
     })
 }
 
@@ -1159,7 +1173,11 @@ pub(crate) fn topology_loop_segments(
             match coedge.pcurve {
                 // Section traces are never planar profile pieces; the
                 // analytic Boolean reads them through `topology_loop_chords`.
-                Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
+                // A B-spline is not a piece either engine carries (ADR 0050).
+                Curve2::Harmonic { .. }
+                | Curve2::Ellipse { .. }
+                | Curve2::Trace { .. }
+                | Curve2::Bspline { .. } => None,
                 Curve2::Line { .. } => Some(Segment::Line { start, end }),
                 Curve2::Circle {
                     center,
@@ -1245,6 +1263,9 @@ pub(crate) fn topology_loop_chords(topology: &Topology, loop_key: LoopKey) -> Op
                 Curve2::Line { .. } | Curve2::Circle { .. } => {
                     topology_loop_segments_one(coedge, start, end)
                 }
+                // The analytic Boolean does not carry a B-spline edge; its
+                // callers decline the body before they get here.
+                Curve2::Bspline { .. } => None,
                 Curve2::Trace {
                     host,
                     other,
@@ -1323,7 +1344,10 @@ fn topology_loop_segments_one(
                     * determinant.signum(),
             })
         }
-        Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
+        Curve2::Harmonic { .. }
+        | Curve2::Ellipse { .. }
+        | Curve2::Trace { .. }
+        | Curve2::Bspline { .. } => None,
     }
 }
 
@@ -1764,7 +1788,7 @@ fn segments_intersect(first: Segment, second: Segment, tolerance: f64) -> bool {
     }
 }
 
-fn adjacent_has_extra_contact(
+pub(crate) fn adjacent_has_extra_contact(
     first: Segment,
     second: Segment,
     allowed: &[Point2],
@@ -2162,7 +2186,7 @@ fn build_analytic_region(extrusion: &ValidatedAnalyticRegionExtrusion) -> Topolo
             push_side_face(
                 &mut topology,
                 &mut next_id,
-                extrusion,
+                (extrusion.frame, extrusion.distance),
                 segment,
                 [
                     keys.bottom_edges[index],
@@ -2352,14 +2376,20 @@ pub(crate) fn push_cap_face(
     });
 }
 
-fn push_side_face(
+pub(crate) fn push_side_face(
     topology: &mut Topology,
     next_id: &mut u64,
-    extrusion: &ValidatedAnalyticRegionExtrusion,
+    (frame, distance): (Frame, f64),
     segment: Segment,
     edges: [EdgeKey; 4],
     role: FaceRole,
 ) {
+    let extrusion = ValidatedAnalyticRegionExtrusion {
+        frame,
+        loops: Vec::new(),
+        distance,
+    };
+    let extrusion = &extrusion;
     let (surface, bottom, right, top, left) = match segment {
         Segment::Line { start, end } => {
             let length = (end.x - start.x).hypot(end.y - start.y);

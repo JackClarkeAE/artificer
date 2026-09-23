@@ -287,6 +287,12 @@ pub(crate) enum Curve3 {
         other: Cylinder,
         branch: f64,
     },
+    /// A non-rational, clamped B-spline curve (ADR 0050): the edge of a
+    /// spline profile's wall, a section of a smooth loft, and a rung between
+    /// two of its walls. The parameter is the spline's own.
+    Bspline {
+        curve: crate::bspline::SplineCurve3,
+    },
 }
 
 impl Curve3 {
@@ -342,6 +348,7 @@ impl Curve3 {
                 branch,
             }
             .point_clamped(parameter),
+            Self::Bspline { curve } => curve.point(parameter),
         }
     }
 
@@ -368,6 +375,7 @@ impl Curve3 {
                 branch,
             }
             .tangent_clamped(parameter),
+            Self::Bspline { curve } => curve.tangent(parameter),
         }
     }
 
@@ -398,6 +406,8 @@ impl Curve3 {
                 other,
                 branch,
             } => host.is_finite() && other.is_finite() && branch.is_finite(),
+            // A stored spline is finite by construction.
+            Self::Bspline { .. } => true,
         }
     }
 }
@@ -560,6 +570,11 @@ impl Edge {
             }
             .arc_length(self.parameter_range.start, self.parameter_range.end)
             .abs(),
+            // Gauss–Legendre on every knot span: ADR 0026's standing for an
+            // integral with no elementary antiderivative.
+            Curve3::Bspline { curve } => curve
+                .length(self.parameter_range.start, self.parameter_range.end)
+                .abs(),
         }
     }
 
@@ -619,6 +634,12 @@ pub(crate) enum Curve2 {
         branch: f64,
         on_other: bool,
         shift: Point2,
+    },
+    /// A B-spline edge's curve in a plane's own coordinates (ADR 0050): the
+    /// projection of the space curve, which for a curve lying in the plane
+    /// is the same B-spline with its control points projected.
+    Bspline {
+        curve: crate::bspline::SplineCurve2,
     },
 }
 
@@ -697,6 +718,7 @@ impl Curve2 {
                     )
                 }
             }
+            Self::Bspline { curve } => curve.point(parameter),
         }
     }
 
@@ -746,6 +768,7 @@ impl Curve2 {
                     Vector2::new(1.0, trace.slope_clamped(parameter))
                 }
             }
+            Self::Bspline { curve } => curve.tangent(parameter),
         }
     }
 
@@ -783,6 +806,7 @@ impl Curve2 {
                 shift,
                 ..
             } => host.is_finite() && other.is_finite() && branch.is_finite() && shift.is_finite(),
+            Self::Bspline { .. } => true,
         }
     }
 }
@@ -1003,6 +1027,10 @@ pub(crate) enum Surface {
     /// The straight lines between two exact rails (ADR 0049): the wall of a
     /// loft between unlike sections, where no elementary carrier is exact.
     Ruled(crate::ruled::RuledSurface),
+    /// A non-rational, clamped B-spline surface (ADR 0050): the wall a spline
+    /// profile sweeps, and every wall of a smooth loft through several
+    /// sections.
+    Bspline(crate::bspline::SplineSurface),
 }
 
 impl Surface {
@@ -1014,6 +1042,7 @@ impl Surface {
             Self::Cone(cone) => cone.evaluate(point),
             Self::Sphere(sphere) => sphere.evaluate(point),
             Self::Ruled(ruled) => ruled.evaluate(point),
+            Self::Bspline(surface) => surface.evaluate(point),
         }
     }
 
@@ -1025,6 +1054,7 @@ impl Surface {
             Self::Cone(cone) => cone.is_finite(),
             Self::Sphere(sphere) => sphere.is_finite(),
             Self::Ruled(ruled) => ruled.is_finite(),
+            Self::Bspline(surface) => surface.is_finite(),
         }
     }
 
@@ -1083,6 +1113,10 @@ impl Surface {
             Self::Ruled(ruled) => ruled
                 .invert(point, None)
                 .and_then(|parameters| ruled.unit_normal(parameters)),
+            // Nor has a B-spline surface; the same holds.
+            Self::Bspline(surface) => surface
+                .invert(point, None)
+                .and_then(|parameters| surface.unit_normal(parameters)),
         }
     }
 
@@ -1127,6 +1161,7 @@ impl Surface {
                 azimuthal * tangent.x + meridian * tangent.y
             }
             Self::Ruled(ruled) => ruled.map_tangent(point, tangent),
+            Self::Bspline(surface) => surface.map_tangent(point, tangent),
         }
     }
 
@@ -1137,7 +1172,8 @@ impl Surface {
             | Self::Torus(_)
             | Self::Cone(_)
             | Self::Sphere(_)
-            | Self::Ruled(_) => None,
+            | Self::Ruled(_)
+            | Self::Bspline(_) => None,
         }
     }
 
@@ -1148,7 +1184,8 @@ impl Surface {
             | Self::Torus(_)
             | Self::Cone(_)
             | Self::Sphere(_)
-            | Self::Ruled(_) => None,
+            | Self::Ruled(_)
+            | Self::Bspline(_) => None,
         }
     }
 }

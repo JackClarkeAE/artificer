@@ -291,7 +291,11 @@ fn cap_prism(
                 other_normal.dot(normal).abs() <= agreement
             }
             Surface::Cylinder(cylinder) => cylinder.axis.cross(normal).length() <= agreement,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => false,
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => false,
         };
         if !along {
             return Err(ShellError::DomainUnsupported);
@@ -699,6 +703,11 @@ fn reverse_face(topology: &mut Topology, face_index: usize) -> Option<()> {
         Surface::Ruled(ruled) => {
             *ruled = ruled.reversed_u();
             |point: Point2| Point2::new(1.0 - point.x, point.y)
+        }
+        // A B-spline surface walks `u` the other way over the negated domain.
+        Surface::Bspline(surface) => {
+            *surface = surface.reversed_u();
+            |point: Point2| Point2::new(-point.x, point.y)
         }
         // A torus and a sphere pin their frame to their angular sign, so
         // the outward normal is always the geometric one: the material

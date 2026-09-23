@@ -473,6 +473,7 @@ const BUILTINS: &[&str] = &[
     "circle",
     "arc",
     "rect",
+    "spline",
     "sketch",
     "extrude",
     "revolve",
@@ -1378,6 +1379,52 @@ impl<'a> Interp<'a> {
                 start_angle: args.number("start_angle")?.to_radians(),
                 end_angle: args.number("end_angle")?.to_radians(),
             })),
+            // A spline through fit points, or by its control points
+            // (ADR 0050).
+            "spline" => {
+                let closed = match args.values.get("closed") {
+                    None => false,
+                    Some(Value::Bool(flag)) => *flag,
+                    Some(other) => {
+                        return Err(ScriptError::eval(format!(
+                            "spline(): `closed` is true or false, got {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                let points = |value: &Value| -> Result<Vec<Point2>, ScriptError> {
+                    match value {
+                        Value::Array(items) => items.iter().map(Value::as_point2).collect(),
+                        other => Err(ScriptError::eval(format!(
+                            "spline(): points are an array of [x, y] arrays, got {}",
+                            other.describe()
+                        ))),
+                    }
+                };
+                match (args.values.get("points"), args.values.get("control_points")) {
+                    (Some(fit), None) => Ok(Value::Entity(SketchEntity::Spline {
+                        points: points(fit)?,
+                        closed,
+                    })),
+                    (None, Some(control)) => {
+                        let degree = args.number_or("degree", 3.0)?;
+                        if !((1.0..=5.0).contains(&degree) && degree.fract() == 0.0) {
+                            return Err(ScriptError::eval(
+                                "spline(): `degree` is a whole number from 1 to 5",
+                            ));
+                        }
+                        Ok(Value::Entity(SketchEntity::ControlSpline {
+                            control_points: points(control)?,
+                            degree: degree as usize,
+                            closed,
+                        }))
+                    }
+                    _ => Err(ScriptError::eval(
+                        "spline() takes either `points`, the points it passes through, or \
+                         `control_points`, the polygon that shapes it",
+                    )),
+                }
+            }
             "rect" => {
                 let width = args.number("width")?;
                 let height = args.number("height")?;
@@ -2422,7 +2469,7 @@ fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
         Value::Entity(_) => std::slice::from_ref(value),
         other => {
             return Err(ScriptError::eval(format!(
-                "sketch(): `entities` is an array of line(), circle(), arc() or rect() calls, got {}",
+                "sketch(): `entities` is an array of line(), circle(), arc(), rect() or spline() calls, got {}",
                 other.describe()
             )));
         }
@@ -2432,7 +2479,7 @@ fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
         .map(|item| match item {
             Value::Entity(entity) => Ok(entity.clone()),
             other => Err(ScriptError::eval(format!(
-                "sketch(): every entity is a line(), circle(), arc() or rect(), got {}",
+                "sketch(): every entity is a line(), circle(), arc(), rect() or spline(), got {}",
                 other.describe()
             ))),
         })

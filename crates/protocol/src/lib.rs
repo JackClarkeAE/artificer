@@ -28,9 +28,9 @@ pub const MAX_PLANAR_PROFILE_CURVES: usize = 1_024;
 
 /// Wire-format ceiling for the sections of one loft.
 ///
-/// The kernel builds lofts between two sections today and refuses more by
-/// name (ADR 0049); the ceiling only stops an untrusted array from
-/// allocating an arbitrary number of profiles before that refusal runs.
+/// The kernel lofts through any number of sections from two (ADR 0049,
+/// ADR 0050); the ceiling only stops an untrusted array from allocating an
+/// arbitrary number of profiles before any of them is checked.
 pub const MAX_LOFT_SECTIONS: usize = 64;
 
 mod bounded_planar_profile {
@@ -967,6 +967,10 @@ pub enum PlanarCurve2 {
         radius: f64,
         direction: ArcDirection,
     },
+    /// A B-spline from its first control point to its last. The kernel
+    /// builds with clamped, non-rational splines of degree one to five and
+    /// refuses weights that are not all equal, and knot vectors that are not
+    /// clamped, by name (ADR 0050).
     Bspline {
         degree: usize,
         control_points: Vec<Point2>,
@@ -1469,13 +1473,15 @@ pub enum KernelCommand {
     ///
     /// The sections may lie on any planes that are not one plane: parallel,
     /// offset, tilted or not parallel at all. Each is one region, an outer
-    /// loop of lines, arcs and circles with any holes inside it. The walls
-    /// are planes, cylinders or cones where one of those is exact, and ruled
-    /// surfaces otherwise. The kernel builds two-section lofts and refuses
-    /// more by name: a smooth loft through several sections needs B-spline
-    /// surfaces. A new body is built from the empty snapshot; an add or a cut
-    /// combines the loft with the body it is given through the Boolean
-    /// ladder, and the report names the rung that answered.
+    /// loop of lines, arcs, circles and B-splines with any holes inside it.
+    /// Between two sections the walls are planes, cylinders or cones where
+    /// one of those is exact, ruled surfaces otherwise, and B-spline surfaces
+    /// ruled between the rows where a section has a spline. Through three
+    /// sections or more the loft is smooth: every wall is one B-spline
+    /// surface through all the sections in order (ADR 0050). A new body is
+    /// built from the empty snapshot; an add or a cut combines the loft with
+    /// the body it is given through the Boolean ladder, and the report names
+    /// the rung that answered.
     LoftPlanarSections {
         #[serde(deserialize_with = "bounded_loft_sections::deserialize")]
         sections: Vec<LoftSection>,
