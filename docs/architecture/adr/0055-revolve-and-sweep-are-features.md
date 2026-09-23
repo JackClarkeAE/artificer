@@ -541,10 +541,18 @@ construction plane (ADR 0048).
     - `SWEEP_PROFILE_ALONG_PATH`, for a start within about five degrees of
       the profile's plane;
     - `SWEEP_PROFILE_TOO_WIDE`, for a profile that reaches past the path's
-      centre of curvature.
+      centre of curvature, the lean of a tilted profile included;
+    - `SWEEP_SELF_INTERSECTS`, for a path that comes back through its own
+      solid: two stretches of the sweep whose bounding spheres meet, and
+      whose profile hulls no separating axis parts, are taken to cross.
+      The test is conservative, so a sweep that only comes very close to
+      itself can be refused too; a spring whose coils sit closer than the
+      wire is thick is refused, one with room between them builds.
 
-    The plan's sampled check for a wall crossing itself elsewhere was not
-    built. A path that comes back through its own solid is not refused.
+    A path spline whose segment stalls or is shorter than the modelling
+    resolution is `SWEEP_PATH_INVALID` when the path is read. A skinned
+    sweep starts from at most 129 copies spread along the path, and its
+    interpolation is a banded solve.
   - **Add and cut** go through `tool_boolean` with the `SWEEP_BOOLEAN`
     labels.
     - A straight sweep cuts exactly through `sweep/boolean-prism`.
