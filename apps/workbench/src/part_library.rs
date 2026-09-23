@@ -1,14 +1,19 @@
-//! Presentation-only foundation for the local Part Library.
+//! Presentation for the local Part Library.
 //!
 //! This module deliberately does not know about kernel snapshots, model
-//! documents, catalog storage, or assembly placement; a part's saved preview
-//! reaches it as plain data to show. It validates the first
-//! built-in parametric card and emits immutable insertion intents which the
-//! workbench can pass through its universal confirmation gate. A later
-//! catalog/model adapter can consume the same intents without moving parameter
-//! validation into rendering code.
+//! documents, catalog storage, or assembly placement. The workbench hands it
+//! the parts the library holds — the built-in extrusion and every part a
+//! person has saved — as plain descriptions with their parameters, and their
+//! saved pictures as plain data. It validates the values typed for the
+//! selected part and emits immutable insertion intents, which the workbench
+//! passes through its universal confirmation gate. Every insertion is its
+//! own intent with its own values, so one part can be placed as many times
+//! as wanted, each at different values.
+
+use std::collections::BTreeMap;
 
 use artificer_catalog::{PartPreview, PartPreviewFacts};
+use artificer_sketch::expression::{FieldUnit, evaluate_entry};
 use egui::{FontId, RichText, Stroke};
 
 use crate::part_preview::decode_png;
@@ -48,12 +53,116 @@ pub enum ParameterValueSource {
     Entered,
 }
 
-/// One concrete, unit-normalized parameter assignment in an insertion intent.
+/// What a parameter measures, which decides how its field reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterQuantity {
+    /// Read in the document's length unit, or the unit typed; millimetres.
+    Length,
+    /// Read in degrees, or the unit typed; radians.
+    Angle,
+    /// A plain number.
+    Number,
+}
+
+/// One parameter a library part takes. Values are canonical: millimetres,
+/// radians, or the number itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryParameter {
+    pub key: String,
+    pub label: String,
+    pub quantity: ParameterQuantity,
+    pub default: Option<f64>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+}
+
+/// One part the library offers, pinned to one exact immutable package.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LibraryPart {
+    pub key: String,
+    /// The exact revision, `[major, minor, patch]`.
+    pub revision: [u32; 3],
+    /// SHA-256 address of the package.
+    pub digest: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub parametric: bool,
+    pub parameters: Vec<LibraryParameter>,
+    /// Extra words the search matches, beyond the name and category.
+    pub keywords: Vec<String>,
+}
+
+impl LibraryPart {
+    /// The built-in extrusion, pinned to `digest` at `revision`, with
+    /// `length_default` as its Length default when it has one.
+    #[must_use]
+    pub fn builtin(digest: String, revision: [u32; 3], length_default: Option<f64>) -> Self {
+        Self {
+            key: ALUMINIUM_EXTRUSION_20X20_KEY.to_owned(),
+            revision,
+            digest,
+            name: ALUMINIUM_EXTRUSION_20X20_NAME.to_owned(),
+            description: Some(
+                "Exact 20 mm × 20 mm profile with a user-resolved extrusion length. Equal variants may share evaluated geometry while every insertion remains independent."
+                    .to_owned(),
+            ),
+            category: Some("Aluminium profiles".to_owned()),
+            parametric: true,
+            parameters: vec![LibraryParameter {
+                key: LENGTH_PARAMETER_KEY.to_owned(),
+                label: "Length".to_owned(),
+                quantity: ParameterQuantity::Length,
+                default: length_default,
+                minimum: Some(MIN_LENGTH_MM),
+                maximum: Some(MAX_LENGTH_MM),
+            }],
+            keywords: vec![
+                "aluminium".into(),
+                "profile".into(),
+                "extrusion".into(),
+                "parametric".into(),
+            ],
+        }
+    }
+
+    /// Whether this is one of the parts Artificer ships.
+    #[must_use]
+    pub fn is_builtin(&self) -> bool {
+        self.key.starts_with("builtin.")
+    }
+
+    fn revision_label(&self) -> String {
+        let [major, minor, patch] = self.revision;
+        format!("{major}.{minor}.{patch}")
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let mut haystack = self.name.to_lowercase();
+        for extra in self
+            .category
+            .iter()
+            .chain(self.description.iter())
+            .chain(self.keywords.iter())
+        {
+            haystack.push(' ');
+            haystack.push_str(&extra.to_lowercase());
+        }
+        haystack.contains(query)
+    }
+}
+
+/// One concrete, canonical parameter assignment in an insertion intent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartParameterAssignment {
     pub key: String,
     pub display_name: String,
-    pub value_mm: f64,
+    /// Canonical: millimetres for a length, radians for an angle, the number
+    /// itself otherwise.
+    pub value: f64,
     pub source: ParameterValueSource,
 }
 
@@ -86,10 +195,16 @@ impl PartInsertionIntent {
     /// Returns the resolved length carried by this built-in definition.
     #[must_use]
     pub fn length_mm(&self) -> Option<f64> {
+        self.value(LENGTH_PARAMETER_KEY)
+    }
+
+    /// The canonical value given for one parameter.
+    #[must_use]
+    pub fn value(&self, key: &str) -> Option<f64> {
         self.parameters
             .iter()
-            .find(|parameter| parameter.key == LENGTH_PARAMETER_KEY)
-            .map(|parameter| parameter.value_mm)
+            .find(|parameter| parameter.key == key)
+            .map(|parameter| parameter.value)
     }
 
     /// Returns the pure resolved 20 × 20 × Length data for this definition.
@@ -109,67 +224,103 @@ impl PartInsertionIntent {
     }
 }
 
-/// Preflight result used by both semantic tests and the egui control state.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// Whether the selected part can be added with the values typed for it, and
+/// if not, which value is wrong.
+#[derive(Clone, Debug, PartialEq)]
 pub enum PartInsertionEligibility {
-    Ready {
-        length_mm: f64,
-        source: ParameterValueSource,
-    },
+    Ready,
+    NoPart,
     AlreadyStaged,
-    MissingLength,
-    InvalidLength,
-    NonFiniteLength,
-    LengthTooSmall,
-    LengthTooLarge,
+    Missing {
+        parameter: String,
+    },
+    Invalid {
+        parameter: String,
+        quantity: ParameterQuantity,
+    },
+    NonFinite {
+        parameter: String,
+    },
+    TooSmall {
+        parameter: String,
+        minimum: String,
+    },
+    TooLarge {
+        parameter: String,
+        maximum: String,
+    },
 }
 
 impl PartInsertionEligibility {
     #[must_use]
-    pub const fn can_stage(self) -> bool {
-        matches!(self, Self::Ready { .. })
+    pub const fn can_stage(&self) -> bool {
+        matches!(self, Self::Ready)
     }
 
     #[must_use]
-    pub const fn visible_reason(self) -> Option<&'static str> {
-        match self {
-            Self::Ready { .. } => None,
+    pub fn visible_reason(&self) -> Option<String> {
+        Some(match self {
+            Self::Ready => return None,
+            Self::NoPart => "Pick a part in the list.".to_owned(),
             Self::AlreadyStaged => {
-                Some("Confirm or cancel the current staged insertion before adding another part.")
+                "Confirm or cancel the current staged insertion before adding another part."
+                    .to_owned()
             }
-            Self::MissingLength => {
-                Some("Length is required. Enter a value before adding this part.")
+            Self::Missing { parameter } => {
+                format!("{parameter} is required. Enter a value before adding this part.")
             }
-            Self::InvalidLength => {
-                Some("Length must be a number, in the document unit or with its own (10mm, 1in).")
+            Self::Invalid {
+                parameter,
+                quantity,
+            } => match quantity {
+                ParameterQuantity::Length => format!(
+                    "{parameter} must be a number, in the document unit or with its own (10mm, 1in)."
+                ),
+                ParameterQuantity::Angle => {
+                    format!(
+                        "{parameter} must be a number of degrees, or carry its own unit (1rad)."
+                    )
+                }
+                ParameterQuantity::Number => format!("{parameter} must be a number."),
+            },
+            Self::NonFinite { parameter } => format!("{parameter} must be a finite value."),
+            Self::TooSmall { parameter, minimum } => {
+                format!("{parameter} must be at least {minimum}.")
             }
-            Self::NonFiniteLength => Some("Length must be a finite value."),
-            Self::LengthTooSmall => Some("Length must be at least 0.001 mm."),
-            Self::LengthTooLarge => Some("Length must not exceed 100000 mm."),
-        }
+            Self::TooLarge { parameter, maximum } => {
+                format!("{parameter} must not exceed {maximum}.")
+            }
+        })
     }
 }
 
-/// Presentation state for the first independent Part Library window.
+/// What a person typed for one parameter of one part.
+#[derive(Clone, Debug, PartialEq)]
+struct ParameterEntry {
+    text: String,
+    source: ParameterValueSource,
+}
+
+/// Presentation state for the Part Library window.
 #[derive(Clone, Debug)]
 pub struct PartLibraryState {
     open: bool,
     search: String,
-    /// The typed length, in `length_unit` unless it carries its own suffix.
-    length_text: String,
-    length_source: ParameterValueSource,
-    length_default_mm: Option<f64>,
-    /// The document's length unit, which the Length field shows and reads.
+    /// The document's length unit, which length fields show and read.
     length_unit: LengthUnit,
-    definition_digest: String,
-    /// The exact revision of the package the card is pinned to.
-    definition_revision: [u32; 3],
+    parts: Vec<LibraryPart>,
+    selected: usize,
+    /// Typed values, by part key and then parameter key, kept while the
+    /// library is open so each part remembers its own.
+    entries: BTreeMap<String, BTreeMap<String, ParameterEntry>>,
+    /// Saved pictures, by package digest.
+    previews: BTreeMap<String, ShownPreview>,
     next_staging_id: u64,
     staged: Option<PartInsertionIntent>,
     committed: Vec<PartInsertionIntent>,
     status: Option<String>,
-    /// The picture and measurements saved with the part the card shows.
-    preview: Option<ShownPreview>,
+    /// Set when "Save current part" is pressed, until the workbench takes it.
+    save_requested: bool,
 }
 
 /// A saved preview as the list shows it: its facts, the decoded picture,
@@ -224,36 +375,35 @@ impl Default for PartLibraryState {
 }
 
 impl PartLibraryState {
-    /// Creates the built-in card with an optional definition-owned default.
+    /// A library holding only the built-in part, with an optional Length
+    /// default.
     ///
-    /// The production example intentionally passes `None`, making Length a
-    /// required input. The constructor keeps default behavior testable and
-    /// adapter-ready for future published definitions.
+    /// The production part passes `None`, making Length a required input.
+    /// The constructor keeps default behavior testable.
     #[must_use]
     pub fn with_length_default(default_mm: Option<f64>) -> Self {
         let valid_default = default_mm
             .filter(|value| value.is_finite() && (MIN_LENGTH_MM..=MAX_LENGTH_MM).contains(value));
-        Self {
+        let mut library = Self {
             open: false,
             search: String::new(),
-            length_text: valid_default
-                .map(|millimetres| LengthUnit::Millimetre.format_value(millimetres))
-                .unwrap_or_default(),
-            length_source: if valid_default.is_some() {
-                ParameterValueSource::Default
-            } else {
-                ParameterValueSource::Entered
-            },
-            length_default_mm: valid_default,
             length_unit: LengthUnit::Millimetre,
-            definition_digest: String::new(),
-            definition_revision: [ALUMINIUM_EXTRUSION_20X20_REVISION, 0, 0],
+            parts: Vec::new(),
+            selected: 0,
+            entries: BTreeMap::new(),
+            previews: BTreeMap::new(),
             next_staging_id: 1,
             staged: None,
             committed: Vec::new(),
             status: None,
-            preview: None,
-        }
+            save_requested: false,
+        };
+        library.set_parts(vec![LibraryPart::builtin(
+            String::new(),
+            [ALUMINIUM_EXTRUSION_20X20_REVISION, 0, 0],
+            valid_default,
+        )]);
+        library
     }
 
     #[must_use]
@@ -265,115 +415,243 @@ impl PartLibraryState {
         &mut self.open
     }
 
+    /// Replaces the parts the library offers. The selection and typed values
+    /// follow each part by key, so saving a new version of the part being
+    /// looked at keeps it selected.
+    pub fn set_parts(&mut self, parts: Vec<LibraryPart>) {
+        let selected_key = self.selected_part().map(|part| part.key.clone());
+        self.parts = parts;
+        self.selected = selected_key
+            .and_then(|key| self.parts.iter().position(|part| part.key == key))
+            .unwrap_or(0);
+        let unit = self.length_unit;
+        for part in &self.parts {
+            let entries = self.entries.entry(part.key.clone()).or_default();
+            entries.retain(|key, _| {
+                part.parameters
+                    .iter()
+                    .any(|parameter| parameter.key == *key)
+            });
+            for parameter in &part.parameters {
+                entries
+                    .entry(parameter.key.clone())
+                    .or_insert_with(|| match parameter.default {
+                        Some(default) => ParameterEntry {
+                            text: format_value(parameter.quantity, default, unit),
+                            source: ParameterValueSource::Default,
+                        },
+                        None => ParameterEntry {
+                            text: String::new(),
+                            source: ParameterValueSource::Entered,
+                        },
+                    });
+            }
+        }
+    }
+
+    /// The parts the library offers.
+    #[must_use]
+    pub fn parts(&self) -> &[LibraryPart] {
+        &self.parts
+    }
+
+    /// The part whose card is showing.
+    #[must_use]
+    pub fn selected_part(&self) -> Option<&LibraryPart> {
+        self.parts.get(self.selected)
+    }
+
+    /// Shows `key`'s card. `false` when the library has no such part.
+    pub fn select_part(&mut self, key: &str) -> bool {
+        match self.parts.iter().position(|part| part.key == key) {
+            Some(index) => {
+                self.selected = index;
+                self.status = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The typed text for one of the selected part's parameters.
+    #[must_use]
+    pub fn parameter_text(&self, key: &str) -> Option<&str> {
+        let part = self.selected_part()?;
+        self.entries
+            .get(&part.key)
+            .and_then(|entries| entries.get(key))
+            .map(|entry| entry.text.as_str())
+    }
+
+    /// Types a value for one of the selected part's parameters.
+    pub fn set_parameter_text(&mut self, key: &str, text: impl Into<String>) {
+        let Some(part) = self.selected_part().map(|part| part.key.clone()) else {
+            return;
+        };
+        if let Some(entry) = self
+            .entries
+            .get_mut(&part)
+            .and_then(|entries| entries.get_mut(key))
+        {
+            entry.text = text.into();
+            entry.source = ParameterValueSource::Entered;
+            self.status = None;
+        }
+    }
+
+    /// The selected part's Length field, which the built-in extrusion and
+    /// most saved parts have.
     #[must_use]
     pub fn length_text(&self) -> &str {
-        &self.length_text
+        self.parameter_text(LENGTH_PARAMETER_KEY).unwrap_or("")
     }
 
     pub fn set_length_text(&mut self, text: impl Into<String>) {
-        self.length_text = text.into();
-        self.length_source = ParameterValueSource::Entered;
-        self.status = None;
+        self.set_parameter_text(LENGTH_PARAMETER_KEY, text);
     }
 
-    /// The unit the Length field shows and reads.
+    /// The unit length fields show and read.
     #[must_use]
     pub const fn length_unit(&self) -> LengthUnit {
         self.length_unit
     }
 
-    /// Follows the document's unit. A value already in the field is
+    /// Follows the document's unit. A length already in a field is
     /// re-rendered in the new unit, so `80` typed as millimetres does not
     /// sit there reading as eighty inches.
     pub fn set_length_unit(&mut self, unit: LengthUnit) {
         if self.length_unit == unit {
             return;
         }
-        if let Ok(millimetres) = self.length_unit.parse(&self.length_text) {
-            self.length_text = unit.format_value(millimetres);
+        let old = self.length_unit;
+        for part in &self.parts {
+            let Some(entries) = self.entries.get_mut(&part.key) else {
+                continue;
+            };
+            for parameter in &part.parameters {
+                if parameter.quantity != ParameterQuantity::Length {
+                    continue;
+                }
+                if let Some(entry) = entries.get_mut(&parameter.key)
+                    && let Ok(millimetres) = old.parse(&entry.text)
+                {
+                    entry.text = unit.format_value(millimetres);
+                }
+            }
         }
         self.length_unit = unit;
     }
 
-    /// Pins the visible card to one exact immutable catalog package.
+    /// Pins the built-in part to one exact immutable catalog package.
     pub(crate) fn set_definition(&mut self, digest: impl Into<String>, revision: [u32; 3]) {
-        self.definition_digest = digest.into();
-        self.definition_revision = revision;
+        let digest = digest.into();
+        if let Some(part) = self
+            .parts
+            .iter_mut()
+            .find(|part| part.key == ALUMINIUM_EXTRUSION_20X20_KEY)
+        {
+            part.digest = digest;
+            part.revision = revision;
+        }
     }
 
-    /// The exact revision of the package the card is pinned to.
+    /// The exact revision of the package the selected card is pinned to.
     #[must_use]
-    pub const fn definition_revision(&self) -> [u32; 3] {
-        self.definition_revision
+    pub fn definition_revision(&self) -> [u32; 3] {
+        self.selected_part().map_or([0, 0, 0], |part| part.revision)
     }
 
-    /// Shows the preview saved with the part, or none. A picture that does
-    /// not decode leaves the list's placeholder, with the size still shown.
-    pub(crate) fn set_preview(&mut self, preview: Option<&PartPreview>) {
-        self.preview = preview.map(|preview| ShownPreview {
-            facts: preview.facts.clone(),
-            image: decode_png(&preview.image_png),
-            texture: None,
-        });
+    #[must_use]
+    pub fn definition_digest(&self) -> &str {
+        self.selected_part().map_or("", |part| part.digest.as_str())
     }
 
-    /// The measurements saved with the part's preview.
+    /// Shows the preview saved with the package `digest`, or none. A picture
+    /// that does not decode leaves the list's placeholder, with the size
+    /// still shown.
+    pub(crate) fn set_preview(&mut self, digest: &str, preview: Option<&PartPreview>) {
+        match preview {
+            Some(preview) => {
+                self.previews.insert(
+                    digest.to_owned(),
+                    ShownPreview {
+                        facts: preview.facts.clone(),
+                        image: decode_png(&preview.image_png),
+                        texture: None,
+                    },
+                );
+            }
+            None => {
+                self.previews.remove(digest);
+            }
+        }
+    }
+
+    fn preview_of(&self, part: &LibraryPart) -> Option<&ShownPreview> {
+        self.previews.get(&part.digest)
+    }
+
+    /// The measurements saved with the selected part's preview.
     #[must_use]
     pub fn preview_facts(&self) -> Option<&PartPreviewFacts> {
-        self.preview.as_ref().map(|preview| &preview.facts)
+        self.selected_part()
+            .and_then(|part| self.preview_of(part))
+            .map(|preview| &preview.facts)
     }
 
-    /// The size of the picture the list shows, in pixels, if it has one.
+    /// The size of the picture the list shows for the selected part, in
+    /// pixels, if it has one.
     #[must_use]
     pub fn preview_image_size(&self) -> Option<[usize; 2]> {
-        self.preview
-            .as_ref()
+        self.selected_part()
+            .and_then(|part| self.preview_of(part))
             .and_then(|preview| preview.image.as_ref())
             .map(|image| image.size)
     }
 
-    /// The part's rough size in the document unit, as the list shows it.
+    /// The selected part's rough size in the document unit.
     #[must_use]
     pub fn rough_dimensions_text(&self) -> Option<String> {
         self.preview_facts()
             .map(|facts| rough_dimensions(facts, self.length_unit))
     }
 
-    fn revision_label(&self) -> String {
-        let [major, minor, patch] = self.definition_revision;
-        format!("{major}.{minor}.{patch}")
+    /// Whether "Save current part" was pressed since the last call.
+    pub(crate) fn take_save_request(&mut self) -> bool {
+        std::mem::take(&mut self.save_requested)
     }
 
-    #[must_use]
-    pub fn definition_digest(&self) -> &str {
-        &self.definition_digest
+    /// Reads every value typed for the selected part.
+    pub fn resolved_values(
+        &self,
+    ) -> Result<Vec<PartParameterAssignment>, PartInsertionEligibility> {
+        let Some(part) = self.selected_part() else {
+            return Err(PartInsertionEligibility::NoPart);
+        };
+        let entries = self.entries.get(&part.key);
+        part.parameters
+            .iter()
+            .map(|parameter| {
+                let entry = entries.and_then(|entries| entries.get(&parameter.key));
+                let text = entry.map_or("", |entry| entry.text.trim());
+                let source = entry.map_or(ParameterValueSource::Entered, |entry| entry.source);
+                let value = read_value(parameter, text, self.length_unit)?;
+                Ok(PartParameterAssignment {
+                    key: parameter.key.clone(),
+                    display_name: parameter.label.clone(),
+                    value,
+                    source,
+                })
+            })
+            .collect()
     }
 
+    /// Whether the selected part can be staged with what is typed.
     #[must_use]
     pub fn eligibility(&self) -> PartInsertionEligibility {
-        let trimmed = self.length_text.trim();
-        if trimmed.is_empty() {
-            return PartInsertionEligibility::MissingLength;
-        }
-        // Read in the document unit, or the unit the text carries. The
-        // reader refuses `NaN` and `inf` as not numbers; they are numbers of
-        // a kind, and the diagnostic says so.
-        let Ok(length_mm) = self.length_unit.parse(trimmed) else {
-            return if trimmed.parse::<f64>().is_ok_and(|value| !value.is_finite()) {
-                PartInsertionEligibility::NonFiniteLength
-            } else {
-                PartInsertionEligibility::InvalidLength
-            };
-        };
-        if length_mm < MIN_LENGTH_MM {
-            return PartInsertionEligibility::LengthTooSmall;
-        }
-        if length_mm > MAX_LENGTH_MM {
-            return PartInsertionEligibility::LengthTooLarge;
-        }
-        PartInsertionEligibility::Ready {
-            length_mm,
-            source: self.length_source,
+        match self.resolved_values() {
+            Ok(_) => PartInsertionEligibility::Ready,
+            Err(reason) => reason,
         }
     }
 
@@ -392,30 +670,27 @@ impl PartLibraryState {
         std::mem::take(&mut self.committed)
     }
 
-    /// Stages the currently resolved card without committing workspace state.
+    /// Stages the selected part at the typed values without committing
+    /// workspace state.
     pub fn stage_selected(&mut self) -> Result<u64, PartInsertionEligibility> {
         if self.staged.is_some() {
             return Err(PartInsertionEligibility::AlreadyStaged);
         }
-        let eligibility = self.eligibility();
-        let PartInsertionEligibility::Ready { length_mm, source } = eligibility else {
-            return Err(eligibility);
-        };
+        let parameters = self.resolved_values()?;
+        let part = self
+            .selected_part()
+            .ok_or(PartInsertionEligibility::NoPart)?;
         let staging_id = self.next_staging_id;
-        self.next_staging_id = self.next_staging_id.saturating_add(1);
-        self.staged = Some(PartInsertionIntent {
+        let intent = PartInsertionIntent {
             staging_id,
-            definition_key: ALUMINIUM_EXTRUSION_20X20_KEY.to_owned(),
-            definition_revision: self.definition_revision,
-            definition_digest: self.definition_digest.clone(),
-            display_name: ALUMINIUM_EXTRUSION_20X20_NAME.to_owned(),
-            parameters: vec![PartParameterAssignment {
-                key: LENGTH_PARAMETER_KEY.to_owned(),
-                display_name: "Length".to_owned(),
-                value_mm: length_mm,
-                source,
-            }],
-        });
+            definition_key: part.key.clone(),
+            definition_revision: part.revision,
+            definition_digest: part.digest.clone(),
+            display_name: part.name.clone(),
+            parameters,
+        };
+        self.next_staging_id = self.next_staging_id.saturating_add(1);
+        self.staged = Some(intent);
         self.status = Some(
             "Placement staged. Use the green tick or Enter to commit; use the red X or Escape to cancel."
                 .to_owned(),
@@ -431,17 +706,47 @@ impl PartLibraryState {
         else {
             return false;
         };
-        let length = staged.length_mm().unwrap_or_default();
+        let values = self.describe_values(&staged);
         let name = staged.display_name.clone();
         if self.committed.len() == MAX_COMMITTED_INTENTS {
             self.committed.remove(0);
         }
         self.committed.push(staged);
-        self.status = Some(format!(
-            "{name} · {} accepted for workspace insertion.",
-            self.length_unit.format(length)
-        ));
+        self.status = Some(if values.is_empty() {
+            format!("{name} accepted for workspace insertion.")
+        } else {
+            format!("{name} · {values} accepted for workspace insertion.")
+        });
         true
+    }
+
+    fn describe_values(&self, intent: &PartInsertionIntent) -> String {
+        let part = self
+            .parts
+            .iter()
+            .find(|part| part.key == intent.definition_key);
+        intent
+            .parameters
+            .iter()
+            .map(|assignment| {
+                let quantity = part
+                    .and_then(|part| {
+                        part.parameters
+                            .iter()
+                            .find(|parameter| parameter.key == assignment.key)
+                    })
+                    .map_or(ParameterQuantity::Number, |parameter| parameter.quantity);
+                // A part with one parameter says only its value, as the
+                // built-in extrusion always has.
+                let value = format_value_with_unit(quantity, assignment.value, self.length_unit);
+                if intent.parameters.len() == 1 {
+                    value
+                } else {
+                    format!("{} {value}", assignment.display_name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Cancels only the matching staged insertion and keeps entered values.
@@ -458,6 +763,11 @@ impl PartLibraryState {
             "Insertion cancelled. Parameter values were retained for another placement.".to_owned(),
         );
         true
+    }
+
+    /// Shows a line under the library's card: what was saved, or why not.
+    pub(crate) fn set_status(&mut self, status: impl Into<String>) {
+        self.status = Some(status.into());
     }
 
     /// Draws the independent library window and returns a newly staged ID.
@@ -511,6 +821,19 @@ impl PartLibraryState {
                     .small()
                     .color(library_muted()),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save = ui
+                    .add_enabled(
+                        !another_operation_pending,
+                        egui::Button::new(RichText::new("Save current part…").small()),
+                    )
+                    .on_hover_text(
+                        "Save the part you are working on into the library, with its variables as the values it takes.",
+                    );
+                if save.clicked() {
+                    self.save_requested = true;
+                }
+            });
         });
         ui.add_space(5.0);
         let search = ui.add(
@@ -545,18 +868,15 @@ impl PartLibraryState {
     }
 
     fn part_list(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("STANDARD COMPONENTS")
-                .small()
-                .color(library_muted())
-                .strong(),
-        );
-        ui.add_space(5.0);
-        let query = self.search.trim().to_ascii_lowercase();
-        let searchable =
-            format!("{ALUMINIUM_EXTRUSION_20X20_NAME} aluminium profile extrusion parametric")
-                .to_ascii_lowercase();
-        if !query.is_empty() && !searchable.contains(&query) {
+        let query = self.search.trim().to_lowercase();
+        let visible = self
+            .parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part.matches(&query))
+            .map(|(index, part)| (index, part.is_builtin()))
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
             ui.label(
                 RichText::new("No local parts match this search.")
                     .color(library_muted())
@@ -564,39 +884,86 @@ impl PartLibraryState {
             );
             return;
         }
+        egui::ScrollArea::vertical()
+            .id_salt("part_library_list")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (heading, builtin) in [("STANDARD COMPONENTS", true), ("MY PARTS", false)] {
+                    let group = visible
+                        .iter()
+                        .filter(|(_, is_builtin)| *is_builtin == builtin)
+                        .map(|(index, _)| *index)
+                        .collect::<Vec<_>>();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    ui.label(
+                        RichText::new(heading)
+                            .small()
+                            .color(library_muted())
+                            .strong(),
+                    );
+                    ui.add_space(5.0);
+                    for index in group {
+                        self.part_row(ui, index);
+                        ui.add_space(6.0);
+                    }
+                    ui.add_space(4.0);
+                }
+            });
+    }
 
-        let version = format!("v{}", self.revision_label());
-        let size = self.rough_dimensions_text();
-        let sample = self.preview_facts().and_then(|facts| facts.sample.clone());
+    fn part_row(&mut self, ui: &mut egui::Ui, index: usize) {
+        let selected = index == self.selected;
+        let part = self.parts[index].clone();
+        let version = format!("v{}", part.revision_label());
+        let size = self
+            .preview_of(&part)
+            .map(|preview| rough_dimensions(&preview.facts, self.length_unit));
+        let sample = self
+            .preview_of(&part)
+            .and_then(|preview| preview.facts.sample.clone());
+        let stroke = if selected {
+            Stroke::new(1.0, library_accent().gamma_multiply(0.65))
+        } else {
+            Stroke::new(1.0, library_border())
+        };
         egui::Frame::new()
             .fill(library_card())
-            .stroke(Stroke::new(1.0, library_accent().gamma_multiply(0.65)))
+            .stroke(stroke)
             .corner_radius(4)
             .inner_margin(egui::Margin::same(7))
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
-                    self.thumbnail(ui);
+                    self.thumbnail(ui, &part);
                     ui.vertical(|ui| {
                         let response = ui.add(
                             egui::Button::new(
-                                RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
-                                    .color(library_text())
-                                    .strong(),
+                                RichText::new(&part.name).color(library_text()).strong(),
                             )
                             .wrap_mode(egui::TextWrapMode::Wrap)
                             .frame(false)
-                            .selected(true),
+                            .selected(selected),
                         );
+                        let name = part.name.clone();
                         response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                true,
-                                ALUMINIUM_EXTRUSION_20X20_NAME,
-                            )
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
                         });
+                        if response.clicked() {
+                            self.selected = index;
+                            self.status = None;
+                        }
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(&version).small().color(library_text()));
-                            ui.label(RichText::new("PARAMETRIC").small().color(library_accent()));
+                            ui.label(
+                                RichText::new(if part.parametric {
+                                    "PARAMETRIC"
+                                } else {
+                                    "FIXED"
+                                })
+                                .small()
+                                .color(library_accent()),
+                            );
                         });
                         if let Some(size) = &size {
                             let label =
@@ -607,11 +974,9 @@ impl PartLibraryState {
                                 ));
                             }
                         }
-                        ui.label(
-                            RichText::new("Aluminium profiles")
-                                .small()
-                                .color(library_muted()),
-                        );
+                        if let Some(category) = &part.category {
+                            ui.label(RichText::new(category).small().color(library_muted()));
+                        }
                     });
                 });
             });
@@ -619,21 +984,21 @@ impl PartLibraryState {
 
     /// The part's saved picture, or a quiet placeholder of the same size so
     /// the row does not jump when a picture is missing.
-    fn thumbnail(&mut self, ui: &mut egui::Ui) {
+    fn thumbnail(&mut self, ui: &mut egui::Ui, part: &LibraryPart) {
         let side = egui::vec2(THUMBNAIL_SIDE, THUMBNAIL_SIDE);
-        let texture = self.preview.as_mut().and_then(|preview| {
+        let texture = self.previews.get_mut(&part.digest).and_then(|preview| {
             if preview.texture.is_none()
                 && let Some(image) = preview.image.clone()
             {
                 preview.texture = Some(ui.ctx().load_texture(
-                    "part_library_preview",
+                    format!("part_library_preview_{}", part.digest),
                     image,
                     egui::TextureOptions::LINEAR,
                 ));
             }
             preview.texture.clone()
         });
-        let label = format!("Picture of {ALUMINIUM_EXTRUSION_20X20_NAME}");
+        let label = format!("Picture of {}", part.name);
         let (rect, response) = ui.allocate_exact_size(side, egui::Sense::hover());
         ui.painter().rect(
             rect,
@@ -656,20 +1021,33 @@ impl PartLibraryState {
     }
 
     fn part_details(&mut self, ui: &mut egui::Ui, another_operation_pending: bool) -> bool {
+        let Some(part) = self.selected_part().cloned() else {
+            ui.label(
+                RichText::new("The library is empty.")
+                    .color(library_muted())
+                    .italics(),
+            );
+            return false;
+        };
         ui.label(
-            RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
+            RichText::new(&part.name)
                 .font(FontId::proportional(17.0))
                 .color(library_text())
                 .strong(),
         );
-        let revision = self.revision_label();
-        let package_identity = if self.definition_digest.len() == 64 {
+        let revision = part.revision_label();
+        let kind = if part.parametric {
+            "Parametric part"
+        } else {
+            "Fixed part"
+        };
+        let package_identity = if part.digest.len() == 64 {
             format!(
-                "Parametric part · revision {revision} · verified {}…",
-                &self.definition_digest[..12]
+                "{kind} · revision {revision} · verified {}…",
+                &part.digest[..12]
             )
         } else {
-            format!("Parametric part · revision {revision} · package unavailable")
+            format!("{kind} · revision {revision} · package unavailable")
         };
         ui.label(
             RichText::new(package_identity)
@@ -683,73 +1061,123 @@ impl PartLibraryState {
                     .color(library_text()),
             );
         }
-        ui.add_space(5.0);
-        ui.label(
-            RichText::new(
-                "Exact 20 mm × 20 mm profile with a user-resolved extrusion length. Equal variants may share evaluated geometry while every insertion remains independent.",
-            )
-            .color(library_muted()),
-        );
+        if let Some(description) = &part.description {
+            ui.add_space(5.0);
+            ui.label(RichText::new(description).color(library_muted()));
+        }
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label(
-            RichText::new("PARAMETERS")
-                .small()
-                .color(library_muted())
-                .strong(),
-        );
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Length").color(library_text()).strong());
-            if self.length_default_mm.is_some()
-                && self.length_source == ParameterValueSource::Default
-            {
-                ui.label(RichText::new("DEFAULT").small().color(library_good()));
-            } else {
-                ui.label(RichText::new("REQUIRED").small().color(library_accent()));
-            }
-        });
+        if !part.parameters.is_empty() {
+            ui.label(
+                RichText::new("PARAMETERS")
+                    .small()
+                    .color(library_muted())
+                    .strong(),
+            );
+            ui.add_space(5.0);
+        }
         let unit = self.length_unit;
-        let editor = ui.add(
-            egui::TextEdit::singleline(&mut self.length_text)
-                .id(egui::Id::new("part_library_length_mm"))
-                .desired_width(190.0),
-        );
-        editor.ctx.accesskit_node_builder(editor.id, |node| {
-            node.set_label(format!("Length ({})", unit.suffix()));
-            node.set_description(format!(
-                "Required aluminium extrusion length in {}, or with its own unit suffix. A valid value enables Add to current workspace.",
-                unit.name()
-            ));
-        });
-        ui.label(RichText::new(unit.name()).small().color(library_muted()));
-        if editor.changed() {
-            self.length_source = ParameterValueSource::Entered;
-            self.status = None;
+        for parameter in &part.parameters {
+            let Some(entry) = self
+                .entries
+                .get_mut(&part.key)
+                .and_then(|entries| entries.get_mut(&parameter.key))
+            else {
+                continue;
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&parameter.label)
+                        .color(library_text())
+                        .strong(),
+                );
+                if parameter.default.is_some() && entry.source == ParameterValueSource::Default {
+                    ui.label(RichText::new("DEFAULT").small().color(library_good()));
+                } else if parameter.default.is_none() {
+                    ui.label(RichText::new("REQUIRED").small().color(library_accent()));
+                }
+            });
+            let editor = ui.add(
+                egui::TextEdit::singleline(&mut entry.text)
+                    .id(egui::Id::new((
+                        "part_library_parameter",
+                        &part.key,
+                        &parameter.key,
+                    )))
+                    .desired_width(190.0),
+            );
+            let (suffix, unit_name) = match parameter.quantity {
+                ParameterQuantity::Length => (unit.suffix().to_owned(), unit.name().to_owned()),
+                ParameterQuantity::Angle => ("deg".to_owned(), "degrees".to_owned()),
+                ParameterQuantity::Number => (String::new(), String::new()),
+            };
+            let field_label = if suffix.is_empty() {
+                parameter.label.clone()
+            } else {
+                format!("{} ({suffix})", parameter.label)
+            };
+            let description = format!(
+                "{} for this insertion{}. A valid value enables Add to current workspace.",
+                parameter.label,
+                if unit_name.is_empty() {
+                    String::new()
+                } else {
+                    format!(", in {unit_name} or with its own unit suffix")
+                }
+            );
+            editor.ctx.accesskit_node_builder(editor.id, |node| {
+                node.set_label(field_label.clone());
+                node.set_description(description.clone());
+            });
+            if !unit_name.is_empty() {
+                ui.label(RichText::new(&unit_name).small().color(library_muted()));
+            }
+            if editor.changed() {
+                entry.source = ParameterValueSource::Entered;
+                self.status = None;
+            }
+            ui.add_space(4.0);
         }
 
         let eligibility = self.eligibility();
         if let Some(reason) = eligibility.visible_reason() {
             ui.label(RichText::new(reason).small().color(library_bad()));
-        } else if let PartInsertionEligibility::Ready { length_mm, source } = eligibility {
-            let source_label = match source {
-                ParameterValueSource::Default => "definition default",
-                ParameterValueSource::Entered => "entered value",
-            };
-            ui.label(
-                RichText::new(format!(
-                    "Resolved · {} · {source_label}",
-                    unit.format(length_mm)
-                ))
-                .small()
-                .color(library_good()),
-            );
+        } else if let Ok(values) = self.resolved_values() {
+            let resolved = values
+                .iter()
+                .map(|assignment| {
+                    let quantity = part
+                        .parameters
+                        .iter()
+                        .find(|parameter| parameter.key == assignment.key)
+                        .map_or(ParameterQuantity::Number, |parameter| parameter.quantity);
+                    let source = match assignment.source {
+                        ParameterValueSource::Default => "definition default",
+                        ParameterValueSource::Entered => "entered value",
+                    };
+                    format!(
+                        "{} · {source}",
+                        format_value_with_unit(quantity, assignment.value, unit)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            if !resolved.is_empty() {
+                ui.label(
+                    RichText::new(format!("Resolved · {resolved}"))
+                        .small()
+                        .color(library_good()),
+                );
+            }
         }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             let blocked_reason = if another_operation_pending || self.staged.is_some() {
-                Some("Confirm or cancel the current staged operation before adding another part.")
+                Some(
+                    "Confirm or cancel the current staged operation before adding another part."
+                        .to_owned(),
+                )
             } else {
                 eligibility.visible_reason()
             };
@@ -781,9 +1209,103 @@ impl PartLibraryState {
     }
 }
 
+/// A canonical value as its field shows it, without a unit.
+fn format_value(quantity: ParameterQuantity, value: f64, unit: LengthUnit) -> String {
+    match quantity {
+        ParameterQuantity::Length => unit.format_value(value),
+        ParameterQuantity::Angle => trim_number(value.to_degrees()),
+        ParameterQuantity::Number => trim_number(value),
+    }
+}
+
+/// A canonical value with its unit, as a person reads it.
+fn format_value_with_unit(quantity: ParameterQuantity, value: f64, unit: LengthUnit) -> String {
+    match quantity {
+        ParameterQuantity::Length => unit.format(value),
+        ParameterQuantity::Angle => format!("{}°", trim_number(value.to_degrees())),
+        ParameterQuantity::Number => trim_number(value),
+    }
+}
+
+fn trim_number(value: f64) -> String {
+    let text = format!("{value:.4}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Reads one parameter's typed text into its canonical value, or says why it
+/// cannot be read. An empty field takes the default when there is one.
+fn read_value(
+    parameter: &LibraryParameter,
+    text: &str,
+    unit: LengthUnit,
+) -> Result<f64, PartInsertionEligibility> {
+    let name = || parameter.label.clone();
+    if text.is_empty() {
+        return parameter
+            .default
+            .ok_or_else(|| PartInsertionEligibility::Missing { parameter: name() });
+    }
+    // The reader refuses `NaN` and `inf` as not numbers; they are numbers
+    // of a kind, and the diagnostic says so.
+    let non_finite = text.parse::<f64>().is_ok_and(|value| !value.is_finite());
+    let parsed = match parameter.quantity {
+        ParameterQuantity::Length => unit.parse(text).ok(),
+        ParameterQuantity::Angle => evaluate_entry(text, FieldUnit::degrees(), &|_| None).ok(),
+        ParameterQuantity::Number => evaluate_entry(text, FieldUnit::SCALAR, &|_| None).ok(),
+    };
+    let Some(value) = parsed.filter(|value| value.is_finite()) else {
+        return Err(if non_finite {
+            PartInsertionEligibility::NonFinite { parameter: name() }
+        } else {
+            PartInsertionEligibility::Invalid {
+                parameter: name(),
+                quantity: parameter.quantity,
+            }
+        });
+    };
+    if let Some(minimum) = parameter.minimum
+        && value < minimum
+    {
+        return Err(PartInsertionEligibility::TooSmall {
+            parameter: name(),
+            minimum: format_bound(parameter.quantity, minimum),
+        });
+    }
+    if let Some(maximum) = parameter.maximum
+        && value > maximum
+    {
+        return Err(PartInsertionEligibility::TooLarge {
+            parameter: name(),
+            maximum: format_bound(parameter.quantity, maximum),
+        });
+    }
+    Ok(value)
+}
+
+/// A limit in the part's own terms: lengths in millimetres, as the
+/// definition states them.
+fn format_bound(quantity: ParameterQuantity, value: f64) -> String {
+    match quantity {
+        ParameterQuantity::Length => format!("{} mm", trim_number(value)),
+        ParameterQuantity::Angle => format!("{}°", trim_number(value.to_degrees())),
+        ParameterQuantity::Number => trim_number(value),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn missing_length() -> PartInsertionEligibility {
+        PartInsertionEligibility::Missing {
+            parameter: "Length".into(),
+        }
+    }
 
     #[test]
     fn rough_dimensions_name_what_a_parameter_sets_and_follow_the_unit() {
@@ -811,34 +1333,32 @@ mod tests {
     #[test]
     fn required_length_blocks_staging_with_precise_diagnostics() {
         let mut library = PartLibraryState::default();
+        assert_eq!(library.eligibility(), missing_length());
+        assert_eq!(library.stage_selected(), Err(missing_length()));
         assert_eq!(
-            library.eligibility(),
-            PartInsertionEligibility::MissingLength
-        );
-        assert_eq!(
-            library.stage_selected(),
-            Err(PartInsertionEligibility::MissingLength)
+            library.eligibility().visible_reason().as_deref(),
+            Some("Length is required. Enter a value before adding this part.")
         );
 
         library.set_length_text("not-a-number");
-        assert_eq!(
+        assert!(matches!(
             library.eligibility(),
-            PartInsertionEligibility::InvalidLength
-        );
+            PartInsertionEligibility::Invalid { .. }
+        ));
         library.set_length_text("NaN");
-        assert_eq!(
+        assert!(matches!(
             library.eligibility(),
-            PartInsertionEligibility::NonFiniteLength
-        );
+            PartInsertionEligibility::NonFinite { .. }
+        ));
         library.set_length_text("0");
         assert_eq!(
-            library.eligibility(),
-            PartInsertionEligibility::LengthTooSmall
+            library.eligibility().visible_reason().as_deref(),
+            Some("Length must be at least 0.001 mm.")
         );
         library.set_length_text("100001");
         assert_eq!(
-            library.eligibility(),
-            PartInsertionEligibility::LengthTooLarge
+            library.eligibility().visible_reason().as_deref(),
+            Some("Length must not exceed 100000 mm.")
         );
         assert!(library.staged_intent().is_none());
     }
@@ -899,5 +1419,66 @@ mod tests {
         assert_eq!(library.length_text(), "310");
         assert!(library.staged_intent().is_none());
         assert!(library.committed_intents().is_empty());
+    }
+
+    /// A saved part with a length and an angle is offered beside the
+    /// built-in one; each part keeps its own values, and its defaults fill
+    /// its fields until something is typed.
+    #[test]
+    fn every_part_keeps_its_own_values_and_defaults() {
+        let mut library = PartLibraryState::default();
+        let bracket = LibraryPart {
+            key: "user.bracket".into(),
+            revision: [2, 0, 0],
+            digest: "b".repeat(64),
+            name: "Bracket".into(),
+            description: None,
+            category: Some("My parts".into()),
+            parametric: true,
+            parameters: vec![
+                LibraryParameter {
+                    key: "length".into(),
+                    label: "Length".into(),
+                    quantity: ParameterQuantity::Length,
+                    default: Some(40.0),
+                    minimum: None,
+                    maximum: None,
+                },
+                LibraryParameter {
+                    key: "tilt".into(),
+                    label: "Tilt".into(),
+                    quantity: ParameterQuantity::Angle,
+                    default: Some(30.0_f64.to_radians()),
+                    minimum: None,
+                    maximum: None,
+                },
+            ],
+            keywords: Vec::new(),
+        };
+        let mut parts = library.parts().to_vec();
+        parts.push(bracket);
+        library.set_parts(parts);
+        library.set_length_text("310");
+
+        assert!(library.select_part("user.bracket"));
+        assert_eq!(library.length_text(), "40");
+        assert_eq!(library.parameter_text("tilt"), Some("30"));
+        library.set_parameter_text("tilt", "45");
+        let staged = library.stage_selected().expect("the bracket stages");
+        let intent = library.staged_intent().unwrap().clone();
+        assert!(library.commit_staged(staged));
+        assert_eq!(intent.definition_key, "user.bracket");
+        assert_eq!(intent.definition_revision, [2, 0, 0]);
+        assert_eq!(intent.value("length"), Some(40.0));
+        assert!((intent.value("tilt").unwrap() - 45.0_f64.to_radians()).abs() < 1.0e-12);
+        assert_eq!(intent.parameters[0].source, ParameterValueSource::Default);
+        assert_eq!(intent.parameters[1].source, ParameterValueSource::Entered);
+
+        assert!(library.select_part(ALUMINIUM_EXTRUSION_20X20_KEY));
+        assert_eq!(library.length_text(), "310", "the built-in kept its own");
+        library.set_parameter_text("length", "1in");
+        let staged = library.stage_selected().unwrap();
+        assert_eq!(library.staged_intent().unwrap().length_mm(), Some(25.4));
+        assert!(library.commit_staged(staged));
     }
 }

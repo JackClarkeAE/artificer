@@ -89,7 +89,9 @@ fn unresolved_parameter_blocks_add_without_mutating_the_document() {
     assert!(harness.state().part_library_open());
     assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::MissingLength
+        PartInsertionEligibility::Missing {
+            parameter: "Length".into()
+        }
     );
     assert!(
         harness
@@ -123,13 +125,11 @@ fn add_stages_then_tick_commits_separate_parameterized_intents() {
 
     click_button(&mut harness, "Library");
     enter_length(&mut harness, "455");
-    assert!(matches!(
+    assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::Ready {
-            length_mm: 455.0,
-            ..
-        }
-    ));
+        PartInsertionEligibility::Ready
+    );
+    assert_eq!(harness.state().part_library_length_mm(), Some(455.0));
 
     click_button(&mut harness, "Add to current workspace");
     assert_eq!(
@@ -221,13 +221,11 @@ fn red_x_cancels_staged_insertion_and_keeps_parameter_value_for_retry() {
     assert_eq!(harness.state().document_feature_count(), features);
     assert_eq!(harness.state().component_instance_count(), 0);
     assert_eq!(harness.state().body_count(), bodies);
-    assert!(matches!(
+    assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::Ready {
-            length_mm: 310.0,
-            ..
-        }
-    ));
+        PartInsertionEligibility::Ready
+    );
+    assert_eq!(harness.state().part_library_length_mm(), Some(310.0));
 
     click_button(&mut harness, "Add to current workspace");
     press_key(&mut harness, egui::Key::Enter);

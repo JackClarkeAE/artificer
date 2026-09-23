@@ -608,7 +608,7 @@ fn intent_length(intent: &PartInsertionIntent) -> Result<f64, LibraryCatalogErro
                 assignment.key.clone(),
             ));
         }
-        if length.replace(assignment.value_mm).is_some() {
+        if length.replace(assignment.value).is_some() {
             return Err(LibraryCatalogError::DuplicateParameter(
                 assignment.key.clone(),
             ));
@@ -697,7 +697,7 @@ mod tests {
             parameters: vec![PartParameterAssignment {
                 key: LENGTH_PARAMETER_KEY.into(),
                 display_name: "Length".into(),
-                value_mm: length_mm,
+                value: length_mm,
                 source: ParameterValueSource::Entered,
             }],
         }

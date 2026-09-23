@@ -63,6 +63,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0050](0050-b-spline-curves-and-surfaces-as-carriers.md) | B-spline curves and surfaces as carriers | Accepted and implemented | 0026, 0047, 0049 |
 | [0051](0051-a-loft-is-a-feature.md) | A loft is a feature | Implemented (workbench) | 0036, 0041, 0048, 0049 |
 | [0052](0052-an-extrusion-distance-can-follow-a-variable.md) | An extrusion distance can follow a variable | Implemented | 0014, 0017, 0021 |
+| [0053](0053-a-part-can-be-saved-into-the-library.md) | A part can be saved into the library, and placed at any values | Implemented | 0017, 0018, 0052 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

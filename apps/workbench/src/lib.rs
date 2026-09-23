@@ -26,6 +26,7 @@ mod parametric;
 pub mod part_library;
 pub mod part_preview;
 mod ribbon;
+pub mod saved_parts;
 pub mod shell;
 pub mod spacemouse;
 pub mod update;
@@ -983,6 +984,29 @@ pub enum ExtrusionMode {
     NewBody,
     Add,
     Cut,
+}
+
+/// What the Save to Part Library window is filling in.
+#[derive(Clone, Debug, Default)]
+struct SavePartDialog {
+    name: String,
+    description: String,
+    /// Which variables become the part's parameters.
+    offered: BTreeMap<ParameterId, bool>,
+    error: Option<String>,
+}
+
+/// A library insertion evaluated and ready to enter the document.
+struct PreparedInsertion {
+    definition: ComponentDefinitionRef,
+    evaluated: artificer_model::EvaluatedParameters,
+    action: ReplayAction,
+    outcome: artificer_kernel::ExecutionOutcome,
+}
+
+enum PreparedInsertionError {
+    Rejected(String),
+    Kernel(KernelError),
 }
 
 /// An extrusion distance typed as an expression over document variables.
@@ -2664,6 +2688,8 @@ pub struct KernelLabApp {
     /// link holds only while the distance is still that value: dragging or
     /// typing a number over it lets it go.
     extrusion_distance_link: Option<DistanceLink>,
+    /// The Save to Part Library window, while it is open.
+    save_part_dialog: Option<SavePartDialog>,
     /// The Theme tab's colour editor window.
     theme_editor_open: bool,
     /// Where the theme choice and edited palettes are written; `None` in
@@ -2951,6 +2977,7 @@ impl Default for KernelLabApp {
             variable_name_drafts: BTreeMap::new(),
             extrusion_expression_draft: String::new(),
             extrusion_distance_link: None,
+            save_part_dialog: None,
             theme_editor_open: false,
             theme_preferences_path: None,
             user_preferences_path: None,
@@ -3214,13 +3241,297 @@ impl KernelLabApp {
             digest.to_hex(),
             crate::library_catalog::builtin_part_revision_parts(),
         );
-        self.part_library.set_preview(preview.as_ref());
+        self.part_library
+            .set_preview(&digest.to_hex(), preview.as_ref());
         self.catalog_store = Some(store);
+        self.refresh_library_parts();
         self.document_status = Some(format!(
             "Local Part Library ready · {} verified definition(s)",
             rebuilt.accepted()
         ));
         Ok(())
+    }
+
+    /// Opens the Save to Part Library window for the part being worked on,
+    /// named after the document, with every variable that can be a
+    /// parameter offered.
+    pub fn open_save_part_dialog(&mut self) {
+        let offered = saved_parts::exposable_variables(&self.document)
+            .into_iter()
+            .map(|variable| (variable.id, true))
+            .collect();
+        self.save_part_dialog = Some(SavePartDialog {
+            name: self.document_title.clone(),
+            description: String::new(),
+            offered,
+            error: None,
+        });
+    }
+
+    /// Whether the Save to Part Library window is open.
+    #[must_use]
+    pub const fn save_part_dialog_open(&self) -> bool {
+        self.save_part_dialog.is_some()
+    }
+
+    /// The body that would be saved as the part, or why there is none.
+    fn body_to_save(&self) -> Result<BodyId, saved_parts::SavedPartError> {
+        let visible = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
+        saved_parts::part_body(&visible, self.active_body_id())
+    }
+
+    /// Saves the part being worked on into the Part Library under `name`,
+    /// with `parameters` as the values it takes when placed. Saving under a
+    /// name the library already has adds a new version of that part. Returns
+    /// what was saved, as the library shows it.
+    pub fn save_current_part_to_library(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        parameters: Vec<ParameterId>,
+    ) -> Result<String, String> {
+        let store = self
+            .catalog_store
+            .as_ref()
+            .ok_or("the Part Library folder is not available on this system")?;
+        let body = self.body_to_save().map_err(|error| error.to_string())?;
+        let key = saved_parts::definition_key_for(name).map_err(|error| error.to_string())?;
+        let revision =
+            saved_parts::next_revision(store, &key).map_err(|error| error.to_string())?;
+        let request = saved_parts::SaveRequest {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            body,
+            parameters,
+        };
+        let package = saved_parts::package_part(&self.document, &request, key.clone(), revision)
+            .map_err(|error| error.to_string())?;
+        crate::part_preview::publish_with_preview(store, &package)
+            .map_err(|error| plain_catalog_error(&error))?;
+        self.refresh_library_parts();
+        self.part_library.select_part(key.as_str());
+        let saved = format!("{} v{revision}", name.trim());
+        self.part_library
+            .set_status(format!("Saved {saved} into the Part Library."));
+        self.document_status = Some(format!("Saved {saved} into the Part Library"));
+        Ok(saved)
+    }
+
+    fn save_part_window(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.save_part_dialog.take() else {
+            return;
+        };
+        let variables = saved_parts::exposable_variables(&self.document);
+        let body = self.body_to_save();
+        let body_label = body
+            .as_ref()
+            .ok()
+            .and_then(|body| self.document.body(*body).map(|record| record.label.clone()));
+        let unit = self.length_unit();
+        let mut save = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new("SAVE TO PART LIBRARY")
+            .id(egui::Id::new("save_part_window"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(420.0)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(context, |ui| {
+                ui.label(RichText::new("Name").small().color(theme::muted()));
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY),
+                );
+                name.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Part name")
+                });
+                ui.label(RichText::new("Description").small().color(theme::muted()));
+                let description = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.description)
+                        .hint_text("optional")
+                        .desired_width(f32::INFINITY),
+                );
+                description.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::TextEdit,
+                        true,
+                        "Part description",
+                    )
+                });
+                ui.add_space(6.0);
+                match (&body, &body_label) {
+                    (Ok(_), Some(label)) => {
+                        ui.label(
+                            RichText::new(format!("The part is {label}"))
+                                .small()
+                                .color(theme::text()),
+                        );
+                    }
+                    (Err(error), _) => {
+                        ui.label(RichText::new(error.to_string()).small().color(theme::bad()));
+                    }
+                    (Ok(_), None) => {}
+                }
+                ui.add_space(6.0);
+                if variables.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No variables to offer: the part is saved at its one size. Give it variables in the Parametric tab to make it take values when placed.",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Values it takes when placed")
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    for variable in &variables {
+                        let value = match variable.quantity {
+                            QuantityKind::Length => unit.format(variable.value),
+                            QuantityKind::Angle => {
+                                format!("{:.3}°", variable.value.to_degrees())
+                            }
+                            QuantityKind::Scalar => format!("{}", variable.value),
+                        };
+                        let offered = dialog.offered.entry(variable.id).or_insert(true);
+                        let checkbox =
+                            ui.checkbox(offered, format!("{} · now {value}", variable.key));
+                        let key = variable.key.clone();
+                        checkbox.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Checkbox,
+                                true,
+                                format!("Offer {key} when placing"),
+                            )
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "An extrusion whose distance was typed as a variable follows the value given when the part is placed; the variable's value now is its default.",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    );
+                }
+                if let Some(error) = &dialog.error {
+                    ui.label(RichText::new(error).small().color(theme::bad()));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_save = body.is_ok() && !dialog.name.trim().is_empty();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save to library"))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            let parameters = variables
+                .iter()
+                .filter(|variable| dialog.offered.get(&variable.id).copied().unwrap_or(true))
+                .map(|variable| variable.id)
+                .collect();
+            let description = dialog.description.trim().to_owned();
+            match self.save_current_part_to_library(
+                &dialog.name,
+                (!description.is_empty()).then_some(description.as_str()),
+                parameters,
+            ) {
+                Ok(_) => {
+                    *self.part_library.open_mut() = true;
+                    return;
+                }
+                Err(error) => dialog.error = Some(error),
+            }
+        }
+        if open && !cancel {
+            self.save_part_dialog = Some(dialog);
+        }
+    }
+
+    /// Offers every part the library holds: the built-in extrusion as this
+    /// build publishes it, and the newest version of each saved part this
+    /// build can read, each with its kept picture. A saved part without a
+    /// picture has one drawn and kept now.
+    fn refresh_library_parts(&mut self) {
+        let Some(store) = self.catalog_store.as_ref() else {
+            return;
+        };
+        let Ok(index) = store.index_snapshot() else {
+            return;
+        };
+        let mut newest = BTreeMap::<String, artificer_catalog::CatalogEntry>::new();
+        for entry in index.entries() {
+            if entry.definition_id().as_str().starts_with("builtin.") {
+                continue;
+            }
+            let key = entry.definition_id().as_str().to_owned();
+            let replace = newest
+                .get(&key)
+                .is_none_or(|kept| entry.revision() > kept.revision());
+            if replace {
+                newest.insert(key, entry.clone());
+            }
+        }
+        let mut parts = self
+            .part_library
+            .parts()
+            .iter()
+            .filter(|part| part.is_builtin())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut previews = Vec::new();
+        for entry in newest.values() {
+            let Ok(package) = store.load(entry.digest()) else {
+                continue;
+            };
+            if !saved_parts::is_saved_part(&package)
+                || package.definition().document().schema_version()
+                    > artificer_model::CURRENT_DOCUMENT_VERSION
+            {
+                continue;
+            }
+            let preview = match store.preview(entry.digest()) {
+                Ok(Some(kept)) => Some(kept),
+                _ => crate::part_preview::draw_package_preview(&package)
+                    .ok()
+                    .inspect(|drawn| {
+                        let _ = store.save_preview(entry.digest(), drawn);
+                    }),
+            };
+            previews.push((entry.digest().to_hex(), preview));
+            parts.push(saved_parts::library_part(&package));
+        }
+        parts.sort_by(|left, right| {
+            right
+                .is_builtin()
+                .cmp(&left.is_builtin())
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        self.part_library.set_parts(parts);
+        for (digest, preview) in previews {
+            self.part_library.set_preview(&digest, preview.as_ref());
+        }
     }
 
     #[must_use]
@@ -3557,10 +3868,12 @@ impl KernelLabApp {
     /// millimetres, or `None` while it holds nothing usable. For tests.
     #[must_use]
     pub fn part_library_length_mm(&self) -> Option<f64> {
-        match self.part_library.eligibility() {
-            PartInsertionEligibility::Ready { length_mm, .. } => Some(length_mm),
-            _ => None,
-        }
+        self.part_library
+            .resolved_values()
+            .ok()?
+            .into_iter()
+            .find(|assignment| assignment.key == crate::part_library::LENGTH_PARAMETER_KEY)
+            .map(|assignment| assignment.value)
     }
 
     /// Portable Artificer workspace envelope. Unlike the raw model archive used
@@ -8349,6 +8662,101 @@ impl KernelLabApp {
     /// transactional kernel/document boundary as every other modeling action.
     /// Nothing is published until the package, kernel result, component
     /// occurrence, and feature-history record have all been accepted.
+    /// Evaluates a staged library insertion into what the document will
+    /// hold: the component's identity and values, its replay action, and the
+    /// body. The built-in extrusion binds its length into one command; a
+    /// saved part is evaluated from its own recipe at the given values.
+    fn prepare_library_insertion(
+        &mut self,
+        intent: &PartInsertionIntent,
+    ) -> Result<PreparedInsertion, PreparedInsertionError> {
+        let [major, minor, patch] = intent.definition_revision;
+        let revision = ComponentDefinitionRevision::new(major, minor, patch);
+        if intent.definition_key == crate::part_library::ALUMINIUM_EXTRUSION_20X20_KEY {
+            let resolved = self
+                .catalog_store
+                .as_ref()
+                .map_or_else(
+                    || resolve_builtin_insertion(intent),
+                    |store| resolve_store_insertion(store, intent),
+                )
+                .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+            if resolved.staging_id() != intent.staging_id {
+                return Err(PreparedInsertionError::Rejected(
+                    "the resolved placement identity changed".into(),
+                ));
+            }
+            let definition = ComponentDefinitionRef::new(
+                intent.definition_key.clone(),
+                revision,
+                ComponentContentDigest::from_bytes(
+                    *resolved.evidence().definition_digest().as_bytes(),
+                ),
+            )
+            .map_err(|error| {
+                PreparedInsertionError::Rejected(format!("invalid component definition: {error}"))
+            })?;
+            self.request_serial = self.request_serial.saturating_add(1);
+            let input = NativeKernel::empty();
+            let request = ExecuteRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                request_id: RequestId::new(format!(
+                    "workbench-{}-insert-library-component",
+                    self.request_serial
+                )),
+                expected_snapshot: input.id(),
+                precision: PrecisionPolicy::default(),
+                command: resolved.command().clone(),
+            };
+            let outcome = NativeKernel::execute(&input, &request, &CancellationToken::new())
+                .map_err(PreparedInsertionError::Kernel)?;
+            return Ok(PreparedInsertion {
+                definition,
+                evaluated: resolved.evaluated_parameters().clone(),
+                action: ReplayAction::Kernel(request.command),
+                outcome,
+            });
+        }
+
+        let store = self.catalog_store.as_ref().ok_or_else(|| {
+            PreparedInsertionError::Rejected("the Part Library folder is not available".into())
+        })?;
+        let key = artificer_catalog::PartDefinitionId::parse(&intent.definition_key)
+            .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+        let package = store
+            .resolve(
+                &key,
+                artificer_catalog::PartRevision::new(major, minor, patch),
+            )
+            .map_err(|error| PreparedInsertionError::Rejected(plain_catalog_error(&error)))?;
+        if package.content_digest().to_hex() != intent.definition_digest {
+            return Err(PreparedInsertionError::Rejected(
+                "the library's copy of the part is not the one that was picked".into(),
+            ));
+        }
+        let values = intent
+            .parameters
+            .iter()
+            .map(|assignment| (assignment.key.clone(), assignment.value))
+            .collect();
+        let evaluated = saved_parts::evaluate_saved_part(&package, &values)
+            .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+        let definition = ComponentDefinitionRef::new(
+            intent.definition_key.clone(),
+            revision,
+            ComponentContentDigest::from_bytes(*package.content_digest().as_bytes()),
+        )
+        .map_err(|error| {
+            PreparedInsertionError::Rejected(format!("invalid component definition: {error}"))
+        })?;
+        Ok(PreparedInsertion {
+            definition,
+            evaluated: evaluated.evaluated,
+            action: saved_parts::replay_action(evaluated.commands),
+            outcome: evaluated.outcome,
+        })
+    }
+
     fn execute_library_insertion(&mut self, staging_id: u64) {
         let Some(intent) = self
             .part_library
@@ -8366,55 +8774,13 @@ impl KernelLabApp {
             return;
         }
 
-        let resolution = self.catalog_store.as_ref().map_or_else(
-            || resolve_builtin_insertion(&intent),
-            |store| resolve_store_insertion(store, &intent),
-        );
-        let resolved = match resolution {
-            Ok(resolved) if resolved.staging_id() == staging_id => resolved,
-            Ok(_) => {
-                self.document_status = Some(
-                    "Library insertion rejected: the resolved placement identity changed".into(),
-                );
+        let prepared = match self.prepare_library_insertion(&intent) {
+            Ok(prepared) => prepared,
+            Err(PreparedInsertionError::Rejected(message)) => {
+                self.document_status = Some(format!("Library insertion rejected: {message}"));
                 return;
             }
-            Err(error) => {
-                self.document_status = Some(format!("Library insertion rejected: {error}"));
-                return;
-            }
-        };
-        let definition = match ComponentDefinitionRef::new(
-            intent.definition_key.clone(),
-            {
-                let [major, minor, patch] = intent.definition_revision;
-                ComponentDefinitionRevision::new(major, minor, patch)
-            },
-            ComponentContentDigest::from_bytes(*resolved.evidence().definition_digest().as_bytes()),
-        ) {
-            Ok(definition) => definition,
-            Err(error) => {
-                self.document_status = Some(format!(
-                    "Library insertion rejected: invalid component definition: {error}"
-                ));
-                return;
-            }
-        };
-        self.request_serial = self.request_serial.saturating_add(1);
-        let input = NativeKernel::empty();
-        let request = ExecuteRequest {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            request_id: RequestId::new(format!(
-                "workbench-{}-insert-library-component",
-                self.request_serial
-            )),
-            expected_snapshot: input.id(),
-            precision: PrecisionPolicy::default(),
-            command: resolved.command().clone(),
-        };
-        let replay_command = request.command.clone();
-        let outcome = match NativeKernel::execute(&input, &request, &CancellationToken::new()) {
-            Ok(outcome) => outcome,
-            Err(error) => {
+            Err(PreparedInsertionError::Kernel(error)) => {
                 self.last_attempt = Attempt::Rejected {
                     operation: "Library component rejected",
                     error,
@@ -8424,6 +8790,12 @@ impl KernelLabApp {
                 return;
             }
         };
+        let PreparedInsertion {
+            definition,
+            evaluated,
+            action: replay_action,
+            outcome,
+        } = prepared;
         let Some(local_bounds) = outcome.report.bounds else {
             self.document_status =
                 Some("Library insertion rejected: the accepted part has no finite bounds".into());
@@ -8449,13 +8821,15 @@ impl KernelLabApp {
         let component = ComponentInstanceDraft::new(
             intent.display_name.clone(),
             definition,
-            resolved.evaluated_parameters().clone(),
+            evaluated,
             initial_pose,
         );
 
         let mut next_document = self.document.clone();
+        // A library part starts from nothing, whether it is one command or
+        // the chain its own recipe built it with.
         let association = SnapshotAssociation::new(
-            outcome.report.input_snapshot,
+            self.empty_snapshot.id(),
             outcome.report.output_snapshot,
             outcome.report.semantic_digest,
         );
@@ -8463,7 +8837,7 @@ impl KernelLabApp {
             FeatureDraft::new(
                 FeatureKind::BaseBody,
                 format!("Insert {}", intent.display_name),
-                ReplayAction::Kernel(replay_command),
+                replay_action,
             )
             .with_component_instance(component)
             .with_output(OutputDraft::CreateBody {
@@ -15335,6 +15709,18 @@ impl KernelLabApp {
                 });
                 if save_as_by_path.clicked() {
                     self.open_document_path_prompt(DocumentPathPurpose::SaveAs);
+                    ui.close();
+                }
+                let save_part = ui
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Save to Part Library…"),
+                    )
+                    .on_hover_text(
+                        "Save the part you are working on into the library, with its variables as the values it takes when placed",
+                    );
+                if save_part.clicked() {
+                    self.open_save_part_dialog();
                     ui.close();
                 }
                 ui.separator();
@@ -22990,6 +23376,10 @@ impl eframe::App for KernelLabApp {
         {
             self.pending_operation = Some(PendingOperation::LibraryInsertion { staging_id });
         }
+        if self.part_library.take_save_request() {
+            self.open_save_part_dialog();
+        }
+        self.save_part_window(ui.ctx());
 
         match confirmation_action {
             Some(ConfirmationAction::FinishSketch) => {

@@ -73,6 +73,9 @@ pub fn publish_with_preview(
 /// changing the parameter changes it, which is found by building the part at
 /// a second length and comparing.
 pub fn draw_package_preview(package: &PartPackage) -> Result<PartPreview, String> {
+    if crate::saved_parts::is_saved_part(package) {
+        return draw_saved_part_preview(package);
+    }
     let scene = package_scene(package, SAMPLE_LENGTH_MM)?;
     let extents_mm = scene_extents(&scene).ok_or("the part has no extent to measure")?;
     let longer = scene_extents(&package_scene(package, SAMPLE_LENGTH_MM * 1.5)?)
@@ -90,6 +93,77 @@ pub fn draw_package_preview(package: &PartPackage) -> Result<PartPreview, String
     })
 }
 
+/// Draws a saved part at the values it was saved with. An extent is named
+/// as a length parameter's when building the part with that parameter half
+/// as large again moves it.
+fn draw_saved_part_preview(package: &PartPackage) -> Result<PartPreview, String> {
+    use artificer_catalog::{ParameterDomain, RealQuantity};
+    use std::collections::BTreeMap;
+
+    let scene_at = |values: &BTreeMap<String, f64>| -> Result<DebugScene, String> {
+        crate::saved_parts::evaluate_saved_part(package, values)
+            .map(|evaluated| NativeKernel::debug_scene(&evaluated.outcome.snapshot))
+            .map_err(|error| error.to_string())
+    };
+    let scene = scene_at(&BTreeMap::new())?;
+    let extents_mm = scene_extents(&scene).ok_or("the part has no extent to measure")?;
+    let mut driven_by: [Option<String>; 3] = Default::default();
+    let mut sample = Vec::new();
+    for spec in package.definition().parameters() {
+        let ParameterDomain::Real {
+            quantity,
+            default: Some(default),
+            rules,
+            ..
+        } = spec.domain()
+        else {
+            continue;
+        };
+        let value = default.get();
+        sample.push(match quantity {
+            RealQuantity::Length => format!("{} {} mm", spec.label(), trim(value)),
+            RealQuantity::Angle => format!("{} {}°", spec.label(), trim(value.to_degrees())),
+            RealQuantity::Scalar => format!("{} {}", spec.label(), trim(value)),
+        });
+        if *quantity != RealQuantity::Length || value <= 0.0 {
+            continue;
+        }
+        let limit = rules
+            .maximum()
+            .map_or(f64::INFINITY, |maximum| maximum.get());
+        let moved = if value * 1.5 <= limit {
+            value * 1.5
+        } else {
+            value * 0.75
+        };
+        let values = BTreeMap::from([(spec.id().as_str().to_owned(), moved)]);
+        let Some(other) = scene_at(&values)
+            .ok()
+            .and_then(|scene| scene_extents(&scene))
+        else {
+            continue;
+        };
+        for axis in 0..3 {
+            if driven_by[axis].is_none() && (other[axis] - extents_mm[axis]).abs() > 1.0e-6 {
+                driven_by[axis] = Some(spec.label().to_owned());
+            }
+        }
+    }
+    Ok(PartPreview {
+        image_png: render_isometric_png(&scene)?,
+        facts: PartPreviewFacts {
+            extents_mm,
+            driven_by,
+            sample: (!sample.is_empty()).then(|| sample.join(", ")),
+        },
+    })
+}
+
+fn trim(value: f64) -> String {
+    let text = format!("{value:.3}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// Builds the package's part at one length, as an insertion would.
 fn package_scene(package: &PartPackage, length_mm: f64) -> Result<DebugScene, String> {
     let definition = package.definition();
@@ -103,7 +177,7 @@ fn package_scene(package: &PartPackage, length_mm: f64) -> Result<DebugScene, St
         parameters: vec![PartParameterAssignment {
             key: LENGTH_PARAMETER_KEY.to_owned(),
             display_name: "Length".to_owned(),
-            value_mm: length_mm,
+            value: length_mm,
             source: ParameterValueSource::Entered,
         }],
     };
