@@ -32740,6 +32740,83 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// A closed fit-point spline drawn on XY extrudes into an exact solid
+    /// (ADR 0050): the volume is the spline's own area times the depth, the
+    /// area taken here from the sketch's curve by the shoelace formula over
+    /// thousands of points, independently of the kernel.
+    #[test]
+    fn a_closed_spline_sketch_extrudes_to_its_area_times_its_depth() {
+        use artificer_sketch::{PointInput, SketchPoint2, SketchRecipe};
+        let mut app = KernelLabApp::default();
+        let points = [(0.0, 0.0), (4.0, -0.5), (5.0, 3.0), (1.0, 4.0), (-1.0, 2.0)]
+            .map(|(u, v)| PointInput::Position(SketchPoint2::new(u, v)))
+            .to_vec();
+        app.sketch
+            .stage_recipe(
+                SketchRecipe::FitPointSpline {
+                    fit_points: points,
+                    degree: 3,
+                    closed: true,
+                },
+                "Spline",
+            )
+            .expect("the spline stages");
+        app.sketch.commit_pending().expect("the spline commits");
+        app.sketch_revision += 1;
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+        assert!(app.sketch.certified_profile_status().can_finish());
+
+        let authoring = app.sketch.authoring();
+        let entity = authoring
+            .active_entities()
+            .next()
+            .expect("the spline is an entity")
+            .id;
+        let curve = authoring
+            .evaluated_curve(entity)
+            .expect("the spline evaluates");
+        let samples = 20_000;
+        let area = (0..samples)
+            .map(|index| {
+                let at = |k: usize| {
+                    curve
+                        .evaluate((k % samples) as f64 / samples as f64)
+                        .expect("inside the domain")
+                };
+                let (a, b) = (at(index), at(index + 1));
+                a.u * b.v - b.u * a.v
+            })
+            .sum::<f64>()
+            .abs()
+            / 2.0;
+
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.set_extrusion_distance_intent(2.0);
+        assert!(
+            app.stage_sketch_extrusion(),
+            "{:?}",
+            app.sketch_extrusion_eligibility()
+        );
+        assert!(
+            app.confirm_pending_operation(),
+            "{:?} {:?}",
+            app.document_status,
+            app.sketch_extrusion_issue
+        );
+        assert!(
+            app.sketch_extrusion_issue.is_none(),
+            "{:?}",
+            app.sketch_extrusion_issue
+        );
+        let volume = app.displayed_measures().expect("an extruded body").volume;
+        assert!(
+            ((volume - 2.0 * area) / (2.0 * area)).abs() < 1.0e-6,
+            "volume {volume} against area {area} × 2"
+        );
+    }
+
     /// The bootstrap block, and the three edges meeting at one of its corners.
     fn block_corner_edges(app: &KernelLabApp) -> Vec<EntityRef> {
         let scene = &app.displayed.as_ref().expect("the bootstrap body").scene;

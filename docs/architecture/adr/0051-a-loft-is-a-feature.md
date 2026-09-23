@@ -10,7 +10,8 @@ sketches and their planes.
 - Extends: [0036](0036-editing-a-committed-feature.md),
   [0041](0041-tools-and-selections-meet-in-either-order.md),
   [0048](0048-a-construction-plane-is-a-feature.md),
-  [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md)
+  [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md),
+  [0050](0050-b-spline-curves-and-surfaces-as-carriers.md)
 
 ## Context
 
@@ -45,9 +46,9 @@ the one extrusions use (`compile_sketch_regions`), so a region that has gone,
 or that now names two cells, fails a loft exactly as it fails an extrusion.
 
 The recipe allows as many sections as the protocol carries. How many the
-kernel can loft through is the kernel's to say, and it says so by name:
-today, more than two is `LOFT_MULTI_SECTION_UNSUPPORTED`, which the card
-shows until smooth multi-section lofts arrive.
+kernel can loft through is the kernel's to say: two sections loft with
+ruled walls (ADR 0049), and three or more loft smoothly on B-spline walls
+(ADR 0050), with no change to the recipe either way.
 
 ### It follows what it was built from
 
@@ -105,7 +106,7 @@ loft. Nothing earlier needs migrating.
   section.
 - The Browser names a sketch on a construction plane by the plane's name
   rather than its feature number.
-- What the loft can build is exactly what the kernel's loft can build: two
-  sections on different planes, lines, arcs and circles, holes that pair.
-  Spline sections and smooth lofts through more sections arrive with the
-  kernel's B-spline surfaces, with no change to the recipe.
+- What the loft can build is exactly what the kernel's loft can build:
+  sections on different planes drawn with lines, arcs, circles and splines,
+  holes that pair, ruled walls between two sections and smooth B-spline
+  walls through three or more (ADR 0050).

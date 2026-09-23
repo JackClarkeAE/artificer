@@ -1057,6 +1057,43 @@ mod tests {
         assert_square_to_circle(body, 10.0);
     }
 
+    /// Through three sections the loft is smooth (ADR 0050): a square up to
+    /// a circle and out to a smaller square, one body whose walls carry on
+    /// through the middle section rather than creasing at it.
+    #[test]
+    fn a_loft_runs_smoothly_through_three_sections() {
+        let (mut app, _, square, circle) = square_and_circle();
+        let upper = plane_at(&mut app, 20.0);
+        let top = sketch_on_plane(
+            &mut app,
+            &upper,
+            SketchGeometry::rectangle(point(-1.0, -1.0), point(1.0, 1.0)),
+        );
+        assert!(app.stage_loft());
+        app.pick_loft_region(square, [0.5, 0.5], false);
+        app.pick_loft_region(circle, [0.1, 0.1], false);
+        app.pick_loft_region(top, [0.1, 0.1], false);
+        assert_eq!(app.staged_loft_section_count(), Some(3));
+        assert!(
+            app.staged_loft_has_preview(),
+            "{:?}",
+            app.staged_loft_issue()
+        );
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let loft = loft_feature(&app);
+        let body = loft_body(&app, loft);
+        let measures = body.body.snapshot.measures();
+        let bounds = measures.bounds.expect("the loft has bounds");
+        assert!(bounds.min.z.abs() < 1.0e-6, "{bounds:?}");
+        assert!((bounds.max.z - 20.0).abs() < 1.0e-6, "{bounds:?}");
+        // Bounded by the prism on the largest section.
+        assert!(
+            measures.volume > 0.0 && measures.volume < 16.0 * 20.0,
+            "volume {}",
+            measures.volume
+        );
+    }
+
     /// Two sections in one plane cannot be lofted. The kernel refuses by
     /// name, the card says why, and confirming builds nothing.
     #[test]
