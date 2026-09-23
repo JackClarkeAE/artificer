@@ -1,14 +1,17 @@
 //! Presentation-only foundation for the local Part Library.
 //!
 //! This module deliberately does not know about kernel snapshots, model
-//! documents, catalog storage, or assembly placement. It validates the first
+//! documents, catalog storage, or assembly placement; a part's saved preview
+//! reaches it as plain data to show. It validates the first
 //! built-in parametric card and emits immutable insertion intents which the
 //! workbench can pass through its universal confirmation gate. A later
 //! catalog/model adapter can consume the same intents without moving parameter
 //! validation into rendering code.
 
+use artificer_catalog::{PartPreview, PartPreviewFacts};
 use egui::{FontId, RichText, Stroke};
 
+use crate::part_preview::decode_png;
 use crate::units::LengthUnit;
 
 // Aliases rather than a second palette: the library styles itself from the
@@ -35,6 +38,8 @@ pub const LENGTH_PARAMETER_KEY: &str = "length";
 const MIN_LENGTH_MM: f64 = 0.001;
 const MAX_LENGTH_MM: f64 = 100_000.0;
 const MAX_COMMITTED_INTENTS: usize = 128;
+/// The side of a part's picture in the list, in points.
+const THUMBNAIL_SIDE: f32 = 52.0;
 
 /// Whether a resolved parameter came from the definition or the user.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +168,53 @@ pub struct PartLibraryState {
     staged: Option<PartInsertionIntent>,
     committed: Vec<PartInsertionIntent>,
     status: Option<String>,
+    /// The picture and measurements saved with the part the card shows.
+    preview: Option<ShownPreview>,
+}
+
+/// A saved preview as the list shows it: its facts, the decoded picture,
+/// and the texture made from that picture the first time it is drawn.
+#[derive(Clone)]
+struct ShownPreview {
+    facts: PartPreviewFacts,
+    image: Option<egui::ColorImage>,
+    texture: Option<egui::TextureHandle>,
+}
+
+impl std::fmt::Debug for ShownPreview {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ShownPreview")
+            .field("facts", &self.facts)
+            .field("image", &self.image.as_ref().map(|image| image.size))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A part's rough size, as the list shows it: each extent in `unit`, and an
+/// extent a parameter sets named as that parameter — `20 × 20 × 100 mm`, or
+/// `20 × 20 mm × Length`.
+#[must_use]
+pub fn rough_dimensions(facts: &PartPreviewFacts, unit: LengthUnit) -> String {
+    let fixed = facts
+        .extents_mm
+        .iter()
+        .zip(&facts.driven_by)
+        .filter(|(_, driver)| driver.is_none())
+        .map(|(extent, _)| unit.format_value(*extent))
+        .collect::<Vec<_>>();
+    let mut text = if fixed.is_empty() {
+        String::new()
+    } else {
+        format!("{} {}", fixed.join(" × "), unit.suffix())
+    };
+    for driver in facts.driven_by.iter().flatten() {
+        if !text.is_empty() {
+            text.push_str(" × ");
+        }
+        text.push_str(driver);
+    }
+    text
 }
 
 impl Default for PartLibraryState {
@@ -200,6 +252,7 @@ impl PartLibraryState {
             staged: None,
             committed: Vec::new(),
             status: None,
+            preview: None,
         }
     }
 
@@ -252,6 +305,38 @@ impl PartLibraryState {
     #[must_use]
     pub const fn definition_revision(&self) -> [u32; 3] {
         self.definition_revision
+    }
+
+    /// Shows the preview saved with the part, or none. A picture that does
+    /// not decode leaves the list's placeholder, with the size still shown.
+    pub(crate) fn set_preview(&mut self, preview: Option<&PartPreview>) {
+        self.preview = preview.map(|preview| ShownPreview {
+            facts: preview.facts.clone(),
+            image: decode_png(&preview.image_png),
+            texture: None,
+        });
+    }
+
+    /// The measurements saved with the part's preview.
+    #[must_use]
+    pub fn preview_facts(&self) -> Option<&PartPreviewFacts> {
+        self.preview.as_ref().map(|preview| &preview.facts)
+    }
+
+    /// The size of the picture the list shows, in pixels, if it has one.
+    #[must_use]
+    pub fn preview_image_size(&self) -> Option<[usize; 2]> {
+        self.preview
+            .as_ref()
+            .and_then(|preview| preview.image.as_ref())
+            .map(|image| image.size)
+    }
+
+    /// The part's rough size in the document unit, as the list shows it.
+    #[must_use]
+    pub fn rough_dimensions_text(&self) -> Option<String> {
+        self.preview_facts()
+            .map(|facts| rough_dimensions(facts, self.length_unit))
     }
 
     fn revision_label(&self) -> String {
@@ -480,38 +565,94 @@ impl PartLibraryState {
             return;
         }
 
+        let version = format!("v{}", self.revision_label());
+        let size = self.rough_dimensions_text();
+        let sample = self.preview_facts().and_then(|facts| facts.sample.clone());
         egui::Frame::new()
             .fill(library_card())
             .stroke(Stroke::new(1.0, library_accent().gamma_multiply(0.65)))
             .corner_radius(4)
             .inner_margin(egui::Margin::same(7))
             .show(ui, |ui| {
-                let response = ui.add_sized(
-                    [ui.available_width(), 66.0],
-                    egui::Button::new(
-                        RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
-                            .color(library_text())
-                            .strong(),
-                    )
-                    .frame(false)
-                    .selected(true),
-                );
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        true,
-                        ALUMINIUM_EXTRUSION_20X20_NAME,
-                    )
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PARAMETRIC").small().color(library_accent()));
-                    ui.label(
-                        RichText::new("Aluminium profiles")
-                            .small()
-                            .color(library_muted()),
-                    );
+                ui.horizontal_top(|ui| {
+                    self.thumbnail(ui);
+                    ui.vertical(|ui| {
+                        let response = ui.add(
+                            egui::Button::new(
+                                RichText::new(ALUMINIUM_EXTRUSION_20X20_NAME)
+                                    .color(library_text())
+                                    .strong(),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Wrap)
+                            .frame(false)
+                            .selected(true),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                ALUMINIUM_EXTRUSION_20X20_NAME,
+                            )
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(&version).small().color(library_text()));
+                            ui.label(RichText::new("PARAMETRIC").small().color(library_accent()));
+                        });
+                        if let Some(size) = &size {
+                            let label =
+                                ui.label(RichText::new(size).small().color(library_muted()));
+                            if let Some(sample) = &sample {
+                                label.on_hover_text(format!(
+                                    "Rough size; the picture shows it at {sample}"
+                                ));
+                            }
+                        }
+                        ui.label(
+                            RichText::new("Aluminium profiles")
+                                .small()
+                                .color(library_muted()),
+                        );
+                    });
                 });
             });
+    }
+
+    /// The part's saved picture, or a quiet placeholder of the same size so
+    /// the row does not jump when a picture is missing.
+    fn thumbnail(&mut self, ui: &mut egui::Ui) {
+        let side = egui::vec2(THUMBNAIL_SIDE, THUMBNAIL_SIDE);
+        let texture = self.preview.as_mut().and_then(|preview| {
+            if preview.texture.is_none()
+                && let Some(image) = preview.image.clone()
+            {
+                preview.texture = Some(ui.ctx().load_texture(
+                    "part_library_preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            preview.texture.clone()
+        });
+        let label = format!("Picture of {ALUMINIUM_EXTRUSION_20X20_NAME}");
+        let (rect, response) = ui.allocate_exact_size(side, egui::Sense::hover());
+        ui.painter().rect(
+            rect,
+            4,
+            library_panel(),
+            Stroke::new(1.0, library_border()),
+            egui::StrokeKind::Inside,
+        );
+        if let Some(texture) = &texture {
+            egui::Image::new((texture.id(), side)).paint_at(ui, rect.shrink(2.0));
+        }
+        let has_picture = texture.is_some();
+        response.widget_info(|| {
+            let mut info = egui::WidgetInfo::labeled(egui::WidgetType::Image, true, &label);
+            if !has_picture {
+                info.label = Some(format!("{label} (not drawn yet)"));
+            }
+            info
+        });
     }
 
     fn part_details(&mut self, ui: &mut egui::Ui, another_operation_pending: bool) -> bool {
@@ -535,6 +676,13 @@ impl PartLibraryState {
                 .small()
                 .color(library_accent()),
         );
+        if let Some(size) = self.rough_dimensions_text() {
+            ui.label(
+                RichText::new(format!("Size · {size}"))
+                    .small()
+                    .color(library_text()),
+            );
+        }
         ui.add_space(5.0);
         ui.label(
             RichText::new(
@@ -636,6 +784,29 @@ impl PartLibraryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rough_dimensions_name_what_a_parameter_sets_and_follow_the_unit() {
+        let extrusion = PartPreviewFacts {
+            extents_mm: [20.0, 20.0, 100.0],
+            driven_by: [None, None, Some("Length".into())],
+            sample: Some("Length 100 mm".into()),
+        };
+        assert_eq!(
+            rough_dimensions(&extrusion, LengthUnit::Millimetre),
+            "20 × 20 mm × Length"
+        );
+        let fixed = PartPreviewFacts {
+            extents_mm: [25.4, 50.8, 12.7],
+            driven_by: [None, None, None],
+            sample: None,
+        };
+        assert_eq!(rough_dimensions(&fixed, LengthUnit::Inch), "1 × 2 × 0.5 in");
+        assert_eq!(
+            rough_dimensions(&fixed, LengthUnit::Millimetre),
+            "25.4 × 50.8 × 12.7 mm"
+        );
+    }
 
     #[test]
     fn required_length_blocks_staging_with_precise_diagnostics() {

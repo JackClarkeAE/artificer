@@ -418,6 +418,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "png",
  "rfd",
  "serde",
  "serde_json",

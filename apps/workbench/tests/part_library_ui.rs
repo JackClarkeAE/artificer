@@ -539,3 +539,65 @@ impl Drop for TemporaryCatalogRoot {
         }
     }
 }
+
+/// Saving a part into the library draws its picture once and keeps it beside
+/// the package: the list shows it with the part's version and rough size, and
+/// a later start reads the kept picture rather than drawing another.
+#[test]
+fn a_part_saved_into_the_library_keeps_a_picture_and_its_size() {
+    use artificer_workbench::library_catalog::builtin_aluminium_extrusion_package;
+
+    let catalog = TemporaryCatalogRoot::new();
+    let mut harness = catalog_harness(catalog.path.clone());
+    harness.run();
+    let library = harness.state().part_library();
+    assert_eq!(library.preview_image_size(), Some([96, 96]));
+    assert_eq!(
+        library.rough_dimensions_text().as_deref(),
+        Some("20 × 20 mm × Length")
+    );
+
+    let digest = builtin_aluminium_extrusion_package()
+        .expect("the built-in part builds")
+        .content_digest();
+    let store = CatalogStore::open(&catalog.path).expect("the store opens");
+    let kept = store
+        .preview(digest)
+        .expect("the store reads")
+        .expect("the picture was saved with the part");
+    assert!(kept.image_png.starts_with(&[0x89, b'P', b'N', b'G']));
+    let hex = digest.to_hex();
+    assert!(
+        catalog
+            .path
+            .join("previews")
+            .join(&hex[..2])
+            .join(format!("{}.png", &hex[2..]))
+            .is_file(),
+        "the picture is a PNG file in the library"
+    );
+
+    click_button(&mut harness, "Library");
+    harness.get_by_role_and_label(Role::Image, "Picture of 20 × 20 Aluminium Extrusion");
+    harness.get_by_label("v1.8.0");
+    harness.get_by_label("20 × 20 mm × Length");
+
+    // A kept picture is what a later start shows: replace it with a marked
+    // one and it is that one that comes back.
+    let mut marked = kept.clone();
+    marked.facts.sample = Some("Length 42 mm".into());
+    store
+        .save_preview(digest, &marked)
+        .expect("the store keeps it");
+    let mut later = catalog_harness(catalog.path.clone());
+    later.run();
+    assert_eq!(
+        later
+            .state()
+            .part_library()
+            .preview_facts()
+            .and_then(|facts| facts.sample.as_deref()),
+        Some("Length 42 mm"),
+        "a start with a kept picture draws nothing new"
+    );
+}

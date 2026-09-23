@@ -71,3 +71,31 @@ F2 gives Artificer a trustworthy local definition/variant/occurrence split and a
 - collision/interference heatmaps, tolerance profiles, animation studies, or interactive sectional analysis.
 
 Those assembly and analysis programmes can build on stable occurrences without being folded into kernel truth. General parameter editing and regeneration still belong to the unfinished M5 feature/document programme.
+
+## Amendment: a part keeps its picture and rough size (2026-09-23)
+
+The library list shows each part as a small picture with its version and
+rough size, so a part can be recognised without reading its description.
+
+- **When it is drawn.** A part's picture is drawn once, when the part is
+  saved into the library, and kept beside its package. It is drawn again
+  only when the store has none for that exact package. That happens when a
+  store written by an older build is opened, or when the kept files cannot
+  be read.
+- **How it is drawn.** The workbench builds the part as an insertion would
+  and draws it on the CPU, with no window or GPU involved. The view is the
+  viewport's isometric one, fitted with a margin, at 96 px square on a
+  transparent background. A parametric part is drawn at a sample value; the
+  built-in extrusion is drawn at Length 100 mm.
+- **What it measures.** The part's bounding box along X, Y and Z is kept
+  with the picture. An extent that changes when a parameter changes is
+  recorded as that parameter's rather than as the sample's number. The
+  extrusion's size therefore reads `20 × 20 mm × Length`.
+- **Where it lives.** `CatalogStore` keeps `previews/<digest>.png` and
+  `previews/<digest>.json` (the measurements) beside `objects/` and `refs/`.
+  A preview is derived rather than authored. It is not part of the
+  package's content address, so it may be replaced, and each file is
+  replaced atomically. The store validates both files and refuses a preview
+  for a package it does not hold. A missing, damaged or oversized preview
+  reads as none, so the answer is to draw it again rather than to fail the
+  library. The index never mistakes a preview for a package.

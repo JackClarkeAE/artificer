@@ -24,6 +24,7 @@ mod loft;
 pub mod material;
 mod parametric;
 pub mod part_library;
+pub mod part_preview;
 mod ribbon;
 pub mod shell;
 pub mod spacemouse;
@@ -3145,11 +3146,11 @@ impl KernelLabApp {
 
     fn open_catalog_store(&mut self, root: impl AsRef<Path>) -> Result<(), String> {
         let package = builtin_aluminium_extrusion_package().map_err(|error| error.to_string())?;
-        let digest = package.content_digest();
         let store = CatalogStore::open(root.as_ref().to_path_buf())
             .map_err(|error| plain_catalog_error(&error))?;
-        store
-            .publish(&package)
+        // Saving the part into the library draws its picture, once; a store
+        // that already has it hands back the kept one.
+        let (digest, preview) = crate::part_preview::publish_with_preview(&store, &package)
             .map_err(|error| plain_catalog_error(&error))?;
         let rebuilt = store
             .rebuild_index()
@@ -3161,6 +3162,7 @@ impl KernelLabApp {
             digest.to_hex(),
             crate::library_catalog::builtin_part_revision_parts(),
         );
+        self.part_library.set_preview(preview.as_ref());
         self.catalog_store = Some(store);
         self.document_status = Some(format!(
             "Local Part Library ready · {} verified definition(s)",
@@ -3995,6 +3997,12 @@ impl KernelLabApp {
         *self.part_library.open_mut() = true;
         self.document_status =
             Some("Library open · choose a part to insert into this design".to_owned());
+    }
+
+    /// The Part Library's presentation state: what its list and card show.
+    #[must_use]
+    pub const fn part_library(&self) -> &PartLibraryState {
+        &self.part_library
     }
 
     #[must_use]

@@ -41,6 +41,7 @@ egui_wgpu = { package = "egui-wgpu", version = "=0.35.0", default-features = fal
 wgpu = { version = "29.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
+png = "0.18"
 sha2 = "0.10"
 thiserror = "2.0"
 rayon = "1.11"

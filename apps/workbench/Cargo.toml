@@ -26,6 +26,7 @@ artificer-sketch-ui = { path = "../../crates/sketch-ui" }
 artificer-spacemouse = { path = "../../crates/spacemouse" }
 artificer-ui-core = { path = "../../crates/ui-core" }
 artificer-viewport = { path = "../../crates/viewport" }
+png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 velopack.workspace = true

@@ -134,3 +134,46 @@ fn committed_parametric_component_snapshot() {
     harness.run();
     harness.snapshot("part_library_committed_parametric_component");
 }
+
+/// The library as a person with a local library sees it: the part's picture
+/// on the left of its row, drawn when the part was saved into the library,
+/// with its version and rough size beside it.
+#[test]
+fn library_list_shows_picture_version_and_size_snapshot() {
+    let snapshot_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots");
+    let root = std::env::temp_dir().join(format!(
+        "artificer-library-visual-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let catalog_root = root.clone();
+    let mut harness = Harness::builder()
+        .with_size([1280.0, 800.0])
+        .with_pixels_per_point(1.0)
+        .with_step_dt(1.0 / 60.0)
+        .with_theme(egui::Theme::Dark)
+        .with_os(egui::os::OperatingSystem::Nix)
+        .with_options(
+            SnapshotOptions::new()
+                .output_path(snapshot_directory)
+                .failed_pixel_count_threshold(OsThreshold::new(0).linux(400).windows(400)),
+        )
+        .wgpu()
+        .build_eframe(move |creation_context| {
+            KernelLabApp::new_paused_with_catalog_root(creation_context, catalog_root)
+        });
+
+    harness.run();
+    assert!(harness.state().persistent_catalog_active());
+    click_button(&mut harness, "Library");
+    harness.get_by_role_and_label(Role::Image, "Picture of 20 × 20 Aluminium Extrusion");
+    harness.remove_cursor();
+    harness.run();
+    harness.snapshot("part_library_list_picture_version_size");
+    let _ = std::fs::remove_dir_all(&root);
+}
