@@ -48,11 +48,46 @@ pub enum FaceGeometry {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// The straight lines between two exact rails (ADR 0049), reported by
+    /// the rails: each one's curve and its two ends, in the direction the
+    /// rulings are paired.
+    Ruled {
+        first_rail: RailGeometry,
+        second_rail: RailGeometry,
+    },
+}
+
+/// One rail of a ruled face: the kind of curve and where it starts and ends.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RailGeometry {
+    /// `line`, `circular_arc` or `elliptical_arc`.
+    pub curve: RailKind,
+    pub start: ProtocolPoint3,
+    pub end: ProtocolPoint3,
+}
+
+/// The curve a rail of a ruled face runs along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RailKind {
+    Line,
+    CircularArc,
+    EllipticalArc,
+}
+
+impl RailKind {
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Line => "a line",
+            Self::CircularArc => "a circular arc",
+            Self::EllipticalArc => "an elliptical arc",
+        }
+    }
 }
 
 impl FaceGeometry {
     /// The surface kind as one lowercase word: `plane`, `cylinder`, `cone`,
-    /// `sphere`, or `torus`.
+    /// `sphere`, `torus`, or `ruled`.
     #[must_use]
     pub const fn surface_kind(&self) -> &'static str {
         match self {
@@ -61,6 +96,7 @@ impl FaceGeometry {
             Self::Cone { .. } => "cone",
             Self::Sphere { .. } => "sphere",
             Self::Torus { .. } => "torus",
+            Self::Ruled { .. } => "ruled",
         }
     }
 }
@@ -158,12 +194,16 @@ pub struct SurfaceCounts {
     pub cones: u64,
     pub spheres: u64,
     pub tori: u64,
+    /// Ruled walls (ADR 0049). Absent from a report written before the
+    /// carrier existed, which had none.
+    #[serde(default)]
+    pub ruled: u64,
 }
 
 impl SurfaceCounts {
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.planes + self.cylinders + self.cones + self.spheres + self.tori
+        self.planes + self.cylinders + self.cones + self.spheres + self.tori + self.ruled
     }
 }
 
@@ -201,6 +241,7 @@ impl NativeKernel {
                 Surface::Cone(_) => counts.cones += 1,
                 Surface::Sphere(_) => counts.spheres += 1,
                 Surface::Torus(_) => counts.tori += 1,
+                Surface::Ruled(_) => counts.ruled += 1,
             }
         }
         counts
@@ -431,6 +472,21 @@ fn face_geometry(surface: Surface) -> Option<FaceGeometry> {
             major_radius: torus.major_radius.abs(),
             minor_radius: torus.minor_radius.abs(),
         },
+        Surface::Ruled(ruled) => {
+            let rail = |rail: crate::ruled::RuledRail| RailGeometry {
+                curve: match rail.curve {
+                    crate::ruled::RailCurve::Line { .. } => RailKind::Line,
+                    crate::ruled::RailCurve::Circle { .. } => RailKind::CircularArc,
+                    crate::ruled::RailCurve::Ellipse { .. } => RailKind::EllipticalArc,
+                },
+                start: protocol_point(rail.point(0.0)),
+                end: protocol_point(rail.point(1.0)),
+            };
+            FaceGeometry::Ruled {
+                first_rail: rail(ruled.rails[0]),
+                second_rail: rail(ruled.rails[1]),
+            }
+        }
     })
 }
 
@@ -482,6 +538,14 @@ fn face_summary(geometry: &FaceGeometry, normal: Vector3, centre: Point3, loops:
             "toroidal, radii {} and {}",
             number(*major_radius),
             number(*minor_radius)
+        ),
+        FaceGeometry::Ruled {
+            first_rail,
+            second_rail,
+        } => format!(
+            "ruled, between {} and {}",
+            first_rail.curve.words(),
+            second_rail.curve.words()
         ),
     };
     format!("{kind}{holes}, centre {}", point_text(centre))

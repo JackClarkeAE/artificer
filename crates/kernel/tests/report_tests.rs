@@ -547,6 +547,7 @@ fn reports_conform_to_the_published_schema() {
         include_str!("../examples/blend_then_drill.art"),
         include_str!("../examples/bearing_mount.art"),
         include_str!("../examples/filleted_flange.art"),
+        include_str!("../examples/square_to_circle_loft.art"),
         "let b = box(size: [10, 10, 10], label: \"b\");\ndrill(face: faces(\">Z\"), center: [0, 0], diameter: 0.000001, depth: 5, label: \"tiny\");\n",
         "let b = box(size: [10, 10, 10], label: \"b\"\n",
     ] {

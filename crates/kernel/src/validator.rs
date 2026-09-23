@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::ruled::{RailCurve, RuledRail, RuledSurface};
 use crate::topology::{
     CoedgeKey, Curve2, Curve3, EdgeKey, EntityId, Face, FaceKey, LoopKey, Orientation, Point2,
     Point3, SolidKey, Surface, Topology, TopologyCounts, Vector2, Vector3,
@@ -595,6 +596,9 @@ fn validate_geometry(
                 } else {
                     f64::INFINITY
                 }),
+            Surface::Ruled(ruled) => {
+                ruled_frame_error(topology, &face.value, ruled, linear_tolerance)
+            }
         };
         if frame_error > linear_tolerance {
             diagnostics.push(
@@ -1121,7 +1125,9 @@ fn pcurve_locus_error(
                 Surface::Torus(torus) => {
                     (torus.major_radius + torus.minor_radius * endpoints[0].y.cos()).abs()
                 }
-                Surface::Plane(_) | Surface::Cylinder(_) => return f64::INFINITY,
+                Surface::Plane(_) | Surface::Cylinder(_) | Surface::Ruled(_) => {
+                    return f64::INFINITY;
+                }
             };
             // Both pcurve endpoints must sit on the same singular iso-line.
             let iso = (endpoints[1].y - endpoints[0].y).abs();
@@ -1170,6 +1176,19 @@ fn pcurve_locus_error(
                 .max(tangent_error)
                 .max(sampled_error)
         }
+        (Surface::Ruled(ruled), Curve2::Line { endpoints }, curve) => ruled_locus_error(
+            ruled,
+            endpoints,
+            curve,
+            RuledUse {
+                edge,
+                coedge,
+                edge_start,
+                edge_delta,
+                pcurve_start,
+                pcurve_delta,
+            },
+        ),
         (Surface::Cylinder(_), Curve2::Trace { .. }, Curve3::Trace { .. }) => {
             // Both descriptions of a trace run over the host's azimuth by
             // construction — that is what lets the two faces either side of
@@ -1207,6 +1226,223 @@ fn effective_normal_error(
         * first_sweep.signum()
         * second_sweep.signum();
     (1.0 - alignment).abs() * length_scale
+}
+
+/// How far a ruled carrier is from a well-formed one: each rail a curve with
+/// a sound frame over a finite, non-empty stretch — a line over `[0, 1]`
+/// either way, an arc within one turn — and a normal that vanishes nowhere
+/// on a grid over the face. A wall that pinches to a point, or whose rung runs along the
+/// rails, has no side to face and is not a surface this kernel can orient.
+fn ruled_frame_error(
+    topology: &Topology,
+    face: &Face,
+    ruled: RuledSurface,
+    linear_tolerance: f64,
+) -> f64 {
+    let rail_error = |rail: RuledRail| -> f64 {
+        let span = rail.range.end - rail.range.start;
+        if !span.is_finite() || span == 0.0 {
+            return f64::INFINITY;
+        }
+        match rail.curve {
+            // A line is walked over `[0, 1]`, or backwards over it once a
+            // mirror has turned the face round.
+            RailCurve::Line { endpoints } => {
+                let unit = crate::topology::ParameterRange::new(0.0, 1.0);
+                if endpoints[0].distance(endpoints[1]) > linear_tolerance
+                    && (rail.range == unit || rail.range == unit.reversed())
+                {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            }
+            RailCurve::Circle { u, v, radius, .. } => (u.length() - 1.0)
+                .abs()
+                .max((v.length() - 1.0).abs())
+                .max(u.dot(v).abs())
+                .max(if radius > linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                })
+                .max(if span.abs() <= std::f64::consts::TAU + linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }),
+            RailCurve::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => (u.length() - 1.0)
+                .abs()
+                .max((v.length() - 1.0).abs())
+                .max(u.dot(v).abs())
+                .max(
+                    if minor_radius > linear_tolerance && major_radius >= minor_radius {
+                        0.0
+                    } else {
+                        f64::INFINITY
+                    },
+                )
+                .max(if span.abs() <= std::f64::consts::TAU + linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }),
+        }
+    };
+    let domain = pcurve_extent(topology, face).unwrap_or((0.0, 1.0, 0.0, 1.0));
+    let scale = ruled.scale().max(1.0);
+    let pinched = ruled.least_normal(domain) <= linear_tolerance * scale;
+    rail_error(ruled.rails[0])
+        .max(rail_error(ruled.rails[1]))
+        .max(if pinched { f64::INFINITY } else { 0.0 })
+}
+
+/// One use of an edge by a ruled face, with the two parameterisations the
+/// locus proof compares.
+struct RuledUse {
+    edge: crate::topology::Edge,
+    coedge: crate::topology::Coedge,
+    edge_start: f64,
+    edge_delta: f64,
+    pcurve_start: f64,
+    pcurve_delta: f64,
+}
+
+/// The locus proof for an edge of a ruled face (ADR 0049).
+///
+/// A ruled surface has no frame to compare a curve against, so the proof
+/// is in two parts. Every sample of the edge — its ends included, which is
+/// the vertex-on-face check — is inverted onto the surface from the point
+/// its own pcurve names there, and must land within the tolerance. And the
+/// pcurve must be one of the curves the surface carries exactly: an iso-`u`
+/// line is a rung, which is straight; an iso-`v` line at `v = 0` or `v = 1`
+/// is a rail, which must be the edge's own curve — same carrier, same frame
+/// — walked over the same parameters, so that an arc through the same two
+/// ends cannot stand in for it; and an iso-`v` line between two straight
+/// rails is straight.
+fn ruled_locus_error(
+    ruled: RuledSurface,
+    endpoints: [Point2; 2],
+    curve: Curve3,
+    used: RuledUse,
+) -> f64 {
+    let RuledUse {
+        edge,
+        coedge,
+        edge_start,
+        edge_delta,
+        pcurve_start,
+        pcurve_delta,
+    } = used;
+    let scale = ruled.scale().max(1.0);
+    let inverted = [0.0, 0.25, 0.5, 0.75, 1.0]
+        .into_iter()
+        .fold(0.0_f64, |worst, t| {
+            let target = edge.curve.evaluate(edge_delta.mul_add(t, edge_start));
+            let seed = coedge
+                .pcurve
+                .evaluate(pcurve_delta.mul_add(t, pcurve_start));
+            worst.max(
+                ruled
+                    .distance_to(target, Some(seed))
+                    .unwrap_or(f64::INFINITY),
+            )
+        });
+    let across_u = (endpoints[1].x - endpoints[0].x).abs();
+    let across_v = (endpoints[1].y - endpoints[0].y).abs();
+    let both_lines = ruled
+        .rails
+        .iter()
+        .all(|rail| matches!(rail.curve, RailCurve::Line { .. }));
+    let rail = if across_v != 0.0 {
+        None
+    } else if endpoints[0].y == 0.0 {
+        Some(ruled.rails[0])
+    } else if endpoints[0].y == 1.0 {
+        Some(ruled.rails[1])
+    } else {
+        None
+    };
+    let structural = match (rail, curve) {
+        // Along a rail: the edge's curve is the rail's, walked over the same
+        // parameters.
+        (Some(rail), _) => {
+            let at = |t: f64| {
+                let parameter = pcurve_delta.mul_add(t, pcurve_start);
+                rail.parameter(coedge.pcurve.evaluate(parameter).x)
+            };
+            let reach = rail
+                .curve
+                .bending_radius()
+                .unwrap_or(scale)
+                .abs()
+                .max(scale);
+            curve_identity_error(rail.curve.curve(), curve, scale)
+                .max((at(0.0) - edge_start).abs() * reach)
+                .max((at(1.0) - (edge_start + edge_delta)).abs() * reach)
+        }
+        // A rung; and between two straight rails, an iso-`v` line as well.
+        (None, Curve3::Line { .. }) if both_lines => across_u.min(across_v) * scale,
+        (None, Curve3::Line { .. }) => across_u * scale,
+        _ => f64::INFINITY,
+    };
+    inverted.max(structural)
+}
+
+/// How far two conics are from being one carrier with one parameterisation:
+/// centre, frame and radii compared, each scaled to a length.
+fn curve_identity_error(first: Curve3, second: Curve3, scale: f64) -> f64 {
+    match (first, second) {
+        (Curve3::Line { endpoints }, Curve3::Line { endpoints: other }) => endpoints[0]
+            .distance(other[0])
+            .max(endpoints[1].distance(other[1])),
+        (
+            Curve3::Circle {
+                center,
+                u,
+                v,
+                radius,
+            },
+            Curve3::Circle {
+                center: other_center,
+                u: other_u,
+                v: other_v,
+                radius: other_radius,
+            },
+        ) => center
+            .distance(other_center)
+            .max((radius - other_radius).abs())
+            .max((u - other_u).length() * scale)
+            .max((v - other_v).length() * scale),
+        (
+            Curve3::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            },
+            Curve3::Ellipse {
+                center: other_center,
+                u: other_u,
+                v: other_v,
+                major_radius: other_major,
+                minor_radius: other_minor,
+            },
+        ) => center
+            .distance(other_center)
+            .max((major_radius - other_major).abs())
+            .max((minor_radius - other_minor).abs())
+            .max((u - other_u).length() * scale)
+            .max((v - other_v).length() * scale),
+        _ => f64::INFINITY,
+    }
 }
 
 fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
@@ -2196,6 +2432,24 @@ pub(crate) fn calculate_exact_shell_measures(
                         [along, across, slope * along, slope * across],
                     );
             }
+            // A ruled face is integrated over its parameter rectangle by
+            // quadrature (ADR 0049). Only a face that is the whole
+            // rectangle it spans is in that form — every face the loft
+            // builds, and every face a transform or mirror of one keeps.
+            Surface::Ruled(ruled) => {
+                if !face.value.inner_loops.is_empty() {
+                    return None;
+                }
+                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
+                let rectangle = (u_max - u_min) * (v_max - v_min);
+                if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
+                    return None;
+                }
+                let measures = ruled.measures((u_min, u_max, v_min, v_max), anchor);
+                surface_area += measures.area;
+                flux += orientation * measures.flux;
+                moment = moment + measures.moment * orientation;
+            }
         }
     }
 
@@ -2734,6 +2988,7 @@ fn calculate_analytic_face_feature_measures(
         Surface::Torus(torus) => torus.axis,
         Surface::Cone(cone) => cone.axis,
         Surface::Sphere(sphere) => sphere.axis,
+        Surface::Ruled(_) => return None,
     };
     let direction = robust_normalized(direction)?;
     let mut start_edges = BTreeSet::new();
@@ -3023,7 +3278,9 @@ fn calculate_analytic_extrusion_measures(
                 Surface::Plane(plane) => plane.u.cross(plane.v).length(),
                 Surface::Cylinder(cylinder) => cylinder.radius * cylinder.axis.length(),
                 // Blend surfaces belong to the exact shell measure strategy.
-                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => return None,
+                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => {
+                    return None;
+                }
             };
             surface_area += parameter_area * jacobian;
         }

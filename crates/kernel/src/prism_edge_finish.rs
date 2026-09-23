@@ -272,7 +272,7 @@ pub(crate) fn extract_prism(
         let parallel = match face.value.surface {
             Surface::Plane(plane) => plane.normal.dot(normal).abs() <= agreement,
             Surface::Cylinder(cylinder) => cylinder.axis.cross(normal).length() <= agreement,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => false,
+            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => false,
         };
         if !parallel {
             return Err(PrismEdgeFinishError::DomainUnsupported);

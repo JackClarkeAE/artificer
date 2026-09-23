@@ -27,7 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use artificer_protocol::{EntityKind, Point2, Point3, Vector3};
+use artificer_protocol::{EntityKind, PlanarFrame3, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::commands::{
@@ -1409,6 +1409,26 @@ impl<'a> Interp<'a> {
                 operation: args.operation()?,
                 draft_degrees: args.number_or("draft", 0.0)?,
             })),
+            "loft" => {
+                let sections = match args.required("sections")? {
+                    Value::Array(items) => items
+                        .iter()
+                        .map(Value::as_step)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    other => {
+                        return Err(ScriptError::eval(format!(
+                            "loft(): `sections` is an array of sketches, got {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                Ok(Value::Command(ApiCommand::Loft {
+                    label: args.label()?,
+                    sections,
+                    operation: args.operation()?,
+                }))
+            }
+            "plane" => world_plane(&args).map(Value::Plane),
             "revolve" => Ok(Value::Command(ApiCommand::Revolve {
                 label: args.label()?,
                 sketch: args.required("sketch")?.as_step()?,
@@ -1556,7 +1576,7 @@ impl<'a> Interp<'a> {
                 }))
             }
             other => Err(ScriptError::eval(format!(
-                "Unknown function `{other}`; the features are box, cylinder, sketch, extrude, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, union, difference and intersection{}",
+                "Unknown function `{other}`; the features are box, cylinder, sketch, plane, extrude, loft, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, union, difference and intersection{}",
                 if self.functions.is_empty() {
                     String::new()
                 } else {
@@ -1821,6 +1841,8 @@ enum Value {
         step: StepLabel,
         faces: BTreeMap<String, EntitySelector>,
     },
+    /// A plane resolved to a frame by `plane(...)`, for `sketch(on: ...)`.
+    Plane(PlanarFrame3),
     /// What a function without a `return` value evaluates to.
     Unit,
 }
@@ -1844,6 +1866,7 @@ impl Value {
                     faces.keys().cloned().collect::<Vec<_>>().join(", ")
                 }
             ),
+            Self::Plane(_) => "a plane".to_owned(),
             Self::Unit => "nothing".to_owned(),
         }
     }
@@ -2218,17 +2241,105 @@ fn sketch_plane(value: &Value) -> Result<SketchPlane, ScriptError> {
             "XZ" => Ok(SketchPlane::XZ),
             "YZ" => Ok(SketchPlane::YZ),
             _ => Err(ScriptError::eval(format!(
-                "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, not \"{name}\""
+                "sketch(): `on` is \"XY\", \"XZ\", \"YZ\", a plane(...) or a face selector, not \"{name}\""
             ))),
         },
         Value::Selector(selector) => Ok(SketchPlane::OnFace {
             face: selector.clone(),
         }),
+        Value::Plane(frame) => Ok(SketchPlane::Frame { frame: *frame }),
         other => Err(ScriptError::eval(format!(
-            "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, got {}",
+            "sketch(): `on` is \"XY\", \"XZ\", \"YZ\", a plane(...) or a face selector, got {}",
             other.describe()
         ))),
     }
+}
+
+/// The frame of one of the three world planes: its origin, and the axes a
+/// sketch on it uses, whose cross product is the side it faces.
+pub(crate) fn world_plane_frame(name: &str) -> Option<PlanarFrame3> {
+    let origin = Point3::new(0.0, 0.0, 0.0);
+    let (u, v) = match name.to_ascii_uppercase().as_str() {
+        "XY" => (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)),
+        "XZ" => (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        "YZ" => (Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        _ => return None,
+    };
+    Some(PlanarFrame3::new(origin, u, v))
+}
+
+/// `plane(...)`: a world plane as a frame.
+///
+/// - `plane(from: "XY", offset: 30)` is a world plane moved along the side it
+///   faces — +Z for XY, −Y for XZ, +X for YZ, the sides their sketches face.
+/// - `plane(origin: [...], normal: [...], x_axis: [...])` faces `normal`,
+///   with its `u` axis along `x_axis` turned into the plane.
+/// - `plane(origin: [...], x_axis: [...], y_axis: [...])` takes its two axes
+///   as given, which is how a decompiled script writes a plane back exactly.
+fn world_plane(args: &Args<'_>) -> Result<PlanarFrame3, ScriptError> {
+    let length =
+        |vector: Vector3| (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+    if let Some(from) = args.values.get("from") {
+        let name = from.as_string()?;
+        let frame = world_plane_frame(name).ok_or_else(|| {
+            ScriptError::eval(format!(
+                "plane(): `from` is \"XY\", \"XZ\" or \"YZ\", not \"{name}\""
+            ))
+        })?;
+        let offset = args.number_or("offset", 0.0)?;
+        if !offset.is_finite() {
+            return Err(ScriptError::eval(
+                "plane(): `offset` must be a finite length",
+            ));
+        }
+        let (u, v) = (frame.u, frame.v);
+        let normal = Vector3::new(
+            u.y * v.z - u.z * v.y,
+            u.z * v.x - u.x * v.z,
+            u.x * v.y - u.y * v.x,
+        );
+        return Ok(PlanarFrame3::new(
+            Point3::new(normal.x * offset, normal.y * offset, normal.z * offset),
+            u,
+            v,
+        ));
+    }
+    let origin = args.point3_or("origin", Point3::new(0.0, 0.0, 0.0))?;
+    let x_axis = args.required("x_axis")?.as_vector3()?;
+    if let Some(y_axis) = args.values.get("y_axis") {
+        return Ok(PlanarFrame3::new(origin, x_axis, y_axis.as_vector3()?));
+    }
+    let normal = args.required("normal")?.as_vector3()?;
+    let normal_length = length(normal);
+    if !normal_length.is_finite() || normal_length == 0.0 {
+        return Err(ScriptError::eval(
+            "plane(): `normal` must be a non-zero direction",
+        ));
+    }
+    let n = Vector3::new(
+        normal.x / normal_length,
+        normal.y / normal_length,
+        normal.z / normal_length,
+    );
+    let along = x_axis.x * n.x + x_axis.y * n.y + x_axis.z * n.z;
+    let u = Vector3::new(
+        x_axis.x - n.x * along,
+        x_axis.y - n.y * along,
+        x_axis.z - n.z * along,
+    );
+    let u_length = length(u);
+    if !u_length.is_finite() || u_length <= 1.0e-9 * length(x_axis).max(1.0) {
+        return Err(ScriptError::eval(
+            "plane(): `x_axis` must not run along `normal`; it names the direction in the plane its sketches take as x",
+        ));
+    }
+    let u = Vector3::new(u.x / u_length, u.y / u_length, u.z / u_length);
+    let v = Vector3::new(
+        n.y * u.z - n.z * u.y,
+        n.z * u.x - n.x * u.z,
+        n.x * u.y - n.y * u.x,
+    );
+    Ok(PlanarFrame3::new(origin, u, v))
 }
 
 fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {

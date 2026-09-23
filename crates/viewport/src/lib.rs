@@ -3896,6 +3896,10 @@ const SILHOUETTE_SWEEP_CHORDS: usize = 96;
 /// condition `n(u, v) · view = 0` for `v` at each step, which is one `atan2`
 /// per sample rather than a numeric root search.
 fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[Point3; 2]> {
+    // A ruled wall has no revolved frame; the kernel solves its silhouette.
+    if let DisplaySurface::Ruled { .. } = carrier.surface {
+        return carrier.surface.ruled_silhouette(carrier.domain, view);
+    }
     let (_, axis, radial_u, radial_v, angular_sign) = carrier.surface.frame();
     let [[u_min, u_max], [v_min, v_max]] = carrier.domain;
     if !(u_min < u_max && v_min < v_max) || angular_sign == 0.0 {
@@ -3960,6 +3964,7 @@ fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[P
             }
             chords
         }
+        DisplaySurface::Ruled { .. } => Vec::new(),
     }
 }
 

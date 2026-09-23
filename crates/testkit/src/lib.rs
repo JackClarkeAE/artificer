@@ -576,6 +576,7 @@ pub fn validate_case(case: &KernelCase) -> Result<(), TestkitError> {
             KernelCommand::ExtrudePolygon { .. } => "native.extrude_polygon.v0",
             KernelCommand::ExtrudePlanarProfile { .. } => "native.extrude_planar_profile.v0",
             KernelCommand::LoftPlanarProfileOffset { .. } => "native.loft_planar_profile_offset.v0",
+            KernelCommand::LoftPlanarSections { .. } => "native.loft_planar_sections.v0",
             KernelCommand::RevolvePlanarProfile { .. } => "native.revolve_planar_profile.v0",
             KernelCommand::ExtrudeFaceProfile { .. } => "native.extrude_face_profile.v0",
             KernelCommand::ExtrudeFacePlanarProfile { .. } => {

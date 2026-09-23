@@ -1155,6 +1155,85 @@ pub(crate) fn subtract_crossing_profile(
     .ok_or_else(|| face_error(FaceFeatureInputError::SweepCollision))
 }
 
+/// Joins a body and a tool, or takes the tool away from the body, through the
+/// same BSP tier, from the two tessellations: the faceted rung of a Boolean
+/// whose operands the exact engines do not carry — a loft's ruled walls
+/// (ADR 0049). The tool's faces become feature faces, as a cutter's are, so
+/// the panels of one of its walls read as one surface. The caller still runs
+/// the ordinary solid validator before commit.
+pub(crate) fn combine_bodies(
+    body: &DebugScene,
+    tool: &DebugScene,
+    add: bool,
+    precision: PrecisionPolicy,
+) -> Option<Topology> {
+    let epsilon = precision
+        .linear_agreement
+        .max(precision.modeling_resolution)
+        .max(1.0e-8)
+        * 16.0;
+    let first_side_role = body
+        .triangles
+        .iter()
+        .filter_map(|triangle| match triangle.role {
+            FaceRole::FeatureSide(role) if role < u32::MAX - 1 => Some(role),
+            _ => None,
+        })
+        .max()
+        .map_or(0, |role| role.saturating_add(1));
+    let body_polygons = body
+        .triangles
+        .iter()
+        .filter_map(|triangle| {
+            Polygon::new(
+                triangle.vertices.map(internal_point).to_vec(),
+                triangle.role,
+                epsilon,
+            )
+        })
+        .collect::<Vec<_>>();
+    let tool_polygons = tool
+        .triangles
+        .iter()
+        .filter_map(|triangle| {
+            let role = match triangle.role {
+                FaceRole::ExtrusionSide(side) | FaceRole::FeatureSide(side) => {
+                    FaceRole::FeatureSide(first_side_role.saturating_add(side))
+                }
+                _ => FaceRole::FeatureEnd,
+            };
+            Polygon::new(
+                triangle.vertices.map(internal_point).to_vec(),
+                role,
+                epsilon,
+            )
+        })
+        .collect::<Vec<_>>();
+    if body_polygons.is_empty()
+        || tool_polygons.is_empty()
+        || body_polygons.len() + tool_polygons.len() > 2 * MAX_SOURCE_POLYGONS
+    {
+        return None;
+    }
+    let body = BspNode::from_polygons(body_polygons, epsilon);
+    let tool = BspNode::from_polygons(tool_polygons, epsilon);
+    let result = if add {
+        union(body, tool)
+    } else {
+        subtract(body, tool)
+    };
+    let maximum_healed_cycle_span = precision
+        .approximation_budget
+        .max(precision.modeling_resolution)
+        .max(precision.min_feature_size)
+        * 512.0;
+    topology_from_polygons_with_heal_limit(
+        result.all_polygons(),
+        epsilon,
+        Some(maximum_healed_cycle_span),
+    )
+}
+
 fn cutter_from_profile(
     regions: &[crate::analytic_extrusion::ValidatedAnalyticRegionExtrusion],
     direction: Vector3,

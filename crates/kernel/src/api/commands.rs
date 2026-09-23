@@ -1,6 +1,6 @@
 //! High-level command types for Artificer
 
-use artificer_protocol::{Point2, Point3, Vector3};
+use artificer_protocol::{PlanarFrame3, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::selectors::EntitySelector;
@@ -52,6 +52,13 @@ pub enum SketchPlane {
     /// otherwise collide with on the wire.
     OnFace {
         face: EntitySelector,
+    },
+    /// Any plane already resolved to a frame: a world plane given by its
+    /// origin and axes, or offset from one of the three above. The frame's
+    /// axes are directions; the kernel normalizes them, and `u × v` is the
+    /// side a sketch on it faces.
+    Frame {
+        frame: PlanarFrame3,
     },
 }
 
@@ -164,6 +171,13 @@ pub enum ApiCommand {
         #[serde(default, skip_serializing_if = "is_zero")]
         draft_degrees: f64,
     },
+    /// A loft between the regions of two sketches, each on its own plane
+    /// (ADR 0049). A new body, or an add or cut against the current one.
+    Loft {
+        label: String,
+        sections: Vec<StepLabel>,
+        operation: ExtrudeOp,
+    },
     Revolve {
         label: String,
         sketch: StepLabel,
@@ -252,6 +266,7 @@ impl ApiCommand {
             Self::MakeCylinder { .. } => "make_cylinder",
             Self::Sketch { .. } => "sketch",
             Self::Extrude { .. } => "extrude",
+            Self::Loft { .. } => "loft",
             Self::Revolve { .. } => "revolve",
             Self::PushPull { .. } => "push_pull",
             Self::DrillHole { .. } => "drill_hole",
@@ -274,6 +289,7 @@ impl ApiCommand {
             | Self::MakeCylinder { label, .. }
             | Self::Sketch { label, .. }
             | Self::Extrude { label, .. }
+            | Self::Loft { label, .. }
             | Self::Revolve { label, .. }
             | Self::PushPull { label, .. }
             | Self::DrillHole { label, .. }

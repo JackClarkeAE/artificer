@@ -1096,7 +1096,7 @@ fn resolve_geometric_selector(
                             DisplaySurface::Cylinder { radius, .. }
                             | DisplaySurface::Sphere { radius, .. } => Some(radius),
                             DisplaySurface::Torus { minor_radius, .. } => Some(minor_radius),
-                            DisplaySurface::Cone { .. } => None,
+                            DisplaySurface::Cone { .. } | DisplaySurface::Ruled { .. } => None,
                         };
                         if let Some(radius) = radius {
                             scores.insert(carrier.source_face.entity, radius);

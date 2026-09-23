@@ -16,6 +16,12 @@ those is a UX decision rather than plumbing. Also outstanding from Phase 1:
 relation glyphs (they belong with P5, which Phase 3 schedules) and a live
 worker-computed revolve preview.
 
+> **Superseded in part by [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md).**
+> The "Splines / NURBS anywhere" row of *What this programme deliberately
+> does not do*, and F2's "Not doing: … spline sketch entities", no longer
+> hold: ruled surfaces are in the vocabulary, and B-spline curves and
+> surfaces are planned there. The rest of this record stands.
+
 This ADR is a survey-grounded programme, in the manner of the blend
 frontier plan that produced `corner_blend`, `prism_edge_finish`,
 `loop_offset`, `rim_loop_blend`, and `section_revolve`. Every claim about

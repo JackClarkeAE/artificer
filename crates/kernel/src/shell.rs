@@ -291,7 +291,7 @@ fn cap_prism(
                 other_normal.dot(normal).abs() <= agreement
             }
             Surface::Cylinder(cylinder) => cylinder.axis.cross(normal).length() <= agreement,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => false,
+            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) | Surface::Ruled(_) => false,
         };
         if !along {
             return Err(ShellError::DomainUnsupported);
@@ -693,6 +693,12 @@ fn reverse_face(topology: &mut Topology, face_index: usize) -> Option<()> {
         Surface::Cone(cone) => {
             cone.angular_sign = -cone.angular_sign;
             |point: Point2| Point2::new(-point.x, point.y)
+        }
+        // A ruled surface walks `u` the other way along both rails, which
+        // mirrors its unit parameter square about `u = ½`.
+        Surface::Ruled(ruled) => {
+            *ruled = ruled.reversed_u();
+            |point: Point2| Point2::new(1.0 - point.x, point.y)
         }
         // A torus and a sphere pin their frame to their angular sign, so
         // the outward normal is always the geometric one: the material

@@ -24,6 +24,7 @@ mod analytic_boolean;
 mod hole_rim_blend;
 #[allow(dead_code)]
 mod loft;
+mod loft_sections;
 mod loop_offset;
 mod mirror;
 mod pattern;
@@ -34,6 +35,7 @@ mod profile_boolean;
 mod push_pull;
 mod revolve;
 mod rim_loop_blend;
+mod ruled;
 mod section_revolve;
 mod sew;
 mod shell;
@@ -56,8 +58,8 @@ use artificer_protocol::{
     Diagnostic as ProtocolDiagnostic, DiagnosticCode as ProtocolDiagnosticCode,
     DiagnosticMeasurement, DiagnosticSeverity, EntityId as ProtocolEntityId, EntityKind, EntityRef,
     ExecuteRequest, FaceExtrusionOperation, HistoryRecord, HistoryRelation, KernelCommand,
-    KernelError, KernelErrorCode, KernelStage, NumericInterval, OperationReport, OperationRole,
-    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
+    KernelError, KernelErrorCode, KernelStage, LoftOperation, NumericInterval, OperationReport,
+    OperationRole, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
     Point2 as ProtocolPoint2, Point3 as ProtocolPoint3, PrecisionPolicy, QuantityKind,
     SemanticDigest, SnapshotId, TopologyCounts as ProtocolTopologyCounts, ValidationProfile,
     ValidationReport as ProtocolValidationReport, Vector3 as ProtocolVector3,
@@ -84,7 +86,8 @@ use crate::topology::{
 use crate::transform::{Similarity, TransformInputError, transform_topology};
 
 pub use crate::describe::{
-    EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, SurfaceCounts,
+    EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, RailGeometry, RailKind,
+    SurfaceCounts,
 };
 pub use crate::step_export::{StepBody, StepPlacement};
 pub use crate::topology::FaceRole;
@@ -261,6 +264,99 @@ pub enum DisplaySurface {
         minor_radius: f64,
         angular_sign: f64,
     },
+    /// The straight lines between two rails (ADR 0049), `(1 − v)·C₀(u) +
+    /// v·C₁(u)`. It has no revolved frame: [`Self::frame`] reports none, and
+    /// its silhouette comes from [`Self::ruled_silhouette`].
+    Ruled { rails: [DisplayRail; 2] },
+}
+
+/// One rail of a ruled display carrier: a conic walked from `start` to `end`
+/// in its own parameter as `u` runs from zero to one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DisplayRail {
+    Line {
+        start: ProtocolPoint3,
+        end: ProtocolPoint3,
+    },
+    /// `center + u·a·cos t + v·b·sin t`; a circle has `a = b`.
+    Conic {
+        center: ProtocolPoint3,
+        u: ProtocolVector3,
+        v: ProtocolVector3,
+        major_radius: f64,
+        minor_radius: f64,
+        start: f64,
+        end: f64,
+    },
+}
+
+impl DisplayRail {
+    fn internal(self) -> ruled::RuledRail {
+        match self {
+            Self::Line { start, end } => ruled::RuledRail {
+                curve: ruled::RailCurve::Line {
+                    endpoints: [internal_point(start), internal_point(end)],
+                },
+                range: topology::ParameterRange::new(0.0, 1.0),
+            },
+            Self::Conic {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                start,
+                end,
+            } => ruled::RuledRail {
+                curve: ruled::RailCurve::Ellipse {
+                    center: internal_point(center),
+                    u: Vector3::new(u.x, u.y, u.z),
+                    v: Vector3::new(v.x, v.y, v.z),
+                    major_radius,
+                    minor_radius,
+                },
+                range: topology::ParameterRange::new(start, end),
+            },
+        }
+    }
+
+    fn from_internal(rail: ruled::RuledRail) -> Self {
+        match rail.curve {
+            ruled::RailCurve::Line { endpoints } => Self::Line {
+                start: protocol_point(endpoints[0]),
+                end: protocol_point(endpoints[1]),
+            },
+            ruled::RailCurve::Circle {
+                center,
+                u,
+                v,
+                radius,
+            } => Self::Conic {
+                center: protocol_point(center),
+                u: protocol_vector(u),
+                v: protocol_vector(v),
+                major_radius: radius,
+                minor_radius: radius,
+                start: rail.range.start,
+                end: rail.range.end,
+            },
+            ruled::RailCurve::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => Self::Conic {
+                center: protocol_point(center),
+                u: protocol_vector(u),
+                v: protocol_vector(v),
+                major_radius,
+                minor_radius,
+                start: rail.range.start,
+                end: rail.range.end,
+            },
+        }
+    }
 }
 
 impl DisplaySurface {
@@ -268,6 +364,12 @@ impl DisplaySurface {
     /// parameterisation.
     #[must_use]
     pub fn evaluate(self, u: f64, v: f64) -> ProtocolPoint3 {
+        if let Self::Ruled { rails } = self {
+            let surface = ruled::RuledSurface {
+                rails: rails.map(DisplayRail::internal),
+            };
+            return protocol_point(surface.evaluate(topology::Point2::new(u, v)));
+        }
         let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
         let angle = angular_sign * u;
         let (sin, cos) = topology::seam_snapped_sin_cos(angle);
@@ -296,6 +398,7 @@ impl DisplaySurface {
                     minor_radius * sin_v,
                 )
             }
+            Self::Ruled { .. } => (0.0, 0.0),
         };
         ProtocolPoint3::new(
             radial.x.mul_add(ring, axis.x.mul_add(lift, origin.x)),
@@ -304,7 +407,9 @@ impl DisplaySurface {
         )
     }
 
-    /// `(origin, axis, radial_u, radial_v, angular_sign)`, shared by every arm.
+    /// `(origin, axis, radial_u, radial_v, angular_sign)`, shared by every
+    /// revolved arm. A ruled carrier has no such frame and reports zeros,
+    /// with a zero angular sign.
     #[must_use]
     pub const fn frame(
         self,
@@ -348,7 +453,89 @@ impl DisplaySurface {
                 angular_sign,
                 ..
             } => (origin, axis, radial_u, radial_v, angular_sign),
+            Self::Ruled { .. } => {
+                let zero = ProtocolVector3::new(0.0, 0.0, 0.0);
+                (ProtocolPoint3::new(0.0, 0.0, 0.0), zero, zero, zero, 0.0)
+            }
         }
+    }
+
+    /// The chords along which a ruled carrier turns away from a viewer
+    /// looking along `view`, within `domain`; empty for any other carrier.
+    ///
+    /// The normal `(∂S/∂u) × (∂S/∂v)` of a ruled surface is linear in `v`
+    /// along each rung, so `n · view` is known exactly along every rung from
+    /// its two ends. Presentation sweeps `u` in strips and, in each, joins
+    /// the points where `n · view` changes sign around the strip's boundary —
+    /// along a rung, where the linear form solves in one division, or along
+    /// a rail. A developable wall, whose silhouette is a whole rung, and a
+    /// twisted one, whose silhouette crosses the rungs, are both found.
+    #[must_use]
+    pub fn ruled_silhouette(
+        self,
+        domain: [[f64; 2]; 2],
+        view: [f64; 3],
+    ) -> Vec<[ProtocolPoint3; 2]> {
+        let Self::Ruled { rails } = self else {
+            return Vec::new();
+        };
+        let surface = ruled::RuledSurface {
+            rails: rails.map(DisplayRail::internal),
+        };
+        let [[u_min, u_max], [v_min, v_max]] = domain;
+        if !(u_min < u_max && v_min < v_max) {
+            return Vec::new();
+        }
+        let view = Vector3::new(view[0], view[1], view[2]);
+        // A value within rounding of zero is zero, and zero counts with the
+        // positive side, so a silhouette lying exactly along the rung two
+        // walls share is drawn by one of them and not lost between both.
+        let facing = |u: f64, v: f64| {
+            let normal = surface.normal(topology::Point2::new(u, v));
+            let value = normal.dot(view);
+            if value.abs() <= 1.0e-12 * normal.length() * view.length() {
+                0.0
+            } else {
+                value
+            }
+        };
+        // Where a linear form through `from` and `to` crosses zero, as a
+        // fraction of the way along.
+        let crossing = |from: f64, to: f64| {
+            ((from < 0.0) != (to < 0.0))
+                .then(|| from / (from - to))
+                .filter(|fraction| fraction.is_finite())
+        };
+        const STEPS: usize = 64;
+        let mut chords = Vec::new();
+        let at = |step: usize| (u_max - u_min).mul_add(step as f64 / STEPS as f64, u_min);
+        let mut left = (facing(at(0), v_min), facing(at(0), v_max));
+        for step in 0..STEPS {
+            let (u0, u1) = (at(step), at(step + 1));
+            let right = (facing(u1, v_min), facing(u1, v_max));
+            let mut points = Vec::with_capacity(4);
+            if let Some(t) = crossing(left.0, right.0) {
+                points.push(((u1 - u0).mul_add(t, u0), v_min));
+            }
+            if let Some(t) = crossing(right.0, right.1) {
+                points.push((u1, (v_max - v_min).mul_add(t, v_min)));
+            }
+            if let Some(t) = crossing(right.1, left.1) {
+                points.push(((u0 - u1).mul_add(t, u1), v_max));
+            }
+            if let Some(t) = crossing(left.1, left.0) {
+                points.push((u0, (v_min - v_max).mul_add(t, v_max)));
+            }
+            for pair in points.chunks_exact(2) {
+                chords.push(
+                    [pair[0], pair[1]].map(|(u, v)| {
+                        protocol_point(surface.evaluate(topology::Point2::new(u, v)))
+                    }),
+                );
+            }
+            left = right;
+        }
+        chords
     }
 }
 
@@ -745,6 +932,34 @@ impl NativeKernel {
                     )
                     .map_err(|reason| loft_input_error(input.id, reason))?;
                     (loft::build_offset_loft(&loft), HistoryMode::Generated)
+                }
+            }
+            KernelCommand::LoftPlanarSections {
+                sections,
+                operation,
+            } => {
+                if *operation == LoftOperation::New {
+                    validate_extrusion_source(input)?;
+                }
+                let loft = loft_sections::validate_loft_sections(sections, request.precision)
+                    .map_err(|reason| loft_sections_error(input.id, reason))?;
+                let tool = loft_sections::build_loft_sections(&loft);
+                match operation {
+                    LoftOperation::New => {
+                        rung = "loft/sections";
+                        (tool, HistoryMode::Generated)
+                    }
+                    LoftOperation::Add | LoftOperation::Cut => {
+                        let (topology, answered) = loft_boolean(
+                            input,
+                            tool,
+                            *operation == LoftOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
                 }
             }
             KernelCommand::ExtrudeFaceProfile {
@@ -2375,6 +2590,17 @@ impl NativeKernel {
                     )
                 });
             }
+            Surface::Ruled(ruled) => {
+                return ruled_face_area(&snapshot.topology, face, ruled).ok_or_else(|| {
+                    error(
+                        KernelErrorCode::InvalidInput,
+                        KernelStage::Preflight,
+                        snapshot.id,
+                        "the requested ruled face area could not be evaluated",
+                        Vec::new(),
+                    )
+                });
+            }
         };
         Ok(parameter_area * jacobian)
     }
@@ -2558,6 +2784,25 @@ impl NativeKernel {
                             ));
                         }
                     }
+                    // The ruled tessellator knows each vertex's parameters,
+                    // so its normals come from them rather than from
+                    // inverting the vertex back onto the surface.
+                    Surface::Ruled(ruled) => {
+                        for (vertices, normals) in tessellate_ruled_face(
+                            &snapshot.topology,
+                            &face.value,
+                            ruled,
+                            budget,
+                            precision,
+                        ) {
+                            triangles.push(DebugTriangle {
+                                vertices: vertices.map(protocol_point),
+                                normals: normals.map(protocol_vector),
+                                source_face,
+                                role: snapshot.topology.faces[index].value.role,
+                            });
+                        }
+                    }
                 }
                 triangles
             },
@@ -2698,6 +2943,9 @@ fn display_carriers(snapshot: &Snapshot) -> Vec<DisplayCarrier> {
                     major_radius: torus.major_radius,
                     minor_radius: torus.minor_radius,
                     angular_sign: torus.angular_sign,
+                },
+                Surface::Ruled(ruled) => DisplaySurface::Ruled {
+                    rails: ruled.rails.map(DisplayRail::from_internal),
                 },
             };
             Some(DisplayCarrier {
@@ -3049,6 +3297,10 @@ fn presentation_edge_classification(
         .evaluate((edge.parameter_range.start + edge.parameter_range.end) * 0.5);
     let first_surface = topology.faces[*first].value.surface;
     let second_surface = topology.faces[*second].value.surface;
+    if matches!(first_surface, Surface::Ruled(_)) || matches!(second_surface, Surface::Ruled(_)) {
+        return ruled_edge_classification(topology, [*first, *second], edge_index)
+            .unwrap_or_else(hard);
+    }
     let normal = |surface: Surface| -> Option<Vector3> {
         let normal = match surface {
             Surface::Plane(plane) => plane.normal,
@@ -3102,6 +3354,8 @@ fn presentation_edge_classification(
                 }
                 relative - cylinder.axis * (relative.dot(cylinder.axis) / axis_denominator)
             }
+            // Classified along the whole edge by `ruled_edge_classification`.
+            Surface::Ruled(_) => return None,
         };
         let length = normal.length();
         (length > f64::EPSILON).then(|| normal / length)
@@ -3271,6 +3525,79 @@ fn presentation_edge_classification(
     }
 }
 
+/// The presentation class of an edge with a ruled face on either side.
+///
+/// A ruled surface's normal turns along a rung, so the two faces are
+/// compared at five points along the whole edge, not at its middle: a rung
+/// where two walls meet at a square corner at one end and tangentially at
+/// the other is a crease, and only an edge whose normals agree everywhere
+/// along it is tangent. Two walls that are one ruled surface split at a
+/// rung — the halves of a full circle's wall — are one carrier, and the
+/// rung between them is a seam that does not draw.
+fn ruled_edge_classification(
+    topology: &Topology,
+    faces: [usize; 2],
+    edge_index: usize,
+) -> Option<PresentationEdgeClassification> {
+    let edge = topology.edges.get(edge_index)?.value;
+    let range = edge.parameter_range;
+    let normal_at = |face_index: usize, fraction: f64| -> Option<Vector3> {
+        let face = &topology.faces.get(face_index)?.value;
+        match face.surface {
+            Surface::Ruled(ruled) => {
+                let coedge = face
+                    .loops()
+                    .filter_map(|loop_key| topology.loop_record(loop_key))
+                    .flat_map(|loop_record| loop_record.value.coedges.iter())
+                    .filter_map(|coedge_key| topology.coedge(*coedge_key))
+                    .find(|coedge| coedge.value.edge.0 == edge_index)?
+                    .value;
+                let along = match coedge.orientation {
+                    Orientation::Forward => fraction,
+                    Orientation::Reverse => 1.0 - fraction,
+                };
+                let span = coedge.parameter_range;
+                let parameters = coedge
+                    .pcurve
+                    .evaluate((span.end - span.start).mul_add(along, span.start));
+                ruled.unit_normal(parameters)
+            }
+            surface => {
+                let point = edge
+                    .curve
+                    .evaluate((range.end - range.start).mul_add(fraction, range.start));
+                surface.outward_normal_at(point)
+            }
+        }
+    };
+    let mut worst = 1.0_f64;
+    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let first = normal_at(faces[0], fraction)?;
+        let second = normal_at(faces[1], fraction)?;
+        worst = worst.min(first.dot(second).abs());
+    }
+    let same_carrier = match (
+        topology.faces[faces[0]].value.surface,
+        topology.faces[faces[1]].value.surface,
+    ) {
+        (Surface::Ruled(first), Surface::Ruled(second)) => {
+            first.rails.iter().zip(&second.rails).all(|(left, right)| {
+                left.curve == right.curve
+                    && (left.range.end - left.range.start) == (right.range.end - right.range.start)
+            })
+        }
+        _ => false,
+    };
+    let low_dihedral = worst >= 15.0_f64.to_radians().cos();
+    let smooth = same_carrier && low_dihedral;
+    Some(PresentationEdgeClassification {
+        smooth,
+        tangent: !smooth && !same_carrier && worst >= 1.0 - 1.0e-9,
+        coplanar_subdivision: false,
+        same_feature_side_role: None,
+    })
+}
+
 /// Why the exact route declined a face feature, kept so that whatever tier
 /// answers instead — or refuses — can say what it was standing in for.
 #[derive(Clone, Copy, Debug)]
@@ -3313,11 +3640,9 @@ impl ExactRouteDecline {
 
     fn sentence(self) -> String {
         match self {
-            Self::Vocabulary => {
-                "the body carries a face class — a torus, a cone or a sphere — that \
-                                 the exact engine cannot sew"
-                    .to_owned()
-            }
+            Self::Vocabulary => "the body carries a face class — a torus, a cone, a sphere or a \
+                                 ruled wall — that the exact engine cannot sew"
+                .to_owned(),
             Self::CarrierPair { first, second } => format!(
                 "the {first} and {second} carriers meet in a curve outside this kernel's line and \
                  circle vocabulary"
@@ -3343,8 +3668,13 @@ impl ExactRouteDecline {
     /// an approximation, an error beside a refusal. The code is the same
     /// either way, because the fact it states is.
     fn diagnostic(self, severity: DiagnosticSeverity) -> ProtocolDiagnostic {
+        self.diagnostic_coded("FACE_FEATURE_EXACT_ROUTE_DECLINED", severity)
+    }
+
+    /// The same statement under another feature's code.
+    fn diagnostic_coded(self, code: &str, severity: DiagnosticSeverity) -> ProtocolDiagnostic {
         let mut diagnostic = simple_diagnostic(
-            "FACE_FEATURE_EXACT_ROUTE_DECLINED",
+            code,
             KernelStage::Construction,
             &format!(
                 "The exact route declined this feature first: {}.",
@@ -3478,6 +3808,131 @@ fn faceted_candidate_refusal(
         "the faceted cut could not be regularized into a closed solid",
         diagnostics,
     ))
+}
+
+/// A loft added to or cut from a body, through the Boolean ladder: the prism
+/// reduction, then the analytic engine where it carries both operands, then
+/// the faceted tier with its label. Returns the body and the rung that
+/// answered.
+///
+/// The loft is certified as a solid before it meets the body, so an invalid
+/// tool never reaches any tier. A loft whose walls all came out as planes,
+/// cylinders or cones — a frustum, say — is inside the exact engines' reach;
+/// a ruled wall is not (ADR 0049), and the engines decline it by name.
+fn loft_boolean(
+    input: &Snapshot,
+    tool: Topology,
+    add: bool,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<(Topology, &'static str), KernelError> {
+    if input.topology.solids.is_empty() {
+        return Err(simple_invalid_input(
+            input.id,
+            "LOFT_TARGET_EMPTY",
+            "An add or cut loft needs a body to combine with; a loft of its own is a new body.",
+        ));
+    }
+    let tool_validation = validator::validate(&tool, precision.linear_agreement);
+    if !tool_validation.diagnostics.is_empty() {
+        return Err(error(
+            KernelErrorCode::ValidationFailed,
+            KernelStage::Validation,
+            input.id,
+            "the loft failed solid validation before it was combined with the body",
+            protocol_validation(input.id, ValidationProfile::Solid, &tool_validation).diagnostics,
+        ));
+    }
+    let (operation, face_operation) = if add {
+        (BooleanOperation::Union, FaceExtrusionOperation::Add)
+    } else {
+        (BooleanOperation::Difference, FaceExtrusionOperation::Cut)
+    };
+    if let Ok(topology) =
+        prism_boolean::build_prism_boolean(&input.topology, &tool, operation, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, "loft/boolean-prism"));
+    }
+    let decline = if analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool) {
+        match analytic_boolean::build_analytic_boolean(&input.topology, &tool, operation, precision)
+            .map_err(ExactRouteDecline::from_engine)
+            .and_then(|topology| exact_candidate(topology, precision))
+        {
+            Ok(topology) => return Ok((topology, "loft/boolean-analytic")),
+            Err(decline) => decline,
+        }
+    } else {
+        ExactRouteDecline::Vocabulary
+    };
+    let declined = |mut refusal: KernelError| {
+        for diagnostic in &mut refusal.diagnostics {
+            if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
+                diagnostic.code = ProtocolDiagnosticCode::new("LOFT_FACETED_UNRESOLVED");
+            }
+        }
+        refusal.diagnostics.insert(
+            0,
+            decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Error),
+        );
+        refusal
+    };
+    // The faceted tier works on the body and the loft as tessellated at a
+    // bounded budget, as the face-feature tier does: a dense tessellation is
+    // an unsuitable Boolean operand.
+    let mut boolean_precision = precision;
+    boolean_precision.max_subdivisions = boolean_precision.max_subdivisions.min(4);
+    let scene_of = |topology: &Topology| {
+        let digest = semantic_digest(topology, boolean_precision);
+        NativeKernel::authoritative_scene(&Snapshot {
+            id: snapshot_id(digest),
+            semantic_digest: digest,
+            precision: Some(boolean_precision),
+            topology: topology.clone(),
+            measures: SnapshotMeasures::default(),
+        })
+    };
+    let topology = faceted_boolean::combine_bodies(
+        &scene_of(&input.topology),
+        &scene_of(&tool),
+        add,
+        precision,
+    )
+    .ok_or_else(|| {
+        declined(error(
+            KernelErrorCode::Unsupported,
+            KernelStage::Construction,
+            input.id,
+            "the faceted tier could not combine the loft with the body",
+            vec![simple_diagnostic(
+                "LOFT_FACETED_UNRESOLVED",
+                KernelStage::Construction,
+                "The loft and the body were rebuilt from their tessellations, but the rebuilt \
+                 shell did not close within the approximation budget.",
+            )],
+        ))
+    })?;
+    certify_faceted_candidate(input.id, &topology, precision).map_err(declined)?;
+    certify_faceted_change(
+        input.id,
+        &input.topology,
+        &topology,
+        face_operation,
+        precision,
+    )
+    .map_err(declined)?;
+    warnings.push(approximation_warning(
+        "LOFT_FACETED_APPROXIMATION",
+        "The exact Boolean engines do not carry this loft's walls, so the loft and the body \
+         were combined from their tessellations. The result's faces, edges and measures \
+         approximate the true solid rather than certifying it. Why the exact route stood aside \
+         is the LOFT_EXACT_ROUTE_DECLINED diagnostic beside this one.",
+    ));
+    warnings
+        .push(decline.diagnostic_coded("LOFT_EXACT_ROUTE_DECLINED", DiagnosticSeverity::Warning));
+    Ok((topology, "loft/faceted"))
 }
 
 /// The edge-finish ladder beyond the six-plane cuboid: each exact rung runs
@@ -4063,6 +4518,11 @@ fn chord_deviations(
                     sagitta(torus.major_radius + torus.minor_radius, u_max - u_min)
                         + sagitta(torus.minor_radius, v_max - v_min)
                 }
+                // The tessellator's own figure: the rails' sagitta plus the
+                // twist a quad of the band can stand off its two triangles.
+                (Surface::Ruled(ruled), Some(domain)) => {
+                    ruled_columns(ruled, domain, budget, precision).1
+                }
             };
             let rim = face
                 .loops()
@@ -4553,6 +5013,18 @@ fn tessellate_sphere_face(
     triangles
 }
 
+/// Area of a ruled face over its rectangular parameter domain, by the same
+/// quadrature the body's measures use (ADR 0049).
+fn ruled_face_area(
+    topology: &Topology,
+    face: &topology::Face,
+    ruled: ruled::RuledSurface,
+) -> Option<f64> {
+    let domain = face_parameter_bounds(topology, face)?;
+    let area = ruled.measures(domain, ruled.rails[0].point(0.0)).area;
+    area.is_finite().then_some(area)
+}
+
 /// Exact lateral area of a cone-frustum face from its rectangular p-curve
 /// bounds: `A = sqrt(1 + slope^2) * sweep * mean_ring_radius * dv`.
 fn cone_face_area(topology: &Topology, face: &topology::Face, cone: topology::Cone) -> Option<f64> {
@@ -4627,6 +5099,129 @@ fn tessellate_cone_face(
         let d = cone.evaluate(topology::Point2::new(u0, v_max));
         triangles.push([a, b, c]);
         triangles.push([a, c, d]);
+    }
+    triangles
+}
+
+/// How many columns a ruled face's display strip needs, and how far those
+/// facets can then sit from the face.
+///
+/// A ruled face is tessellated as one band of quads between its rails, like
+/// a cone's: its rungs are straight, so nothing is lost along `v`. Across
+/// `u` two things bend it away from its chords. A rail that is an arc sags
+/// from its chord, as any arc does. And a wall whose two rails do not run
+/// parallel is twisted: a quad of it spanning `du` is a hyperbolic
+/// paraboloid, which stands off the two triangles of its corners by at most
+/// a quarter of the twist `∂²S/∂u∂v` — its part across the wall, the part
+/// along it moves nothing off the wall — times `du`. The column count covers
+/// both, and is a multiple of each rail's own edge chord count, so the
+/// face's samples along a rail are the edge's own samples or lie between
+/// them.
+fn ruled_columns(
+    ruled: ruled::RuledSurface,
+    domain: (f64, f64, f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> (usize, f64) {
+    let (u_min, u_max, _, _) = domain;
+    let fraction = (u_max - u_min).abs();
+    let maximum = 1_usize << precision.max_subdivisions.min(12);
+    let mut base = 1_usize;
+    let mut bends = Vec::new();
+    for rail in ruled.rails {
+        if let Some(radius) = rail.curve.bending_radius() {
+            let sweep = rail.sweep() * fraction;
+            let count = arc_subdivisions(radius.abs(), sweep, budget, precision);
+            base = least_common_multiple(base, count).min(maximum);
+            bends.push((radius.abs(), sweep));
+        }
+    }
+    let twist = (0..=16)
+        .map(|index| {
+            let u = (u_max - u_min).mul_add(f64::from(index) / 16.0, u_min);
+            let twist = ruled.rails[1].rate(u) - ruled.rails[0].rate(u);
+            [0.0, 0.5, 1.0]
+                .into_iter()
+                .map(|v| {
+                    ruled
+                        .unit_normal(topology::Point2::new(u, v))
+                        .map_or(twist.length(), |normal| twist.dot(normal).abs())
+                })
+                .fold(0.0_f64, f64::max)
+        })
+        .fold(0.0_f64, f64::max);
+    let tolerance = budget.tolerance(ruled.scale().max(precision.min_feature_size), precision);
+    let needed = (twist * fraction / (4.0 * tolerance)).ceil();
+    let columns = if needed.is_finite() && needed > base as f64 {
+        let multiple = (needed / base as f64).ceil() as usize;
+        base.saturating_mul(multiple).min(maximum).max(base)
+    } else {
+        base
+    };
+    let columns = columns.max(1);
+    let deviation = bends
+        .iter()
+        .map(|(radius, sweep)| chord_sagitta(*radius, sweep / columns as f64))
+        .fold(0.0_f64, f64::max)
+        + twist * fraction / (4.0 * columns as f64);
+    (columns, deviation)
+}
+
+fn least_common_multiple(first: usize, second: usize) -> usize {
+    let (mut a, mut b) = (first.max(1), second.max(1));
+    let product = a.saturating_mul(b);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    product / a
+}
+
+/// One band of quads between a ruled face's rails, each vertex with the
+/// surface's own normal at its parameters.
+fn tessellate_ruled_face(
+    topology: &Topology,
+    face: &topology::Face,
+    ruled: ruled::RuledSurface,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<([Point3; 3], [Vector3; 3])> {
+    let Some(domain) = face_parameter_bounds(topology, face) else {
+        return Vec::new();
+    };
+    let (u_min, u_max, v_min, v_max) = domain;
+    // A loop walked clockwise in the parameters faces the other way.
+    let flipped = validator::face_parameter_area_and_moment(topology, face)
+        .is_some_and(|(area, _)| area < 0.0);
+    let (columns, _) = ruled_columns(ruled, domain, budget, precision);
+    let sample = |u: f64, v: f64| {
+        let parameters = topology::Point2::new(u, v);
+        let normal = ruled
+            .unit_normal(parameters)
+            .map(|normal| if flipped { normal * -1.0 } else { normal });
+        (ruled.evaluate(parameters), normal)
+    };
+    let mut triangles = Vec::with_capacity(columns * 2);
+    let mut low = sample(u_min, v_min);
+    let mut high = sample(u_min, v_max);
+    for column in 0..columns {
+        let u = (u_max - u_min).mul_add((column + 1) as f64 / columns as f64, u_min);
+        let next_low = sample(u, v_min);
+        let next_high = sample(u, v_max);
+        let quad = [low, next_low, next_high, high];
+        for corners in [[0, 1, 2], [0, 2, 3]] {
+            let mut vertices = corners.map(|corner| quad[corner].0);
+            if flipped {
+                vertices.swap(1, 2);
+            }
+            let facet = facet_normal(vertices);
+            let mut normals = corners.map(|corner| quad[corner].1.unwrap_or(facet));
+            if flipped {
+                normals.swap(1, 2);
+            }
+            triangles.push((vertices, normals));
+        }
+        low = next_low;
+        high = next_high;
     }
     triangles
 }
@@ -5715,6 +6310,79 @@ fn loft_input_error(snapshot: SnapshotId, reason: loft::LoftInputError) -> Kerne
     }
 }
 
+fn loft_sections_error(
+    snapshot: SnapshotId,
+    reason: loft_sections::LoftSectionsError,
+) -> KernelError {
+    use loft_sections::LoftSectionsError;
+    match reason {
+        LoftSectionsError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        LoftSectionsError::TooFewSections => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_TOO_FEW_SECTIONS",
+            "a loft needs two sections",
+        ),
+        LoftSectionsError::MultiSection => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "LOFT_MULTI_SECTION_UNSUPPORTED",
+            "a loft through more than two sections needs a surface that stays smooth across the \
+             middle sections, a B-spline surface, which arrives with B-spline curves and \
+             surfaces (ADR 0049, K-B). Loft two sections at a time for now.",
+        ),
+        LoftSectionsError::RegionCount => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTION_REGIONS_UNSUPPORTED",
+            "each loft section must be exactly one region: one outer loop, with any holes \
+             inside it",
+        ),
+        LoftSectionsError::SplineCurve => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "LOFT_SECTION_SPLINE_UNSUPPORTED",
+            "a loft section carries a B-spline curve; B-spline curves enter the vocabulary with \
+             ADR 0049's K-B stage. Draw the section from lines, arcs and circles.",
+        ),
+        LoftSectionsError::Coplanar => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTIONS_COPLANAR",
+            "the two sections lie on one plane, so there is nothing between them to loft",
+        ),
+        LoftSectionsError::CrossesPlane => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTION_CROSSES_PLANE",
+            "a section reaches onto or through the other section's plane, so the loft would \
+             fold through itself; each section must lie wholly beyond the other's plane",
+        ),
+        LoftSectionsError::HoleCountMismatch => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "LOFT_HOLE_COUNT_MISMATCH",
+            "the two sections have different numbers of holes; a loft pairs each hole with one \
+             hole of the other section",
+        ),
+        LoftSectionsError::RungsCross => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_RUNGS_CROSS",
+            "the straight rungs between the sections cross, or the walls between them do, so \
+             the loft would pass through itself. Turn or redraw a section so its corners line \
+             up with the other's.",
+        ),
+        LoftSectionsError::WallDegenerate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_WALL_DEGENERATE",
+            "a wall between the sections pinches to a point or folds flat: somewhere its rung \
+             runs along its rails, and a wall there has no side to face",
+        ),
+    }
+}
+
 fn planar_profile_input_error(
     snapshot: SnapshotId,
     reason: PlanarProfileInputError,
@@ -5997,6 +6665,7 @@ fn validate_transform_candidate(
                 Surface::Torus(torus) => torus.origin,
                 Surface::Cone(cone) => cone.origin,
                 Surface::Sphere(sphere) => sphere.origin,
+                Surface::Ruled(ruled) => ruled.rails[0].point(0.0),
             };
             [point.x, point.y, point.z]
         }))
@@ -7970,6 +8639,52 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
                 hash_f64(&mut hasher, cone.slope);
                 hash_f64(&mut hasher, cone.angular_sign);
             }
+            Surface::Ruled(ruled) => {
+                hasher.update(b"ruled-surface-v0");
+                for rail in ruled.rails {
+                    match rail.curve {
+                        ruled::RailCurve::Line { endpoints } => {
+                            hasher.update(b"line-rail");
+                            hash_point(&mut hasher, endpoints[0]);
+                            hash_point(&mut hasher, endpoints[1]);
+                        }
+                        ruled::RailCurve::Circle {
+                            center,
+                            u,
+                            v,
+                            radius,
+                        } => {
+                            hasher.update(b"circle-rail");
+                            hash_point(&mut hasher, center);
+                            for vector in [u, v] {
+                                hash_f64(&mut hasher, vector.x);
+                                hash_f64(&mut hasher, vector.y);
+                                hash_f64(&mut hasher, vector.z);
+                            }
+                            hash_f64(&mut hasher, radius);
+                        }
+                        ruled::RailCurve::Ellipse {
+                            center,
+                            u,
+                            v,
+                            major_radius,
+                            minor_radius,
+                        } => {
+                            hasher.update(b"ellipse-rail");
+                            hash_point(&mut hasher, center);
+                            for vector in [u, v] {
+                                hash_f64(&mut hasher, vector.x);
+                                hash_f64(&mut hasher, vector.y);
+                                hash_f64(&mut hasher, vector.z);
+                            }
+                            hash_f64(&mut hasher, major_radius);
+                            hash_f64(&mut hasher, minor_radius);
+                        }
+                    }
+                    hash_f64(&mut hasher, rail.range.start);
+                    hash_f64(&mut hasher, rail.range.end);
+                }
+            }
         }
         hash_u64(&mut hasher, face.value.outer_loop.0 as u64);
         // Preserve established digests for the pre-hole representation while
@@ -8650,7 +9365,8 @@ mod tests {
                         Surface::Cylinder(_)
                         | Surface::Torus(_)
                         | Surface::Cone(_)
-                        | Surface::Sphere(_) => None,
+                        | Surface::Sphere(_)
+                        | Surface::Ruled(_) => None,
                     })
                     .collect::<Vec<_>>();
                 (incident.len() == 2

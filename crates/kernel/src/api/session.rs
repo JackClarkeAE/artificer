@@ -6,9 +6,9 @@ use std::time::Instant;
 use crate::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
-    ExecuteRequest, KernelCommand, OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3,
-    PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId,
-    RevolveAngle, SnapshotId, Tier, Vector3,
+    ExecuteRequest, KernelCommand, LoftOperation, LoftSection, OperationReport, PlanarAxis2,
+    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3,
+    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, Tier, Vector3,
 };
 
 use artificer_protocol::FaceExtrusionOperation;
@@ -659,9 +659,9 @@ impl Session {
     fn starts_new_body(command: &ApiCommand) -> bool {
         match command {
             ApiCommand::MakeBox { .. } | ApiCommand::MakeCylinder { .. } => true,
-            ApiCommand::Extrude { operation, .. } | ApiCommand::Revolve { operation, .. } => {
-                *operation == ExtrudeOp::New
-            }
+            ApiCommand::Extrude { operation, .. }
+            | ApiCommand::Revolve { operation, .. }
+            | ApiCommand::Loft { operation, .. } => *operation == ExtrudeOp::New,
             _ => false,
         }
     }
@@ -962,6 +962,27 @@ impl Session {
                     }
                 }
             }
+            ApiCommand::Loft {
+                sections,
+                operation,
+                ..
+            } => {
+                let sections = sections
+                    .iter()
+                    .map(|sketch| {
+                        self.build_sketch_profile(sketch)
+                            .map(|(frame, profile)| LoftSection { frame, profile })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(KernelCommand::LoftPlanarSections {
+                    sections,
+                    operation: match operation {
+                        ExtrudeOp::New => LoftOperation::New,
+                        ExtrudeOp::Add => LoftOperation::Add,
+                        ExtrudeOp::Cut => LoftOperation::Cut,
+                    },
+                })
+            }
             ApiCommand::Revolve {
                 sketch,
                 regions,
@@ -1098,6 +1119,7 @@ impl Session {
                             .map_err(ApiError::from)?;
                         support.frame
                     }
+                    SketchPlane::Frame { frame } => *frame,
                 };
 
                 let loops = sketch_loops(entities)?;

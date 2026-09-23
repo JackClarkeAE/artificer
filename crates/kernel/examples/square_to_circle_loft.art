@@ -1,0 +1,26 @@
+// A square duct lofted to a round spigot, then cut through a mounting plate.
+//
+// A loft pairs the two sections segment for segment: the circle is cut
+// where it comes nearest the square's first corner and again at the
+// square's other corners, so each side of the square is ruled to a quarter
+// of the circle. Those walls are ruled surfaces (ADR 0049) — exact, and
+// measured exactly — but the Boolean engines do not carry them yet, so the
+// cut through the plate is answered by the faceted tier and says so.
+
+param side: f64 [mm] in 20..120 = 60.0 "side of the square end";
+param spigot: f64 [mm] in 10..100 = 40.0 "diameter of the round end";
+param length: f64 [mm] in 20..200 = 80.0 "distance between the two ends";
+param plate: f64 [mm] in 2..20 = 6.0 "thickness of the mounting plate";
+
+let square_end = sketch(on: plane(from: "XY"), entities: [rect(width: side, height: side)], label: "square_end");
+let round_end = sketch(
+    on: plane(origin: [0, 0, length], normal: [0, 0, 1], x_axis: [1, 0, 0]),
+    entities: [circle(diameter: spigot)],
+    label: "round_end"
+);
+let duct = loft(sections: [square_end, round_end], label: "duct");
+
+// A plate the duct passes through, and the duct's opening cut from it: the
+// same two sections lofted again, as a cut.
+let flange = box(origin: [-side, -side, 20], size: [2 * side, 2 * side, plate], label: "flange");
+let opening = loft(sections: [square_end, round_end], operation: "cut", label: "opening");

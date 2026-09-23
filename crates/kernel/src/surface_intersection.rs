@@ -897,6 +897,7 @@ pub(crate) const fn surface_name(surface: Surface) -> &'static str {
         Surface::Cone(_) => "cone",
         Surface::Sphere(_) => "sphere",
         Surface::Torus(_) => "torus",
+        Surface::Ruled(_) => "ruled",
     }
 }
 
@@ -968,6 +969,7 @@ mod tests {
                 let ring = across.length() - torus.major_radius;
                 (ring.hypot(height) - torus.minor_radius).abs()
             }
+            Surface::Ruled(ruled) => ruled.distance_to(point, None).unwrap_or(f64::INFINITY),
         }
     }
 
@@ -1042,6 +1044,7 @@ mod tests {
                     let ring = across.length() - torus.major_radius;
                     (ring.hypot(height) - torus.minor_radius).abs()
                 }
+                Surface::Ruled(ruled) => ruled.distance_to(point, None).unwrap_or(f64::INFINITY),
             };
             assert!(
                 residual < 1.0e-12,

@@ -26,6 +26,13 @@ pub const MAX_PLANAR_PROFILE_REGIONS: usize = 32;
 pub const MAX_PLANAR_PROFILE_LOOPS: usize = 128;
 pub const MAX_PLANAR_PROFILE_CURVES: usize = 1_024;
 
+/// Wire-format ceiling for the sections of one loft.
+///
+/// The kernel builds lofts between two sections today and refuses more by
+/// name (ADR 0049); the ceiling only stops an untrusted array from
+/// allocating an arbitrary number of profiles before that refusal runs.
+pub const MAX_LOFT_SECTIONS: usize = 64;
+
 mod bounded_planar_profile {
     use std::fmt;
 
@@ -522,6 +529,56 @@ mod bounded_profile_vertices {
                 vertices.push(vertex);
             }
             Ok(vertices)
+        }
+    }
+}
+
+mod bounded_loft_sections {
+    use std::fmt;
+
+    use serde::{Deserializer, de};
+
+    use super::{LoftSection, MAX_LOFT_SECTIONS};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<LoftSection>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(LoftSectionsVisitor)
+    }
+
+    struct LoftSectionsVisitor;
+
+    impl<'de> de::Visitor<'de> for LoftSectionsVisitor {
+        type Value = Vec<LoftSection>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAX_LOFT_SECTIONS} loft sections")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            if sequence
+                .size_hint()
+                .is_some_and(|size| size > MAX_LOFT_SECTIONS)
+            {
+                return Err(de::Error::custom(format_args!(
+                    "loft exceeds {MAX_LOFT_SECTIONS} sections"
+                )));
+            }
+            let mut sections =
+                Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_LOFT_SECTIONS));
+            while let Some(section) = sequence.next_element()? {
+                if sections.len() == MAX_LOFT_SECTIONS {
+                    return Err(de::Error::custom(format_args!(
+                        "loft exceeds {MAX_LOFT_SECTIONS} sections"
+                    )));
+                }
+                sections.push(section);
+            }
+            Ok(sections)
         }
     }
 }
@@ -1408,6 +1465,22 @@ pub enum KernelCommand {
         #[serde(with = "finite_f64")]
         offset: f64,
     },
+    /// Lofts between planar sections, each on a frame of its own (ADR 0049).
+    ///
+    /// The sections may lie on any planes that are not one plane: parallel,
+    /// offset, tilted or not parallel at all. Each is one region, an outer
+    /// loop of lines, arcs and circles with any holes inside it. The walls
+    /// are planes, cylinders or cones where one of those is exact, and ruled
+    /// surfaces otherwise. The kernel builds two-section lofts and refuses
+    /// more by name: a smooth loft through several sections needs B-spline
+    /// surfaces. A new body is built from the empty snapshot; an add or a cut
+    /// combines the loft with the body it is given through the Boolean
+    /// ladder, and the report names the rung that answered.
+    LoftPlanarSections {
+        #[serde(deserialize_with = "bounded_loft_sections::deserialize")]
+        sections: Vec<LoftSection>,
+        operation: LoftOperation,
+    },
     /// Revolves one certified planar region a full turn about an axis lying in
     /// its own frame.
     ///
@@ -1537,6 +1610,26 @@ pub enum EdgeFinishKind {
 #[serde(rename_all = "snake_case")]
 pub enum FaceExtrusionOperation {
     Add,
+    Cut,
+}
+
+/// One section of a loft: a planar profile drawn on a frame of its own.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LoftSection {
+    pub frame: PlanarFrame3,
+    #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+    pub profile: PlanarProfile2,
+}
+
+/// What a loft does with the body it is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoftOperation {
+    /// A body of its own, from the empty snapshot.
+    New,
+    /// Joined to the body.
+    Add,
+    /// Taken away from the body.
     Cut,
 }
 
