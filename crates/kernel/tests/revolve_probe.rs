@@ -279,6 +279,75 @@ fn a_revolved_shaft_still_takes_a_rim_fillet() {
     );
 }
 
+/// A pointed cone keeps its base rim blendable: the rim is where the base
+/// meets the slant at an acute angle, and the fillet takes away the kite
+/// between its two tangent points less the circular sector that stays, each
+/// by Pappus.
+#[test]
+fn a_pointed_cone_still_takes_a_rim_fillet() {
+    let (radius, height, blend) = (5.0_f64, 6.0_f64, 0.8_f64);
+    let cone = revolve(
+        polygon(&[(0.0, 0.0), (radius, 0.0), (0.0, height)]),
+        "revolve-cone",
+    )
+    .expect("the cone revolves");
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("revolve-cone-fillet"),
+        expected_snapshot: cone.id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::FinishEdges {
+            target_edges: top_rim(&cone, 0.0),
+            kind: EdgeFinishKind::Fillet,
+            distance: blend,
+            standing_apart: false,
+        },
+    };
+    let filleted = NativeKernel::execute(&cone, &request, &CancellationToken::new())
+        .unwrap_or_else(|error| panic!("the cone's rim must fillet: {:?}", error.diagnostics))
+        .snapshot;
+    assert!(NativeKernel::validate(&filleted, ValidationProfile::Solid).valid);
+
+    // In the section: the corner V, the two sides' directions from it, and
+    // the angle between them.
+    let slant = radius.hypot(height);
+    let corner = (radius, 0.0_f64);
+    let along_base = (-1.0_f64, 0.0_f64);
+    let along_slant = (-radius / slant, height / slant);
+    let angle = (radius / slant).acos();
+    let bisector = {
+        let (x, y) = (along_base.0 + along_slant.0, along_base.1 + along_slant.1);
+        let length = x.hypot(y);
+        (x / length, y / length)
+    };
+    let reach = blend / (angle / 2.0).tan();
+    let centre_distance = blend / (angle / 2.0).sin();
+    let at = |from: (f64, f64), direction: (f64, f64), distance: f64| {
+        (
+            from.0 + direction.0 * distance,
+            from.1 + direction.1 * distance,
+        )
+    };
+    let first = at(corner, along_base, reach);
+    let second = at(corner, along_slant, reach);
+    let centre = at(corner, bisector, centre_distance);
+    let triangle =
+        |a: (f64, f64), b: (f64, f64)| (blend * reach / 2.0, (corner.0 + a.0 + b.0) / 3.0);
+    let (kite_one, x_one) = triangle(first, centre);
+    let (kite_two, x_two) = triangle(second, centre);
+    let theta = PI - angle;
+    let sector = theta * blend * blend / 2.0;
+    // The sector left in the kite faces the corner, back along the bisector.
+    let sector_x = centre.0 - bisector.0 * (4.0 * blend * (theta / 2.0).sin() / (3.0 * theta));
+    let removed = TAU * (kite_one * x_one + kite_two * x_two - sector * sector_x);
+    let expected = PI * radius * radius * height / 3.0 - removed;
+    assert!(
+        ((filleted.measures().volume - expected) / expected).abs() < 1.0e-9,
+        "filleted cone volume {} should equal {expected}",
+        filleted.measures().volume
+    );
+}
+
 fn top_rim(snapshot: &Snapshot, height: f64) -> Vec<EntityRef> {
     let scene = NativeKernel::debug_scene(snapshot);
     let mut rim = Vec::new();
@@ -310,21 +379,68 @@ fn a_profile_crossing_the_axis_is_refused() {
     );
 }
 
+/// A slanted side running into the axis sweeps a cone to its apex, which
+/// closes through a pole as a sphere does: a third of the cylinder it stands
+/// in, whichever way up, and two of them for a double cone.
 #[test]
-fn an_oblique_axis_contact_is_refused() {
-    // A triangle whose slanted side runs into the axis would sweep an apex.
-    let error = revolve(
-        polygon(&[(0.0, 0.0), (5.0, 0.0), (0.0, 6.0)]),
-        "revolve-apex",
+fn a_slanted_side_meeting_the_axis_sweeps_a_pointed_cone() {
+    let (radius, height) = (5.0_f64, 6.0_f64);
+    let cone = PI * radius * radius * height / 3.0;
+    for (what, profile, expected) in [
+        (
+            "standing on its base",
+            polygon(&[(0.0, 0.0), (radius, 0.0), (0.0, height)]),
+            cone,
+        ),
+        (
+            "balanced on its apex",
+            polygon(&[(0.0, 0.0), (radius, height), (0.0, height)]),
+            cone,
+        ),
+        (
+            "double cone",
+            polygon(&[(0.0, 0.0), (radius, height), (0.0, 2.0 * height)]),
+            2.0 * cone,
+        ),
+    ] {
+        let solid = revolve(profile.clone(), "revolve-apex")
+            .unwrap_or_else(|error| panic!("{what}: {:?}", error.diagnostics));
+        assert_volume(&solid, expected, what);
+        let step = NativeKernel::export_step(&solid, "cone").expect("the cone exports");
+        assert!(step.contains("CONICAL_SURFACE"), "{what}: exact cone");
+        let quarter = revolve_through(
+            profile,
+            axis(),
+            RevolveAngle::partial(0.0, PI / 2.0),
+            "revolve-apex-quarter",
+        )
+        .unwrap_or_else(|error| panic!("{what}, a quarter: {:?}", error.diagnostics));
+        assert_volume(&quarter, expected / 4.0, what);
+    }
+}
+
+/// A cone point sunk into a block takes out the cone: the faceted tier
+/// answers, as it does for any carrier the exact engines do not sew, and the
+/// volume it removes is the cone's to within the faceting.
+#[test]
+fn a_pointed_cone_cuts_a_block() {
+    // The block's top face is at z = 0; the cone stands point down, its apex
+    // 4 below the face and its rim of radius 3 held 1 above it.
+    let (radius, depth, over) = (3.0_f64, 4.0_f64, 1.0_f64);
+    let outcome = revolve_into(
+        &block(),
+        polygon(&[(0.0, -depth), (radius, over), (0.0, over)]),
+        SolidOperation::Cut,
     )
-    .expect_err("a cone apex must refuse");
+    .expect("the cone cuts the block");
+    let removed = 32_000.0 - outcome.snapshot.measures().volume;
+    let submerged = radius * depth / (depth + over);
+    let expected = PI * submerged * submerged * depth / 3.0;
     assert!(
-        error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code.as_str() == "REVOLVE_OBLIQUE_AXIS_CONTACT"),
-        "unexpected refusal: {error:?}"
+        ((removed - expected) / expected).abs() < 2.0e-2,
+        "removed {removed}, the submerged cone is {expected}"
     );
+    assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
 }
 
 #[test]

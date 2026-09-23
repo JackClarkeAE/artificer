@@ -1506,6 +1506,46 @@ mod tests {
         );
     }
 
+    /// A triangle with one leg on the centreline turns into a pointed cone:
+    /// a third of the cylinder it stands in.
+    #[test]
+    fn a_triangle_against_its_centreline_revolves_into_a_cone() {
+        let mut app = KernelLabApp::default();
+        app.open_origin_plane_sketch(SketchPlane::XZ);
+        for (start, end) in [((0.0, 0.0), (2.0, 0.0)), ((2.0, 0.0), (0.0, 3.0))] {
+            let side = app
+                .sketch
+                .stage_geometry(SketchGeometry::Segment {
+                    start: SketchPoint::new(start.0, start.1),
+                    end: SketchPoint::new(end.0, end.1),
+                })
+                .expect("the side stages");
+            app.commit_sketch_stroke(side);
+        }
+        let centreline = app
+            .sketch
+            .stage_geometry_with_role(
+                SketchGeometry::Segment {
+                    start: SketchPoint::new(0.0, 0.0),
+                    end: SketchPoint::new(0.0, 3.0),
+                },
+                crate::sketch::SketchEntityRole::Construction,
+            )
+            .expect("the centreline stages");
+        app.commit_sketch_stroke(centreline);
+        let closing = app
+            .sketch
+            .stage_geometry(SketchGeometry::Segment {
+                start: SketchPoint::new(0.0, 3.0),
+                end: SketchPoint::new(0.0, 0.0),
+            })
+            .expect("the leg on the axis stages");
+        app.commit_sketch_stroke(closing);
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        assert_close(preview_volume(&app), PI * 4.0 * 3.0 / 3.0, "cone");
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+    }
+
     /// Added to or cut from the body it is staged over, a revolve changes
     /// that body; a bore through the corner of the starting block takes a
     /// quarter of a cylinder away, exactly.

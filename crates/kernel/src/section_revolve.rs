@@ -943,9 +943,10 @@ impl Builder<'_> {
     }
 
     /// The ring a section vertex sweeps. A point on the axis is a pole only
-    /// when a curve meets it. A radial line ending on the axis closes a planar
-    /// cap instead: a full disk sweeps no ring at all, and a sector is centred
-    /// on the bare axis point its two straight sides meet at.
+    /// when a curved band meets it: an arc, or a slanted line sweeping a cone
+    /// to its apex. A radial line ending on the axis closes a planar cap
+    /// instead: a full disk sweeps no ring at all, and a sector is centred on
+    /// the bare axis point its two straight sides meet at.
     fn ring_at(&mut self, point: Point2, curved: bool) -> Option<Ring> {
         if point.x > 0.0 {
             Some(Ring::Circle(self.rim_circle(point.x, point.y)))
@@ -1143,9 +1144,15 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
 
     // One circle per section vertex with r > 0. Vertex `index` is the start of
     // segment `index`; the final vertex is the end of the last segment.
+    // A segment sweeps a curved band, not a planar cap, when it is an arc or
+    // a line that is not radial.
+    let curved = |segment: &Segment| match *segment {
+        Segment::Line { start, end } => (end.y - start.y).abs() > axis_agreement(section),
+        _ => true,
+    };
     let mut circles: Vec<Option<Ring>> = Vec::with_capacity(count + 1);
     for segment in &section.segments {
-        circles.push(builder.ring_at(segment.start(), matches!(segment, Segment::Arc { .. })));
+        circles.push(builder.ring_at(segment.start(), curved(segment)));
     }
     if section.closed {
         // A tube's chain returns to where it started, so the final ring is the
@@ -1154,7 +1161,7 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
         circles.push(circles[0]);
     } else {
         let last = section.segments[count - 1];
-        circles.push(builder.ring_at(last.end(), matches!(last, Segment::Arc { .. })));
+        circles.push(builder.ring_at(last.end(), curved(&last)));
     }
 
     let mut wedges: Vec<Option<WedgeUse>> = vec![None; count];
@@ -1163,7 +1170,10 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
         let start = segment.start();
         let end = segment.end();
         match *segment {
-            Segment::Line { .. } if start.x <= 0.0 || end.x <= 0.0 => {
+            Segment::Line { .. }
+                if (start.x <= 0.0 || end.x <= 0.0)
+                    && (end.y - start.y).abs() <= axis_agreement(section) =>
+            {
                 // A radial line touching the axis is a planar cap: a full disk,
                 // or a sector for a partial turn.
                 let (circle, radius, height, outward_up) = if start.x <= 0.0 {
@@ -1312,9 +1322,6 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                 );
             }
             Segment::Line { .. } => {
-                // A slanted line reaching the axis would sweep a cone apex,
-                // which is a sharp singularity rather than a pole; that stays
-                // outside the certified domain.
                 // A section travelling down the page has material on the other
                 // side of the band: it is the bore of a tube or the inside of
                 // a cup, not an outside wall. The band is built from its lower
@@ -1328,19 +1335,29 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                 } else {
                     (start, end)
                 };
+                // Either end may be a cone's apex, a pole on the axis.
                 let (Some(low), Some(high)) = (
-                    circles[if descending { index + 1 } else { index }].and_then(Ring::as_circle),
-                    circles[if descending { index } else { index + 1 }].and_then(Ring::as_circle),
+                    circles[if descending { index + 1 } else { index }],
+                    circles[if descending { index } else { index + 1 }],
                 ) else {
                     continue;
                 };
-                let seams = builder.line_generators(Ring::Circle(low), Ring::Circle(high));
+                let seams = builder.line_generators(low, high);
                 wedges[index] = Some(WedgeUse {
                     generators: [seams[0], seams[2]],
                     along_chain: !descending,
                 });
                 let angular_sign = if descending { -1.0 } else { 1.0 };
                 let slope = (top.x - base.x) / (top.y - base.y);
+                let height = top.y - base.y;
+                // A cone is anchored at a ring with a radius, so a band
+                // whose base is the apex is anchored at its top instead and
+                // runs up to zero from below.
+                let (anchor, parameters) = if base.x > 0.0 {
+                    (base, (0.0, height))
+                } else {
+                    (top, (-height, 0.0))
+                };
                 let surface = if slope.abs() <= f64::EPSILON {
                     Surface::Cylinder(Cylinder {
                         origin: section.center + section.axis * base.y,
@@ -1352,11 +1369,11 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                     })
                 } else {
                     Surface::Cone(Cone {
-                        origin: section.center + section.axis * base.y,
+                        origin: section.center + section.axis * anchor.y,
                         axis: section.axis,
                         radial_u: section.radial_u,
                         radial_v: section.radial_v,
-                        base_radius: base.x,
+                        base_radius: anchor.x,
                         slope,
                         angular_sign,
                     })
@@ -1364,10 +1381,10 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                 push_band(
                     &mut builder,
                     surface,
-                    Ring::Circle(low),
-                    Ring::Circle(high),
+                    low,
+                    high,
                     seams,
-                    (0.0, top.y - base.y),
+                    parameters,
                     role,
                     descending,
                 );

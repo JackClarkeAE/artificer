@@ -675,3 +675,34 @@ Six of the seven close and validate.
 lengthwise along the side of the pipe, parallel to whole rows of its
 facets. It still leaves slivers about the weld distance wide. Such a cut
 is refused with `SWEEP_FACETED_UNRESOLVED`, never answered wrongly.
+
+## Completing the revolve
+
+After R1 to R3, five things about the revolve were still missing. Each is
+recorded here as it lands.
+
+### Pointed cones
+
+A slanted line that reaches the axis used to be refused
+(`REVOLVE_OBLIQUE_AXIS_CONTACT`). The refusal's note said an apex is "a
+singular point rather than a pole". The builder in fact closes it exactly
+as it closes a sphere, through a pole, so the refusal and its code are
+gone.
+- **Where a pole is used.** A vertex on the axis is a pole wherever a
+  curved band meets it: an arc, or now any line that is not radial. A
+  radial line still closes a planar cap.
+- **The carrier.** A cone is anchored at the end of the band that has a
+  radius. A band that rises from its apex has its origin at the top, and
+  its parameter runs from minus its height up to zero. This keeps the
+  validator's rule that a cone's base radius is positive.
+- **The validator.** A cone's slant-generator rule no longer applies to a
+  degenerate pole edge; the pole-closure rule, which already knew cones,
+  certifies it.
+- **Tests.** Each is checked against a closed form, by Pappus or πr²h/3:
+  - a cone on its base, one on its point, and a double cone;
+  - a full turn and a quarter turn of each, exported to STEP as
+    `CONICAL_SURFACE`;
+  - a cone point cut into a block;
+  - a fillet on a cone's base rim, exact to 10⁻⁹ by Pappus on the kite and
+    sector it removes;
+  - in the workbench, a triangle against its centreline.

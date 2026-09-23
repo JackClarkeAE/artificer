@@ -7637,10 +7637,6 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
             "REVOLVE_PROFILE_CROSSES_AXIS",
             "The profile has material on both sides of the axis; the sweep would pass through itself.",
         ),
-        revolve::RevolveInputError::ObliqueAxisContact => (
-            "REVOLVE_OBLIQUE_AXIS_CONTACT",
-            "A straight profile segment meets the axis obliquely. It would sweep a cone apex, which is a singular point rather than a pole, and stays outside the certified domain.",
-        ),
         revolve::RevolveInputError::SectionNotContiguous => (
             "REVOLVE_SECTION_NOT_CONTIGUOUS",
             "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",

@@ -1081,7 +1081,9 @@ fn pcurve_locus_error(
                 f64::INFINITY
             }
         }
-        (Surface::Cone(cone), Curve2::Line { endpoints }, Curve3::Line { .. }) => {
+        (Surface::Cone(cone), Curve2::Line { endpoints }, Curve3::Line { endpoints: locus })
+            if locus[0] != locus[1] =>
+        {
             // Slant seam generator: the azimuth must stay fixed; the sampled
             // and tangent errors certify the line itself.
             let angular_motion = (endpoints[1].x - endpoints[0].x).abs()

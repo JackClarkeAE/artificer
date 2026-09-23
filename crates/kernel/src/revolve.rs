@@ -41,9 +41,6 @@ pub(crate) enum RevolveInputError {
     DegenerateAxis,
     /// Material lies on both sides of the axis; the sweep would self-intersect.
     ProfileCrossesAxis,
-    /// A straight segment meets the axis obliquely. It would sweep a cone apex
-    /// — a singular point rather than a pole — which stays outside the domain.
-    ObliqueAxisContact,
     /// The chain left after dropping axis-collinear segments is not one
     /// contiguous section.
     SectionNotContiguous,
@@ -212,12 +209,8 @@ pub(crate) fn validate_revolve(
                     // no face; the builder closes the chain through the axis.
                     continue;
                 }
-                if (start_on_axis || end_on_axis)
-                    && (end.y - start.y).abs() > on_axis
-                    && (end.x - start.x).abs() > on_axis
-                {
-                    return Err(RevolveInputError::ObliqueAxisContact);
-                }
+                // A slanted line reaching the axis sweeps a cone to its
+                // apex, which closes through a pole as a sphere does.
                 Segment::Line { start, end }
             }
             Segment::Arc {
