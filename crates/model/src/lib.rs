@@ -19,6 +19,7 @@ pub mod persistent;
 pub mod revolve;
 pub mod sketch_region;
 pub mod sketches;
+pub mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -72,6 +73,10 @@ pub use sketch_region::{
 pub use sketches::{
     CURRENT_SKETCH_PRECISION_POLICY_VERSION, SketchPayload, SketchPayloadError, SketchSupportRecipe,
 };
+pub use sweep::{
+    CURRENT_SKETCH_SWEEP_RECIPE_VERSION, MAX_SWEEP_PATH_CURVES, SketchSweep, SketchSweepError,
+    SweepPath,
+};
 
 /// Stable native document format marker.
 pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
@@ -84,7 +89,7 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 /// Version 8 adds the loft between sketch sections (ADR 0051). Version 9
 /// lets an extrusion's distance follow a variable and a library part replay
 /// as the chain of kernel commands it was built from. Version 10 adds the
-/// revolve feature and the construction axis (ADR 0055).
+/// revolve feature, the construction axis and the sweep (ADR 0055).
 pub const CURRENT_DOCUMENT_VERSION: u32 = 10;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
@@ -105,6 +110,8 @@ pub const LINKED_PARAMETER_DOCUMENT_VERSION: u32 = 9;
 pub const SKETCH_REVOLVE_DOCUMENT_VERSION: u32 = 10;
 /// First native schema that can hold a construction axis.
 pub const DATUM_AXIS_DOCUMENT_VERSION: u32 = 10;
+/// First native schema that can hold a sweep feature.
+pub const SKETCH_SWEEP_DOCUMENT_VERSION: u32 = 10;
 /// The longest chain of kernel commands one feature may replay.
 pub const MAX_KERNEL_CHAIN_COMMANDS: usize = 1_024;
 /// Oldest native document schema this version can migrate in memory.
@@ -174,6 +181,7 @@ pub enum FeatureKind {
     Boolean,
     Loft,
     Revolve,
+    Sweep,
 }
 
 impl FeatureKind {
@@ -183,7 +191,7 @@ impl FeatureKind {
     pub const fn consumes_sketches(self) -> bool {
         matches!(
             self,
-            Self::Extrude | Self::Add | Self::Cut | Self::Loft | Self::Revolve
+            Self::Extrude | Self::Add | Self::Cut | Self::Loft | Self::Revolve | Self::Sweep
         )
     }
 }
@@ -262,6 +270,9 @@ pub enum ReplayAction {
     /// A loft whose sections are resolved from their sketches, on their
     /// planes, immediately before replay (ADR 0051).
     SketchLoft(SketchLoft),
+    /// A sweep of a sketch profile along a path drawn in another sketch,
+    /// resolved from both sketches immediately before replay (ADR 0055).
+    SketchSweep(SketchSweep),
     /// A revolve whose regions and axis are resolved from its sketch, on its
     /// plane, immediately before replay (ADR 0055).
     SketchRevolve(SketchRevolve),
@@ -308,6 +319,7 @@ impl ReplayAction {
             | Self::DatumPlane(_)
             | Self::DatumAxis(_)
             | Self::SketchLoft(_)
+            | Self::SketchSweep(_)
             | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
@@ -327,6 +339,7 @@ impl ReplayAction {
             | Self::DatumPlane(_)
             | Self::DatumAxis(_)
             | Self::SketchLoft(_)
+            | Self::SketchSweep(_)
             | Self::KernelChain(_) => false,
         }
     }
@@ -377,6 +390,7 @@ impl ReplayAction {
                 recipe.resolve_in_frame(document, precision, frame)
             }
             Self::SketchLoft(recipe) => recipe.resolve_with_planes(document, precision, planes),
+            Self::SketchSweep(recipe) => recipe.resolve_with_planes(document, precision, planes),
             Self::SketchRevolve(recipe) => {
                 recipe.resolve_with_datums(document, precision, planes, axes)
             }
@@ -3270,6 +3284,12 @@ pub enum DocumentError {
     InvalidLoftFeature,
     #[error("invalid revolve: {0}")]
     SketchRevolve(#[from] SketchRevolveError),
+    #[error("invalid sweep: {0}")]
+    SketchSweep(#[from] SketchSweepError),
+    #[error(
+        "a sweep feature must carry a sweep recipe, and a sweep recipe must be a sweep feature"
+    )]
+    InvalidSweepFeature,
     #[error(
         "a revolve feature must carry a revolve recipe, and a revolve recipe must be a revolve feature"
     )]
@@ -3439,6 +3459,7 @@ pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), Docume
         ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::DatumAxis(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchSweep(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::SketchRevolve(recipe) => recipe.validate().map_err(Into::into),
         ReplayAction::KernelChain(commands) => {
             if commands.is_empty() || commands.len() > MAX_KERNEL_CHAIN_COMMANDS {
@@ -3468,6 +3489,9 @@ fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), 
     }
     if matches!(action, ReplayAction::SketchRevolve(_)) != (kind == FeatureKind::Revolve) {
         return Err(DocumentError::InvalidRevolveFeature);
+    }
+    if matches!(action, ReplayAction::SketchSweep(_)) != (kind == FeatureKind::Sweep) {
+        return Err(DocumentError::InvalidSweepFeature);
     }
     Ok(())
 }
@@ -3532,6 +3556,7 @@ fn validate_action_parameter_inputs(
         | ReplayAction::DatumPlane(_)
         | ReplayAction::DatumAxis(_)
         | ReplayAction::SketchLoft(_)
+        | ReplayAction::SketchSweep(_)
         | ReplayAction::KernelChain(_) => {}
     }
     Ok(())
@@ -3569,6 +3594,24 @@ fn validate_action_feature_inputs(
                 .any(|input| matches!(input, FeatureInput::Body(_)))
         {
             return Err(SketchLoftError::MissingTargetBody.into());
+        }
+    }
+    // A sweep reads its profile's sketch and its path's on every replay; an
+    // add or a cut changes a body, which is its branch.
+    if let ReplayAction::SketchSweep(recipe) = action {
+        if let Some(sketch) = recipe
+            .sketches()
+            .into_iter()
+            .find(|sketch| !feature_inputs.contains(&FeatureInput::Sketch(*sketch)))
+        {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(sketch));
+        }
+        if recipe.operation != artificer_protocol::SolidOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchSweepError::MissingTargetBody.into());
         }
     }
     // A revolve reads its sketch on every replay; an add or a cut changes a

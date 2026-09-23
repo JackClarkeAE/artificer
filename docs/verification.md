@@ -69,6 +69,10 @@ are stable, slash-separated paths:
 | `revolve/partial-turn` | A section turned through less than a full turn (ADR 0055 R3): its curved faces are split halfway round the turn, and two planar wedge faces, the section and its turned copy, close it. |
 | `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
 | `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
+| `sweep/straight` | A profile swept along a straight path (ADR 0055): lofted to its copy at the far end, with planes, cylinders and ruled walls. Exact. |
+| `sweep/revolve` | A profile swept along one circular arc about an axis in its own plane, turned with the path: a partial revolve. Exact. |
+| `sweep/skinned` | A profile swept along any other path: skinned through copies of it along the path, graded in wherever the skin strays. Carries `SWEEP_APPROXIMATION_TOLERANCE`, measuring the worst departure from the true sweep against the approximation budget. |
+| `sweep/boolean-prism`, `sweep/boolean-analytic`, `sweep/faceted` | A sweep added to or cut from the body, on the same ladder as a revolve's. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
 | `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise, and B-spline walls ruled between the rows where a section has a spline (ADR 0050). |
 | `loft/skinned` | A new body lofted smoothly through three planar sections or more (ADR 0050): every wall one B-spline surface through all the sections, smooth across the middle ones. |

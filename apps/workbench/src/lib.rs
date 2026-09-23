@@ -32,6 +32,7 @@ pub mod saved_parts;
 pub mod shell;
 pub mod sketch_links;
 pub mod spacemouse;
+mod sweep;
 pub mod update;
 pub mod user_data;
 
@@ -487,6 +488,12 @@ enum PendingOperation {
         /// The committed revolve this editor was reopened on, when it was.
         editing: Option<FeatureId>,
     },
+    /// A sweep in its editor (ADR 0055). Its picks live in `staged_sweep`
+    /// beside the operation, as a revolve's do.
+    StageSweep {
+        /// The committed sweep this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
     /// The tool bodies are picked interactively while this is staged and live
     /// in `boolean_tools`, the same way an edge finish collects `selected_edges`.
     /// Keeping them out of the pending value lets the operation stay `Copy`.
@@ -626,6 +633,8 @@ impl PendingOperation {
             Self::StageLoft { editing: Some(_) } => "Edit loft",
             Self::StageRevolve { editing: None } => "Revolve",
             Self::StageRevolve { editing: Some(_) } => "Edit revolve",
+            Self::StageSweep { editing: None } => "Sweep",
+            Self::StageSweep { editing: Some(_) } => "Edit sweep",
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
                 BooleanOperation::Difference => "Subtract bodies",
@@ -699,6 +708,12 @@ impl PendingOperation {
             Self::StageRevolve { editing: Some(_) } => {
                 "Confirm to rewrite the revolve and replay everything built after it"
             }
+            Self::StageSweep { editing: None } => {
+                "Click the profile, choose the path, then confirm to build the sweep"
+            }
+            Self::StageSweep { editing: Some(_) } => {
+                "Confirm to rewrite the sweep and replay everything built after it"
+            }
             Self::BooleanBodies { .. } => {
                 "Click the tool bodies to combine with the target, then confirm to publish a validated successor"
             }
@@ -759,7 +774,8 @@ impl PendingOperation {
             Self::StagePlane { editing }
             | Self::StageAxis { editing }
             | Self::StageLoft { editing }
-            | Self::StageRevolve { editing } => {
+            | Self::StageRevolve { editing }
+            | Self::StageSweep { editing } => {
                 if let Some(feature) = editing {
                     object.insert("editing".to_owned(), serde_json::json!(feature.get()));
                 }
@@ -1219,6 +1235,7 @@ enum ModelBodyKind {
     Boolean,
     Lofted,
     Revolved,
+    Swept,
 }
 
 impl ModelBodyKind {
@@ -1232,6 +1249,7 @@ impl ModelBodyKind {
             Self::Boolean => "native Boolean result",
             Self::Lofted => "native loft",
             Self::Revolved => "native revolve",
+            Self::Swept => "native sweep",
         }
     }
 }
@@ -1387,6 +1405,8 @@ enum FeaturePreviewKind {
     Loft,
     /// A revolve of a sketch profile, named by its feature (ADR 0055).
     Revolve,
+    /// A sketch profile swept along a path, named by its feature (ADR 0055).
+    Sweep,
     /// A construction axis, named by its feature (ADR 0055).
     Axis,
 }
@@ -1444,6 +1464,10 @@ impl FeaturePreviewEntry {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Revolve {}", self.ordinal)),
+            FeaturePreviewKind::Sweep => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Sweep {}", self.ordinal)),
         }
     }
 
@@ -2204,6 +2228,8 @@ enum TimelineContextCommand {
     EditLoft,
     /// Reopen a revolve's editor (ADR 0055).
     EditRevolve,
+    /// Reopen a sweep's editor (ADR 0055).
+    EditSweep,
     Rename,
     Suppress,
     Restore,
@@ -2222,6 +2248,7 @@ impl TimelineContextCommand {
             Self::EditPlane => "Edit this plane",
             Self::EditLoft => "Edit this loft",
             Self::EditRevolve => "Edit this revolve",
+            Self::EditSweep => "Edit this sweep",
             Self::Rename => "Rename…",
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
@@ -2825,6 +2852,9 @@ pub struct KernelLabApp {
     /// A revolve in its editor (ADR 0055), beside
     /// `PendingOperation::StageRevolve`.
     staged_revolve: Option<revolve::StagedRevolve>,
+    /// A sweep in its editor (ADR 0055), beside
+    /// `PendingOperation::StageSweep`.
+    staged_sweep: Option<sweep::StagedSweep>,
     active_tool: ActiveTool,
     display_transform: DisplayTransform,
     pending_operation: Option<PendingOperation>,
@@ -3068,6 +3098,7 @@ impl Default for KernelLabApp {
             armed_resume: None,
             boolean_tools: Vec::new(),
             staged_revolve: None,
+            staged_sweep: None,
             active_tool: ActiveTool::Select,
             display_transform: DisplayTransform::default(),
             pending_operation: None,
@@ -5310,6 +5341,7 @@ impl KernelLabApp {
                 | PendingOperation::StageAxis { .. }
                 | PendingOperation::StageLoft { .. }
                 | PendingOperation::StageRevolve { .. }
+                | PendingOperation::StageSweep { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
                 | PendingOperation::SketchEdit { .. }
@@ -5579,6 +5611,7 @@ impl KernelLabApp {
                 FeatureKind::Boolean => ModelBodyKind::Boolean,
                 FeatureKind::Loft => ModelBodyKind::Lofted,
                 FeatureKind::Revolve => ModelBodyKind::Revolved,
+                FeatureKind::Sweep => ModelBodyKind::Swept,
                 FeatureKind::Origin
                 | FeatureKind::DatumPlane
                 | FeatureKind::DatumAxis
@@ -6314,6 +6347,7 @@ impl KernelLabApp {
             FeatureKind::Boolean => format!("Boolean {ordinal}"),
             FeatureKind::Loft => format!("Loft {ordinal}"),
             FeatureKind::Revolve => format!("Revolve {ordinal}"),
+            FeatureKind::Sweep => format!("Sweep {ordinal}"),
         }
     }
 
@@ -6515,6 +6549,7 @@ impl KernelLabApp {
                 FeatureKind::Boolean => FeaturePreviewKind::Boolean,
                 FeatureKind::Loft => FeaturePreviewKind::Loft,
                 FeatureKind::Revolve => FeaturePreviewKind::Revolve,
+                FeatureKind::Sweep => FeaturePreviewKind::Sweep,
             };
             let key = kind as u8;
             let ordinal = if matches!(
@@ -6604,9 +6639,9 @@ impl KernelLabApp {
                     } else {
                         feature.label.clone()
                     }),
-                    FeaturePreviewKind::Loft | FeaturePreviewKind::Revolve => {
-                        Some(feature.label.clone())
-                    }
+                    FeaturePreviewKind::Loft
+                    | FeaturePreviewKind::Revolve
+                    | FeaturePreviewKind::Sweep => Some(feature.label.clone()),
                     _ => None,
                 },
             });
@@ -7083,7 +7118,8 @@ impl KernelLabApp {
                 }
                 ReplayAction::SketchRegionExtrusion(_)
                 | ReplayAction::SketchLoft(_)
-                | ReplayAction::SketchRevolve(_) => {
+                | ReplayAction::SketchRevolve(_)
+                | ReplayAction::SketchSweep(_) => {
                     unreachable!("sketch-region replay actions are resolved before kernel dispatch")
                 }
                 ReplayAction::Boolean(recipe) => RebuildDispatch::Boolean(recipe),
@@ -7153,6 +7189,7 @@ impl KernelLabApp {
                     Some(FeatureKind::Boolean) => ModelBodyKind::Boolean,
                     Some(FeatureKind::Loft) => ModelBodyKind::Lofted,
                     Some(FeatureKind::Revolve) => ModelBodyKind::Revolved,
+                    Some(FeatureKind::Sweep) => ModelBodyKind::Swept,
                     Some(
                         FeatureKind::Origin
                         | FeatureKind::DatumPlane
@@ -12233,6 +12270,7 @@ impl KernelLabApp {
             PendingOperation::StageAxis { editing } => self.commit_staged_axis(editing),
             PendingOperation::StageLoft { editing } => self.commit_staged_loft(editing),
             PendingOperation::StageRevolve { editing } => self.commit_staged_revolve(editing),
+            PendingOperation::StageSweep { editing } => self.commit_staged_sweep(editing),
             PendingOperation::BooleanBodies {
                 target,
                 operation,
@@ -12420,6 +12458,7 @@ impl KernelLabApp {
             }
             PendingOperation::StageLoft { editing } => self.cancel_staged_loft(editing),
             PendingOperation::StageRevolve { editing } => self.cancel_staged_revolve(editing),
+            PendingOperation::StageSweep { editing } => self.cancel_staged_sweep(editing),
             PendingOperation::SetParameterBindingEntry { .. } => {
                 self.staged_parameter_binding = None;
                 self.pending_operation = None;
@@ -17039,6 +17078,8 @@ impl KernelLabApp {
                 TimelineContextCommand::EditLoft
             } else if node.kind == FeatureKind::Revolve {
                 TimelineContextCommand::EditRevolve
+            } else if node.kind == FeatureKind::Sweep {
+                TimelineContextCommand::EditSweep
             } else {
                 TimelineContextCommand::Edit
             });
@@ -17077,6 +17118,9 @@ impl KernelLabApp {
             }
             TimelineContextCommand::EditRevolve => {
                 self.begin_revolve_edit(feature);
+            }
+            TimelineContextCommand::EditSweep => {
+                self.begin_sweep_edit(feature);
             }
             TimelineContextCommand::Rename => self.begin_feature_rename(feature),
             TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
@@ -17282,6 +17326,7 @@ impl KernelLabApp {
     fn staged_solid_preview<'a>(
         staged_loft: &'a Option<loft::StagedLoft>,
         staged_revolve: &'a Option<revolve::StagedRevolve>,
+        staged_sweep: &'a Option<sweep::StagedSweep>,
     ) -> Option<(
         Option<BodyId>,
         &'a OperationReport,
@@ -17297,7 +17342,17 @@ impl KernelLabApp {
                 &preview.scene,
             ));
         }
-        let staged = staged_revolve.as_ref()?;
+        if let Some(staged) = staged_revolve.as_ref() {
+            let preview = staged.preview.as_ref()?;
+            return Some((
+                staged
+                    .target
+                    .filter(|_| staged.operation != artificer_protocol::SolidOperation::New),
+                &preview.report,
+                &preview.scene,
+            ));
+        }
+        let staged = staged_sweep.as_ref()?;
         let preview = staged.preview.as_ref()?;
         Some((
             staged
@@ -17323,6 +17378,7 @@ impl KernelLabApp {
                         | ReplayAction::DatumAxis(_)
                         | ReplayAction::SketchLoft(_)
                         | ReplayAction::SketchRevolve(_)
+                        | ReplayAction::SketchSweep(_)
                 ) && !node.state.read_only
             })
     }
@@ -20296,6 +20352,15 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageSweep { .. }))
+                {
+                    card(ui, "sweep", "SWEEP", &mut |ui| {
+                        self.sweep_feature_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
@@ -20305,6 +20370,7 @@ impl KernelLabApp {
                             PendingOperation::StagePlane { .. }
                                 | PendingOperation::StageLoft { .. }
                                 | PendingOperation::StageRevolve { .. }
+                                | PendingOperation::StageSweep { .. }
                         )
                     )
                 {
@@ -22168,6 +22234,8 @@ impl KernelLabApp {
             self.loft_region_selections()
         } else if self.revolve_pick_active() {
             self.revolve_region_selections()
+        } else if self.sweep_pick_active() {
+            self.sweep_region_selections()
         } else {
             self.selected_sketch_region_selections()
         };
@@ -22201,8 +22269,11 @@ impl KernelLabApp {
                 // A staged loft is drawn as what confirming would build: in
                 // place of the body an add or a cut changes, or beside the
                 // bodies as a new one.
-                let loft_preview =
-                    Self::staged_solid_preview(&self.staged_loft, &self.staged_revolve);
+                let loft_preview = Self::staged_solid_preview(
+                    &self.staged_loft,
+                    &self.staged_revolve,
+                    &self.staged_sweep,
+                );
                 let mut body_instances = self
                     .bodies
                     .iter()
@@ -22459,6 +22530,14 @@ impl KernelLabApp {
                         if let Some(region) = output.selected_sketch_region {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.pick_revolve_region(region.sketch_index, region.anchor, additive);
+                        }
+                    } else if self.sweep_pick_active() {
+                        // The sweep editor owns clicks on sketch regions:
+                        // each one is its profile. Its path is chosen on
+                        // the card.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_sweep_region(region.sketch_index, region.anchor, additive);
                         }
                     } else if self.extrusion_face_pick_armed() {
                         // A side waiting for its face owns the next click on

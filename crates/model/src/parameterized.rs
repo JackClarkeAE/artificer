@@ -378,6 +378,7 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         // live in the profile and the axis, which parameterization reaches
         // through the sketch rather than through the command.
         | KernelCommand::RevolvePlanarProfile { .. }
+        | KernelCommand::SweepPlanarProfile { .. }
         // A drafted loft's distance and offset drive each other through the
         // draft angle; binding one alone would silently change the angle.
         | KernelCommand::LoftPlanarProfileOffset { .. }

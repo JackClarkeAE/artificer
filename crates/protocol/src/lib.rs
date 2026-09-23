@@ -33,6 +33,13 @@ pub const MAX_PLANAR_PROFILE_CURVES: usize = 1_024;
 /// arbitrary number of profiles before any of them is checked.
 pub const MAX_LOFT_SECTIONS: usize = 64;
 
+/// Wire-format ceiling for the segments of one sweep path (ADR 0055).
+pub const MAX_SWEEP_PATH_SEGMENTS: usize = 256;
+
+/// Wire-format ceiling for the control points of one spline segment of a
+/// sweep path.
+pub const MAX_SWEEP_SPLINE_POINTS: usize = 1_024;
+
 mod bounded_planar_profile {
     use std::fmt;
 
@@ -581,6 +588,108 @@ mod bounded_loft_sections {
             Ok(sections)
         }
     }
+}
+
+/// A bounded sequence: at most `MAX` elements are allocated before the
+/// input is refused.
+struct BoundedVisitor<T, const MAX: usize>(std::marker::PhantomData<T>, &'static str);
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de>
+    for BoundedVisitor<T, MAX>
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "at most {MAX} {}", self.1)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let too_many = || serde::de::Error::custom(format_args!("more than {MAX} {}", self.1));
+        if sequence.size_hint().is_some_and(|size| size > MAX) {
+            return Err(too_many());
+        }
+        let mut items = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+        while let Some(item) = sequence.next_element()? {
+            if items.len() == MAX {
+                return Err(too_many());
+            }
+            items.push(item);
+        }
+        Ok(items)
+    }
+}
+
+fn bounded_sweep_segments<'de, D>(deserializer: D) -> Result<Vec<SweepSegment3>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedVisitor::<SweepSegment3, MAX_SWEEP_PATH_SEGMENTS>(
+        std::marker::PhantomData,
+        "sweep path segments",
+    ))
+}
+
+fn bounded_sweep_points<'de, D>(deserializer: D) -> Result<Vec<Point3>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedVisitor::<Point3, MAX_SWEEP_SPLINE_POINTS>(
+        std::marker::PhantomData,
+        "spline control points",
+    ))
+}
+
+/// One piece of a sweep's path, in model space (ADR 0055).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SweepSegment3 {
+    Line {
+        start: Point3,
+        end: Point3,
+    },
+    /// A circular arc from `start`, turning `sweep` radians right-handed
+    /// about `normal` around `center`. `start - center` is perpendicular to
+    /// `normal`.
+    Arc {
+        center: Point3,
+        start: Point3,
+        normal: Vector3,
+        #[serde(with = "finite_f64")]
+        sweep: f64,
+    },
+    /// A clamped, non-rational B-spline.
+    Spline {
+        degree: u32,
+        knots: Vec<f64>,
+        #[serde(deserialize_with = "bounded_sweep_points")]
+        points: Vec<Point3>,
+    },
+}
+
+/// The path a sweep follows: segments in order, each beginning where the one
+/// before it ends and leaving in the direction it arrived, open at both ends.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SweepPath3 {
+    #[serde(deserialize_with = "bounded_sweep_segments")]
+    pub segments: Vec<SweepSegment3>,
+}
+
+/// How a sweep carries its profile along the path.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOrientation {
+    /// Turned with the path, twisting as little as a frame can: the
+    /// rotation-minimising frame, carried by double reflection.
+    #[default]
+    RotationMinimising,
+    /// Never turned: the profile keeps its orientation in space and only
+    /// moves along the path.
+    Fixed,
 }
 
 /// JSON must never silently turn an invalid IEEE-754 value into `null`.
@@ -1505,6 +1614,27 @@ pub enum KernelCommand {
         #[serde(deserialize_with = "bounded_loft_sections::deserialize")]
         sections: Vec<LoftSection>,
         operation: LoftOperation,
+    },
+    /// Sweeps one certified planar region along a path (ADR 0055).
+    ///
+    /// The profile is carried along the path rigidly, by the path's
+    /// rotation-minimising frame or with its orientation fixed, from where
+    /// it lies at the path's start. A straight path is an extrusion and a
+    /// circular arc about an axis in the profile's plane is a partial
+    /// revolve, both exact; any other path is skinned through copies of the
+    /// profile along it, to the precision's approximation budget, and says
+    /// so. A new body is built from the empty snapshot; an add or a cut
+    /// combines the sweep with the body it is given through the Boolean
+    /// ladder.
+    SweepPlanarProfile {
+        frame: PlanarFrame3,
+        #[serde(deserialize_with = "bounded_planar_profile::deserialize")]
+        profile: PlanarProfile2,
+        path: SweepPath3,
+        #[serde(default)]
+        orientation: SweepOrientation,
+        #[serde(default)]
+        operation: SolidOperation,
     },
     /// Revolves one certified planar region a full turn about an axis lying in
     /// its own frame.

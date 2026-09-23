@@ -722,6 +722,8 @@ pub enum SketchRegionResolveError {
     InvalidLoft(crate::loft::SketchLoftError),
     #[error("invalid revolve: {0}")]
     InvalidRevolve(crate::revolve::SketchRevolveError),
+    #[error("invalid sweep: {0}")]
+    InvalidSweep(crate::sweep::SketchSweepError),
 }
 
 /// Compiles the named regions of a sketch's current authoring graph into an

@@ -22,6 +22,7 @@ pub enum CommandIcon {
     Extrude,
     Revolve,
     Loft,
+    Sweep,
     Hole,
     Rib,
     Mirror,
@@ -253,6 +254,20 @@ impl IconPainter<'_> {
                 self.line((0.14, 0.72), (0.34, 0.24));
                 self.line((0.86, 0.88), (0.66, 0.24));
                 self.dashed((0.50, 0.80), (0.50, 0.40));
+            }
+            CommandIcon::Sweep => {
+                // A round profile carried up and round a bend: the tube's
+                // two walls, the profile where it starts, the end it
+                // reaches.
+                use std::f32::consts::PI;
+                self.circle((0.18, 0.84), 0.09);
+                self.line((0.09, 0.84), (0.09, 0.50));
+                self.arc((0.50, 0.50), 0.41, PI, 0.5 * PI);
+                self.line((0.50, 0.09), (0.88, 0.09));
+                self.line((0.27, 0.84), (0.27, 0.50));
+                self.arc((0.50, 0.50), 0.23, PI, 0.5 * PI);
+                self.line((0.50, 0.27), (0.88, 0.27));
+                self.line((0.88, 0.09), (0.88, 0.27));
             }
             CommandIcon::Hole => {
                 self.rectangle((0.12, 0.20), (0.88, 0.80));

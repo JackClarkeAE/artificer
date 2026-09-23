@@ -253,7 +253,7 @@ impl KernelLabApp {
     }
 
     /// An interior point of every region a finished sketch has.
-    fn sketch_region_anchors(&self, sketch: SketchId) -> Vec<[f64; 2]> {
+    pub(crate) fn sketch_region_anchors(&self, sketch: SketchId) -> Vec<[f64; 2]> {
         let Some(payload) = self.document.sketch(sketch).and_then(|record| {
             self.document
                 .sketch_payload(sketch, record.geometry_revision)

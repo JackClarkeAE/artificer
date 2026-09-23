@@ -838,6 +838,26 @@ impl KernelLabApp {
                 }
                 CommandAvailability::Enabled
             }
+            ModelCommand::Sweep => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                // The profile and its path are two sketches; one still being
+                // drawn is finished by the press.
+                let drawing = self.workbench_mode == WorkbenchMode::Sketch
+                    && !self.sketch.authoring().operations().is_empty();
+                let finished = self
+                    .sketches
+                    .iter()
+                    .filter(|sketch| sketch.finished && sketch.id.is_some())
+                    .count();
+                if finished + usize::from(drawing) < 2 {
+                    return CommandAvailability::disabled(
+                        "A sweep carries a profile along a path drawn in another sketch. Sketch both first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::Hole => self.preset_feature_availability(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.preset_feature_availability(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.preset_feature_availability(SolidFeaturePreset::Mirror),
@@ -1187,6 +1207,9 @@ impl KernelLabApp {
             }
             ModelCommand::Loft => {
                 self.stage_loft();
+            }
+            ModelCommand::Sweep => {
+                self.stage_sweep();
             }
             ModelCommand::Hole => self.stage_preset_feature(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.stage_preset_feature(SolidFeaturePreset::Rib),

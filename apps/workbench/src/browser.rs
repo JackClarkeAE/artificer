@@ -353,8 +353,7 @@ impl KernelLabApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         for plane in SketchPlane::ALL {
-                            let has_other_plane_sketch =
-                                !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
+                            let has_other_plane_sketch = self.sketch_open_on_another_plane(plane);
                             let enabled =
                                 self.pending_operation.is_none() && !has_other_plane_sketch;
                             let selected = self.selected_origin_plane == plane
@@ -384,7 +383,7 @@ impl KernelLabApp {
                             }
                             if has_other_plane_sketch {
                                 response.on_disabled_hover_text(
-                                    "This first profile slice owns one plane per document.",
+                                    "Finish the sketch being drawn before choosing another plane.",
                                 );
                             }
                         }
@@ -746,6 +745,12 @@ impl KernelLabApp {
         self.browser_selected_sketch
     }
 
+    /// Whether a sketch still being drawn holds a plane other than `plane`.
+    /// A finished one does not: the next sketch may go on any plane.
+    fn sketch_open_on_another_plane(&self, plane: SketchPlane) -> bool {
+        !self.sketch_finished && !self.sketch.entities().is_empty() && self.sketch.plane() != plane
+    }
+
     /// One left click on an origin plane row, shared with the context menu's
     /// "Select this plane".
     pub(crate) fn select_origin_plane(&mut self, plane: SketchPlane) {
@@ -927,8 +932,7 @@ impl KernelLabApp {
                 commands.push(BrowserContextCommand::DeletePlane);
             }
             BrowserContextTarget::OriginPlane(plane) => {
-                let has_other_plane_sketch =
-                    !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
+                let has_other_plane_sketch = self.sketch_open_on_another_plane(plane);
                 let already_selected = self.selected_origin_plane == plane
                     && self.selected_construction_plane.is_none();
                 if !has_other_plane_sketch && !already_selected {
@@ -1081,9 +1085,7 @@ impl KernelLabApp {
                     self.clear_model_entity_selection();
                 }
                 BrowserContextTarget::OriginPlane(plane) => {
-                    let has_other_plane_sketch =
-                        !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
-                    if !has_other_plane_sketch {
+                    if !self.sketch_open_on_another_plane(plane) {
                         self.select_origin_plane(plane);
                     }
                 }

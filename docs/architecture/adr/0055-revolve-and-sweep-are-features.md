@@ -1,11 +1,13 @@
 # ADR 0055: Revolve and sweep are features
 
-Status: accepted. Phases R1, R2 and R3 are implemented, with construction
-axes: Revolve is a history feature that turns a sketch profile about a
-centreline, the sketch's own axes, an origin axis or a construction axis, a
-full turn or through an angle that can follow a variable, as a new body or
-added to or cut from the active one. The sweep phases are planned below;
-the sketch side of S1 is built.
+Status: accepted. Phases R1, R2, R3 and S1 to S3 are implemented, with
+construction axes. Revolve is a history feature that turns a sketch profile
+about a centreline, the sketch's own axes, an origin axis or a construction
+axis, a full turn or through an angle that can follow a variable. Sweep is a
+history feature that carries a sketch profile along a path drawn in another
+sketch, exactly where the path is straight or one arc, and to a stated
+tolerance otherwise. Both make a new body or add to or cut from the active
+one. R4 remains optional.
 
 - Date: 2026-09-23
 - Decision owners: Artificer project
@@ -469,3 +471,124 @@ construction plane (ADR 0048).
     - an axis along the block's edge that a revolve turns about exactly;
     - an axis where two faces meet, flipped in its editor and deleted;
     - a flat face alone is refused.
+
+## As built (S1 to S3)
+
+- **Sketch.** `SketchDefinition::ordered_chain(entities)` puts a path's
+  curves end to end, from the free end of the curve named first, and
+  refuses by name:
+  - a gap;
+  - a branch;
+  - a corner;
+  - a closed chain;
+  - a circle or an unclamped spline.
+
+  `tangent_chain_through(entity)` finds the smooth chain through one curve.
+- **Protocol.** `SweepPath3` is a list of `SweepSegment3`: a line, a
+  circular arc (centre, start, normal, sweep), or a clamped B-spline.
+  `KernelCommand::SweepPlanarProfile { frame, profile, path, orientation,
+  operation }`: the orientation reads as rotation-minimising and the
+  operation as New from a command written without them. A path has at most
+  256 segments and a spline at most 1024 points.
+- **Kernel** (`crates/kernel/src/sweep_profile.rs`). The profile is carried
+  rigidly from where it lies. Each copy is the profile moved by the motion
+  that takes the path's frame at its start to its frame further along, so
+  the profile need not sit on the path.
+  - **Frames.** Rotation-minimising frames are carried by double
+    reflection, 16 steps between two copies of the profile. `Fixed` only
+    moves the profile. Collinear lines in a row are merged into one.
+  - **Exact routes.**
+    - A straight path is the two-section loft to the profile's copy at the
+      far end (`sweep/straight`).
+    - One arc, carried by its rotation-minimising frame about an axis in the
+      profile's plane, is a partial revolve (`sweep/revolve`).
+  - **The skinned route** (`sweep/skinned`) lofts smoothly through copies of
+    the profile (ADR 0050). It starts with copies about a twelfth of the
+    path apart.
+    - **Measuring.** Between every two copies, the skin's departure from the
+      true sweep is measured at the quarter points. Each profile sample is
+      inverted onto the skin, seeded from the previous station, so the
+      measure stays cheap.
+    - **Refining.** A span that misses the budget is split: into `⁴√miss`
+      parts in the middle of a piece, and by repeated halving toward a join
+      between pieces. A join is where curvature jumps, so the error there
+      shrinks only as h².
+    - **Folds and limits.** If the skin folds, every span is halved and the
+      loft tried again. At most 257 copies are used; if even that many do
+      not meet the budget, `SWEEP_TOLERANCE_UNMET` gives the departure it
+      reached.
+    - **Tolerance.** The budget is the precision's `approximation_budget`
+      (10⁻⁵ by default), held at least to its modelling resolution. The
+      result carries `SWEEP_APPROXIMATION_TOLERANCE`, measuring the worst
+      departure found against that budget. A disc round a 90° bend of three
+      times its radius takes three rounds and 55 copies.
+  - **Refusals**, each a named code:
+    - `SWEEP_PATH_EMPTY`;
+    - `SWEEP_PATH_INVALID`, for a segment that is not sound;
+    - `SWEEP_PATH_GAP`;
+    - `SWEEP_PATH_CORNER`, for tangents that disagree by more than 10⁻⁶
+      radians;
+    - `SWEEP_PATH_CLOSED`;
+    - `SWEEP_PROFILE_ALONG_PATH`, for a start within about five degrees of
+      the profile's plane;
+    - `SWEEP_PROFILE_TOO_WIDE`, for a profile that reaches past the path's
+      centre of curvature.
+
+    The plan's sampled check for a wall crossing itself elsewhere was not
+    built. A path that comes back through its own solid is not refused.
+  - **Add and cut** go through `tool_boolean` with the `SWEEP_BOOLEAN`
+    labels.
+    - A straight sweep cuts exactly through `sweep/boolean-prism`.
+    - A skinned sweep's B-spline walls fall to the faceted tier. That tier
+      cannot yet close a skinned pipe through a block, so such a cut is
+      refused with `SWEEP_FACETED_UNRESOLVED` rather than answered wrongly.
+- **Model** (`crates/model/src/sweep.rs`). `SketchSweep` and `SweepPath`
+  are as planned, plus a `reversed` flag that runs the path from its far
+  end (omitted from the file when false).
+  - The feature is `FeatureKind::Sweep` with `ReplayAction::SketchSweep`.
+  - It names both sketches, and for an add or cut its body, as inputs.
+  - Replay places the path with its sketch's current frame, a construction
+    plane's included, so the sweep follows the path sketch.
+  - It stays in document version 10 (`SKETCH_SWEEP_DOCUMENT_VERSION`).
+- **Workbench** (`apps/workbench/src/sweep.rs`).
+  - The Sweep button, in the Solid group, needs two finished sketches, one
+    of which may be still being drawn. It takes the active sketch's picked
+    or only region as the profile. Clicking a region in the model view picks
+    it; Shift adds or removes one.
+  - **The path is chosen on the card, not picked in the viewport**, which
+    departs from the plan. The card lists every open, smooth chain in the
+    other finished sketches ("Sketch 2 path 1 · 3 curves") and starts on the
+    first. Reverse path runs it from its far end.
+  - Orientation is Follow path (rotation-minimising) or Keep orientation
+    (fixed). The operation is New, Add or Cut. The card says whether the
+    preview is exact or skinned, and how close a skinned one came.
+  - Confirming commits "Sweep N" with a chip of its own and hides both
+    sketches. The chip's menu reopens the editor, and confirming rewrites
+    the sweep in place.
+  - The Browser no longer greys out the other origin planes once a sketch
+    is finished. That rule dated from when a document held one sketch, and
+    it stopped a profile and its path going on two origin planes.
+- **Not yet.** A sweep has no scripting form. There is no twist, no guide
+  rail and no closed path.
+- **Tests.**
+  - Sketch: `ordered_chain` and `tangent_chain_through`, each refusal
+    included.
+  - Kernel frames: a helix's frame turns at its torsion, and a straight
+    path does not twist.
+  - Kernel solids:
+    - a leaning straight sweep is an exact prism;
+    - an arc about an axis in the profile is the revolve;
+    - a bend is skinned within its stated budget, by Pappus, and exports to
+      STEP;
+    - a fixed sweep keeps its disc level, by Cavalieri;
+    - each refusal is named;
+    - a straight sweep cuts a block exactly.
+  - Model: the recipe's refusals, and a reversed curve placed running the
+    other way.
+  - Workbench:
+    - an oblique cylinder, exact, with its chip, editor and spent sketches;
+    - an arc sweep that is exact until the path is reversed, which is then
+      refused by name;
+    - an edit that reverses the path, then a save and replay;
+    - through the real widgets, a path on XZ and a disc on XY swept,
+      reopened from the chip, reversed and held level.

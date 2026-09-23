@@ -433,7 +433,8 @@ pub fn hydrate_model_document(
             }
             ReplayAction::SketchRegionExtrusion(_)
             | ReplayAction::SketchLoft(_)
-            | ReplayAction::SketchRevolve(_) => {
+            | ReplayAction::SketchRevolve(_)
+            | ReplayAction::SketchSweep(_) => {
                 unreachable!("sketch-region replay actions are resolved before kernel dispatch")
             }
             ReplayAction::Boolean(recipe) => {

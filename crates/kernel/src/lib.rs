@@ -44,6 +44,7 @@ mod shell;
 mod spline_profile;
 mod step_export;
 mod surface_intersection;
+mod sweep_profile;
 mod topology;
 mod transform;
 mod validator;
@@ -976,6 +977,41 @@ impl NativeKernel {
                             request.precision,
                             &mut warnings,
                             &REVOLVE_BOOLEAN,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
+                }
+            }
+            KernelCommand::SweepPlanarProfile {
+                frame,
+                profile,
+                path,
+                orientation,
+                operation,
+            } => {
+                if *operation == SolidOperation::New {
+                    validate_extrusion_source(input)?;
+                }
+                let swept =
+                    sweep_profile::sweep(*frame, profile, path, *orientation, request.precision)
+                        .map_err(|reason| sweep_input_error(input.id, reason))?;
+                if let Some(approximation) = swept.approximation {
+                    warnings.push(sweep_approximation_warning(approximation));
+                }
+                match operation {
+                    SolidOperation::New => {
+                        rung = swept.rung;
+                        (swept.topology, HistoryMode::Generated)
+                    }
+                    SolidOperation::Add | SolidOperation::Cut => {
+                        let (topology, answered) = tool_boolean(
+                            input,
+                            swept.topology,
+                            *operation == SolidOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                            &SWEEP_BOOLEAN,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -4244,6 +4280,19 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
 /// faces are all planes and coaxial cylinders is a prism along its axis and
 /// answers exactly; a cone, torus or sphere takes the faceted tier until the
 /// coaxial Boolean of ADR 0026 F4 exists.
+const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "sweep",
+    empty: "SWEEP_TARGET_EMPTY",
+    declined: "SWEEP_EXACT_ROUTE_DECLINED",
+    unresolved: "SWEEP_FACETED_UNRESOLVED",
+    approximation: "SWEEP_FACETED_APPROXIMATION",
+    rungs: [
+        "sweep/boolean-prism",
+        "sweep/boolean-analytic",
+        "sweep/faceted",
+    ],
+};
+
 const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
     noun: "revolve",
     empty: "REVOLVE_TARGET_EMPTY",
@@ -7432,6 +7481,89 @@ fn planar_profile_error(
             message,
         )],
     )
+}
+
+fn sweep_input_error(snapshot: SnapshotId, reason: sweep_profile::SweepInputError) -> KernelError {
+    use sweep_profile::SweepInputError;
+    let (diagnostic, message) = match reason {
+        SweepInputError::Profile(reason) => return planar_profile_input_error(snapshot, reason),
+        SweepInputError::Loft(reason) => return loft_sections_error(snapshot, reason),
+        SweepInputError::PathEmpty => (
+            "SWEEP_PATH_EMPTY".to_owned(),
+            "A sweep needs a path of at least one segment.".to_owned(),
+        ),
+        SweepInputError::PathInvalid { segment } => (
+            "SWEEP_PATH_INVALID".to_owned(),
+            format!(
+                "Path segment {segment} is not finite, has no length, or is not a sound arc or clamped spline."
+            ),
+        ),
+        SweepInputError::PathGap { segment } => (
+            "SWEEP_PATH_GAP".to_owned(),
+            format!("Path segment {segment} does not begin where the one before it ends."),
+        ),
+        SweepInputError::PathCorner { segment } => (
+            "SWEEP_PATH_CORNER".to_owned(),
+            format!(
+                "The path turns a corner where segment {segment} begins; a sweep's path must be tangent where its segments meet."
+            ),
+        ),
+        SweepInputError::PathClosed => (
+            "SWEEP_PATH_CLOSED".to_owned(),
+            "The path ends where it begins; a sweep along a closed path is not supported yet.".to_owned(),
+        ),
+        SweepInputError::ProfileAlongPath => (
+            "SWEEP_PROFILE_ALONG_PATH".to_owned(),
+            "The path starts along the profile's own plane, so the profile would be swept edge-on.".to_owned(),
+        ),
+        SweepInputError::ProfileTooWide => (
+            "SWEEP_PROFILE_TOO_WIDE".to_owned(),
+            "The profile reaches past the path's centre of curvature where the path bends most tightly, so the swept wall would fold through itself.".to_owned(),
+        ),
+        SweepInputError::ToleranceUnmet {
+            deviation,
+            tolerance,
+        } => (
+            "SWEEP_TOLERANCE_UNMET".to_owned(),
+            format!(
+                "Even the most copies of the profile left the skinned sweep {deviation:.3e} from the true sweep, beyond the approximation budget of {tolerance:.3e}."
+            ),
+        ),
+    };
+    error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Preflight,
+        snapshot,
+        "the sweep's profile and path leave the certified domain",
+        vec![simple_diagnostic(
+            &diagnostic,
+            KernelStage::Preflight,
+            &message,
+        )],
+    )
+}
+
+/// A skinned sweep is published with the departure from the true sweep it
+/// met, and the budget it was held to (ADR 0055).
+fn sweep_approximation_warning(approximation: sweep_profile::Approximation) -> ProtocolDiagnostic {
+    let mut warning = approximation_warning(
+        "SWEEP_APPROXIMATION_TOLERANCE",
+        &format!(
+            "The sweep is skinned through {} copies of the profile along the path. Its walls \
+             pass through every copy exactly and are within {:.3e} of the true sweep between \
+             them, inside the approximation budget of {:.3e}.",
+            approximation.sections, approximation.deviation, approximation.tolerance
+        ),
+    );
+    warning.measurement = Some(DiagnosticMeasurement {
+        quantity: QuantityKind::Length,
+        measured: approximation.deviation,
+        allowed: NumericInterval {
+            min: None,
+            max: Some(approximation.tolerance),
+        },
+    });
+    warning
 }
 
 fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError) -> KernelError {
