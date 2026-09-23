@@ -102,12 +102,27 @@ pub(crate) struct Approximation {
 }
 
 /// Certifies and builds a sweep.
+/// What a skinned sweep is brought within.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkinBudget {
+    /// The precision's approximation budget: the sweep is the body.
+    Precision,
+    /// The chord tolerance the faceted Boolean tier samples a B-spline of
+    /// the sweep's size at: the sweep is a tool that tier will combine, and
+    /// copies placed more closely than that would only be tessellated away.
+    /// Worse, they would be harmful: a join packed with copies is tessellated
+    /// into facets so short that those either side of it are all but
+    /// coplanar, and the tier's splitting shreds them into slivers.
+    FacetedTool,
+}
+
 pub(crate) fn sweep(
     frame: PlanarFrame3,
     profile: &PlanarProfile2,
     path: &SweepPath3,
     orientation: SweepOrientation,
     precision: PrecisionPolicy,
+    budget: SkinBudget,
 ) -> Result<Swept, SweepInputError> {
     let placed = normalize_frame(frame, precision)?;
     let pieces = parse_path(path, precision)?;
@@ -168,6 +183,15 @@ pub(crate) fn sweep(
         });
     }
 
+    let tolerance = match budget {
+        SkinBudget::Precision => precision
+            .approximation_budget
+            .max(precision.modeling_resolution),
+        SkinBudget::FacetedTool => crate::faceted_spline_tolerance(
+            pieces.iter().map(|piece| piece.length()).sum::<f64>(),
+            precision,
+        ),
+    };
     skinned(
         frame,
         placed,
@@ -176,6 +200,7 @@ pub(crate) fn sweep(
         orientation,
         &samples,
         precision,
+        tolerance,
     )
 }
 
@@ -187,6 +212,7 @@ pub(crate) fn sweep(
 /// and its departure there shrinks only with the square of the spacing.
 /// Refining just the spans that miss the budget grades the copies in towards
 /// such joins instead of multiplying them everywhere.
+#[allow(clippy::too_many_arguments)]
 fn skinned(
     frame: PlanarFrame3,
     placed: Frame,
@@ -195,10 +221,8 @@ fn skinned(
     orientation: SweepOrientation,
     samples: &[Point3],
     precision: PrecisionPolicy,
+    tolerance: f64,
 ) -> Result<Swept, SweepInputError> {
-    let tolerance = precision
-        .approximation_budget
-        .max(precision.modeling_resolution);
     // Where each copy stands along the path: piece index plus the fraction
     // of that piece, so a copy always stands at every join.
     // The copies start about evenly spaced along the whole path: a smooth

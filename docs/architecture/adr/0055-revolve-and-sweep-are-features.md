@@ -539,9 +539,9 @@ construction plane (ADR 0048).
   - **Add and cut** go through `tool_boolean` with the `SWEEP_BOOLEAN`
     labels.
     - A straight sweep cuts exactly through `sweep/boolean-prism`.
-    - A skinned sweep's B-spline walls fall to the faceted tier. That tier
-      cannot yet close a skinned pipe through a block, so such a cut is
-      refused with `SWEEP_FACETED_UNRESOLVED` rather than answered wrongly.
+    - A skinned sweep's B-spline walls fall to the faceted tier
+      (`sweep/faceted`, `SWEEP_FACETED_APPROXIMATION`). See "Skinned
+      sweeps on the faceted tier" below for what that took.
 - **Model** (`crates/model/src/sweep.rs`). `SketchSweep` and `SweepPath`
   are as planned, plus a `reversed` flag that runs the path from its far
   end (omitted from the file when false).
@@ -582,7 +582,12 @@ construction plane (ADR 0048).
       STEP;
     - a fixed sweep keeps its disc level, by Cavalieri;
     - each refusal is named;
-    - a straight sweep cuts a block exactly.
+    - a straight sweep cuts a block exactly;
+    - a disc held level along a leaning arc cuts through a block, by
+      Cavalieri;
+    - a bent pipe cuts up through a block, round a bend inside it and out
+      of its side, taking away its bore times the centreline inside the
+      block, by Pappus.
   - Model: the recipe's refusals, and a reversed curve placed running the
     other way.
   - Workbench:
@@ -592,3 +597,81 @@ construction plane (ADR 0048).
     - an edit that reverses the path, then a save and replay;
     - through the real widgets, a path on XZ and a disc on XY swept,
       reopened from the chip, reversed and held level.
+
+## Skinned sweeps on the faceted tier
+
+At first a skinned sweep could not be added or cut: the faceted tier
+refused it. Two things were wrong, one at each end of the tier.
+
+- **The tool was too dense to combine.** A B-spline face was sampled at
+  the kernel's budget of 10⁻⁵ mm, with a cap only on each knot span. A
+  skin has a span between every two copies of the profile, so a pipe's
+  wall ran to almost half a million facets. Two changes fix this:
+  - `ChordBudget::FacetedOperand` is used wherever the faceted tier
+    tessellates an operand: `tool_boolean` and the two face-feature
+    crossings.
+    - Arcs and ruled walls are sampled as before, sixteen chords to a
+      curved face.
+    - B-spline faces and edges are sampled at the display chord
+      tolerance, a few thousandths of a millimetre. That is what the tier
+      already leaves its arcs at.
+  - A sweep that will be added or cut is skinned to that same tolerance
+    (`SkinBudget::FacetedTool`). Copies placed closer would only be
+    tessellated away. A new body is still skinned to the kernel's budget.
+- **The tier could not keep a smooth wall closed.** It judged a point to
+  lie on a plane within the modelling resolution. At that scale, the
+  facets of a wall that runs on tangentially, as a sweep does past every
+  join of its path, read as lying on their neighbours' planes, and the
+  splits that followed shredded the wall into slivers. Six changes to
+  `faceted_boolean.rs` fix this:
+  - `combine_bodies` judges coplanarity at the linear agreement. Both
+    operands are the kernel's own tessellations, whose shared corners
+    agree to rounding.
+  - Only the body near the tool goes through the Boolean.
+    - The body is split at a box around the tool, grown by a margin.
+    - The part inside is closed with the box's faces, which carry a
+      marker role and are dropped from the answer.
+    - The rest is carried over untouched. Otherwise every facet plane of
+      the tool splits the body's faces clear across, out to corners the
+      tool never reaches.
+  - The Boolean's polygons are taken as they come. They are no longer
+    built into a tree again, which split every one by its neighbours'
+    planes.
+  - A face is flat only if its corners lie within a nanometre of its
+    plane, the tolerance the validator holds every planar face to. Before,
+    the rebuild accepted corners up to 1.6×10⁻⁷ mm off the plane, which
+    the validator then refused. This applies in three places:
+    - the split of non-planar polygons;
+    - the merge of coplanar panels, which now refuses a union that is
+      not flat;
+    - the acceptance of a face after welding.
+  - Two outlines that are one another turned over enclose nothing, and
+    both are dropped before faces are made.
+  - Healing handles two cases that had no answer:
+    - A gap with no width is a T-junction. The face that runs straight
+      past the vertex is rerouted through it, and the topology is
+      compacted.
+    - A point on a straight run of a gap's boundary is left out of the
+      triangulation, then put back on the side it lies on.
+  - The last three hold only for `combine_bodies`, whose rebuild is
+    `Rebuild::Strict`. The edge finishes and the face-feature crossing cut
+    keep `Rebuild::Classic`, the rules their results were certified under.
+    Under the strict rules, the faceted fallback would round the second
+    edge of an already rounded corner approximately, where ADR 0044 means
+    it to be refused and offered as a join.
+
+**What it covers.** Each case below was cut through a block by a bent
+pipe (up, a quarter bend, along), with the block at seven placements:
+- the whole bend, the pipe crossing both faces square;
+- the original block through the bend;
+- the bend alone;
+- the far line alone;
+- the straight part alone;
+- an arbitrary offset block.
+
+Six of the seven close and validate.
+
+**What it does not.** The seventh fails: a slab whose face runs
+lengthwise along the side of the pipe, parallel to whole rows of its
+facets. It still leaves slivers about the weld distance wide. Such a cut
+is refused with `SWEEP_FACETED_UNRESOLVED`, never answered wrongly.

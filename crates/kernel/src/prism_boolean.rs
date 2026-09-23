@@ -1274,7 +1274,7 @@ fn segment_midpoint(segment: Segment) -> Point2 {
 
 /// Rebuilds the topology keeping only entities reachable from its solids,
 /// renumbering keys and identifiers densely.
-fn compact(source: Topology) -> Topology {
+pub(crate) fn compact(source: Topology) -> Topology {
     let mut used_faces = vec![false; source.faces.len()];
     for shell in &source.shells {
         for face in &shell.value.faces {

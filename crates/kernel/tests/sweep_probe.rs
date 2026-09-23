@@ -348,3 +348,97 @@ fn a_straight_sweep_cuts_a_block_exactly() {
     );
     assert_eq!(report.rung.as_deref(), Some("sweep/boolean-prism"));
 }
+
+fn block(origin: [f64; 3], size: [f64; 3]) -> Snapshot {
+    let request = ExecuteRequest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("block"),
+        expected_snapshot: NativeKernel::empty().id(),
+        precision: PrecisionPolicy::default(),
+        command: KernelCommand::MakeCuboid {
+            origin: Point3::new(origin[0], origin[1], origin[2]),
+            size_x: size[0],
+            size_y: size[1],
+            size_z: size[2],
+        },
+    };
+    NativeKernel::execute(&NativeKernel::empty(), &request, &CancellationToken::new())
+        .expect("block")
+        .snapshot
+}
+
+/// A skinned sweep through a block: the disc held level along a leaning arc
+/// passes through the block's top and bottom, so by Cavalieri it takes the
+/// disc's area times the block's height away.
+#[test]
+fn a_skinned_sweep_cuts_through_a_block_on_the_faceted_tier() {
+    let body = block([-3.0, -3.0, 0.5], [8.0, 6.0, 1.5]);
+    let before = body.measures().volume;
+    let (cut, report) = sweep_into(
+        &body,
+        frame_xy(),
+        disc((0.0, 0.0), 1.0),
+        vec![arc(
+            [4.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            PI / 4.0,
+        )],
+        SweepOrientation::Fixed,
+        SolidOperation::Cut,
+    )
+    .expect("the sweep cuts the block");
+    assert_valid(&cut, "cut");
+    assert_eq!(report.rung.as_deref(), Some("sweep/faceted"));
+    assert_close(
+        cut.measures().volume,
+        before - PI * 1.5,
+        1.0e-2,
+        "Cavalieri",
+    );
+}
+
+/// Up through a block, round a bend inside it and out through its side: the
+/// pipe crosses both faces square, so what it takes away is its bore times
+/// the length of centreline inside the block, by Pappus — three up, a
+/// quarter turn of radius three, three along. The bend's walls are B-spline
+/// skins, which only the faceted tier can combine.
+#[test]
+fn a_bent_pipe_cuts_through_a_block_on_the_faceted_tier() {
+    let body = block([-3.0, -3.0, 2.0], [9.0, 6.0, 8.0]);
+    let before = body.measures().volume;
+    let bend = 3.0;
+    let (cut, report) = sweep_into(
+        &body,
+        frame_xy(),
+        disc((0.0, 0.0), 1.0),
+        vec![
+            line([0.0, 0.0, 0.0], [0.0, 0.0, 5.0]),
+            arc([bend, 0.0, 5.0], [0.0, 0.0, 5.0], [0.0, 1.0, 0.0], PI / 2.0),
+            line([bend, 0.0, 5.0 + bend], [bend + 5.0, 0.0, 5.0 + bend]),
+        ],
+        SweepOrientation::RotationMinimising,
+        SolidOperation::Cut,
+    )
+    .expect("the pipe cuts the block");
+    assert_valid(&cut, "cut");
+    assert_eq!(report.rung.as_deref(), Some("sweep/faceted"));
+    assert_eq!(report.tier(), Tier::Approximate);
+    let codes = report
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        codes.contains(&"SWEEP_FACETED_APPROXIMATION".to_owned())
+            && codes.contains(&"SWEEP_EXACT_ROUTE_DECLINED".to_owned()),
+        "the approximation and its reason are named: {codes:?}"
+    );
+    let removed = PI * (3.0 + bend * PI / 2.0 + 3.0);
+    assert_close(
+        before - cut.measures().volume,
+        removed,
+        1.0e-2,
+        "the bore times the centreline inside the block",
+    );
+}

@@ -369,28 +369,175 @@ impl BspNode {
     }
 }
 
-fn subtract(mut left: BspNode, mut right: BspNode) -> BspNode {
+fn subtract(left: BspNode, right: BspNode) -> BspNode {
     let epsilon = left.epsilon.max(right.epsilon);
-    left.invert();
-    left.clip_to(&right);
-    right.clip_to(&left);
-    right.invert();
-    right.clip_to(&left);
-    right.invert();
-    left.build(right.all_polygons());
-    left.invert();
-    BspNode::from_polygons(left.all_polygons(), epsilon)
+    BspNode::from_polygons(subtracted_polygons(left, right), epsilon)
 }
 
-fn union(mut left: BspNode, mut right: BspNode) -> BspNode {
-    let epsilon = left.epsilon.max(right.epsilon);
+/// What is left of `left` once `right` is taken away, as polygons. Building
+/// them into a tree again, as [`subtract`] does, splits each by the planes
+/// of the rest, which buys nothing when the polygons are all that is wanted:
+/// on a curved wall that runs on tangentially — a swept pipe past a join —
+/// it cuts facets by their neighbours' nearly coincident planes into slivers
+/// that leave holes when they weld.
+fn subtracted_polygons(mut left: BspNode, mut right: BspNode) -> Vec<Polygon> {
+    left.invert();
     left.clip_to(&right);
     right.clip_to(&left);
     right.invert();
     right.clip_to(&left);
     right.invert();
     left.build(right.all_polygons());
-    BspNode::from_polygons(left.all_polygons(), epsilon)
+    left.invert();
+    left.all_polygons()
+}
+
+/// The role that marks a polygon as a face of the box a Boolean is confined
+/// to rather than of either operand. Such polygons are dropped from the
+/// answer, and the role is never numbered as a feature side.
+const BOX_ROLE: FaceRole = FaceRole::FeatureSide(u32::MAX - 1);
+
+/// The corners of the box around `polygons`, grown by `margin` on every side.
+fn polygon_bounds(polygons: &[Polygon], margin: f64) -> Option<[Point3; 2]> {
+    let mut minimum = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut maximum = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for point in polygons.iter().flat_map(|polygon| &polygon.vertices) {
+        minimum = Point3::new(
+            minimum.x.min(point.x),
+            minimum.y.min(point.y),
+            minimum.z.min(point.z),
+        );
+        maximum = Point3::new(
+            maximum.x.max(point.x),
+            maximum.y.max(point.y),
+            maximum.z.max(point.z),
+        );
+    }
+    let grow = Vector3::new(margin, margin, margin);
+    (minimum.x.is_finite() && maximum.x.is_finite())
+        .then(|| [minimum + grow * -1.0, maximum + grow])
+}
+
+/// The six planes of a box, each facing out of it.
+fn box_planes([low, high]: [Point3; 2]) -> [SplitPlane; 6] {
+    let plane = |normal: Vector3, point: Point3| SplitPlane {
+        normal,
+        offset: normal.dot(point.as_vector()),
+    };
+    [
+        plane(Vector3::new(-1.0, 0.0, 0.0), low),
+        plane(Vector3::new(1.0, 0.0, 0.0), high),
+        plane(Vector3::new(0.0, -1.0, 0.0), low),
+        plane(Vector3::new(0.0, 1.0, 0.0), high),
+        plane(Vector3::new(0.0, 0.0, -1.0), low),
+        plane(Vector3::new(0.0, 0.0, 1.0), high),
+    ]
+}
+
+/// A box as six quads facing out of it, each carrying [`BOX_ROLE`].
+fn box_polygons([low, high]: [Point3; 2], epsilon: f64) -> Vec<Polygon> {
+    let corner = |x: bool, y: bool, z: bool| {
+        Point3::new(
+            if x { high.x } else { low.x },
+            if y { high.y } else { low.y },
+            if z { high.z } else { low.z },
+        )
+    };
+    [
+        [
+            (false, false, false),
+            (false, false, true),
+            (false, true, true),
+            (false, true, false),
+        ],
+        [
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+            (true, false, true),
+        ],
+        [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (false, false, true),
+        ],
+        [
+            (false, true, false),
+            (false, true, true),
+            (true, true, true),
+            (true, true, false),
+        ],
+        [
+            (false, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+        ],
+        [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (false, true, true),
+        ],
+    ]
+    .into_iter()
+    .filter_map(|quad| {
+        Polygon::new(
+            quad.map(|(x, y, z)| corner(x, y, z)).to_vec(),
+            BOX_ROLE,
+            epsilon,
+        )
+    })
+    .collect()
+}
+
+/// Splits polygons at a box: the pieces inside it, and those outside it or
+/// lying on one of its faces.
+fn split_at_box(
+    polygons: Vec<Polygon>,
+    bounds: [Point3; 2],
+    epsilon: f64,
+) -> (Vec<Polygon>, Vec<Polygon>) {
+    let mut inside = polygons;
+    let mut outside = Vec::new();
+    for plane in box_planes(bounds) {
+        let mut kept = Vec::with_capacity(inside.len());
+        for polygon in inside {
+            let mut on_front = Vec::new();
+            let mut on_back = Vec::new();
+            let mut front = Vec::new();
+            plane.split_polygon(
+                &polygon,
+                epsilon,
+                &mut on_front,
+                &mut on_back,
+                &mut front,
+                &mut kept,
+            );
+            outside.extend(on_front);
+            outside.extend(on_back);
+            outside.extend(front);
+        }
+        inside = kept;
+    }
+    (inside, outside)
+}
+
+fn union(left: BspNode, right: BspNode) -> BspNode {
+    let epsilon = left.epsilon.max(right.epsilon);
+    BspNode::from_polygons(united_polygons(left, right), epsilon)
+}
+
+/// The two joined, as polygons; see [`subtracted_polygons`].
+fn united_polygons(mut left: BspNode, mut right: BspNode) -> Vec<Polygon> {
+    left.clip_to(&right);
+    right.clip_to(&left);
+    right.invert();
+    right.clip_to(&left);
+    right.invert();
+    left.build(right.all_polygons());
+    left.all_polygons()
 }
 
 /// Regularized multi-axis/successor edge finish.
@@ -543,6 +690,7 @@ pub(crate) fn finish_edges(
         conformed,
         publication_epsilon,
         Some(distance.mul_add(6.0, publication_epsilon * 32.0)),
+        Rebuild::Classic,
     )
 }
 
@@ -1186,6 +1334,7 @@ pub(crate) fn subtract_crossing_profile(
         result.all_polygons(),
         epsilon,
         Some(maximum_healed_cycle_span),
+        Rebuild::Classic,
     )
     .ok_or_else(|| face_error(FaceFeatureInputError::SweepCollision))
 }
@@ -1202,11 +1351,15 @@ pub(crate) fn combine_bodies(
     add: bool,
     precision: PrecisionPolicy,
 ) -> Option<Topology> {
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
+    // Both operands are the kernel's own tessellations, whose shared corners
+    // agree to rounding, so a point is on a plane when it is within the
+    // linear agreement of it, not the modelling resolution. Judged at the
+    // coarser scale, the facets of a gently curving wall — a swept pipe's,
+    // which turn by a fraction of a degree from one to the next — read as
+    // lying on their neighbours' planes wherever the wall runs on
+    // tangentially, as it does past every join of a sweep's path, and the
+    // splits that follow shred it into slivers that no longer weld closed.
+    let epsilon = precision.linear_agreement.max(1.0e-8) * 16.0;
     let first_side_role = body
         .triangles
         .iter()
@@ -1250,22 +1403,52 @@ pub(crate) fn combine_bodies(
     {
         return None;
     }
-    let body = BspNode::from_polygons(body_polygons, epsilon);
+    // Only the body near the tool can change, so only that part of it goes
+    // through the Boolean: the body is split at a box around the tool, the
+    // part inside is closed with the box's faces where they lie in the body,
+    // and the part outside is carried over as it is. Otherwise every facet
+    // plane of the tool — thousands, for a swept pipe — splits the body's
+    // faces clear across, out to corners the tool never reaches, where the
+    // slivers left between nearly parallel cuts no longer weld closed. The
+    // box's faces are dropped from the answer, and the two parts of each
+    // body face meet again along the box, as any two panels of a split face
+    // do.
+    let margin = (polygon_extent(&tool_polygons) * 0.02).max(epsilon * 1.0e3);
+    let (near, far, caps) = match polygon_bounds(&tool_polygons, margin) {
+        Some(bounds) => {
+            let mut inside_body = BspNode::from_polygons(body_polygons.clone(), epsilon);
+            inside_body.invert();
+            let caps = inside_body.clip_polygons(box_polygons(bounds, epsilon));
+            let (near, far) = split_at_box(body_polygons, bounds, epsilon);
+            (near, far, caps)
+        }
+        None => (body_polygons, Vec::new(), Vec::new()),
+    };
+    if near.is_empty() {
+        return None;
+    }
+    let body = BspNode::from_polygons(near.into_iter().chain(caps).collect(), epsilon);
     let tool = BspNode::from_polygons(tool_polygons, epsilon);
     let result = if add {
-        union(body, tool)
+        united_polygons(body, tool)
     } else {
-        subtract(body, tool)
+        subtracted_polygons(body, tool)
     };
+    let polygons = result
+        .into_iter()
+        .filter(|polygon| polygon.role != BOX_ROLE)
+        .chain(far)
+        .collect::<Vec<_>>();
     let maximum_healed_cycle_span = precision
         .approximation_budget
         .max(precision.modeling_resolution)
         .max(precision.min_feature_size)
         * 512.0;
     topology_from_polygons_with_heal_limit(
-        result.all_polygons(),
+        polygons,
         epsilon,
         Some(maximum_healed_cycle_span),
+        Rebuild::Strict,
     )
 }
 
@@ -1527,7 +1710,43 @@ fn point_in_triangle(point: Point2, triangle: [Point2; 3]) -> bool {
     signs.iter().all(|value| *value >= 0.0) || signs.iter().all(|value| *value <= 0.0)
 }
 
-fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygon> {
+/// How strictly a rebuild holds its faces together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rebuild {
+    /// The rules the edge finishes and crossing cuts were certified under:
+    /// a face is flat within a hundredth of the BSP's noise, and healing
+    /// closes only holes with width.
+    Classic,
+    /// For operands tessellated from smooth walls, whose facets meet at
+    /// angles small enough to leave slivers: a face is flat only to the
+    /// B-rep's own agreement ([`flatness`]), outlines that cancel are
+    /// dropped ([`cancelling_pairs`]), and healing also resolves gaps with
+    /// no width and points on straight runs.
+    Strict,
+}
+
+impl Rebuild {
+    /// How far a face's corners may stand off its plane: when splitting
+    /// polygons as they arrive, and when accepting a face after welding.
+    fn flat(self, epsilon: f64, after_weld: bool) -> f64 {
+        match (self, after_weld) {
+            (Self::Strict, _) => flatness(epsilon),
+            (Self::Classic, false) => (epsilon * 1.0e-4).max(1.0e-12),
+            (Self::Classic, true) => (epsilon * 1.0e-2).max(1.0e-7),
+        }
+    }
+}
+
+/// How far a face's corners may stand off its plane and still be one flat
+/// face: under the B-rep's linear agreement (a nanometre by default), which
+/// is what the validator holds every planar face to. The pipeline's own
+/// `epsilon` is four orders coarser, being the scale of the BSP's noise, so
+/// flatness is judged well below it.
+fn flatness(epsilon: f64) -> f64 {
+    (epsilon * 3.0e-5).max(1.0e-12)
+}
+
+fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64, flat: f64) -> Vec<Polygon> {
     let mut result = Vec::with_capacity(polygons.len());
     for polygon in polygons {
         if polygon.vertices.len() <= 3 {
@@ -1553,7 +1772,7 @@ fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
             .iter()
             .map(|p| ((*p - p0).dot(plane.normal)).abs())
             .fold(0.0_f64, f64::max);
-        if planar_error > (epsilon * 1.0e-4).max(1.0e-12) {
+        if planar_error > flat {
             let projected = polygon
                 .vertices
                 .iter()
@@ -1598,7 +1817,7 @@ fn split_non_planar_polygons(polygons: Vec<Polygon>, epsilon: f64) -> Vec<Polygo
 ///
 /// Nothing is moved. Every vertex of the merged outline is a vertex the group
 /// already had, so the merge cannot change what the body occupies.
-fn merge_coplanar_polygons(polygons: Vec<Polygon>, weld: f64) -> Vec<Polygon> {
+fn merge_coplanar_polygons(polygons: Vec<Polygon>, weld: f64, flat: f64) -> Vec<Polygon> {
     // A plane's key has to be coarse enough that two facets of one wall agree
     // and fine enough that two nearby walls do not. The normal is a direction,
     // so it is keyed at a fixed angular scale; the offset is a length and is
@@ -1632,7 +1851,7 @@ fn merge_coplanar_polygons(polygons: Vec<Polygon>, weld: f64) -> Vec<Polygon> {
         if members.len() < 2 {
             continue;
         }
-        merged.extend(merge_group_pairwise(&mut by_index, members, weld));
+        merged.extend(merge_group_pairwise(&mut by_index, members, weld, flat));
     }
     merged.extend(by_index.into_iter().flatten());
     dissolve_shared_collinear_vertices(merged, weld)
@@ -1733,6 +1952,7 @@ fn merge_group_pairwise(
     polygons: &mut [Option<Polygon>],
     members: &[usize],
     weld: f64,
+    flat: f64,
 ) -> Vec<Polygon> {
     let mut live: Vec<Polygon> = members
         .iter()
@@ -1776,7 +1996,7 @@ fn merge_group_pairwise(
             if retired[first] || retired[second] {
                 continue;
             }
-            let Some(union) = merge_two_polygons(&live[first], &live[second], weld) else {
+            let Some(union) = merge_two_polygons(&live[first], &live[second], weld, flat) else {
                 continue;
             };
             retired[first] = true;
@@ -1797,8 +2017,11 @@ fn merge_group_pairwise(
 }
 
 /// Two coplanar facets as one, or nothing when their union is not a simple
-/// loop: a pair that meets at a point, or in two places, or not at all.
-fn merge_two_polygons(first: &Polygon, second: &Polygon, weld: f64) -> Option<Polygon> {
+/// loop: a pair that meets at a point, or in two places, or not at all — or
+/// when it is not flat to within `flat`. Facets group by a plane key rounded
+/// to a millionth of a radian, and two panels of a gently curving wall can
+/// share one while their corners stand nanometres off any single plane.
+fn merge_two_polygons(first: &Polygon, second: &Polygon, weld: f64, flat: f64) -> Option<Polygon> {
     let mut edges: BTreeMap<([i64; 3], [i64; 3]), Point3> = BTreeMap::new();
     for polygon in [first, second] {
         if polygon.vertices.len() < 3 {
@@ -1862,6 +2085,15 @@ fn merge_two_polygons(first: &Polygon, second: &Polygon, weld: f64) -> Option<Po
     // also merges less, not more: this outline stays simple more often with
     // them in, and the face count is lower with them kept than dropped.
     let merged = Polygon::new_narrow(loop_points, first.role, weld * weld)?;
+    let origin = merged.vertices[0];
+    let normal = merged.plane.normal * (1.0 / merged.plane.normal.length());
+    if merged
+        .vertices
+        .iter()
+        .any(|point| (*point - origin).dot(normal).abs() > flat)
+    {
+        return None;
+    }
     // The merge may not turn the wall over: a normal that flipped means the
     // outline was chained the other way round, and a face pointing into the
     // material is worse than a fan of panels pointing out of it.
@@ -1872,8 +2104,9 @@ fn topology_from_polygons_with_heal_limit(
     polygons: Vec<Polygon>,
     epsilon: f64,
     maximum_healed_cycle_span: Option<f64>,
+    rules: Rebuild,
 ) -> Option<Topology> {
-    let polygons = split_non_planar_polygons(polygons, epsilon);
+    let polygons = split_non_planar_polygons(polygons, epsilon, rules.flat(epsilon, false));
     let polygons = conform_polygon_edges(polygons, epsilon);
     // The BSP classifies a vertex as "on" a split plane within `epsilon`
     // without moving it there, so after several splits two spellings of one
@@ -1895,7 +2128,14 @@ fn topology_from_polygons_with_heal_limit(
     // before they become faces is what keeps a crossing bore's face count in
     // proportion to the shape rather than to how many times the BSP happened
     // to split it, and what stops the seams being drawn as creases.
-    let polygons = merge_coplanar_polygons(polygons, weld);
+    let polygons = merge_coplanar_polygons(
+        polygons,
+        weld,
+        match rules {
+            Rebuild::Strict => flatness(epsilon),
+            Rebuild::Classic => f64::INFINITY,
+        },
+    );
     // A merged outline is a new loop, so its edges have to be conformed against
     // its neighbours again: a vertex that sat mid-edge on the panel next door
     // is still a T-junction on the face that replaced the panels.
@@ -1906,6 +2146,7 @@ fn topology_from_polygons_with_heal_limit(
     let mut vertex_map = BTreeMap::<[i64; 3], VertexKey>::new();
     let mut edge_map = BTreeMap::<[usize; 2], EdgeKey>::new();
     let mut shell_faces = Vec::new();
+    let mut outlines = Vec::<(Vec<VertexKey>, Vec<Point2>, Plane, FaceRole)>::new();
 
     while let Some(polygon) = pending.pop_front() {
         if polygon.vertices.len() < 3 {
@@ -2022,7 +2263,7 @@ fn topology_from_polygons_with_heal_limit(
             .iter()
             .map(|point| ((*point - points[0]).dot(normal)).abs())
             .fold(0.0_f64, f64::max);
-        if points.len() > 3 && planar_error > (epsilon * 1.0e-2).max(1.0e-7) {
+        if points.len() > 3 && planar_error > rules.flat(epsilon, true) {
             let triangles = ear_clip(&projected);
             let degenerate = triangles.iter().any(|triangle| {
                 signed_area(
@@ -2080,9 +2321,26 @@ fn topology_from_polygons_with_heal_limit(
             projected.reverse();
             twice_area = -twice_area;
         }
+        outlines.push((vertex_keys, projected, plane, polygon.role));
+    }
+    // Faces are made only once every outline is known, so a pair that
+    // cancels can be left out before either takes an edge.
+    let dropped = match rules {
+        Rebuild::Strict => cancelling_pairs(
+            &outlines
+                .iter()
+                .map(|(keys, ..)| keys.iter().map(|key| key.0).collect())
+                .collect::<Vec<_>>(),
+        ),
+        Rebuild::Classic => vec![false; outlines.len()],
+    };
+    for ((vertex_keys, projected, plane, role), dropped) in outlines.into_iter().zip(dropped) {
+        if dropped {
+            continue;
+        }
         let mut coedges = Vec::new();
-        for index in 0..points.len() {
-            let next = (index + 1) % points.len();
+        for index in 0..vertex_keys.len() {
+            let next = (index + 1) % vertex_keys.len();
             let start = vertex_keys[index];
             let end = vertex_keys[next];
             let ordered = if start.0 < end.0 {
@@ -2124,17 +2382,18 @@ fn topology_from_polygons_with_heal_limit(
                 surface: Surface::Plane(plane),
                 outer_loop: loop_key,
                 inner_loops: Vec::new(),
-                role: polygon.role,
+                role,
             },
         });
         shell_faces.push(face_key);
     }
-    heal_planar_boundary_cycles(
+    let rerouted = heal_planar_boundary_cycles(
         &mut topology,
         &mut next_id,
         &mut shell_faces,
         epsilon,
         maximum_healed_cycle_span,
+        rules,
     );
     if shell_faces.is_empty() {
         return None;
@@ -2192,7 +2451,12 @@ fn topology_from_polygons_with_heal_limit(
             },
         });
     }
-    Some(topology)
+    // A face rerouted past a T-junction left its old coedge and edge behind.
+    Some(if rerouted {
+        crate::prism_boolean::compact(topology)
+    } else {
+        topology
+    })
 }
 
 /// Closes bounded boundary cycles left where several BSP split paths converge
@@ -2207,7 +2471,9 @@ fn heal_planar_boundary_cycles(
     shell_faces: &mut Vec<FaceKey>,
     epsilon: f64,
     maximum_cycle_span: Option<f64>,
-) {
+    rules: Rebuild,
+) -> bool {
+    let mut rerouted = false;
     let mut uses = vec![Vec::<CoedgeKey>::new(); topology.edges.len()];
     for (index, coedge) in topology.coedges.iter().enumerate() {
         uses[coedge.value.edge.0].push(CoedgeKey(index));
@@ -2271,6 +2537,13 @@ fn heal_planar_boundary_cycles(
             .map(|vertex| topology.vertices[*vertex].value.point)
             .collect::<Vec<_>>();
         let cycle_span = boundary_cycle_span(&points);
+        // A cycle with no width is not a hole but a T-junction: one face's
+        // edge runs straight past a vertex its neighbours share. No face can
+        // fill it; the face is made to follow its neighbours' edges instead.
+        if rules == Rebuild::Strict && collinear(&points, flatness(epsilon)) {
+            rerouted |= reroute_past_junction(topology, next_id, &cycle, &uses);
+            continue;
+        }
         let Some(mut split_plane) = SplitPlane::from_points(&points, epsilon * epsilon) else {
             continue;
         };
@@ -2300,8 +2573,28 @@ fn heal_planar_boundary_cycles(
             .iter()
             .map(|point| plane.project(*point))
             .collect::<Vec<_>>();
-        let triangles = ear_clip(&projected);
-        if triangles.len() != points.len().saturating_sub(2) {
+        // A point on the straight run between its neighbours is a corner of
+        // no triangle: one through it would have no area. It is left out of
+        // the triangulation and put back on the side it lies on, so the face
+        // there walks the neighbours' edges through it.
+        let kept = match rules {
+            Rebuild::Strict => corners_off_straight_runs(&points, flatness(epsilon)),
+            Rebuild::Classic => (0..points.len()).collect(),
+        };
+        let triangles = if kept.len() >= 3 {
+            ear_clip(
+                &kept
+                    .iter()
+                    .map(|index| projected[*index])
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .map(|triangle| triangle.map(|corner| kept[corner]))
+            .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if kept.len() < 3 || triangles.len() != kept.len() - 2 {
             if maximum_cycle_span.is_some_and(|maximum| cycle_span <= maximum)
                 && append_non_planar_boundary_fan(
                     topology,
@@ -2353,10 +2646,37 @@ fn heal_planar_boundary_cycles(
                 triangle.swap(1, 2);
                 model_triangle.swap(1, 2);
             }
-            let mut coedges = Vec::with_capacity(3);
+            // The triangle's corners, with every point left out on a side of
+            // it put back where it lies.
+            let mut corners = Vec::with_capacity(3);
             for side in 0..3 {
-                let start = walk[triangle[side]];
-                let end = walk[triangle[(side + 1) % 3]];
+                let (from, to) = (triangle[side], triangle[(side + 1) % 3]);
+                corners.push(from);
+                let (Some(at), Some(until)) = (
+                    kept.iter().position(|index| *index == from),
+                    kept.iter().position(|index| *index == to),
+                ) else {
+                    continue;
+                };
+                let count = points.len();
+                if until == (at + 1) % kept.len() {
+                    let mut index = (from + 1) % count;
+                    while index != to {
+                        corners.push(index);
+                        index = (index + 1) % count;
+                    }
+                } else if at == (until + 1) % kept.len() {
+                    let mut index = (from + count - 1) % count;
+                    while index != to {
+                        corners.push(index);
+                        index = (index + count - 1) % count;
+                    }
+                }
+            }
+            let mut coedges = Vec::with_capacity(corners.len());
+            for side in 0..corners.len() {
+                let start = walk[corners[side]];
+                let end = walk[corners[(side + 1) % corners.len()]];
                 let ordered = if start < end {
                     [start, end]
                 } else {
@@ -2386,8 +2706,8 @@ fn heal_planar_boundary_cycles(
                         edge,
                         orientation,
                         [
-                            triangle_plane.project(model_triangle[side]),
-                            triangle_plane.project(model_triangle[(side + 1) % 3]),
+                            triangle_plane.project(points[corners[side]]),
+                            triangle_plane.project(points[corners[(side + 1) % corners.len()]]),
                         ],
                     ),
                 });
@@ -2411,6 +2731,205 @@ fn heal_planar_boundary_cycles(
             shell_faces.push(face_key);
         }
     }
+    rerouted
+}
+
+/// The corners of a closed loop that are not on the straight run between
+/// their neighbours, in order: a point within `tolerance` of the segment
+/// joining the corners either side of it, and between them, is dropped, and
+/// the test repeats on what is left until nothing more goes.
+fn corners_off_straight_runs(points: &[Point3], tolerance: f64) -> Vec<usize> {
+    let mut kept = (0..points.len()).collect::<Vec<_>>();
+    loop {
+        if kept.len() <= 3 {
+            return kept;
+        }
+        let straight = (0..kept.len()).find(|position| {
+            let before = points[kept[(position + kept.len() - 1) % kept.len()]];
+            let here = points[kept[*position]];
+            let after = points[kept[(position + 1) % kept.len()]];
+            let run = after - before;
+            let length = run.length();
+            if length <= tolerance {
+                return false;
+            }
+            let along = (here - before).dot(run) / (length * length);
+            let off = (here - before) - run * along;
+            along > 0.0 && along < 1.0 && off.length() <= tolerance
+        });
+        match straight {
+            Some(position) => {
+                kept.remove(position);
+            }
+            None => return kept,
+        }
+    }
+}
+
+/// Which of these outlines to drop: every two that are one another turned
+/// over, the same corners walked in opposite directions. Such a pair
+/// encloses no material — the BSP leaves one where a sliver of one
+/// operand's wall is kept on both sides of the other's — and between them
+/// they use each of their edges twice each way, which no closed shell can
+/// carry. What the faces beside them needed from either is a hole the size
+/// of the sliver, which healing closes.
+fn cancelling_pairs(outlines: &[Vec<usize>]) -> Vec<bool> {
+    let canonical = |mut keys: Vec<usize>| {
+        if let Some(first) = keys
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, key)| **key)
+            .map(|(index, _)| index)
+        {
+            keys.rotate_left(first);
+        }
+        keys
+    };
+    let mut open = BTreeMap::<Vec<usize>, Vec<usize>>::new();
+    for (index, outline) in outlines.iter().enumerate() {
+        open.entry(canonical(outline.clone()))
+            .or_default()
+            .push(index);
+    }
+    let mut dropped = vec![false; outlines.len()];
+    for (index, outline) in outlines.iter().enumerate() {
+        if dropped[index] {
+            continue;
+        }
+        let mut reversed = outline.clone();
+        reversed.reverse();
+        let Some(twin) = open.get_mut(&canonical(reversed)).and_then(|twins| {
+            let position = twins
+                .iter()
+                .position(|twin| !dropped[*twin] && *twin != index)?;
+            Some(twins.remove(position))
+        }) else {
+            continue;
+        };
+        dropped[index] = true;
+        dropped[twin] = true;
+    }
+    dropped
+}
+
+/// Whether every point lies within `tolerance` of the line through the two
+/// that are farthest apart.
+fn collinear(points: &[Point3], tolerance: f64) -> bool {
+    let mut widest = (0.0_f64, 0, 0);
+    for (i, a) in points.iter().enumerate() {
+        for (j, b) in points.iter().enumerate().skip(i + 1) {
+            let length = a.distance(*b);
+            if length > widest.0 {
+                widest = (length, i, j);
+            }
+        }
+    }
+    let (length, i, j) = widest;
+    if length <= 0.0 {
+        return true;
+    }
+    let direction = (points[j] - points[i]) / length;
+    points.iter().all(|point| {
+        let offset = *point - points[i];
+        (offset - direction * offset.dot(direction)).length() <= tolerance
+    })
+}
+
+/// Resolves a zero-width boundary cycle: one record runs the whole length,
+/// used once by one face, and the rest run back along it through the
+/// points where its neighbours' edges meet, each used once by a neighbour.
+/// The face is made to walk those shorter edges instead of the long one,
+/// which then belongs to nothing and is dropped when the topology is
+/// compacted. Returns whether the face was rerouted; anything else about
+/// the cycle is left for the validator to name.
+fn reroute_past_junction(
+    topology: &mut Topology,
+    next_id: &mut u64,
+    cycle: &[(usize, usize, EdgeKey, Orientation)],
+    uses: &[Vec<CoedgeKey>],
+) -> bool {
+    if cycle.len() < 3 {
+        return false;
+    }
+    // The long record is the one whose two ends are the cycle's extremes.
+    let point = |vertex: usize| topology.vertices[vertex].value.point;
+    let Some(long) = cycle
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| {
+            point(left.0)
+                .distance(point(left.1))
+                .total_cmp(&point(right.0).distance(point(right.1)))
+        })
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    let (long_start, long_end, long_edge, _) = cycle[long];
+    // The others must chain from the long record's end back to its start,
+    // along the directions their missing uses run.
+    let mut chain = Vec::with_capacity(cycle.len() - 1);
+    let mut cursor = long_end;
+    let mut left = (0..cycle.len())
+        .filter(|index| *index != long)
+        .collect::<BTreeSet<_>>();
+    while cursor != long_start {
+        let Some(next) = left.iter().copied().find(|index| cycle[*index].0 == cursor) else {
+            return false;
+        };
+        left.remove(&next);
+        chain.push(cycle[next]);
+        cursor = cycle[next].1;
+    }
+    if !left.is_empty() {
+        return false;
+    }
+    // The one face using the long edge, and where in its loop it does.
+    let [coedge] = uses[long_edge.0][..] else {
+        return false;
+    };
+    let Some((loop_index, position)) =
+        topology
+            .loops
+            .iter()
+            .enumerate()
+            .find_map(|(index, record)| {
+                record
+                    .value
+                    .coedges
+                    .iter()
+                    .position(|candidate| *candidate == coedge)
+                    .map(|position| (index, position))
+            })
+    else {
+        return false;
+    };
+    let Some(Surface::Plane(plane)) = topology.faces.iter().find_map(|face| {
+        face.value
+            .loops()
+            .any(|loop_key| loop_key.0 == loop_index)
+            .then_some(face.value.surface)
+    }) else {
+        return false;
+    };
+    let mut replacement = Vec::with_capacity(chain.len());
+    for (start, end, edge, orientation) in chain {
+        let key = CoedgeKey(topology.coedges.len());
+        topology.coedges.push(Record {
+            id: allocate_id(next_id),
+            value: Coedge::line(
+                edge,
+                orientation,
+                [plane.project(point(start)), plane.project(point(end))],
+            ),
+        });
+        replacement.push(key);
+    }
+    topology.loops[loop_index]
+        .value
+        .coedges
+        .splice(position..=position, replacement);
+    true
 }
 
 /// The area-weighted normal of a closed loop (Newell's method): twice the
@@ -2941,7 +3460,7 @@ mod tests {
             [2.0, 1.0, 0.0],
             [1.0, 1.0, 0.0],
         ]);
-        let merged = merge_two_polygons(&left, &right, 1.0e-6).expect("the panels merge");
+        let merged = merge_two_polygons(&left, &right, 1.0e-6, 1.0e-12).expect("the panels merge");
         // Six points, not four: the two ends of the dissolved seam stay as
         // corners of the outline. They are kept deliberately — see the note in
         // `merge_two_polygons` on why dropping them costs more than it saves.
@@ -2995,7 +3514,7 @@ mod tests {
             [2.0, 2.0, 0.0],
             [1.0, 2.0, 0.0],
         ]);
-        assert!(merge_two_polygons(&first, &second, 1.0e-6).is_none());
+        assert!(merge_two_polygons(&first, &second, 1.0e-6, 1.0e-12).is_none());
     }
 
     /// Facets that do not touch at all are not a merge either.
@@ -3013,7 +3532,7 @@ mod tests {
             [6.0, 1.0, 0.0],
             [5.0, 1.0, 0.0],
         ]);
-        assert!(merge_two_polygons(&first, &apart, 1.0e-6).is_none());
+        assert!(merge_two_polygons(&first, &apart, 1.0e-6, 1.0e-12).is_none());
     }
 
     /// A ring is the case the merge must refuse: the union of the four panels
@@ -3048,7 +3567,7 @@ mod tests {
                 [2.0, 2.0, 0.0],
             ]),
         ];
-        let merged = merge_coplanar_polygons(panels, 1.0e-6);
+        let merged = merge_coplanar_polygons(panels, 1.0e-6, 1.0e-12);
         assert!(
             merged.len() > 1,
             "the ring must not collapse into one loop, and gave {merged:?}"
@@ -3080,7 +3599,7 @@ mod tests {
                 ])
             })
             .collect();
-        let merged = merge_coplanar_polygons(panels, 1.0e-6);
+        let merged = merge_coplanar_polygons(panels, 1.0e-6, 1.0e-12);
         assert_eq!(merged.len(), 1, "sixteen panels of one wall are one wall");
         let area = newell_normal(&merged[0].vertices).length() * 0.5;
         assert!(

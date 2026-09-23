@@ -993,9 +993,22 @@ impl NativeKernel {
                 if *operation == SolidOperation::New {
                     validate_extrusion_source(input)?;
                 }
-                let swept =
-                    sweep_profile::sweep(*frame, profile, path, *orientation, request.precision)
-                        .map_err(|reason| sweep_input_error(input.id, reason))?;
+                // A skinned sweep that is added or cut is a tool for the
+                // faceted tier, and is skinned to that tier's tolerance.
+                let budget = if *operation == SolidOperation::New {
+                    sweep_profile::SkinBudget::Precision
+                } else {
+                    sweep_profile::SkinBudget::FacetedTool
+                };
+                let swept = sweep_profile::sweep(
+                    *frame,
+                    profile,
+                    path,
+                    *orientation,
+                    request.precision,
+                    budget,
+                )
+                .map_err(|reason| sweep_input_error(input.id, reason))?;
                 if let Some(approximation) = swept.approximation {
                     warnings.push(sweep_approximation_warning(approximation));
                 }
@@ -1389,12 +1402,8 @@ impl NativeKernel {
                                 // previously caused explosive BSP fragmentation).
                                 // Bound this construction mesh independently; the
                                 // immutable analytic predecessor remains untouched.
-                                let mut boolean_input = input.clone();
-                                let mut boolean_precision = request.precision;
-                                boolean_precision.max_subdivisions =
-                                    boolean_precision.max_subdivisions.min(4);
-                                boolean_input.precision = Some(boolean_precision);
-                                let scene = NativeKernel::authoritative_scene(&boolean_input);
+                                let scene =
+                                    NativeKernel::faceted_operand_scene(input, request.precision);
                                 let topology = faceted_boolean::subtract_crossing_profile(
                                     &scene,
                                     *frame,
@@ -1582,12 +1591,10 @@ impl NativeKernel {
                                 }
                                 Err(decline) if *operation == FaceExtrusionOperation::Cut => {
                                     rung = "face-feature/faceted";
-                                    let mut boolean_input = input.clone();
-                                    let mut boolean_precision = request.precision;
-                                    boolean_precision.max_subdivisions =
-                                        boolean_precision.max_subdivisions.min(4);
-                                    boolean_input.precision = Some(boolean_precision);
-                                    let scene = NativeKernel::authoritative_scene(&boolean_input);
+                                    let scene = NativeKernel::faceted_operand_scene(
+                                        input,
+                                        request.precision,
+                                    );
                                     let topology = faceted_boolean::subtract_crossing_profile(
                                         &scene,
                                         *frame,
@@ -3009,6 +3016,18 @@ impl NativeKernel {
         Self::scene_with_budget(ComputePool::global(), snapshot, ChordBudget::Authoritative)
     }
 
+    /// A body as the faceted Boolean tier takes it: sampled as
+    /// [`Self::authoritative_scene`] is, with at most sixteen chords to a
+    /// curved face, except that B-spline faces and edges are sampled at the
+    /// display chord tolerance (see `ChordBudget::FacetedOperand`).
+    fn faceted_operand_scene(snapshot: &Snapshot, precision: PrecisionPolicy) -> DebugScene {
+        let mut operand = snapshot.clone();
+        let mut precision = precision;
+        precision.max_subdivisions = precision.max_subdivisions.min(4);
+        operand.precision = Some(precision);
+        Self::scene_with_budget(ComputePool::global(), &operand, ChordBudget::FacetedOperand)
+    }
+
     /// How far the display facets of each face and the face they stand for
     /// can sit from one another, in millimetres, keyed by the face
     /// reference the scene's triangles carry as `source_face`. Zero both
@@ -3052,7 +3071,10 @@ impl NativeKernel {
         budget: ChordBudget,
     ) -> DebugScene {
         let precision = snapshot.precision.unwrap_or_default();
-        let fallback = if matches!(budget, ChordBudget::Authoritative) {
+        let fallback = if matches!(
+            budget,
+            ChordBudget::Authoritative | ChordBudget::FacetedOperand
+        ) {
             TessellationFallback::Refuse
         } else {
             TessellationFallback::Display
@@ -4276,10 +4298,9 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
     ],
 };
 
-/// A revolve added to or cut from a body (ADR 0055). A revolve whose
-/// faces are all planes and coaxial cylinders is a prism along its axis and
-/// answers exactly; a cone, torus or sphere takes the faceted tier until the
-/// coaxial Boolean of ADR 0026 F4 exists.
+/// A sweep added to or cut from a body (ADR 0055). A straight sweep is a
+/// prism and answers exactly; a skinned one's B-spline walls take the
+/// faceted tier, skinned to that tier's own chord tolerance.
 const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
     noun: "sweep",
     empty: "SWEEP_TARGET_EMPTY",
@@ -4293,6 +4314,10 @@ const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
     ],
 };
 
+/// A revolve added to or cut from a body (ADR 0055). A revolve whose
+/// faces are all planes and coaxial cylinders is a prism along its axis and
+/// answers exactly; a cone, torus or sphere takes the faceted tier until the
+/// coaxial Boolean of ADR 0026 F4 exists.
 const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
     noun: "revolve",
     empty: "REVOLVE_TARGET_EMPTY",
@@ -4421,13 +4446,16 @@ fn tool_boolean(
     boolean_precision.max_subdivisions = boolean_precision.max_subdivisions.min(4);
     let scene_of = |topology: &Topology| {
         let digest = semantic_digest(topology, boolean_precision);
-        NativeKernel::authoritative_scene(&Snapshot {
-            id: snapshot_id(digest),
-            semantic_digest: digest,
-            precision: Some(boolean_precision),
-            topology: topology.clone(),
-            measures: SnapshotMeasures::default(),
-        })
+        NativeKernel::faceted_operand_scene(
+            &Snapshot {
+                id: snapshot_id(digest),
+                semantic_digest: digest,
+                precision: Some(boolean_precision),
+                topology: topology.clone(),
+                measures: SnapshotMeasures::default(),
+            },
+            boolean_precision,
+        )
     };
     let topology = faceted_boolean::combine_bodies(
         &scene_of(&input.topology),
@@ -5034,9 +5062,24 @@ fn resolve_measure_entity(
 /// presentation budget. Reusing the kernel budget (10 nm by default) for
 /// display would emit thousands of segments per circle on palm-sized turned
 /// parts and drown the interactive viewport.
+/// The chord tolerance the faceted Boolean tier samples a B-spline of this
+/// size at (`ChordBudget::FacetedOperand`).
+pub(crate) fn faceted_spline_tolerance(size: f64, precision: PrecisionPolicy) -> f64 {
+    ChordBudget::FacetedOperand.spline_tolerance(size.max(precision.min_feature_size), precision)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ChordBudget {
     Authoritative,
+    /// The operands of a faceted Boolean. Arcs and ruled walls are sampled
+    /// as `Authoritative`, under the subdivision cap the tier sets, which
+    /// leaves a half-turn face at 16 chords, some 0.005 of its radius off.
+    /// A B-spline has no such cap on the whole face, only on each knot span,
+    /// so a skinned wall of a hundred spans sampled at the kernel budget
+    /// runs to hundreds of thousands of facets, far past what the tier can
+    /// split. It is sampled at the display chord tolerance instead, the
+    /// same few thousandths the tier's arcs are left at.
+    FacetedOperand,
     Display,
     /// Display sampling additionally coarsened for bodies that project small
     /// on screen. The multiplier is clamped, and `arc_subdivisions` keeps its
@@ -5054,7 +5097,7 @@ impl ChordBudget {
         // chords per full circle) while bounding density for large parts.
         let display = (radius * 4.0e-4).clamp(5.0e-3, 0.1).max(authoritative);
         let tolerance = match self {
-            Self::Authoritative => authoritative,
+            Self::Authoritative | Self::FacetedOperand => authoritative,
             Self::Display => display,
             Self::DisplayScaled(scale) => {
                 if scale < 1.0 {
@@ -5065,6 +5108,14 @@ impl ChordBudget {
             }
         };
         tolerance.min(radius)
+    }
+
+    /// The chord tolerance for a B-spline of this size.
+    pub(crate) fn spline_tolerance(self, size: f64, precision: PrecisionPolicy) -> f64 {
+        match self {
+            Self::FacetedOperand => Self::Display.tolerance(size, precision),
+            _ => self.tolerance(size, precision),
+        }
     }
 }
 
@@ -5972,7 +6023,8 @@ fn spline_curve_samples(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<f64> {
-    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    let tolerance =
+        budget.spline_tolerance(curve.size().max(precision.min_feature_size), precision);
     curve.samples(
         range.start,
         range.end,
@@ -5989,7 +6041,8 @@ fn spline_curve_deviation(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> f64 {
-    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    let tolerance =
+        budget.spline_tolerance(curve.size().max(precision.min_feature_size), precision);
     curve
         .spans(range.start, range.end)
         .into_iter()
@@ -6024,7 +6077,8 @@ fn spline_face_samples(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<f64> {
-    let tolerance = budget.tolerance(surface.scale().max(precision.min_feature_size), precision);
+    let tolerance =
+        budget.spline_tolerance(surface.scale().max(precision.min_feature_size), precision);
     let most = spline_steps_per_span(precision);
     let mut samples = vec![from];
     for span in surface.spans(direction, from, to) {
