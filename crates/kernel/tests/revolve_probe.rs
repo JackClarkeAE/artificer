@@ -348,6 +348,81 @@ fn a_pointed_cone_still_takes_a_rim_fillet() {
     );
 }
 
+/// A quarter of a shaft takes the same rim fillet a whole one does, a
+/// quarter of it: the section is blended and turned through the same span,
+/// its wedge faces taking the blended section.
+#[test]
+fn a_partial_revolve_takes_a_rim_fillet_and_chamfer() {
+    let (radius, height, blend) = (5.0_f64, 12.0_f64, 1.0_f64);
+    let profile = polygon(&[(0.0, 0.0), (radius, 0.0), (radius, height), (0.0, height)]);
+    let corner = TAU * blend * blend * (radius - blend / 2.0);
+    let quarter_round =
+        TAU * (PI * blend * blend / 4.0) * blend.mul_add(4.0 / (3.0 * PI), radius - blend);
+    let bevel = TAU * (blend * blend / 2.0) * (radius - blend / 3.0);
+    for (kind, removed) in [
+        (EdgeFinishKind::Fillet, corner - quarter_round),
+        (EdgeFinishKind::Chamfer, bevel),
+    ] {
+        for share in [0.25, 0.75] {
+            // The span starts off the profile's own plane, so a blend
+            // rebuilt from the wrong azimuth would land somewhere else.
+            let shaft = revolve_through(
+                profile.clone(),
+                axis(),
+                RevolveAngle::partial(0.4, share * TAU),
+                "revolve-partial-shaft",
+            )
+            .expect("the partial shaft revolves");
+            let rim = rim_arcs(&shaft, height, radius);
+            assert!(!rim.is_empty(), "the partial shaft shows its top rim");
+            let request = ExecuteRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                request_id: RequestId::new("revolve-partial-finish"),
+                expected_snapshot: shaft.id(),
+                precision: PrecisionPolicy::default(),
+                command: KernelCommand::FinishEdges {
+                    target_edges: rim,
+                    kind,
+                    distance: blend,
+                    standing_apart: false,
+                },
+            };
+            let outcome = NativeKernel::execute(&shaft, &request, &CancellationToken::new())
+                .unwrap_or_else(|error| {
+                    panic!("{kind:?} on {share} of a turn: {:?}", error.diagnostics)
+                });
+            assert_eq!(outcome.report.tier(), Tier::Exact, "{kind:?}");
+            let expected = share * (PI * radius * radius * height - removed);
+            assert_volume(&outcome.snapshot, expected, "finished partial shaft");
+            // The bottom rim is untouched, so the body spans the same box.
+            let (before, after) = (
+                shaft.measures().bounds.expect("bounds"),
+                outcome.snapshot.measures().bounds.expect("bounds"),
+            );
+            for (was, is) in [(before.min, after.min), (before.max, after.max)] {
+                let gap = (was.x - is.x).abs() + (was.y - is.y).abs() + (was.z - is.z).abs();
+                assert!(gap < 1.0e-6, "{kind:?} on {share}: {was:?} became {is:?}");
+            }
+        }
+    }
+}
+
+/// The rim arcs at `height` and `radius`, without the straight sides of the
+/// cap that end there.
+fn rim_arcs(snapshot: &Snapshot, height: f64, radius: f64) -> Vec<EntityRef> {
+    let scene = NativeKernel::debug_scene(snapshot);
+    let mut rim = Vec::new();
+    for edge in &scene.edges {
+        let on_rim = edge.endpoints.iter().all(|point| {
+            (point.z - height).abs() < 1.0e-9 && (point.x.hypot(point.y) - radius).abs() < 1.0e-9
+        });
+        if on_rim && !rim.contains(&edge.source_edge) {
+            rim.push(edge.source_edge);
+        }
+    }
+    rim
+}
+
 fn top_rim(snapshot: &Snapshot, height: f64) -> Vec<EntityRef> {
     let scene = NativeKernel::debug_scene(snapshot);
     let mut rim = Vec::new();

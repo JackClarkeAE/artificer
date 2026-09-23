@@ -8,6 +8,7 @@ mod analytic_extrusion;
 pub mod api;
 pub mod brep;
 mod bspline;
+mod coaxial_boolean;
 mod corner_blend;
 mod cuboid;
 mod cylinder_trace;
@@ -1867,7 +1868,8 @@ impl NativeKernel {
                         profile,
                         axis,
                         angle,
-                        open: false,
+                        open,
+                        clip,
                     } => {
                         let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
                             frame,
@@ -1876,42 +1878,78 @@ impl NativeKernel {
                             angle,
                             operation: SolidOperation::New,
                         })?;
-                        let topology =
-                            shell::hollow(&input.topology, &core.topology).ok_or_else(|| {
-                                simple_invalid_input(
-                                    input.id,
-                                    "SHELL_CORE_UNSUPPORTED",
-                                    "The shell core is not a single closed solid to enclose.",
+                        // A partial turn's core is turned a full turn and
+                        // then loses the prism standing along the axis that
+                        // keeps one wall along each closed wedge face. The
+                        // prism's walls are planes parallel to the axis, so
+                        // against planes and coaxial cylinders the cut is
+                        // exact; a cone meets them in a hyperbola, which
+                        // takes the faceted tier with its label.
+                        let (core, faceted) = match clip {
+                            None => (core, false),
+                            Some(clip) => {
+                                let prism = core_from_empty(KernelCommand::ExtrudePlanarProfile {
+                                    frame: clip.frame,
+                                    profile: clip.profile,
+                                    distance: clip.distance,
+                                })?;
+                                let (topology, answered) = tool_boolean(
+                                    &core,
+                                    prism.topology,
+                                    false,
+                                    request.precision,
+                                    &mut warnings,
+                                    &SHELL_BOOLEAN,
+                                )?;
+                                let digest = semantic_digest(&topology, request.precision);
+                                (
+                                    Snapshot {
+                                        id: snapshot_id(digest),
+                                        semantic_digest: digest,
+                                        precision: Some(request.precision),
+                                        topology,
+                                        measures: SnapshotMeasures::default(),
+                                    },
+                                    answered == SHELL_BOOLEAN.rungs[2],
                                 )
-                            })?;
-                        rung = "shell/closed-revolve";
-                        (topology, HistoryMode::Generated)
-                    }
-                    shell::ShellPlan::Revolved {
-                        frame,
-                        profile,
-                        axis,
-                        angle,
-                        open: true,
-                    } => {
-                        // An open cap's core reaches past the body, so the
-                        // wall there is taken away rather than enclosed.
-                        let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
-                            frame,
-                            profile,
-                            axis,
-                            angle,
-                            operation: SolidOperation::New,
-                        })?;
-                        let opened = BooleanRequest {
-                            protocol_version: CURRENT_PROTOCOL_VERSION,
-                            request_id: artificer_protocol::RequestId::new("shell::open"),
-                            expected_target_snapshot: input.id,
-                            expected_tool_snapshot: core.id(),
-                            precision: request.precision,
-                            operation: BooleanOperation::Difference,
+                            }
                         };
-                        let mut outcome = Self::execute_boolean(
+                        if !open {
+                            let topology = shell::hollow(&input.topology, &core.topology)
+                                .ok_or_else(|| {
+                                    simple_invalid_input(
+                                        input.id,
+                                        "SHELL_CORE_UNSUPPORTED",
+                                        "The shell core is not a single closed solid to enclose.",
+                                    )
+                                })?;
+                            rung = if faceted {
+                                "shell/faceted"
+                            } else {
+                                "shell/closed-revolve"
+                            };
+                            (topology, HistoryMode::Generated)
+                        } else {
+                            if faceted {
+                                // A faceted core cannot be taken away exactly,
+                                // and the body's own cones are what faceted it.
+                                return Err(simple_invalid_input(
+                                    input.id,
+                                    "SHELL_OPEN_REVOLVE_UNSUPPORTED",
+                                    "Opening a revolved body's cap takes the wall away through the Boolean engine, which does not carry this body's surfaces yet. A closed shell of the same body needs no Boolean.",
+                                ));
+                            }
+                            // An open cap's core reaches past the body, so the
+                            // wall there is taken away rather than enclosed.
+                            let opened = BooleanRequest {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                request_id: artificer_protocol::RequestId::new("shell::open"),
+                                expected_target_snapshot: input.id,
+                                expected_tool_snapshot: core.id(),
+                                precision: request.precision,
+                                operation: BooleanOperation::Difference,
+                            };
+                            let mut outcome = Self::execute_boolean(
                             input, &core, &opened, cancellation,
                         )
                         .map_err(|inner| {
@@ -1934,8 +1972,9 @@ impl NativeKernel {
                                 diagnostics,
                             )
                         })?;
-                        outcome.report.rung = Some("shell/open-revolve".to_owned());
-                        return Ok(outcome);
+                            outcome.report.rung = Some("shell/open-revolve".to_owned());
+                            return Ok(outcome);
+                        }
                     }
                 }
             }
@@ -2285,8 +2324,29 @@ impl NativeKernel {
         // full imprint/classify/regularize/sew pipeline for operands whose
         // faces it can carry. Everything is exact; nothing tessellates.
         let mut rung = "boolean/prism";
+        // Two coaxial bodies of revolution combine in their shared section,
+        // exactly, cones, spheres and tori included (ADR 0026 F4).
+        let coaxial = match &analytic {
+            Ok(_) => None,
+            Err(_) => coaxial_boolean::coaxial_boolean(
+                &target.topology,
+                &tool.topology,
+                request.operation,
+                request.precision,
+            )
+            .ok()
+            .filter(|topology| {
+                validator::validate(topology, request.precision.linear_agreement)
+                    .diagnostics
+                    .is_empty()
+            }),
+        };
         let topology = match analytic {
             Ok(topology) => topology,
+            Err(_) if coaxial.is_some() => {
+                rung = "boolean/coaxial";
+                coaxial.expect("checked above")
+            }
             Err(_) => {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
@@ -4282,6 +4342,9 @@ struct ToolBoolean {
     /// The rungs, in order: the prism reduction, the analytic engine, the
     /// faceted tier.
     rungs: [&'static str; 3],
+    /// The rung for two coaxial bodies of revolution combined in their
+    /// shared section (ADR 0026 F4).
+    coaxial: &'static str,
 }
 
 /// A loft added to or cut from a body (ADR 0049).
@@ -4296,6 +4359,7 @@ const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
         "loft/boolean-analytic",
         "loft/faceted",
     ],
+    coaxial: "loft/boolean-coaxial",
 };
 
 /// A sweep added to or cut from a body (ADR 0055). A straight sweep is a
@@ -4312,12 +4376,14 @@ const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
         "sweep/boolean-analytic",
         "sweep/faceted",
     ],
+    coaxial: "sweep/boolean-coaxial",
 };
 
 /// A revolve added to or cut from a body (ADR 0055). A revolve whose
 /// faces are all planes and coaxial cylinders is a prism along its axis and
-/// answers exactly; a cone, torus or sphere takes the faceted tier until the
-/// coaxial Boolean of ADR 0026 F4 exists.
+/// answers exactly. One turned about the body's own axis, with any faces,
+/// answers exactly in the two bodies' shared section (ADR 0026 F4). A cone,
+/// torus or sphere about another axis takes the faceted tier.
 const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
     noun: "revolve",
     empty: "REVOLVE_TARGET_EMPTY",
@@ -4329,6 +4395,25 @@ const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
         "revolve/boolean-analytic",
         "revolve/faceted",
     ],
+    coaxial: "revolve/boolean-coaxial",
+};
+
+/// The wedge wall taken off a partial turn's shell core (ADR 0055). The
+/// core's planes and coaxial cylinders meet the prism's planes in lines and
+/// answer exactly; a cone meets them in a hyperbola and takes the faceted
+/// tier.
+const SHELL_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "shell core",
+    empty: "SHELL_CORE_UNSUPPORTED",
+    declined: "SHELL_EXACT_ROUTE_DECLINED",
+    unresolved: "SHELL_FACETED_UNRESOLVED",
+    approximation: "SHELL_FACETED_APPROXIMATION",
+    rungs: [
+        "shell/closed-revolve",
+        "shell/closed-revolve",
+        "shell/faceted",
+    ],
+    coaxial: "shell/closed-revolve",
 };
 
 /// A spline profile added to or cut from a face (ADR 0050), which answers
@@ -4344,6 +4429,7 @@ const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
         "face-feature/analytic-boolean",
         "face-feature/faceted",
     ],
+    coaxial: "face-feature/coaxial-section",
 };
 
 /// A loft added to or cut from a body, through the Boolean ladder.
@@ -4415,6 +4501,16 @@ fn tool_boolean(
             .is_empty()
     {
         return Ok((topology, labels.rungs[0]));
+    }
+    // Two coaxial bodies of revolution combine in their shared section,
+    // exactly, whatever carriers the section builder makes of it.
+    if let Ok(topology) =
+        coaxial_boolean::coaxial_boolean(&input.topology, &tool, operation, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, labels.coaxial));
     }
     let decline = if analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool) {
         match analytic_boolean::build_analytic_boolean(&input.topology, &tool, operation, precision)

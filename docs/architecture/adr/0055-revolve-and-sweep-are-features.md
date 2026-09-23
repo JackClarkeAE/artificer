@@ -386,9 +386,9 @@ new geometry. R4/F4 is independent, and can run in parallel with the sweep.
   start that is not finite or is beyond a turn, or a sweep or remaining gap
   narrower than the minimum feature at the profile's outermost radius.
   A section point within agreement of the axis is now put on it exactly.
-- **Downstream.** `extract_rz_section` refuses a wedge face, so a partial
-  revolve takes no rim blend or section shell; it falls to the other
-  finish and shell routes, or to their refusals. It does combine: a quarter
+- **Downstream.** As first landed, `extract_rz_section` refused a wedge
+  face, so a partial revolve took no rim blend or section shell. Both now
+  work; see "Finishing a partial revolve" below. It combines: a quarter
   tube cuts a block exactly through `revolve/boolean-prism`. The rung for a
   new partial body is `revolve/partial-turn`. Scripts'
   `revolve(angle: …)` takes any angle within a turn either way.
@@ -739,3 +739,111 @@ loop, and a region is built whole.
   - two regions, a full turn and a half, as two solids;
   - two rings cut into a block exactly;
   - in the workbench, a circle drawn inside the section.
+
+### Finishing a partial revolve
+
+A revolve through less than a full turn used to take no rim fillet or
+chamfer, and no shell: `extract_rz_section` refused its wedge faces.
+- **Reading the section back.** A plane that holds the axis is a wedge
+  face. The extractor now skips it and counts it.
+  - A full turn has no wedge faces; a partial one has exactly two.
+  - Each curved carrier's two halves must span the same azimuth, and
+    that span is the sweep.
+  - Azimuth zero is read from the wedge faces themselves, not from a
+    carrier's frame. The turn begins at the face whose material lies
+    ahead of it about the axis.
+  - A partial turn's cap is a sector: its one loop has arcs and two
+    straight sides. `cap_radii` reads it as a disc or a washer.
+- **Rim blends.** The blended section is rebuilt through the same span,
+  and its wedge faces take the blended outline. A fillet or chamfer on the
+  rim of a quarter or a three-quarter shaft is exact. Each is checked by
+  Pappus against its share of the full turn, and its bounds against the
+  unblended body's.
+- **Shell.** The core is the section offset one wall inward, as for a full
+  turn, and it is turned a full turn. It then loses a prism standing along
+  the axis. The prism is drawn square to the axis, from `radial_u` towards
+  `radial_v`, and runs one wall past the core at each end.
+  - **Up to half a turn**, the core keeps the wedge between two lines, one
+    wall in from each closed wedge face. The prism is the rest of a disc
+    one wall beyond the core. At exactly half a turn both faces lie in one
+    plane, and each side keeps its own line.
+  - **Beyond half a turn**, the empty wedge is the convex part. The prism
+    holds every point within one wall of it: the empty wedge, a band one
+    wall wide along each face, and the disc one wall about the axis where
+    the bands meet. The void's wall bends round the axis, exactly.
+  - **Open wedge faces.** An open wedge face moves its line one wall
+    outward, so the core runs past the face and the difference opens it.
+    This works up to half a turn, which gives a cutaway. Beyond half a
+    turn, near the axis, the empty wedge is narrower than the wall the
+    other face keeps. There is nowhere for the core to run, so an open
+    wedge face there is `SHELL_OPEN_FACES_UNSUPPORTED`. A cap and a wedge
+    face together are the revolved reading's to take, even on a body the
+    prism reading would own for its caps alone.
+  - **Exactness.** The prism's walls are planes parallel to the axis and
+    cylinders about it. They meet planes and coaxial cylinders in lines
+    and circles, so a stepped hub's shell is exact. A cone meets them in a
+    hyperbola, so a partial cone's closed shell takes the faceted tier
+    with its label (`shell/faceted`, `SHELL_FACETED_APPROXIMATION`). Its
+    open shell is refused (`SHELL_OPEN_REVOLVE_UNSUPPORTED`), since a
+    faceted core cannot be taken away exactly. The disc's rim is drawn as
+    two arcs, so neither passes half a turn, which the analytic engine
+    will not classify.
+- **Tests.** Volumes are checked against closed forms for the area a
+  wedge keeps of each disc of the core:
+  - a quarter and a three-quarter stepped hub, closed;
+  - a quarter hub opened at its top;
+  - a half hub opened at its top and both wedge faces;
+  - a quarter cylinder opened at its top and one wedge face;
+  - a quarter cone, closed, faceted and within 1% of the integral;
+  - an open wedge face beyond half a turn, refused.
+
+### Exact add and cut for turned shapes (ADR 0026 F4)
+
+Adding or cutting a revolve with a cone, torus or sphere face used to take
+the faceted tier every time; only planes and cylinders about the axis came
+back exact. Two bodies of revolution about one axis now combine in their
+shared section, exactly, as ADR 0026 F4 planned.
+- **The route** (`coaxial_boolean`). Turning a half-section is a bijection
+  onto the body, and it commutes with union, intersection and difference.
+  - Both bodies are read back with `extract_rz_section`.
+  - Their sections are combined by the exact line/arc engine
+    (`profile_boolean_multi`); the axis is an ordinary boundary run there.
+  - The result is turned again through `validate_revolve` and the section
+    builder, so every carrier comes back exact: plane, cylinder, cone,
+    sphere and torus.
+- **The domain.** Both bodies must be single solids the extractor reads.
+  Their axes must agree in direction and in position, within the linear
+  agreement. Both must be full turns, or both the same partial turn from
+  the same azimuth. Anything else is not this route's, and the caller's
+  ladder carries on.
+- **Where it runs.** In `tool_boolean` after the prism rung and before the
+  analytic engine, for revolves, sweeps, lofts and spline face features
+  alike (`revolve/boolean-coaxial` and its siblings). In `execute_boolean`
+  in the same place (`boolean/coaxial`). The open shell of a solid of
+  revolution runs through `execute_boolean`, so a cone's open shell is now
+  exact too.
+- **What the extractor learned.**
+  - A body of spheres alone, a ball, takes its frame from a sphere.
+  - A section may be a single arc from pole to pole.
+  - Pieces of one arc pair by their midpoint as well as their ends, so the
+    two halves of a circle are no longer taken for one piece.
+- **Arcs of one circle are merged** before the Boolean. A torus is built
+  in an inner and an outer half, split where its section crosses the
+  major radius. A round groove centred on a shaft's surface would meet the
+  shaft there at a vertex, which the plane engine refuses; merged, the
+  split is gone.
+- **Limits.** Two bodies about different axes still meet in curves beyond
+  the analytic engine's lines and circles, so a cone, torus or sphere off
+  the body's axis takes the faceted tier with its label. A section contact
+  that is tangent, or that meets at a vertex, is refused by the plane
+  engine and falls through in the same way.
+- **Tests.** Volumes are checked against closed forms:
+  - a V-groove cut into a shaft, by Pappus on the triangle left inside;
+  - a ball joined to a shaft end;
+  - a chamfer turned on cylinder stock;
+  - a bore through a tapered post;
+  - a round groove, a torus, centred on the shaft's surface;
+  - a quarter groove in a quarter shaft;
+  - a script `difference` of two coaxial bodies;
+  - the open shell of a tapered post;
+  - a cone about another axis, which is not taken for coaxial.

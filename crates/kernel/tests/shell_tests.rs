@@ -495,10 +495,35 @@ shell(wall: 1, label: \"shelled\");
 }
 
 #[test]
-fn opening_a_cap_the_boolean_cannot_carry_names_the_shell_first() {
-    // A cone's wall is taken away through the Boolean engine, which does
-    // not reconstruct cones yet. The refusal leads with the shell's own
-    // account and keeps the engine's underneath.
+fn a_tapered_post_opens_at_its_top_through_the_coaxial_boolean() {
+    // The post and its core turn about one axis, so the wall is taken away
+    // in their shared section and the cones come back exact.
+    let session = run("let s = sketch(on: \"XZ\", label: \"s\", entities: [
+    line(start: [0, 0], end: [20, 0]),
+    line(start: [20, 0], end: [12, 30]),
+    line(start: [12, 30], end: [0, 30]),
+    line(start: [0, 30], end: [0, 0]),
+]);
+let post = revolve(sketch: s, axis: [0, 0, 1], label: \"post\");
+shell(open: faces(\">Z\"), wall: 2, label: \"cup\");
+");
+    let (wall, slope): (f64, f64) = (2.0, 8.0 / 30.0);
+    let inset = wall * (1.0 + slope * slope).sqrt();
+    let radius = |z: f64| 20.0 - inset - slope * z;
+    let (lower, upper) = (radius(wall), radius(30.0));
+    let removed = PI * (30.0 - wall) / 3.0 * (lower * lower + lower * upper + upper * upper);
+    let body = PI * 30.0 / 3.0 * (400.0 + 20.0 * 12.0 + 144.0);
+    assert_close(session.snapshot.measures().volume, body - removed, "volume");
+    assert_eq!(session.snapshot.counts().shells, 1, "the cup is open");
+    assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn opening_a_partial_cone_names_the_shell_first() {
+    // A partial cone's core is cut on the faceted tier, and a faceted core
+    // cannot be taken away exactly: the refusal says so in the shell's
+    // own words.
     let (_, codes) = refusal(
         "let s = sketch(on: \"XZ\", label: \"s\", entities: [
     line(start: [0, 0], end: [20, 0]),
@@ -506,7 +531,7 @@ fn opening_a_cap_the_boolean_cannot_carry_names_the_shell_first() {
     line(start: [12, 30], end: [0, 30]),
     line(start: [0, 30], end: [0, 0]),
 ]);
-let post = revolve(sketch: s, axis: [0, 0, 1], label: \"post\");
+let post = revolve(sketch: s, axis: [0, 0, 1], angle: 90, label: \"post\");
 shell(open: faces(\">Z\"), wall: 2, label: \"shelled\");
 ",
     );
@@ -514,5 +539,189 @@ shell(open: faces(\">Z\"), wall: 2, label: \"shelled\");
         codes.starts_with("SHELL_OPEN_REVOLVE_UNSUPPORTED"),
         "{codes}"
     );
-    assert!(codes.contains("BOOLEAN_"), "{codes}");
+}
+
+// ---------------------------------------------------------------------------
+// Partial turns
+// ---------------------------------------------------------------------------
+
+/// The stepped hub turned `angle` degrees from `+X` towards `+Y`, so its
+/// wedge faces lie on `y = 0` and at `angle`.
+fn partial_hub(angle: f64) -> String {
+    stepped_hub().replace(
+        "axis: [0, 0, 1], label",
+        &format!("axis: [0, 0, 1], angle: {angle}, label"),
+    )
+}
+
+/// The integral of `√(ρ² − t²)` from zero to `t`.
+fn under_circle(rho: f64, t: f64) -> f64 {
+    (t * (rho * rho - t * t).sqrt() + rho * rho * (t / rho).asin()) / 2.0
+}
+
+/// The area of a disc of radius `rho` about the axis kept by a quarter
+/// turn's core: one wall in from both wedge faces, `x ≥ w` and `y ≥ w`.
+fn quarter_core_area(rho: f64, wall: f64) -> f64 {
+    let far = (rho * rho - wall * wall).sqrt();
+    under_circle(rho, far) - under_circle(rho, wall) - wall * (far - wall)
+}
+
+/// The same for three quarters of a turn: the disc less the empty quarter,
+/// a band one wall wide along each wedge face, and the quarter of the disc
+/// one wall about the axis where the bands meet.
+fn three_quarter_core_area(rho: f64, wall: f64) -> f64 {
+    0.75 * PI * rho * rho - 2.0 * under_circle(rho, wall) - PI * wall * wall / 4.0
+}
+
+/// The full hub's volume.
+fn hub_volume() -> f64 {
+    PI * (30.0 * 30.0 * 10.0 + 12.0 * 12.0 * 30.0)
+}
+
+#[test]
+fn a_quarter_hub_shells_closed_one_wall_in_from_its_wedge_faces() {
+    let session = run(&format!(
+        "{}shell(wall: 3, label: \"hollow\");\n",
+        partial_hub(90.0)
+    ));
+    // The core is the section offset 3 mm inward, turned, and kept one wall
+    // clear of both wedge faces: a 27 mm disc from z = 3 to 7 and a 9 mm
+    // post to z = 37, each cut to `x ≥ 3, y ≥ 3`.
+    let core = 4.0 * quarter_core_area(27.0, 3.0) + 30.0 * quarter_core_area(9.0, 3.0);
+    assert_close(
+        session.snapshot.measures().volume,
+        hub_volume() / 4.0 - core,
+        "volume",
+    );
+    assert_eq!(session.snapshot.counts().shells, 2, "a shell and a void");
+    assert_eq!(rung_of(&session, "hollow"), "shell/closed-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+    let wall = min_wall(&session);
+    assert!((wall - 3.0).abs() <= 1.0e-2, "thinnest wall {wall}");
+}
+
+#[test]
+fn a_three_quarter_hub_shells_closed_round_its_axis() {
+    let session = run(&format!(
+        "{}shell(wall: 3, label: \"hollow\");\n",
+        partial_hub(270.0)
+    ));
+    // Beyond half a turn the wall bends round the axis between the two
+    // wedge faces: the void stays one wall clear of the axis itself.
+    let core = 4.0 * three_quarter_core_area(27.0, 3.0) + 30.0 * three_quarter_core_area(9.0, 3.0);
+    assert_close(
+        session.snapshot.measures().volume,
+        hub_volume() * 0.75 - core,
+        "volume",
+    );
+    assert_eq!(session.snapshot.counts().shells, 2);
+    assert_eq!(rung_of(&session, "hollow"), "shell/closed-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn a_quarter_hub_opens_at_its_top_cap() {
+    let session = run(&format!(
+        "{}shell(open: faces(\">Z\"), wall: 3, label: \"cup\");\n",
+        partial_hub(90.0)
+    ));
+    // As closed, but the bore runs out through the top.
+    let removed = 4.0 * quarter_core_area(27.0, 3.0) + 33.0 * quarter_core_area(9.0, 3.0);
+    assert_close(
+        session.snapshot.measures().volume,
+        hub_volume() / 4.0 - removed,
+        "volume",
+    );
+    assert_eq!(session.snapshot.counts().shells, 1);
+    assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn a_half_hub_opens_through_its_wedge_faces_as_a_cutaway() {
+    // Both wedge faces lie on y = 0, facing -Y, one each side of the axis;
+    // opened with the top cap, what is left is the half of a hollow hub's
+    // wall.
+    let session = run(&format!(
+        "{}shell(open: [nearest(point: [20, 0, 5], kind: \"face\"), nearest(point: [-20, 0, 5], kind: \"face\"), faces(\">Z\")], wall: 3, label: \"cup\");\n",
+        partial_hub(180.0)
+    ));
+    let removed = PI * (27.0 * 27.0 * 4.0 + 9.0 * 9.0 * 33.0) / 2.0;
+    assert_close(
+        session.snapshot.measures().volume,
+        hub_volume() / 2.0 - removed,
+        "volume",
+    );
+    assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
+}
+
+#[test]
+fn a_quarter_tapered_post_shells_closed_on_the_faceted_tier() {
+    let script = "let s = sketch(on: \"XZ\", label: \"s\", entities: [
+    line(start: [0, 0], end: [20, 0]),
+    line(start: [20, 0], end: [12, 30]),
+    line(start: [12, 30], end: [0, 30]),
+    line(start: [0, 30], end: [0, 0]),
+]);
+let post = revolve(sketch: s, axis: [0, 0, 1], angle: 90, label: \"post\");
+shell(wall: 2, label: \"hollow\");
+";
+    let session = run(script);
+    // A wedge face's wall meets the conical core in a hyperbola, outside
+    // the exact engines' vocabulary: the cut is faceted and says so.
+    assert_eq!(rung_of(&session, "hollow"), "shell/faceted");
+    assert_eq!(session.report().tier, Tier::Approximate);
+    let (wall, slope): (f64, f64) = (2.0, 8.0 / 30.0);
+    let inset = wall * (1.0 + slope * slope).sqrt();
+    let steps = 2000;
+    let span = 30.0 - 2.0 * wall;
+    let core: f64 = (0..steps)
+        .map(|index| {
+            let z = wall + span * (index as f64 + 0.5) / steps as f64;
+            quarter_core_area(20.0 - inset - slope * z, wall) * span / steps as f64
+        })
+        .sum();
+    let body = PI * 30.0 / 3.0 * (400.0 + 20.0 * 12.0 + 144.0) / 4.0;
+    let volume = session.snapshot.measures().volume;
+    assert!(
+        ((volume - (body - core)) / (body - core)).abs() < 1.0e-2,
+        "volume {volume} should be near {}",
+        body - core
+    );
+    assert_eq!(session.snapshot.counts().shells, 2);
+}
+
+#[test]
+fn an_open_wedge_face_beyond_half_a_turn_is_refused() {
+    // Near the axis the empty wedge is narrower than the wall the other
+    // face keeps, so there is nowhere for the open face's core to run.
+    let (_, codes) = refusal(&format!(
+        "{}shell(open: faces(\"<Y\"), wall: 3, label: \"cup\");\n",
+        partial_hub(270.0)
+    ));
+    assert!(codes.contains("SHELL_OPEN_FACES_UNSUPPORTED"), "{codes}");
+}
+
+#[test]
+fn a_quarter_cylinder_opens_at_its_top_and_one_wedge_face() {
+    // A quarter cylinder is a prism about its caps, but the prism opens
+    // only on one cap or two opposite ones; a cap with a wedge face is the
+    // revolved reading's to take.
+    let session = run("let s = sketch(on: \"XZ\", label: \"s\", entities: [
+    rect(origin: [0, 0], width: 20, height: 30),
+]);
+let quarter = revolve(sketch: s, axis: [0, 0, 1], angle: 90, label: \"quarter\");
+shell(open: [faces(\">Z\"), faces(\"<Y\")], wall: 2, label: \"cup\");
+");
+    // The core keeps x ≥ 2 against the closed wedge face and runs past the
+    // open one at y = 0, inside radius 18 from z = 2 up through the top.
+    let removed = 28.0 * (under_circle(18.0, 18.0) - under_circle(18.0, 2.0));
+    assert_close(
+        session.snapshot.measures().volume,
+        PI * 20.0 * 20.0 * 30.0 / 4.0 - removed,
+        "volume",
+    );
+    assert_eq!(rung_of(&session, "cup"), "shell/open-revolve");
+    assert_eq!(session.report().tier, Tier::Exact);
 }

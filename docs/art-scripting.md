@@ -396,7 +396,7 @@ let ring = revolve(sketch: section, axis: [0, 0, 1], label: "ring");
 | `axis_origin` | no | A point on the axis. Default `[0, 0, 0]`. |
 | `angle` | no | Degrees. Default `360`, a full turn. Less turns that far right-handed about `axis`, and closes the solid with the section at each end; a negative angle turns the other way. |
 | `regions` | no | As for `extrude`. |
-| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. |
+| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. Turned about the body's own axis, as a groove in a shaft is, it is exact whatever its faces; about another axis, a cone, sphere or torus face takes the faceted tier. |
 
 The section must lie on one side of the axis (touching it is fine). A section
 drawn on `"XZ"` about `[0, 0, 1]` is the usual `(r, z)` half-section: `x` is
@@ -548,7 +548,12 @@ exactly, and so do the cylinders of a filleted vertical edge.
 axis or on itself. The offset happens in the section, which carries the
 whole boundary, so a two-diameter turned hub, a tapered post and a tube
 all hollow to one wall measured square to the surface. Every open face
-must then be a cap square to the axis.
+must then be a cap square to the axis, or a wedge face of a partial turn.
+A partial turn keeps one wall along each closed wedge face, and past half a
+turn that wall bends round the axis. Opening a wedge face, up to half a
+turn, cuts the body away as a cutaway; beyond half a turn it is refused. A
+partial cone's closed shell is faceted and labelled (`shell/faceted`),
+since its wall meets the wedge wall in a hyperbola.
 
 Refusals are by name. A wall that leaves no floor or no core, or one
 thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
@@ -557,9 +562,11 @@ thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
 `SHELL_BLEND_UNSUPPORTED`: the inner surface would be the offset of a
 torus or a sphere with the material on the far side of the tube, which
 this release's carriers do not express, so shell first and blend after.
-Opening a cap takes the wall away through the Boolean engine, so a body
-whose surfaces that engine does not carry yet — a cone, today — is
-`SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the same body shells closed.
+Opening a cap takes the wall away through the Boolean engine. A body of
+revolution and its core turn about one axis, so the wall comes away in
+their shared section, exactly, cones included. A partial cone's core is
+faceted, so opening it is `SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the
+same body shells closed.
 
 ### `union`, `difference`, `intersection`
 
@@ -892,9 +899,10 @@ For an agent, the rules that make this reliable:
 
 ## 13. Not in 0.3
 
-Partial revolves, sweeps, revolved splines, drafted splines, exact
-Booleans with a loft's ruled or B-spline walls or a spline extrusion's
-(they fall to the faceted tier),
+Sweeps, revolved splines, drafted splines, exact Booleans with a loft's
+ruled or B-spline walls or a spline extrusion's, or with a cone, sphere or
+torus turned about another axis than the body's (they fall to the faceted
+tier),
 concave fillets between a boss and its plate, text as sketch geometry from a
 script, and threads. A script builds parts; joints and occurrences belong
 to a document, so a mechanism is assembled in the workbench and analysed

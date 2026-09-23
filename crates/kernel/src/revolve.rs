@@ -2,7 +2,7 @@
 //!
 //! The kernel already knew how to build every surface a revolve needs: a
 //! coaxial solid of revolution is exactly its `(r, z)` section, and
-//! [`section_revolve::build_revolved_topology`] turns that section into
+//! [`section_revolve::build_turned_region`] turns that section into
 //! cylinders, cones, tori, spheres, and planar caps. What was missing was a way
 //! for a user to reach it. This module is that mapping, and nothing more: it
 //! certifies the profile against the axis, rewrites it into the section

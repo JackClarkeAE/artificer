@@ -1578,6 +1578,41 @@ mod tests {
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
     }
 
+    /// A quarter turn shells closed like any body: the void keeps one wall
+    /// from every face, the two wedge faces included.
+    #[test]
+    fn a_quarter_turn_shells_closed_one_wall_from_its_wedge_faces() {
+        let mut app = KernelLabApp::default();
+        rectangle_beside_a_centreline(&mut app);
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        assert!(app.enter_revolve_angle("90"), "{:?}", app.document_status);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let tube = PI * (4.0 - 1.0) * 3.0 / 4.0;
+        assert_close(app.displayed_measures().unwrap().volume, tube, "quarter");
+
+        app.selected_faces.clear();
+        app.stage_preset_feature(crate::SolidFeaturePreset::Shell);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let displayed = app.displayed.as_ref().expect("a body");
+        assert_eq!(displayed.snapshot.counts().shells, 2, "a void inside");
+        // The staged wall is a tenth of the smallest side, 2 across. The
+        // void keeps x and y at least one wall, radii 1.2 to 1.8, and
+        // heights 0.2 to 2.8.
+        let wall = 0.2;
+        let kept = |rho: f64| {
+            let under =
+                |t: f64| (t * (rho * rho - t * t).sqrt() + rho * rho * (t / rho).asin()) / 2.0;
+            let far = (rho * rho - wall * wall).sqrt();
+            under(far) - under(wall) - wall * (far - wall)
+        };
+        let void = (kept(1.8) - kept(1.2)) * (3.0 - 2.0 * wall);
+        assert_close(
+            app.displayed_measures().unwrap().volume,
+            tube - void,
+            "shelled quarter",
+        );
+    }
+
     /// Added to or cut from the body it is staged over, a revolve changes
     /// that body; a bore through the corner of the starting block takes a
     /// quarter of a cylinder away, exactly.
