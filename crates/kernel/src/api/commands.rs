@@ -60,6 +60,40 @@ pub enum SketchPlane {
     Frame {
         frame: PlanarFrame3,
     },
+    /// A planar face of the current body, its own frame moved `offset` along
+    /// its outward normal (ADR 0048).
+    OffsetFace {
+        face: Box<EntitySelector>,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
+    /// Halfway between two parallel planar faces of the current body, facing
+    /// as the first does, then moved `offset` along that normal.
+    Midplane {
+        first: Box<EntitySelector>,
+        second: Box<EntitySelector>,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
+    /// Through a straight edge of the current body, hinged on it and turned
+    /// `angle_degrees` from the planar face it starts on: 0 lies on the face,
+    /// 90 stands square to it. `face` names which face when the edge bounds
+    /// two planar faces.
+    ThroughEdge {
+        edge: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face: Option<Box<EntitySelector>>,
+        #[serde(default)]
+        angle_degrees: f64,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
 }
 
 /// A 2D geometric entity in a sketch.

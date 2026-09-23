@@ -1,9 +1,10 @@
 # ADR 0048: A construction plane is a feature
 
-Status: implemented in the workbench — planes are document features with a
-recipe, placed with a live preview and handles, edited from the history,
-followed by the sketches built on them, and usable wherever a face's plane is.
-The script forms of `plane(...)` arrive with the loft work (ADR 0049).
+Status: implemented — planes are document features with a recipe, placed
+with a live preview and handles, edited from the history, followed by the
+sketches built on them, and usable wherever a face's plane is. Scripts place
+the same planes with `plane(on:)`, `plane(between:)` and `plane(through:)`;
+the frame forms arrived with the loft work (ADR 0049).
 
 - Date: 2026-09-22
 - Decision owners: Artificer project
@@ -137,8 +138,11 @@ records and can undo, and saving is offered after it.
   feature, and replay measures to its current frame.
 - **Mirror** keeps using a selected plane, as before.
 - **Scripts.** `plane(...)` builds a plane from a world frame, an origin
-  plane and offset, a face and offset, two faces, or an edge, a face and an
-  angle, and `sketch(on: …)` accepts it.
+  plane and offset, a face and offset (`on:`), two faces (`between:`), or an
+  edge, a face and an angle (`through:`), and `sketch(on: …)` accepts it. The
+  kernel answers where a straight edge sits on its face
+  (`NativeKernel::straight_edge_on_planar_face`) for both the workbench and
+  scripts, so a plane through an edge is the same plane in either.
 
 ### Files written before this change
 

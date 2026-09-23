@@ -298,7 +298,7 @@ The whole API is reachable from a script, one builtin per command, with named ar
 | `sketch(on: "XY" \| "XZ" \| "YZ" \| face, entities: [...], label:)` with `line(start:, end:)`, `circle(center:, radius:)`, `arc(center:, radius:, start_angle:, end_angle:)`, `rect(origin: or center:, width:, height:)` | A profile on a plane or a face. Lines and arcs chain into loops; nested loops become holes. |
 | `extrude(sketch:, distance:, operation: "new" \| "add" \| "cut", draft:, regions:, label:)` | A prism, or a drafted loft for a new body. |
 | `revolve(sketch:, axis:, axis_origin:, angle:, operation:, label:)` | A solid of revolution. |
-| `plane(from: "XY", offset:)`, `plane(origin:, normal:, x_axis:)`, `plane(origin:, x_axis:, y_axis:)` | A plane in space for `sketch(on:)`. |
+| `plane(from: "XY", offset:)`, `plane(origin:, normal:, x_axis:)`, `plane(on: face, offset:)`, `plane(between: [a, b])`, `plane(through: edge, face:, angle:)` | A plane for `sketch(on:)`: in space, or placed by the body's faces and edges. |
 | `loft(sections: [a, b], operation: "new" \| "add" \| "cut", label:)` | A solid between two sketches on different planes, with exact walls: planes, cylinders and cones where they fit, ruled surfaces otherwise. |
 | `drill(face:, center:, diameter:, depth:)`, `push_pull(face:, distance:)`, `fillet(edges:, radius:)`, `chamfer(edges:, distance:)` | Face and edge features. |
 | `shell(open:, wall:)` | Hollows the current body to one wall, open at one face, two opposite faces, or none; prisms and solids of revolution. |

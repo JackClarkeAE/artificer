@@ -191,7 +191,7 @@ let profile = sketch(on: "XY", label: "profile", entities: [
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, a `plane(...)`, or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
+| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, a `plane(...)` — in space, or placed by the body's faces and edges — or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
 | `entities` | yes | An array of `line`, `circle`, `arc`, `rect`. |
 | `label` | no | Step label. |
 
@@ -218,11 +218,25 @@ let top = sketch(on: tilted, entities: [circle(radius: 8)], label: "top");
 | `plane(from: "XY", offset: d)` | A world plane moved `d` along the side its sketches face: +Z for `"XY"`, −Y for `"XZ"`, +X for `"YZ"`. `offset` defaults to 0. |
 | `plane(origin: [x, y, z], normal: [x, y, z], x_axis: [x, y, z])` | Faces `normal`; the sketch's `x` runs along `x_axis` turned into the plane, and its `y` is `normal × x`. `origin` defaults to the world origin. |
 | `plane(origin: [...], x_axis: [...], y_axis: [...])` | The two axes as given; the plane faces `x_axis × y_axis`. This is how a decompiled script writes a plane back exactly. |
+| `plane(on: face, offset: d)` | A planar face's own frame — the one `sketch(on: face)` uses — moved `d` along the face's outward normal. |
+| `plane(between: [a, b], offset: d)` | Halfway between two parallel planar faces, through the midpoint of their centres, with the first face's axes and normal. |
+| `plane(through: edge, face: f, angle: a, offset: d)` | Hinged on a straight edge like a door: `x` runs along the edge and `y` leans away from it, turned `a` degrees from the face `f` — at 0 it lies on the face, facing out with it; at 90 it stands square to it. `face` may be left out when the edge bounds only one planar face. |
 
 The sketch's 2D coordinates are the plane's own `x` and `y`, from its
-origin. Planes placed by the body's faces and edges — offset from a face,
-through an edge at an angle — come through the same `on:` and are added
-separately.
+origin. The last three are placed by the current body and resolved when a
+feature first uses the sketch, against the body as it then stands; each takes
+`flip: true` to face the other way, and each is refused by name where it
+cannot be placed — faces that are not parallel, an edge that is curved or not
+on the face, or an edge between two planar faces with no `face:` to say
+which. They are the script forms of the workbench's construction planes (ADR
+0048) and follow the same conventions.
+
+```art
+let b = box(size: [40, 40, 10], label: "b");
+let above = plane(on: faces(">Z"), offset: 20);
+let middle = plane(between: [faces("<X"), faces(">X")]);
+let leaning = plane(through: nearest(point: [20, 0, 10], kind: "edge"), face: faces(">Z"), angle: 60);
+```
 
 **Regions.** Closed loops become regions. A loop inside another loop is a
 hole in it, so the sketch above is a plate with a hole. Intersecting loops

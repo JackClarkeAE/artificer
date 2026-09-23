@@ -26132,11 +26132,8 @@ fn datum_face_geometry(
 }
 
 /// A straight edge and the planar face it is turned from, with the direction
-/// from the edge into that face.
-///
-/// The direction is found by asking which side of the edge the face is on,
-/// a hair away from the edge's middle. A face is not always convex, so its
-/// middle is not always on the inside of every edge; the boundary is.
+/// from the edge into that face. The kernel answers it, so a script's plane
+/// through an edge and the workbench's are the same plane.
 fn datum_edge_geometry(
     snapshot: &Snapshot,
     edge: EntityRef,
@@ -26145,87 +26142,17 @@ fn datum_edge_geometry(
     let ends = NativeKernel::straight_edge_ends(snapshot, edge)
         .map_err(|_| DatumPlaneError::EdgeMissing)?
         .ok_or(DatumPlaneError::EdgeNotStraight)?;
-    let support = NativeKernel::planar_face_support(snapshot, face)
+    NativeKernel::planar_face_support(snapshot, face)
         .map_err(|_| DatumPlaneError::FaceNotPlanar)?;
-    let normal = frame_normal(support.frame).ok_or(DatumPlaneError::FaceNotPlanar)?;
-    let along = Vector3::new(
-        ends[1].x - ends[0].x,
-        ends[1].y - ends[0].y,
-        ends[1].z - ends[0].z,
-    );
-    let length = vector_length(along).unwrap_or(0.0);
-    if length <= 1.0e-9 {
-        return Err(DatumPlaneError::EdgeMissing);
-    }
-    let across =
-        normalized_vector(cross_vector(normal, along)).ok_or(DatumPlaneError::EdgeNotOnFace)?;
-    let middle = Point3::new(
-        0.5 * (ends[0].x + ends[1].x),
-        0.5 * (ends[0].y + ends[1].y),
-        0.5 * (ends[0].z + ends[1].z),
-    );
-    let step = (length * 1.0e-3).max(1.0e-4);
-    let inside = |sign: f64| {
-        let point = Point3::new(
-            middle.x + sign * step * across.x,
-            middle.y + sign * step * across.y,
-            middle.z + sign * step * across.z,
-        );
-        point_in_face_support(&support, point)
-    };
-    let into_face = match (inside(1.0), inside(-1.0)) {
-        (true, false) => across,
-        (false, true) => Vector3::new(-across.x, -across.y, -across.z),
-        // Both or neither: the edge is not on this face's boundary in any way
-        // that says which side the face is on.
-        _ => return Err(DatumPlaneError::EdgeNotOnFace),
-    };
+    let placed = NativeKernel::straight_edge_on_planar_face(snapshot, edge, face)
+        .map_err(|_| DatumPlaneError::EdgeNotOnFace)?;
+    debug_assert_eq!([placed.start, placed.end], ends);
     Ok(DatumEdgeGeometry {
-        start: ends[0],
-        end: ends[1],
-        face_normal: normal,
-        into_face,
+        start: placed.start,
+        end: placed.end,
+        face_normal: placed.face_normal,
+        into_face: placed.into_face,
     })
-}
-
-/// Whether a point in a face's plane lies inside the face's outer boundary
-/// and outside every hole in it.
-fn point_in_face_support(support: &PlanarFaceSupport, point: Point3) -> bool {
-    let frame = support.frame;
-    let offset = Vector3::new(
-        point.x - frame.origin.x,
-        point.y - frame.origin.y,
-        point.z - frame.origin.z,
-    );
-    let uu = dot_vector(frame.u, frame.u);
-    let uv = dot_vector(frame.u, frame.v);
-    let vv = dot_vector(frame.v, frame.v);
-    let determinant = uu * vv - uv * uv;
-    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-        return false;
-    }
-    let pu = dot_vector(offset, frame.u);
-    let pv = dot_vector(offset, frame.v);
-    let x = (pu * vv - pv * uv) / determinant;
-    let y = (pv * uu - pu * uv) / determinant;
-    let contains = |polygon: &[ProtocolPoint2]| {
-        let mut inside = false;
-        let mut previous = polygon.last().copied();
-        for current in polygon.iter().copied() {
-            if let Some(prior) = previous
-                && (current.y > y) != (prior.y > y)
-            {
-                let crossing =
-                    prior.x + (y - prior.y) * (current.x - prior.x) / (current.y - prior.y);
-                if x < crossing {
-                    inside = !inside;
-                }
-            }
-            previous = Some(current);
-        }
-        inside
-    };
-    contains(&support.boundary) && !support.inner_boundaries.iter().any(|hole| contains(hole))
 }
 
 /// Resolves plane recipes against a rebuild's reports and bodies.

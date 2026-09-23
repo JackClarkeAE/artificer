@@ -18,6 +18,7 @@ use crate::api::commands::{
 };
 use crate::api::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
 use crate::api::journal::{Journal, JournalEntry};
+use crate::api::planes;
 use crate::api::query::QueryHandle;
 use crate::api::selectors::{EntitySelector, resolve_selector, resolve_selector_set};
 use crate::api::snapshot::{SnapshotOptions, SnapshotOutput, render_snapshot};
@@ -1120,6 +1121,33 @@ impl Session {
                         support.frame
                     }
                     SketchPlane::Frame { frame } => *frame,
+                    SketchPlane::OffsetFace { face, offset, flip } => {
+                        let face = self.planar_face_frame(face)?;
+                        planes::placed(face, *offset, *flip)?
+                    }
+                    SketchPlane::Midplane {
+                        first,
+                        second,
+                        offset,
+                        flip,
+                    } => {
+                        let middle = planes::midplane(
+                            self.planar_face_frame(first)?,
+                            self.planar_face_frame(second)?,
+                        )?;
+                        planes::placed(middle, *offset, *flip)?
+                    }
+                    SketchPlane::ThroughEdge {
+                        edge,
+                        face,
+                        angle_degrees,
+                        offset,
+                        flip,
+                    } => {
+                        let hinge = self.straight_edge_on_face(edge, face.as_deref())?;
+                        let turned = planes::through_edge(hinge, *angle_degrees)?;
+                        planes::placed(turned, *offset, *flip)?
+                    }
                 };
 
                 let loops = sketch_loops(entities)?;
@@ -1131,6 +1159,56 @@ impl Session {
                 "Target step is not a Sketch",
             )),
         }
+    }
+
+    /// The frame of the planar face a selector names, as a sketch on that face
+    /// would use it.
+    fn planar_face_frame(&self, face: &EntitySelector) -> Result<PlanarFrame3, ApiError> {
+        let face_ref =
+            resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?;
+        NativeKernel::planar_face_support(&self.snapshot, face_ref)
+            .map(|support| support.frame)
+            .map_err(ApiError::from)
+    }
+
+    /// The straight edge a selector names, with the planar face a plane is
+    /// turned from: the one named, or the only planar face the edge bounds.
+    fn straight_edge_on_face(
+        &self,
+        edge: &EntitySelector,
+        face: Option<&EntitySelector>,
+    ) -> Result<crate::StraightEdgeOnFace, ApiError> {
+        let edge_ref =
+            resolve_selector(edge, &self.snapshot, &self.step_order, &self.step_reports)?;
+        let face_ref = match face {
+            Some(face) => {
+                resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?
+            }
+            None => {
+                let planar = NativeKernel::edge_faces(&self.snapshot, edge_ref)
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .filter(|face| NativeKernel::planar_face_support(&self.snapshot, *face).is_ok())
+                    .collect::<Vec<_>>();
+                match planar.as_slice() {
+                    [only] => *only,
+                    [] => {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "plane(): the edge bounds no planar face to turn the plane from",
+                        ));
+                    }
+                    _ => {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "plane(): the edge bounds two planar faces; name the one the plane turns from with `face:`",
+                        ));
+                    }
+                }
+            }
+        };
+        NativeKernel::straight_edge_on_planar_face(&self.snapshot, edge_ref, face_ref)
+            .map_err(ApiError::from)
     }
 
     /// The face a sketch was drawn on, when it was drawn on one.

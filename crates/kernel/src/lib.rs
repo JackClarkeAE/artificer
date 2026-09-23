@@ -634,6 +634,17 @@ impl FaceBoundaryCurve2 {
     }
 }
 
+/// A straight edge and the planar face a construction plane is turned from
+/// (ADR 0048): the edge's ends in its own direction, the face's outward
+/// normal, and the unit direction from the edge into the face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StraightEdgeOnFace {
+    pub start: ProtocolPoint3,
+    pub end: ProtocolPoint3,
+    pub face_normal: ProtocolVector3,
+    pub into_face: ProtocolVector3,
+}
+
 /// Exact read-only placement and boundary for a planar B-rep face.
 ///
 /// Sketches may use this local two-dimensional frame without treating debug
@@ -2539,6 +2550,75 @@ impl NativeKernel {
         Ok(Some(edge.endpoints().map(protocol_point)))
     }
 
+    /// Returns the faces on either side of one edge, in topology order: two
+    /// for an ordinary edge, one for a seam that a face meets itself along.
+    pub fn edge_faces(snapshot: &Snapshot, edge: EntityRef) -> Result<Vec<EntityRef>, KernelError> {
+        let record = resolve_measure_entity(snapshot, edge, EntityKind::Edge, "edge")?;
+        Ok(edge_incident_faces(snapshot)
+            .get(record)
+            .map(|faces| faces.iter().flatten().copied().collect())
+            .unwrap_or_default())
+    }
+
+    /// Returns a straight edge as a construction plane turned about it sees
+    /// it (ADR 0048): its ends, the outward normal of a planar face that
+    /// holds it, and the direction from the edge into that face.
+    ///
+    /// The direction is found by asking which side of the edge the face is
+    /// on, a hair from the edge's middle. A face is not always convex, so its
+    /// middle is not always inside every edge; its boundary is. An edge that
+    /// is curved, or that is not on the face's boundary in a way that says
+    /// which side the face is on, is refused by name.
+    pub fn straight_edge_on_planar_face(
+        snapshot: &Snapshot,
+        edge: EntityRef,
+        face: EntityRef,
+    ) -> Result<StraightEdgeOnFace, KernelError> {
+        let ends = Self::straight_edge_ends(snapshot, edge)?.ok_or_else(|| {
+            simple_invalid_input(
+                snapshot.id,
+                "EDGE_NOT_STRAIGHT",
+                "A plane turns about a straight edge; this edge is curved.",
+            )
+        })?;
+        let support = Self::planar_face_support(snapshot, face)?;
+        let frame = support.frame;
+        let unit = |vector: Vector3| {
+            let length = vector.length();
+            (length.is_finite() && length > 1.0e-12).then(|| vector / length)
+        };
+        let normal = unit(
+            Vector3::new(frame.u.x, frame.u.y, frame.u.z)
+                .cross(Vector3::new(frame.v.x, frame.v.y, frame.v.z)),
+        );
+        let not_on_face = || {
+            simple_invalid_input(
+                snapshot.id,
+                "EDGE_NOT_ON_FACE",
+                "The edge is not on the boundary of the face it is turned from.",
+            )
+        };
+        let (start, end) = (internal_point(ends[0]), internal_point(ends[1]));
+        let along = end - start;
+        let length = along.length();
+        let normal = normal.filter(|_| length > 1.0e-9).ok_or_else(not_on_face)?;
+        let across = unit(normal.cross(along)).ok_or_else(not_on_face)?;
+        let middle = start + along * 0.5;
+        let step = (length * 1.0e-3).max(1.0e-4);
+        let inside = |sign: f64| point_in_face_support(&support, middle + across * (sign * step));
+        let into_face = match (inside(1.0), inside(-1.0)) {
+            (true, false) => across,
+            (false, true) => across * -1.0,
+            _ => return Err(not_on_face()),
+        };
+        Ok(StraightEdgeOnFace {
+            start: ends[0],
+            end: ends[1],
+            face_normal: protocol_vector(normal),
+            into_face: protocol_vector(into_face),
+        })
+    }
+
     /// Returns the exact model-space area of one authoritative B-rep face.
     pub fn face_area(snapshot: &Snapshot, face: EntityRef) -> Result<f64, KernelError> {
         let record = resolve_measure_entity(snapshot, face, EntityKind::Face, "face")?;
@@ -2863,6 +2943,43 @@ impl NativeKernel {
             carriers: display_carriers(snapshot),
         }
     }
+}
+
+/// Whether a point in a face's plane lies inside the face's outer boundary
+/// and outside every hole in it, judged on the face's own polygon.
+fn point_in_face_support(support: &PlanarFaceSupport, point: Point3) -> bool {
+    let frame = support.frame;
+    let (u, v) = (
+        Vector3::new(frame.u.x, frame.u.y, frame.u.z),
+        Vector3::new(frame.v.x, frame.v.y, frame.v.z),
+    );
+    let offset = point - internal_point(frame.origin);
+    let (uu, uv, vv) = (u.dot(u), u.dot(v), v.dot(v));
+    let determinant = uu * vv - uv * uv;
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return false;
+    }
+    let (pu, pv) = (offset.dot(u), offset.dot(v));
+    let x = (pu * vv - pv * uv) / determinant;
+    let y = (pv * uu - pu * uv) / determinant;
+    let contains = |polygon: &[ProtocolPoint2]| {
+        let mut inside = false;
+        let mut previous = polygon.last().copied();
+        for current in polygon.iter().copied() {
+            if let Some(prior) = previous
+                && (current.y > y) != (prior.y > y)
+            {
+                let crossing =
+                    prior.x + (y - prior.y) * (current.x - prior.x) / (current.y - prior.y);
+                if x < crossing {
+                    inside = !inside;
+                }
+            }
+            previous = Some(current);
+        }
+        inside
+    };
+    contains(&support.boundary) && !support.inner_boundaries.iter().any(|hole| contains(hole))
 }
 
 /// The faces on either side of every edge, in topology order.

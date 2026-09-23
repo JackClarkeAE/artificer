@@ -203,6 +203,38 @@ impl Writer<'_> {
                     SketchPlane::YZ => "\"YZ\"".to_owned(),
                     SketchPlane::OnFace { face } => self.selector(face)?,
                     SketchPlane::Frame { frame } => plane_text(*frame),
+                    SketchPlane::OffsetFace { face, offset, flip } => format!(
+                        "plane(on: {}{})",
+                        self.selector(face)?,
+                        placement_text(*offset, *flip)
+                    ),
+                    SketchPlane::Midplane {
+                        first,
+                        second,
+                        offset,
+                        flip,
+                    } => format!(
+                        "plane(between: [{}, {}]{})",
+                        self.selector(first)?,
+                        self.selector(second)?,
+                        placement_text(*offset, *flip)
+                    ),
+                    SketchPlane::ThroughEdge {
+                        edge,
+                        face,
+                        angle_degrees,
+                        offset,
+                        flip,
+                    } => format!(
+                        "plane(through: {}{}, angle: {}{})",
+                        self.selector(edge)?,
+                        face.as_ref()
+                            .map(|face| self.selector(face).map(|text| format!(", face: {text}")))
+                            .transpose()?
+                            .unwrap_or_default(),
+                        number(*angle_degrees),
+                        placement_text(*offset, *flip)
+                    ),
                 };
                 let entities = entities
                     .iter()
@@ -674,6 +706,19 @@ fn axis_word(direction: Vector3) -> Option<&'static str> {
 /// A plane as the script spells it: one of the world planes moved along the
 /// side it faces where it is one, and its origin and two axes, exactly as
 /// held, otherwise.
+/// The `offset:` and `flip:` a plane placed by faces or edges carries, each
+/// written only when it is not the default.
+fn placement_text(offset: f64, flip: bool) -> String {
+    let mut text = String::new();
+    if offset != 0.0 {
+        text.push_str(&format!(", offset: {}", number(offset)));
+    }
+    if flip {
+        text.push_str(", flip: true");
+    }
+    text
+}
+
 fn plane_text(frame: PlanarFrame3) -> String {
     for name in ["XY", "XZ", "YZ"] {
         let Some(world) = crate::api::scripting::world_plane_frame(name) else {

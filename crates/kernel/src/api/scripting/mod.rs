@@ -1428,7 +1428,7 @@ impl<'a> Interp<'a> {
                     operation: args.operation()?,
                 }))
             }
-            "plane" => world_plane(&args).map(Value::Plane),
+            "plane" => script_plane(&args).map(Value::Plane),
             "revolve" => Ok(Value::Command(ApiCommand::Revolve {
                 label: args.label()?,
                 sketch: args.required("sketch")?.as_step()?,
@@ -1841,8 +1841,10 @@ enum Value {
         step: StepLabel,
         faces: BTreeMap<String, EntitySelector>,
     },
-    /// A plane resolved to a frame by `plane(...)`, for `sketch(on: ...)`.
-    Plane(PlanarFrame3),
+    /// A plane named by `plane(...)`, for `sketch(on: ...)`: a frame in
+    /// space, or a plane placed by the body's faces and edges, which is
+    /// resolved when the sketch runs.
+    Plane(SketchPlane),
     /// What a function without a `return` value evaluates to.
     Unit,
 }
@@ -2247,7 +2249,7 @@ fn sketch_plane(value: &Value) -> Result<SketchPlane, ScriptError> {
         Value::Selector(selector) => Ok(SketchPlane::OnFace {
             face: selector.clone(),
         }),
-        Value::Plane(frame) => Ok(SketchPlane::Frame { frame: *frame }),
+        Value::Plane(plane) => Ok(plane.clone()),
         other => Err(ScriptError::eval(format!(
             "sketch(): `on` is \"XY\", \"XZ\", \"YZ\", a plane(...) or a face selector, got {}",
             other.describe()
@@ -2268,7 +2270,79 @@ pub(crate) fn world_plane_frame(name: &str) -> Option<PlanarFrame3> {
     Some(PlanarFrame3::new(origin, u, v))
 }
 
-/// `plane(...)`: a world plane as a frame.
+/// `plane(...)`: a plane for `sketch(on: ...)`.
+///
+/// The forms placed by the body (ADR 0048) are resolved when the sketch runs,
+/// against the body as it then stands:
+///
+/// - `plane(on: face, offset: d)` is the face's own frame moved `d` along its
+///   outward normal.
+/// - `plane(between: [a, b], offset: d)` is halfway between two parallel
+///   faces, facing as the first does.
+/// - `plane(through: edge, face: f, angle: a)` hangs off a straight edge,
+///   turned `a` degrees from the face `f` (the edge's only planar face when
+///   left out).
+///
+/// Each takes `flip: true` to face the other way. The rest are frames in
+/// space, fixed as they are written.
+fn script_plane(args: &Args<'_>) -> Result<SketchPlane, ScriptError> {
+    let offset = args.number_or("offset", 0.0)?;
+    let flip = match args.values.get("flip") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(ScriptError::eval(format!(
+                "plane(): `flip` is true or false, got {}",
+                other.describe()
+            )));
+        }
+    };
+    if let Some(face) = args.values.get("on") {
+        return Ok(SketchPlane::OffsetFace {
+            face: Box::new(face.as_selector()?),
+            offset,
+            flip,
+        });
+    }
+    if let Some(faces) = args.values.get("between") {
+        let faces = faces.as_selectors()?;
+        let [first, second] = <[EntitySelector; 2]>::try_from(faces).map_err(|faces| {
+            ScriptError::eval(format!(
+                "plane(): `between` is an array of two faces, got {}",
+                faces.len()
+            ))
+        })?;
+        return Ok(SketchPlane::Midplane {
+            first: Box::new(first),
+            second: Box::new(second),
+            offset,
+            flip,
+        });
+    }
+    if let Some(edge) = args.values.get("through") {
+        return Ok(SketchPlane::ThroughEdge {
+            edge: Box::new(edge.as_selector()?),
+            face: args
+                .values
+                .get("face")
+                .map(Value::as_selector)
+                .transpose()?
+                .map(Box::new),
+            angle_degrees: args.number_or("angle", 0.0)?,
+            offset,
+            flip,
+        });
+    }
+    if flip {
+        return Err(ScriptError::eval(
+            "plane(): `flip` goes with `on`, `between` or `through`; a frame in space faces the way its axes say",
+        ));
+    }
+    world_plane(args).map(|frame| SketchPlane::Frame { frame })
+}
+
+/// A plane in space as a frame: a world plane moved along its normal, or
+/// one given by its origin and axes.
 ///
 /// - `plane(from: "XY", offset: 30)` is a world plane moved along the side it
 ///   faces — +Z for XY, −Y for XZ, +X for YZ, the sides their sketches face.
