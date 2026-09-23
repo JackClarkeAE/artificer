@@ -727,22 +727,30 @@ pub fn evaluate_recipe(
         SketchRecipe::FitPointSpline {
             fit_points,
             degree,
-            closed: _,
+            closed,
         } => {
-            if fit_points.len() < 2 {
+            if fit_points.len() < 2 || (*closed && fit_points.len() < 3) {
                 return Err(SketchValidationError::FeatureTooSmall {
                     operation: placeholder_operation(),
                 });
             }
-            let mut resolved_fit_points = Vec::with_capacity(fit_points.len());
+            let mut resolved_fit_points = Vec::with_capacity(fit_points.len() + 1);
             for (index, pt_input) in fit_points.iter().enumerate() {
                 let role = PointOutputRole::FitPoint(index_u16(index)?);
                 let binding = builder.bind_input(*pt_input, role)?;
                 let pos = builder.position(binding)?;
                 resolved_fit_points.push(pos);
             }
-            let (control_positions, knots) = fit_spline_points(&resolved_fit_points, *degree)?;
-            let p_degree = (*degree).min(resolved_fit_points.len() - 1);
+            // A closed spline passes through its first point again at the
+            // end and leaves it along the tangent it arrives on, so it bounds
+            // a region with no corner at the seam.
+            let (control_positions, knots, p_degree) = if *closed {
+                let (control, knots) = closed_fit_spline_points(&resolved_fit_points)?;
+                (control, knots, 3)
+            } else {
+                let (control, knots) = fit_spline_points(&resolved_fit_points, *degree)?;
+                (control, knots, (*degree).min(resolved_fit_points.len() - 1))
+            };
             let mut control_bindings = Vec::with_capacity(control_positions.len());
             for (index, pos) in control_positions.into_iter().enumerate() {
                 let role = PointOutputRole::ControlPoint(index_u16(index)?);
@@ -763,18 +771,23 @@ pub fn evaluate_recipe(
             degree,
             knots,
             weights,
-            closed: _,
+            closed,
         } => {
             if control_points.len() <= *degree || *degree == 0 {
                 return Err(SketchValidationError::FeatureTooSmall {
                     operation: placeholder_operation(),
                 });
             }
-            let mut control_bindings = Vec::with_capacity(control_points.len());
+            let mut control_bindings = Vec::with_capacity(control_points.len() + 1);
             for (index, pt_input) in control_points.iter().enumerate() {
                 let role = PointOutputRole::ControlPoint(index_u16(index)?);
                 let binding = builder.bind_input(*pt_input, role)?;
                 control_bindings.push(binding);
+            }
+            // A closed control polygon returns to its first vertex, which a
+            // clamped curve then ends on: the loop closes at that vertex.
+            if *closed {
+                control_bindings.push(control_bindings[0]);
             }
             builder.add_bspline(
                 CurveOutputRole::Spline,
@@ -788,6 +801,179 @@ pub fn evaluate_recipe(
     }
 
     builder.finish()
+}
+
+/// A clamped, uniform knot vector for `count` control points of `degree`:
+/// the curve starts on the first control point and ends on the last.
+#[must_use]
+pub fn clamped_uniform_knots(count: usize, degree: usize) -> Vec<f64> {
+    let degree = degree.min(count.saturating_sub(1)).max(1);
+    let interior = count.saturating_sub(degree + 1);
+    let mut knots = vec![0.0; degree + 1];
+    for index in 1..=interior {
+        knots.push(index as f64 / (interior + 1) as f64);
+    }
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+    knots
+}
+
+/// The curve a fit-point spline draws through `points`: the one the recipe
+/// makes, for a tool to preview before anything is staged.
+pub fn fit_point_spline_curve(
+    points: &[SketchPoint2],
+    degree: usize,
+    closed: bool,
+) -> Result<EvaluatedCurve2, SketchValidationError> {
+    if closed && points.len() >= 3 {
+        let (control_points, knots) = closed_fit_spline_points(points)?;
+        return Ok(EvaluatedCurve2::Bspline {
+            control_points,
+            degree: 3,
+            knots,
+            weights: None,
+        });
+    }
+    if points.len() < 2 {
+        return Err(SketchValidationError::FeatureTooSmall {
+            operation: placeholder_operation(),
+        });
+    }
+    let (control_points, knots) = fit_spline_points(points, degree)?;
+    Ok(EvaluatedCurve2::Bspline {
+        control_points,
+        degree: degree.clamp(1, points.len() - 1),
+        knots,
+        weights: None,
+    })
+}
+
+/// A closed cubic through `points` and back to the first, smooth at the seam.
+///
+/// The curve stays clamped — it starts and ends on the first point, which is
+/// what every consumer of a sketch B-spline assumes — and is made to leave
+/// that point along the same tangent it arrives on. With chord-length
+/// parameters `ū`, the cubic interpolating `points` and the first point again
+/// with end derivatives `T` has `n + 3` control points and the data
+/// parameters as its interior knots; the two end derivatives fix the second
+/// and second-to-last control points outright (`C'(0) = 3 (P1 − P0) / ū₁`),
+/// leaving a square system for the rest. `T` is the tangent a periodic curve
+/// would have at the seam: the chord from the last point to the second, over
+/// the parameter span it covers.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn closed_fit_spline_points(
+    points: &[SketchPoint2],
+) -> Result<(Vec<SketchPoint2>, Vec<f64>), SketchValidationError> {
+    let too_small = || SketchValidationError::FeatureTooSmall {
+        operation: placeholder_operation(),
+    };
+    let n = points.len();
+    if n < 3 {
+        return Err(too_small());
+    }
+    let mut data = points.to_vec();
+    data.push(points[0]);
+    let chords = data
+        .windows(2)
+        .map(|pair| (pair[1].u - pair[0].u).hypot(pair[1].v - pair[0].v))
+        .collect::<Vec<_>>();
+    let total = chords.iter().sum::<f64>();
+    if !total.is_finite() || total < 1.0e-12 || chords.iter().any(|chord| *chord < 1.0e-12) {
+        return Err(too_small());
+    }
+    let mut parameters = Vec::with_capacity(n + 1);
+    let mut running = 0.0;
+    parameters.push(0.0);
+    for chord in &chords {
+        running += chord;
+        parameters.push((running / total).clamp(0.0, 1.0));
+    }
+    parameters[n] = 1.0;
+
+    let degree = 3;
+    let count = n + 3;
+    let mut knots = vec![0.0; degree + 1];
+    knots.extend_from_slice(&parameters[1..n]);
+    knots.extend(std::iter::repeat_n(1.0, degree + 1));
+
+    let first_span = parameters[1];
+    let last_span = 1.0 - parameters[n - 1];
+    let seam = SketchPoint2::new(
+        (points[1].u - points[n - 1].u) / (first_span + last_span),
+        (points[1].v - points[n - 1].v) / (first_span + last_span),
+    );
+    let mut control = vec![SketchPoint2::new(0.0, 0.0); count];
+    control[0] = points[0];
+    control[1] = SketchPoint2::new(
+        points[0].u + seam.u * first_span / 3.0,
+        points[0].v + seam.v * first_span / 3.0,
+    );
+    control[count - 1] = points[0];
+    control[count - 2] = SketchPoint2::new(
+        points[0].u - seam.u * last_span / 3.0,
+        points[0].v - seam.v * last_span / 3.0,
+    );
+
+    // Interpolate the interior points: rows k = 1..n-1, unknowns P2..P(count-3).
+    let unknowns = count - 4;
+    let mut matrix = vec![vec![0.0; unknowns]; unknowns];
+    let mut rhs_u = vec![0.0; unknowns];
+    let mut rhs_v = vec![0.0; unknowns];
+    for row in 0..unknowns {
+        let k = row + 1;
+        let basis = artificer_geometry::basis_values(degree, &knots, count, parameters[k]);
+        rhs_u[row] = data[k].u;
+        rhs_v[row] = data[k].v;
+        for (index, value) in basis.into_iter().enumerate() {
+            if (2..count - 2).contains(&index) {
+                matrix[row][index - 2] = value;
+            } else {
+                rhs_u[row] -= value * control[index].u;
+                rhs_v[row] -= value * control[index].v;
+            }
+        }
+    }
+    // Gaussian elimination with partial pivoting, as the open fit does.
+    for column in 0..unknowns {
+        let pivot = (column..unknowns)
+            .max_by(|first, second| {
+                matrix[*first][column]
+                    .abs()
+                    .total_cmp(&matrix[*second][column].abs())
+            })
+            .ok_or_else(too_small)?;
+        if matrix[pivot][column].abs() < 1.0e-14 {
+            return Err(too_small());
+        }
+        matrix.swap(column, pivot);
+        rhs_u.swap(column, pivot);
+        rhs_v.swap(column, pivot);
+        for row in column + 1..unknowns {
+            let factor = matrix[row][column] / matrix[column][column];
+            for entry in column..unknowns {
+                matrix[row][entry] -= factor * matrix[column][entry];
+            }
+            rhs_u[row] -= factor * rhs_u[column];
+            rhs_v[row] -= factor * rhs_v[column];
+        }
+    }
+    for row in (0..unknowns).rev() {
+        for entry in row + 1..unknowns {
+            rhs_u[row] -= matrix[row][entry] * rhs_u[entry];
+            rhs_v[row] -= matrix[row][entry] * rhs_v[entry];
+        }
+        rhs_u[row] /= matrix[row][row];
+        rhs_v[row] /= matrix[row][row];
+    }
+    for index in 0..unknowns {
+        control[index + 2] = SketchPoint2::new(rhs_u[index], rhs_v[index]);
+    }
+    if control
+        .iter()
+        .any(|point| !point.u.is_finite() || !point.v.is_finite())
+    {
+        return Err(too_small());
+    }
+    Ok((control, knots))
 }
 
 #[allow(clippy::needless_range_loop)]

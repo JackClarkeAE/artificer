@@ -1,3 +1,4 @@
+use crate::EvaluatedCurve2;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -17,6 +18,48 @@ pub const MAX_CURVE_EDITS_PER_TRANSACTION: usize = 1_024;
 pub const MAX_PATTERN_INSTANCES: u16 = 256;
 pub const MAX_POLYGON_SIDES: u16 = 256;
 pub const MIN_POLYGON_SIDES: u16 = 3;
+/// Most recipe values one sketch may keep linked to document variables.
+pub const MAX_SKETCH_VALUE_LINKS: usize = 4_096;
+/// Longest recipe field key a value link may name, in bytes.
+pub const MAX_VALUE_LINK_FIELD_BYTES: usize = 64;
+/// Longest entry a value link may keep, in bytes.
+pub const MAX_VALUE_LINK_TEXT_BYTES: usize = 1_024;
+
+/// One value in a sketch that follows the document's variables.
+///
+/// A dimension typed as `width / 2` is worked out when it is typed, and the
+/// sketch keeps the number that came out. On its own that is a copy: change
+/// `width` and the sketch keeps its old size. A link is what makes it stay
+/// linked. It names the value the entry was typed into and keeps the entry
+/// itself, written with its units ([`crate::expression::written_entry`]) so
+/// it reads the same whatever unit the document is later shown in. Whoever
+/// owns the variables works the entry out again when one changes and sets
+/// the value to the answer.
+///
+/// The sketch never evaluates a link itself; it only keeps it with the value
+/// it belongs to, through edits, undo and saving, and drops it when that
+/// value goes: its operation retired, or its relation removed.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SketchValueLink {
+    pub target: SketchValueTarget,
+    pub text: String,
+}
+
+/// The value a link sets.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SketchValueTarget {
+    /// One field of an operation's recipe: a rectangle's `width`, a
+    /// circle's `diameter`, a line's `angle`.
+    RecipeField {
+        operation: SketchOperationId,
+        field: String,
+    },
+    /// The measurement a relation holds: a dimension drawn between two
+    /// points, from a point to an edge or its midpoint, or between two
+    /// parallel edges.
+    Relation { constraint: SketchConstraintId },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "index", rename_all = "snake_case")]
@@ -246,6 +289,10 @@ impl SketchIdHighWaterMarks {
 }
 
 /// Persisted exact sketch intent plus deterministic, checked evaluated caches.
+/// The first entity id an arrangement gives a support curve. Authored ids
+/// count up from one and never reach here.
+pub const SUPPORT_CURVE_ENTITY_BASE: u64 = 1 << 62;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SketchDefinition {
     pub(crate) points: BTreeMap<SketchPointId, SketchPointRecord>,
@@ -255,6 +302,19 @@ pub struct SketchDefinition {
     pub(crate) constraints: BTreeMap<SketchConstraintId, SketchConstraintRecord>,
     pub(crate) allocator: SketchIdHighWaterMarks,
     pub(crate) revision: SketchRevision,
+    /// The boundary of the face this sketch was drawn on — its outline and
+    /// the rims of its holes — as curves the sketch can close regions
+    /// against. A sketch on a face spends most of its life talking about
+    /// that face, and "the face minus what I drew" is the commonest region
+    /// there is. These are context, not authoring: they carry no ids the
+    /// user can pick, take no part in the revision, and travel with the
+    /// definition so a replay closes exactly the regions the canvas did.
+    #[serde(default)]
+    pub(crate) support_curves: Vec<EvaluatedCurve2>,
+    /// The values that follow document variables, ordered by target, at
+    /// most one per value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) value_links: Vec<SketchValueLink>,
 }
 
 impl Default for SketchDefinition {
@@ -267,6 +327,8 @@ impl SketchDefinition {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            support_curves: Vec::new(),
+            value_links: Vec::new(),
             points: BTreeMap::new(),
             operations: Vec::new(),
             entities: BTreeMap::new(),
@@ -430,8 +492,12 @@ impl SketchDefinition {
         Ok(())
     }
 
+    /// Removes a relation, and with it the link its measurement followed.
     pub fn remove_constraint(&mut self, id: SketchConstraintId) -> bool {
         let removed = self.constraints.remove(&id).is_some();
+        if removed {
+            self.set_value_link(SketchValueTarget::Relation { constraint: id }, None);
+        }
         if removed && let Some(next) = self.revision.checked_next() {
             self.revision = next;
         }
@@ -504,72 +570,180 @@ impl SketchDefinition {
         &self,
         entity: SketchEntityId,
     ) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
-        let record = self
-            .entities
-            .get(&entity)
-            .filter(|record| record.active)
-            .ok_or(SketchValidationError::MissingEntity { entity })?;
+        self.evaluated_curves(&[entity])
+            .map(|mut curves| curves.remove(0))
+    }
+
+    /// Resolves several active curves at once, in the order asked, solving
+    /// the constraints once for all of them.
+    pub fn evaluated_curves(
+        &self,
+        entities: &[SketchEntityId],
+    ) -> Result<Vec<crate::EvaluatedCurve2>, SketchValidationError> {
+        let records = entities
+            .iter()
+            .map(|entity| {
+                self.entities
+                    .get(entity)
+                    .filter(|record| record.active)
+                    .ok_or(SketchValidationError::MissingEntity { entity: *entity })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let solved = self
             .solve_constraints(PrecisionPolicy::default())
             .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
-        let point = |id: SketchPointId| {
-            solved
-                .positions
-                .get(&id)
-                .copied()
-                .ok_or(SketchValidationError::InactivePointReference { point: id })
-        };
-        Ok(match record.geometry {
-            SketchCurve2::Line { start, end } => crate::EvaluatedCurve2::Line {
-                start: point(start)?,
-                end: point(end)?,
-            },
-            SketchCurve2::CircularArc {
-                center,
-                start,
-                end,
-                direction,
-            } => crate::EvaluatedCurve2::CircularArc {
-                center: point(center)?,
-                start: point(start)?,
-                end: point(end)?,
-                direction,
-            },
-            SketchCurve2::Circle {
-                center,
-                radius,
-                direction,
-            } => crate::EvaluatedCurve2::Circle {
-                center: point(center)?,
-                radius,
-                direction,
-            },
-            SketchCurve2::Bspline {
-                ref control_points,
-                degree,
-                ref knots,
-                ref weights,
-            } => {
-                let mut evaluated_cps = Vec::with_capacity(control_points.len());
-                for &cp in control_points {
-                    evaluated_cps.push(point(cp)?);
-                }
-                crate::EvaluatedCurve2::Bspline {
-                    control_points: evaluated_cps,
-                    degree,
-                    knots: knots.clone(),
-                    weights: weights.clone(),
-                }
-            }
-        })
+        records
+            .into_iter()
+            .map(|record| evaluate_record(record, &solved.positions))
+            .collect()
     }
 
     /// Produces exact profile-only inputs for the planar arrangement in stable
     /// entity-ID order. Construction/reference geometry and visibility state do
     /// not alter material topology.
+    /// Replaces the face boundary this sketch closes regions against.
+    /// Returns whether anything changed. The revision is untouched: the
+    /// boundary is the body's, not an edit of the sketch.
+    pub fn set_support_curves(&mut self, curves: Vec<EvaluatedCurve2>) -> bool {
+        if self.support_curves == curves {
+            return false;
+        }
+        self.support_curves = curves;
+        true
+    }
+
+    #[must_use]
+    pub fn support_curves(&self) -> &[EvaluatedCurve2] {
+        &self.support_curves
+    }
+
+    /// Every value that follows a document variable.
+    #[must_use]
+    pub fn value_links(&self) -> &[SketchValueLink] {
+        &self.value_links
+    }
+
+    /// The entry one recipe field follows, if it follows one.
+    #[must_use]
+    pub fn value_link(&self, operation: SketchOperationId, field: &str) -> Option<&str> {
+        self.value_links
+            .iter()
+            .find(|link| {
+                matches!(&link.target, SketchValueTarget::RecipeField { operation: linked, field: named }
+                    if *linked == operation && named == field)
+            })
+            .map(|link| link.text.as_str())
+    }
+
+    /// The entry a relation's measurement follows, if it follows one.
+    #[must_use]
+    pub fn relation_link(&self, constraint: SketchConstraintId) -> Option<&str> {
+        self.value_links
+            .iter()
+            .find(|link| link.target == SketchValueTarget::Relation { constraint })
+            .map(|link| link.text.as_str())
+    }
+
+    /// Links or unlinks one value, keeping the list in order. Returns
+    /// whether anything changed. The revision is the caller's to advance:
+    /// a link is set as part of the edit that typed it.
+    pub(crate) fn set_value_link(
+        &mut self,
+        target: SketchValueTarget,
+        text: Option<String>,
+    ) -> bool {
+        let found = self
+            .value_links
+            .binary_search_by(|link| link.target.cmp(&target));
+        match (found, text) {
+            (Ok(index), Some(text)) => {
+                if self.value_links[index].text == text {
+                    return false;
+                }
+                self.value_links[index].text = text;
+            }
+            (Ok(index), None) => {
+                self.value_links.remove(index);
+            }
+            (Err(index), Some(text)) => self
+                .value_links
+                .insert(index, SketchValueLink { target, text }),
+            (Err(_), None) => return false,
+        }
+        true
+    }
+
+    /// Drops the links whose value is gone: an operation no longer active,
+    /// or a relation removed.
+    pub(crate) fn prune_value_links(&mut self) {
+        let active: BTreeSet<SketchOperationId> = self
+            .active_operations()
+            .map(|operation| operation.id)
+            .collect();
+        let constraints = &self.constraints;
+        self.value_links.retain(|link| match &link.target {
+            SketchValueTarget::RecipeField { operation, .. } => active.contains(operation),
+            SketchValueTarget::Relation { constraint } => constraints.contains_key(constraint),
+        });
+    }
+
+    /// Renames a variable in every link that uses it. Returns whether any
+    /// link changed. Like the variable it follows, a renamed link is not an
+    /// edit of the sketch, so the revision stays.
+    pub fn rename_in_value_links(&mut self, from: &str, to: &str) -> bool {
+        let mut changed = false;
+        for link in &mut self.value_links {
+            let Ok(names) = crate::expression::entry_names(&link.text) else {
+                continue;
+            };
+            if !names.contains(from) {
+                continue;
+            }
+            if let Ok(renamed) = crate::expression::rename_in_entry(&link.text, from, to) {
+                link.text = renamed;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The entity id the `index`th support curve takes in an arrangement.
+    ///
+    /// Support curves are not entities and have none of their own, but a
+    /// fragment key names its source, and a region's signature has to be
+    /// the same on every rebuild. Ids from the top of the range are what
+    /// no authored entity will ever be allocated.
+    #[must_use]
+    pub const fn support_curve_entity(index: usize) -> SketchEntityId {
+        // The base is far above zero, so the only way this is `None` is an
+        // index past the top of the range, which no face has edges enough
+        // to reach.
+        match SketchEntityId::new(SUPPORT_CURVE_ENTITY_BASE + index as u64) {
+            Some(entity) => entity,
+            None => panic!("support curve index overflows the entity id range"),
+        }
+    }
+
+    /// Whether an arrangement entity id names a support curve rather than
+    /// an authored entity.
+    #[must_use]
+    pub const fn is_support_curve_entity(entity: SketchEntityId) -> bool {
+        entity.get() >= SUPPORT_CURVE_ENTITY_BASE
+    }
+
     pub fn arrangement_inputs(
         &self,
     ) -> Result<Vec<crate::ArrangementInputCurve>, SketchValidationError> {
+        let support = self
+            .support_curves
+            .iter()
+            .enumerate()
+            .map(|(index, curve)| crate::ArrangementInputCurve {
+                entity: Self::support_curve_entity(index),
+                curve: curve.clone(),
+                start_point: None,
+                end_point: None,
+            });
         self.active_entities()
             .filter(|entity| entity.role == SketchEntityRole::Profile)
             .map(|entity| {
@@ -592,6 +766,7 @@ impl SketchDefinition {
                     end_point,
                 })
             })
+            .chain(support.map(Ok))
             .collect()
     }
 
@@ -640,6 +815,14 @@ impl SketchDefinition {
                 resource: "constraints",
                 requested: self.constraints.len(),
                 limit: crate::MAX_SKETCH_CONSTRAINTS,
+            });
+        }
+
+        if self.value_links.len() > MAX_SKETCH_VALUE_LINKS {
+            return Err(SketchValidationError::ResourceLimit {
+                resource: "value_links",
+                requested: self.value_links.len(),
+                limit: MAX_SKETCH_VALUE_LINKS,
             });
         }
 
@@ -752,6 +935,31 @@ impl SketchDefinition {
         }
         self.solve_constraints(precision)
             .map_err(|_| SketchValidationError::ConstraintSystemConflict)?;
+
+        for (index, link) in self.value_links.iter().enumerate() {
+            let invalid = SketchValidationError::InvalidValueLink {
+                target: link.target.clone(),
+            };
+            let ordered = index == 0 || self.value_links[index - 1].target < link.target;
+            let target_exists = match &link.target {
+                SketchValueTarget::RecipeField { operation, field } => {
+                    operation_positions.contains_key(operation)
+                        && !field.is_empty()
+                        && field.len() <= MAX_VALUE_LINK_FIELD_BYTES
+                }
+                SketchValueTarget::Relation { constraint } => self
+                    .constraints
+                    .get(constraint)
+                    .is_some_and(|record| record.kind.measurement().is_some()),
+            };
+            if !ordered || !target_exists || link.text.len() > MAX_VALUE_LINK_TEXT_BYTES {
+                return Err(invalid);
+            }
+            match crate::expression::entry_names(&link.text) {
+                Ok(names) if !names.is_empty() => {}
+                _ => return Err(invalid),
+            }
+        }
 
         if self.allocator.point < self.points.keys().map(|id| id.get()).max().unwrap_or(0)
             || self.allocator.operation
@@ -1143,6 +1351,11 @@ pub enum SketchValidationError {
     },
     InvalidConstraint,
     ConstraintSystemConflict,
+    /// A value link out of order, on a value the sketch does not have, or
+    /// whose entry does not read or names no variable.
+    InvalidValueLink {
+        target: SketchValueTarget,
+    },
 }
 
 impl fmt::Display for SketchValidationError {
@@ -1283,6 +1496,16 @@ impl fmt::Display for SketchValidationError {
             Self::ConstraintSystemConflict => {
                 formatter.write_str("sketch constraint system is conflicting")
             }
+            Self::InvalidValueLink { target } => match target {
+                SketchValueTarget::RecipeField { operation, field } => write!(
+                    formatter,
+                    "the {field} of operation {operation} is linked to an entry that cannot be kept"
+                ),
+                SketchValueTarget::Relation { constraint } => write!(
+                    formatter,
+                    "the measurement of relation {constraint} is linked to an entry that cannot be kept"
+                ),
+            },
         }
     }
 }
@@ -1304,4 +1527,60 @@ pub struct SketchTombstones {
     pub points: BTreeSet<SketchPointId>,
     pub operations: BTreeSet<SketchOperationId>,
     pub entities: BTreeSet<SketchEntityId>,
+}
+
+/// One record's curve at solved point positions.
+fn evaluate_record(
+    record: &SketchEntityRecord,
+    positions: &std::collections::BTreeMap<SketchPointId, crate::SketchPoint2>,
+) -> Result<crate::EvaluatedCurve2, SketchValidationError> {
+    let point = |id: SketchPointId| {
+        positions
+            .get(&id)
+            .copied()
+            .ok_or(SketchValidationError::InactivePointReference { point: id })
+    };
+    Ok(match record.geometry {
+        SketchCurve2::Line { start, end } => crate::EvaluatedCurve2::Line {
+            start: point(start)?,
+            end: point(end)?,
+        },
+        SketchCurve2::CircularArc {
+            center,
+            start,
+            end,
+            direction,
+        } => crate::EvaluatedCurve2::CircularArc {
+            center: point(center)?,
+            start: point(start)?,
+            end: point(end)?,
+            direction,
+        },
+        SketchCurve2::Circle {
+            center,
+            radius,
+            direction,
+        } => crate::EvaluatedCurve2::Circle {
+            center: point(center)?,
+            radius,
+            direction,
+        },
+        SketchCurve2::Bspline {
+            ref control_points,
+            degree,
+            ref knots,
+            ref weights,
+        } => {
+            let mut evaluated_cps = Vec::with_capacity(control_points.len());
+            for &cp in control_points {
+                evaluated_cps.push(point(cp)?);
+            }
+            crate::EvaluatedCurve2::Bspline {
+                control_points: evaluated_cps,
+                degree,
+                knots: knots.clone(),
+                weights: weights.clone(),
+            }
+        }
+    })
 }

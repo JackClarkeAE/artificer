@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::bspline::{SplineCurve3, SplineSurface, array3, greville};
+use crate::ruled::{RailCurve, RuledRail, RuledSurface};
 use crate::topology::{
     CoedgeKey, Curve2, Curve3, EdgeKey, EntityId, Face, FaceKey, LoopKey, Orientation, Point2,
     Point3, SolidKey, Surface, Topology, TopologyCounts, Vector2, Vector3,
@@ -251,6 +253,30 @@ fn validate_geometry(
                 })
                 // The major axis is the first one by construction.
                 .max((minor_radius - major_radius).max(0.0)),
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => {
+                // A trace has no frame of its own to be degenerate: its two
+                // carriers are validated where they are surfaces, and the one
+                // thing this curve needs beyond them is a branch it can read.
+                if host.is_finite() && other.is_finite() && (branch.abs() - 1.0).abs() <= 1.0e-12 {
+                    0.0
+                } else {
+                    linear_tolerance
+                }
+            }
+            // A stored B-spline is well formed by construction — clamped, of
+            // a degree the kernel carries, finite — so what is left to check
+            // is that the edge walks inside its domain.
+            Curve3::Bspline { curve } => {
+                if range_within(curve.domain(), range) {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            }
         };
         if !curve_frame_error.is_finite() || curve_frame_error > linear_tolerance {
             diagnostics.push(
@@ -440,6 +466,28 @@ fn validate_geometry(
                     .with_measure(sweep, std::f64::consts::TAU),
                 );
             }
+        } else if let Curve2::Bspline { curve } = coedge.value.pcurve {
+            if !range_within(curve.domain(), coedge.value.parameter_range) {
+                diagnostics.push(Diagnostic::new(
+                    DiagnosticCode::ParameterRangeInvalid,
+                    format!("coedge/{}/parameter-range", coedge.id.get()),
+                ));
+            }
+        } else if matches!(coedge.value.pcurve, Curve2::Trace { .. }) {
+            // A trace's parameter is its host's azimuth, as on its edge: any
+            // finite span short of a whole turn. A trace never runs a whole
+            // turn between the landmarks every piece of one is cut at.
+            let sweep =
+                (coedge.value.parameter_range.end - coedge.value.parameter_range.start).abs();
+            if !sweep.is_finite() || sweep <= f64::EPSILON || sweep >= std::f64::consts::TAU {
+                diagnostics.push(
+                    Diagnostic::new(
+                        DiagnosticCode::ParameterRangeInvalid,
+                        format!("coedge/{}/parameter-range", coedge.id.get()),
+                    )
+                    .with_measure(sweep, std::f64::consts::TAU),
+                );
+            }
         } else if coedge.value.parameter_range != crate::topology::ParameterRange::new(0.0, 1.0) {
             diagnostics.push(Diagnostic::new(
                 DiagnosticCode::ParameterRangeInvalid,
@@ -500,10 +548,11 @@ fn validate_geometry(
                 .max(torus.radial_u.dot(torus.axis).abs())
                 .max(torus.radial_v.dot(torus.axis).abs())
                 .max((torus.angular_sign.abs() - 1.0).abs())
-                .max(
-                    (torus.radial_u.cross(torus.radial_v) - torus.axis * torus.angular_sign)
-                        .length(),
-                )
+                // Either handedness: the frame's handedness times the angular
+                // sign decides which way the surface faces, so a band whose
+                // material lies outside its tube — a concave round in a
+                // revolved section — can be expressed, as for a cone.
+                .max((torus.radial_u.cross(torus.radial_v).dot(torus.axis).abs() - 1.0).abs())
                 .max(if torus.minor_radius > 0.0 && torus.major_radius > 0.0 {
                     0.0
                 } else {
@@ -540,9 +589,15 @@ fn validate_geometry(
                 .max(sphere.radial_u.dot(sphere.axis).abs())
                 .max(sphere.radial_v.dot(sphere.axis).abs())
                 .max((sphere.angular_sign.abs() - 1.0).abs())
+                // As for a torus, either handedness: a sphere may face in.
                 .max(
-                    (sphere.radial_u.cross(sphere.radial_v) - sphere.axis * sphere.angular_sign)
-                        .length(),
+                    (sphere
+                        .radial_u
+                        .cross(sphere.radial_v)
+                        .dot(sphere.axis)
+                        .abs()
+                        - 1.0)
+                        .abs(),
                 )
                 .max(if sphere.radius > 0.0 {
                     0.0
@@ -566,6 +621,12 @@ fn validate_geometry(
                 } else {
                     f64::INFINITY
                 }),
+            Surface::Ruled(ruled) => {
+                ruled_frame_error(topology, &face.value, ruled, linear_tolerance)
+            }
+            Surface::Bspline(surface) => {
+                spline_frame_error(topology, &face.value, surface, linear_tolerance)
+            }
         };
         if frame_error > linear_tolerance {
             diagnostics.push(
@@ -810,9 +871,28 @@ fn pcurve_locus_error(
         )
     });
 
-    let edge_tangent = edge.curve.derivative(edge_start) * edge_delta;
-    let pcurve_point = coedge.pcurve.evaluate(pcurve_start);
-    let pcurve_derivative = coedge.pcurve.derivative(pcurve_start);
+    // Tangents are compared where a piece starts, except on a trace: its
+    // parameter is an azimuth that stops being one at a branch point — the
+    // curve runs along a generator there and the rate is unbounded — and a
+    // piece of trace routinely starts at one. Only a direction survives at
+    // such a point, so the two descriptions are compared in the middle of
+    // the piece instead, where both are regular and the comparison is as
+    // sharp as it is anywhere.
+    let tangent_fraction = if matches!(
+        (coedge.pcurve, edge.curve),
+        (Curve2::Trace { .. }, Curve3::Trace { .. })
+    ) {
+        0.5
+    } else {
+        0.0
+    };
+    let edge_tangent = edge
+        .curve
+        .derivative(edge_delta.mul_add(tangent_fraction, edge_start))
+        * edge_delta;
+    let pcurve_at = pcurve_delta.mul_add(tangent_fraction, pcurve_start);
+    let pcurve_point = coedge.pcurve.evaluate(pcurve_at);
+    let pcurve_derivative = coedge.pcurve.derivative(pcurve_at);
     let surface_tangent = surface.map_tangent(
         pcurve_point,
         crate::topology::Vector2::new(
@@ -1001,7 +1081,9 @@ fn pcurve_locus_error(
                 f64::INFINITY
             }
         }
-        (Surface::Cone(cone), Curve2::Line { endpoints }, Curve3::Line { .. }) => {
+        (Surface::Cone(cone), Curve2::Line { endpoints }, Curve3::Line { endpoints: locus })
+            if locus[0] != locus[1] =>
+        {
             // Slant seam generator: the azimuth must stay fixed; the sampled
             // and tangent errors certify the line itself.
             let angular_motion = (endpoints[1].x - endpoints[0].x).abs()
@@ -1073,7 +1155,12 @@ fn pcurve_locus_error(
                 Surface::Torus(torus) => {
                     (torus.major_radius + torus.minor_radius * endpoints[0].y.cos()).abs()
                 }
-                Surface::Plane(_) | Surface::Cylinder(_) => return f64::INFINITY,
+                Surface::Plane(_)
+                | Surface::Cylinder(_)
+                | Surface::Ruled(_)
+                | Surface::Bspline(_) => {
+                    return f64::INFINITY;
+                }
             };
             // Both pcurve endpoints must sit on the same singular iso-line.
             let iso = (endpoints[1].y - endpoints[0].y).abs();
@@ -1096,23 +1183,81 @@ fn pcurve_locus_error(
                 minor_radius,
             },
         ) => {
-            // Same centre, same axes (mapped through the plane), same radii,
-            // same parameter: an affine map of a circle is checked the way a
-            // circle is, with the sampled and tangent errors tying the
-            // parameterization.
+            // Same centre, same axes (mapped through the plane), same radii:
+            // an affine map of a circle is checked the way a circle is, with
+            // the sampled and tangent errors tying the parameterization.
+            //
+            // The two descriptions may run the ellipse opposite ways round,
+            // or start half a turn apart — the plane's section chord and the
+            // cylinder's harmonic each write the same locus in their own
+            // frame. Either axis may then be reversed, and the parameter
+            // relation is `s = ±t + δ` with the sign the product of the two
+            // axis signs; the sampled and tangent errors settle `δ`.
             let mapped_center = plane.evaluate(pcenter);
             let mapped_u = plane.u * pu.x + plane.v * pu.y;
             let mapped_v = plane.u * pv.x + plane.v * pv.y;
+            let u_sign = if mapped_u.dot(u) >= 0.0 { 1.0 } else { -1.0 };
+            let v_sign = if mapped_v.dot(v) >= 0.0 { 1.0 } else { -1.0 };
             let scale = major_radius.max(pmajor);
             mapped_center
                 .distance(center)
                 .max((pmajor - major_radius).abs())
                 .max((pminor - minor_radius).abs())
-                .max((mapped_u - u).length() * scale)
-                .max((mapped_v - v).length() * scale)
-                .max((pcurve_delta - edge_delta).abs() * scale)
+                .max((mapped_u - u * u_sign).length() * scale)
+                .max((mapped_v - v * v_sign).length() * scale)
+                .max((pcurve_delta * u_sign * v_sign - edge_delta).abs() * scale)
                 .max(tangent_error)
                 .max(sampled_error)
+        }
+        (Surface::Ruled(ruled), Curve2::Line { endpoints }, curve) => ruled_locus_error(
+            ruled,
+            endpoints,
+            curve,
+            RuledUse {
+                edge,
+                coedge,
+                edge_start,
+                edge_delta,
+                pcurve_start,
+                pcurve_delta,
+            },
+        ),
+        (Surface::Bspline(surface), Curve2::Line { endpoints }, curve) => spline_locus_error(
+            surface,
+            endpoints,
+            curve,
+            RuledUse {
+                edge,
+                coedge,
+                edge_start,
+                edge_delta,
+                pcurve_start,
+                pcurve_delta,
+            },
+        ),
+        (Surface::Plane(plane), Curve2::Bspline { curve: pcurve }, Curve3::Bspline { curve }) => {
+            // The same B-spline twice: the pcurve's control points carried
+            // through the plane are the edge's, on the same knots after the
+            // affine map between the two parameters. Agreement of control
+            // points bounds the curves' separation everywhere, and the
+            // sampled and tangent errors tie the parameters as for any curve.
+            let mapped =
+                pcurve.mapped(|point| array3(plane.evaluate(crate::bspline::point2(point))));
+            // The pcurve's parameter is `alpha·t + beta` in the edge's `t`.
+            let alpha = pcurve_delta / edge_delta;
+            let beta = alpha.mul_add(-edge_start, pcurve_start);
+            let identity = mapped.map_or(f64::INFINITY, |mapped| {
+                spline_identity_error(curve, mapped, alpha, beta)
+            });
+            identity.max(tangent_error).max(sampled_error)
+        }
+        (Surface::Cylinder(_), Curve2::Trace { .. }, Curve3::Trace { .. }) => {
+            // Both descriptions of a trace run over the host's azimuth by
+            // construction — that is what lets the two faces either side of
+            // it agree point for point — so the sampled and tangent errors
+            // already compare like with like, and there is no further
+            // invariant to check. A quartic has no frame to compare.
+            sampled_error.max(tangent_error)
         }
         _ => f64::INFINITY,
     };
@@ -1143,6 +1288,405 @@ fn effective_normal_error(
         * first_sweep.signum()
         * second_sweep.signum();
     (1.0 - alignment).abs() * length_scale
+}
+
+/// How far a ruled carrier is from a well-formed one: each rail a curve with
+/// a sound frame over a finite, non-empty stretch — a line over `[0, 1]`
+/// either way, an arc within one turn — and a normal that vanishes nowhere
+/// on a grid over the face. A wall that pinches to a point, or whose rung runs along the
+/// rails, has no side to face and is not a surface this kernel can orient.
+fn ruled_frame_error(
+    topology: &Topology,
+    face: &Face,
+    ruled: RuledSurface,
+    linear_tolerance: f64,
+) -> f64 {
+    let rail_error = |rail: RuledRail| -> f64 {
+        let span = rail.range.end - rail.range.start;
+        if !span.is_finite() || span == 0.0 {
+            return f64::INFINITY;
+        }
+        match rail.curve {
+            // A line is walked over `[0, 1]`, or backwards over it once a
+            // mirror has turned the face round.
+            RailCurve::Line { endpoints } => {
+                let unit = crate::topology::ParameterRange::new(0.0, 1.0);
+                if endpoints[0].distance(endpoints[1]) > linear_tolerance
+                    && (rail.range == unit || rail.range == unit.reversed())
+                {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }
+            }
+            RailCurve::Circle { u, v, radius, .. } => (u.length() - 1.0)
+                .abs()
+                .max((v.length() - 1.0).abs())
+                .max(u.dot(v).abs())
+                .max(if radius > linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                })
+                .max(if span.abs() <= std::f64::consts::TAU + linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }),
+            RailCurve::Ellipse {
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                ..
+            } => (u.length() - 1.0)
+                .abs()
+                .max((v.length() - 1.0).abs())
+                .max(u.dot(v).abs())
+                .max(
+                    if minor_radius > linear_tolerance && major_radius >= minor_radius {
+                        0.0
+                    } else {
+                        f64::INFINITY
+                    },
+                )
+                .max(if span.abs() <= std::f64::consts::TAU + linear_tolerance {
+                    0.0
+                } else {
+                    f64::INFINITY
+                }),
+        }
+    };
+    let domain = pcurve_extent(topology, face).unwrap_or((0.0, 1.0, 0.0, 1.0));
+    let scale = ruled.scale().max(1.0);
+    let pinched = ruled.least_normal(domain) <= linear_tolerance * scale;
+    rail_error(ruled.rails[0])
+        .max(rail_error(ruled.rails[1]))
+        .max(if pinched { f64::INFINITY } else { 0.0 })
+}
+
+/// One use of an edge by a ruled face, with the two parameterisations the
+/// locus proof compares.
+struct RuledUse {
+    edge: crate::topology::Edge,
+    coedge: crate::topology::Coedge,
+    edge_start: f64,
+    edge_delta: f64,
+    pcurve_start: f64,
+    pcurve_delta: f64,
+}
+
+/// The locus proof for an edge of a ruled face (ADR 0049).
+///
+/// A ruled surface has no frame to compare a curve against, so the proof
+/// is in two parts. Every sample of the edge — its ends included, which is
+/// the vertex-on-face check — is inverted onto the surface from the point
+/// its own pcurve names there, and must land within the tolerance. And the
+/// pcurve must be one of the curves the surface carries exactly: an iso-`u`
+/// line is a rung, which is straight; an iso-`v` line at `v = 0` or `v = 1`
+/// is a rail, which must be the edge's own curve — same carrier, same frame
+/// — walked over the same parameters, so that an arc through the same two
+/// ends cannot stand in for it; and an iso-`v` line between two straight
+/// rails is straight.
+fn ruled_locus_error(
+    ruled: RuledSurface,
+    endpoints: [Point2; 2],
+    curve: Curve3,
+    used: RuledUse,
+) -> f64 {
+    let RuledUse {
+        edge,
+        coedge,
+        edge_start,
+        edge_delta,
+        pcurve_start,
+        pcurve_delta,
+    } = used;
+    let scale = ruled.scale().max(1.0);
+    let inverted = [0.0, 0.25, 0.5, 0.75, 1.0]
+        .into_iter()
+        .fold(0.0_f64, |worst, t| {
+            let target = edge.curve.evaluate(edge_delta.mul_add(t, edge_start));
+            let seed = coedge
+                .pcurve
+                .evaluate(pcurve_delta.mul_add(t, pcurve_start));
+            worst.max(
+                ruled
+                    .distance_to(target, Some(seed))
+                    .unwrap_or(f64::INFINITY),
+            )
+        });
+    let across_u = (endpoints[1].x - endpoints[0].x).abs();
+    let across_v = (endpoints[1].y - endpoints[0].y).abs();
+    let both_lines = ruled
+        .rails
+        .iter()
+        .all(|rail| matches!(rail.curve, RailCurve::Line { .. }));
+    let rail = if across_v != 0.0 {
+        None
+    } else if endpoints[0].y == 0.0 {
+        Some(ruled.rails[0])
+    } else if endpoints[0].y == 1.0 {
+        Some(ruled.rails[1])
+    } else {
+        None
+    };
+    let structural = match (rail, curve) {
+        // Along a rail: the edge's curve is the rail's, walked over the same
+        // parameters.
+        (Some(rail), _) => {
+            let at = |t: f64| {
+                let parameter = pcurve_delta.mul_add(t, pcurve_start);
+                rail.parameter(coedge.pcurve.evaluate(parameter).x)
+            };
+            let reach = rail
+                .curve
+                .bending_radius()
+                .unwrap_or(scale)
+                .abs()
+                .max(scale);
+            curve_identity_error(rail.curve.curve(), curve, scale)
+                .max((at(0.0) - edge_start).abs() * reach)
+                .max((at(1.0) - (edge_start + edge_delta)).abs() * reach)
+        }
+        // A rung; and between two straight rails, an iso-`v` line as well.
+        (None, Curve3::Line { .. }) if both_lines => across_u.min(across_v) * scale,
+        (None, Curve3::Line { .. }) => across_u * scale,
+        _ => f64::INFINITY,
+    };
+    inverted.max(structural)
+}
+
+/// How far two conics are from being one carrier with one parameterisation:
+/// centre, frame and radii compared, each scaled to a length.
+fn curve_identity_error(first: Curve3, second: Curve3, scale: f64) -> f64 {
+    match (first, second) {
+        (Curve3::Line { endpoints }, Curve3::Line { endpoints: other }) => endpoints[0]
+            .distance(other[0])
+            .max(endpoints[1].distance(other[1])),
+        (
+            Curve3::Circle {
+                center,
+                u,
+                v,
+                radius,
+            },
+            Curve3::Circle {
+                center: other_center,
+                u: other_u,
+                v: other_v,
+                radius: other_radius,
+            },
+        ) => center
+            .distance(other_center)
+            .max((radius - other_radius).abs())
+            .max((u - other_u).length() * scale)
+            .max((v - other_v).length() * scale),
+        (
+            Curve3::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            },
+            Curve3::Ellipse {
+                center: other_center,
+                u: other_u,
+                v: other_v,
+                major_radius: other_major,
+                minor_radius: other_minor,
+            },
+        ) => center
+            .distance(other_center)
+            .max((major_radius - other_major).abs())
+            .max((minor_radius - other_minor).abs())
+            .max((u - other_u).length() * scale)
+            .max((v - other_v).length() * scale),
+        _ => f64::INFINITY,
+    }
+}
+
+/// How far a B-spline carrier is from one a face can stand on: the face's
+/// parameter rectangle inside the surface's domain, and a normal that
+/// vanishes nowhere on a sampling of every span cell of it. A wall that
+/// pinches to a point or folds flat has no side to face.
+fn spline_frame_error(
+    topology: &Topology,
+    face: &Face,
+    surface: SplineSurface,
+    linear_tolerance: f64,
+) -> f64 {
+    let (u_min, u_max, v_min, v_max) = surface.domain();
+    let domain = pcurve_extent(topology, face).unwrap_or((u_min, u_max, v_min, v_max));
+    let inside = range_within(
+        (u_min, u_max),
+        crate::topology::ParameterRange::new(domain.0, domain.1),
+    ) && range_within(
+        (v_min, v_max),
+        crate::topology::ParameterRange::new(domain.2, domain.3),
+    );
+    if !inside {
+        return f64::INFINITY;
+    }
+    let scale = surface.scale().max(1.0);
+    if surface.least_normal(domain) <= linear_tolerance * scale {
+        f64::INFINITY
+    } else {
+        0.0
+    }
+}
+
+/// The locus proof for an edge of a B-spline face (ADR 0050).
+///
+/// A B-spline surface carries exactly the curves along which one of its
+/// parameters is fixed, so the pcurve must be such a line, and the edge must
+/// be that isocurve. The isocurve is read off the net exactly — a boundary
+/// row or column, or the net blended by the basis at the fixed parameter —
+/// and compared with the edge by control points. A B-spline edge must have
+/// the isocurve's degree, and its knots and control points after the affine
+/// map between the edge's parameter and the surface's. A straight edge must
+/// have the isocurve's control points on the line at the isocurve's Greville
+/// abscissae, which is exactly when the isocurve is that line walked at an
+/// even rate. Either way two B-splines whose control points agree within a
+/// tolerance agree everywhere within it — the basis is a partition of unity
+/// — so the comparison is a proof, not a sampling. Every sample of the edge
+/// is also inverted onto the surface from the point its own pcurve names
+/// there, as a ruled face's are.
+fn spline_locus_error(
+    surface: SplineSurface,
+    endpoints: [Point2; 2],
+    curve: Curve3,
+    used: RuledUse,
+) -> f64 {
+    let RuledUse {
+        edge,
+        coedge,
+        edge_start,
+        edge_delta,
+        pcurve_start,
+        pcurve_delta,
+    } = used;
+    let inverted = [0.0, 0.25, 0.5, 0.75, 1.0]
+        .into_iter()
+        .fold(0.0_f64, |worst, t| {
+            let target = edge.curve.evaluate(edge_delta.mul_add(t, edge_start));
+            let seed = coedge
+                .pcurve
+                .evaluate(pcurve_delta.mul_add(t, pcurve_start));
+            worst.max(
+                surface
+                    .distance_to(target, Some(seed))
+                    .unwrap_or(f64::INFINITY),
+            )
+        });
+    // Which parameter the pcurve holds fixed, and the isocurve there.
+    let along_u = endpoints[0].y == endpoints[1].y;
+    let along_v = endpoints[0].x == endpoints[1].x;
+    let (isocurve, from, to) = if along_u && !along_v {
+        (
+            surface.isocurve_at_v(endpoints[0].y),
+            endpoints[0].x,
+            endpoints[1].x,
+        )
+    } else if along_v && !along_u {
+        (
+            surface.isocurve_at_u(endpoints[0].x),
+            endpoints[0].y,
+            endpoints[1].y,
+        )
+    } else {
+        return f64::INFINITY;
+    };
+    let Some(isocurve) = isocurve else {
+        return f64::INFINITY;
+    };
+    // The surface parameter at the pcurve's two ends of the walk, and the
+    // edge parameter there: `surface = alpha·edge + beta`.
+    let at = |fraction: f64| {
+        let parameter = pcurve_delta.mul_add(fraction, pcurve_start);
+        (to - from).mul_add(parameter, from)
+    };
+    let (first, last) = (at(0.0), at(1.0));
+    if edge_delta == 0.0 || first == last {
+        return f64::INFINITY;
+    }
+    let alpha = (last - first) / edge_delta;
+    let beta = alpha.mul_add(-edge_start, first);
+    let structural = match curve {
+        Curve3::Bspline { curve } => spline_identity_error(curve, isocurve, alpha, beta),
+        Curve3::Line { endpoints: line } => {
+            // `L(e) = A + e·(B − A)`, and `e = (s − beta)/alpha` for the
+            // surface parameter `s`.
+            let abscissae = greville(isocurve.degree(), isocurve.knots(), isocurve.count());
+            isocurve
+                .points()
+                .iter()
+                .zip(abscissae)
+                .map(|(point, abscissa)| {
+                    let e = (abscissa - beta) / alpha;
+                    let on_line = line[0] + (line[1] - line[0]) * e;
+                    crate::bspline::point3(*point).distance(on_line)
+                })
+                .fold(0.0_f64, f64::max)
+        }
+        _ => f64::INFINITY,
+    };
+    inverted.max(structural)
+}
+
+/// How far the B-spline `first`, reparameterised by `s = alpha·t + beta`,
+/// is from being the B-spline `second`: the worst control-point distance
+/// once the knots agree, and unbounded when they do not.
+fn spline_identity_error(first: SplineCurve3, second: SplineCurve3, alpha: f64, beta: f64) -> f64 {
+    if first.degree() != second.degree() || first.count() != second.count() || alpha == 0.0 {
+        return f64::INFINITY;
+    }
+    let mapped: Vec<f64> = if alpha > 0.0 {
+        first
+            .knots()
+            .iter()
+            .map(|knot| alpha.mul_add(*knot, beta))
+            .collect()
+    } else {
+        first
+            .knots()
+            .iter()
+            .rev()
+            .map(|knot| alpha.mul_add(*knot, beta))
+            .collect()
+    };
+    let span = {
+        let knots = second.knots();
+        (knots[knots.len() - 1] - knots[0]).abs().max(1.0)
+    };
+    if mapped
+        .iter()
+        .zip(second.knots())
+        .any(|(mapped, knot)| (mapped - knot).abs() > 1.0e-9 * span)
+    {
+        return f64::INFINITY;
+    }
+    let pairs: Vec<([f64; 3], [f64; 3])> = if alpha > 0.0 {
+        first
+            .points()
+            .iter()
+            .copied()
+            .zip(second.points().iter().copied())
+            .collect()
+    } else {
+        first
+            .points()
+            .iter()
+            .rev()
+            .copied()
+            .zip(second.points().iter().copied())
+            .collect()
+    };
+    pairs
+        .into_iter()
+        .map(|(left, right)| crate::bspline::point3(left).distance(crate::bspline::point3(right)))
+        .fold(0.0_f64, f64::max)
 }
 
 fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
@@ -1186,6 +1730,22 @@ fn loop_parameter_area(topology: &Topology, loop_key: LoopKey) -> Option<f64> {
                 let frame_determinant = u.x * v.y - u.y * v.x;
                 0.5 * (center.x * (end.y - start.y) - center.y * (end.x - start.x)
                     + major_radius * minor_radius * frame_determinant * sweep)
+            }
+            // Exact: the integrand is a polynomial on every knot span.
+            Curve2::Bspline { curve } => {
+                let range = coedge.parameter_range;
+                curve.contour(range.start, range.end, Point2::new(0.0, 0.0))[0]
+            }
+            Curve2::Trace { .. } => {
+                // `½∮(x dy − y dx)` over the piece, integrated as ADR 0026
+                // already integrates the elliptic arc length beside it.
+                let moment = |parameter: f64| {
+                    let point = coedge.pcurve.evaluate(parameter);
+                    let rate = coedge.pcurve.derivative(parameter);
+                    0.5 * point.x.mul_add(rate.y, -(point.y * rate.x))
+                };
+                let range = coedge.parameter_range;
+                crate::cylinder_trace::integrate(range.start, range.end, &moment)
             }
         };
         area += contribution;
@@ -2121,6 +2681,43 @@ pub(crate) fn calculate_exact_shell_measures(
                         [along, across, slope * along, slope * across],
                     );
             }
+            // A ruled face is integrated over its parameter rectangle by
+            // quadrature (ADR 0049). Only a face that is the whole
+            // rectangle it spans is in that form — every face the loft
+            // builds, and every face a transform or mirror of one keeps.
+            Surface::Ruled(ruled) => {
+                if !face.value.inner_loops.is_empty() {
+                    return None;
+                }
+                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
+                let rectangle = (u_max - u_min) * (v_max - v_min);
+                if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
+                    return None;
+                }
+                let measures = ruled.measures((u_min, u_max, v_min, v_max), anchor);
+                surface_area += measures.area;
+                flux += orientation * measures.flux;
+                moment = moment + measures.moment * orientation;
+            }
+            // A B-spline face is integrated over its parameter rectangle by
+            // Gauss–Legendre on every span cell (ADR 0050): exact for the
+            // flux and the moment, whose integrands are polynomials there.
+            // As for a ruled face, only a face that is the whole rectangle it
+            // spans is in that form, which every builder makes.
+            Surface::Bspline(surface) => {
+                if !face.value.inner_loops.is_empty() {
+                    return None;
+                }
+                let (u_min, u_max, v_min, v_max) = pcurve_extent(topology, &face.value)?;
+                let rectangle = (u_max - u_min) * (v_max - v_min);
+                if (parameter_area.abs() - rectangle).abs() > 1.0e-12 * rectangle.max(1.0) {
+                    return None;
+                }
+                let measures = surface.measures((u_min, u_max, v_min, v_max), anchor);
+                surface_area += measures.area;
+                flux += orientation * measures.flux;
+                moment = moment + measures.moment * orientation;
+            }
         }
     }
 
@@ -2163,6 +2760,18 @@ struct TrigPoly(Vec<(f64, u32, u32)>);
 impl TrigPoly {
     fn constant(value: f64) -> Self {
         Self(vec![(value, 0, 0)])
+    }
+
+    /// The polynomial's value at one angle, for the integrands that are
+    /// sampled rather than integrated term by term.
+    fn evaluate(&self, angle: f64) -> f64 {
+        let (sin, cos) = angle.sin_cos();
+        self.0
+            .iter()
+            .map(|(coefficient, cosines, sines)| {
+                coefficient * cos.powi(*cosines as i32) * sin.powi(*sines as i32)
+            })
+            .sum()
     }
 
     fn cosine() -> Self {
@@ -2289,6 +2898,20 @@ fn cylinder_region_integral(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Bspline { .. } => return None,
+                Curve2::Trace { .. } => {
+                    // The same Green's term as a harmonic's, for a boundary
+                    // whose ordinate has no closed form: the integrand is
+                    // read pointwise and the abscissa's own rate carries
+                    // `dx` when the piece is written on the other face.
+                    let integrand = |parameter: f64| {
+                        let point = coedge.pcurve.evaluate(parameter);
+                        let rate = coedge.pcurve.derivative(parameter);
+                        -weight.evaluate(point.x) * point.y.powi(power as i32 + 1) * rate.x
+                            / f64::from(power + 1)
+                    };
+                    crate::cylinder_trace::integrate(range.start, range.end, &integrand)
+                }
             };
         }
     }
@@ -2449,9 +3072,12 @@ fn face_parameter_polar_moment(topology: &Topology, face: &Face) -> Option<f64> 
             let coedge = topology.coedge(*coedge_key)?.value;
             let range = coedge.parameter_range;
             total += match coedge.pcurve {
-                // Harmonics live on cylinders and cones; the polar moment is a
-                // planar quantity, so a face carrying one is outside this form.
-                Curve2::Harmonic { .. } => return None,
+                // Harmonics and traces live on cylinders and cones; the polar
+                // moment is a planar quantity, so a face carrying one is
+                // outside this form.
+                Curve2::Harmonic { .. } | Curve2::Trace { .. } => return None,
+                // `¼∮|w|²(w × dw)`, a polynomial on every knot span.
+                Curve2::Bspline { curve } => curve.contour(range.start, range.end, origin)[3],
                 Curve2::Line { .. } => {
                     let from = coedge.pcurve.evaluate(range.start);
                     let to = coedge.pcurve.evaluate(range.end);
@@ -2633,6 +3259,7 @@ fn calculate_analytic_face_feature_measures(
         Surface::Torus(torus) => torus.axis,
         Surface::Cone(cone) => cone.axis,
         Surface::Sphere(sphere) => sphere.axis,
+        Surface::Ruled(_) | Surface::Bspline(_) => return None,
     };
     let direction = robust_normalized(direction)?;
     let mut start_edges = BTreeSet::new();
@@ -2922,7 +3549,13 @@ fn calculate_analytic_extrusion_measures(
                 Surface::Plane(plane) => plane.u.cross(plane.v).length(),
                 Surface::Cylinder(cylinder) => cylinder.radius * cylinder.axis.length(),
                 // Blend surfaces belong to the exact shell measure strategy.
-                Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => return None,
+                Surface::Torus(_)
+                | Surface::Cone(_)
+                | Surface::Sphere(_)
+                | Surface::Ruled(_)
+                | Surface::Bspline(_) => {
+                    return None;
+                }
             };
             surface_area += parameter_area * jacobian;
         }
@@ -2991,10 +3624,15 @@ pub(crate) fn face_parameter_area_and_moment(
                 minor_radius,
             } = coedge.pcurve
             {
-                // The exact contour terms of the elliptical arc, `∮x dy`,
-                // `∮½x² dy` and `−∮½y² dx`, integrate in closed form as
-                // trigonometric polynomials of the parameter; the chord's
-                // share, counted above, comes off again.
+                // The exact contour terms of the elliptical arc integrate in
+                // closed form as trigonometric polynomials of the parameter,
+                // and the chord's share, counted above, comes off again. They
+                // are taken in the same symmetric form the chords use —
+                // `½∮(x dy − y dx)` and `⅓∮x(x dy − y dx)` — because the
+                // several forms of Green's theorem agree only around a closed
+                // chain, and an arc beside straight edges is not one: the
+                // `∮x dy` form counted the chamfer face between two bands at
+                // half again its area.
                 let center = Point2::new(center.x - anchor.x, center.y - anchor.y);
                 let x = TrigPoly::constant(center.x)
                     .plus(&TrigPoly::cosine().scaled(major_radius * u.x))
@@ -3009,12 +3647,26 @@ pub(crate) fn face_parameter_area_and_moment(
                     .scaled(-major_radius * u.y)
                     .plus(&TrigPoly::cosine().scaled(minor_radius * v.y));
                 let (from, to) = (coedge.parameter_range.start, coedge.parameter_range.end);
-                let exact_area = x.times(&dy).integrate(from, to);
-                let exact_moment_x = x.power(2).times(&dy).scaled(0.5).integrate(from, to);
-                let exact_moment_y = y.power(2).times(&dx).scaled(-0.5).integrate(from, to);
+                let turn = x.times(&dy).plus(&y.times(&dx).scaled(-1.0));
+                let exact_area = turn.scaled(0.5).integrate(from, to);
+                let exact_moment_x = x.times(&turn).scaled(1.0 / 3.0).integrate(from, to);
+                let exact_moment_y = y.times(&turn).scaled(1.0 / 3.0).integrate(from, to);
                 area += exact_area - chord_area;
                 moment.x += exact_moment_x - chord_cross * (start.x + end.x) / 6.0;
                 moment.y += exact_moment_y - chord_cross * (start.y + end.y) / 6.0;
+            }
+            if let Curve2::Bspline { curve } = coedge.pcurve {
+                // The exact contour terms of a B-spline, less the chord's
+                // share counted above, in the chords' symmetric form: exact
+                // on every knot span.
+                let [exact_area, exact_x, exact_y, _] = curve.contour(
+                    coedge.parameter_range.start,
+                    coedge.parameter_range.end,
+                    anchor,
+                );
+                area += exact_area - chord_area;
+                moment.x += exact_x - chord_cross * (start.x + end.x) / 6.0;
+                moment.y += exact_y - chord_cross * (start.y + end.y) / 6.0;
             }
             if let Curve2::Harmonic {
                 mean,
@@ -3072,6 +3724,37 @@ fn calculate_bounds(topology: &Topology) -> Option<Bounds3> {
                 minor_radius,
                 ..
             } => (u, v, major_radius, minor_radius),
+            // A trace has no closed-form extreme, so it is sampled; the
+            // bound only has to contain the curve.
+            Curve3::Trace { .. } => {
+                let range = edge.value.parameter_range;
+                for step in 0..=64 {
+                    let point = edge.value.curve.evaluate(
+                        (range.end - range.start).mul_add(f64::from(step) / 64.0, range.start),
+                    );
+                    min.x = min.x.min(point.x);
+                    min.y = min.y.min(point.y);
+                    min.z = min.z.min(point.z);
+                    max.x = max.x.max(point.x);
+                    max.y = max.y.max(point.y);
+                    max.z = max.z.max(point.z);
+                }
+                continue;
+            }
+            // A B-spline's extremes along each axis are where that
+            // component's rate changes sign: bracketed on a sampling of
+            // every span and bisected.
+            Curve3::Bspline { curve } => {
+                for point in spline_extremes(curve, edge.value.parameter_range) {
+                    min.x = min.x.min(point.x);
+                    min.y = min.y.min(point.y);
+                    min.z = min.z.min(point.z);
+                    max.x = max.x.max(point.x);
+                    max.y = max.y.max(point.y);
+                    max.z = max.z.max(point.z);
+                }
+                continue;
+            }
             Curve3::Line { .. } => continue,
         };
         for (u_component, v_component) in [(u.x, v.x), (u.y, v.y), (u.z, v.z)] {
@@ -3092,7 +3775,76 @@ fn calculate_bounds(topology: &Topology) -> Option<Bounds3> {
             }
         }
     }
+    // A B-spline face can bulge past every edge it has — a smooth loft
+    // through a wide middle section has no edge there — so its own points
+    // count too: a fine sampling of every span cell.
+    for face in &topology.faces {
+        let Surface::Bspline(surface) = face.value.surface else {
+            continue;
+        };
+        let Some((u_min, u_max, v_min, v_max)) = pcurve_extent(topology, &face.value) else {
+            continue;
+        };
+        for (u_low, u_high) in surface.spans(0, u_min, u_max) {
+            for (v_low, v_high) in surface.spans(1, v_min, v_max) {
+                for a in 0..=8 {
+                    let u = (u_high - u_low).mul_add(f64::from(a) / 8.0, u_low);
+                    for b in 0..=8 {
+                        let v = (v_high - v_low).mul_add(f64::from(b) / 8.0, v_low);
+                        let point = surface.evaluate(Point2::new(u, v));
+                        min.x = min.x.min(point.x);
+                        min.y = min.y.min(point.y);
+                        min.z = min.z.min(point.z);
+                        max.x = max.x.max(point.x);
+                        max.y = max.y.max(point.y);
+                        max.z = max.z.max(point.z);
+                    }
+                }
+            }
+        }
+    }
     Some(Bounds3 { min, max })
+}
+
+/// The points of a B-spline edge where a coordinate is extremal, and its
+/// two ends.
+fn spline_extremes(curve: SplineCurve3, range: crate::topology::ParameterRange) -> Vec<Point3> {
+    let mut points = vec![curve.point(range.start), curve.point(range.end)];
+    for (low, high) in curve.spans(range.start, range.end) {
+        const SAMPLES: usize = 16;
+        let at = |step: usize| (high - low).mul_add(step as f64 / SAMPLES as f64, low);
+        for axis in 0..3 {
+            let rate = |t: f64| curve.derivatives(t)[1][axis];
+            let mut previous = (at(0), rate(at(0)));
+            for step in 1..=SAMPLES {
+                let current = (at(step), rate(at(step)));
+                if (previous.1 < 0.0) != (current.1 < 0.0) {
+                    let (mut from, mut to) = (previous.0, current.0);
+                    let falling = previous.1 < 0.0;
+                    for _ in 0..60 {
+                        let middle = 0.5 * (from + to);
+                        if (rate(middle) < 0.0) == falling {
+                            from = middle;
+                        } else {
+                            to = middle;
+                        }
+                    }
+                    points.push(curve.point(0.5 * (from + to)));
+                }
+                previous = current;
+            }
+        }
+    }
+    points
+}
+
+/// Whether an edge or a pcurve walks inside a spline's domain, either way,
+/// allowing the few ulps an affine map of the ends can cost.
+fn range_within(domain: (f64, f64), range: crate::topology::ParameterRange) -> bool {
+    let (start, end) = domain;
+    let slack = 64.0 * f64::EPSILON * (end - start).abs().max(start.abs()).max(end.abs());
+    let (low, high) = (range.start.min(range.end), range.start.max(range.end));
+    range.start != range.end && low >= start - slack && high <= end + slack
 }
 
 fn angle_is_on_range(angle: f64, range: crate::topology::ParameterRange) -> bool {

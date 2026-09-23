@@ -30,6 +30,8 @@ pub(crate) enum PlanarProfileInputError {
     EmptyLoop,
     DisconnectedLoop,
     AnalyticCurve,
+    /// A B-spline curve reached a construction that does not carry one.
+    SplineCurve,
     OverlappingRegions,
     HoledFrameUnsupported,
     Extrusion(ExtrusionInputError),

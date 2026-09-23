@@ -29,8 +29,8 @@ use crate::theme::{self, ribbon_group};
 use artificer_model::QuantityKind;
 
 use crate::{
-    KernelLabApp, SketchPlane, SolidFeaturePreset, WorkbenchMode, origin_plane_label,
-    shell_button_activated, viewport,
+    KernelLabApp, SketchPlane, SketchSupport, SolidFeaturePreset, WorkbenchMode,
+    origin_plane_label, shell_button_activated, viewport,
 };
 
 /// Whether a command can run right now, and in plain words why not when it
@@ -644,6 +644,7 @@ impl KernelLabApp {
         match descriptor.command {
             ModelCommand::NewSketch => match self.sketch_entry_action() {
                 SketchEntryAction::OnSelectedFace => "On face",
+                SketchEntryAction::OnSelectedPlane => "On plane",
                 SketchEntryAction::New => "New sketch",
                 SketchEntryAction::Create => "Sketch",
                 SketchEntryAction::Edit => "Edit sketch",
@@ -661,6 +662,7 @@ impl KernelLabApp {
         match descriptor.command {
             ModelCommand::NewSketch => match self.sketch_entry_action() {
                 SketchEntryAction::OnSelectedFace => "Sketch on selected face",
+                SketchEntryAction::OnSelectedPlane => "Sketch on selected plane",
                 SketchEntryAction::New => "New sketch",
                 SketchEntryAction::Create => "Create sketch",
                 SketchEntryAction::Edit => "Edit sketch",
@@ -704,6 +706,20 @@ impl KernelLabApp {
         if self.selected_face().is_some() {
             return SketchEntryAction::OnSelectedFace;
         }
+        // A selected construction plane is where the next sketch goes,
+        // however many sketches already exist (ADR 0048). Carrying on with
+        // the sketch already open on that plane is the one exception.
+        if let Some(id) = self.selected_construction_plane {
+            let open_on_it = matches!(
+                self.sketch_support,
+                SketchSupport::ConstructionPlane { id: Some(active), .. } if active == id
+            ) && !self.sketch.entities().is_empty()
+                && !self.sketch_finished
+                && self.sketch_support_is_current();
+            if !open_on_it {
+                return SketchEntryAction::OnSelectedPlane;
+            }
+        }
         let starts_new_origin_sketch = !self.sketch.entities().is_empty()
             && (self.sketch_finished
                 || self.extruded_sketch_revision == Some(self.sketch_revision)
@@ -721,6 +737,7 @@ impl KernelLabApp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SketchEntryAction {
     OnSelectedFace,
+    OnSelectedPlane,
     New,
     Create,
     Edit,
@@ -768,6 +785,7 @@ impl KernelLabApp {
                 let action = self.sketch_entry_action();
                 if !self.sketch_support_is_current()
                     && action != SketchEntryAction::OnSelectedFace
+                    && action != SketchEntryAction::OnSelectedPlane
                     && action != SketchEntryAction::New
                 {
                     return CommandAvailability::disabled(
@@ -776,14 +794,70 @@ impl KernelLabApp {
                 }
                 CommandAvailability::Enabled
             }
-            ModelCommand::ConstructionPlane => {
+            ModelCommand::ConstructionPlane | ModelCommand::ConstructionAxis => {
                 if let Some(blocked) = free(self) {
                     return blocked;
                 }
                 CommandAvailability::Enabled
             }
             ModelCommand::Extrude => self.extrude_availability(),
-            ModelCommand::Revolve => self.preset_feature_availability(SolidFeaturePreset::Revolve),
+            ModelCommand::Revolve => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                // A sketch being drawn is finished by the press, and one
+                // already finished is picked from in the model view.
+                let drawing = self.workbench_mode == WorkbenchMode::Sketch
+                    && !self.sketch.authoring().operations().is_empty();
+                if !drawing
+                    && !self
+                        .sketches
+                        .iter()
+                        .any(|sketch| sketch.finished && sketch.id.is_some())
+                {
+                    return CommandAvailability::disabled(
+                        "A revolve turns a sketch profile about an axis. Sketch the profile first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
+            ModelCommand::Loft => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                if self
+                    .sketches
+                    .iter()
+                    .filter(|sketch| sketch.finished && sketch.id.is_some())
+                    .count()
+                    < 2
+                {
+                    return CommandAvailability::disabled(
+                        "A loft runs through profiles in two sketches on different planes. Sketch both first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
+            ModelCommand::Sweep => {
+                if let Some(blocked) = free(self) {
+                    return blocked;
+                }
+                // The profile and its path are two sketches; one still being
+                // drawn is finished by the press.
+                let drawing = self.workbench_mode == WorkbenchMode::Sketch
+                    && !self.sketch.authoring().operations().is_empty();
+                let finished = self
+                    .sketches
+                    .iter()
+                    .filter(|sketch| sketch.finished && sketch.id.is_some())
+                    .count();
+                if finished + usize::from(drawing) < 2 {
+                    return CommandAvailability::disabled(
+                        "A sweep carries a profile along a path drawn in another sketch. Sketch both first.",
+                    );
+                }
+                CommandAvailability::Enabled
+            }
             ModelCommand::Hole => self.preset_feature_availability(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.preset_feature_availability(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.preset_feature_availability(SolidFeaturePreset::Mirror),
@@ -950,7 +1024,6 @@ impl KernelLabApp {
             );
         }
         let ready = match preset {
-            SolidFeaturePreset::Revolve => true,
             // Converted (ADR 0041): pressing one with nothing picked enters it
             // and asks for a face, so availability asks only whether this
             // workspace has a body to put a face feature on.
@@ -995,6 +1068,13 @@ impl KernelLabApp {
     /// Extrude is the one command that serves two operations — extruding the
     /// active sketch and pushing the selected face — so its reasons stay
     /// enumerated in the order the user is most likely to have hit them.
+    /// The active sketch, when it is finished and no feature has used it yet.
+    pub(crate) fn unconsumed_active_sketch_index(&self) -> Option<usize> {
+        let index = self.active_sketch_index?;
+        let sketch = self.sketches.get(index)?;
+        (!sketch.consumed).then_some(index)
+    }
+
     fn extrude_availability(&self) -> CommandAvailability {
         let linked_sketch_support = self
             .sketch_support
@@ -1010,8 +1090,10 @@ impl KernelLabApp {
         // become a solid — Extrude is still the right button to press: it
         // hands the canvas to Select and says where to click, instead of
         // greying out behind a tooltip.
-        let awaiting_profile_pick =
-            self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick();
+        let awaiting_profile_pick = eligibility.wants_profile_pick()
+            && (self.workbench_mode == WorkbenchMode::Sketch
+                || (self.selected_face().is_none()
+                    && self.unconsumed_active_sketch_index().is_some()));
         let sketch_enabled = self.pending_operation.is_none()
             && self.history_is_at_end()
             && !already_extruded
@@ -1061,26 +1143,51 @@ impl KernelLabApp {
         })
     }
 
-    fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
+    pub(crate) fn run_command(&mut self, command: ModelCommand, context: &egui::Context) {
         match command {
-            ModelCommand::NewSketch => {
-                if self.sketch_entry_action() == SketchEntryAction::New {
-                    self.begin_new_origin_sketch();
-                } else {
-                    self.enter_sketch_mode();
+            ModelCommand::NewSketch => match self.sketch_entry_action() {
+                SketchEntryAction::New => self.begin_new_origin_sketch(),
+                SketchEntryAction::OnSelectedPlane => {
+                    if let Some(id) = self.selected_construction_plane
+                        && self.pending_operation.is_none()
+                        && self.history_is_at_end()
+                    {
+                        self.forget_picked_ribbon_tab();
+                        self.begin_construction_plane_sketch(id);
+                    }
                 }
-            }
+                SketchEntryAction::OnSelectedFace
+                | SketchEntryAction::Create
+                | SketchEntryAction::Edit => self.enter_sketch_mode(),
+            },
             // The library is where a part is chosen and its parameters set,
             // so the command opens it rather than duplicating that panel: an
             // insertion still goes through the same confirmation gate every
             // other operation does.
             ModelCommand::InsertPart => self.open_part_library(),
             ModelCommand::ConstructionPlane => self.stage_construction_plane(),
+            ModelCommand::ConstructionAxis => self.stage_construction_axis(),
             ModelCommand::Extrude => {
                 let eligibility = self.sketch_extrusion_eligibility();
                 if self.workbench_mode == WorkbenchMode::Sketch && eligibility.wants_profile_pick()
                 {
                     self.begin_profile_pick_for_extrusion(eligibility);
+                    return;
+                }
+                // From the model workspace, a sketch that is finished but not
+                // yet used is what Extrude is for, and its profile is picked
+                // on its own canvas: open it there and ask. A picked face
+                // still means push/pull; an unused sketch is the fallback
+                // that used to grey the button instead (ADR 0041).
+                if self.workbench_mode == WorkbenchMode::Model
+                    && eligibility.wants_profile_pick()
+                    && self.selected_face_push_pull_support().is_none()
+                    && let Some(index) = self.unconsumed_active_sketch_index()
+                {
+                    self.edit_committed_sketch(index);
+                    if self.workbench_mode == WorkbenchMode::Sketch {
+                        self.begin_profile_pick_for_extrusion(eligibility);
+                    }
                     return;
                 }
                 let staged = if eligibility.can_stage()
@@ -1095,7 +1202,15 @@ impl KernelLabApp {
                 // that will commit it.
                 let _ = staged;
             }
-            ModelCommand::Revolve => self.stage_preset_feature(SolidFeaturePreset::Revolve),
+            ModelCommand::Revolve => {
+                self.stage_revolve();
+            }
+            ModelCommand::Loft => {
+                self.stage_loft();
+            }
+            ModelCommand::Sweep => {
+                self.stage_sweep();
+            }
             ModelCommand::Hole => self.stage_preset_feature(SolidFeaturePreset::Hole),
             ModelCommand::Rib => self.stage_preset_feature(SolidFeaturePreset::Rib),
             ModelCommand::Mirror => self.stage_preset_feature(SolidFeaturePreset::Mirror),

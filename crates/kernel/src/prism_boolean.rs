@@ -151,7 +151,11 @@ fn extract_slab(topology: &Topology, axis: Vector3, precision: PrecisionPolicy) 
                 plane.normal.dot(axis).abs() <= angular * length
             }
             Surface::Cylinder(cylinder) => cylinder.axis.cross(axis).length() <= angular,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => false,
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => false,
         };
         if !along {
             return None;
@@ -224,7 +228,9 @@ fn prism_boolean_along(
                 sweep,
             }
         }
-        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other,
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }) => {
+            other
+        }
     };
     let map_loop = |segments: &[Segment]| segments.iter().map(map_segment).collect::<Vec<_>>();
 
@@ -470,7 +476,7 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                         ArcDirection::Clockwise
                     },
                 },
-                Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                     unreachable!("planar profiles carry lines and arcs only")
                 }
             })
@@ -784,7 +790,11 @@ fn reverse_face_orientation(
                 cylinder.angular_sign = -cylinder.angular_sign;
                 |point: Point2| Point2::new(-point.x, point.y)
             }
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => {
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => {
                 return Err(PrismBooleanError::DomainUnsupported);
             }
         }
@@ -823,6 +833,12 @@ fn reverse_face_orientation(
                             radius,
                         };
                         coedge.parameter_range = ParameterRange::new(range.end, range.start);
+                    }
+                    // A prism reduction never builds one, and reversing a
+                    // body that already carries one belongs to the general
+                    // engine rather than here.
+                    Curve2::Trace { .. } | Curve2::Bspline { .. } => {
+                        return Err(PrismBooleanError::DomainUnsupported);
                     }
                     Curve2::Harmonic {
                         mean,
@@ -1105,6 +1121,7 @@ fn glue_layers(
                     },
                     ParameterRange::new(start.x, end.x),
                 ),
+                Segment::Trace { .. } => return Err(PrismBooleanError::DomainUnsupported),
             };
             let coedge_key = CoedgeKey(merged.coedges.len());
             merged.coedges.push(Record {
@@ -1257,7 +1274,7 @@ fn segment_midpoint(segment: Segment) -> Point2 {
 
 /// Rebuilds the topology keeping only entities reachable from its solids,
 /// renumbering keys and identifiers densely.
-fn compact(source: Topology) -> Topology {
+pub(crate) fn compact(source: Topology) -> Topology {
     let mut used_faces = vec![false; source.faces.len()];
     for shell in &source.shells {
         for face in &shell.value.faces {

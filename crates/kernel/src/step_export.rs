@@ -4,9 +4,18 @@
 //! five carrier surfaces become the five STEP elementary surfaces; lines,
 //! circles and ellipses become `line`, `circle` and `ellipse`; every coedge
 //! is an `oriented_edge` over an `edge_curve` with an exact 3D curve and no
-//! curve-on-surface, which STEP permits when the 3D curves are exact. Two
-//! half faces per revolved carrier and their seam edges are ordinary
-//! topology. Cavities are `brep_with_voids`.
+//! curve-on-surface, which STEP permits when the 3D curves are exact. The
+//! one curve STEP has no entity for, the quartic where two cylinders meet
+//! (ADR 0047), is an `intersection_curve` naming the two cylinders, with a
+//! cubic spline within a tenth of the file's accuracy as its 3D curve. The one
+//! surface STEP has no entity for, the ruled wall of a loft (ADR 0049), is a
+//! `b_spline_surface_with_knots`: exactly, where both rails are lines, and
+//! otherwise within that same tenth, bounded by its rails, which are exact
+//! edges like any other. A B-spline curve or surface (ADR 0050) is a
+//! `b_spline_curve_with_knots` or `b_spline_surface_with_knots` exactly,
+//! since that is what the kernel holds. Two half faces per revolved carrier
+//! and their seam edges are ordinary topology. Cavities are
+//! `brep_with_voids`.
 //!
 //! Every surface is written so that its STEP normal is the direction the
 //! kernel's own parameterisation calls outward; where the kernel's face is
@@ -17,6 +26,8 @@ use std::fmt::Write as _;
 
 use artificer_protocol::{KernelError, KernelErrorCode, KernelStage};
 
+use crate::cylinder_trace::CylinderTrace;
+use crate::ruled::RailCurve;
 use crate::topology::{
     Curve3, EdgeKey, Orientation, Point3, Surface, Topology, Vector3, VertexKey, frame_orientation,
 };
@@ -24,6 +35,12 @@ use crate::{DebugTriangle, NativeKernel, Snapshot, error};
 
 /// The AP214 schema identifier the file claims.
 const SCHEMA: &str = "AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }";
+
+/// How far, in millimetres, the spline written beside an intersection curve
+/// may stray from the curve: a tenth of the confusion accuracy the file
+/// declares, so a reader that takes the spline takes a curve the file itself
+/// cannot tell from the exact one.
+const SPLINE_TOLERANCE: f64 = 1.0e-7;
 
 /// One body in an exported file: its geometry, its name, where it sits and
 /// what colour it is shown in.
@@ -525,6 +542,9 @@ impl BodyWriter<'_> {
         let start = self.vertex(start)?;
         let end = self.vertex(end)?;
         let range = edge.value.parameter_range;
+        // The edge runs from its first vertex to its second; the curve's
+        // parameter agrees with that unless the range runs backwards.
+        let mut same_sense = range.end >= range.start;
         let curve = match edge.value.curve {
             Curve3::Line { endpoints } => {
                 let direction = endpoints[1] - endpoints[0];
@@ -549,6 +569,69 @@ impl BodyWriter<'_> {
                 self.file
                     .entity(format!("CIRCLE('',#{placement},{})", real(radius.abs())))
             }
+            // STEP has no entity for the quartic two cylinders share. It has
+            // `intersection_curve`, which says the edge *is* where two named
+            // surfaces meet and carries a 3D curve beside them for readers
+            // that want one; that is written here, the 3D curve a cubic
+            // spline a tenth of the file's own confusion accuracy from the
+            // curve. The spline runs the way the edge does whichever way the
+            // parameter runs.
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => {
+                let spline = CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                }
+                .spline(range.start, range.end, SPLINE_TOLERANCE)
+                .ok_or(
+                    "an edge where two cylinders meet could not be fitted with a spline within \
+                     the file's accuracy",
+                )?;
+                let points: Vec<u64> = spline
+                    .control_points
+                    .iter()
+                    .map(|point| self.point(*point))
+                    .collect();
+                let multiplicities: Vec<String> = spline
+                    .knots
+                    .iter()
+                    .map(|(_, multiplicity)| multiplicity.to_string())
+                    .collect();
+                let knots: Vec<String> = spline.knots.iter().map(|(knot, _)| real(*knot)).collect();
+                let curve = self.file.entity(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',3,({}),.UNSPECIFIED.,.F.,.F.,({}),({}),\
+                     .UNSPECIFIED.)",
+                    ids(&points),
+                    multiplicities.join(","),
+                    knots.join(",")
+                ));
+                let (host, _) = self.surface(Surface::Cylinder(host))?;
+                let (other, _) = self.surface(Surface::Cylinder(other))?;
+                same_sense = true;
+                self.file.entity(format!(
+                    "INTERSECTION_CURVE('',#{curve},(#{host},#{other}),.CURVE_3D.)"
+                ))
+            }
+            // The kernel's own B-spline, written as itself: its degree, its
+            // control points and its knots, nothing fitted.
+            Curve3::Bspline { curve } => {
+                let points: Vec<u64> = curve
+                    .points()
+                    .iter()
+                    .map(|point| self.point(crate::bspline::point3(*point)))
+                    .collect();
+                let (multiplicities, knots) = knot_lists(curve.knots());
+                self.file.entity(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({multiplicities}),\
+                     ({knots}),.UNSPECIFIED.)",
+                    curve.degree(),
+                    ids(&points),
+                ))
+            }
             Curve3::Ellipse {
                 center,
                 u,
@@ -566,11 +649,9 @@ impl BodyWriter<'_> {
                 ))
             }
         };
-        // The edge runs from its first vertex to its second; the curve's
-        // parameter agrees with that unless the range runs backwards.
         let id = self.file.entity(format!(
             "EDGE_CURVE('',#{start},#{end},#{curve},{})",
-            flag(range.end >= range.start)
+            flag(same_sense)
         ));
         self.edges.insert(key, id);
         Ok(id)
@@ -679,8 +760,111 @@ impl BodyWriter<'_> {
                     sign > 0.0,
                 )
             }
+            // STEP has no surface ruled between two arbitrary curves. Between
+            // two lines the surface is a bilinear patch, which is exactly a
+            // B-spline surface of degree one by one. Otherwise the two rails
+            // are fitted with cubics on one knot vector and the surface
+            // written as degree three by one: it is linear in `v`, as the
+            // ruled surface is, so it strays from it by no more than the
+            // worse of the two fits. The surface's own parameterisation is
+            // the kernel's, so its normal is the kernel's outward one.
+            Surface::Ruled(ruled) => {
+                let both_lines = ruled
+                    .rails
+                    .iter()
+                    .all(|rail| matches!(rail.curve, RailCurve::Line { .. }));
+                let (degree, rows, knots) = if both_lines {
+                    (
+                        1,
+                        [
+                            vec![ruled.rails[0].point(0.0), ruled.rails[0].point(1.0)],
+                            vec![ruled.rails[1].point(0.0), ruled.rails[1].point(1.0)],
+                        ],
+                        vec![(0.0, 2), (1.0, 2)],
+                    )
+                } else {
+                    let splines = ruled.rail_splines(SPLINE_TOLERANCE).ok_or(
+                        "a ruled face could not be fitted with a spline surface within the \
+                         file's accuracy",
+                    )?;
+                    (3, splines.rows, splines.knots)
+                };
+                let mut columns = Vec::with_capacity(rows[0].len());
+                for (low, high) in rows[0].iter().zip(&rows[1]) {
+                    let low = self.point(*low);
+                    let high = self.point(*high);
+                    columns.push(format!("(#{low},#{high})"));
+                }
+                let multiplicities: Vec<String> = knots
+                    .iter()
+                    .map(|(_, multiplicity)| multiplicity.to_string())
+                    .collect();
+                let values: Vec<String> = knots.iter().map(|(knot, _)| real(*knot)).collect();
+                (
+                    self.file.entity(format!(
+                        "B_SPLINE_SURFACE_WITH_KNOTS('ruled surface',{degree},1,({}),\
+                         .UNSPECIFIED.,.F.,.F.,.F.,({}),(2,2),({}),(0.,1.),.UNSPECIFIED.)",
+                        columns.join(","),
+                        multiplicities.join(","),
+                        values.join(",")
+                    )),
+                    true,
+                )
+            }
+            // A B-spline surface is written exactly as the kernel holds it.
+            // Its normal is `∂S/∂u × ∂S/∂v` in STEP as in the kernel, which
+            // the builders point out of the material, so the sense agrees.
+            Surface::Bspline(surface) => {
+                let [degree_u, degree_v] = surface.degree();
+                let [count_u, count_v] = surface.counts();
+                let mut rows = Vec::with_capacity(count_u);
+                for i in 0..count_u {
+                    let row: Vec<u64> = (0..count_v)
+                        .map(|j| {
+                            self.point(crate::bspline::point3(surface.points()[i * count_v + j]))
+                        })
+                        .collect();
+                    rows.push(format!("({})", ids(&row)));
+                }
+                let [knots_u, knots_v] = surface.knots();
+                let (multiplicities_u, values_u) = knot_lists(knots_u);
+                let (multiplicities_v, values_v) = knot_lists(knots_v);
+                (
+                    self.file.entity(format!(
+                        "B_SPLINE_SURFACE_WITH_KNOTS('',{degree_u},{degree_v},({}),\
+                         .UNSPECIFIED.,.F.,.F.,.F.,({multiplicities_u}),({multiplicities_v}),\
+                         ({values_u}),({values_v}),.UNSPECIFIED.)",
+                        rows.join(","),
+                    )),
+                    true,
+                )
+            }
         })
     }
+}
+
+/// A full knot vector as STEP writes it: the distinct knots, and how many
+/// times each appears.
+fn knot_lists(knots: &[f64]) -> (String, String) {
+    let mut distinct: Vec<(f64, usize)> = Vec::new();
+    for knot in knots {
+        match distinct.last_mut() {
+            Some((value, count)) if *value == *knot => *count += 1,
+            _ => distinct.push((*knot, 1)),
+        }
+    }
+    (
+        distinct
+            .iter()
+            .map(|(_, count)| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        distinct
+            .iter()
+            .map(|(knot, _)| real(*knot))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn unit(vector: Vector3) -> Option<Vector3> {

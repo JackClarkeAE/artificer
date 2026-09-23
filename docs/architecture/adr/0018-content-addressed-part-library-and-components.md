@@ -33,7 +33,7 @@ Sealing a definition computes a SHA-256 digest over its canonical authored conte
 
 The in-memory search index is disposable and rebuilt from verified refs and objects. Corrupt, unsafe, oversized, or symlinked entries are rejected and reported rather than becoming searchable. Object writes and ref writes use same-directory temporary files and atomic create/compare behavior, so an interrupted publication cannot replace an existing revision.
 
-At application startup the first built-in definition, `20 × 20 Aluminium Extrusion` revision `1.0.0`, is sealed and idempotently published into the local store. `ARTIFICER_CATALOG_DIR` overrides the store root; otherwise the application uses the operating system's local application-data location. If the store cannot open, the same verified built-in package remains available as an explicit in-memory fallback.
+At application startup the first built-in definition, `20 × 20 Aluminium Extrusion` revision `1.0.0`, is sealed and idempotently published into the local store. `ARTIFICER_CATALOG_DIR` overrides the store root; otherwise the application uses the per-user data folder described in the amendment on where the library lives. If the store cannot open, the same verified built-in package remains available as an explicit in-memory fallback.
 
 ### Parameterized insertion
 
@@ -71,3 +71,58 @@ F2 gives Artificer a trustworthy local definition/variant/occurrence split and a
 - collision/interference heatmaps, tolerance profiles, animation studies, or interactive sectional analysis.
 
 Those assembly and analysis programmes can build on stable occurrences without being folded into kernel truth. General parameter editing and regeneration still belong to the unfinished M5 feature/document programme.
+
+## Amendment: a part keeps its picture and rough size (2026-09-23)
+
+The library list shows each part as a small picture with its version and
+rough size, so a part can be recognised without reading its description.
+
+- **When it is drawn.** A part's picture is drawn once, when the part is
+  saved into the library, and kept beside its package. It is drawn again
+  only when the store has none for that exact package. That happens when a
+  store written by an older build is opened, or when the kept files cannot
+  be read.
+- **How it is drawn.** The workbench builds the part as an insertion would
+  and draws it on the CPU, with no window or GPU involved. The view is the
+  viewport's isometric one, fitted with a margin, at 96 px square on a
+  transparent background. A parametric part is drawn at a sample value; the
+  built-in extrusion is drawn at Length 100 mm.
+- **What it measures.** The part's bounding box along X, Y and Z is kept
+  with the picture. An extent that changes when a parameter changes is
+  recorded as that parameter's rather than as the sample's number. The
+  extrusion's size therefore reads `20 × 20 mm × Length`.
+- **Where it lives.** `CatalogStore` keeps `previews/<digest>.png` and
+  `previews/<digest>.json` (the measurements) beside `objects/` and `refs/`.
+  A preview is derived rather than authored. It is not part of the
+  package's content address, so it may be replaced, and each file is
+  replaced atomically. The store validates both files and refuses a preview
+  for a package it does not hold. A missing, damaged or oversized preview
+  reads as none, so the answer is to draw it again rather than to fail the
+  library. The index never mistakes a preview for a package.
+
+## Amendment: where the library lives (2026-09-23)
+
+The library, the theme, the preferences and the reopened workspace live in
+the operating system's per-user data folder. Each of these is hidden from
+everyday browsing, so it is neither in the way nor easy to delete by
+accident:
+
+| System | Folder |
+| --- | --- |
+| Windows | `%APPDATA%\Artificer` (Roaming `AppData`, hidden) |
+| macOS | `~/Library/Application Support/Artificer` (`~/Library` is hidden) |
+| Linux and other Unix | `$XDG_DATA_HOME/artificer`, else `~/.local/share/artificer` |
+
+The library itself is the `catalog` folder inside it. A `README.txt` in the
+library says what the folder is, and that deleting it removes the parts.
+
+Windows used to keep all of this in `%LOCALAPPDATA%\Artificer`. That is
+the folder the installer puts the application in (ADR 0029, pack id
+`Artificer`), and uninstalling removes it whole, parts included. At start
+the application copies anything it finds there that the new folder lacks.
+It overwrites nothing, and the old copies stay where they are.
+
+When the system names no per-user folder, there is no library on disk
+rather than one in the temporary folder, which the system empties. The
+verified built-in part remains available, as for a store that fails to
+open.

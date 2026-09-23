@@ -5,8 +5,10 @@
 //! dependency. Display tessellation is never used to create kernel geometry.
 
 mod arrangement;
+mod chain;
 mod constraints;
 mod definition;
+pub mod expression;
 mod geometry;
 mod ids;
 mod intersections;
@@ -19,6 +21,7 @@ mod transaction;
 mod trim;
 
 pub use arrangement::*;
+pub use chain::*;
 pub use constraints::*;
 pub use definition::*;
 pub use geometry::*;

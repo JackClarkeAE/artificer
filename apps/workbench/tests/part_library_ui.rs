@@ -89,7 +89,9 @@ fn unresolved_parameter_blocks_add_without_mutating_the_document() {
     assert!(harness.state().part_library_open());
     assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::MissingLength
+        PartInsertionEligibility::Missing {
+            parameter: "Length".into()
+        }
     );
     assert!(
         harness
@@ -123,13 +125,11 @@ fn add_stages_then_tick_commits_separate_parameterized_intents() {
 
     click_button(&mut harness, "Library");
     enter_length(&mut harness, "455");
-    assert!(matches!(
+    assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::Ready {
-            length_mm: 455.0,
-            ..
-        }
-    ));
+        PartInsertionEligibility::Ready
+    );
+    assert_eq!(harness.state().part_library_length_mm(), Some(455.0));
 
     click_button(&mut harness, "Add to current workspace");
     assert_eq!(
@@ -221,13 +221,11 @@ fn red_x_cancels_staged_insertion_and_keeps_parameter_value_for_retry() {
     assert_eq!(harness.state().document_feature_count(), features);
     assert_eq!(harness.state().component_instance_count(), 0);
     assert_eq!(harness.state().body_count(), bodies);
-    assert!(matches!(
+    assert_eq!(
         harness.state().part_library_eligibility(),
-        PartInsertionEligibility::Ready {
-            length_mm: 310.0,
-            ..
-        }
-    ));
+        PartInsertionEligibility::Ready
+    );
+    assert_eq!(harness.state().part_library_length_mm(), Some(310.0));
 
     click_button(&mut harness, "Add to current workspace");
     press_key(&mut harness, egui::Key::Enter);
@@ -291,6 +289,67 @@ fn persistent_store_selection_pins_digest_and_inserts_through_exact_revision() {
 
     let reopened = CatalogStore::open(&catalog.path).expect("catalog should reopen");
     assert_eq!(reopened.index_snapshot().unwrap().len(), 1);
+}
+
+/// A library a previous build wrote still opens, and still inserts through
+/// the store.
+///
+/// Every build rebuilds the built-in part from code, and the document it
+/// embeds records the schema it was written in, so a schema bump changes the
+/// package's bytes. The built-in used to keep revision 1.0.0 regardless, so
+/// the store refused the new copy as a clash with the old one, the workbench
+/// fell back to its in-memory part for good, and each refused publish left
+/// another unreachable copy on disk.
+#[test]
+fn a_store_written_by_an_older_build_still_opens_and_inserts() {
+    use artificer_catalog::{PartDefinition, PartPackage, PartRevision};
+    use artificer_workbench::library_catalog::builtin_aluminium_extrusion_package;
+
+    let catalog = TemporaryCatalogRoot::new();
+    let current = builtin_aluminium_extrusion_package().expect("the built-in part builds");
+    let definition = current.definition();
+    let older = PartPackage::seal(
+        PartDefinition::parametric(
+            definition.id().clone(),
+            PartRevision::new(1, 0, 0),
+            definition
+                .metadata()
+                .clone()
+                .with_description("The built-in part as an earlier build wrote it.")
+                .expect("valid metadata"),
+            definition.parameters().to_vec(),
+            definition.document().clone(),
+        )
+        .expect("a valid definition"),
+    )
+    .expect("the older package seals");
+    {
+        let store = CatalogStore::open(&catalog.path).expect("the store opens");
+        store.publish(&older).expect("the older build publishes");
+    }
+
+    let mut harness = catalog_harness(catalog.path.clone());
+    harness.run();
+    assert!(
+        harness.state().persistent_catalog_active(),
+        "the store must stay in use after an upgrade"
+    );
+    assert_eq!(
+        harness.state().catalog_entry_count(),
+        2,
+        "the older revision stays, beside the current one"
+    );
+
+    click_button(&mut harness, "Library");
+    enter_length(&mut harness, "125");
+    click_button(&mut harness, "Add to current workspace");
+    let staged = harness
+        .state()
+        .staged_part_insertion()
+        .expect("the store-backed intent stages");
+    assert_eq!(staged.definition_revision[1], CURRENT_DOCUMENT_VERSION);
+    click_button(&mut harness, "Confirm operation");
+    assert_eq!(harness.state().component_instance_count(), 1);
 }
 
 #[test]
@@ -477,4 +536,66 @@ impl Drop for TemporaryCatalogRoot {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
+}
+
+/// Saving a part into the library draws its picture once and keeps it beside
+/// the package: the list shows it with the part's version and rough size, and
+/// a later start reads the kept picture rather than drawing another.
+#[test]
+fn a_part_saved_into_the_library_keeps_a_picture_and_its_size() {
+    use artificer_workbench::library_catalog::builtin_aluminium_extrusion_package;
+
+    let catalog = TemporaryCatalogRoot::new();
+    let mut harness = catalog_harness(catalog.path.clone());
+    harness.run();
+    let library = harness.state().part_library();
+    assert_eq!(library.preview_image_size(), Some([96, 96]));
+    assert_eq!(
+        library.rough_dimensions_text().as_deref(),
+        Some("20 × 20 mm × Length")
+    );
+
+    let digest = builtin_aluminium_extrusion_package()
+        .expect("the built-in part builds")
+        .content_digest();
+    let store = CatalogStore::open(&catalog.path).expect("the store opens");
+    let kept = store
+        .preview(digest)
+        .expect("the store reads")
+        .expect("the picture was saved with the part");
+    assert!(kept.image_png.starts_with(&[0x89, b'P', b'N', b'G']));
+    let hex = digest.to_hex();
+    assert!(
+        catalog
+            .path
+            .join("previews")
+            .join(&hex[..2])
+            .join(format!("{}.png", &hex[2..]))
+            .is_file(),
+        "the picture is a PNG file in the library"
+    );
+
+    click_button(&mut harness, "Library");
+    harness.get_by_role_and_label(Role::Image, "Picture of 20 × 20 Aluminium Extrusion");
+    harness.get_by_label(&format!("v1.{CURRENT_DOCUMENT_VERSION}.0"));
+    harness.get_by_label("20 × 20 mm × Length");
+
+    // A kept picture is what a later start shows: replace it with a marked
+    // one and it is that one that comes back.
+    let mut marked = kept.clone();
+    marked.facts.sample = Some("Length 42 mm".into());
+    store
+        .save_preview(digest, &marked)
+        .expect("the store keeps it");
+    let mut later = catalog_harness(catalog.path.clone());
+    later.run();
+    assert_eq!(
+        later
+            .state()
+            .part_library()
+            .preview_facts()
+            .and_then(|facts| facts.sample.as_deref()),
+        Some("Length 42 mm"),
+        "a start with a kept picture draws nothing new"
+    );
 }

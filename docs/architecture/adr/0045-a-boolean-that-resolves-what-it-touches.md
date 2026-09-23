@@ -109,9 +109,99 @@ twelve from the rest. Scattered failures across a smooth parameter are the
 signature of a decision resting on arithmetic rather than on shape, and the
 sweep is now a test, because that signature is invisible to any one example.
 
+### A profile may touch what is already on the face
+
+The face-feature gate refused any profile boundary within the feature floor
+of the face's outline or a hole's rim, and called it "outside face
+material". An annular boss whose inner rim *is* the bore's rim — the
+commonest boss there is — was refused as though it had been drawn off the
+face, and the enclosed area between two drawn circles and the face's own
+outline was not a region at all, because the outline took no part in
+closure.
+
+Both halves now go through the same door. The face's outline and its hole
+rims travel with the sketch as *support curves* and join the arrangement
+that closes regions, with reserved entity ids so a document replays the
+same regions its canvas showed. A profile coincident with the face's
+boundary or a void's rim is reformulated as the Boolean the general engine
+already resolves — a cut becomes the difference, an add the union — and
+only a profile that *crosses* out of the face is still refused. An add
+whose profile misses the face has no interface; the union of two solids
+that never meet is two solids, and that still refuses by name.
+
+### A carrier pair is refused only where the faces could meet
+
+The intersection matrix answers for carriers, which are unbounded, and it
+refuses a pair it cannot trace — two bores of unequal radius crossing at an
+angle — whether or not the two bounded faces ever come near each other. A
+boss on one end of a block is nowhere near the bore through the other end,
+and a refusal about their carriers was refusing the Boolean.
+
+Each face now has an extent: a box it cannot leave, a plane face's
+parameter box mapped to the plane, a cylinder face's whole drum over its
+height range. A pair the matrix refuses is skipped when the extents are
+apart, and is a refusal only when they are not. The extent is a superset of
+the face, so a pair it separates is a pair the faces separate; it is never
+used to *skip a pair the matrix can answer*, because a section is closed by
+pieces from every face the carrier crosses, near this face or not, and a
+loop with a piece missing does not close.
+
+### The skin counts as covered
+
+Where the other solid has a face on this very carrier, the probe that
+decides which side of a section chain the other solid lies on lands on that
+skin, and a ray's parity there is a coin toss — one half of a bore answered
+one way and the other half the other, and the sewn shell had four open
+edges. A section is a closure. A probe on a face of the other solid is
+covered, and only a probe off every coincident face is asked of the solid's
+interior.
+
+Three smaller things the same case taught, each a seam problem in
+disguise. A generator on a cylinder's seam maps its two ends to `π` and
+`−π` by the arctangent and read as no generator at all; the azimuth is the
+same, and the first end's branch is kept. A loop carried from one face onto
+a coincident cylinder came back torn at the seam for the same reason; it is
+now carried as a loop, each piece brought by whole turns onto the branch the
+previous one ended on, and the whole brought onto the window the receiving
+face's own region uses. And two section chords sharing one oblique trace on
+a cylinder — the edge where a bore meets a wall, and a tool wall that
+continues it — had no overlap rule, so the clip refused what it should have
+kept: a region contains its own boundary.
+
+### The faceted tier may not publish a wrong volume
+
+The faceted fallback closed a counterbore into a perfectly valid shell
+around the wrong material: a *cut* that left the body with more volume than
+it started with, published as an approximation. Closedness is what the
+validator certifies, and a tessellated rebuild can be closed around the
+wrong answer, which is the failure named at the end of this document.
+Volume is the cheapest invariant that catches it: a cut may not gain volume
+and an add may not lose it, beyond the approximation budget, and a
+candidate that does is refused rather than published.
+
+### Two things the wider domain uncovered downstream
+
+Both were found by the same signature as the last section: a body that
+validated and measured wrong.
+
+The exact measure counted a planar face's elliptical arc in the `∮x dy`
+form of Green's theorem while it counted every chord in the symmetric
+`½∮(x dy − y dx)` form. The forms agree around a closed chain, which is why
+a bore's ellipse — two arcs that close on each other — measured exactly, and
+disagree along an open one, which a bevel plane cutting through two fillet
+bands is: two arcs ending on straight edges. That face measured at half
+again its area and the body gained volume under a cut. The arc terms now
+use the chords' form, and the stand-apart test measures the body twice,
+once exactly and once from its tessellation, and asks the two to agree.
+
+An add's tool used to overshoot into the body so that no cap lay on the face
+plane, on the reasoning that an overshoot inside the body changes nothing. It
+changes nothing under the part of the profile that lies over the face; under
+a part that hangs past the face's edge it pokes out again and publishes a
+sliver as material. An add's tool now stands exactly on the face, and its
+cap is a coincident face the overlay rule resolves.
+
 ### What still fails closed
-
-
 
 Contacts of no width that would weld two solids at a seam. A cylinder kissing
 a plate along one line is not a solid and still refuses: the change is about

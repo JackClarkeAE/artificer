@@ -16,10 +16,13 @@ use std::f32::consts::TAU;
 pub enum CommandIcon {
     Sketch,
     Plane,
+    Axis,
     Section,
     Interference,
     Extrude,
     Revolve,
+    Loft,
+    Sweep,
     Hole,
     Rib,
     Mirror,
@@ -214,6 +217,12 @@ impl IconPainter<'_> {
                 self.closed_path(&[(0.10, 0.62), (0.44, 0.80), (0.90, 0.56), (0.56, 0.38)]);
                 self.dashed((0.50, 0.09), (0.50, 0.44));
             }
+            CommandIcon::Axis => {
+                // A dashed line through space, with the way it runs marked.
+                self.dashed((0.16, 0.86), (0.80, 0.22));
+                self.arrowhead((0.86, 0.16), (0.64, -0.64), 0.14);
+                self.dot((0.16, 0.86), 0.05);
+            }
             CommandIcon::Section => {
                 // A block with its near half cut away, the cut face hatched.
                 self.closed_path(&[(0.14, 0.30), (0.50, 0.14), (0.86, 0.30), (0.50, 0.46)]);
@@ -236,6 +245,29 @@ impl IconPainter<'_> {
                 self.closed_path(&[(0.42, 0.30), (0.72, 0.30), (0.72, 0.70), (0.42, 0.70)]);
                 self.arc((0.18, 0.50), 0.40, -1.05, 2.10);
                 self.arrowhead((0.38, 0.85), (0.35, 0.35), 0.09);
+            }
+            CommandIcon::Loft => {
+                // A square section below, a circle above, and the rungs a
+                // loft draws between them.
+                self.closed_path(&[(0.14, 0.72), (0.58, 0.72), (0.86, 0.88), (0.42, 0.88)]);
+                self.circle((0.50, 0.24), 0.16);
+                self.line((0.14, 0.72), (0.34, 0.24));
+                self.line((0.86, 0.88), (0.66, 0.24));
+                self.dashed((0.50, 0.80), (0.50, 0.40));
+            }
+            CommandIcon::Sweep => {
+                // A round profile carried up and round a bend: the tube's
+                // two walls, the profile where it starts, the end it
+                // reaches.
+                use std::f32::consts::PI;
+                self.circle((0.18, 0.84), 0.09);
+                self.line((0.09, 0.84), (0.09, 0.50));
+                self.arc((0.50, 0.50), 0.41, PI, 0.5 * PI);
+                self.line((0.50, 0.09), (0.88, 0.09));
+                self.line((0.27, 0.84), (0.27, 0.50));
+                self.arc((0.50, 0.50), 0.23, PI, 0.5 * PI);
+                self.line((0.50, 0.27), (0.88, 0.27));
+                self.line((0.88, 0.09), (0.88, 0.27));
             }
             CommandIcon::Hole => {
                 self.rectangle((0.12, 0.20), (0.88, 0.80));

@@ -356,6 +356,7 @@ artificer-scan info    <mesh>
 artificer-scan align   <source> <target> [--out aligned.stl]
 artificer-scan reverse <mesh> [--tolerance MM] [--max-dihedral DEG]
                               [--min-faces N] [--no-snap] [--json out.json]
+                              [--no-splines] [--no-reclaim] [--step patches.step]
 artificer-scan view    <mesh> [reverse options] [--out viewer.html]
 artificer-scan snapshot <mesh> [reverse options] [--top] [--out snapshot.png]
 artificer-scan sections <mesh> [reverse options] [--meridians N] [--levels N]
@@ -387,6 +388,32 @@ at interactive rates; **Save** runs the full mesh through the identical
 deterministic path, so the saved STL is exactly what `simulate` prints
 with the same options. Rendering is `scan-core::render` — the same
 rasterizer the snapshots use, so the lab shows what CI would.
+
+**Synthetic parts and the freeform columns (2026-09-23).** Any `<mesh>`
+argument, and any bench `source=`, may be `synth:plate-with-boss` or
+`synth:freeform-block`: parts built in code, so their fixtures need
+nothing but the repository (the wheel spacer and DIN rail STEPs are
+kept out of the tree and are not on every machine). The freeform block
+is a closed block whose top is a known bump-and-saddle height field
+(`synth::freeform_top_height`), which gives the bench something no file
+fixture has: ground truth for a surface no analytic fitter describes.
+The bench prints a second table beside the first — `free%`, the scan
+area left freeform; `an-rms`/`an-max`, the analytic fits against their
+own faces; `sewn%` and `open`, how much of the rebuilt shell closes;
+and on a part with truth, `truth-rms`/`truth-max` of the rebuilt model
+against the true surface and `cad%`, the share of that surface carried
+as a CAD surface rather than as measured mesh (over 100% means some of
+it is drawn twice, by overlapping patches).
+
+The first run on the block says where freeform actually goes, and it
+is not where it was assumed to go. Almost none of the top stays
+freeform (0.2%): RANSAC carves it into forty-odd plane facets, a few
+spheres and an 81° cone, each passing the 0.12 mm working tolerance
+because the tolerance is seven noise sigmas and a gently curved surface
+is flat to that over a hand's width. Together they miss the true
+surface by up to 1.16 mm, overlap until the top is drawn 1.8 times, and
+leave the shell 12.9% sewn — and the feature tree reads the facets as
+a stack of extrudes.
 
 **Drilled holes are recognized and opened (2026-08-16).** A lone
 cylinder is the commonest extrusion there is — a drilled hole — and the
@@ -1007,8 +1034,10 @@ writer) — for chat, CI, and documentation.
     What has **no analytic form** is emitted as what it is: the measured
     surface itself, decimated to the working tolerance and marked so no
     reader mistakes it for something the kernel can certify. ADR 0026
-    rules out splines, and it is right to — but the alternative to a
-    spline is not a hole. A casting's rough surface is genuinely not
+    ruled out splines when this was written — ADR 0049 has since admitted
+    ruled and B-spline surfaces, and step 21 now carries what one patch
+    can carry, so what stays measured is what no patch could — but the
+    alternative to a spline is not a hole. A casting's rough surface is genuinely not
     analytic, and a scan-to-CAD model that silently omits a third of the
     part is worse than a hybrid one that says which parts are exact. So
     the coverage figure is reported split: on the test pump the model
@@ -1047,6 +1076,136 @@ writer) — for chat, CI, and documentation.
     `rebuild --out model.stl --snapshot cmp.png` writes the sharp STL
     and a scan-versus-rebuild comparison image.
 
+21. **B-spline patches** (`bspline`, `freeform`) — the surface the
+    analytic vocabulary cannot carry. ADR 0049 gives the kernel ruled and
+    B-spline surfaces; this stage gives it something to hold, fitted to
+    the part and then optimised after the fact.
+
+    **Where freeform actually goes.** The first measurement said the
+    stage could not simply fit whatever ends freeform, because on a
+    designed freeform surface almost nothing does: RANSAC carves the
+    freeform block's top into forty-odd plane facets, a few spheres and a
+    cone, every one inside the 0.12 mm working tolerance, and 0.2% of the
+    scan is left freeform. So the stage looks in two places — freeform
+    features, and analytic features whose fit is **strained**: a robust
+    residual scale (the RMS of the nearest 85% of the feature's face
+    centroids, scaled so Gaussian noise reads as its sigma) of at least
+    `max(1.5 σ̂, 0.25 tol)`. An honest plane leaves noise behind — the
+    block's walls read 0.8–1.0 σ̂ — while a plane laid across a curved
+    surface leaves a bowl, and the top's facets read 1.4–9 σ̂. Trimmed so
+    the strays every feature claims at its border cannot make an honest
+    plane look strained; not a median, because a facet across a saddle
+    crowds its residuals near zero and a median reads the crowd.
+    `ARTIFICER_SPLINE_DEBUG=1` prints every analytic feature's strain
+    against the floor, which is how that line was drawn.
+    Candidates join into regions over mesh adjacency, crossing from one
+    feature into another only where the normals agree within 25°: a facet
+    boundary on a smooth surface, not the edge between a top and a wall.
+
+    **Analytic first, always.** Every region is handed to the pipeline's
+    own classifier (`classify_region`) before any spline is fitted, and if
+    a plane, cylinder, sphere, cone or torus describes the whole region
+    within tolerance the region stays with the analytic surfaces. A patch
+    that would absorb facets must also fit their material at least 1.5
+    times better than they did. Pieces below `--min-feature` that the
+    patch encloses go with it — by the pipeline's own significance rule
+    they are transition geometry — while larger analytic islands stay
+    and are trimmed around. `--no-reclaim` restricts the stage to
+    freeform features alone, and on the block it then finds nothing to
+    fit: every freeform region there is under 25 mm².
+
+    **The fit** (`bspline::fit_surface`), pure Rust over a banded
+    Cholesky solver added to `numeric`:
+    - *Chart.* Samples get first parameters from a base surface: the
+      region's PCA plane, a fitted cylinder unrolled from a cut in its
+      widest angular gap, or a fitted sphere mapped azimuthally about a
+      pole through the region. A base is admissible when no more than 3%
+      of the area folds past 80° against its height direction; the plane
+      wins unless a curved base aligns better by a clear margin.
+    - *Regularized least squares.* Sample residuals plus a thin-plate
+      energy `∫∫ S_uu² + 2 S_uv² + S_vv²`, integrated exactly per knot
+      cell by Gauss–Legendre, so it means the same on a refined knot
+      vector as on a uniform one; its length scale is the sample spacing.
+      It also keeps control points with no data under them — the chart
+      rectangle's corners, a dropout — quiet rather than free.
+    - *Parameter correction.* After each solve every sample is projected
+      onto the new surface by Newton point inversion (Gauss–Newton where
+      the Hessian is indefinite) and the net solved again, up to three
+      passes a round, stopping when a pass gains under half a percent.
+    - *Adaptive refinement.* From one cubic Bézier patch (4 x 4, more
+      along a long side), knots go into the midpoints of spans holding a
+      cell whose inlier RMS is still above `max(1.5 σ̂, 0.25 tol)`, worst
+      first, within a 1,024-control-point budget, never narrower than
+      four sample spacings, for at most eight rounds.
+    - *Robustness.* Huber weights at twice a median-based scale floored
+      at the scan's noise, and a trim past `max(5 scale, 2 tol)` — never
+      inside twice the tolerance, so unresolved shape on a coarse round
+      is down-weighted, not discarded. A patch is accepted at inlier RMS
+      within tolerance with at most 5% of its samples trimmed.
+    - *Refusals, by name:* too small (under `4 (p+1)²` samples); not a
+      height field over any base tried (each base's folded share is
+      quoted); ill-conditioned (a strip under two sample spacings wide,
+      or singular normal equations); out of tolerance at the budget.
+
+    **Bounded, drawn and exported.** A patch spans its chart's rectangle;
+    the face is where the scan's region stops. Boundary loops are
+    projected into the patch's parameters and simplified at half the
+    sample spacing; inner loops that are ≥90% open mesh boundary are
+    scanner dropout and bridged, loops of a face or two are closed, and
+    loops round another feature stay holes. The rebuild draws the trimmed
+    patch (the trim ear-clipped and refined to 1.2 mm in parameter space,
+    with a rasterized trim as fallback) instead of measured mesh, and
+    patches compete for the scan's occupancy cells on the same terms as
+    analytic carriers — without that, the few facets left on the block's
+    noisy top each drew twelve to nineteen times their own area flat
+    across it. `reverse`/`rebuild --step patches.step` writes each patch
+    as an `ADVANCED_FACE` on a `B_SPLINE_SURFACE_WITH_KNOTS`, trimmed by
+    `EDGE_LOOP`s of `POLYLINE` edges whose points lie on the surface, each
+    in an `OPEN_SHELL` of one `SHELL_BASED_SURFACE_MODEL`. **Not a solid:**
+    nothing is sewn to a patch yet and the analytic faces are not in the
+    file. The report JSON carries every patch in full — degree, knots,
+    control net, trim loops — and the feature tree names a "freeform
+    body bounded by trimmed B-spline surface" where it used to say
+    "measured body".
+
+    **Before and after** (`bench`, synthetic rows; the STEP-sourced rows
+    need parts this machine does not have):
+
+    | fixture | free% | anly% | truth rms / max (mm) | cad% | inv% | sewn% / open | patch | spl rms / max | spline s | run s |
+    |---|---|---|---|---|---|---|---|---|---|---|
+    | plate-n002 before | 0.1 | 99.99 | – | – | 0.06 | 100 / 0 | – | – | – | 9.6 |
+    | plate-n002 after | 0.1 | 99.99 | – | – | 0.06 | 100 / 0 | 0 | – | 0.3 | 9.6 |
+    | plate-n007 before | 0.3 | 98.2 | – | – | 0.0 | 6.7 / 16 | – | – | – | 8.4 |
+    | plate-n007 after | 0.3 | 98.2 | – | – | 0.0 | 6.7 / 16 | 0 | – | 0.6 | 9.6 |
+    | freeform-n002 before | 0.2 | 99.5 | 0.149 / 1.161 | 181 | 2.8 | 12.9 / 284 | – | – | – | 26.2 |
+    | freeform-n002 after | 0.1 | 62.6 | **0.0055 / 0.040** | **98.8** | 0.1 | 0.0 / 4 | 1 (20x17) | 0.024 / 0.54 | 2.3 | 17.4 |
+    | freeform-n005-holes before | 0.9 | 98.8 | 0.243 / 0.979 | 159 | 0.7 | 16.3 / 253 | – | – | – | 11.2 |
+    | freeform-n005-holes after | 0.2 | 70.7 | **0.033 / 0.531** | **104.4** | 0.1 | 30.0 / 13 | 1 (11x11) | 0.054 / 1.13 | 2.3 | 10.3 |
+
+    The analytic parts give up nothing. On the block the top becomes one
+    patch that sits within 6 µm RMS and 40 µm worst of the true surface
+    at 20 µm scanner noise — the facets it replaced missed by up to
+    1.16 mm — drawn once instead of 1.8 times, and the feature tree loses
+    its stack of tilted extrudes. The analytic share falls by the top's
+    area, because that area was never analytic; the facets only passed
+    tolerance. On the noisy, holed scan the dropouts are bridged by the
+    patch, and the remaining truth error is three small facets that fit
+    close enough to the noise to stay planes. `sewn%` on the clean block falls to zero because the
+    facets were sewing to each other: the sew stage knows only analytic
+    carriers, so the patch's edges with the walls are not recovered yet
+    (on the holed scan the shell closes more than before, 30% against
+    16%, only because far fewer broken facet edges are left to fail).
+    The stage costs about 2.3 s on the 280k-triangle block — chart,
+    seven refinement rounds and fifteen parameter corrections over 16,000
+    samples — and half a second of strain probing on a part with nothing
+    to reclaim; the whole run is faster on the block (26 s to 17 s)
+    because forty facets no longer go through consolidation, instancing
+    and the rebuild.
+    (`sewn`/`open` also move by a few points between identical runs of an
+    unchanged part — `plate-n007` reads 6.2–12.5% — from hash-map order in
+    the rebuild's edge extraction; they are a trend, not a measurement to
+    the digit.)
+
 Import formats: STL (binary/ascii), PLY (ascii/binary-LE), OBJ.
 
 ## Known limits / next milestones
@@ -1054,3 +1213,13 @@ Import formats: STL (binary/ascii), PLY (ascii/binary-LE), OBJ.
   and boundary-line extraction feed feature reconstruction in the kernel.
 - Feature export into the parametric history (extrude/revolve candidates
   from plane+cylinder families).
+- B-spline patches are not yet carriers to the sew stage. Every carrier
+  answers `probe` with a signed distance, and a patch can
+  (`SplinePatch::trimmed_distance`), so the edge extractor and the
+  Newton corner solve could take patches as they are; until they do, a
+  patch's boundary with its analytic neighbours is its measured trim, not
+  a solved intersection, and the STEP export is open shells beside the
+  model rather than faces sewn into it.
+- One patch per region: a freeform region that folds over every chart
+  (a tube, a surface wrapping past a half-turn in two directions) is
+  refused rather than split into several patches.

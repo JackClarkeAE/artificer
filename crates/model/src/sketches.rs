@@ -6,12 +6,13 @@ use artificer_protocol::{
 };
 use artificer_sketch::SketchDefinition;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
-use crate::BodyId;
 use crate::persistent::{
     CURRENT_PERSISTENT_REF_VERSION, MAX_PERSISTENT_LINEAGE_DEPTH, PersistentRef,
 };
+use crate::{BodyId, FeatureId};
 
 /// Version of the authoring-side precision/validation contract persisted with
 /// editable sketches. This is independent of the native document version.
@@ -83,6 +84,27 @@ impl SketchPayload {
         self.authoring.as_ref()
     }
 
+    /// The names of the document variables this sketch's values follow
+    /// (ADR 0054). A link that does not read names nothing here; the
+    /// sketch's own validation refuses it.
+    #[must_use]
+    pub fn followed_variable_names(&self) -> BTreeSet<String> {
+        self.authoring
+            .iter()
+            .flat_map(SketchDefinition::value_links)
+            .filter_map(|link| artificer_sketch::expression::entry_names(&link.text).ok())
+            .flatten()
+            .collect()
+    }
+
+    /// Renames a variable wherever this sketch's values follow it. Returns
+    /// whether anything changed.
+    pub fn rename_followed_variable(&mut self, from: &str, to: &str) -> bool {
+        self.authoring
+            .as_mut()
+            .is_some_and(|authoring| authoring.rename_in_value_links(from, to))
+    }
+
     /// Validates defensive bounds and snapshot-independent support identity.
     ///
     /// Curve closure, winding, intersections, and tolerances remain kernel
@@ -120,12 +142,22 @@ pub enum SketchSupportRecipe {
         /// Document-level face identity; never a snapshot-local entity handle.
         face: PersistentRef,
     },
+    /// A construction plane (ADR 0048). The payload frame is the plane's frame
+    /// when the sketch was last replayed; replay reads the plane's current
+    /// one, so the sketch moves with the plane.
+    DatumPlane { plane: FeatureId },
 }
 
 impl SketchSupportRecipe {
     fn validate(&self) -> Result<(), SketchPayloadError> {
         match self {
             Self::Origin => Ok(()),
+            Self::DatumPlane { plane } => {
+                if plane.get() == 0 {
+                    return Err(SketchPayloadError::InvalidSupportPlane);
+                }
+                Ok(())
+            }
             Self::PlanarFace { body, face } => {
                 if body.get() == 0 {
                     return Err(SketchPayloadError::InvalidSupportBody);
@@ -142,8 +174,17 @@ impl SketchSupportRecipe {
     #[must_use]
     pub const fn body(&self) -> Option<BodyId> {
         match self {
-            Self::Origin => None,
+            Self::Origin | Self::DatumPlane { .. } => None,
             Self::PlanarFace { body, .. } => Some(*body),
+        }
+    }
+
+    /// The construction plane carrying this support, if it is plane-hosted.
+    #[must_use]
+    pub const fn plane(&self) -> Option<FeatureId> {
+        match self {
+            Self::DatumPlane { plane } => Some(*plane),
+            Self::Origin | Self::PlanarFace { .. } => None,
         }
     }
 
@@ -151,7 +192,7 @@ impl SketchSupportRecipe {
     #[must_use]
     pub const fn face(&self) -> Option<&PersistentRef> {
         match self {
-            Self::Origin => None,
+            Self::Origin | Self::DatumPlane { .. } => None,
             Self::PlanarFace { face, .. } => Some(face),
         }
     }
@@ -186,6 +227,8 @@ pub enum SketchPayloadError {
     InvalidSupportBody,
     #[error("a planar-face sketch support must target a face")]
     PlanarFaceTargetRequired,
+    #[error("a construction-plane sketch support must name a plane feature")]
+    InvalidSupportPlane,
     #[error(
         "unsupported persistent-reference version {found}; this build supports {CURRENT_PERSISTENT_REF_VERSION}"
     )]

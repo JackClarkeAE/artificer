@@ -9,12 +9,17 @@
 
 pub mod assembly;
 pub mod components;
+pub mod datum;
+pub mod datum_axis;
 pub mod kinematics;
+pub mod loft;
 pub mod parameterized;
 pub mod parameters;
 pub mod persistent;
+pub mod revolve;
 pub mod sketch_region;
 pub mod sketches;
+pub mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -32,6 +37,18 @@ pub use components::{
     ComponentDefinitionRevision, ComponentError, ComponentInstanceDraft, ComponentInstanceRecord,
     ComponentTranslation, RigidComponentPose,
 };
+pub use datum::{
+    CURRENT_DATUM_PLANE_RECIPE_VERSION, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef,
+    DatumPlaneBase, DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, OriginPlane,
+    ResolvedDatumPlane,
+};
+pub use datum_axis::{
+    CURRENT_DATUM_AXIS_RECIPE_VERSION, DatumAxisBase, DatumAxisError, DatumAxisPlane,
+    DatumAxisRecipe, DatumAxisResolver, ORIGIN_AXIS_HALF_LENGTH, ResolvedDatumAxis,
+};
+pub use loft::{
+    CURRENT_SKETCH_LOFT_RECIPE_VERSION, SketchLoft, SketchLoftError, SketchLoftSection,
+};
 pub use parameterized::{
     KernelParameterBinding, KernelReplayTemplate, KernelScalarTarget,
     MAX_KERNEL_PARAMETER_BINDINGS, ParameterizedKernel, ParameterizedKernelError,
@@ -43,6 +60,10 @@ pub use parameters::{
     ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, QuantityValue,
     format_parameter_binding, parameter_unit_suffix, parse_parameter_entry,
 };
+pub use revolve::{
+    CURRENT_SKETCH_REVOLVE_RECIPE_VERSION, OriginAxis, RevolveAxis, RevolveDirection,
+    RevolveExtent, SketchAxisDirection, SketchRevolve, SketchRevolveError,
+};
 pub use sketch_region::{
     CURRENT_SKETCH_REGION_RECIPE_VERSION, MAX_SELECTED_SKETCH_REGIONS, SketchRegionExtrusion,
     SketchRegionExtrusionTarget, SketchRegionRecipeError, SketchRegionResolveError,
@@ -52,6 +73,10 @@ pub use sketch_region::{
 pub use sketches::{
     CURRENT_SKETCH_PRECISION_POLICY_VERSION, SketchPayload, SketchPayloadError, SketchSupportRecipe,
 };
+pub use sweep::{
+    CURRENT_SKETCH_SWEEP_RECIPE_VERSION, MAX_SWEEP_PATH_CURVES, SketchSweep, SketchSweepError,
+    SweepPath,
+};
 
 /// Stable native document format marker.
 pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
@@ -59,14 +84,36 @@ pub const NATIVE_DOCUMENT_FORMAT: &str = "artificer.native.document";
 ///
 /// Version 4 introduced portable sketch payloads and typed parameterized
 /// kernel recipes. Version 5 adds the persistent assembly joint forest.
-/// Version 6 adds authoritative editable sketch-operation graphs.
-pub const CURRENT_DOCUMENT_VERSION: u32 = 6;
+/// Version 6 adds authoritative editable sketch-operation graphs. Version 7
+/// makes a construction plane a recipe rather than a marker (ADR 0048).
+/// Version 8 adds the loft between sketch sections (ADR 0051). Version 9
+/// lets an extrusion's distance follow a variable and a library part replay
+/// as the chain of kernel commands it was built from. Version 10 adds the
+/// revolve feature, the construction axis and the sweep (ADR 0055).
+pub const CURRENT_DOCUMENT_VERSION: u32 = 10;
 /// First native schema that requires exact portable sketch payloads.
 pub const PORTABLE_SKETCH_DOCUMENT_VERSION: u32 = 4;
 /// First native schema with a persistent assembly hierarchy and joint graph.
 pub const ASSEMBLY_JOINT_DOCUMENT_VERSION: u32 = 5;
 /// First native schema that requires an authoritative editable sketch graph.
 pub const EDITABLE_SKETCH_DOCUMENT_VERSION: u32 = 6;
+/// First native schema whose construction planes carry their own recipe.
+/// Older files hold plane markers, which the workbench migrates from the
+/// frames its workspace envelope kept for them.
+pub const DATUM_PLANE_DOCUMENT_VERSION: u32 = 7;
+/// First native schema that can hold a loft feature.
+pub const SKETCH_LOFT_DOCUMENT_VERSION: u32 = 8;
+/// First native schema whose extrusion distances can follow a variable and
+/// whose features can replay a chain of kernel commands.
+pub const LINKED_PARAMETER_DOCUMENT_VERSION: u32 = 9;
+/// First native schema that can hold a revolve feature.
+pub const SKETCH_REVOLVE_DOCUMENT_VERSION: u32 = 10;
+/// First native schema that can hold a construction axis.
+pub const DATUM_AXIS_DOCUMENT_VERSION: u32 = 10;
+/// First native schema that can hold a sweep feature.
+pub const SKETCH_SWEEP_DOCUMENT_VERSION: u32 = 10;
+/// The longest chain of kernel commands one feature may replay.
+pub const MAX_KERNEL_CHAIN_COMMANDS: usize = 1_024;
 /// Oldest native document schema this version can migrate in memory.
 pub const MIN_SUPPORTED_DOCUMENT_VERSION: u32 = 1;
 /// Hard ceiling for one document's ordered feature timeline.
@@ -124,6 +171,7 @@ stable_id!(JointId, "joint:");
 pub enum FeatureKind {
     Origin,
     DatumPlane,
+    DatumAxis,
     BaseBody,
     Sketch,
     Extrude,
@@ -131,6 +179,21 @@ pub enum FeatureKind {
     Cut,
     Transform,
     Boolean,
+    Loft,
+    Revolve,
+    Sweep,
+}
+
+impl FeatureKind {
+    /// Whether this kind of feature builds solid from a sketch's regions, and
+    /// so hides the sketch it has spent (see `auto_hide_sketch_consumed_by`).
+    #[must_use]
+    pub const fn consumes_sketches(self) -> bool {
+        matches!(
+            self,
+            Self::Extrude | Self::Add | Self::Cut | Self::Loft | Self::Revolve | Self::Sweep
+        )
+    }
 }
 
 /// Stable two-body Boolean intent. The target owns the successor snapshot;
@@ -198,9 +261,40 @@ pub enum ReplayAction {
     SketchRegionExtrusion(SketchRegionExtrusion),
     /// Two-snapshot native Boolean resolved by the replay coordinator.
     Boolean(BooleanFeatureRecipe),
+    /// A construction plane. It runs no kernel command; replay resolves where
+    /// its base now puts it (ADR 0048).
+    DatumPlane(DatumPlaneRecipe),
+    /// A construction axis (ADR 0055): its recipe, resolved against the model
+    /// as a rebuild reaches it. Like a plane it runs nothing.
+    DatumAxis(DatumAxisRecipe),
+    /// A loft whose sections are resolved from their sketches, on their
+    /// planes, immediately before replay (ADR 0051).
+    SketchLoft(SketchLoft),
+    /// A sweep of a sketch profile along a path drawn in another sketch,
+    /// resolved from both sketches immediately before replay (ADR 0055).
+    SketchSweep(SketchSweep),
+    /// A revolve whose regions and axis are resolved from its sketch, on its
+    /// plane, immediately before replay (ADR 0055).
+    SketchRevolve(SketchRevolve),
+    /// Kernel commands run in order, each on the result of the one before,
+    /// from the feature's input: a library part as its own recipe built it,
+    /// at the values it was inserted with. A command may name an entity of
+    /// a result made earlier in the chain, which the chain itself makes
+    /// again, so it needs no persistent target.
+    KernelChain(Vec<KernelCommand>),
 }
 
 impl ReplayAction {
+    /// Whether this action records a document fact without running the
+    /// kernel, so its feature's input and output snapshots are the same.
+    #[must_use]
+    pub const fn is_document_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Marker | Self::DatumPlane(_) | Self::DatumAxis(_)
+        )
+    }
+
     /// Resolves typed scalar bindings into an ordinary replay action.
     ///
     /// Marker and already-concrete actions are cloned unchanged. A successful
@@ -212,11 +306,41 @@ impl ReplayAction {
     ) -> Result<Self, ParameterizedKernelError> {
         match self {
             Self::ParameterizedKernel(recipe) => recipe.resolve(parameters),
+            Self::SketchRegionExtrusion(recipe) => recipe
+                .resolve_parameters(parameters)
+                .map(Self::SketchRegionExtrusion),
+            Self::SketchRevolve(recipe) => recipe
+                .resolve_parameters(parameters)
+                .map(Self::SketchRevolve),
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
-            | Self::SketchRegionExtrusion(_)
-            | Self::Boolean(_) => Ok(self.clone()),
+            | Self::Boolean(_)
+            | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
+            | Self::SketchLoft(_)
+            | Self::SketchSweep(_)
+            | Self::KernelChain(_) => Ok(self.clone()),
+        }
+    }
+
+    /// Whether replay must evaluate the document's variables first, because
+    /// a value in the recipe follows one.
+    #[must_use]
+    pub const fn reads_parameters(&self) -> bool {
+        match self {
+            Self::ParameterizedKernel(_) => true,
+            Self::SketchRegionExtrusion(recipe) => recipe.distance_expression.is_some(),
+            Self::SketchRevolve(recipe) => recipe.angle_expression.is_some(),
+            Self::Marker
+            | Self::TargetedKernel(_)
+            | Self::Kernel(_)
+            | Self::Boolean(_)
+            | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
+            | Self::SketchLoft(_)
+            | Self::SketchSweep(_)
+            | Self::KernelChain(_) => false,
         }
     }
 
@@ -227,13 +351,57 @@ impl ReplayAction {
         document: &ModelDocument,
         precision: artificer_protocol::PrecisionPolicy,
     ) -> Result<Self, SketchRegionResolveError> {
+        self.resolve_sketch_regions_with_planes(document, precision, &BTreeMap::new())
+    }
+
+    /// Resolves as [`Self::resolve_sketch_regions`] does, reading a sketch on
+    /// a construction plane in the frame `planes` holds for that plane. A
+    /// rebuild passes the planes it has resolved so far.
+    pub fn resolve_sketch_regions_with_planes(
+        &self,
+        document: &ModelDocument,
+        precision: artificer_protocol::PrecisionPolicy,
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> Result<Self, SketchRegionResolveError> {
+        self.resolve_sketch_regions_with_datums(document, precision, planes, &BTreeMap::new())
+    }
+
+    /// Resolves as [`Self::resolve_sketch_regions_with_planes`] does, and
+    /// turns a revolve about a construction axis where `axes` holds it. A
+    /// rebuild passes the planes and axes it has resolved so far; any other
+    /// is read where its recipe last put it.
+    pub fn resolve_sketch_regions_with_datums(
+        &self,
+        document: &ModelDocument,
+        precision: artificer_protocol::PrecisionPolicy,
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+        axes: &BTreeMap<FeatureId, ResolvedDatumAxis>,
+    ) -> Result<Self, SketchRegionResolveError> {
         match self {
-            Self::SketchRegionExtrusion(recipe) => recipe.resolve(document, precision),
+            Self::SketchRegionExtrusion(recipe) => {
+                let frame = document
+                    .sketch(recipe.sketch)
+                    .and_then(|record| {
+                        document.sketch_payload(recipe.sketch, record.geometry_revision)
+                    })
+                    .and_then(|payload| payload.support.plane())
+                    .and_then(|plane| planes.get(&plane))
+                    .map(|plane| plane.frame);
+                recipe.resolve_in_frame(document, precision, frame)
+            }
+            Self::SketchLoft(recipe) => recipe.resolve_with_planes(document, precision, planes),
+            Self::SketchSweep(recipe) => recipe.resolve_with_planes(document, precision, planes),
+            Self::SketchRevolve(recipe) => {
+                recipe.resolve_with_datums(document, precision, planes, axes)
+            }
             Self::Marker
             | Self::TargetedKernel(_)
             | Self::Kernel(_)
             | Self::ParameterizedKernel(_)
-            | Self::Boolean(_) => Ok(self.clone()),
+            | Self::Boolean(_)
+            | Self::DatumPlane(_)
+            | Self::DatumAxis(_)
+            | Self::KernelChain(_) => Ok(self.clone()),
         }
     }
 }
@@ -739,8 +907,27 @@ impl ModelDocument {
     ) -> Result<bool, DocumentError> {
         let previous = self.state.clone();
         let mut affected = self.state.parameters.affected_by(id);
+        let old_key = self
+            .state
+            .parameters
+            .get(id)
+            .map(|record| record.spec.key.clone());
+        let new_key = spec.key.clone();
         if !self.state.parameters.replace_spec(id, spec)? {
             return Ok(false);
+        }
+        // Sketch values name the variables they follow, so a renamed
+        // variable is renamed in every sketch revision that follows it.
+        if let Some(old_key) = old_key
+            && old_key != new_key
+        {
+            for feature in &mut self.state.features {
+                if feature.parameter_inputs.contains(&id)
+                    && let Some(payload) = feature.sketch_payload.as_mut()
+                {
+                    payload.rename_followed_variable(&old_key, &new_key);
+                }
+            }
         }
         if let Err(error) = validate_all_action_parameter_inputs(&self.state) {
             self.state = previous;
@@ -999,6 +1186,282 @@ impl ModelDocument {
         self.state.features.iter().find(|feature| feature.id == id)
     }
 
+    /// Whether `id` is a construction plane, whatever its recipe form.
+    #[must_use]
+    pub fn is_datum_plane(&self, id: FeatureId) -> bool {
+        self.feature(id)
+            .is_some_and(|feature| feature.kind == FeatureKind::DatumPlane)
+    }
+
+    /// A construction plane's recipe, when it has one. Planes from version 6
+    /// files are markers until the workbench migrates them.
+    #[must_use]
+    pub fn datum_plane(&self, id: FeatureId) -> Option<&DatumPlaneRecipe> {
+        self.feature(id).and_then(|feature| match &feature.action {
+            ReplayAction::DatumPlane(recipe) if feature.kind == FeatureKind::DatumPlane => {
+                Some(recipe)
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether `id` is a construction axis.
+    #[must_use]
+    pub fn is_datum_axis(&self, id: FeatureId) -> bool {
+        self.feature(id)
+            .is_some_and(|feature| feature.kind == FeatureKind::DatumAxis)
+    }
+
+    /// A construction axis's recipe.
+    #[must_use]
+    pub fn datum_axis(&self, id: FeatureId) -> Option<&DatumAxisRecipe> {
+        self.feature(id).and_then(|feature| match &feature.action {
+            ReplayAction::DatumAxis(recipe) if feature.kind == FeatureKind::DatumAxis => {
+                Some(recipe)
+            }
+            _ => None,
+        })
+    }
+
+    /// Writes where a rebuild found each construction axis into its recipe's
+    /// cache, as [`Self::refresh_datum_plane_frames`] does for planes.
+    /// Returns whether anything moved.
+    pub fn refresh_datum_axis_lines(
+        &mut self,
+        resolved: &BTreeMap<FeatureId, ResolvedDatumAxis>,
+    ) -> bool {
+        let changed = self.state.features.iter().any(|feature| {
+            matches!(&feature.action, ReplayAction::DatumAxis(recipe)
+                if resolved.get(&feature.id).is_some_and(|axis| recipe.cached() != *axis))
+        });
+        if !changed {
+            return false;
+        }
+        for feature in &mut self.state.features {
+            if let ReplayAction::DatumAxis(recipe) = &mut feature.action
+                && let Some(axis) = resolved.get(&feature.id)
+            {
+                recipe.origin = axis.origin;
+                recipe.direction = axis.direction;
+                recipe.half_length = axis.half_length;
+            }
+        }
+        // The lines are what the committed rebuild used, so this shares the
+        // rebuild's revision bump rather than being an edit of its own.
+        self.bump_revision();
+        true
+    }
+
+    /// Deletes a construction axis nothing is built on, as
+    /// [`Self::remove_datum_plane`] deletes a plane.
+    pub fn remove_datum_axis(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        if !self.is_datum_axis(id) {
+            return Err(DocumentError::NotADatumAxis(id));
+        }
+        self.remove_construction_feature(id)
+    }
+
+    /// The features that depend on `id` directly.
+    #[must_use]
+    pub fn dependents_of(&self, id: FeatureId) -> Vec<FeatureId> {
+        self.state
+            .features
+            .iter()
+            .filter(|feature| feature.dependencies.contains(&id))
+            .map(|feature| feature.id)
+            .collect()
+    }
+
+    /// The frame a sketch is drawn in, as the document now stands: a sketch
+    /// on a construction plane is in that plane's last resolved frame, and
+    /// every other sketch is in its payload's.
+    #[must_use]
+    pub fn sketch_frame(&self, id: SketchId) -> Option<artificer_protocol::PlanarFrame3> {
+        let record = self.sketch(id)?;
+        let payload = self.sketch_payload(id, record.geometry_revision)?;
+        Some(
+            payload
+                .support
+                .plane()
+                .and_then(|plane| self.datum_plane(plane))
+                .map_or(payload.frame, |recipe| recipe.frame),
+        )
+    }
+
+    /// Shows or hides a construction plane. Visibility is part of the recipe,
+    /// so this is an undoable edit that saving picks up; it moves nothing, so
+    /// it dirties no rebuild.
+    pub fn set_datum_plane_visible(
+        &mut self,
+        id: FeatureId,
+        visible: bool,
+    ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        let ReplayAction::DatumPlane(recipe) = &feature.action else {
+            return Err(DocumentError::NotADatumPlane(id));
+        };
+        if recipe.visible == visible {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        if let ReplayAction::DatumPlane(recipe) = &mut self.state.features[index].action {
+            recipe.visible = visible;
+        }
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Shows or hides a construction axis. Nothing is rebuilt: visibility is
+    /// how the axis is drawn, not where it is. Returns whether it changed.
+    pub fn set_datum_axis_visible(
+        &mut self,
+        id: FeatureId,
+        visible: bool,
+    ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        let ReplayAction::DatumAxis(recipe) = &feature.action else {
+            return Err(DocumentError::NotADatumAxis(id));
+        };
+        if recipe.visible == visible {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        if let ReplayAction::DatumAxis(recipe) = &mut self.state.features[index].action {
+            recipe.visible = visible;
+        }
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces the frames cached in construction-plane recipes, and in the
+    /// payloads of the sketches drawn on them, with the ones a replay just
+    /// resolved. Nothing is rebuilt: the frames are the ones the rebuild
+    /// already used. One undo checkpoint covers the whole refresh.
+    pub fn refresh_datum_plane_frames(
+        &mut self,
+        resolved: &BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> bool {
+        let changed = |recipe: &DatumPlaneRecipe, plane: &ResolvedDatumPlane| {
+            recipe.frame != plane.frame || recipe.half_extent != plane.half_extent
+        };
+        let planes_changed = self.state.features.iter().any(|feature| {
+            matches!(&feature.action, ReplayAction::DatumPlane(recipe)
+                if resolved.get(&feature.id).is_some_and(|plane| changed(recipe, plane)))
+        });
+        let sketches_changed = self.state.features.iter().any(|feature| {
+            feature.sketch_payload.as_ref().is_some_and(|payload| {
+                payload
+                    .support
+                    .plane()
+                    .and_then(|plane| resolved.get(&plane))
+                    .is_some_and(|plane| payload.frame != plane.frame)
+            })
+        });
+        if !planes_changed && !sketches_changed {
+            return false;
+        }
+        for feature in &mut self.state.features {
+            if let ReplayAction::DatumPlane(recipe) = &mut feature.action
+                && let Some(plane) = resolved.get(&feature.id)
+            {
+                recipe.frame = plane.frame;
+                recipe.half_extent = plane.half_extent;
+            }
+            if let Some(payload) = feature.sketch_payload.as_mut()
+                && let Some(plane) = payload
+                    .support
+                    .plane()
+                    .and_then(|plane| resolved.get(&plane))
+            {
+                payload.frame = plane.frame;
+            }
+        }
+        // The frames are what the committed rebuild used, so this is the same
+        // edit rather than a new one: it shares the rebuild's revision bump.
+        self.bump_revision();
+        true
+    }
+
+    /// Gives construction planes loaded as version 6 markers the recipes the
+    /// workbench rebuilt for them from its workspace envelope (ADR 0048).
+    ///
+    /// This is part of loading, not an edit: it takes no undo checkpoint and
+    /// dirties nothing, because the planes are where they already were. A
+    /// recipe for a feature that is not a plane marker is ignored, and one
+    /// that does not validate is refused before anything changes.
+    pub fn adopt_legacy_datum_planes(
+        &mut self,
+        recipes: BTreeMap<FeatureId, DatumPlaneRecipe>,
+    ) -> Result<usize, DocumentError> {
+        for recipe in recipes.values() {
+            recipe.validate()?;
+            if !recipe.base.bodies().is_empty()
+                || matches!(recipe.base, DatumPlaneBase::Plane { .. })
+            {
+                return Err(DocumentError::InvalidDatumPlaneFeature);
+            }
+        }
+        let mut adopted = 0;
+        for feature in &mut self.state.features {
+            if feature.kind == FeatureKind::DatumPlane
+                && feature.action == ReplayAction::Marker
+                && let Some(recipe) = recipes.get(&feature.id)
+            {
+                feature.action = ReplayAction::DatumPlane(recipe.clone());
+                adopted += 1;
+            }
+        }
+        Ok(adopted)
+    }
+
+    /// Deletes a construction plane that nothing depends on.
+    ///
+    /// This is the history's only deletion, and it is deliberately narrow: a
+    /// plane produces no body and no snapshot, so removing one that nothing
+    /// is built on cannot change any result. A plane something depends on is
+    /// refused with the first dependent's identity.
+    pub fn remove_datum_plane(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        if !self.is_datum_plane(id) {
+            return Err(DocumentError::NotADatumPlane(id));
+        }
+        self.remove_construction_feature(id)
+    }
+
+    /// Removes a plane or an axis: it produces no body and no snapshot, so
+    /// removing one nothing is built on changes no result.
+    fn remove_construction_feature(&mut self, id: FeatureId) -> Result<FeatureNode, DocumentError> {
+        let index = self.feature_index(id)?;
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        if let Some(dependent) = self.dependents_of(id).first().copied() {
+            return Err(DocumentError::FeatureInUse {
+                feature: id,
+                dependent,
+            });
+        }
+        let previous = self.state.clone();
+        if self.state.history_cursor == HistoryCursor::After(id) {
+            self.state.history_cursor = match index.checked_sub(1) {
+                Some(before) => HistoryCursor::After(self.state.features[before].id),
+                None => HistoryCursor::Start,
+            };
+        }
+        let removed = self.state.features.remove(index);
+        reconcile_active_object_state(&mut self.state);
+        self.finish_user_edit(previous);
+        Ok(removed)
+    }
+
     #[must_use]
     pub fn body(&self, id: BodyId) -> Option<&BodyRecord> {
         self.state.bodies.iter().find(|body| body.id == id)
@@ -1045,7 +1508,42 @@ impl ModelDocument {
         sketch: SketchId,
         payload: SketchPayload,
     ) -> Result<bool, DocumentError> {
+        let Some(previous) = self.install_sketch_payload(sketch, payload)? else {
+            return Ok(false);
+        };
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces a sketch's payload with the one its linked values come to
+    /// after a variable changed (ADR 0054).
+    ///
+    /// It is the same replacement as [`Self::replace_sketch_payload`], made
+    /// as part of the variable change that caused it rather than as an edit
+    /// of its own: it adds no undo step, so one undo takes back the variable
+    /// and every sketch that followed it together.
+    pub fn follow_variables_in_sketch(
+        &mut self,
+        sketch: SketchId,
+        payload: SketchPayload,
+    ) -> Result<bool, DocumentError> {
+        if self.install_sketch_payload(sketch, payload)?.is_none() {
+            return Ok(false);
+        }
+        self.bump_revision();
+        Ok(true)
+    }
+
+    /// Installs a new payload for a sketch's current revision, returning
+    /// the state before it when anything changed. The sketch feature reads
+    /// exactly the variables its values follow.
+    fn install_sketch_payload(
+        &mut self,
+        sketch: SketchId,
+        payload: SketchPayload,
+    ) -> Result<Option<DocumentState>, DocumentError> {
         payload.validate()?;
+        let parameter_inputs = followed_parameters(&payload, &self.state.parameters)?;
         let sketch_index = self.sketch_index(sketch)?;
         let record = &self.state.sketches[sketch_index];
         if record.read_only {
@@ -1076,12 +1574,18 @@ impl ModelDocument {
                     }
                 }
             }
-            SketchSupportRecipe::Origin | SketchSupportRecipe::PlanarFace { .. } => {
+            SketchSupportRecipe::DatumPlane { plane }
+                if record.support_body.is_none()
+                    && feature.dependencies.contains(plane)
+                    && self.is_datum_plane(*plane) => {}
+            SketchSupportRecipe::Origin
+            | SketchSupportRecipe::PlanarFace { .. }
+            | SketchSupportRecipe::DatumPlane { .. } => {
                 return Err(DocumentError::SketchSupportMismatch);
             }
         }
         if feature.sketch_payload.as_ref() == Some(&payload) {
-            return Ok(false);
+            return Ok(None);
         }
         let next_revision = record
             .geometry_revision
@@ -1102,14 +1606,14 @@ impl ModelDocument {
         let previous = self.state.clone();
         let feature = &mut self.state.features[feature_index];
         feature.sketch_payload = Some(payload);
+        feature.parameter_inputs = parameter_inputs;
         feature.outputs[0] = FeatureOutput::Sketch {
             sketch,
             geometry_revision: next_revision,
         };
         self.state.sketches[sketch_index].geometry_revision = next_revision;
         self.mark_branch_dirty(feature_index);
-        self.finish_user_edit(previous);
-        Ok(true)
+        Ok(Some(previous))
     }
 
     #[must_use]
@@ -1152,6 +1656,19 @@ impl ModelDocument {
         true
     }
 
+    /// Takes the last edit back as if it had never been made: unlike
+    /// [`Self::undo`] it leaves nothing to redo. This is for an edit whose
+    /// consequences turned out to be refused — a variable no sketch that
+    /// follows it can take — so the refusal cannot be redone by accident.
+    pub fn abandon_last_edit(&mut self) -> bool {
+        let Some(previous) = self.undo.pop_back() else {
+            return false;
+        };
+        self.state = previous;
+        self.bump_revision();
+        true
+    }
+
     pub fn redo(&mut self) -> bool {
         let Some(next) = self.redo.pop_back() else {
             return false;
@@ -1174,7 +1691,24 @@ impl ModelDocument {
             return Err(DocumentError::HistoryCursorNotAtEnd);
         }
         validate_replay_action(&draft.action)?;
+        validate_action_kind(draft.kind, &draft.action)?;
+        // A new plane always carries its recipe; only planes loaded from
+        // version 6 files are markers, and those are migrated on load.
+        if draft.kind == FeatureKind::DatumPlane
+            && (!matches!(draft.action, ReplayAction::DatumPlane(_)) || !draft.outputs.is_empty())
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
+        if draft.kind == FeatureKind::DatumAxis && !draft.outputs.is_empty() {
+            return Err(DocumentError::InvalidDatumAxisFeature);
+        }
         validate_label(&draft.label)?;
+        // A sketch reads exactly the variables its values follow.
+        if draft.kind == FeatureKind::Sketch
+            && let Some(payload) = &draft.sketch_payload
+        {
+            draft.parameter_inputs = followed_parameters(payload, &self.state.parameters)?;
+        }
         validate_reference_count("inputs", draft.inputs.len())?;
         validate_reference_count("parameter inputs", draft.parameter_inputs.len())?;
         validate_reference_count("dependencies", draft.dependencies.len())?;
@@ -1355,7 +1889,7 @@ impl ModelDocument {
         let primary_branch = boolean_recipe
             .map(|recipe| recipe.target)
             .or_else(|| existing_branches.first().copied());
-        if draft.action != ReplayAction::Marker
+        if !draft.action.is_document_only()
             && let Some(body) = primary_branch
             && !draft.outputs.contains(&OutputDraft::ModifyBody(body))
         {
@@ -1371,7 +1905,7 @@ impl ModelDocument {
             }) {
                 return Err(DocumentError::UnavailableDependency(dependency));
             }
-            if draft.action == ReplayAction::Marker && committed.input != committed.output {
+            if draft.action.is_document_only() && committed.input != committed.output {
                 return Err(DocumentError::MarkerChangedSnapshot);
             }
             let expected_input = if let Some(body) = primary_branch {
@@ -1596,6 +2130,7 @@ impl ModelDocument {
         if self.state.features[index].state.read_only {
             return Err(DocumentError::ReadOnlyFeature(id));
         }
+        validate_action_kind(self.state.features[index].kind, &action)?;
         validate_action_parameter_inputs(
             &action,
             &self.state.features[index].parameter_inputs,
@@ -1607,6 +2142,117 @@ impl ModelDocument {
         }
         let previous = self.state.clone();
         self.state.features[index].action = action;
+        self.mark_branch_dirty(index);
+        self.finish_user_edit(previous);
+        Ok(true)
+    }
+
+    /// Replaces a feature's action together with the other features it names
+    /// as inputs — an extrusion that now ends at a plane, or no longer does.
+    ///
+    /// Only feature inputs may change here. A body or sketch input names the
+    /// state its producer left, which is fixed by the feature's place in the
+    /// history; a feature input names the feature itself, which must come
+    /// earlier. Dependencies follow the inputs that were added or dropped.
+    pub fn replace_feature_action_and_inputs(
+        &mut self,
+        id: FeatureId,
+        action: ReplayAction,
+        inputs: Vec<FeatureInput>,
+    ) -> Result<bool, DocumentError> {
+        let index = self.feature_index(id)?;
+        let parameter_inputs = self.state.features[index].parameter_inputs.clone();
+        self.replace_feature_recipe(id, action, inputs, parameter_inputs)
+    }
+
+    /// Replaces a feature's action, its feature inputs, and the variables it
+    /// reads — an extrusion whose distance now follows a variable, or no
+    /// longer does. The rules for inputs are those of
+    /// [`Self::replace_feature_action_and_inputs`]; the variables must be
+    /// exactly the ones the action names.
+    pub fn replace_feature_recipe(
+        &mut self,
+        id: FeatureId,
+        action: ReplayAction,
+        inputs: Vec<FeatureInput>,
+        parameter_inputs: Vec<ParameterId>,
+    ) -> Result<bool, DocumentError> {
+        validate_replay_action(&action)?;
+        let index = self.feature_index(id)?;
+        validate_reference_count("parameter inputs", parameter_inputs.len())?;
+        if let Some(unknown) = parameter_inputs
+            .iter()
+            .find(|parameter| self.state.parameters.get(**parameter).is_none())
+        {
+            return Err(DocumentError::UnknownParameter(*unknown));
+        }
+        let feature = &self.state.features[index];
+        if feature.state.read_only {
+            return Err(DocumentError::ReadOnlyFeature(id));
+        }
+        validate_action_kind(feature.kind, &action)?;
+        validate_reference_count("inputs", inputs.len())?;
+        ensure_unique(inputs.iter().copied(), "feature inputs")?;
+        let is_feature = |input: &&FeatureInput| matches!(input, FeatureInput::Feature(_));
+        let old_others = feature
+            .inputs
+            .iter()
+            .filter(|input| !is_feature(input))
+            .collect::<BTreeSet<_>>();
+        let new_others = inputs
+            .iter()
+            .filter(|input| !is_feature(input))
+            .collect::<BTreeSet<_>>();
+        if old_others != new_others {
+            return Err(DocumentError::InvalidArchive(
+                "only feature inputs can change after a feature is made",
+            ));
+        }
+        let positions = self.feature_positions();
+        let named = |inputs: &[FeatureInput]| {
+            inputs
+                .iter()
+                .filter_map(|input| match input {
+                    FeatureInput::Feature(feature) => Some(*feature),
+                    FeatureInput::Body(_) | FeatureInput::Sketch(_) => None,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let before = named(&feature.inputs);
+        let after = named(&inputs);
+        for added in after.difference(&before) {
+            match positions.get(added) {
+                None => return Err(DocumentError::UnknownFeature(*added)),
+                Some(position) if *position >= index => {
+                    return Err(DocumentError::FeatureBeyondHistoryCursor(*added));
+                }
+                Some(_) => {}
+            }
+        }
+        validate_action_parameter_inputs(&action, &parameter_inputs, &self.state.parameters)?;
+        validate_action_feature_inputs(&action, &inputs)?;
+        if feature.action == action
+            && feature.inputs == inputs
+            && feature.parameter_inputs == parameter_inputs
+        {
+            return Ok(false);
+        }
+        let mut dependencies = feature
+            .dependencies
+            .iter()
+            .copied()
+            .filter(|dependency| !before.contains(dependency) || after.contains(dependency))
+            .chain(after.iter().copied())
+            .collect::<Vec<_>>();
+        dependencies
+            .sort_by_key(|dependency| positions.get(dependency).copied().unwrap_or(usize::MAX));
+        dependencies.dedup();
+        let previous = self.state.clone();
+        let node = &mut self.state.features[index];
+        node.action = action;
+        node.inputs = inputs;
+        node.parameter_inputs = parameter_inputs;
+        node.dependencies = dependencies;
         self.mark_branch_dirty(index);
         self.finish_user_edit(previous);
         Ok(true)
@@ -1693,10 +2339,7 @@ impl ModelDocument {
             .ok_or(DocumentError::UnavailableDependency(consumer))?;
         if feature.committed.is_none()
             || feature.state.suppressed
-            || !matches!(
-                feature.kind,
-                FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-            )
+            || !feature.kind.consumes_sketches()
             || !feature.inputs.contains(&FeatureInput::Sketch(sketch))
         {
             return Err(DocumentError::UnavailableDependency(consumer));
@@ -2292,6 +2935,14 @@ impl ModelDocument {
                 return Err(DocumentError::SketchSupportMismatch);
             }
             SketchSupportRecipe::Origin => {}
+            SketchSupportRecipe::DatumPlane { plane } => {
+                if !branches.is_empty()
+                    || !self.is_datum_plane(*plane)
+                    || !draft.inputs.contains(&FeatureInput::Feature(*plane))
+                {
+                    return Err(DocumentError::SketchSupportMismatch);
+                }
+            }
             SketchSupportRecipe::PlanarFace { body, face } => {
                 if self.body(*body).is_none() {
                     return Err(DocumentError::UnknownBody(*body));
@@ -2529,7 +3180,7 @@ impl RebuildTransaction {
             .ok_or(DocumentError::RebuildAlreadyComplete)?;
         let expected = next_step.feature;
         let branches = next_step.branches.clone();
-        let marker = next_step.action == ReplayAction::Marker;
+        let marker = next_step.action.is_document_only();
         if feature != expected {
             return Err(DocumentError::RebuildOutOfOrder {
                 expected,
@@ -2651,6 +3302,45 @@ pub enum DocumentError {
     SketchPayload(#[from] SketchPayloadError),
     #[error(transparent)]
     SketchRegionRecipe(#[from] SketchRegionRecipeError),
+    #[error(transparent)]
+    DatumPlane(#[from] DatumPlaneError),
+    #[error("invalid loft: {0}")]
+    SketchLoft(#[from] SketchLoftError),
+    #[error("a loft feature must carry a loft recipe, and a loft recipe must be a loft feature")]
+    InvalidLoftFeature,
+    #[error("invalid revolve: {0}")]
+    SketchRevolve(#[from] SketchRevolveError),
+    #[error("invalid sweep: {0}")]
+    SketchSweep(#[from] SketchSweepError),
+    #[error(
+        "a sweep feature must carry a sweep recipe, and a sweep recipe must be a sweep feature"
+    )]
+    InvalidSweepFeature,
+    #[error(
+        "a revolve feature must carry a revolve recipe, and a revolve recipe must be a revolve feature"
+    )]
+    InvalidRevolveFeature,
+    #[error("a kernel chain must hold between one and {MAX_KERNEL_CHAIN_COMMANDS} commands")]
+    InvalidKernelChain,
+    #[error("a sketch value follows {0:?}, which is not a variable of this document")]
+    UnknownSketchVariable(String),
+    #[error("a construction plane must be a construction-plane feature with a plane recipe")]
+    InvalidDatumPlaneFeature,
+    #[error("{0} is not a construction plane")]
+    NotADatumPlane(FeatureId),
+    #[error("invalid construction axis: {0}")]
+    DatumAxis(#[from] DatumAxisError),
+    #[error("a construction axis must be a construction-axis feature with an axis recipe")]
+    InvalidDatumAxisFeature,
+    #[error("{0} is not a construction axis")]
+    NotADatumAxis(FeatureId),
+    #[error("an extrusion's end plane {0} must be declared as a feature input")]
+    EndPlaneMustBeInput(FeatureId),
+    #[error("{dependent} depends on {feature}")]
+    FeatureInUse {
+        feature: FeatureId,
+        dependent: FeatureId,
+    },
     #[error("new sketch features require an exact portable sketch payload")]
     SketchPayloadRequired,
     #[error("only sketch features may carry a portable sketch payload")]
@@ -2774,7 +3464,7 @@ fn validate_label(label: &str) -> Result<(), DocumentError> {
     }
 }
 
-fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
+pub(crate) fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
     match action {
         ReplayAction::Kernel(
             KernelCommand::ExtrudeFaceProfile { .. }
@@ -2792,6 +3482,18 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
         ReplayAction::Boolean(recipe) if recipe.target == recipe.tool => {
             Err(DocumentError::InvalidBooleanFeature)
         }
+        ReplayAction::DatumPlane(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::DatumAxis(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchLoft(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchSweep(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::SketchRevolve(recipe) => recipe.validate().map_err(Into::into),
+        ReplayAction::KernelChain(commands) => {
+            if commands.is_empty() || commands.len() > MAX_KERNEL_CHAIN_COMMANDS {
+                Err(DocumentError::InvalidKernelChain)
+            } else {
+                Ok(())
+            }
+        }
         ReplayAction::Marker
         | ReplayAction::Kernel(_)
         | ReplayAction::TargetedKernel(_)
@@ -2799,13 +3501,89 @@ fn validate_replay_action(action: &ReplayAction) -> Result<(), DocumentError> {
     }
 }
 
+fn validate_action_kind(kind: FeatureKind, action: &ReplayAction) -> Result<(), DocumentError> {
+    if matches!(action, ReplayAction::DatumPlane(_)) && kind != FeatureKind::DatumPlane {
+        return Err(DocumentError::InvalidDatumPlaneFeature);
+    }
+    if matches!(action, ReplayAction::DatumAxis(_)) != (kind == FeatureKind::DatumAxis) {
+        return Err(DocumentError::InvalidDatumAxisFeature);
+    }
+    // A loft is the only thing that can build a loft feature, and the other
+    // way round: the history names features by what they are.
+    if matches!(action, ReplayAction::SketchLoft(_)) != (kind == FeatureKind::Loft) {
+        return Err(DocumentError::InvalidLoftFeature);
+    }
+    if matches!(action, ReplayAction::SketchRevolve(_)) != (kind == FeatureKind::Revolve) {
+        return Err(DocumentError::InvalidRevolveFeature);
+    }
+    if matches!(action, ReplayAction::SketchSweep(_)) != (kind == FeatureKind::Sweep) {
+        return Err(DocumentError::InvalidSweepFeature);
+    }
+    Ok(())
+}
+
 fn validate_action_parameter_inputs(
     action: &ReplayAction,
     parameter_inputs: &[ParameterId],
     parameters: &ParameterTable,
 ) -> Result<(), DocumentError> {
-    if let ReplayAction::ParameterizedKernel(recipe) = action {
-        recipe.validate_parameter_inputs(parameter_inputs, parameters)?;
+    match action {
+        ReplayAction::ParameterizedKernel(recipe) => {
+            recipe.validate_parameter_inputs(parameter_inputs, parameters)?;
+        }
+        // An extrusion reads exactly the variables its distance names, so
+        // changing any of them rebuilds it and none can be deleted under it.
+        ReplayAction::SketchRegionExtrusion(recipe) => {
+            let declared = parameter_inputs.iter().copied().collect::<BTreeSet<_>>();
+            if declared.len() != parameter_inputs.len() {
+                return Err(ParameterizedKernelError::DuplicateParameterInput.into());
+            }
+            if declared != recipe.parameter_references() {
+                return Err(ParameterizedKernelError::ParameterInputMismatch.into());
+            }
+            if let Some(expression) = &recipe.distance_expression {
+                match parameters.expression_type(expression) {
+                    Ok(ParameterType::Quantity(QuantityKind::Length)) => {}
+                    Ok(_) => return Err(ParameterizedKernelError::DistanceNotALength.into()),
+                    Err(error) => {
+                        return Err(ParameterizedKernelError::DistanceExpression(
+                            error.to_string(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        // A revolve reads exactly the variables its angle names.
+        ReplayAction::SketchRevolve(recipe) => {
+            let declared = parameter_inputs.iter().copied().collect::<BTreeSet<_>>();
+            if declared.len() != parameter_inputs.len() {
+                return Err(ParameterizedKernelError::DuplicateParameterInput.into());
+            }
+            if declared != recipe.parameter_references() {
+                return Err(ParameterizedKernelError::ParameterInputMismatch.into());
+            }
+            if let Some(expression) = &recipe.angle_expression {
+                match parameters.expression_type(expression) {
+                    Ok(ParameterType::Quantity(QuantityKind::Angle)) => {}
+                    Ok(_) => return Err(ParameterizedKernelError::AngleNotAnAngle.into()),
+                    Err(error) => {
+                        return Err(
+                            ParameterizedKernelError::AngleExpression(error.to_string()).into()
+                        );
+                    }
+                }
+            }
+        }
+        ReplayAction::Marker
+        | ReplayAction::TargetedKernel(_)
+        | ReplayAction::Kernel(_)
+        | ReplayAction::Boolean(_)
+        | ReplayAction::DatumPlane(_)
+        | ReplayAction::DatumAxis(_)
+        | ReplayAction::SketchLoft(_)
+        | ReplayAction::SketchSweep(_)
+        | ReplayAction::KernelChain(_) => {}
     }
     Ok(())
 }
@@ -2814,10 +3592,67 @@ fn validate_action_feature_inputs(
     action: &ReplayAction,
     feature_inputs: &[FeatureInput],
 ) -> Result<(), DocumentError> {
-    if let ReplayAction::SketchRegionExtrusion(recipe) = action
-        && !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch))
-    {
-        return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+    if let ReplayAction::SketchRegionExtrusion(recipe) = action {
+        if !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch)) {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+        }
+        // A side that ends at a plane is measured to it on every replay, so
+        // the plane is an input: moving it rebuilds the extrusion.
+        if let Some(plane) = recipe
+            .end_planes()
+            .find(|plane| !feature_inputs.contains(&FeatureInput::Feature(*plane)))
+        {
+            return Err(DocumentError::EndPlaneMustBeInput(plane));
+        }
+    }
+    // Every section is read from its sketch on every replay, so every sketch
+    // is an input; an add or a cut changes a body, which is its branch.
+    if let ReplayAction::SketchLoft(recipe) = action {
+        if let Some(sketch) = recipe
+            .sketches()
+            .find(|sketch| !feature_inputs.contains(&FeatureInput::Sketch(*sketch)))
+        {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(sketch));
+        }
+        if recipe.operation != artificer_protocol::LoftOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchLoftError::MissingTargetBody.into());
+        }
+    }
+    // A sweep reads its profile's sketch and its path's on every replay; an
+    // add or a cut changes a body, which is its branch.
+    if let ReplayAction::SketchSweep(recipe) = action {
+        if let Some(sketch) = recipe
+            .sketches()
+            .into_iter()
+            .find(|sketch| !feature_inputs.contains(&FeatureInput::Sketch(*sketch)))
+        {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(sketch));
+        }
+        if recipe.operation != artificer_protocol::SolidOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchSweepError::MissingTargetBody.into());
+        }
+    }
+    // A revolve reads its sketch on every replay; an add or a cut changes a
+    // body, which is its branch.
+    if let ReplayAction::SketchRevolve(recipe) = action {
+        if !feature_inputs.contains(&FeatureInput::Sketch(recipe.sketch)) {
+            return Err(DocumentError::SketchRegionSourceMustBeInput(recipe.sketch));
+        }
+        if recipe.operation != artificer_protocol::SolidOperation::New
+            && !feature_inputs
+                .iter()
+                .any(|input| matches!(input, FeatureInput::Body(_)))
+        {
+            return Err(SketchRevolveError::MissingTargetBody.into());
+        }
     }
     if let ReplayAction::Boolean(recipe) = action
         && (!feature_inputs.contains(&FeatureInput::Body(recipe.target))
@@ -2825,7 +3660,69 @@ fn validate_action_feature_inputs(
     {
         return Err(DocumentError::InvalidBooleanFeature);
     }
+    // A plane reads the body its base names as it stands at the plane's place
+    // in the history, so that body is its branch; a plane on another plane
+    // reads that plane. A midplane across two bodies takes the first as its
+    // branch and depends on the second, because one feature has one branch.
+    if let ReplayAction::DatumPlane(recipe) = action {
+        if let Some(body) = recipe.base.bodies().first()
+            && !feature_inputs.contains(&FeatureInput::Body(*body))
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
+        if let DatumPlaneBase::Plane { plane } = recipe.base
+            && !feature_inputs.contains(&FeatureInput::Feature(plane))
+        {
+            return Err(DocumentError::InvalidDatumPlaneFeature);
+        }
+    }
+    // An axis reads the body its base names, and any plane it is the
+    // meeting of, as a plane does.
+    if let ReplayAction::DatumAxis(recipe) = action {
+        if let Some(body) = recipe.base.bodies().first()
+            && !feature_inputs.contains(&FeatureInput::Body(*body))
+        {
+            return Err(DocumentError::InvalidDatumAxisFeature);
+        }
+        if recipe
+            .base
+            .planes()
+            .into_iter()
+            .any(|plane| !feature_inputs.contains(&FeatureInput::Feature(plane)))
+        {
+            return Err(DocumentError::InvalidDatumAxisFeature);
+        }
+    }
+    // A revolve about a construction axis reads that axis, so moving the
+    // axis rebuilds it and the axis cannot be deleted from under it.
+    if let ReplayAction::SketchRevolve(recipe) = action
+        && let RevolveAxis::DatumAxis { axis } = recipe.axis
+        && !feature_inputs.contains(&FeatureInput::Feature(axis))
+    {
+        return Err(DocumentError::InvalidRevolveFeature);
+    }
     Ok(())
+}
+
+/// The document variables a sketch's values follow, by id, in order. A
+/// name the document does not have is refused.
+fn followed_parameters(
+    payload: &SketchPayload,
+    parameters: &ParameterTable,
+) -> Result<Vec<ParameterId>, DocumentError> {
+    let mut followed = payload
+        .followed_variable_names()
+        .into_iter()
+        .map(|name| {
+            parameters
+                .get_by_key(&name)
+                .map(|record| record.id)
+                .ok_or(DocumentError::UnknownSketchVariable(name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    followed.sort_unstable();
+    followed.dedup();
+    Ok(followed)
 }
 
 fn validate_all_action_parameter_inputs(state: &DocumentState) -> Result<(), DocumentError> {
@@ -3063,6 +3960,19 @@ fn validate_loaded_sketch_payload(
             if !branches.is_empty() || sketch_record.support_body.is_some() {
                 return Err(DocumentError::InvalidArchive(
                     "an origin sketch payload is attached to a body branch",
+                ));
+            }
+        }
+        SketchSupportRecipe::DatumPlane { plane } => {
+            if !branches.is_empty()
+                || sketch_record.support_body.is_some()
+                || !feature.dependencies.contains(plane)
+                || positions
+                    .get(plane)
+                    .is_none_or(|plane_index| *plane_index >= feature_index)
+            {
+                return Err(DocumentError::InvalidArchive(
+                    "a construction-plane sketch must follow and depend on its plane",
                 ));
             }
         }
@@ -3408,6 +4318,9 @@ fn validate_loaded_state(
                 "a feature references a missing parameter",
             ));
         }
+        validate_action_kind(feature.kind, &feature.action).map_err(|_| {
+            DocumentError::InvalidArchive("a plane recipe is on a feature that is not a plane")
+        })?;
         validate_replay_action(&feature.action).map_err(|error| match error {
             DocumentError::PersistentTargetRequired => DocumentError::InvalidArchive(
                 "raw entity-targeting commands require a persistent target recipe",
@@ -3432,6 +4345,23 @@ fn validate_loaded_state(
                 "parameterized replay inputs or declared parameter types are invalid",
             )
         })?;
+        if feature.kind == FeatureKind::Sketch {
+            let followed = match &feature.sketch_payload {
+                Some(payload) => followed_parameters(payload, &state.parameters).map_err(|_| {
+                    DocumentError::InvalidArchive(
+                        "a sketch value follows a variable the document does not have",
+                    )
+                })?,
+                None => Vec::new(),
+            };
+            let mut declared = feature.parameter_inputs.clone();
+            declared.sort_unstable();
+            if declared != followed {
+                return Err(DocumentError::InvalidArchive(
+                    "a sketch's variable inputs are not the variables its values follow",
+                ));
+            }
+        }
         validate_label(&feature.label)?;
         validate_reference_count("inputs", feature.inputs.len())?;
         validate_reference_count("dependencies", feature.dependencies.len())?;
@@ -3571,7 +4501,7 @@ fn validate_loaded_state(
                 "a sketch support body does not match its creating feature branch",
             ));
         }
-        if feature.action != ReplayAction::Marker
+        if !feature.action.is_document_only()
             && let Some(body) = branches.first().copied()
             && !feature.outputs.contains(&FeatureOutput::Body(body))
         {
@@ -3580,7 +4510,7 @@ fn validate_loaded_state(
             ));
         }
         if let Some(commit) = feature.committed {
-            if feature.action == ReplayAction::Marker && commit.input != commit.output {
+            if feature.action.is_document_only() && commit.input != commit.output {
                 return Err(DocumentError::MarkerChangedSnapshot);
             }
             let mut association_is_attached = true;
@@ -3665,10 +4595,8 @@ fn validate_loaded_state(
                     "a sketch auto-hide references a missing feature",
                 ));
             };
-            if !matches!(
-                feature.kind,
-                FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-            ) || !feature.inputs.contains(&FeatureInput::Sketch(sketch.id))
+            if !feature.kind.consumes_sketches()
+                || !feature.inputs.contains(&FeatureInput::Sketch(sketch.id))
             {
                 return Err(DocumentError::InvalidArchive(
                     "a sketch auto-hide is not owned by a consuming modeling feature",
@@ -5623,6 +6551,143 @@ mod tests {
             )
             .expect("parameterized cuboid recipe should validate"),
         )
+    }
+
+    /// An origin sketch whose one operation has a value following `entry`.
+    fn sketch_payload_following(entry: &str) -> SketchPayload {
+        let mut payload = origin_sketch_payload();
+        let authoring = payload.authoring.as_ref().expect("an editable sketch");
+        let operation = authoring.operations()[0].id;
+        let mut json = serde_json::to_value(authoring).expect("the sketch encodes");
+        json["value_links"] = serde_json::json!([{
+            "target": { "kind": "recipe_field", "operation": operation, "field": "width" },
+            "text": entry,
+        }]);
+        payload.authoring = Some(serde_json::from_value(json).expect("the sketch decodes"));
+        payload
+            .validate()
+            .expect("a followed sketch is a valid sketch");
+        payload
+    }
+
+    fn sketch_following(entry: &str) -> FeatureDraft {
+        FeatureDraft::new(FeatureKind::Sketch, "Sketch", ReplayAction::Marker)
+            .with_sketch_payload(sketch_payload_following(entry))
+            .with_output(OutputDraft::CreateSketch {
+                label: "Sketch".to_owned(),
+                geometry_revision: 1,
+            })
+    }
+
+    /// A sketch value typed over a variable is a read of it (ADR 0054): the
+    /// sketch declares it, cannot outlive it, follows its name, and a
+    /// variable change and the sketch that follows it undo as one.
+    #[test]
+    fn a_sketch_reads_the_variables_its_values_follow() {
+        let mut document = ModelDocument::default();
+        let width = document
+            .add_parameter(
+                length_parameter_spec("width"),
+                ParameterBinding::literal(ParameterValue::quantity(
+                    40.0,
+                    ParameterUnit::Millimeter,
+                )),
+            )
+            .expect("parameter should append");
+        assert_eq!(
+            document.append_feature(sketch_following("depth * 2")),
+            Err(DocumentError::UnknownSketchVariable("depth".to_owned()))
+        );
+        let feature = document
+            .append_feature(sketch_following("width / 2"))
+            .expect("a followed sketch appends")
+            .feature;
+        assert_eq!(
+            document
+                .feature(feature)
+                .expect("the sketch")
+                .parameter_inputs,
+            vec![width]
+        );
+        assert!(matches!(
+            document.remove_parameter(width),
+            Err(DocumentError::ParameterInUse { parameter, .. }) if parameter == width
+        ));
+
+        let sketch = document.sketches()[0].id;
+        let followed = |document: &ModelDocument| {
+            let revision = document
+                .sketch(sketch)
+                .expect("the sketch")
+                .geometry_revision;
+            document
+                .sketch_payload(sketch, revision)
+                .and_then(SketchPayload::authoring)
+                .expect("the sketch payload")
+                .value_links()[0]
+                .text
+                .clone()
+        };
+        assert!(
+            document
+                .replace_parameter_spec(width, length_parameter_spec("span"))
+                .expect("the rename applies")
+        );
+        assert_eq!(followed(&document), "span / 2");
+        assert!(document.undo());
+        assert_eq!(followed(&document), "width / 2");
+        assert!(document.redo());
+
+        // The variable changes, and the sketch follows as part of it.
+        assert!(
+            document
+                .set_parameter_binding(
+                    width,
+                    ParameterBinding::literal(ParameterValue::quantity(
+                        60.0,
+                        ParameterUnit::Millimeter,
+                    )),
+                )
+                .expect("the new value applies")
+        );
+        let revision = document.revision();
+        assert!(
+            document
+                .follow_variables_in_sketch(sketch, sketch_payload_following("span / 3"))
+                .expect("the sketch follows")
+        );
+        assert!(document.revision() > revision);
+        assert_eq!(followed(&document), "span / 3");
+        assert!(document.undo(), "one undo takes both back");
+        assert!(document.redo());
+        assert_eq!(followed(&document), "span / 3");
+        assert!(document.abandon_last_edit());
+        assert!(!document.can_redo(), "an abandoned edit cannot come back");
+        assert_eq!(followed(&document), "span / 2");
+        assert_eq!(
+            document
+                .evaluate_parameters(&ParameterOverrides::default())
+                .expect("the variables evaluate")
+                .get(width),
+            Some(&ParameterValue::quantity(40.0, ParameterUnit::Millimeter))
+        );
+
+        // Saved and opened again, the read is kept; a file that says
+        // otherwise does not open.
+        let native = document.to_native();
+        ModelDocument::from_native(native.clone()).expect("the document reopens");
+        let mut tampered = native;
+        let index = tampered
+            .state
+            .features
+            .iter()
+            .position(|candidate| candidate.id == feature)
+            .expect("the sketch feature");
+        tampered.state.features[index].parameter_inputs.clear();
+        assert!(matches!(
+            ModelDocument::from_native(tampered),
+            Err(DocumentError::InvalidArchive(_))
+        ));
     }
 
     #[test]

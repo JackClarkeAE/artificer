@@ -56,6 +56,8 @@ pub(crate) fn sew_shells(
         .map(|point| point.x.abs().max(point.y.abs()))
         .fold(1.0_f64, f64::max);
     let weld = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
+    let merged = without_needless_vertices(pieces, weld);
+    let pieces = merged.as_slice();
 
     let mut topology = Topology::default();
     let mut next_id = 1_u64;
@@ -100,13 +102,29 @@ pub(crate) fn sew_shells(
                     surface_point(piece.surface, segment.start()).ok_or(SewError::Inconsistent)?;
                 let end_world =
                     surface_point(piece.surface, segment.end()).ok_or(SewError::Inconsistent)?;
-                let middle_world = surface_point(piece.surface, segment_midpoint(*segment))
-                    .ok_or(SewError::Inconsistent)?;
+                // A trace is read over the pair's one parameter from here on,
+                // and its midpoint is that parameter's midpoint, so the weld
+                // below compares the same point from either face.
+                let canonical = canonical_trace(piece.surface, *segment);
+                if matches!(segment, Segment::Trace { .. }) && canonical.is_none() {
+                    return Err(SewError::Inconsistent);
+                }
+                let middle_2d = canonical.map_or_else(
+                    || segment_midpoint(*segment),
+                    |trace| {
+                        let range = trace.pcurve_range;
+                        trace.pcurve.evaluate((range.start + range.end) / 2.0)
+                    },
+                );
+                let middle_world =
+                    surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?;
                 let start_vertex = find_vertex(&mut topology, &mut next_id, weld, start_world);
                 let end_vertex = find_vertex(&mut topology, &mut next_id, weld, end_world);
 
-                let (curve, parameter_range) =
-                    segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?;
+                let (curve, parameter_range) = match canonical {
+                    Some(trace) => (trace.curve, trace.range),
+                    None => segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?,
+                };
                 let found = topology.edges.iter().position(|edge| {
                     let vertices = edge.value.vertices;
                     let aligned = vertices == [start_vertex, end_vertex];
@@ -144,7 +162,10 @@ pub(crate) fn sew_shells(
                         (key, Orientation::Forward)
                     }
                 };
-                let (pcurve, pcurve_range) = segment_pcurve(*segment);
+                let (pcurve, pcurve_range) = match canonical {
+                    Some(trace) => (trace.pcurve, trace.pcurve_range),
+                    None => segment_pcurve(*segment),
+                };
                 let coedge_key = CoedgeKey(topology.coedges.len());
                 topology.coedges.push(Record {
                     id: allocate(&mut next_id),
@@ -318,6 +339,202 @@ pub(crate) fn sew_shells(
     Ok(topology)
 }
 
+/// The pieces with every vertex that no other face has taken out of their
+/// loops.
+///
+/// A face's boundary is built from chords, and a chord is cut wherever its
+/// carrier's own frame happens to part it: a ring on a cylinder at azimuth
+/// zero, a circle on a plane into two halves, a plane section at every half
+/// turn. Two faces that share a curve are meant to share those cuts, and
+/// usually do. But a face whose edge was already there — the wall of a tool
+/// whose rim is the very circle a section lays on the face beside it — keeps
+/// that edge whole, while its neighbour receives the section cut in two; the
+/// sewer then finds one edge on one side and two on the other, and neither
+/// is used twice. A vertex where only one face's boundary is cut, with the
+/// same curve running on through it, is where no other face meets, so it is
+/// not a vertex of the solid, and joining the two pieces again is what both
+/// faces meant.
+///
+/// A trace is never joined: every face cuts it at the curve's own landmarks,
+/// so its cuts are always shared, and a reading of it past a landmark would
+/// stop being a graph.
+fn without_needless_vertices(pieces: &[SewFace], weld: f64) -> Vec<SewFace> {
+    let corners: Vec<Vec<Point3>> = pieces
+        .iter()
+        .map(|piece| {
+            piece
+                .loops
+                .iter()
+                .flatten()
+                .filter_map(|segment| surface_point(piece.surface, segment.start()))
+                .collect()
+        })
+        .collect();
+    let shared = |face: usize, point: Point3| {
+        corners.iter().enumerate().any(|(other, points)| {
+            other != face
+                && points
+                    .iter()
+                    .any(|candidate| (*candidate - point).length() <= weld)
+        })
+    };
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(face, piece)| SewFace {
+            surface: piece.surface,
+            role: piece.role,
+            loops: piece
+                .loops
+                .iter()
+                .map(|segments| {
+                    let mut segments = segments.clone();
+                    let mut index = 0;
+                    while segments.len() > 2 && index < segments.len() {
+                        let next = (index + 1) % segments.len();
+                        let junction = surface_point(piece.surface, segments[index].end());
+                        let joined = junction
+                            .filter(|point| !shared(face, *point))
+                            .and_then(|_| joined_segment(segments[index], segments[next]));
+                        match joined {
+                            Some(whole) => {
+                                segments[index] = whole;
+                                segments.remove(next);
+                                if next < index {
+                                    index -= 1;
+                                }
+                            }
+                            None => index += 1,
+                        }
+                    }
+                    segments
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// Two consecutive pieces of one carrier, running on through the point they
+/// meet at, as the single piece they are — or `None` when they are not.
+fn joined_segment(first: Segment, second: Segment) -> Option<Segment> {
+    let same = |a: f64, b: f64| (a - b).abs() <= 1.0e-9 * a.abs().max(b.abs()).max(1.0);
+    let same_point = |a: Point2, b: Point2| same(a.x, b.x) && same(a.y, b.y);
+    match (first, second) {
+        (Segment::Line { start, end }, Segment::Line { end: last, .. }) => {
+            let (dx, dy) = (end.x - start.x, end.y - start.y);
+            let (ex, ey) = (last.x - end.x, last.y - end.y);
+            let (first_length, second_length) = (dx.hypot(dy), ex.hypot(ey));
+            if first_length <= 0.0 || second_length <= 0.0 {
+                return None;
+            }
+            let cross = dx.mul_add(ey, -(dy * ex)) / (first_length * second_length);
+            let dot = dx.mul_add(ex, dy * ey);
+            (cross.abs() <= 1.0e-12 && dot > 0.0).then_some(Segment::Line { start, end: last })
+        }
+        (
+            Segment::Arc {
+                center,
+                start,
+                radius,
+                start_angle,
+                sweep,
+                ..
+            },
+            Segment::Arc {
+                center: other_center,
+                end,
+                radius: other_radius,
+                sweep: other_sweep,
+                ..
+            },
+        ) => {
+            let total = sweep + other_sweep;
+            (same_point(center, other_center)
+                && same(radius, other_radius)
+                && sweep.signum() == other_sweep.signum()
+                && total.abs() < std::f64::consts::TAU - 1.0e-9)
+                .then_some(Segment::Arc {
+                    center,
+                    start,
+                    end,
+                    radius,
+                    start_angle,
+                    sweep: total,
+                })
+        }
+        (
+            Segment::Ellipse {
+                center,
+                u,
+                major,
+                minor,
+                start,
+                start_angle,
+                sweep,
+                ..
+            },
+            Segment::Ellipse {
+                center: other_center,
+                u: other_u,
+                major: other_major,
+                minor: other_minor,
+                end,
+                sweep: other_sweep,
+                ..
+            },
+        ) => {
+            let total = sweep + other_sweep;
+            (same_point(center, other_center)
+                && same_point(u, other_u)
+                && same(major, other_major)
+                && same(minor, other_minor)
+                && sweep.signum() == other_sweep.signum()
+                && total.abs() < std::f64::consts::TAU - 1.0e-9)
+                .then_some(Segment::Ellipse {
+                    center,
+                    u,
+                    major,
+                    minor,
+                    start,
+                    end,
+                    start_angle,
+                    sweep: total,
+                })
+        }
+        (
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start,
+                end: middle,
+            },
+            Segment::Harmonic {
+                mean: other_mean,
+                amplitude: other_amplitude,
+                phase: other_phase,
+                end,
+                ..
+            },
+        ) => {
+            let rising = middle.x > start.x;
+            (same(mean, other_mean)
+                && same(amplitude, other_amplitude)
+                && same(phase, other_phase)
+                && (end.x > middle.x) == rising
+                && (end.x - start.x).abs() < std::f64::consts::TAU - 1.0e-9)
+                .then_some(Segment::Harmonic {
+                    mean,
+                    amplitude,
+                    phase,
+                    start,
+                    end,
+                })
+        }
+        _ => None,
+    }
+}
+
 /// Whether a point is inside the closed component labelled `wanted`, by ray
 /// casting along a fixed set of directions and taking the first
 /// non-degenerate parity.
@@ -460,7 +677,11 @@ pub(crate) fn ray_face_crossings(
             }
             Some(crossings)
         }
-        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => None,
+        Surface::Torus(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Ruled(_)
+        | Surface::Bspline(_) => None,
     }
 }
 
@@ -530,7 +751,7 @@ fn segment_distance(segment: Segment, point: Point2) -> f64 {
                 to_start.min(to_end)
             }
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => (0..=64)
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => (0..=64)
             .map(|step| {
                 let sample = segment.point_at(f64::from(step) / 64.0);
                 (point.x - sample.x).hypot(point.y - sample.y)
@@ -567,7 +788,11 @@ fn surface_point(surface: Surface, point: Point2) -> Option<Point3> {
     match surface {
         Surface::Plane(plane) => Some(plane.evaluate(point)),
         Surface::Cylinder(cylinder) => Some(cylinder.evaluate(point)),
-        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => None,
+        Surface::Torus(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Ruled(_)
+        | Surface::Bspline(_) => None,
     }
 }
 
@@ -674,8 +899,100 @@ fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, Paramete
                 ParameterRange::new(section.angle_at(start.x), section.angle_at(end.x)),
             ))
         }
+        // A trace's curve is the pair's canonical reading, which
+        // `canonical_trace` builds with its pcurve; nothing reaches here.
         _ => None,
     }
+}
+
+/// A trace piece as the edge both its faces share: the curve over the
+/// pair's canonical parameter, and this face's pcurve over that same
+/// parameter.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalTrace {
+    curve: Curve3,
+    range: ParameterRange,
+    pcurve: Curve2,
+    pcurve_range: ParameterRange,
+}
+
+/// Puts a trace piece onto the one parameter its two faces agree on.
+///
+/// Every 2D stage reads a trace over its own face's azimuth, where it is a
+/// plain graph; the two faces either side of the curve therefore arrive here
+/// with the same stretch of curve described over two different parameters.
+/// An edge has one. The pair's host is fixed by the same axis order the
+/// intersection matrix uses (ADR 0047), and a piece on the other cylinder is
+/// re-read over the host's azimuth. Its pcurve then maps each host
+/// parameter into this face's coordinates, with the azimuth held within half
+/// a turn of the piece's own middle so it stays in the window it came from.
+///
+/// `None` for anything that is not a trace piece on a cylinder, and for a
+/// piece that cannot be re-read — one that is not a graph over the host's
+/// azimuth, which the landmark cuts rule out.
+fn canonical_trace(surface: Surface, segment: Segment) -> Option<CanonicalTrace> {
+    let (
+        Surface::Cylinder(_),
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            shift,
+            from,
+            to,
+            start,
+            end,
+        },
+    ) = (surface, segment)
+    else {
+        return None;
+    };
+    if crate::surface_intersection::hosts_trace(&host, &other) {
+        return Some(CanonicalTrace {
+            curve: Curve3::Trace {
+                host,
+                other,
+                branch,
+            },
+            range: ParameterRange::new(from, to),
+            pcurve: Curve2::Trace {
+                host,
+                other,
+                branch,
+                on_other: false,
+                shift,
+            },
+            pcurve_range: ParameterRange::new(from, to),
+        });
+    }
+    let trace = crate::cylinder_trace::CylinderTrace {
+        host,
+        other,
+        branch,
+    };
+    let unshifted = |point: Point2| Point2::new(point.x - shift.x, point.y - shift.y);
+    let ends = [
+        host.evaluate(unshifted(start)),
+        host.evaluate(unshifted(end)),
+    ];
+    let (canonical, arc) = trace.read_on(other, from, to, ends)?;
+    let window = segment.point_at(0.5).x;
+    Some(CanonicalTrace {
+        curve: Curve3::Trace {
+            host: canonical.host,
+            other: canonical.other,
+            branch: canonical.branch,
+        },
+        range: ParameterRange::new(arc.from, arc.to),
+        pcurve: Curve2::Trace {
+            host: canonical.host,
+            other: canonical.other,
+            branch: canonical.branch,
+            on_other: true,
+            shift: Point2::new(window, shift.y),
+        },
+        pcurve_range: ParameterRange::new(arc.from, arc.to),
+    })
 }
 
 /// The pcurve for one 2D boundary segment, in the face's parameter space.
@@ -728,6 +1045,26 @@ fn segment_pcurve(segment: Segment) -> (Curve2, ParameterRange) {
                 phase,
             },
             ParameterRange::new(start.x, end.x),
+        ),
+        // The host reading; `canonical_trace` is what the sewer uses, and
+        // this arm only keeps the function total.
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            shift,
+            from,
+            to,
+            ..
+        } => (
+            Curve2::Trace {
+                host,
+                other,
+                branch,
+                on_other: false,
+                shift,
+            },
+            ParameterRange::new(from, to),
         ),
     }
 }

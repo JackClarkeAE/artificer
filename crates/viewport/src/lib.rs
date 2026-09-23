@@ -310,22 +310,81 @@ pub struct FeaturePreviewDragState {
     feature: DragHandleState,
     active: Option<ActiveFeatureDrag>,
     edge_finish: DragHandleState,
+    datum: DragHandleState,
+    datum_active: Option<ActiveDatumDrag>,
 }
 
 impl FeaturePreviewDragState {
     pub const fn is_active(self) -> bool {
-        self.feature.is_active()
+        self.feature.is_active() || self.datum.is_active()
     }
 
     pub fn cancel(&mut self) {
         self.cancel_feature();
         self.edge_finish.cancel();
+        self.datum.cancel();
+        self.datum_active = None;
     }
 
     fn cancel_feature(&mut self) {
         self.feature.cancel();
         self.active = None;
     }
+}
+
+/// The handles on a staged construction plane (ADR 0048).
+///
+/// All in document space: a plane is construction geometry and never takes a
+/// body's transform. The arrow runs along the base plane's normal from the
+/// plane's centre; dragging it reports the plane's new offset. A plane through
+/// an edge also carries a turning arc about that edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DatumPlaneHandles {
+    /// The plane's centre with no offset: on the base plane.
+    pub anchor: Point3,
+    /// The base plane's unit normal; a positive offset runs along it.
+    pub normal: Vector3,
+    /// The plane's offset from its base.
+    pub offset: f64,
+    /// How long the arrow is drawn, in model units.
+    pub arrow_length: f64,
+    pub turn: Option<DatumTurnHandle>,
+}
+
+/// A hinge a staged plane turns about.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DatumTurnHandle {
+    /// A point on the hinge: the middle of the edge.
+    pub hinge: Point3,
+    /// Unit direction of the plane at no angle, away from the hinge.
+    pub zero: Vector3,
+    /// Unit direction the plane turns towards; +90 degrees points along it.
+    pub up: Vector3,
+    /// Radius of the arc, in model units.
+    pub radius: f64,
+    pub angle_degrees: f64,
+}
+
+/// One gesture on a staged plane's handles.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DatumHandleDrag {
+    Offset {
+        offset: f64,
+        phase: FeatureDragPhase,
+    },
+    Angle {
+        angle_degrees: f64,
+        phase: FeatureDragPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ActiveDatumDrag {
+    Offset(ActiveFeatureDrag),
+    Angle {
+        baseline_angle: f64,
+        pointer_origin: Pos2,
+    },
 }
 
 /// Combined result for the interactive document viewport.
@@ -338,6 +397,11 @@ pub struct DocumentViewportOutput {
     pub edge_finish_distance_delta: Option<f64>,
     pub selected_sketch_region: Option<ModelSketchRegionSelection>,
     pub selected_reference_plane: Option<ReferencePlaneSelection>,
+    /// A click on a line an overlay offers to be picked: a sketch line or a
+    /// construction axis, when the shell asks for one.
+    pub selected_line: Option<PickableLine>,
+    /// A drag on a staged plane's arrow or arc.
+    pub datum_drag: Option<DatumHandleDrag>,
     pub context_click: Option<ViewportContextClick>,
     /// A Select-tool primary click that landed on nothing at all — no
     /// vertex, edge, face, sketch region, or datum plane. The shell clears
@@ -411,6 +475,16 @@ impl ModelSketchRegion {
     }
 }
 
+/// A straight line an overlay offers to be picked, named the way the shell
+/// knows it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PickableLine {
+    /// A line of a sketch, by the sketch's index and the entity's number.
+    SketchEntity { sketch_index: usize, entity: u64 },
+    /// A construction axis, by its feature's number.
+    ConstructionAxis(u64),
+}
+
 /// Presentation-only world-space lines retained for a committed sketch.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelSketchOverlay {
@@ -422,6 +496,9 @@ pub struct ModelSketchOverlay {
     sketch_index: Option<usize>,
     regions: Vec<ModelSketchRegion>,
     reference_plane: Option<ReferencePlaneOverlay>,
+    datum_handles: Option<DatumPlaneHandles>,
+    /// Lines a click may pick, each with its two ends in world space.
+    pickable_lines: Vec<(PickableLine, [Point3; 2])>,
 }
 
 impl ModelSketchOverlay {
@@ -436,7 +513,31 @@ impl ModelSketchOverlay {
             sketch_index: None,
             regions: Vec::new(),
             reference_plane: None,
+            datum_handles: None,
+            pickable_lines: Vec::new(),
         }
+    }
+
+    /// Offers straight lines to be picked: a click near one reports it as
+    /// the viewport's `selected_line`, and the pointer over one lights it.
+    #[must_use]
+    pub fn with_pickable_lines(mut self, lines: Vec<(PickableLine, [Point3; 2])>) -> Self {
+        self.pickable_lines = lines;
+        self
+    }
+
+    /// Number of lines this overlay offers to be picked.
+    #[must_use]
+    pub fn pickable_line_count(&self) -> usize {
+        self.pickable_lines.len()
+    }
+
+    /// Gives a staged plane's card its offset arrow and, for a plane through
+    /// an edge, its turning arc.
+    #[must_use]
+    pub const fn with_datum_handles(mut self, handles: DatumPlaneHandles) -> Self {
+        self.datum_handles = Some(handles);
+        self
     }
 
     /// Binds an overlay to one document body so another body's transform
@@ -1712,6 +1813,23 @@ fn show_document_impl(
         .map_or_else(FeatureInteraction::default, |state| {
             handle_feature_preview_drag(ui, &canvas, state, feature_arrow)
         });
+    let datum_geometry = sketch_overlays
+        .iter()
+        .find_map(|overlay| overlay.datum_handles)
+        .and_then(|handles| project_datum_handles(handles, projection, *view));
+    let datum_interaction = feature_drag_state
+        .as_deref_mut()
+        .map_or_else(DatumInteraction::default, |state| {
+            handle_datum_drag(ui, &canvas, state, datum_geometry)
+        });
+    // A plane's handles own the pointer exactly as the extrusion arrow does:
+    // nothing under them is picked, and no camera gesture starts on them.
+    let feature_interaction = FeatureInteraction {
+        event: feature_interaction.event,
+        consumes_primary: feature_interaction.consumes_primary
+            || datum_interaction.consumes_primary,
+        handle_hovered: feature_interaction.handle_hovered || datum_interaction.hovered.is_some(),
+    };
 
     // Face-focused sketch views deliberately move the camera target away from
     // the body centre. The first subsequent Orbit gesture returns the pivot to
@@ -2435,6 +2553,36 @@ fn show_document_impl(
     } else {
         None
     };
+    // A line offered for picking answers before anything under it: the
+    // shell only offers lines while it is asking for one.
+    let line_at = |position: Pos2| {
+        hit_test_pickable_lines(
+            position,
+            sketch_overlays,
+            bodies,
+            active_body,
+            projection,
+            *view,
+            *active_display_transform,
+            animation_phase,
+        )
+    };
+    let selected_line = if active_tool == ActiveTool::Select
+        && !feature_interaction.consumes_primary
+        && canvas.clicked_by(PointerButton::Primary)
+    {
+        canvas
+            .interact_pointer_pos()
+            .and_then(&line_at)
+            .map(|(line, _)| line)
+    } else {
+        None
+    };
+    if active_tool == ActiveTool::Select
+        && let Some((_, ends)) = hover_position.and_then(line_at)
+    {
+        painter.line_segment(ends, Stroke::new(4.0, HOVERED));
+    }
     let selected_reference_plane = if active_tool == ActiveTool::Select
         && !feature_interaction.consumes_primary
         && clicked_edge.is_none()
@@ -2472,6 +2620,10 @@ fn show_document_impl(
             presentation,
             feature_interaction.handle_hovered,
         );
+    }
+
+    if let Some(geometry) = datum_geometry {
+        paint_datum_handles(&painter, geometry, datum_interaction.hovered);
     }
 
     let mut selected_from_ui = clicked;
@@ -2660,9 +2812,62 @@ fn show_document_impl(
         edge_finish_distance_delta,
         selected_sketch_region,
         selected_reference_plane,
+        selected_line,
+        datum_drag: datum_interaction.event,
         context_click,
         clicked_empty,
     }
+}
+
+/// The offered line nearest a screen position, within picking reach, with
+/// its two ends on screen.
+#[allow(clippy::too_many_arguments)]
+fn hit_test_pickable_lines(
+    position: Pos2,
+    overlays: &[ModelSketchOverlay],
+    bodies: &[DocumentBodyInstance<'_>],
+    active_body: Option<BodyInstanceKey>,
+    projection: Projection,
+    view: ViewState,
+    active_transform: DisplayTransform,
+    animation_phase: f64,
+) -> Option<(PickableLine, [Pos2; 2])> {
+    const LINE_PICK_RADIUS: f32 = 8.0;
+    overlays
+        .iter()
+        .filter(|overlay| !overlay.pickable_lines.is_empty())
+        .filter_map(|overlay| {
+            let presentation = overlay_presentation(
+                overlay,
+                bodies,
+                active_body,
+                active_transform,
+                animation_phase,
+            )?;
+            overlay
+                .pickable_lines
+                .iter()
+                .map(|(line, ends)| {
+                    let ends =
+                        ends.map(|point| projection.instance_point(point, view, presentation));
+                    (*line, ends, distance_to_screen_segment(position, ends))
+                })
+                .filter(|(_, _, distance)| *distance <= LINE_PICK_RADIUS)
+                .min_by(|left, right| left.2.total_cmp(&right.2))
+        })
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+        .map(|(line, ends, _)| (line, ends))
+}
+
+/// How far a screen point is from a screen segment.
+fn distance_to_screen_segment(point: Pos2, [start, end]: [Pos2; 2]) -> f32 {
+    let along = end - start;
+    let length = along.length_sq();
+    if length <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let t = ((point - start).dot(along) / length).clamp(0.0, 1.0);
+    point.distance(start + along * t)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3803,6 +4008,14 @@ const SILHOUETTE_SWEEP_CHORDS: usize = 96;
 /// condition `n(u, v) · view = 0` for `v` at each step, which is one `atan2`
 /// per sample rather than a numeric root search.
 fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[Point3; 2]> {
+    // A ruled wall has no revolved frame; the kernel solves its silhouette.
+    if let DisplaySurface::Ruled { .. } = carrier.surface {
+        return carrier.surface.ruled_silhouette(carrier.domain, view);
+    }
+    // Nor has a B-spline wall; the kernel contours `n · view` over it.
+    if let DisplaySurface::Bspline { .. } = carrier.surface {
+        return carrier.surface.spline_silhouette(carrier.domain, view);
+    }
     let (_, axis, radial_u, radial_v, angular_sign) = carrier.surface.frame();
     let [[u_min, u_max], [v_min, v_max]] = carrier.domain;
     if !(u_min < u_max && v_min < v_max) || angular_sign == 0.0 {
@@ -3867,6 +4080,7 @@ fn carrier_silhouette_chords(carrier: &DisplayCarrier, view: [f64; 3]) -> Vec<[P
             }
             chords
         }
+        DisplaySurface::Ruled { .. } | DisplaySurface::Bspline { .. } => Vec::new(),
     }
 }
 
@@ -6464,6 +6678,379 @@ fn handle_feature_preview_drag(
     interaction
 }
 
+/// A staged plane's handles as drawn this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DatumHandleGeometry {
+    /// The plane's centre, and the arrow's tip beyond it along the normal.
+    centre: Pos2,
+    tip: Pos2,
+    /// Where the plane's centre is with no offset.
+    base: Pos2,
+    offset: f64,
+    drag_projection: SignedDistanceDragProjection,
+    facing: AxisCameraFacing,
+    turn: Option<DatumTurnGeometry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DatumTurnGeometry {
+    hinge: Pos2,
+    /// Screen images of the arc's two model axes, each one radius long.
+    zero: Vec2,
+    up: Vec2,
+    knob: Pos2,
+    angle_degrees: f64,
+}
+
+impl DatumTurnGeometry {
+    fn point_at(self, angle_degrees: f64) -> Pos2 {
+        let (sin, cos) = angle_degrees.to_radians().sin_cos();
+        self.hinge + self.zero * cos as f32 + self.up * sin as f32
+    }
+
+    /// The angle whose arc point lies under `pointer`, or `None` when the arc
+    /// is seen edge-on and has no inside to point at.
+    fn angle_under(self, pointer: Pos2) -> Option<f64> {
+        let relative = pointer - self.hinge;
+        let determinant = self.zero.x * self.up.y - self.zero.y * self.up.x;
+        let scale = self.zero.length_sq() + self.up.length_sq();
+        if !determinant.is_finite() || determinant.abs() <= 0.05 * scale {
+            return None;
+        }
+        let along_zero = (relative.x * self.up.y - relative.y * self.up.x) / determinant;
+        let along_up = (self.zero.x * relative.y - self.zero.y * relative.x) / determinant;
+        Some(
+            f64::from(along_up)
+                .atan2(f64::from(along_zero))
+                .to_degrees(),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct DatumInteraction {
+    event: Option<DatumHandleDrag>,
+    consumes_primary: bool,
+    /// Which handle the pointer is over or holding.
+    hovered: Option<DatumHandleKind>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DatumHandleKind {
+    Offset,
+    Angle,
+}
+
+fn world_point_on_screen(point: Point3, projection: Projection, view: ViewState) -> (Pos2, f64) {
+    let camera = InstancePresentation::identity(Point3::default()).project_point(point, view);
+    (projection.camera_point(camera), camera.depth)
+}
+
+fn project_datum_handles(
+    handles: DatumPlaneHandles,
+    projection: Projection,
+    view: ViewState,
+) -> Option<DatumHandleGeometry> {
+    let length = handles
+        .normal
+        .x
+        .hypot(handles.normal.y)
+        .hypot(handles.normal.z);
+    if !length.is_finite() || length <= f64::EPSILON || !handles.offset.is_finite() {
+        return None;
+    }
+    let normal = Vector3::new(
+        handles.normal.x / length,
+        handles.normal.y / length,
+        handles.normal.z / length,
+    );
+    let along = |distance: f64| {
+        offset_point(
+            handles.anchor,
+            Vector3::new(
+                normal.x * distance,
+                normal.y * distance,
+                normal.z * distance,
+            ),
+        )
+    };
+    let (base, _) = world_point_on_screen(handles.anchor, projection, view);
+    let (centre, centre_depth) = world_point_on_screen(along(handles.offset), projection, view);
+    let (unit_end, unit_depth) =
+        world_point_on_screen(along(handles.offset + 1.0), projection, view);
+    let arrow = handles.arrow_length.max(f64::EPSILON);
+    let (tip, _) = world_point_on_screen(along(handles.offset + arrow), projection, view);
+    let screen_axis = unit_end - centre;
+    let depth_points_per_unit =
+        (unit_depth - centre_depth) * projection.points_per_unit * view.zoom;
+    let drag_projection = SignedDistanceDragProjection::new(
+        [f64::from(screen_axis.x), f64::from(screen_axis.y)],
+        unit_depth - centre_depth,
+        f64::from(screen_axis.length()).hypot(depth_points_per_unit),
+    )?;
+    let turn = handles.turn.and_then(|turn| {
+        let scale = |vector: Vector3| {
+            Vector3::new(
+                vector.x * turn.radius,
+                vector.y * turn.radius,
+                vector.z * turn.radius,
+            )
+        };
+        let (hinge, _) = world_point_on_screen(turn.hinge, projection, view);
+        let (zero, _) =
+            world_point_on_screen(offset_point(turn.hinge, scale(turn.zero)), projection, view);
+        let (up, _) =
+            world_point_on_screen(offset_point(turn.hinge, scale(turn.up)), projection, view);
+        let geometry = DatumTurnGeometry {
+            hinge,
+            zero: zero - hinge,
+            up: up - hinge,
+            knob: hinge,
+            angle_degrees: turn.angle_degrees,
+        };
+        let knob = geometry.point_at(turn.angle_degrees);
+        (hinge.is_finite() && knob.is_finite()).then_some(DatumTurnGeometry { knob, ..geometry })
+    });
+    (base.is_finite() && centre.is_finite() && tip.is_finite()).then_some(DatumHandleGeometry {
+        centre,
+        tip,
+        base,
+        offset: handles.offset,
+        drag_projection,
+        facing: drag_projection.facing(),
+        turn,
+    })
+}
+
+/// Which of a plane's handles is under `position`, the knob first: it sits on
+/// the plane, where the arrow's foot also is.
+fn datum_handle_at(geometry: DatumHandleGeometry, position: Pos2) -> Option<DatumHandleKind> {
+    const HIT_RADIUS: f32 = 12.0;
+    if let Some(turn) = geometry.turn
+        && position.distance_sq(turn.knob) <= HIT_RADIUS * HIT_RADIUS
+    {
+        return Some(DatumHandleKind::Angle);
+    }
+    let arrow = FeatureArrowGeometry {
+        start: geometry.centre,
+        end: geometry.tip,
+        signed_extent: geometry.offset,
+        drag_projection: geometry.drag_projection,
+        displayed_facing: geometry.facing,
+    };
+    if feature_arrow_hit_test(arrow, position) {
+        return Some(DatumHandleKind::Offset);
+    }
+    let on_arc = geometry.turn.is_some_and(|turn| {
+        (0..60).any(|step| {
+            let from = turn.point_at(f64::from(step) * 6.0 - 180.0);
+            let to = turn.point_at(f64::from(step + 1) * 6.0 - 180.0);
+            point_segment_distance_squared(position, from, to) <= 8.0 * 8.0
+        })
+    });
+    on_arc.then_some(DatumHandleKind::Angle)
+}
+
+fn handle_datum_drag(
+    ui: &Ui,
+    canvas: &Response,
+    state: &mut FeaturePreviewDragState,
+    geometry: Option<DatumHandleGeometry>,
+) -> DatumInteraction {
+    let Some(geometry) = geometry else {
+        if state.datum.is_active() {
+            state.datum.cancel();
+            state.datum_active = None;
+        }
+        return DatumInteraction::default();
+    };
+    // Register the handles so they win the press over the canvas, exactly as
+    // the extrusion arrow does.
+    let mut hovered_response = false;
+    let mut started = false;
+    let mut dragged = false;
+    let mut stopped = false;
+    let mut spots = vec![geometry.centre, geometry.tip];
+    if let Some(turn) = geometry.turn {
+        spots.push(turn.knob);
+    }
+    for (index, spot) in spots.into_iter().enumerate() {
+        let response = ui.interact(
+            Rect::from_center_size(spot, Vec2::splat(24.0)),
+            ui.id().with(("datum-plane-handle", index)),
+            Sense::drag(),
+        );
+        // The arrow's tip and the arc's knob are the handles a user reaches
+        // for; the arrow's foot is only more of the same hit area.
+        if index > 0 {
+            response.widget_info(|| {
+                WidgetInfo::labeled(
+                    WidgetType::Slider,
+                    true,
+                    if index == 2 {
+                        "Plane angle handle"
+                    } else {
+                        "Plane offset handle"
+                    },
+                )
+            });
+        }
+        hovered_response |= response.hovered();
+        started |= response.drag_started();
+        dragged |= response.dragged();
+        stopped |= response.drag_stopped();
+    }
+    let mut pointer = PointerSample::primary(ui, canvas.rect);
+    pointer.pressed |= started;
+    pointer.down |= dragged;
+    pointer.released |= stopped;
+    pointer.in_bounds |= hovered_response;
+    let under = pointer
+        .position
+        .filter(|_| pointer.in_bounds)
+        .and_then(|position| datum_handle_at(geometry, position));
+    let capture = state.datum.update(pointer, under.is_some());
+    let event = capture.event.and_then(|event| {
+        let active = match event.phase {
+            DragHandlePhase::Started => {
+                let active = match under? {
+                    DatumHandleKind::Offset => ActiveDatumDrag::Offset(ActiveFeatureDrag {
+                        pointer_origin: event.position,
+                        baseline_extent: geometry.offset,
+                        last_extent: geometry.offset,
+                        projection: geometry.drag_projection,
+                    }),
+                    DatumHandleKind::Angle => ActiveDatumDrag::Angle {
+                        baseline_angle: geometry.turn?.angle_degrees,
+                        pointer_origin: event.position,
+                    },
+                };
+                state.datum_active = Some(active);
+                active
+            }
+            DragHandlePhase::Dragging | DragHandlePhase::Finished => state.datum_active?,
+        };
+        let phase = match event.phase {
+            DragHandlePhase::Started => FeatureDragPhase::Started,
+            DragHandlePhase::Dragging => FeatureDragPhase::Dragging,
+            DragHandlePhase::Finished => FeatureDragPhase::Finished,
+        };
+        if phase == FeatureDragPhase::Finished {
+            state.datum_active = None;
+        }
+        Some(match active {
+            ActiveDatumDrag::Offset(drag) => DatumHandleDrag::Offset {
+                offset: sample_feature_drag(drag, event.position),
+                phase,
+            },
+            ActiveDatumDrag::Angle {
+                baseline_angle,
+                pointer_origin,
+            } => {
+                let turn = geometry.turn?;
+                // Point at the arc and the plane turns to where you point.
+                // Seen edge-on the arc has no inside, so the drag runs along
+                // its tangent instead.
+                let angle = turn.angle_under(event.position).unwrap_or_else(|| {
+                    let tangent =
+                        turn.point_at(baseline_angle + 1.0) - turn.point_at(baseline_angle);
+                    let delta = event.position - pointer_origin;
+                    let squared = tangent.length_sq();
+                    if squared <= f32::EPSILON {
+                        baseline_angle
+                    } else {
+                        baseline_angle + f64::from(delta.dot(tangent) / squared)
+                    }
+                });
+                DatumHandleDrag::Angle {
+                    angle_degrees: (angle * 10.0).round() / 10.0,
+                    phase,
+                }
+            }
+        })
+    });
+    let hovered = if state.datum.is_active() {
+        match state.datum_active {
+            Some(ActiveDatumDrag::Offset(_)) => Some(DatumHandleKind::Offset),
+            Some(ActiveDatumDrag::Angle { .. }) => Some(DatumHandleKind::Angle),
+            None => under,
+        }
+    } else {
+        under
+    };
+    if hovered.is_some() || capture.consumes_primary {
+        ui.ctx().set_cursor_icon(match hovered {
+            Some(DatumHandleKind::Angle) => CursorIcon::Grab,
+            _ => CursorIcon::ResizeVertical,
+        });
+    }
+    // Only a drag in progress needs the next frame; a pointer resting on a
+    // handle changes nothing until it moves, and egui repaints on movement.
+    if state.datum.is_active() {
+        ui.ctx().request_repaint();
+    }
+    DatumInteraction {
+        event,
+        consumes_primary: capture.consumes_primary,
+        hovered,
+    }
+}
+
+fn paint_datum_handles(
+    painter: &egui::Painter,
+    geometry: DatumHandleGeometry,
+    hovered: Option<DatumHandleKind>,
+) {
+    let accent = Color32::from_rgb(92, 170, 255);
+    let halo = Stroke::new(
+        4.0,
+        artificer_ui_core::theme::viewport_bottom().gamma_multiply(0.7),
+    );
+    // How far the plane stands from its base, as a dashed leader.
+    if geometry.base.distance(geometry.centre) > 2.0 {
+        let leader = geometry.centre - geometry.base;
+        let dashes = ((leader.length() / 6.0).floor() as usize).clamp(1, 400);
+        for dash in (0..dashes).step_by(2) {
+            let from = geometry.base + leader * (dash as f32 / dashes as f32);
+            let to = geometry.base + leader * ((dash + 1) as f32 / dashes as f32);
+            painter.line_segment([from, to], Stroke::new(1.4, accent.gamma_multiply(0.8)));
+        }
+        painter.circle_filled(geometry.base, 2.6, accent.gamma_multiply(0.8));
+    }
+    if let Some(turn) = geometry.turn {
+        let arc = (0..=60)
+            .map(|step| turn.point_at(f64::from(step) * 6.0 - 180.0))
+            .collect::<Vec<_>>();
+        let emphasis = if hovered == Some(DatumHandleKind::Angle) {
+            0.95
+        } else {
+            0.55
+        };
+        for pair in arc.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(1.6, accent.gamma_multiply(emphasis)),
+            );
+        }
+        painter.line_segment(
+            [turn.hinge, turn.knob],
+            Stroke::new(1.2, accent.gamma_multiply(0.7)),
+        );
+        painter.circle_filled(turn.knob, 7.0, artificer_ui_core::theme::viewport_bottom());
+        painter.circle_filled(turn.knob, 5.5, accent.gamma_multiply(emphasis));
+    }
+    painter.line_segment([geometry.centre, geometry.tip], halo);
+    paint_preview_arrow(
+        painter,
+        geometry.centre,
+        geometry.tip,
+        accent,
+        geometry.facing,
+        hovered == Some(DatumHandleKind::Offset),
+    );
+    painter.circle_filled(geometry.centre, 3.5, accent);
+}
+
 fn update_feature_preview_drag(
     state: &mut FeaturePreviewDragState,
     arrow: Option<FeatureArrowGeometry>,
@@ -7791,6 +8378,61 @@ mod tests {
             ),
             Some(ReferencePlaneSelection::Origin(0))
         );
+    }
+
+    /// A line an overlay offers is picked by a click near it, the nearer of
+    /// two wins, and a click far from both picks nothing.
+    #[test]
+    fn an_offered_line_is_picked_by_a_click_near_it() {
+        let sketch_line = PickableLine::SketchEntity {
+            sketch_index: 0,
+            entity: 7,
+        };
+        let axis = PickableLine::ConstructionAxis(3);
+        let overlays = [
+            ModelSketchOverlay::new(Vec::new(), Vec::new(), false).with_pickable_lines(vec![(
+                sketch_line,
+                [Point3::new(-2.0, 0.0, 0.0), Point3::new(2.0, 0.0, 0.0)],
+            )]),
+            ModelSketchOverlay::new(Vec::new(), Vec::new(), false).with_pickable_lines(vec![(
+                axis,
+                [Point3::new(0.0, -2.0, 0.0), Point3::new(0.0, 2.0, 0.0)],
+            )]),
+        ];
+        let mut view = ViewState::default();
+        view.frame(Aabb3::new(
+            Point3::new(-2.0, -2.0, -2.0),
+            Point3::new(2.0, 2.0, 2.0),
+        ));
+        let projection = projection_for_view(
+            view,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
+        )
+        .expect("framed projection");
+        let screen = |point: Point3| {
+            projection.instance_point(
+                point,
+                view,
+                InstancePresentation::identity(Point3::default()),
+            )
+        };
+        let pick = |position: Pos2| {
+            hit_test_pickable_lines(
+                position,
+                &overlays,
+                &[],
+                None,
+                projection,
+                view,
+                DisplayTransform::default(),
+                0.0,
+            )
+            .map(|(line, _)| line)
+        };
+        assert_eq!(pick(screen(Point3::new(1.5, 0.0, 0.0))), Some(sketch_line));
+        assert_eq!(pick(screen(Point3::new(0.0, 1.5, 0.0))), Some(axis));
+        assert_eq!(pick(screen(Point3::new(1.5, 1.5, 0.0))), None);
+        assert_eq!(overlays[0].pickable_line_count(), 1);
     }
 
     #[test]
@@ -11311,6 +11953,11 @@ mod tests {
     /// many small B-rep edges between coplanar cap fragments and wall
     /// panels. Hovering one of them must light the whole rim, as it does on
     /// an exact body, and a slot's arc must light as one arc.
+    ///
+    /// Bores crossing a side cut used to be the faceted case here. The exact
+    /// engine owns them now (ADR 0047), so they stay beside the plate as a
+    /// second exact body. The faceted case is now a hub with a bolt hole,
+    /// re-faceted when a later hole goes through its blended rim.
     #[test]
     fn a_faceted_bore_rim_hovers_as_one_logical_edge() {
         use artificer_kernel::api::scripting::NoModules;
@@ -11320,19 +11967,27 @@ mod tests {
         let plate = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");";
         let crossed = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");\ndrill(face: faces(\">Z\"), center: [15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_b\");\ndrill(face: faces(\"<Y\"), center: [0.0, 0.0], diameter: 20.0, depth: 30.0, label: \"side_cut\");";
         let slot = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet s = sketch(on: faces(\">Z\"), entities: [line(start: [-10, -5], end: [10, -5]), arc(center: [10, 0], radius: 5, start_angle: -90, end_angle: 90), line(start: [10, 5], end: [-10, 5]), arc(center: [-10, 0], radius: 5, start_angle: 90, end_angle: 270)], label: \"s\");\nextrude(sketch: s, distance: 10, operation: \"cut\", label: \"slot\");";
-        // Chords on the top face of hole_a's rim: at z = 40, eight from the
-        // hole's centre at (35, 25). The faceted tier splits a rim's polygon
-        // sides at points along the chord, which sit inside the circle by up
-        // to the sagitta of a sixteen-gon, so the band is half a millimetre.
-        let on_hole_a = |edge: &&DebugEdge| {
-            edge.endpoints.iter().all(|point| {
-                (point.z - 40.0).abs() < 1.0e-6
-                    && ((point.x - 35.0).hypot(point.y - 25.0) - 8.0).abs() < 0.5
-            })
-        };
-        for (label, script, expected_sources) in
-            [("exact plate", plate, 2), ("crossing cut", crossed, 0)]
-        {
+        // A hub whose flange rim is blended, a bolt hole drilled beside the
+        // band, and a second hole drilled through the band: that last step
+        // meets the torus off its axis and reaches the faceted tier, which
+        // re-facets the whole body, the bolt hole's rim included.
+        let hub = "let section = sketch(on: \"XZ\", label: \"section\", entities: [line(start: [6, 0], end: [45, 0]), line(start: [45, 0], end: [45, 8]), line(start: [45, 8], end: [20, 8]), line(start: [20, 8], end: [20, 40]), line(start: [20, 40], end: [6, 40]), line(start: [6, 40], end: [6, 0])]);\nlet hub = revolve(sketch: section, axis: [0, 0, 1], label: \"hub\");\nfillet(edges: [nearest(point: [0, 45, 8], kind: \"edge\"), nearest(point: [0, -45, 8], kind: \"edge\")], radius: 2, label: \"flange_top_rim\");\ndrill(face: nearest(point: [-30.0, 5.0, 8.0]), center: [-30.0, 0.0], diameter: 6.0, depth: 8.0, label: \"bolt\");\ndrill(face: nearest(point: [25.0, 10.0, 8.0]), center: [43.0, 0.0], diameter: 6.0, depth: 8.0, label: \"rim_hole\");";
+        // Each case names a bore's rim on a top face: hole_a's at z = 40,
+        // eight from (35, 25), or the bolt hole's at z = 8, three from
+        // (−30, 0). The faceted tier splits a rim's polygon sides at points
+        // along the chord, which sit inside the circle by up to the sagitta
+        // of a sixteen-gon, so the band is half a millimetre.
+        for (label, script, centre, radius, expected_sources) in [
+            ("exact plate", plate, (35.0, 25.0, 40.0), 8.0, 2),
+            ("crossing cut", crossed, (35.0, 25.0, 40.0), 8.0, 2),
+            ("faceted hub", hub, (-30.0, 0.0, 8.0), 3.0, 0),
+        ] {
+            let on_hole_a = |edge: &&DebugEdge| {
+                edge.endpoints.iter().all(|point| {
+                    (point.z - centre.2).abs() < 1.0e-6
+                        && ((point.x - centre.0).hypot(point.y - centre.1) - radius).abs() < 0.5
+                })
+            };
             session.reset();
             let outcome = session.run_script_with(script, &BTreeMap::new(), &NoModules, &token);
             assert!(outcome.failure.is_none(), "{label}: {:?}", outcome.failure);

@@ -13,6 +13,7 @@ pub mod assembly;
 mod browser;
 mod command_icons;
 pub mod commands;
+mod construction_axis;
 mod development_log;
 pub mod document_replay;
 pub mod documents;
@@ -20,13 +21,20 @@ mod export;
 pub mod feature_editor;
 pub mod invocation;
 pub mod library_catalog;
+mod loft;
 pub mod material;
 mod parametric;
 pub mod part_library;
+pub mod part_preview;
+mod revolve;
 mod ribbon;
+pub mod saved_parts;
 pub mod shell;
+pub mod sketch_links;
 pub mod spacemouse;
+mod sweep;
 pub mod update;
+pub mod user_data;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -53,25 +61,27 @@ use artificer_model::persistent::{
 use artificer_model::{
     BodyId, BooleanFeatureRecipe, ComponentContentDigest, ComponentDefinitionRef,
     ComponentDefinitionRevision, ComponentInstanceDraft, ComponentInstanceId,
-    ComponentInstanceRecord, FeatureDraft, FeatureId, FeatureInput, FeatureKind, FeatureOutput,
-    JointAxis, JointDraft, JointKind, JointOrigin, JointParent, ModelDocument, OutputDraft,
-    ParameterBinding, ParameterExposure, ParameterId, ParameterMetadata, ParameterOverrides,
-    ParameterSpec, ParameterType, ParameterUnit, ParameterValue, QuantityKind, RebuildState,
-    ReplayAction, ReplayDisposition, RigidComponentPose, SketchId, SketchPayload,
+    ComponentInstanceRecord, DatumEdgeGeometry, DatumFaceGeometry, DatumFaceRef, DatumPlaneBase,
+    DatumPlaneError, DatumPlaneRecipe, DatumPlaneResolver, FeatureDraft, FeatureId, FeatureInput,
+    FeatureKind, FeatureOutput, JointAxis, JointDraft, JointKind, JointOrigin, JointParent,
+    ModelDocument, OutputDraft, ParameterBinding, ParameterExposure, ParameterExpression,
+    ParameterId, ParameterMetadata, ParameterOverrides, ParameterSpec, ParameterType,
+    ParameterUnit, ParameterValue, ParsedParameterEntry, QuantityKind, RebuildState, ReplayAction,
+    ReplayDisposition, ResolvedDatumPlane, RigidComponentPose, SketchId, SketchPayload,
     SketchRegionExtrusion, SketchRegionExtrusionTarget, SketchRegionRecipeError,
     SketchSupportRecipe, SnapshotAssociation, extrusion_frame_is_reversed,
-    frame_moved_along_normal, plane_height_above_frame, reflected_profile_across_u,
-    reversed_extrusion_direction,
+    format_parameter_binding, frame_moved_along_normal, parse_parameter_entry,
+    plane_height_above_frame, reflected_profile_across_u, reversed_extrusion_direction,
 };
 use artificer_protocol::{
     Aabb3, ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION,
     DiagnosticSeverity, DiagnosticSubject, EdgeFinishKind, EntityKind, EntityRef, ExecuteRequest,
     FaceExtrusionOperation, HistoryRelation, KernelCommand, KernelError, KernelErrorCode,
-    KernelStage, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
-    MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarAxis2,
-    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
-    Point2 as ProtocolPoint2, Point3, PrecisionPolicy, RequestId, RevolveAngle, RotationQuaternion,
-    SemanticDigest, SnapshotId, TopologyCounts, Vector3,
+    KernelStage, LoftOperation, MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES,
+    MAX_PLANAR_PROFILE_LOOPS, MAX_PLANAR_PROFILE_REGIONS, OperationReport, PlanarCurve2,
+    PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2 as ProtocolPoint2, Point3,
+    PrecisionPolicy, RequestId, RotationQuaternion, SemanticDigest, SnapshotId, TopologyCounts,
+    Vector3,
 };
 use artificer_sketch::{
     ArrangementCell, ArrangementLimits, CurveDirection as AuthoringCurveDirection,
@@ -200,8 +210,10 @@ struct ArtificerWorkspaceFile {
     format: String,
     version: u32,
     settings: DocumentSettings,
-    #[serde(default)]
-    construction_planes: Vec<ConstructionPlane>,
+    /// Planes as files before version 7 documents kept them. Read once to
+    /// migrate them into the document (ADR 0048), and never written again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    construction_planes: Vec<LegacyConstructionPlane>,
     #[serde(default)]
     materials: Vec<BodyMaterial>,
     #[serde(default)]
@@ -229,11 +241,33 @@ struct BodyColour {
     rgb: [u8; 3],
 }
 
-/// One document-owned datum plane. Geometry is stored explicitly so the plane
-/// remains available even while its source face is absent at a history stop;
-/// `source` retains the creation intent for future associative remapping.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+/// A construction plane as the workbench shows it.
+///
+/// The document owns the plane: its feature's recipe is the definition and
+/// holds the frame last resolved (ADR 0048). This is the runtime view of it,
+/// rebuilt from the document whenever the runtime is, so it can never drift
+/// from what was saved. `id` is the plane's feature number, which is what the
+/// viewport and the Browser use to name it.
+#[derive(Clone, Debug, PartialEq)]
 struct ConstructionPlane {
+    id: u64,
+    name: String,
+    feature: FeatureId,
+    frame: PlanarFrame3,
+    half_u: f64,
+    half_v: f64,
+    visible: bool,
+    /// What the plane is built from, for the Browser and the card.
+    description: String,
+    /// The plane's base did not resolve at the last rebuild, so it stands
+    /// where it last was.
+    stale: bool,
+}
+
+/// A plane as a version 6 workspace envelope stored it: a frame beside a
+/// marker feature. Read only to migrate.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct LegacyConstructionPlane {
     id: u64,
     name: String,
     #[serde(default)]
@@ -242,28 +276,79 @@ struct ConstructionPlane {
     half_u: f64,
     half_v: f64,
     visible: bool,
-    source: ConstructionPlaneSource,
+    #[serde(default)]
+    source: serde_json::Value,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ConstructionPlaneSource {
-    OnFace {
+/// What a staged plane is being built from, in the terms of the body on
+/// screen. Committing turns the face and edge handles into persistent
+/// references; until then they are this snapshot's own.
+#[derive(Clone, Debug, PartialEq)]
+enum StagedPlaneBase {
+    Origin(artificer_model::OriginPlane),
+    Face {
         body: BodyId,
         face: EntityRef,
     },
-    BetweenFaces {
-        first_body: BodyId,
-        first_face: EntityRef,
-        second_body: BodyId,
-        second_face: EntityRef,
+    Plane(FeatureId),
+    Midplane {
+        first: (BodyId, EntityRef),
+        second: (BodyId, EntityRef),
     },
-    FromOrigin {
-        plane_index: u8,
+    Edge {
+        body: BodyId,
+        edge: EntityRef,
+        face: EntityRef,
     },
-    FromPlane {
-        id: u64,
-    },
+    /// Reopened from a recipe: the base stays exactly what the recipe says,
+    /// and only the offset, angle and flip are edited.
+    Recipe(artificer_model::DatumPlaneBase),
+}
+
+/// The plane editor's working state while a plane is staged.
+#[derive(Clone, Debug, PartialEq)]
+struct StagedPlane {
+    base: StagedPlaneBase,
+    /// The base resolved against the model on screen, before the offset.
+    base_plane: artificer_model::ResolvedDatumPlane,
+    /// For a plane through an edge, the edge and face it turns about.
+    edge: Option<artificer_model::DatumEdgeGeometry>,
+    offset: f64,
+    angle_degrees: f64,
+    flip: bool,
+}
+
+impl StagedPlane {
+    /// Where the staged plane is now: the base, turned about the edge when it
+    /// has one, then moved by the offset and flipped.
+    fn resolved(&self) -> artificer_model::ResolvedDatumPlane {
+        let base = self
+            .edge
+            .and_then(|edge| artificer_model::datum::edge_plane(edge, self.angle_degrees).ok())
+            .unwrap_or(self.base_plane);
+        artificer_model::datum::place_on_base(base, self.offset, self.flip)
+    }
+
+    fn takes_an_angle(&self) -> bool {
+        self.edge.is_some()
+    }
+
+    fn describe(&self) -> String {
+        match &self.base {
+            StagedPlaneBase::Origin(plane) => format!("On the {}", plane.label()),
+            StagedPlaneBase::Face { .. } => "On the selected face".to_owned(),
+            StagedPlaneBase::Plane(plane) => format!("On construction plane {plane}"),
+            StagedPlaneBase::Midplane { .. } => "Halfway between the two faces".to_owned(),
+            StagedPlaneBase::Edge { .. } => "Through the selected edge".to_owned(),
+            StagedPlaneBase::Recipe(base) => {
+                let text = base.describe();
+                let mut characters = text.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(characters).collect()
+                })
+            }
+        }
+    }
 }
 
 /// Top-level presentation mode of the Artificer workbench.
@@ -343,15 +428,6 @@ impl LabCase {
 ///
 /// Widgets may create or edit this state, but only
 /// `confirm_pending_operation` may execute it through the kernel.
-/// A revolve captured at staging time: the region, the axis it turns about,
-/// and the frame both live in.
-#[derive(Clone, Debug, PartialEq)]
-struct StagedRevolve {
-    frame: PlanarFrame3,
-    profile: PlanarProfile2,
-    axis: PlanarAxis2,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PendingOperation {
     Transform {
@@ -377,15 +453,6 @@ enum PendingOperation {
         staging_id: u64,
     },
     LoadDefaultDocument,
-    SetParameterLiteral {
-        parameter: ParameterId,
-        base: ParameterLiteralDraft,
-        value: ParameterLiteralDraft,
-    },
-    AddUserLengthParameter {
-        ordinal: u32,
-        value_mm: f64,
-    },
     /// The parsed binding is not `Copy`, so it stages beside the operation in
     /// `staged_parameter_binding`, exactly as a Boolean's tool picks do.
     SetParameterBindingEntry {
@@ -398,11 +465,34 @@ enum PendingOperation {
         ordinal: u32,
         kind: QuantityKind,
     },
-    CreateConstructionPlane {
-        frame: PlanarFrame3,
-        half_u: f64,
-        half_v: f64,
-        source: ConstructionPlaneSource,
+    /// A plane in its editor. The working values are not `Copy`, so they live
+    /// in `staged_plane` beside the operation, as a Boolean's tools do.
+    StagePlane {
+        /// The committed plane this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
+    /// An axis in its editor (ADR 0055); its values live in `staged_axis`.
+    StageAxis {
+        /// The committed axis this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
+    /// A loft in its editor. The picked sections are not `Copy`, so they
+    /// live in `staged_loft` beside the operation, as a plane's values do.
+    StageLoft {
+        /// The committed loft this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
+    /// A revolve in its editor (ADR 0055). Its picks live in
+    /// `staged_revolve` beside the operation, as a loft's do.
+    StageRevolve {
+        /// The committed revolve this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
+    },
+    /// A sweep in its editor (ADR 0055). Its picks live in `staged_sweep`
+    /// beside the operation, as a revolve's do.
+    StageSweep {
+        /// The committed sweep this editor was reopened on, when it was.
+        editing: Option<FeatureId>,
     },
     /// The tool bodies are picked interactively while this is staged and live
     /// in `boolean_tools`, the same way an edge finish collects `selected_edges`.
@@ -444,6 +534,8 @@ enum PendingOperation {
         second_distance: Option<f64>,
         /// The faces each side ends at, when it ends at a face.
         up_to_faces: [Option<EntityRef>; 2],
+        /// The construction planes each side ends at, when it ends at one.
+        up_to_planes: [Option<FeatureId>; 2],
         /// For an Add or Cut from a sketch on a plane rather than a face:
         /// the body the swept solid is combined with once it exists.
         boolean_target: Option<BodyId>,
@@ -526,8 +618,6 @@ impl PendingOperation {
             Self::RunCase { case, .. } => case.title(),
             Self::LibraryInsertion { .. } => "Insert library component",
             Self::LoadDefaultDocument => "Open saved document",
-            Self::SetParameterLiteral { .. } => "Update document parameter",
-            Self::AddUserLengthParameter { .. } => "Add document parameter",
             Self::SetParameterBindingEntry { .. } => "Update variable",
             Self::RemoveParameter { .. } => "Delete variable",
             Self::AddUserParameter { kind, .. } => match kind {
@@ -535,12 +625,16 @@ impl PendingOperation {
                 QuantityKind::Angle => "Add angle variable",
                 QuantityKind::Scalar => "Add factor variable",
             },
-            Self::CreateConstructionPlane { source, .. } => match source {
-                ConstructionPlaneSource::OnFace { .. } => "Create plane on face",
-                ConstructionPlaneSource::BetweenFaces { .. } => "Create midplane",
-                ConstructionPlaneSource::FromOrigin { .. } => "Create origin datum plane",
-                ConstructionPlaneSource::FromPlane { .. } => "Create construction plane",
-            },
+            Self::StagePlane { editing: None } => "Create construction plane",
+            Self::StagePlane { editing: Some(_) } => "Edit construction plane",
+            Self::StageAxis { editing: None } => "Create construction axis",
+            Self::StageAxis { editing: Some(_) } => "Edit construction axis",
+            Self::StageLoft { editing: None } => "Loft",
+            Self::StageLoft { editing: Some(_) } => "Edit loft",
+            Self::StageRevolve { editing: None } => "Revolve",
+            Self::StageRevolve { editing: Some(_) } => "Edit revolve",
+            Self::StageSweep { editing: None } => "Sweep",
+            Self::StageSweep { editing: Some(_) } => "Edit sweep",
             Self::BooleanBodies { operation, .. } => match operation {
                 BooleanOperation::Union => "Combine bodies",
                 BooleanOperation::Difference => "Subtract bodies",
@@ -583,33 +677,43 @@ impl PendingOperation {
             Self::LoadDefaultDocument => {
                 "Replace the current workspace from the verified native document file"
             }
-            Self::SetParameterLiteral { .. } => {
-                "Publish the new typed value and rebuild every consuming feature"
-            }
-            Self::AddUserLengthParameter { .. } => {
-                "Create one named, reusable length parameter in this document"
-            }
             Self::SetParameterBindingEntry { .. } => {
-                "Publish the new value or expression and rebuild every consuming feature"
+                "Set the variable, the variables written in terms of it, and the extrusions whose distance follows it; numbers typed into sketches keep their values"
             }
             Self::RemoveParameter { .. } => {
                 "Delete the variable; a variable a feature or expression still uses is refused"
             }
             Self::AddUserParameter { .. } => "Create one named, reusable variable in this document",
-            Self::CreateConstructionPlane { source, .. } => match source {
-                ConstructionPlaneSource::OnFace { .. } => {
-                    "Commit a datum plane coincident with the selected planar face"
-                }
-                ConstructionPlaneSource::BetweenFaces { .. } => {
-                    "Commit a datum plane halfway between two parallel planar faces"
-                }
-                ConstructionPlaneSource::FromOrigin { .. } => {
-                    "Commit a datum plane on the selected origin plane"
-                }
-                ConstructionPlaneSource::FromPlane { .. } => {
-                    "Commit a datum plane on the selected construction plane"
-                }
-            },
+            Self::StagePlane { editing: None } => {
+                "Drag the arrow or type an offset, then confirm to add the plane to the history"
+            }
+            Self::StagePlane { editing: Some(_) } => {
+                "Confirm to rewrite the plane and replay everything built on it"
+            }
+            Self::StageAxis { editing: None } => {
+                "Flip it if it should run the other way, then confirm to add the axis to the history"
+            }
+            Self::StageAxis { editing: Some(_) } => {
+                "Confirm to rewrite the axis and replay everything built on it"
+            }
+            Self::StageLoft { editing: None } => {
+                "Click a profile in each sketch in order, then confirm to build the loft"
+            }
+            Self::StageLoft { editing: Some(_) } => {
+                "Confirm to rewrite the loft and replay everything built after it"
+            }
+            Self::StageRevolve { editing: None } => {
+                "Click the profile, choose the axis, then confirm to build the revolve"
+            }
+            Self::StageRevolve { editing: Some(_) } => {
+                "Confirm to rewrite the revolve and replay everything built after it"
+            }
+            Self::StageSweep { editing: None } => {
+                "Click the profile, choose the path, then confirm to build the sweep"
+            }
+            Self::StageSweep { editing: Some(_) } => {
+                "Confirm to rewrite the sweep and replay everything built after it"
+            }
             Self::BooleanBodies { .. } => {
                 "Click the tool bodies to combine with the target, then confirm to publish a validated successor"
             }
@@ -657,16 +761,6 @@ impl PendingOperation {
             Self::LibraryInsertion { staging_id } => {
                 object.insert("staging_id".to_owned(), serde_json::json!(staging_id));
             }
-            Self::SetParameterLiteral { parameter, .. } => {
-                object.insert(
-                    "parameter_id".to_owned(),
-                    serde_json::json!(parameter.to_string()),
-                );
-            }
-            Self::AddUserLengthParameter { ordinal, value_mm } => {
-                object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
-                object.insert("value_mm".to_owned(), serde_json::json!(value_mm));
-            }
             Self::SetParameterBindingEntry { parameter } | Self::RemoveParameter { parameter } => {
                 object.insert(
                     "parameter_id".to_owned(),
@@ -677,11 +771,14 @@ impl PendingOperation {
                 object.insert("ordinal".to_owned(), serde_json::json!(ordinal));
                 object.insert("kind".to_owned(), serde_json::json!(format!("{kind:?}")));
             }
-            Self::CreateConstructionPlane { source, .. } => {
-                object.insert(
-                    "plane_source".to_owned(),
-                    serde_json::json!(format!("{source:?}")),
-                );
+            Self::StagePlane { editing }
+            | Self::StageAxis { editing }
+            | Self::StageLoft { editing }
+            | Self::StageRevolve { editing }
+            | Self::StageSweep { editing } => {
+                if let Some(feature) = editing {
+                    object.insert("editing".to_owned(), serde_json::json!(feature.get()));
+                }
             }
             Self::BooleanBodies {
                 target,
@@ -778,7 +875,6 @@ const HOLE_PATTERN_COUNT: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SolidFeaturePreset {
-    Revolve,
     Hole,
     Rib,
     Mirror,
@@ -887,7 +983,6 @@ enum PendingPlaneSketch {
 impl SolidFeaturePreset {
     const fn label(self) -> &'static str {
         match self {
-            Self::Revolve => "Revolve radial section",
             Self::Hole => "Drill hole",
             Self::Rib => "Add rib",
             Self::Mirror => "Mirror body",
@@ -901,7 +996,6 @@ impl SolidFeaturePreset {
 
     const fn detail(self) -> &'static str {
         match self {
-            Self::Revolve => "Create an exact full-turn annular revolve as a new body",
             Self::Hole => "Cut an exact cylindrical hole normal to the selected planar face",
             Self::Rib => "Add a straight rectangular rib to the selected planar face",
             Self::Mirror => "Mirror the browser-selected bodies across the selected plane",
@@ -920,35 +1014,6 @@ impl SolidFeaturePreset {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ParameterLiteralDraft {
-    Quantity { magnitude: f64, unit: ParameterUnit },
-    Integer(i64),
-    Boolean(bool),
-}
-
-impl ParameterLiteralDraft {
-    fn from_value(value: &ParameterValue) -> Option<Self> {
-        match value {
-            ParameterValue::Quantity { value } => Some(Self::Quantity {
-                magnitude: value.magnitude,
-                unit: value.unit,
-            }),
-            ParameterValue::Integer { value } => Some(Self::Integer(*value)),
-            ParameterValue::Boolean { value } => Some(Self::Boolean(*value)),
-            ParameterValue::Choice { .. } => None,
-        }
-    }
-
-    fn into_value(self) -> ParameterValue {
-        match self {
-            Self::Quantity { magnitude, unit } => ParameterValue::quantity(magnitude, unit),
-            Self::Integer(value) => ParameterValue::integer(value),
-            Self::Boolean(value) => ParameterValue::boolean(value),
-        }
-    }
-}
-
 /// User-visible material intent for the extrusion command.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExtrusionMode {
@@ -958,6 +1023,51 @@ pub enum ExtrusionMode {
     Cut,
 }
 
+/// What the Save to Part Library window is filling in.
+#[derive(Clone, Debug, Default)]
+struct SavePartDialog {
+    name: String,
+    description: String,
+    /// Which variables become the part's parameters.
+    offered: BTreeMap<ParameterId, bool>,
+    error: Option<String>,
+}
+
+/// A library insertion evaluated and ready to enter the document.
+struct PreparedInsertion {
+    definition: ComponentDefinitionRef,
+    evaluated: artificer_model::EvaluatedParameters,
+    action: ReplayAction,
+    outcome: artificer_kernel::ExecutionOutcome,
+}
+
+enum PreparedInsertionError {
+    Rejected(String),
+    Kernel(KernelError),
+}
+
+/// An extrusion distance typed as an expression over document variables.
+#[derive(Clone, Debug, PartialEq)]
+struct DistanceLink {
+    /// What was typed, shown back in the field.
+    text: String,
+    expression: ParameterExpression,
+    /// What the expression came to when it was typed, in millimetres.
+    value: f64,
+}
+
+/// The variables-panel unit a bare number in a length field is read in.
+const fn parameter_unit_for(unit: units::LengthUnit) -> ParameterUnit {
+    match unit {
+        units::LengthUnit::Micrometre => ParameterUnit::Micrometer,
+        units::LengthUnit::Millimetre => ParameterUnit::Millimeter,
+        units::LengthUnit::Centimetre => ParameterUnit::Centimeter,
+        units::LengthUnit::Metre => ParameterUnit::Meter,
+        units::LengthUnit::Inch => ParameterUnit::Inch,
+        units::LengthUnit::Foot => ParameterUnit::Foot,
+    }
+}
+
 /// What a committed extrusion records, beyond the one depth the kernel
 /// command carries: the side it was asked to grow, what it does to the body,
 /// the second side, and the persistent faces a side was told to reach.
@@ -965,9 +1075,12 @@ pub enum ExtrusionMode {
 pub struct ExtrusionRecord {
     /// The first side, signed: the sign is the direction the sweep goes.
     signed_distance: f64,
+    /// The variable expression the first side follows, if it follows one.
+    distance_expression: Option<ParameterExpression>,
     mode: ExtrusionMode,
     second_distance: Option<f64>,
     up_to_faces: [Option<PersistentRef>; 2],
+    up_to_planes: [Option<FeatureId>; 2],
 }
 
 /// Where one side of an extrusion ends.
@@ -981,13 +1094,22 @@ pub enum ExtrusionExtentIntent {
     /// At this face, parallel to the sketch plane; the side's distance is
     /// the length measured to it.
     ToFace(EntityRef),
+    /// At this construction plane, parallel to the sketch plane (ADR 0048).
+    ToPlane(FeatureId),
 }
 
 impl ExtrusionExtentIntent {
     const fn face(self) -> Option<EntityRef> {
         match self {
             Self::ToFace(face) => Some(face),
-            Self::Distance | Self::PickingFace => None,
+            Self::Distance | Self::PickingFace | Self::ToPlane(_) => None,
+        }
+    }
+
+    const fn plane(self) -> Option<FeatureId> {
+        match self {
+            Self::ToPlane(plane) => Some(plane),
+            Self::Distance | Self::PickingFace | Self::ToFace(_) => None,
         }
     }
 }
@@ -1111,6 +1233,9 @@ enum ModelBodyKind {
     CutPocket,
     PushedPulled,
     Boolean,
+    Lofted,
+    Revolved,
+    Swept,
 }
 
 impl ModelBodyKind {
@@ -1122,6 +1247,9 @@ impl ModelBodyKind {
             Self::CutPocket => "native cut pocket",
             Self::PushedPulled => "native pushed/pulled solid",
             Self::Boolean => "native Boolean result",
+            Self::Lofted => "native loft",
+            Self::Revolved => "native revolve",
+            Self::Swept => "native sweep",
         }
     }
 }
@@ -1262,6 +1390,9 @@ fn model_segments_share_tangent_endpoint(first: [Point3; 2], second: [Point3; 2]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FeaturePreviewKind {
     Origin,
+    /// A construction plane: a chip of its own, named by its feature, with
+    /// the same right-click menu as any other feature (ADR 0048).
+    Plane,
     BaseBody,
     Component,
     Sketch,
@@ -1270,6 +1401,14 @@ enum FeaturePreviewKind {
     Cut,
     Transform,
     Boolean,
+    /// A loft between sketch sections, named by its feature (ADR 0051).
+    Loft,
+    /// A revolve of a sketch profile, named by its feature (ADR 0055).
+    Revolve,
+    /// A sketch profile swept along a path, named by its feature (ADR 0055).
+    Sweep,
+    /// A construction axis, named by its feature (ADR 0055).
+    Axis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1280,6 +1419,8 @@ struct FeaturePreviewEntry {
     finished: bool,
     /// Stable lineage colour/group for related sketch and solid features.
     group: u64,
+    /// The feature's own name, for chips the user can rename.
+    name: Option<String>,
 }
 
 impl FeaturePreviewEntry {
@@ -1290,12 +1431,21 @@ impl FeaturePreviewEntry {
             revision: 0,
             finished: true,
             group: 0,
+            name: None,
         }
     }
 
     fn label(&self) -> String {
         match self.kind {
             FeaturePreviewKind::Origin => "Origin".to_owned(),
+            FeaturePreviewKind::Plane => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Plane {}", self.ordinal)),
+            FeaturePreviewKind::Axis => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Axis {}", self.ordinal)),
             FeaturePreviewKind::BaseBody => "Base body".to_owned(),
             FeaturePreviewKind::Component => format!("Component {}", self.ordinal),
             FeaturePreviewKind::Sketch => {
@@ -1306,6 +1456,18 @@ impl FeaturePreviewEntry {
             FeaturePreviewKind::Cut => format!("Cut {}", self.ordinal),
             FeaturePreviewKind::Transform => format!("Transform {}", self.ordinal),
             FeaturePreviewKind::Boolean => format!("Boolean {}", self.ordinal),
+            FeaturePreviewKind::Loft => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Loft {}", self.ordinal)),
+            FeaturePreviewKind::Revolve => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Revolve {}", self.ordinal)),
+            FeaturePreviewKind::Sweep => self
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Sweep {}", self.ordinal)),
         }
     }
 
@@ -1387,6 +1549,7 @@ impl FeaturePreviewState {
                 .max()
                 .unwrap_or(0)
                 .saturating_add(1),
+            name: None,
         });
         self.active_sketch = Some(self.entries.len() - 1);
     }
@@ -1438,6 +1601,7 @@ impl FeaturePreviewState {
                     || self.entries.last().map_or(0, |entry| entry.group),
                     |entry| entry.group,
                 ),
+            name: None,
         });
     }
 
@@ -2058,16 +2222,39 @@ struct TimelineContextMenu {
 enum TimelineContextCommand {
     /// Reopen the 3D editor the feature was made in.
     Edit,
+    /// Reopen a construction plane's editor (ADR 0048).
+    EditPlane,
+    /// Reopen a loft's editor (ADR 0051).
+    EditLoft,
+    /// Reopen a revolve's editor (ADR 0055).
+    EditRevolve,
+    /// Reopen a sweep's editor (ADR 0055).
+    EditSweep,
+    Rename,
     Suppress,
     Restore,
+    /// Delete a construction plane nothing is built on.
+    DeletePlane,
+    /// Reopen a construction axis's editor (ADR 0055).
+    EditAxis,
+    /// Delete a construction axis nothing is built on.
+    DeleteAxis,
 }
 
 impl TimelineContextCommand {
     const fn label(self) -> &'static str {
         match self {
             Self::Edit => "Edit this extrusion",
+            Self::EditPlane => "Edit this plane",
+            Self::EditLoft => "Edit this loft",
+            Self::EditRevolve => "Edit this revolve",
+            Self::EditSweep => "Edit this sweep",
+            Self::Rename => "Rename…",
             Self::Suppress => "Suppress this feature",
             Self::Restore => "Restore this feature",
+            Self::DeletePlane => "Delete this plane",
+            Self::EditAxis => "Edit this axis",
+            Self::DeleteAxis => "Delete this axis",
         }
     }
 }
@@ -2499,6 +2686,15 @@ struct RecipeParameterField {
 }
 
 /// State for the native Artificer workbench and kernel lab.
+/// The command to run again once an armed tool has what it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmedResume {
+    /// Extrude in the model workspace, pushing or pulling a face.
+    PushPull,
+    /// One of the solid feature presets.
+    Preset(SolidFeaturePreset),
+}
+
 pub struct KernelLabApp {
     document: ModelDocument,
     document_path: PathBuf,
@@ -2510,14 +2706,31 @@ pub struct KernelLabApp {
     /// closing its own), drained by the shell every frame.
     shell_requests: Vec<documents::ShellRequest>,
     document_settings: DocumentSettings,
+    /// The document's construction planes, as the runtime shows them.
     construction_planes: Vec<ConstructionPlane>,
-    next_construction_plane_id: u64,
     selected_construction_plane: Option<u64>,
+    /// The plane editor's working values while `StagePlane` is pending.
+    staged_plane: Option<StagedPlane>,
+    /// The committed construction axes (ADR 0055), and the one in its editor.
+    construction_axes: Vec<construction_axis::ConstructionAxis>,
+    staged_axis: Option<construction_axis::StagedAxis>,
+    /// Axes whose base did not resolve on the last rebuild.
+    stale_axes: BTreeSet<FeatureId>,
+    /// A loft in its editor (ADR 0051), beside `PendingOperation::StageLoft`.
+    staged_loft: Option<loft::StagedLoft>,
+    /// A plane being renamed from the history or the Browser, and its text.
+    plane_rename: Option<(FeatureId, String)>,
+    /// Planes whose base did not resolve at the last rebuild; each stands on
+    /// the frame it last resolved to until its base comes back.
+    stale_planes: BTreeSet<FeatureId>,
     document_properties_open: bool,
     pending_export: Option<PendingExport>,
     /// The document's revision the last time it was saved or loaded. The
     /// document is dirty when its revision has moved on from this.
     saved_revision: u64,
+    /// Features the last open had to suppress because they could not be
+    /// rebuilt.
+    suppressed_on_open: Vec<FeatureId>,
     /// Whether Open, Save as and the exports use the desktop's own file
     /// dialog. Off, they fall back to typed paths, which is also what a
     /// headless test drives.
@@ -2546,6 +2759,13 @@ pub struct KernelLabApp {
     variable_name_drafts: BTreeMap<u64, String>,
     /// Text typed into the extrusion distance expression field.
     extrusion_expression_draft: String,
+    /// The variable expression the extrusion's distance follows, when it was
+    /// typed as one (`length`, `depth * 2`), and the value it came to. The
+    /// link holds only while the distance is still that value: dragging or
+    /// typing a number over it lets it go.
+    extrusion_distance_link: Option<DistanceLink>,
+    /// The Save to Part Library window, while it is open.
+    save_part_dialog: Option<SavePartDialog>,
     /// The Theme tab's colour editor window.
     theme_editor_open: bool,
     /// Where the theme choice and edited palettes are written; `None` in
@@ -2623,13 +2843,18 @@ pub struct KernelLabApp {
     /// first command to take it; flipping a gate before the path exists would
     /// ship a live button with nothing behind it.
     armed_tool: Option<invocation::ArmedTool>,
+    /// How to carry on once an armed tool has its operands: the command that
+    /// armed it, run again against the selection the pick just joined.
+    armed_resume: Option<ArmedResume>,
     /// Tool bodies picked while a Boolean is staged, in click order. Empty
     /// outside a staged Boolean; the target is never a member.
     boolean_tools: Vec<BodyId>,
-    /// The sketch region and axis captured when a revolve was staged. It lives
-    /// beside the pending operation rather than inside it because a profile is
-    /// not `Copy`, exactly as the Boolean tool list does.
-    staged_revolve: Option<StagedRevolve>,
+    /// A revolve in its editor (ADR 0055), beside
+    /// `PendingOperation::StageRevolve`.
+    staged_revolve: Option<revolve::StagedRevolve>,
+    /// A sweep in its editor (ADR 0055), beside
+    /// `PendingOperation::StageSweep`.
+    staged_sweep: Option<sweep::StagedSweep>,
     active_tool: ActiveTool,
     display_transform: DisplayTransform,
     pending_operation: Option<PendingOperation>,
@@ -2668,6 +2893,10 @@ pub struct KernelLabApp {
     extrusion_symmetric: bool,
     /// Where each side ends: at its distance, or at a picked face.
     extrusion_extents: [ExtrusionExtentIntent; 2],
+    /// Why a side could not end at a face, shown under its row until the
+    /// side is changed again. A refusal that only reaches the status line
+    /// reads as a button that did nothing.
+    extrusion_extent_notes: [Option<String>; 2],
     extrusion_mode: ExtrusionMode,
     /// When false, signed face distance retains the convenient Add/Cut
     /// inference. Clicking an operation in Properties turns this on so the
@@ -2793,7 +3022,10 @@ impl Default for KernelLabApp {
         let step_export_path_text = document_path.with_extension("step").display().to_string();
         let mut part_library = PartLibraryState::default();
         if let Ok(package) = builtin_aluminium_extrusion_package() {
-            part_library.set_definition_digest(package.content_digest().to_hex());
+            part_library.set_definition(
+                package.content_digest().to_hex(),
+                crate::library_catalog::builtin_part_revision_parts(),
+            );
         }
         let mut app = Self {
             document: ModelDocument::default(),
@@ -2803,11 +3035,18 @@ impl Default for KernelLabApp {
             shell_requests: Vec::new(),
             document_settings: DocumentSettings::default(),
             construction_planes: Vec::new(),
-            next_construction_plane_id: 1,
             selected_construction_plane: None,
+            staged_plane: None,
+            construction_axes: Vec::new(),
+            staged_axis: None,
+            stale_axes: BTreeSet::new(),
+            staged_loft: None,
+            plane_rename: None,
+            stale_planes: BTreeSet::new(),
             document_properties_open: false,
             pending_export: None,
             saved_revision: 0,
+            suppressed_on_open: Vec::new(),
             native_file_dialogs: true,
             last_dialog_directory: None,
             document_path_prompt: None,
@@ -2818,6 +3057,8 @@ impl Default for KernelLabApp {
             variable_value_drafts: BTreeMap::new(),
             variable_name_drafts: BTreeMap::new(),
             extrusion_expression_draft: String::new(),
+            extrusion_distance_link: None,
+            save_part_dialog: None,
             theme_editor_open: false,
             theme_preferences_path: None,
             user_preferences_path: None,
@@ -2854,8 +3095,10 @@ impl Default for KernelLabApp {
             measured_edges: Vec::new(),
             measured_face: None,
             armed_tool: None,
+            armed_resume: None,
             boolean_tools: Vec::new(),
             staged_revolve: None,
+            staged_sweep: None,
             active_tool: ActiveTool::Select,
             display_transform: DisplayTransform::default(),
             pending_operation: None,
@@ -2889,6 +3132,7 @@ impl Default for KernelLabApp {
             extrusion_second_distance: None,
             extrusion_symmetric: false,
             extrusion_extents: [ExtrusionExtentIntent::Distance; 2],
+            extrusion_extent_notes: [None, None],
             extrusion_mode: ExtrusionMode::NewBody,
             extrusion_mode_explicit: false,
             extruded_sketch_revision: None,
@@ -2983,17 +3227,34 @@ impl KernelLabApp {
             ..Self::default()
         };
         app.reset_to_blank_workspace();
-        app.theme_preferences_path = Some(theme_preferences_path());
+        // Earlier builds on Windows kept all of this inside the installer's
+        // own folder, which uninstalling removes; bring it across first.
+        if let Err(error) = user_data::migrate_legacy_data() {
+            app.document_status = Some(format!(
+                "Could not bring settings and parts over from the earlier location: {error}"
+            ));
+        }
+        app.theme_preferences_path = theme_preferences_path();
         app.load_theme_preferences(egui_ctx);
-        app.user_preferences_path = Some(user_preferences_path());
+        app.user_preferences_path = user_preferences_path();
         app.load_user_preferences();
         // The 3D mouse is opened once per process; a further document
         // shares the reader and takes its motion while it is in front.
         app.spacemouse = spacemouse::SpaceMouseNavigation::attach(egui_ctx);
-        if let Err(error) = app.open_catalog_store(default_catalog_root()) {
-            app.document_status = Some(format!(
-                "Local Part Library is using its verified built-in fallback: {error}"
-            ));
+        match user_data::library_directory() {
+            Some(root) => {
+                if let Err(error) = app.open_catalog_store(root) {
+                    app.document_status = Some(format!(
+                        "Local Part Library is using its verified built-in fallback: {error}"
+                    ));
+                }
+            }
+            None => {
+                app.document_status = Some(
+                    "Local Part Library is using its verified built-in fallback: this system names no per-user data folder to keep parts in"
+                        .to_owned(),
+                );
+            }
         }
         app
     }
@@ -3043,21 +3304,316 @@ impl KernelLabApp {
 
     fn open_catalog_store(&mut self, root: impl AsRef<Path>) -> Result<(), String> {
         let package = builtin_aluminium_extrusion_package().map_err(|error| error.to_string())?;
-        let digest = package.content_digest();
-        let store =
-            CatalogStore::open(root.as_ref().to_path_buf()).map_err(|error| error.to_string())?;
-        store.publish(&package).map_err(|error| error.to_string())?;
-        let rebuilt = store.rebuild_index().map_err(|error| error.to_string())?;
+        let store = CatalogStore::open(root.as_ref().to_path_buf())
+            .map_err(|error| plain_catalog_error(&error))?;
+        // A note for anyone who comes across the folder; not having one is
+        // no reason to go without the library.
+        let _ = user_data::write_library_readme(root.as_ref());
+        // Saving the part into the library draws its picture, once; a store
+        // that already has it hands back the kept one.
+        let (digest, preview) = crate::part_preview::publish_with_preview(&store, &package)
+            .map_err(|error| plain_catalog_error(&error))?;
+        let rebuilt = store
+            .rebuild_index()
+            .map_err(|error| plain_catalog_error(&error))?;
         if rebuilt.accepted() == 0 {
             return Err("the catalog contains no accepted definitions".into());
         }
-        self.part_library.set_definition_digest(digest.to_hex());
+        self.part_library.set_definition(
+            digest.to_hex(),
+            crate::library_catalog::builtin_part_revision_parts(),
+        );
+        self.part_library
+            .set_preview(&digest.to_hex(), preview.as_ref());
         self.catalog_store = Some(store);
+        self.refresh_library_parts();
         self.document_status = Some(format!(
             "Local Part Library ready · {} verified definition(s)",
             rebuilt.accepted()
         ));
         Ok(())
+    }
+
+    /// Opens the Save to Part Library window for the part being worked on,
+    /// named after the document, with every variable that can be a
+    /// parameter offered.
+    pub fn open_save_part_dialog(&mut self) {
+        let offered = saved_parts::exposable_variables(&self.document)
+            .into_iter()
+            .map(|variable| (variable.id, true))
+            .collect();
+        self.save_part_dialog = Some(SavePartDialog {
+            name: self.document_title.clone(),
+            description: String::new(),
+            offered,
+            error: None,
+        });
+    }
+
+    /// Whether the Save to Part Library window is open.
+    #[must_use]
+    pub const fn save_part_dialog_open(&self) -> bool {
+        self.save_part_dialog.is_some()
+    }
+
+    /// The body that would be saved as the part, or why there is none.
+    fn body_to_save(&self) -> Result<BodyId, saved_parts::SavedPartError> {
+        let visible = self
+            .bodies
+            .iter()
+            .filter(|body| body.visible)
+            .map(|body| body.id)
+            .collect::<Vec<_>>();
+        saved_parts::part_body(&visible, self.active_body_id())
+    }
+
+    /// Saves the part being worked on into the Part Library under `name`,
+    /// with `parameters` as the values it takes when placed. Saving under a
+    /// name the library already has adds a new version of that part. Returns
+    /// what was saved, as the library shows it.
+    pub fn save_current_part_to_library(
+        &mut self,
+        name: &str,
+        description: Option<&str>,
+        parameters: Vec<ParameterId>,
+    ) -> Result<String, String> {
+        let store = self
+            .catalog_store
+            .as_ref()
+            .ok_or("the Part Library folder is not available on this system")?;
+        let body = self.body_to_save().map_err(|error| error.to_string())?;
+        let key = saved_parts::definition_key_for(name).map_err(|error| error.to_string())?;
+        let revision =
+            saved_parts::next_revision(store, &key).map_err(|error| error.to_string())?;
+        let request = saved_parts::SaveRequest {
+            name: name.to_owned(),
+            description: description.map(str::to_owned),
+            body,
+            parameters,
+        };
+        let package = saved_parts::package_part(&self.document, &request, key.clone(), revision)
+            .map_err(|error| error.to_string())?;
+        crate::part_preview::publish_with_preview(store, &package)
+            .map_err(|error| plain_catalog_error(&error))?;
+        self.refresh_library_parts();
+        self.part_library.select_part(key.as_str());
+        let saved = format!("{} v{revision}", name.trim());
+        self.part_library
+            .set_status(format!("Saved {saved} into the Part Library."));
+        self.document_status = Some(format!("Saved {saved} into the Part Library"));
+        Ok(saved)
+    }
+
+    fn save_part_window(&mut self, context: &egui::Context) {
+        let Some(mut dialog) = self.save_part_dialog.take() else {
+            return;
+        };
+        let variables = saved_parts::exposable_variables(&self.document);
+        let body = self.body_to_save();
+        let body_label = body
+            .as_ref()
+            .ok()
+            .and_then(|body| self.document.body(*body).map(|record| record.label.clone()));
+        let unit = self.length_unit();
+        let mut save = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new("SAVE TO PART LIBRARY")
+            .id(egui::Id::new("save_part_window"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_width(420.0)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .frame(
+                Frame::new()
+                    .fill(theme::panel().gamma_multiply(0.98))
+                    .stroke(Stroke::new(1.0, theme::border()))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(10)),
+            )
+            .show(context, |ui| {
+                ui.label(RichText::new("Name").small().color(theme::muted()));
+                let name = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY),
+                );
+                name.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Part name")
+                });
+                ui.label(RichText::new("Description").small().color(theme::muted()));
+                let description = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.description)
+                        .hint_text("optional")
+                        .desired_width(f32::INFINITY),
+                );
+                description.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::TextEdit,
+                        true,
+                        "Part description",
+                    )
+                });
+                ui.add_space(6.0);
+                match (&body, &body_label) {
+                    (Ok(_), Some(label)) => {
+                        ui.label(
+                            RichText::new(format!("The part is {label}"))
+                                .small()
+                                .color(theme::text()),
+                        );
+                    }
+                    (Err(error), _) => {
+                        ui.label(RichText::new(error.to_string()).small().color(theme::bad()));
+                    }
+                    (Ok(_), None) => {}
+                }
+                ui.add_space(6.0);
+                if variables.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "No variables to offer: the part is saved at its one size. Give it variables in the Parametric tab to make it take values when placed.",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Values it takes when placed")
+                            .small()
+                            .color(theme::muted()),
+                    );
+                    for variable in &variables {
+                        let value = match variable.quantity {
+                            QuantityKind::Length => unit.format(variable.value),
+                            QuantityKind::Angle => {
+                                format!("{:.3}°", variable.value.to_degrees())
+                            }
+                            QuantityKind::Scalar => format!("{}", variable.value),
+                        };
+                        let offered = dialog.offered.entry(variable.id).or_insert(true);
+                        let checkbox =
+                            ui.checkbox(offered, format!("{} · now {value}", variable.key));
+                        let key = variable.key.clone();
+                        checkbox.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Checkbox,
+                                true,
+                                format!("Offer {key} when placing"),
+                            )
+                        });
+                    }
+                    ui.label(
+                        RichText::new(
+                            "A sketch dimension or extrusion distance typed over a variable follows the value given when the part is placed; the variable's value now is its default.",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    );
+                }
+                if let Some(error) = &dialog.error {
+                    ui.label(RichText::new(error).small().color(theme::bad()));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let can_save = body.is_ok() && !dialog.name.trim().is_empty();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save to library"))
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            let parameters = variables
+                .iter()
+                .filter(|variable| dialog.offered.get(&variable.id).copied().unwrap_or(true))
+                .map(|variable| variable.id)
+                .collect();
+            let description = dialog.description.trim().to_owned();
+            match self.save_current_part_to_library(
+                &dialog.name,
+                (!description.is_empty()).then_some(description.as_str()),
+                parameters,
+            ) {
+                Ok(_) => {
+                    *self.part_library.open_mut() = true;
+                    return;
+                }
+                Err(error) => dialog.error = Some(error),
+            }
+        }
+        if open && !cancel {
+            self.save_part_dialog = Some(dialog);
+        }
+    }
+
+    /// Offers every part the library holds: the built-in extrusion as this
+    /// build publishes it, and the newest version of each saved part this
+    /// build can read, each with its kept picture. A saved part without a
+    /// picture has one drawn and kept now.
+    fn refresh_library_parts(&mut self) {
+        let Some(store) = self.catalog_store.as_ref() else {
+            return;
+        };
+        let Ok(index) = store.index_snapshot() else {
+            return;
+        };
+        let mut newest = BTreeMap::<String, artificer_catalog::CatalogEntry>::new();
+        for entry in index.entries() {
+            if entry.definition_id().as_str().starts_with("builtin.") {
+                continue;
+            }
+            let key = entry.definition_id().as_str().to_owned();
+            let replace = newest
+                .get(&key)
+                .is_none_or(|kept| entry.revision() > kept.revision());
+            if replace {
+                newest.insert(key, entry.clone());
+            }
+        }
+        let mut parts = self
+            .part_library
+            .parts()
+            .iter()
+            .filter(|part| part.is_builtin())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut previews = Vec::new();
+        for entry in newest.values() {
+            let Ok(package) = store.load(entry.digest()) else {
+                continue;
+            };
+            if !saved_parts::is_saved_part(&package)
+                || package.definition().document().schema_version()
+                    > artificer_model::CURRENT_DOCUMENT_VERSION
+            {
+                continue;
+            }
+            let preview = match store.preview(entry.digest()) {
+                Ok(Some(kept)) => Some(kept),
+                _ => crate::part_preview::draw_package_preview(&package)
+                    .ok()
+                    .inspect(|drawn| {
+                        let _ = store.save_preview(entry.digest(), drawn);
+                    }),
+            };
+            previews.push((entry.digest().to_hex(), preview));
+            parts.push(saved_parts::library_part(&package));
+        }
+        parts.sort_by(|left, right| {
+            right
+                .is_builtin()
+                .cmp(&left.is_builtin())
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        self.part_library.set_parts(parts);
+        for (digest, preview) in previews {
+            self.part_library.set_preview(&digest, preview.as_ref());
+        }
     }
 
     #[must_use]
@@ -3290,6 +3846,13 @@ impl KernelLabApp {
         self.document.revision() != self.saved_revision
     }
 
+    /// The features the last open had to suppress because they could not
+    /// be rebuilt.
+    #[must_use]
+    pub fn features_suppressed_on_open(&self) -> &[FeatureId] {
+        &self.suppressed_on_open
+    }
+
     /// Records that the document as it stands is what is on disk.
     pub const fn mark_document_saved(&mut self) {
         self.saved_revision = self.document.revision();
@@ -3387,10 +3950,12 @@ impl KernelLabApp {
     /// millimetres, or `None` while it holds nothing usable. For tests.
     #[must_use]
     pub fn part_library_length_mm(&self) -> Option<f64> {
-        match self.part_library.eligibility() {
-            PartInsertionEligibility::Ready { length_mm, .. } => Some(length_mm),
-            _ => None,
-        }
+        self.part_library
+            .resolved_values()
+            .ok()?
+            .into_iter()
+            .find(|assignment| assignment.key == crate::part_library::LENGTH_PARAMETER_KEY)
+            .map(|assignment| assignment.value)
     }
 
     /// Portable Artificer workspace envelope. Unlike the raw model archive used
@@ -3426,7 +3991,7 @@ impl KernelLabApp {
                 navigation: self.navigation_preference,
                 ..self.document_settings
             },
-            construction_planes: self.construction_planes.clone(),
+            construction_planes: Vec::new(),
             document: self.document.clone(),
         })
         .map_err(|error| error.to_string())
@@ -3531,7 +4096,13 @@ impl KernelLabApp {
     /// after the whole load rather than before it.
     pub fn load_workspace_json(&mut self, json: &str) -> Result<(), String> {
         self.load_workspace_json_unmarked(json)?;
-        self.mark_document_saved();
+        if self.suppressed_on_open.is_empty() {
+            self.mark_document_saved();
+        } else {
+            // Features were suppressed to open it, so what is open is no
+            // longer what is on disk.
+            self.saved_revision = u64::MAX;
+        }
         Ok(())
     }
 
@@ -3561,14 +4132,7 @@ impl KernelLabApp {
         // only so older builds keep reading, and adopting it here would let
         // every opened document overwrite how the user's mouse behaves.
         self.document_settings.navigation = self.navigation_preference;
-        self.construction_planes = workspace.construction_planes;
-        self.next_construction_plane_id = self
-            .construction_planes
-            .iter()
-            .map(|plane| plane.id)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        self.adopt_legacy_construction_planes(&workspace.construction_planes)?;
         self.selected_construction_plane = None;
         // Restore material assignments by stable key. A key this build does
         // not carry leaves that body unassigned rather than substituting a
@@ -3611,6 +4175,63 @@ impl KernelLabApp {
         self.load_native_document_json(&json)
     }
 
+    /// Replays a document privately, as opening it does. A feature whose
+    /// recipe no longer builds — a variable changed under it before the
+    /// save, a kernel that now refuses it — is suppressed in `document`, and
+    /// what depends on it with it, rather than refusing the whole document;
+    /// each is returned with why. A document that is malformed, or whose
+    /// recorded results do not match what it rebuilds, still refuses.
+    fn hydrate_suppressing_unbuildable(
+        document: &mut ModelDocument,
+    ) -> Result<(HydratedDocument, Vec<(FeatureId, String)>), String> {
+        let mut unbuildable = Vec::<(FeatureId, String)>::new();
+        loop {
+            let mut replay_document = document.clone();
+            if replay_document.history_position() != replay_document.features().len() {
+                replay_document
+                    .set_history_position(replay_document.features().len())
+                    .map_err(|error| {
+                        format!("history could not be prepared for replay: {error}")
+                    })?;
+                replay_document.clear_undo_history();
+            }
+            match hydrate_model_document(replay_document, HydrationOptions::default()) {
+                Ok(hydrated) => return Ok((hydrated, unbuildable)),
+                Err(error) => {
+                    let Some(feature) = error.unbuildable_feature() else {
+                        return Err(error.to_string());
+                    };
+                    if !matches!(document.set_feature_suppressed(feature, true), Ok(true)) {
+                        return Err(error.to_string());
+                    }
+                    unbuildable.push((feature, error.to_string()));
+                }
+            }
+        }
+    }
+
+    /// The features, by name, that would open suppressed if the document
+    /// were saved now: those a change upstream left waiting on a rebuild
+    /// that did not succeed. Only a document with such a feature is replayed
+    /// to find out.
+    #[must_use]
+    pub fn features_awaiting_rebuild(&self) -> Vec<String> {
+        if !self.document.features().iter().any(|feature| {
+            !feature.state.suppressed && feature.state.rebuild == RebuildState::Dirty
+        }) {
+            return Vec::new();
+        }
+        let mut probe = self.document.clone();
+        match Self::hydrate_suppressing_unbuildable(&mut probe) {
+            Ok((_, unbuildable)) => unbuildable
+                .iter()
+                .filter_map(|(feature, _)| self.document.feature(*feature))
+                .map(|feature| feature.label.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Atomically replaces the workspace from a native document archive.
     /// Kernel snapshots and reports are regenerated in a private stage; any
     /// parse, replay, persistent-reference, or provenance error leaves the
@@ -3619,21 +4240,31 @@ impl KernelLabApp {
         if self.pending_operation.is_some() {
             return Err("confirm or cancel the pending operation before loading a document".into());
         }
-        let original = serde_json::from_str::<ModelDocument>(json)
+        let mut original = serde_json::from_str::<ModelDocument>(json)
             .map_err(|error| format!("native document is invalid: {error}"))?;
         let saved_history_position = original.history_position();
-        let mut replay_document = original.clone();
-        if replay_document.history_position() != replay_document.features().len() {
-            replay_document
-                .set_history_position(replay_document.features().len())
-                .map_err(|error| format!("history could not be prepared for replay: {error}"))?;
-            replay_document.clear_undo_history();
+        let (hydrated, unbuildable) = Self::hydrate_suppressing_unbuildable(&mut original)?;
+        if !unbuildable.is_empty() {
+            // Undoing the suppression would only bring back what cannot be
+            // built; the opened document starts from here.
+            original.clear_undo_history();
         }
-        let hydrated = hydrate_model_document(replay_document, HydrationOptions::default())
-            .map_err(|error| error.to_string())?;
         let mut runtime = Self::project_hydrated_runtime(hydrated)?;
         runtime.document = original;
         self.publish_hydrated_runtime(runtime);
+        self.suppressed_on_open = unbuildable.iter().map(|(feature, _)| *feature).collect();
+        if !unbuildable.is_empty()
+            && let Some(first) = self
+                .document
+                .active_features()
+                .iter()
+                .find(|feature| feature.state.rebuild == RebuildState::Dirty)
+                .map(|feature| feature.id)
+        {
+            // The suppression marked what follows it for rebuilding; the
+            // runtime just built is that rebuild, so record it as one.
+            self.rebuild_document_from(first);
+        }
         if saved_history_position != self.document.features().len() {
             self.restore_runtime_from_document();
             self.history_scrub_position = saved_history_position;
@@ -3641,6 +4272,33 @@ impl KernelLabApp {
                 "Loaded native document at history position {saved_history_position} of {}",
                 self.document.features().len()
             ));
+        }
+        if !unbuildable.is_empty() {
+            let described = unbuildable
+                .iter()
+                .map(|(feature, reason)| {
+                    let label = self
+                        .document
+                        .feature(*feature)
+                        .map_or_else(|| format!("Feature {feature}"), |node| node.label.clone());
+                    (label, reason.as_str())
+                })
+                .collect::<Vec<_>>();
+            self.document_status = Some(match described.as_slice() {
+                [(label, reason)] => format!(
+                    "Opened with {label} suppressed: it could not be rebuilt ({reason}). \
+                     Fix it and unsuppress it from the history."
+                ),
+                many => format!(
+                    "Opened with {} features suppressed because they could not be rebuilt: {}. \
+                     Fix them and unsuppress them from the history.",
+                    many.len(),
+                    many.iter()
+                        .map(|(label, reason)| format!("{label} ({reason})"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            });
         }
         Ok(())
     }
@@ -3672,6 +4330,23 @@ impl KernelLabApp {
     #[must_use]
     pub fn selected_face(&self) -> Option<viewport::DocumentFaceSelection> {
         self.selected_faces.last().copied()
+    }
+
+    /// The staged plane's offset from its base, while the plane editor is
+    /// open.
+    #[must_use]
+    pub fn staged_plane_offset(&self) -> Option<f64> {
+        self.staged_plane.as_ref().map(|staged| staged.offset)
+    }
+
+    /// The names of the construction planes the model shows, in history
+    /// order.
+    #[must_use]
+    pub fn construction_plane_names(&self) -> Vec<String> {
+        self.construction_planes
+            .iter()
+            .map(|plane| plane.name.clone())
+            .collect()
     }
 
     #[must_use]
@@ -3769,6 +4444,12 @@ impl KernelLabApp {
         *self.part_library.open_mut() = true;
         self.document_status =
             Some("Library open · choose a part to insert into this design".to_owned());
+    }
+
+    /// The Part Library's presentation state: what its list and card show.
+    #[must_use]
+    pub const fn part_library(&self) -> &PartLibraryState {
+        &self.part_library
     }
 
     #[must_use]
@@ -3999,6 +4680,18 @@ impl KernelLabApp {
         self.sketch.point_to_point_dimensions()
     }
 
+    /// The entry a dimension drawn between points follows, if it was typed
+    /// over a variable (ADR 0054).
+    #[must_use]
+    pub fn sketch_relation_dimension_follows(
+        &self,
+        constraint: artificer_sketch::SketchConstraintId,
+    ) -> Option<String> {
+        self.sketch
+            .relation_dimension_follows(constraint)
+            .map(str::to_owned)
+    }
+
     /// The point-to-point dimension open for typing: its text, and why the last
     /// entry was refused if it was.
     #[must_use]
@@ -4121,6 +4814,49 @@ impl KernelLabApp {
         self.extrusion_distance.is_finite() && self.extrusion_distance.abs() > f64::EPSILON
     }
 
+    /// The link a distance field's text makes, when the text names document
+    /// variables: `length`, `depth * 2 + 5mm`. A plain number makes none.
+    fn distance_link_for(&self, text: &str, value: f64) -> Option<DistanceLink> {
+        let names = self
+            .document
+            .parameters()
+            .records()
+            .iter()
+            .map(|record| (record.spec.key.clone(), record.id))
+            .collect::<BTreeMap<_, _>>();
+        match parse_parameter_entry(
+            text,
+            parameter_unit_for(self.length_unit()),
+            &|name: &str| names.get(name).copied(),
+        ) {
+            Ok(ParsedParameterEntry::Expression(expression))
+                if !expression.referenced_parameters().is_empty() =>
+            {
+                Some(DistanceLink {
+                    text: text.trim().to_owned(),
+                    expression,
+                    value,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The distance link, while the distance is still what it came to.
+    fn live_distance_link(&self, distance: f64) -> Option<&DistanceLink> {
+        self.extrusion_distance_link
+            .as_ref()
+            .filter(|link| (link.value - distance).abs() <= 1.0e-9)
+    }
+
+    /// Which variables the extrusion distance follows, as typed, while it
+    /// follows any.
+    #[must_use]
+    pub fn extrusion_distance_follows(&self) -> Option<&str> {
+        self.live_distance_link(self.extrusion_distance)
+            .map(|link| link.text.as_str())
+    }
+
     fn set_extrusion_distance_intent(&mut self, distance: f64) {
         self.extrusion_distance = distance;
         // A sketch on a plane over a body may be an Add or a Cut, chosen
@@ -4169,7 +4905,21 @@ impl KernelLabApp {
 
     #[must_use]
     pub fn sketch_support_label(&self) -> String {
-        self.sketch_support.label()
+        self.support_label(&self.sketch_support)
+    }
+
+    /// What a sketch is drawn on, as the user named it: a construction
+    /// plane by its feature's name rather than by its id.
+    fn support_label(&self, support: &SketchSupport) -> String {
+        if let SketchSupport::ConstructionPlane { id: Some(id), .. } = support
+            && let Some(plane) = self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+        {
+            return plane.name.clone();
+        }
+        support.label()
     }
 
     #[must_use]
@@ -4214,6 +4964,119 @@ impl KernelLabApp {
                 Some(*body) == self.active_body_id()
                     && Some(*snapshot) == self.displayed_snapshot_id()
             }
+        }
+    }
+
+    /// Gives the plane markers of a version 6 file the recipes its envelope
+    /// kept frames for. Their snapshot-local sources cannot be named after
+    /// the fact, so each becomes a fixed plane where it stood (ADR 0048).
+    fn adopt_legacy_construction_planes(
+        &mut self,
+        legacy: &[LegacyConstructionPlane],
+    ) -> Result<(), String> {
+        let recipes = legacy
+            .iter()
+            .filter_map(|plane| {
+                let feature = plane.feature?;
+                let frame = artificer_model::datum::orthonormal_frame(plane.frame)?;
+                let mut recipe = DatumPlaneRecipe::new(
+                    DatumPlaneBase::Fixed { frame },
+                    ResolvedDatumPlane {
+                        frame,
+                        half_extent: [plane.half_u, plane.half_v],
+                    },
+                );
+                recipe.visible = plane.visible;
+                Some((feature, recipe))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if recipes.is_empty() {
+            return Ok(());
+        }
+        self.document
+            .adopt_legacy_datum_planes(recipes)
+            .map_err(|error| {
+                format!("Artificer workspace planes could not be migrated: {error}")
+            })?;
+        self.restore_runtime_from_document();
+        Ok(())
+    }
+
+    /// Rebuilds the runtime planes from the document's plane features.
+    ///
+    /// A plane is shown when it is inside the history cursor, not suppressed,
+    /// and committed; the frame is the one its recipe last resolved to. The
+    /// sketches drawn on a plane take that frame too, so what the viewport
+    /// draws is what replay used.
+    fn sync_construction_planes_from_document(&mut self) {
+        let mut planes = Vec::new();
+        for feature in self.document.features() {
+            let ReplayAction::DatumPlane(recipe) = &feature.action else {
+                continue;
+            };
+            if feature.kind != FeatureKind::DatumPlane
+                || !self.document.feature_is_active(feature.id).unwrap_or(false)
+                || feature.state.suppressed
+                || feature.committed.is_none()
+            {
+                continue;
+            }
+            let stale = self.stale_planes.contains(&feature.id);
+            let mut description = recipe.base.describe();
+            if let Some(first) = description.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            planes.push(ConstructionPlane {
+                id: feature.id.get(),
+                name: feature.label.clone(),
+                feature: feature.id,
+                frame: recipe.frame,
+                half_u: recipe.half_extent[0],
+                half_v: recipe.half_extent[1],
+                visible: recipe.visible,
+                description,
+                stale,
+            });
+        }
+        self.construction_planes = planes;
+        if self
+            .selected_construction_plane
+            .is_some_and(|id| !self.construction_planes.iter().any(|plane| plane.id == id))
+        {
+            self.selected_construction_plane = None;
+        }
+        let frame_of = |plane: u64| {
+            self.construction_planes
+                .iter()
+                .find(|candidate| candidate.id == plane)
+                .map(|candidate| candidate.frame)
+        };
+        let sketch_frames = self
+            .sketches
+            .iter()
+            .map(|sketch| match &sketch.support {
+                SketchSupport::ConstructionPlane { id: Some(id), .. } => frame_of(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (sketch, frame) in self.sketches.iter_mut().zip(sketch_frames) {
+            if let (Some(frame), SketchSupport::ConstructionPlane { frame: held, .. }) =
+                (frame, &mut sketch.support)
+            {
+                **held = frame;
+            }
+        }
+        if let SketchSupport::ConstructionPlane {
+            id: Some(id),
+            frame,
+        } = &mut self.sketch_support
+            && let Some(current) = self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+                .map(|plane| plane.frame)
+        {
+            **frame = current;
         }
     }
 
@@ -4471,12 +5334,14 @@ impl KernelLabApp {
                 | PendingOperation::RunCase { .. }
                 | PendingOperation::LibraryInsertion { .. }
                 | PendingOperation::LoadDefaultDocument
-                | PendingOperation::SetParameterLiteral { .. }
-                | PendingOperation::AddUserLengthParameter { .. }
                 | PendingOperation::SetParameterBindingEntry { .. }
                 | PendingOperation::RemoveParameter { .. }
                 | PendingOperation::AddUserParameter { .. }
-                | PendingOperation::CreateConstructionPlane { .. }
+                | PendingOperation::StagePlane { .. }
+                | PendingOperation::StageAxis { .. }
+                | PendingOperation::StageLoft { .. }
+                | PendingOperation::StageRevolve { .. }
+                | PendingOperation::StageSweep { .. }
                 | PendingOperation::BooleanBodies { .. }
                 | PendingOperation::PresetFeature { .. }
                 | PendingOperation::SketchEdit { .. }
@@ -4594,8 +5459,12 @@ impl KernelLabApp {
         self.body_archive.clear();
         self.bootstrap_body = None;
         self.construction_planes.clear();
-        self.next_construction_plane_id = 1;
         self.selected_construction_plane = None;
+        self.staged_plane = None;
+        self.construction_axes.clear();
+        self.staged_axis = None;
+        self.stale_axes.clear();
+        self.plane_rename = None;
         self.displayed = None;
         self.bodies.clear();
         self.sketches.clear();
@@ -4740,9 +5609,13 @@ impl KernelLabApp {
                 FeatureKind::Cut => ModelBodyKind::CutPocket,
                 FeatureKind::Transform => previous_kind,
                 FeatureKind::Boolean => ModelBodyKind::Boolean,
-                FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch => {
-                    previous_kind
-                }
+                FeatureKind::Loft => ModelBodyKind::Lofted,
+                FeatureKind::Revolve => ModelBodyKind::Revolved,
+                FeatureKind::Sweep => ModelBodyKind::Swept,
+                FeatureKind::Origin
+                | FeatureKind::DatumPlane
+                | FeatureKind::DatumAxis
+                | FeatureKind::Sketch => previous_kind,
             };
             for body in &result.branches {
                 body_kinds.insert(*body, kind);
@@ -4896,6 +5769,17 @@ impl KernelLabApp {
                         SketchSupport::Origin { plane }
                     }
                 }
+                Some(SketchSupportRecipe::DatumPlane { plane }) => {
+                    SketchSupport::ConstructionPlane {
+                        id: Some(plane.get()),
+                        frame: Box::new(document.sketch_frame(record.id).unwrap_or_else(|| {
+                            payload
+                                .as_ref()
+                                .expect("the support came from a payload")
+                                .frame
+                        })),
+                    }
+                }
                 Some(SketchSupportRecipe::PlanarFace { body, face }) => {
                     let head = hydrated.branch_heads.get(body).copied().ok_or_else(|| {
                         format!("sketch {} support body {} is unavailable", record.id, body)
@@ -4958,10 +5842,7 @@ impl KernelLabApp {
                 document.feature_is_active(feature.id).unwrap_or(false)
                     && feature.committed.is_some()
                     && !feature.state.suppressed
-                    && matches!(
-                        feature.kind,
-                        FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-                    )
+                    && feature.kind.consumes_sketches()
                     && feature.inputs.contains(&FeatureInput::Sketch(record.id))
             });
             let auto_hidden_consumer_active = record.auto_hidden_by.is_some_and(|consumer| {
@@ -5109,6 +5990,10 @@ impl KernelLabApp {
             .active_features()
             .last()
             .map(|feature| feature.id);
+        self.stale_planes.clear();
+        self.stale_axes.clear();
+        self.sync_construction_planes_from_document();
+        self.sync_construction_axes_from_document();
         self.sync_feature_preview_from_document();
         self.frame_visible_document();
         self.last_attempt = Attempt::Accepted {
@@ -5452,6 +6337,7 @@ impl KernelLabApp {
         match kind {
             FeatureKind::Origin => "Origin".to_owned(),
             FeatureKind::DatumPlane => format!("Plane {ordinal}"),
+            FeatureKind::DatumAxis => format!("Axis {ordinal}"),
             FeatureKind::BaseBody => "Base body".to_owned(),
             FeatureKind::Sketch => format!("Sketch {ordinal}"),
             FeatureKind::Extrude => format!("Extrude {ordinal}"),
@@ -5459,6 +6345,9 @@ impl KernelLabApp {
             FeatureKind::Cut => format!("Cut {ordinal}"),
             FeatureKind::Transform => format!("Transform {ordinal}"),
             FeatureKind::Boolean => format!("Boolean {ordinal}"),
+            FeatureKind::Loft => format!("Loft {ordinal}"),
+            FeatureKind::Revolve => format!("Revolve {ordinal}"),
+            FeatureKind::Sweep => format!("Sweep {ordinal}"),
         }
     }
 
@@ -5488,7 +6377,7 @@ impl KernelLabApp {
         let mut active = Vec::new();
         let mut missing = Vec::new();
         for node in self.document.features() {
-            if node.action == ReplayAction::Marker {
+            if node.action.is_document_only() {
                 continue;
             }
             let Some(association) = node.committed else {
@@ -5529,10 +6418,20 @@ impl KernelLabApp {
         entity: EntityRef,
         before: Option<FeatureId>,
     ) -> Option<PersistentRef> {
+        self.persistent_ref_for_entity_in(entity, before, self.active_body_id()?)
+    }
+
+    /// The same identity, named through the history of `body` rather than of
+    /// the active body: a plane between faces of two bodies names both.
+    fn persistent_ref_for_entity_in(
+        &self,
+        entity: EntityRef,
+        before: Option<FeatureId>,
+        active_body: BodyId,
+    ) -> Option<PersistentRef> {
         if !matches!(entity.kind, EntityKind::Face | EntityKind::Edge) {
             return None;
         }
-        let active_body = self.active_body_id()?;
         let position = |id: FeatureId| {
             self.document
                 .features()
@@ -5636,7 +6535,8 @@ impl KernelLabApp {
         for feature in self.document.features() {
             let kind = match feature.kind {
                 FeatureKind::Origin => FeaturePreviewKind::Origin,
-                FeatureKind::DatumPlane => FeaturePreviewKind::Origin,
+                FeatureKind::DatumPlane => FeaturePreviewKind::Plane,
+                FeatureKind::DatumAxis => FeaturePreviewKind::Axis,
                 FeatureKind::BaseBody if feature.component_instance.is_some() => {
                     FeaturePreviewKind::Component
                 }
@@ -5647,6 +6547,9 @@ impl KernelLabApp {
                 FeatureKind::Cut => FeaturePreviewKind::Cut,
                 FeatureKind::Transform => FeaturePreviewKind::Transform,
                 FeatureKind::Boolean => FeaturePreviewKind::Boolean,
+                FeatureKind::Loft => FeaturePreviewKind::Loft,
+                FeatureKind::Revolve => FeaturePreviewKind::Revolve,
+                FeatureKind::Sweep => FeaturePreviewKind::Sweep,
             };
             let key = kind as u8;
             let ordinal = if matches!(
@@ -5687,7 +6590,10 @@ impl KernelLabApp {
                 }
                 _ => None,
             };
-            let group = if matches!(kind, FeaturePreviewKind::Origin) {
+            let group = if matches!(
+                kind,
+                FeaturePreviewKind::Origin | FeaturePreviewKind::Plane | FeaturePreviewKind::Axis
+            ) {
                 0
             } else if matches!(kind, FeaturePreviewKind::Sketch) {
                 feature.id.get()
@@ -5720,6 +6626,24 @@ impl KernelLabApp {
                 revision,
                 finished: kind == FeaturePreviewKind::Sketch,
                 group,
+                // A plane whose base did not resolve stands where it last
+                // was, and its chip says so (ADR 0048).
+                name: match kind {
+                    FeaturePreviewKind::Plane => Some(if self.stale_planes.contains(&feature.id) {
+                        format!("{} · held", feature.label)
+                    } else {
+                        feature.label.clone()
+                    }),
+                    FeaturePreviewKind::Axis => Some(if self.stale_axes.contains(&feature.id) {
+                        format!("{} · held", feature.label)
+                    } else {
+                        feature.label.clone()
+                    }),
+                    FeaturePreviewKind::Loft
+                    | FeaturePreviewKind::Revolve
+                    | FeaturePreviewKind::Sweep => Some(feature.label.clone()),
+                    _ => None,
+                },
             });
         }
         self.feature_preview = FeaturePreviewState {
@@ -5836,10 +6760,7 @@ impl KernelLabApp {
                 self.document.feature_is_active(feature.id).unwrap_or(false)
                     && feature.committed.is_some()
                     && !feature.state.suppressed
-                    && matches!(
-                        feature.kind,
-                        FeatureKind::Extrude | FeatureKind::Add | FeatureKind::Cut
-                    )
+                    && feature.kind.consumes_sketches()
                     && feature.inputs.contains(&FeatureInput::Sketch(id))
             });
             let auto_hidden_consumer_active = record.auto_hidden_by.is_some_and(|consumer| {
@@ -5855,12 +6776,17 @@ impl KernelLabApp {
                 && (record.visible
                     || record.auto_hidden_by.is_some() && !auto_hidden_consumer_active);
         }
+        // Undo and redo restore sketch payloads along with everything else,
+        // including those a variable change made its sketches follow.
+        self.refresh_sketch_payloads_from_document();
         self.extruded_sketch_revision = self
             .active_sketch_index
             .and_then(|index| self.sketches.get(index))
             .and_then(|sketch| sketch.consumed.then_some(sketch.revision));
         self.selected_faces.clear();
         self.history_scrub_position = self.document.history_position();
+        self.sync_construction_planes_from_document();
+        self.sync_construction_axes_from_document();
         self.sync_feature_preview_from_document();
     }
 
@@ -5959,7 +6885,7 @@ impl KernelLabApp {
             .plan()
             .steps
             .iter()
-            .any(|step| matches!(step.action, ReplayAction::ParameterizedKernel(_)))
+            .any(|step| step.action.reads_parameters())
         {
             match self
                 .document
@@ -6004,6 +6930,13 @@ impl KernelLabApp {
         // Sides that end at a face and could not be measured again. The
         // rebuild still succeeds, so nothing else would ever mention them.
         let mut lost_targets = Vec::<String>::new();
+        // Planes resolved so far in this rebuild, which the sketches drawn on
+        // them and the sides that end at them read before the document's
+        // cached frames are refreshed (ADR 0048).
+        let mut plane_frames = BTreeMap::<FeatureId, ResolvedDatumPlane>::new();
+        let mut stale_planes = BTreeSet::<FeatureId>::new();
+        let mut axis_lines = BTreeMap::<FeatureId, artificer_model::ResolvedDatumAxis>::new();
+        let mut stale_axes = BTreeSet::<FeatureId>::new();
 
         while let Some(step) = transaction.next_executable_step().cloned() {
             debug_assert_eq!(step.disposition, ReplayDisposition::Execute);
@@ -6032,10 +6965,10 @@ impl KernelLabApp {
                 return false;
             };
             let action = match step.action {
-                parameterized @ ReplayAction::ParameterizedKernel(_) => {
+                parameterized if parameterized.reads_parameters() => {
                     let parameters = evaluated_parameters
                         .as_ref()
-                        .expect("parameterized rebuild steps require evaluated parameters");
+                        .expect("rebuild steps that read parameters require evaluated parameters");
                     match parameterized.resolve_parameters(parameters) {
                         Ok(action) => action,
                         Err(error) => {
@@ -6052,8 +6985,13 @@ impl KernelLabApp {
             // A side that ends at a face is measured against the body as it
             // now stands, before the regions resolve: that is what makes it
             // follow the face instead of freezing the length it first had.
-            let (action, lost_here) =
-                self.remeasured_sketch_region_extents(action, &reports, &input, &rebuilt_bodies);
+            let (action, lost_here) = self.remeasured_sketch_region_extents(
+                action,
+                &reports,
+                &input,
+                &rebuilt_bodies,
+                &plane_frames,
+            );
             for (side, reason) in lost_here {
                 let label = self
                     .document
@@ -6065,9 +7003,62 @@ impl KernelLabApp {
                     reason.describe()
                 ));
             }
-            let action = match action.resolve_sketch_regions(
+            // A plane is placed again against the bodies as they now stand.
+            // A base that no longer resolves leaves the plane where it last
+            // was, and says so; the rebuild does not fail for it.
+            if let ReplayAction::DatumPlane(recipe) = &action {
+                let resolver = ModelPlaneResolver::new(
+                    &self.document,
+                    &reports,
+                    std::iter::once(&input)
+                        .chain(rebuilt_bodies.iter().rev().map(|body| &body.body.snapshot))
+                        .chain(self.bodies.iter().map(|body| &body.body.snapshot)),
+                    &plane_frames,
+                );
+                let placed = match recipe.resolve(&resolver) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        let label = self
+                            .document
+                            .feature(feature)
+                            .map_or_else(|| "A plane".to_owned(), |node| node.label.clone());
+                        lost_targets.push(format!("{label} stayed where it was because {error}"));
+                        stale_planes.insert(feature);
+                        recipe.cached()
+                    }
+                };
+                plane_frames.insert(feature, placed);
+            }
+            // An axis is found again the same way, and holds its place when
+            // its base no longer resolves.
+            if let ReplayAction::DatumAxis(recipe) = &action {
+                let resolver = ModelPlaneResolver::new(
+                    &self.document,
+                    &reports,
+                    std::iter::once(&input)
+                        .chain(rebuilt_bodies.iter().rev().map(|body| &body.body.snapshot))
+                        .chain(self.bodies.iter().map(|body| &body.body.snapshot)),
+                    &plane_frames,
+                );
+                let placed = match recipe.resolve(&resolver) {
+                    Ok(placed) => placed,
+                    Err(error) => {
+                        let label = self
+                            .document
+                            .feature(feature)
+                            .map_or_else(|| "An axis".to_owned(), |node| node.label.clone());
+                        lost_targets.push(format!("{label} stayed where it was because {error}"));
+                        stale_axes.insert(feature);
+                        recipe.cached()
+                    }
+                };
+                axis_lines.insert(feature, placed);
+            }
+            let action = match action.resolve_sketch_regions_with_datums(
                 &self.document,
                 input.precision_policy().unwrap_or_default(),
+                &plane_frames,
+                &axis_lines,
             ) {
                 Ok(action) => action,
                 Err(error) => {
@@ -6080,12 +7071,15 @@ impl KernelLabApp {
             };
             enum RebuildDispatch {
                 Marker,
-                Command(KernelCommand),
+                Commands(Vec<KernelCommand>),
                 Boolean(artificer_model::BooleanFeatureRecipe),
             }
             let dispatch = match action {
-                ReplayAction::Marker => RebuildDispatch::Marker,
-                ReplayAction::Kernel(command) => RebuildDispatch::Command(command),
+                ReplayAction::Marker | ReplayAction::DatumPlane(_) | ReplayAction::DatumAxis(_) => {
+                    RebuildDispatch::Marker
+                }
+                ReplayAction::Kernel(command) => RebuildDispatch::Commands(vec![command]),
+                ReplayAction::KernelChain(chain) => RebuildDispatch::Commands(chain),
                 ReplayAction::TargetedKernel(targeted) => {
                     let ordered = self
                         .document
@@ -6099,7 +7093,7 @@ impl KernelLabApp {
                         .collect::<Vec<_>>();
                     match targeted.rebind(&ordered, input.id()) {
                         PersistentResolution::Resolved(command) => {
-                            RebuildDispatch::Command(command)
+                            RebuildDispatch::Commands(vec![command])
                         }
                         PersistentResolution::Missing(missing) => {
                             let message =
@@ -6122,27 +7116,37 @@ impl KernelLabApp {
                 ReplayAction::ParameterizedKernel(_) => {
                     unreachable!("parameterized replay actions are resolved before kernel dispatch")
                 }
-                ReplayAction::SketchRegionExtrusion(_) => {
+                ReplayAction::SketchRegionExtrusion(_)
+                | ReplayAction::SketchLoft(_)
+                | ReplayAction::SketchRevolve(_)
+                | ReplayAction::SketchSweep(_) => {
                     unreachable!("sketch-region replay actions are resolved before kernel dispatch")
                 }
                 ReplayAction::Boolean(recipe) => RebuildDispatch::Boolean(recipe),
             };
-            let association = if let RebuildDispatch::Command(command) = &dispatch {
-                self.request_serial = self.request_serial.saturating_add(1);
-                let request = ExecuteRequest {
-                    protocol_version: CURRENT_PROTOCOL_VERSION,
-                    request_id: RequestId::new(format!(
-                        "workbench-{}-rebuild-{}",
-                        self.request_serial,
-                        feature.get()
-                    )),
-                    expected_snapshot: input.id(),
-                    precision: input.precision_policy().unwrap_or_default(),
-                    command: command.clone(),
-                };
-                let outcome =
-                    match NativeKernel::execute(&input, &request, &CancellationToken::new()) {
-                        Ok(outcome) => outcome,
+            let association = if let RebuildDispatch::Commands(commands) = &dispatch {
+                // One command, or a library part's chain: each runs on the
+                // result of the one before.
+                let mut step_input = input.clone();
+                let mut last = None;
+                for command in commands {
+                    self.request_serial = self.request_serial.saturating_add(1);
+                    let request = ExecuteRequest {
+                        protocol_version: CURRENT_PROTOCOL_VERSION,
+                        request_id: RequestId::new(format!(
+                            "workbench-{}-rebuild-{}",
+                            self.request_serial,
+                            feature.get()
+                        )),
+                        expected_snapshot: step_input.id(),
+                        precision: step_input.precision_policy().unwrap_or_default(),
+                        command: command.clone(),
+                    };
+                    match NativeKernel::execute(&step_input, &request, &CancellationToken::new()) {
+                        Ok(outcome) => {
+                            step_input = outcome.snapshot.clone();
+                            last = Some(outcome);
+                        }
                         Err(error) => {
                             let message = format!("kernel replay failed: {error}");
                             let _ = transaction.record_failure(feature, message.clone());
@@ -6150,7 +7154,15 @@ impl KernelLabApp {
                             self.document_status = Some(format!("Rebuild rolled back: {message}"));
                             return false;
                         }
-                    };
+                    }
+                }
+                let Some(outcome) = last else {
+                    let message = "a kernel chain holds no commands".to_owned();
+                    let _ = transaction.record_failure(feature, message.clone());
+                    let _ = self.document.rollback_rebuild(transaction);
+                    self.document_status = Some(format!("Rebuild rolled back: {message}"));
+                    return false;
+                };
                 let feature_node = self.document.feature(feature);
                 let is_push_pull = feature_node.is_some_and(|node| {
                     matches!(
@@ -6175,7 +7187,15 @@ impl KernelLabApp {
                         })
                         .unwrap_or(ModelBodyKind::Cuboid),
                     Some(FeatureKind::Boolean) => ModelBodyKind::Boolean,
-                    Some(FeatureKind::Origin | FeatureKind::DatumPlane | FeatureKind::Sketch)
+                    Some(FeatureKind::Loft) => ModelBodyKind::Lofted,
+                    Some(FeatureKind::Revolve) => ModelBodyKind::Revolved,
+                    Some(FeatureKind::Sweep) => ModelBodyKind::Swept,
+                    Some(
+                        FeatureKind::Origin
+                        | FeatureKind::DatumPlane
+                        | FeatureKind::DatumAxis
+                        | FeatureKind::Sketch,
+                    )
                     | None => ModelBodyKind::Cuboid,
                 };
                 let archived = ArchivedBody {
@@ -6190,7 +7210,7 @@ impl KernelLabApp {
                 reports.push((feature, outcome.report.clone()));
                 rebuilt_bodies.push(archived);
                 SnapshotAssociation::new(
-                    outcome.report.input_snapshot,
+                    input.id(),
                     outcome.report.output_snapshot,
                     outcome.report.semantic_digest,
                 )
@@ -6273,6 +7293,25 @@ impl KernelLabApp {
         if let Err(error) = self.document.commit_rebuild(transaction) {
             self.document_status = Some(format!("Rebuild commit rejected: {error}"));
             return false;
+        }
+        // The frames the rebuild placed its planes at become the planes'
+        // cached frames, and the frames of the sketches drawn on them.
+        self.document.refresh_datum_plane_frames(&plane_frames);
+        for plane in plane_frames.keys() {
+            if stale_planes.contains(plane) {
+                self.stale_planes.insert(*plane);
+            } else {
+                self.stale_planes.remove(plane);
+            }
+        }
+        // And the lines it found its axes on become their cached lines.
+        self.document.refresh_datum_axis_lines(&axis_lines);
+        for axis in axis_lines.keys() {
+            if stale_axes.contains(axis) {
+                self.stale_axes.insert(*axis);
+            } else {
+                self.stale_axes.remove(axis);
+            }
         }
         for rebuilt in rebuilt_bodies {
             if !self
@@ -6415,10 +7454,19 @@ impl KernelLabApp {
     }
 
     /// The numbers the selected feature lets the user change, if any.
+    ///
+    /// A library part's insertion is not one of them. Its extrusion is the
+    /// part the library resolved at the length the user chose, and the
+    /// component record keeps that length and its digest; changing the
+    /// extrusion here would resize the part behind the library's back, past
+    /// its limits, and leave the record describing a part that is no longer
+    /// there.
     fn selected_feature_scalars(&self) -> Vec<feature_editor::EditableScalar> {
         self.selected_history_feature
             .and_then(|feature| self.document.feature(feature))
-            .filter(|node| !node.state.read_only && !node.state.suppressed)
+            .filter(|node| {
+                !node.state.read_only && !node.state.suppressed && node.component_instance.is_none()
+            })
             .map(|node| feature_editor::action_scalars(&node.action))
             .unwrap_or_default()
     }
@@ -6440,6 +7488,13 @@ impl KernelLabApp {
         };
         if node.state.read_only {
             self.document_status = Some("That feature cannot be edited".to_owned());
+            return false;
+        }
+        if node.component_instance.is_some() {
+            self.document_status = Some(
+                "A library part keeps the size it was inserted at · insert it again from the library for another size"
+                    .to_owned(),
+            );
             return false;
         }
         let Some(edited) = feature_editor::with_action_scalar(&node.action, index, value) else {
@@ -6635,6 +7690,28 @@ impl KernelLabApp {
                 .is_some_and(|displayed| !displayed.scene.edges.is_empty())
     }
 
+    /// Which command to run again when the armed tool's operands arrive.
+    ///
+    /// The selection stays the one source of truth: a pick made while a tool
+    /// waits joins the selection, and the command that armed the tool is run
+    /// once more against it, exactly as if the operands had been picked first
+    /// (ADR 0041 stage 4).
+    fn resume_armed_tool(&mut self) {
+        let Some(resume) = self.armed_resume.take() else {
+            return;
+        };
+        self.armed_tool = None;
+        match resume {
+            ArmedResume::PushPull => {
+                self.stage_face_push_pull();
+            }
+            ArmedResume::Preset(preset) => self.stage_preset_feature(preset),
+        }
+        if let Some(prompt) = self.armed_tool_prompt() {
+            self.document_status = Some(prompt);
+        }
+    }
+
     /// Presses a tool: stages straight away when the selection already
     /// satisfies it, and otherwise arms it holding whatever fits.
     ///
@@ -6669,6 +7746,7 @@ impl KernelLabApp {
             invocation::OperandResolution::Complete { .. }
             | invocation::OperandResolution::InvalidSelection(_) => {
                 self.armed_tool = None;
+                self.armed_resume = None;
             }
         }
         resolution
@@ -6679,7 +7757,6 @@ impl KernelLabApp {
     /// Disarming and clearing the selection are different intentions and must
     /// not share a key: the tool never owned the selection, so there is
     /// nothing here to restore.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn disarm_tool(&mut self) -> bool {
         self.armed_tool.take().is_some()
     }
@@ -6688,7 +7765,6 @@ impl KernelLabApp {
     ///
     /// Returns whether the tool took it, so the ordinary selection paths can
     /// leave the click alone when it did.
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn offer_to_armed_tool(&mut self, item: invocation::SelectionItem) -> bool {
         let revision = self.document_revision();
         let Some(mut armed) = self.armed_tool.take() else {
@@ -6704,7 +7780,6 @@ impl KernelLabApp {
     /// Whether the armed tool could use this pick, which is what narrows the
     /// viewport's hit test while one is waiting.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn armed_tool_accepts(&self, item: invocation::SelectionItem) -> bool {
         self.armed_tool
             .as_ref()
@@ -6713,7 +7788,6 @@ impl KernelLabApp {
 
     /// What the status line says while a tool waits for operands.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "wired up by ADR 0041 stage 4"))]
     fn armed_tool_prompt(&self) -> Option<String> {
         self.armed_tool.as_ref().map(invocation::ArmedTool::prompt)
     }
@@ -6731,6 +7805,17 @@ impl KernelLabApp {
         // A side of the extrusion waiting for a face takes this click and
         // nothing else does: the pick is what the user is in the middle of.
         if self.adopt_extrusion_extent_face(selection.face) {
+            return;
+        }
+        // A tool waiting for a face takes it next. The pick joins the
+        // selection rather than replacing it — the tool asked for more, not
+        // for different — and the command that armed the tool runs again.
+        let item = invocation::SelectionItem::Face(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            if !self.selected_faces.contains(&selection) {
+                self.selected_faces.push(selection);
+            }
+            self.resume_armed_tool();
             return;
         }
         if !additive {
@@ -6771,6 +7856,19 @@ impl KernelLabApp {
                 edge,
             })
             .collect::<Vec<_>>();
+        // A tool waiting for edges takes the click, and takes the whole
+        // logical edge with it: a rim picked for a fillet is the rim, not the
+        // semicircle under the pointer.
+        let item = invocation::SelectionItem::Edge(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            for candidate in selections {
+                if !self.selected_edges.contains(&candidate) {
+                    self.selected_edges.push(candidate);
+                }
+            }
+            self.resume_armed_tool();
+            return;
+        }
         if !additive {
             self.clear_model_entity_selection();
         }
@@ -6795,6 +7893,14 @@ impl KernelLabApp {
         selection: viewport::DocumentVertexSelection,
         additive: bool,
     ) {
+        let item = invocation::SelectionItem::Vertex(selection);
+        if self.armed_tool_accepts(item) && self.offer_to_armed_tool(item) {
+            if !self.selected_vertices.contains(&selection) {
+                self.selected_vertices.push(selection);
+            }
+            self.resume_armed_tool();
+            return;
+        }
         if !additive {
             self.clear_model_entity_selection();
         }
@@ -6847,7 +7953,14 @@ impl KernelLabApp {
                 let selectable_regions = sketch.overlay_regions.clone();
                 if let Some(payload) = &sketch.portable_payload {
                     if let Some(authoring) = payload.authoring() {
-                        for entity in authoring.active_entities().filter(|entity| entity.visible) {
+                        // A host edge projected into the sketch to be measured
+                        // against is borrowed from the body, which is already
+                        // drawing it. Painting the copy in the sketch's colour
+                        // put a line on the model that nobody drew.
+                        for entity in authoring.active_entities().filter(|entity| {
+                            entity.visible
+                                && entity.role != artificer_sketch::SketchEntityRole::Reference
+                        }) {
                             let Ok(curve) = authoring.evaluated_curve(entity.id) else {
                                 continue;
                             };
@@ -6896,10 +8009,13 @@ impl KernelLabApp {
                     }
                 }
                 (!points.is_empty() || !segments.is_empty()).then(|| {
+                    // While a revolve's axis is being picked, its sketch's
+                    // straight lines are offered.
                     let overlay =
                         viewport::ModelSketchOverlay::new(points, segments, sketch.consumed)
                             .on_frame(frame)
-                            .selectable(sketch_index, selectable_regions);
+                            .selectable(sketch_index, selectable_regions)
+                            .with_pickable_lines(self.revolve_axis_pickable_lines(sketch_index));
                     match sketch.body {
                         Some(body) => overlay.for_body(viewport::BodyInstanceKey::new(body.get())),
                         None => overlay,
@@ -6925,21 +8041,20 @@ impl KernelLabApp {
                 )
             })
             .collect::<Vec<_>>();
-        if let Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            ..
-        }) = self.pending_operation
+        if let (Some(placed), Some(handles)) =
+            (self.staged_plane_preview(), self.staged_plane_handles())
         {
-            planes.push(reference_plane_overlay(
-                frame,
-                half_u,
-                half_v,
-                false,
-                None,
-                "Plane preview",
-            ));
+            planes.push(
+                reference_plane_overlay(
+                    placed.frame,
+                    placed.half_extent[0],
+                    placed.half_extent[1],
+                    false,
+                    None,
+                    &self.staged_plane_label(),
+                )
+                .with_datum_handles(handles),
+            );
         }
         planes.extend(self.section_plane_overlay());
         // A genuinely blank document still presents its three usable origin
@@ -6977,14 +8092,12 @@ impl KernelLabApp {
                 plane.half_v,
             ));
         }
-        if let Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            ..
-        }) = self.pending_operation
-        {
-            points.extend(reference_plane_corners(frame, half_u, half_v));
+        if let Some(staged) = self.staged_plane_preview() {
+            points.extend(reference_plane_corners(
+                staged.frame,
+                staged.half_extent[0],
+                staged.half_extent[1],
+            ));
         }
         if self.origin_reference_planes_visible() {
             for plane in SketchPlane::ALL {
@@ -7041,9 +8154,9 @@ impl KernelLabApp {
     }
 
     fn construction_plane_is_active(&self, plane: &ConstructionPlane) -> bool {
-        plane
-            .feature
-            .is_none_or(|feature| self.document.feature_is_active(feature).unwrap_or(false))
+        self.document
+            .feature_is_active(plane.feature)
+            .unwrap_or(false)
     }
 
     fn sync_active_sketch_record(&mut self) {
@@ -7127,10 +8240,25 @@ impl KernelLabApp {
             .validate(PrecisionPolicy::default())
             .map_err(|error| format!("the editable sketch graph is invalid: {error}"))?;
         let profile = self.current_canvas_profile_payload();
+        // A sketch on a construction plane names the plane and depends on
+        // it, so it moves with the plane (ADR 0048). One on a plane that is
+        // not a feature — a legacy copy of a frame — keeps its frame alone.
+        let support_plane = match &self.sketch_support {
+            SketchSupport::ConstructionPlane { id: Some(id), .. } => self
+                .construction_planes
+                .iter()
+                .find(|plane| plane.id == *id)
+                .map(|plane| plane.feature),
+            _ => None,
+        };
         let support = match &self.sketch_support {
+            SketchSupport::ConstructionPlane { .. } if support_plane.is_some() => {
+                SketchSupportRecipe::DatumPlane {
+                    plane: support_plane.expect("checked just above"),
+                }
+            }
             SketchSupport::Origin { .. } | SketchSupport::ConstructionPlane { .. } => {
-                // The exact frame is carried by the payload. The workspace
-                // envelope owns the datum-plane identity and provenance.
+                // The exact frame is carried by the payload.
                 SketchSupportRecipe::Origin
             }
             SketchSupport::PlanarFace { body, face, .. } => {
@@ -7204,6 +8332,9 @@ impl KernelLabApp {
         )
         .with_sketch_payload(payload)
         .with_commit(sketch_commit);
+        if let Some(plane) = support_plane {
+            draft = draft.with_input(FeatureInput::Feature(plane));
+        }
         draft = if let Some(body) = self.sketch_support.body() {
             draft
                 .with_output(OutputDraft::CreateSketch {
@@ -7276,7 +8407,9 @@ impl KernelLabApp {
                 Some(second) => recipe.with_second_side(second)?,
                 None => recipe,
             };
-            recipe.with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())
+            recipe
+                .with_up_to_faces(record.up_to_faces[0].clone(), record.up_to_faces[1].clone())?
+                .with_up_to_planes(record.up_to_planes[0], record.up_to_planes[1])
         };
         // A feature on a face grows from that face and has no second side, but
         // its one side may still end at a face the user picked. Dropping that
@@ -7284,7 +8417,9 @@ impl KernelLabApp {
         // so it stopped following the face it was told to reach.
         let with_front_face =
             |recipe: SketchRegionExtrusion| -> Result<_, SketchRegionRecipeError> {
-                recipe.with_up_to_faces(record.up_to_faces[0].clone(), None)
+                recipe
+                    .with_up_to_faces(record.up_to_faces[0].clone(), None)?
+                    .with_up_to_planes(record.up_to_planes[0], None)
             };
         let kind = match mode {
             ExtrusionMode::NewBody => FeatureKind::Extrude,
@@ -7402,6 +8537,18 @@ impl KernelLabApp {
             }
             _ => ReplayAction::Kernel(command),
         };
+        // A distance typed as variables stays with them: the recipe carries
+        // the expression and the feature reads the variables it names.
+        let (action, parameters) = match (action, &record.distance_expression) {
+            (ReplayAction::SketchRegionExtrusion(recipe), Some(expression)) => {
+                let recipe = recipe
+                    .with_distance_expression(Some(expression.clone()))
+                    .map_err(|error| format!("invalid linked extrusion distance: {error}"))?;
+                let parameters = recipe.parameter_references();
+                (ReplayAction::SketchRegionExtrusion(recipe), parameters)
+            }
+            (action, _) => (action, BTreeSet::new()),
+        };
         let mut draft = FeatureDraft::new(
             kind,
             Self::next_document_feature_label(document, kind),
@@ -7426,12 +8573,27 @@ impl KernelLabApp {
             .collect::<Vec<_>>();
         target_producers.sort_unstable();
         target_producers.dedup();
-        eprintln!(
-            "TRACE append up_to_faces {:?} producers {target_producers:?}",
-            record.up_to_faces
-        );
         for producer in target_producers {
             draft = draft.with_dependency(producer);
+        }
+        // A side that ends at a plane names the plane as an input: moving
+        // the plane rebuilds the extrusion, and the plane cannot be deleted
+        // from under it.
+        let mut end_planes = record
+            .up_to_planes
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        if mode != ExtrusionMode::NewBody {
+            end_planes.truncate(1);
+        }
+        end_planes.dedup();
+        for plane in end_planes {
+            draft = draft.with_input(FeatureInput::Feature(plane));
+        }
+        for parameter in parameters {
+            draft = draft.with_parameter(parameter);
         }
         match mode {
             ExtrusionMode::NewBody => {
@@ -7677,6 +8839,101 @@ impl KernelLabApp {
     /// transactional kernel/document boundary as every other modeling action.
     /// Nothing is published until the package, kernel result, component
     /// occurrence, and feature-history record have all been accepted.
+    /// Evaluates a staged library insertion into what the document will
+    /// hold: the component's identity and values, its replay action, and the
+    /// body. The built-in extrusion binds its length into one command; a
+    /// saved part is evaluated from its own recipe at the given values.
+    fn prepare_library_insertion(
+        &mut self,
+        intent: &PartInsertionIntent,
+    ) -> Result<PreparedInsertion, PreparedInsertionError> {
+        let [major, minor, patch] = intent.definition_revision;
+        let revision = ComponentDefinitionRevision::new(major, minor, patch);
+        if intent.definition_key == crate::part_library::ALUMINIUM_EXTRUSION_20X20_KEY {
+            let resolved = self
+                .catalog_store
+                .as_ref()
+                .map_or_else(
+                    || resolve_builtin_insertion(intent),
+                    |store| resolve_store_insertion(store, intent),
+                )
+                .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+            if resolved.staging_id() != intent.staging_id {
+                return Err(PreparedInsertionError::Rejected(
+                    "the resolved placement identity changed".into(),
+                ));
+            }
+            let definition = ComponentDefinitionRef::new(
+                intent.definition_key.clone(),
+                revision,
+                ComponentContentDigest::from_bytes(
+                    *resolved.evidence().definition_digest().as_bytes(),
+                ),
+            )
+            .map_err(|error| {
+                PreparedInsertionError::Rejected(format!("invalid component definition: {error}"))
+            })?;
+            self.request_serial = self.request_serial.saturating_add(1);
+            let input = NativeKernel::empty();
+            let request = ExecuteRequest {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                request_id: RequestId::new(format!(
+                    "workbench-{}-insert-library-component",
+                    self.request_serial
+                )),
+                expected_snapshot: input.id(),
+                precision: PrecisionPolicy::default(),
+                command: resolved.command().clone(),
+            };
+            let outcome = NativeKernel::execute(&input, &request, &CancellationToken::new())
+                .map_err(PreparedInsertionError::Kernel)?;
+            return Ok(PreparedInsertion {
+                definition,
+                evaluated: resolved.evaluated_parameters().clone(),
+                action: ReplayAction::Kernel(request.command),
+                outcome,
+            });
+        }
+
+        let store = self.catalog_store.as_ref().ok_or_else(|| {
+            PreparedInsertionError::Rejected("the Part Library folder is not available".into())
+        })?;
+        let key = artificer_catalog::PartDefinitionId::parse(&intent.definition_key)
+            .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+        let package = store
+            .resolve(
+                &key,
+                artificer_catalog::PartRevision::new(major, minor, patch),
+            )
+            .map_err(|error| PreparedInsertionError::Rejected(plain_catalog_error(&error)))?;
+        if package.content_digest().to_hex() != intent.definition_digest {
+            return Err(PreparedInsertionError::Rejected(
+                "the library's copy of the part is not the one that was picked".into(),
+            ));
+        }
+        let values = intent
+            .parameters
+            .iter()
+            .map(|assignment| (assignment.key.clone(), assignment.value))
+            .collect();
+        let evaluated = saved_parts::evaluate_saved_part(&package, &values)
+            .map_err(|error| PreparedInsertionError::Rejected(error.to_string()))?;
+        let definition = ComponentDefinitionRef::new(
+            intent.definition_key.clone(),
+            revision,
+            ComponentContentDigest::from_bytes(*package.content_digest().as_bytes()),
+        )
+        .map_err(|error| {
+            PreparedInsertionError::Rejected(format!("invalid component definition: {error}"))
+        })?;
+        Ok(PreparedInsertion {
+            definition,
+            evaluated: evaluated.evaluated,
+            action: saved_parts::replay_action(evaluated.commands),
+            outcome: evaluated.outcome,
+        })
+    }
+
     fn execute_library_insertion(&mut self, staging_id: u64) {
         let Some(intent) = self
             .part_library
@@ -7694,52 +8951,13 @@ impl KernelLabApp {
             return;
         }
 
-        let resolution = self.catalog_store.as_ref().map_or_else(
-            || resolve_builtin_insertion(&intent),
-            |store| resolve_store_insertion(store, &intent),
-        );
-        let resolved = match resolution {
-            Ok(resolved) if resolved.staging_id() == staging_id => resolved,
-            Ok(_) => {
-                self.document_status = Some(
-                    "Library insertion rejected: the resolved placement identity changed".into(),
-                );
+        let prepared = match self.prepare_library_insertion(&intent) {
+            Ok(prepared) => prepared,
+            Err(PreparedInsertionError::Rejected(message)) => {
+                self.document_status = Some(format!("Library insertion rejected: {message}"));
                 return;
             }
-            Err(error) => {
-                self.document_status = Some(format!("Library insertion rejected: {error}"));
-                return;
-            }
-        };
-        let definition = match ComponentDefinitionRef::new(
-            intent.definition_key.clone(),
-            ComponentDefinitionRevision::new(intent.definition_revision, 0, 0),
-            ComponentContentDigest::from_bytes(*resolved.evidence().definition_digest().as_bytes()),
-        ) {
-            Ok(definition) => definition,
-            Err(error) => {
-                self.document_status = Some(format!(
-                    "Library insertion rejected: invalid component definition: {error}"
-                ));
-                return;
-            }
-        };
-        self.request_serial = self.request_serial.saturating_add(1);
-        let input = NativeKernel::empty();
-        let request = ExecuteRequest {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            request_id: RequestId::new(format!(
-                "workbench-{}-insert-library-component",
-                self.request_serial
-            )),
-            expected_snapshot: input.id(),
-            precision: PrecisionPolicy::default(),
-            command: resolved.command().clone(),
-        };
-        let replay_command = request.command.clone();
-        let outcome = match NativeKernel::execute(&input, &request, &CancellationToken::new()) {
-            Ok(outcome) => outcome,
-            Err(error) => {
+            Err(PreparedInsertionError::Kernel(error)) => {
                 self.last_attempt = Attempt::Rejected {
                     operation: "Library component rejected",
                     error,
@@ -7749,6 +8967,12 @@ impl KernelLabApp {
                 return;
             }
         };
+        let PreparedInsertion {
+            definition,
+            evaluated,
+            action: replay_action,
+            outcome,
+        } = prepared;
         let Some(local_bounds) = outcome.report.bounds else {
             self.document_status =
                 Some("Library insertion rejected: the accepted part has no finite bounds".into());
@@ -7774,13 +8998,15 @@ impl KernelLabApp {
         let component = ComponentInstanceDraft::new(
             intent.display_name.clone(),
             definition,
-            resolved.evaluated_parameters().clone(),
+            evaluated,
             initial_pose,
         );
 
         let mut next_document = self.document.clone();
+        // A library part starts from nothing, whether it is one command or
+        // the chain its own recipe built it with.
         let association = SnapshotAssociation::new(
-            outcome.report.input_snapshot,
+            self.empty_snapshot.id(),
             outcome.report.output_snapshot,
             outcome.report.semantic_digest,
         );
@@ -7788,7 +9014,7 @@ impl KernelLabApp {
             FeatureDraft::new(
                 FeatureKind::BaseBody,
                 format!("Insert {}", intent.display_name),
-                ReplayAction::Kernel(replay_command),
+                replay_action,
             )
             .with_component_instance(component)
             .with_output(OutputDraft::CreateBody {
@@ -8080,198 +9306,512 @@ impl KernelLabApp {
         }
     }
 
+    /// Stages a construction plane on what is picked (ADR 0048).
+    ///
+    /// A face gives a plane on the face; two parallel faces give their
+    /// midplane; a straight edge gives a plane through it, lying on the face
+    /// picked with it or on the planar face beside it; a construction plane
+    /// or an origin plane gives a plane on top of it. The plane is drawn where
+    /// it will go and moved with its handles or the card's fields until it is
+    /// confirmed.
     fn stage_construction_plane(&mut self) {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
-        if self.selected_faces.is_empty() {
-            if let Some(id) = self.selected_construction_plane
-                && let Some(plane) = self
-                    .construction_planes
-                    .iter()
-                    .find(|p| p.id == id)
-                    .cloned()
-            {
-                self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-                    frame: plane.frame,
-                    half_u: plane.half_u,
-                    half_v: plane.half_v,
-                    source: ConstructionPlaneSource::FromPlane { id: plane.id },
-                });
-                self.document_status =
-                    Some("Construction plane staged · confirm with Enter or the green tick".into());
-                return;
-            }
-            let plane = self.selected_origin_plane;
-            let frame = sketch_plane_frame(plane);
-            let plane_index = match plane {
-                SketchPlane::XY => 0,
-                SketchPlane::YZ => 1,
-                SketchPlane::XZ => 2,
-            };
-            self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-                frame,
-                half_u: ORIGIN_PLANE_HALF_EXTENT_MM,
-                half_v: ORIGIN_PLANE_HALF_EXTENT_MM,
-                source: ConstructionPlaneSource::FromOrigin { plane_index },
-            });
-            self.document_status = Some(format!(
-                "{} construction plane staged · confirm with Enter or the green tick",
-                origin_plane_label(plane)
-            ));
-            return;
-        }
-        if self.selected_faces.len() > 2 {
-            self.document_status = Some(
-                "Select one planar face for a coincident plane, or two parallel planar faces for a midplane"
-                    .into(),
-            );
-            return;
-        }
-        let supports = self
-            .selected_faces
-            .iter()
-            .map(|selection| {
-                let body = self
-                    .bodies
-                    .iter()
-                    .find(|body| body.id.get() == selection.body.get())
-                    .ok_or_else(|| "the selected face body is no longer available".to_owned())?;
-                let support =
-                    NativeKernel::planar_face_support(&body.body.snapshot, selection.face)
-                        .map_err(|error| format!("the selected face is not planar: {error}"))?;
-                let (frame, half_u, half_v) = centered_plane_frame(&support)?;
-                Ok((body.id, selection.face, frame, half_u, half_v))
-            })
-            .collect::<Result<Vec<_>, String>>();
-        let supports = match supports {
-            Ok(supports) => supports,
+        let staged = match self.staged_plane_from_selection() {
+            Ok(staged) => staged,
             Err(error) => {
                 self.document_status = Some(format!("Plane creation rejected: {error}"));
                 return;
             }
         };
-        let (frame, half_u, half_v, source) = match supports.as_slice() {
-            [(body, face, frame, half_u, half_v)] => (
-                *frame,
-                *half_u,
-                *half_v,
-                ConstructionPlaneSource::OnFace {
-                    body: *body,
-                    face: *face,
-                },
-            ),
-            [first, second] => {
-                let Some(first_normal) = frame_normal(first.2) else {
-                    self.document_status =
-                        Some("Plane creation rejected: invalid first face frame".into());
-                    return;
-                };
-                let Some(second_normal) = frame_normal(second.2) else {
-                    self.document_status =
-                        Some("Plane creation rejected: invalid second face frame".into());
-                    return;
-                };
-                if dot_vector(first_normal, second_normal).abs() < 1.0 - 1.0e-8 {
-                    self.document_status = Some(
-                        "Plane creation rejected: the two selected faces must be parallel".into(),
-                    );
-                    return;
-                }
-                let separation = dot_vector(
-                    Vector3::new(
-                        second.2.origin.x - first.2.origin.x,
-                        second.2.origin.y - first.2.origin.y,
-                        second.2.origin.z - first.2.origin.z,
-                    ),
-                    first_normal,
-                );
-                let origin = Point3::new(
-                    first.2.origin.x + 0.5 * separation * first_normal.x,
-                    first.2.origin.y + 0.5 * separation * first_normal.y,
-                    first.2.origin.z + 0.5 * separation * first_normal.z,
-                );
-                (
-                    PlanarFrame3::new(origin, first.2.u, first.2.v),
-                    first.3.max(second.3),
-                    first.4.max(second.4),
-                    ConstructionPlaneSource::BetweenFaces {
-                        first_body: first.0,
-                        first_face: first.1,
-                        second_body: second.0,
-                        second_face: second.1,
-                    },
-                )
-            }
-            _ => unreachable!("the selection count was bounded above"),
-        };
-        self.pending_operation = Some(PendingOperation::CreateConstructionPlane {
-            frame,
-            half_u,
-            half_v,
-            source,
-        });
-        self.document_status = Some(if supports.len() == 1 {
-            "Coincident plane staged · confirm with Enter or the green tick".into()
-        } else {
-            "Midplane staged · confirm with Enter or the green tick".into()
-        });
+        let description = staged.describe();
+        self.begin_plane_editor(staged, None);
+        self.document_status = Some(format!(
+            "{description} · drag the arrow or type an offset, then confirm with Enter or the green tick"
+        ));
     }
 
-    fn commit_construction_plane(
-        &mut self,
-        frame: PlanarFrame3,
-        half_u: f64,
-        half_v: f64,
-        source: ConstructionPlaneSource,
-    ) {
-        let id = self.next_construction_plane_id;
-        self.next_construction_plane_id = id.saturating_add(1);
-        self.construction_planes.push(ConstructionPlane {
-            id,
-            name: format!("Plane {id}"),
-            feature: None,
-            frame,
-            half_u,
-            half_v,
-            visible: true,
-            source,
-        });
-        let association = self.displayed.as_ref().map_or_else(
-            || {
-                SnapshotAssociation::new(
-                    self.empty_snapshot.id(),
-                    self.empty_snapshot.id(),
-                    self.empty_snapshot.semantic_digest(),
-                )
-            },
-            |displayed| {
-                SnapshotAssociation::new(
-                    displayed.snapshot.id(),
-                    displayed.snapshot.id(),
-                    displayed.snapshot.semantic_digest(),
-                )
-            },
-        );
-        if let Ok(appended) = self.document.append_feature(
-            FeatureDraft::new(
-                FeatureKind::DatumPlane,
-                format!("Plane {id}"),
-                ReplayAction::Marker,
-            )
-            .with_commit(association),
-        ) {
-            if let Some(plane) = self.construction_planes.last_mut() {
-                plane.feature = Some(appended.feature);
-            }
-            self.selected_history_feature = Some(appended.feature);
-            self.history_scrub_position = self.document.history_position();
-            self.sync_feature_preview_from_document();
-        }
-        self.selected_construction_plane = Some(id);
+    /// Opens the plane editor on `staged`.
+    fn begin_plane_editor(&mut self, staged: StagedPlane, editing: Option<FeatureId>) {
+        self.staged_plane = Some(staged);
+        self.pending_operation = Some(PendingOperation::StagePlane { editing });
         self.clear_model_entity_selection();
+    }
+
+    /// Reads what the user has picked as the base of a new plane.
+    fn staged_plane_from_selection(&self) -> Result<StagedPlane, String> {
+        let body_of = |key: viewport::BodyInstanceKey| {
+            self.bodies
+                .iter()
+                .find(|body| body.id.get() == key.get())
+                .ok_or_else(|| "the selected body is no longer available".to_owned())
+        };
+        let staged = |base, base_plane, edge| StagedPlane {
+            base,
+            base_plane,
+            edge,
+            offset: 0.0,
+            angle_degrees: 0.0,
+            flip: false,
+        };
+        if let Some(edge) = self
+            .selected_edges
+            .first()
+            .copied()
+            .or_else(|| self.selected_edge())
+        {
+            let body = body_of(edge.body)?;
+            // The face the plane starts on: the one picked with the edge, or
+            // else the one planar face beside the edge.
+            let face = match self.selected_faces.first() {
+                Some(face) if face.body == edge.body => face.face,
+                Some(_) => return Err("pick the edge and a face of the same body".to_owned()),
+                None => planar_faces_beside_edge(&body.body, edge.edge)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "the edge has no flat face beside it to turn from".to_owned())?,
+            };
+            let geometry = datum_edge_geometry(&body.body.snapshot, edge.edge, face)
+                .map_err(|error| error.to_string())?;
+            let base_plane = artificer_model::datum::edge_plane(geometry, 0.0)
+                .map_err(|error| error.to_string())?;
+            return Ok(staged(
+                StagedPlaneBase::Edge {
+                    body: body.id,
+                    edge: edge.edge,
+                    face,
+                },
+                base_plane,
+                Some(geometry),
+            ));
+        }
+        match self.selected_faces.as_slice() {
+            [] => {}
+            [face] => {
+                let body = body_of(face.body)?;
+                let geometry = datum_face_geometry(&body.body.snapshot, face.face)
+                    .map_err(|error| format!("the selected face cannot carry a plane: {error}"))?;
+                return Ok(staged(
+                    StagedPlaneBase::Face {
+                        body: body.id,
+                        face: face.face,
+                    },
+                    ResolvedDatumPlane {
+                        frame: geometry.frame,
+                        half_extent: geometry.half_extent,
+                    },
+                    None,
+                ));
+            }
+            [first, second] => {
+                let first_body = body_of(first.body)?;
+                let second_body = body_of(second.body)?;
+                let first_geometry = datum_face_geometry(&first_body.body.snapshot, first.face)
+                    .map_err(|error| format!("the first face cannot carry a plane: {error}"))?;
+                let second_geometry = datum_face_geometry(&second_body.body.snapshot, second.face)
+                    .map_err(|error| format!("the second face cannot carry a plane: {error}"))?;
+                let base_plane = artificer_model::datum::midplane(first_geometry, second_geometry)
+                    .map_err(|error| error.to_string())?;
+                return Ok(staged(
+                    StagedPlaneBase::Midplane {
+                        first: (first_body.id, first.face),
+                        second: (second_body.id, second.face),
+                    },
+                    base_plane,
+                    None,
+                ));
+            }
+            _ => {
+                return Err(
+                    "select one planar face, two parallel planar faces, or a straight edge"
+                        .to_owned(),
+                );
+            }
+        }
+        if let Some(id) = self.selected_construction_plane
+            && let Some(plane) = self.construction_planes.iter().find(|plane| plane.id == id)
+        {
+            return Ok(staged(
+                StagedPlaneBase::Plane(plane.feature),
+                ResolvedDatumPlane {
+                    frame: plane.frame,
+                    half_extent: [plane.half_u, plane.half_v],
+                },
+                None,
+            ));
+        }
+        let origin = origin_plane_for_sketch_plane(self.selected_origin_plane);
+        Ok(staged(
+            StagedPlaneBase::Origin(origin),
+            ResolvedDatumPlane {
+                frame: origin.frame(),
+                half_extent: [artificer_model::datum::ORIGIN_DATUM_HALF_EXTENT; 2],
+            },
+            None,
+        ))
+    }
+
+    /// Where the staged plane would go, while one is staged.
+    fn staged_plane_preview(&self) -> Option<ResolvedDatumPlane> {
+        matches!(
+            self.pending_operation,
+            Some(PendingOperation::StagePlane { .. })
+        )
+        .then(|| self.staged_plane.as_ref().map(StagedPlane::resolved))
+        .flatten()
+    }
+
+    /// The staged plane's arrow and, through an edge, its turning arc.
+    fn staged_plane_handles(&self) -> Option<viewport::DatumPlaneHandles> {
+        let staged = self.staged_plane.as_ref()?;
+        // The arrow stands on the plane's own base: the turned plane for one
+        // through an edge, so the offset always runs square to the card.
+        let base = staged
+            .edge
+            .and_then(|edge| artificer_model::datum::edge_plane(edge, staged.angle_degrees).ok())
+            .unwrap_or(staged.base_plane);
+        let normal = frame_normal(base.frame)?;
+        let reach = base.half_extent[0].max(base.half_extent[1]);
+        let turn = staged.edge.map(|edge| viewport::DatumTurnHandle {
+            hinge: Point3::new(
+                0.5 * (edge.start.x + edge.end.x),
+                0.5 * (edge.start.y + edge.end.y),
+                0.5 * (edge.start.z + edge.end.z),
+            ),
+            zero: edge.into_face,
+            up: edge.face_normal,
+            // The card hangs off the edge and is twice its half-extent deep;
+            // the knob sits three quarters of the way out, on the card but
+            // near enough the hinge to stay on screen as the card lifts.
+            radius: 1.5 * base.half_extent[1],
+            angle_degrees: staged.angle_degrees,
+        });
+        Some(viewport::DatumPlaneHandles {
+            anchor: base.frame.origin,
+            normal,
+            offset: staged.offset,
+            arrow_length: (0.45 * reach).max(1.0),
+            turn,
+        })
+    }
+
+    fn staged_plane_label(&self) -> String {
+        match self.pending_operation {
+            Some(PendingOperation::StagePlane {
+                editing: Some(feature),
+            }) => self
+                .document
+                .feature(feature)
+                .map_or_else(|| "Plane".to_owned(), |node| node.label.clone()),
+            _ => format!("Plane {}", self.next_plane_ordinal()),
+        }
+    }
+
+    /// The number the next plane's name takes: one more than any plane in
+    /// the document, so names are never reused within a document.
+    fn next_plane_ordinal(&self) -> u32 {
+        self.document
+            .features()
+            .iter()
+            .filter(|feature| feature.kind == FeatureKind::DatumPlane)
+            .filter_map(|feature| {
+                feature
+                    .label
+                    .strip_prefix("Plane ")
+                    .and_then(|number| number.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    /// Moves the staged plane's offset, as the arrow and the Offset field do.
+    fn set_staged_plane_offset(&mut self, offset: f64) {
+        if !offset.is_finite() || offset.abs() > artificer_model::datum::MAX_DATUM_OFFSET {
+            return;
+        }
+        if let Some(staged) = self.staged_plane.as_mut() {
+            staged.offset = offset;
+        }
+    }
+
+    /// Turns the staged plane about its edge, as the arc and the Angle field
+    /// do. Only a plane through an edge turns.
+    fn set_staged_plane_angle(&mut self, angle_degrees: f64) {
+        if !angle_degrees.is_finite() {
+            return;
+        }
+        // Keep the angle in (−180, 180]: a full turn is the same plane.
+        let wrapped = (angle_degrees + 180.0).rem_euclid(360.0) - 180.0;
+        let wrapped = if wrapped == -180.0 { 180.0 } else { wrapped };
+        if let Some(staged) = self.staged_plane.as_mut()
+            && staged.takes_an_angle()
+        {
+            staged.angle_degrees = wrapped;
+        }
+    }
+
+    fn set_staged_plane_flip(&mut self, flip: bool) {
+        if let Some(staged) = self.staged_plane.as_mut() {
+            staged.flip = flip;
+        }
+    }
+
+    /// Turns the staged base into a recipe base whose face and edge are named
+    /// by persistent reference. A base whose faces cannot be named — a face of
+    /// a library component, say — is refused rather than quietly fixed.
+    fn staged_plane_recipe_base(&self, base: &StagedPlaneBase) -> Result<DatumPlaneBase, String> {
+        let name = |entity: EntityRef, body: BodyId| {
+            self.persistent_ref_for_entity_in(entity, None, body).ok_or_else(|| {
+                "the picked geometry has no unique history to follow; pick it on the body's latest state"
+                    .to_owned()
+            })
+        };
+        Ok(match base {
+            StagedPlaneBase::Origin(plane) => DatumPlaneBase::Origin { plane: *plane },
+            StagedPlaneBase::Face { body, face } => DatumPlaneBase::Face(DatumFaceRef {
+                body: *body,
+                face: name(*face, *body)?,
+            }),
+            StagedPlaneBase::Plane(plane) => DatumPlaneBase::Plane { plane: *plane },
+            StagedPlaneBase::Midplane { first, second } => DatumPlaneBase::Midplane {
+                first: DatumFaceRef {
+                    body: first.0,
+                    face: name(first.1, first.0)?,
+                },
+                second: DatumFaceRef {
+                    body: second.0,
+                    face: name(second.1, second.0)?,
+                },
+            },
+            StagedPlaneBase::Edge { body, edge, face } => DatumPlaneBase::Edge {
+                body: *body,
+                edge: name(*edge, *body)?,
+                face: name(*face, *body)?,
+            },
+            StagedPlaneBase::Recipe(base) => base.clone(),
+        })
+    }
+
+    /// The inputs a plane with this base declares: the body it reads, and
+    /// the plane it stands on. A midplane across two bodies takes the first
+    /// as its branch and depends on the second body's latest feature.
+    fn plane_feature_inputs(&self, base: &DatumPlaneBase) -> (Vec<FeatureInput>, Vec<FeatureId>) {
+        let mut inputs = Vec::new();
+        let mut dependencies = Vec::new();
+        let bodies = base.bodies();
+        if let Some(first) = bodies.first() {
+            inputs.push(FeatureInput::Body(*first));
+        }
+        for other in bodies.iter().skip(1) {
+            if let Some(record) = self.document.body(*other) {
+                dependencies.push(record.last_feature);
+            }
+        }
+        if let DatumPlaneBase::Plane { plane } = base {
+            inputs.push(FeatureInput::Feature(*plane));
+        }
+        (inputs, dependencies)
+    }
+
+    /// Confirms the plane editor: a new plane is appended to the history, and
+    /// an edited one has its recipe rewritten in place and everything built
+    /// on it replayed.
+    fn commit_staged_plane(&mut self, editing: Option<FeatureId>) {
+        let Some(staged) = self.staged_plane.clone() else {
+            self.pending_operation = None;
+            return;
+        };
+        let base = match self.staged_plane_recipe_base(&staged.base) {
+            Ok(base) => base,
+            Err(error) => {
+                self.document_status = Some(format!("Plane rejected: {error}"));
+                return;
+            }
+        };
+        let placed = staged.resolved();
+        let mut recipe = DatumPlaneRecipe::new(base, placed);
+        recipe.offset = staged.offset;
+        recipe.angle_degrees = if recipe.base.takes_an_angle() {
+            staged.angle_degrees
+        } else {
+            0.0
+        };
+        recipe.flip = staged.flip;
+        if let Err(error) = recipe.validate() {
+            self.document_status = Some(format!("Plane rejected: {error}"));
+            return;
+        }
+        if let Some(feature) = editing {
+            self.apply_plane_edit(feature, recipe);
+            return;
+        }
+        let (inputs, dependencies) = self.plane_feature_inputs(&recipe.base);
+        let branch_snapshot = inputs.iter().find_map(|input| match input {
+            FeatureInput::Body(body) => self
+                .bodies
+                .iter()
+                .find(|candidate| candidate.id == *body)
+                .map(|candidate| &candidate.body.snapshot),
+            FeatureInput::Feature(_) | FeatureInput::Sketch(_) => None,
+        });
+        let association = branch_snapshot
+            .or_else(|| self.displayed.as_ref().map(|displayed| &displayed.snapshot))
+            .map_or_else(
+                || {
+                    SnapshotAssociation::new(
+                        self.empty_snapshot.id(),
+                        self.empty_snapshot.id(),
+                        self.empty_snapshot.semantic_digest(),
+                    )
+                },
+                |snapshot| {
+                    SnapshotAssociation::new(
+                        snapshot.id(),
+                        snapshot.id(),
+                        snapshot.semantic_digest(),
+                    )
+                },
+            );
+        let label = format!("Plane {}", self.next_plane_ordinal());
+        let mut draft = FeatureDraft::new(
+            FeatureKind::DatumPlane,
+            label.clone(),
+            ReplayAction::DatumPlane(recipe),
+        )
+        .with_commit(association);
+        for input in inputs {
+            draft = draft.with_input(input);
+        }
+        for dependency in dependencies {
+            draft = draft.with_dependency(dependency);
+        }
+        match self.document.append_feature(draft) {
+            Ok(appended) => {
+                self.staged_plane = None;
+                self.pending_operation = None;
+                self.selected_history_feature = Some(appended.feature);
+                self.history_scrub_position = self.document.history_position();
+                self.sync_construction_planes_from_document();
+                self.sync_feature_preview_from_document();
+                self.selected_construction_plane = Some(appended.feature.get());
+                self.document_status = Some(format!("{label} committed and ready for sketching"));
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Plane rejected: {error}"));
+            }
+        }
+    }
+
+    /// Reopens a committed plane in its editor (ADR 0048).
+    ///
+    /// As with an extrusion (ADR 0036), the history rolls back to just before
+    /// the plane, so what is on screen is what the plane was placed against,
+    /// and confirming rewrites the recipe in its slot and replays what
+    /// follows.
+    pub(crate) fn begin_plane_edit(&mut self, feature: FeatureId) -> bool {
+        if self.pending_operation.is_some() {
+            return false;
+        }
+        let Some(index) = self
+            .document
+            .features()
+            .iter()
+            .position(|node| node.id == feature)
+        else {
+            return false;
+        };
+        let Some(recipe) = self.document.datum_plane(feature).cloned() else {
+            self.document_status = Some("That feature is not a construction plane".to_owned());
+            return false;
+        };
+        if !self.move_history_cursor(index) {
+            return false;
+        }
+        // The base as the rolled-back model resolves it; a base that no
+        // longer resolves opens on the plane's last frame, fixed there.
+        let reports = self.feature_reports.clone();
+        let resolved_planes = self
+            .construction_planes
+            .iter()
+            .map(|plane| {
+                (
+                    plane.feature,
+                    ResolvedDatumPlane {
+                        frame: plane.frame,
+                        half_extent: [plane.half_u, plane.half_v],
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let resolver = ModelPlaneResolver::new(
+            &self.document,
+            &reports,
+            self.bodies.iter().map(|body| &body.body.snapshot),
+            &resolved_planes,
+        );
+        let edge = match &recipe.base {
+            DatumPlaneBase::Edge { body, edge, face } => resolver.edge(*body, edge, face).ok(),
+            _ => None,
+        };
+        let base_plane = recipe.base_plane(&resolver);
+        let lost = base_plane.is_err();
+        let base_plane = base_plane.unwrap_or_else(|_| {
+            let unflipped = if recipe.flip {
+                artificer_model::datum::flipped(recipe.frame)
+            } else {
+                recipe.frame
+            };
+            ResolvedDatumPlane {
+                frame: artificer_model::datum::offset_along_normal(unflipped, -recipe.offset),
+                half_extent: recipe.half_extent,
+            }
+        });
+        let staged = StagedPlane {
+            base: StagedPlaneBase::Recipe(recipe.base.clone()),
+            base_plane,
+            edge: if lost { None } else { edge },
+            offset: recipe.offset,
+            angle_degrees: recipe.angle_degrees,
+            flip: recipe.flip,
+        };
+        self.begin_plane_editor(staged, Some(feature));
+        let label = self
+            .document
+            .feature(feature)
+            .map_or_else(|| "this plane".to_owned(), |node| node.label.clone());
+        self.document_status = Some(if lost {
+            format!(
+                "Editing {label} · its base no longer resolves, so it moves from where it last was"
+            )
+        } else {
+            format!("Editing {label} · confirm to rewrite it and replay what is built on it")
+        });
+        true
+    }
+
+    /// Rewrites an edited plane's recipe and replays everything after it.
+    fn apply_plane_edit(&mut self, feature: FeatureId, recipe: DatumPlaneRecipe) {
+        self.staged_plane = None;
         self.pending_operation = None;
-        self.document_status = Some(format!("Plane {id} committed and ready for sketching"));
+        match self
+            .document
+            .replace_feature_action(feature, ReplayAction::DatumPlane(recipe))
+        {
+            Ok(_) => {
+                self.move_history_cursor(self.document.features().len());
+                self.selected_history_feature = Some(feature);
+                if self.rebuild_document_from(feature) {
+                    self.document_status =
+                        Some("Plane moved; everything built on it rebuilt".to_owned());
+                }
+            }
+            Err(error) => {
+                self.document_status = Some(format!("Plane edit rejected: {error}"));
+                self.move_history_cursor(self.document.features().len());
+            }
+        }
     }
 
     fn begin_construction_plane_sketch(&mut self, id: u64) {
@@ -9016,6 +10556,7 @@ impl KernelLabApp {
             .extrusion_second_distance
             .filter(|_| target_face.is_none());
         let up_to_faces = self.extrusion_extents.map(ExtrusionExtentIntent::face);
+        let up_to_planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
         // Extrusion owns pointer interaction until it is confirmed or
         // cancelled. Do not leave a transform drag tool armed behind the
         // feature preview, where its presentation-only change would be lost
@@ -9051,6 +10592,7 @@ impl KernelLabApp {
             mode,
             second_distance,
             up_to_faces,
+            up_to_planes,
             boolean_target,
             editing_feature: None,
         });
@@ -9097,6 +10639,7 @@ impl KernelLabApp {
         reports: &[(FeatureId, OperationReport)],
         input: &Snapshot,
         rebuilt: &[ArchivedBody],
+        planes: &BTreeMap<FeatureId, ResolvedDatumPlane>,
     ) -> (ReplayAction, Vec<(usize, LostExtentTarget)>) {
         let ReplayAction::SketchRegionExtrusion(recipe) = &action else {
             return (action, Vec::new());
@@ -9104,6 +10647,12 @@ impl KernelLabApp {
         if !recipe.ends_at_a_face() {
             return (action, Vec::new());
         }
+        let plane_frame = |plane: FeatureId| {
+            planes
+                .get(&plane)
+                .map(|plane| plane.frame)
+                .or_else(|| self.document.datum_plane(plane).map(|recipe| recipe.frame))
+        };
         let Some(frame) = self
             .document
             .sketch(recipe.sketch)
@@ -9111,7 +10660,13 @@ impl KernelLabApp {
                 self.document
                     .sketch_payload(recipe.sketch, record.geometry_revision)
             })
-            .map(|payload| payload.frame)
+            .map(|payload| {
+                payload
+                    .support
+                    .plane()
+                    .and_then(plane_frame)
+                    .unwrap_or(payload.frame)
+            })
         else {
             return (action, vec![(0, LostExtentTarget::SketchGone)]);
         };
@@ -9200,6 +10755,38 @@ impl KernelLabApp {
             };
         let first = side_of(recipe.up_to_face.as_ref(), 0);
         let second = side_of(recipe.second_up_to_face.as_ref(), 1);
+        // A side that ends at a construction plane is measured to where the
+        // plane now is, by the same rule as a face's plane.
+        let to_plane =
+            |plane: Option<FeatureId>, side: usize| -> Result<Option<f64>, LostExtentTarget> {
+                let Some(plane) = plane else {
+                    return Ok(None);
+                };
+                let target = plane_frame(plane).ok_or(LostExtentTarget::Missing)?;
+                let normal = frame_normal(target).ok_or(LostExtentTarget::NoLongerAPlane)?;
+                let height = plane_height_above_frame(frame, target.origin, normal, 1.0e-6)
+                    .ok_or(LostExtentTarget::NoLongerParallel)?;
+                let forward = if recipe.distance < 0.0 { -1.0 } else { 1.0 };
+                let along = if side == 0 {
+                    height * forward
+                } else {
+                    -height * forward
+                };
+                if along > PrecisionPolicy::default().min_feature_size {
+                    Ok(Some(along))
+                } else {
+                    Err(LostExtentTarget::NoLongerAhead)
+                }
+            };
+        let mut plane_side = |plane: Option<FeatureId>, side: usize| match to_plane(plane, side) {
+            Ok(measured) => measured,
+            Err(reason) => {
+                lost.push((side, reason));
+                None
+            }
+        };
+        let first = first.or_else(|| plane_side(recipe.up_to_plane, 0));
+        let second = second.or_else(|| plane_side(recipe.second_up_to_plane, 1));
         (
             ReplayAction::SketchRegionExtrusion(
                 recipe.clone().with_measured_distances(first, second),
@@ -9297,10 +10884,12 @@ impl KernelLabApp {
     /// the direction or the body it measures against may have moved.
     fn remeasure_extrusion_extents(&mut self) {
         for side in 0..self.extrusion_extents.len() {
-            let Some(face) = self.extrusion_extents[side].face() else {
-                continue;
+            let measured = match self.extrusion_extents[side] {
+                ExtrusionExtentIntent::ToFace(face) => self.measure_extent_to_face(face, side),
+                ExtrusionExtentIntent::ToPlane(plane) => self.measure_extent_to_plane(plane, side),
+                ExtrusionExtentIntent::Distance | ExtrusionExtentIntent::PickingFace => continue,
             };
-            match self.measure_extent_to_face(face, side) {
+            match measured {
                 Ok(distance) => self.set_extrusion_side_distance(side, distance),
                 Err(reason) => {
                     self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
@@ -9362,15 +10951,56 @@ impl KernelLabApp {
     /// become choosing a different one behind the user's back later.
     fn arm_extrusion_face_pick(&mut self, side: usize) {
         self.extrusion_extents[side] = ExtrusionExtentIntent::PickingFace;
+        self.extrusion_extent_notes[side] = None;
         let targets = self.remembered_extrusion_targets(side);
+        // Construction planes are destinations too. With any on offer the
+        // side stays armed and the list names them beside the faces.
+        let planes = self.extrusion_plane_targets(side);
+        if !planes.is_empty() {
+            if targets.is_empty() && planes.len() == 1 {
+                let (plane, name, _) = planes[0].clone();
+                self.adopt_extrusion_extent_plane(side, plane);
+                if self.extrusion_extents[side] == ExtrusionExtentIntent::ToPlane(plane) {
+                    self.document_status = Some(format!(
+                        "Side {} ends at the only place it can reach · {name}",
+                        side + 1
+                    ));
+                }
+                return;
+            }
+            self.document_status = Some(format!(
+                "{} places could end side {} · choose one in the panel",
+                targets.len() + planes.len(),
+                side + 1
+            ));
+            return;
+        }
         match targets.len() {
             0 => {
+                // Nothing ahead. Say so where the click was made, and say
+                // what *is* there: an Add pushed out from a wall has no face
+                // in front of it, and the faces the user was thinking of are
+                // usually the ones behind, which a Cut would reach.
                 self.extrusion_extents[side] = ExtrusionExtentIntent::Distance;
-                self.document_status = Some(
-                    "No face of this design is parallel to the sketch plane on that side, \
-                     so there is nothing for this side to end at"
-                        .to_owned(),
-                );
+                let behind = self.extrusion_targets_behind(side).len();
+                let note = if behind == 0 {
+                    "No face of this design is parallel to the sketch plane, ahead of this side \
+                     or behind it, so it can only end at a distance."
+                        .to_owned()
+                } else {
+                    format!(
+                        "No face lies ahead of this side, so it ends at a distance. {behind} \
+                         parallel {} behind it — switch the operation to Cut (or the distance's \
+                         sign) to end there.",
+                        if behind == 1 {
+                            "face lies"
+                        } else {
+                            "faces lie"
+                        }
+                    )
+                };
+                self.document_status = Some(note.clone());
+                self.extrusion_extent_notes[side] = Some(note);
             }
             1 => {
                 let only = &targets[0];
@@ -9422,6 +11052,27 @@ impl KernelLabApp {
             reversed,
             targets: targets.clone(),
         });
+        targets
+    }
+
+    /// Why a side is not ending at a face, if it was asked to and could not.
+    #[must_use]
+    pub fn extrusion_extent_note(&self, side: usize) -> Option<&str> {
+        self.extrusion_extent_notes
+            .get(side)
+            .and_then(|note| note.as_deref())
+    }
+
+    /// The faces this side would reach if the sweep ran the other way.
+    ///
+    /// Direction is the signed distance's, so the question is asked by
+    /// flipping the sign for the length of one call and putting it back.
+    /// This never touches the memo, which is keyed on the real sign.
+    fn extrusion_targets_behind(&mut self, side: usize) -> Vec<ExtrusionTarget> {
+        let distance = self.extrusion_distance;
+        self.extrusion_distance = if distance == 0.0 { -1.0 } else { -distance };
+        let targets = self.extrusion_targets(side);
+        self.extrusion_distance = distance;
         targets
     }
 
@@ -9543,6 +11194,77 @@ impl KernelLabApp {
         Ok(along)
     }
 
+    /// How far a side sweeps to end at a construction plane: by the same
+    /// rule as a face's plane, which is all a construction plane is.
+    fn measure_extent_to_plane(&self, plane: FeatureId, side: usize) -> Result<f64, &'static str> {
+        let target = self
+            .construction_planes
+            .iter()
+            .find(|candidate| candidate.feature == plane)
+            .ok_or("that plane is not in the design at this point in history")?;
+        let normal = frame_normal(target.frame).ok_or("that plane has no usable normal")?;
+        let height = plane_height_above_frame(
+            self.sketch_support.frame(),
+            target.frame.origin,
+            normal,
+            1.0e-6,
+        )
+        .ok_or("that plane is not parallel to the sketch plane")?;
+        let forward = if self.extrusion_distance < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let along = if side == 0 {
+            height * forward
+        } else {
+            -height * forward
+        };
+        if along <= PrecisionPolicy::default().min_feature_size {
+            return Err("that plane lies on the other side of the sketch plane from this side");
+        }
+        Ok(along)
+    }
+
+    /// The construction planes this side could end at, nearest first, with
+    /// the length to each.
+    fn extrusion_plane_targets(&self, side: usize) -> Vec<(FeatureId, String, f64)> {
+        let mut targets = self
+            .construction_planes
+            .iter()
+            .filter(|plane| {
+                // A sketch cannot end at the plane it is drawn on.
+                !matches!(
+                    self.sketch_support,
+                    SketchSupport::ConstructionPlane { id: Some(id), .. } if id == plane.id
+                )
+            })
+            .filter_map(|plane| {
+                self.measure_extent_to_plane(plane.feature, side)
+                    .ok()
+                    .map(|reach| (plane.feature, plane.name.clone(), reach))
+            })
+            .collect::<Vec<_>>();
+        targets.sort_by(|first, second| first.2.total_cmp(&second.2));
+        targets
+    }
+
+    /// Ends a side at a construction plane, measuring the length to it.
+    fn adopt_extrusion_extent_plane(&mut self, side: usize, plane: FeatureId) {
+        match self.measure_extent_to_plane(plane, side) {
+            Ok(distance) => {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::ToPlane(plane);
+                self.extrusion_extent_notes[side] = None;
+                self.set_extrusion_side_distance(side, distance);
+                self.sync_pending_sketch_extrusion_inputs();
+            }
+            Err(reason) => {
+                self.document_status =
+                    Some(format!("Side {} cannot end there: {reason}", side + 1));
+            }
+        }
+    }
+
     fn selected_face_push_pull_support(&self) -> Option<PlanarFaceSupport> {
         let face = self.selected_face()?.face;
         let body = self.displayed.as_ref()?;
@@ -9563,6 +11285,7 @@ impl KernelLabApp {
             // No usable face is picked, so the tool asks for one rather than
             // doing nothing. Pressing it is entering it (ADR 0041).
             self.invoke_tool("Extrude", &invocation::FACE_PUSH_PULL);
+            self.armed_resume = self.armed_tool.is_some().then_some(ArmedResume::PushPull);
             return false;
         };
         let Some(support_body) = self.active_body_id() else {
@@ -9596,6 +11319,7 @@ impl KernelLabApp {
         let wanted_second = self.extrusion_second_distance;
         let wanted_draft = self.extrusion_draft_degrees;
         let wanted_up_to = self.extrusion_extents.map(ExtrusionExtentIntent::face);
+        let wanted_planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
         match self.pending_operation.as_mut() {
             Some(PendingOperation::ExtrudeSketch {
                 distance,
@@ -9604,12 +11328,14 @@ impl KernelLabApp {
                 target_face,
                 second_distance,
                 up_to_faces,
+                up_to_planes,
                 boolean_target,
                 ..
             }) => {
                 *distance = wanted_distance;
                 *second_distance = wanted_second.filter(|_| target_face.is_none());
                 *up_to_faces = wanted_up_to;
+                *up_to_planes = wanted_planes;
                 // A draft needs one side to lean from.
                 *draft_degrees = if target_face.is_none() && second_distance.is_none() {
                     wanted_draft
@@ -10461,54 +12187,6 @@ impl KernelLabApp {
                     self.document_status = Some(format!("Open failed: {error}"));
                 }
             }
-            PendingOperation::SetParameterLiteral {
-                parameter, value, ..
-            } => {
-                match self
-                    .document
-                    .set_parameter_binding(parameter, ParameterBinding::literal(value.into_value()))
-                {
-                    Ok(_) => {
-                        self.pending_operation = None;
-                        self.rebuild_after_parameter_change();
-                    }
-                    Err(error) => {
-                        self.document_status = Some(format!("Parameter update rejected: {error}"));
-                    }
-                }
-            }
-            PendingOperation::AddUserLengthParameter { ordinal, value_mm } => {
-                let key = format!("UserLength{ordinal}");
-                let metadata = ParameterMetadata {
-                    exposure: ParameterExposure::UserInput,
-                    description: Some("Reusable document length".to_owned()),
-                    ..ParameterMetadata::default()
-                };
-                let spec = ParameterSpec::new(
-                    key.clone(),
-                    format!("User length {ordinal}"),
-                    ParameterType::Quantity(QuantityKind::Length),
-                )
-                .with_display_unit(ParameterUnit::Millimeter)
-                .with_metadata(metadata);
-                match self.document.add_parameter(
-                    spec,
-                    ParameterBinding::literal(ParameterValue::quantity(
-                        value_mm,
-                        ParameterUnit::Millimeter,
-                    )),
-                ) {
-                    Ok(_) => {
-                        self.pending_operation = None;
-                        self.history_scrub_position = self.document.history_position();
-                        self.document_status = Some(format!("Parameter {key} added"));
-                    }
-                    Err(error) => {
-                        self.document_status =
-                            Some(format!("Parameter creation rejected: {error}"));
-                    }
-                }
-            }
             PendingOperation::SetParameterBindingEntry { parameter } => {
                 match self
                     .staged_parameter_binding
@@ -10520,8 +12198,16 @@ impl KernelLabApp {
                         match self
                             .document
                             .set_parameter_binding(parameter, binding.clone())
-                        {
-                            Ok(_) => {
+                            .map_err(|error| error.to_string())
+                            .and_then(|changed| {
+                                // Only a change has an undo step to abandon.
+                                if changed {
+                                    self.follow_variables_in_sketches()
+                                } else {
+                                    Ok(())
+                                }
+                            }) {
+                            Ok(()) => {
                                 self.pending_operation = None;
                                 self.variable_value_drafts.remove(&parameter.get());
                                 self.rebuild_after_parameter_change();
@@ -10583,12 +12269,11 @@ impl KernelLabApp {
                     }
                 }
             }
-            PendingOperation::CreateConstructionPlane {
-                frame,
-                half_u,
-                half_v,
-                source,
-            } => self.commit_construction_plane(frame, half_u, half_v, source),
+            PendingOperation::StagePlane { editing } => self.commit_staged_plane(editing),
+            PendingOperation::StageAxis { editing } => self.commit_staged_axis(editing),
+            PendingOperation::StageLoft { editing } => self.commit_staged_loft(editing),
+            PendingOperation::StageRevolve { editing } => self.commit_staged_revolve(editing),
+            PendingOperation::StageSweep { editing } => self.commit_staged_sweep(editing),
             PendingOperation::BooleanBodies {
                 target,
                 operation,
@@ -10761,17 +12446,27 @@ impl KernelLabApp {
                 self.boolean_tools.clear();
                 self.pending_operation = None;
             }
-            PendingOperation::SetParameterLiteral { .. }
-            | PendingOperation::AddUserLengthParameter { .. }
-            | PendingOperation::RemoveParameter { .. }
-            | PendingOperation::AddUserParameter { .. }
-            | PendingOperation::CreateConstructionPlane { .. } => self.pending_operation = None,
+            PendingOperation::RemoveParameter { .. }
+            | PendingOperation::AddUserParameter { .. } => self.pending_operation = None,
+            PendingOperation::StageAxis { editing } => self.cancel_staged_axis(editing),
+            PendingOperation::StagePlane { editing } => {
+                self.staged_plane = None;
+                self.pending_operation = None;
+                if editing.is_some() {
+                    // Editing rolled the history back to just before the
+                    // plane; abandoning puts the whole model back.
+                    self.move_history_cursor(self.document.features().len());
+                    self.document_status = Some("Plane edit abandoned".to_owned());
+                }
+            }
+            PendingOperation::StageLoft { editing } => self.cancel_staged_loft(editing),
+            PendingOperation::StageRevolve { editing } => self.cancel_staged_revolve(editing),
+            PendingOperation::StageSweep { editing } => self.cancel_staged_sweep(editing),
             PendingOperation::SetParameterBindingEntry { .. } => {
                 self.staged_parameter_binding = None;
                 self.pending_operation = None;
             }
             PendingOperation::PresetFeature { .. } => {
-                self.staged_revolve = None;
                 self.pending_operation = None;
             }
             PendingOperation::SketchEdit { .. } => {
@@ -10828,6 +12523,7 @@ impl KernelLabApp {
             mode,
             second_distance,
             up_to_faces: _,
+            up_to_planes: _,
             boolean_target,
             editing_feature: _,
         } = pending
@@ -11062,6 +12758,7 @@ impl KernelLabApp {
             boolean_target,
             second_distance,
             up_to_faces,
+            up_to_planes,
             ..
         } = pending
         else {
@@ -11093,11 +12790,16 @@ impl KernelLabApp {
                 };
                 let record = ExtrusionRecord {
                     signed_distance: distance,
+                    distance_expression: self
+                        .live_distance_link(distance)
+                        .filter(|_| up_to_faces[0].is_none() && up_to_planes[0].is_none())
+                        .map(|link| link.expression.clone()),
                     mode: record_mode,
                     second_distance,
                     up_to_faces: up_to_faces.map(|face| {
                         face.and_then(|face| self.persistent_ref_for_current_face(face))
                     }),
+                    up_to_planes,
                 };
                 let feature_binding = self.append_extrusion_to_document(
                     &mut next_document,
@@ -11148,6 +12850,10 @@ impl KernelLabApp {
                 self.clear_transform_preview();
                 self.pending_operation = None;
                 self.selected_faces.clear();
+                // So does the variable the distance followed: the next
+                // extrusion starts from a plain number.
+                self.extrusion_distance_link = None;
+                self.extrusion_expression_draft.clear();
                 // The extents belonged to the extrusion that just committed,
                 // and the recipe carries them now. Leaving them set handed the
                 // next extrusion a face it never asked for, which then
@@ -12789,23 +14495,6 @@ impl KernelLabApp {
         ));
     }
 
-    /// The active sketch's closed profile and centreline, if it has both.
-    ///
-    /// A revolve needs a region and an axis in the same frame, which is
-    /// exactly what a sketch with one centreline already is.
-    fn staged_sketch_revolve(&self) -> Option<StagedRevolve> {
-        let (start, end) = self.sketch.centreline_axis()?;
-        let profile = self.sketch_planar_profile_payload()?;
-        Some(StagedRevolve {
-            frame: self.sketch_support.frame(),
-            profile,
-            axis: PlanarAxis2::new(
-                ProtocolPoint2::new(start.u, start.v),
-                ProtocolPoint2::new(end.u, end.v),
-            ),
-        })
-    }
-
     /// The mirror plane chosen in the Browser or viewport: the selected
     /// construction plane when there is one, the selected planar face if one
     /// is picked, and the selected origin plane otherwise.
@@ -12856,25 +14545,6 @@ impl KernelLabApp {
         if self.pending_operation.is_some() || !self.history_is_at_end() {
             return;
         }
-        if preset == SolidFeaturePreset::Revolve {
-            // A sketched region turning about its own centreline is the real
-            // command; the fixed tube remains only for an empty document.
-            self.staged_revolve = self.staged_sketch_revolve();
-            self.document_status = Some(if self.staged_revolve.is_some() {
-                "Revolve staged from the active sketch profile and centreline".to_owned()
-            } else {
-                "Revolve staged · draw a closed profile and one centreline to revolve your own"
-                    .to_owned()
-            });
-            self.pending_operation = Some(PendingOperation::PresetFeature {
-                preset,
-                base_snapshot: SnapshotId::ZERO,
-                body: None,
-                target_face: None,
-                frame: None,
-            });
-            return;
-        }
         let Some(index) = self.active_body_index() else {
             return;
         };
@@ -12893,6 +14563,10 @@ impl KernelLabApp {
                     _ => "Hole pattern",
                 };
                 self.invoke_tool(tool, &invocation::PLANAR_FACE_FEATURE);
+                self.armed_resume = self
+                    .armed_tool
+                    .is_some()
+                    .then_some(ArmedResume::Preset(preset));
                 return;
             };
             let support =
@@ -12926,6 +14600,10 @@ impl KernelLabApp {
                     "Chamfer"
                 };
                 self.invoke_tool(tool, &invocation::EDGE_FINISH);
+                self.armed_resume = self
+                    .armed_tool
+                    .is_some()
+                    .then_some(ArmedResume::Preset(preset));
                 return;
             }
             let support = self.edge_finish_selection_support();
@@ -13055,9 +14733,7 @@ impl KernelLabApp {
         target_face: Option<EntityRef>,
         frame: Option<PlanarFrame3>,
     ) {
-        let input = if preset == SolidFeaturePreset::Revolve {
-            NativeKernel::empty()
-        } else {
+        let input = {
             let Some(body) = body else {
                 return;
             };
@@ -13090,47 +14766,6 @@ impl KernelLabApp {
             }
         }
         let command = match preset {
-            // The preset is still a fixed tube, but it now travels the
-            // general revolve: a section rectangle beside an axis in its own
-            // frame, exactly as a sketched profile will once region-and-axis
-            // staging lands. `MakeRevolvedAnnulus` has no consumer left in the
-            // product.
-            SolidFeaturePreset::Revolve => {
-                let staged = self.staged_revolve.clone();
-                staged.map_or_else(
-                    // No sketch to turn: the preset still builds the tube it
-                    // always did, so an empty document has something to show.
-                    || KernelCommand::RevolvePlanarProfile {
-                        frame: PlanarFrame3::new(
-                            Point3::new(0.0, 0.0, 0.0),
-                            Vector3::new(1.0, 0.0, 0.0),
-                            Vector3::new(0.0, 0.0, 1.0),
-                        ),
-                        profile: PlanarProfile2 {
-                            regions: vec![PlanarRegion2 {
-                                outer: PlanarLoop2::from_polygon(&[
-                                    ProtocolPoint2::new(1.0, 0.0),
-                                    ProtocolPoint2::new(2.0, 0.0),
-                                    ProtocolPoint2::new(2.0, 3.0),
-                                    ProtocolPoint2::new(1.0, 3.0),
-                                ]),
-                                holes: Vec::new(),
-                            }],
-                        },
-                        axis: PlanarAxis2::new(
-                            ProtocolPoint2::new(0.0, 0.0),
-                            ProtocolPoint2::new(0.0, 1.0),
-                        ),
-                        angle: RevolveAngle::FullTurn,
-                    },
-                    |staged| KernelCommand::RevolvePlanarProfile {
-                        frame: staged.frame,
-                        profile: staged.profile,
-                        axis: staged.axis,
-                        angle: RevolveAngle::FullTurn,
-                    },
-                )
-            }
             SolidFeaturePreset::Hole => KernelCommand::DrillHole {
                 target_face: target_face.expect("staged hole face"),
                 frame: frame.expect("staged hole frame"),
@@ -13282,15 +14917,12 @@ impl KernelLabApp {
                 return;
             }
         };
-        // The captured region and axis have been spent.
-        self.staged_revolve = None;
         let association = SnapshotAssociation::new(
             outcome.report.input_snapshot,
             outcome.report.output_snapshot,
             outcome.report.semantic_digest,
         );
         let kind = match preset {
-            SolidFeaturePreset::Revolve => FeatureKind::BaseBody,
             SolidFeaturePreset::Hole => FeatureKind::Cut,
             SolidFeaturePreset::Rib => FeatureKind::Add,
             SolidFeaturePreset::HolePattern | SolidFeaturePreset::Shell => FeatureKind::Cut,
@@ -13351,7 +14983,7 @@ impl KernelLabApp {
                 .with_output(OutputDraft::ModifyBody(body));
         } else {
             draft = draft.with_output(OutputDraft::CreateBody {
-                label: "Revolved body".to_owned(),
+                label: format!("Body {}", self.next_body_ordinal),
             });
         }
         let appended = match next_document.append_feature(draft) {
@@ -13399,7 +15031,6 @@ impl KernelLabApp {
         self.model_body_kind = match preset {
             SolidFeaturePreset::Hole => ModelBodyKind::CutPocket,
             SolidFeaturePreset::Rib => ModelBodyKind::AddedBoss,
-            SolidFeaturePreset::Revolve => ModelBodyKind::SketchExtrusion,
             _ => ModelBodyKind::Boolean,
         };
         // History replay restores immutable snapshots from this archive. Edge
@@ -14185,6 +15816,18 @@ impl KernelLabApp {
                 });
                 if save_as_by_path.clicked() {
                     self.open_document_path_prompt(DocumentPathPurpose::SaveAs);
+                    ui.close();
+                }
+                let save_part = ui
+                    .add_enabled(
+                        !operation_pending,
+                        egui::Button::new("Save to Part Library…"),
+                    )
+                    .on_hover_text(
+                        "Save the part you are working on into the library, with its variables as the values it takes when placed",
+                    );
+                if save_part.clicked() {
+                    self.open_save_part_dialog();
                     ui.close();
                 }
                 ui.separator();
@@ -15026,14 +16669,32 @@ impl KernelLabApp {
     }
 
     /// Saves to `path`, adopts it as the document's own, and reports.
+    ///
+    /// A save never refuses: the work is kept whatever state it is in. When
+    /// a feature is still waiting on a rebuild that failed, the report says
+    /// which, because the model on screen is then not what the file builds,
+    /// and the file will open with that feature suppressed.
     pub fn save_document_to(&mut self, path: &Path) -> bool {
         match self.save_workspace_to_path(path) {
             Ok(()) => {
                 self.set_document_path(path.to_path_buf());
                 self.remember_dialog_directory(path);
                 self.mark_document_saved();
-                self.document_status =
-                    Some(format!("Saved Artificer workspace to {}", path.display()));
+                let unbuilt = self.features_awaiting_rebuild();
+                self.document_status = Some(match unbuilt.as_slice() {
+                    [] => format!("Saved Artificer workspace to {}", path.display()),
+                    [label] => format!(
+                        "Saved to {}, but {label} did not rebuild after the last change: \
+                         the file will open with it suppressed until it is fixed",
+                        path.display()
+                    ),
+                    labels => format!(
+                        "Saved to {}, but {} did not rebuild after the last change: \
+                         the file will open with them suppressed until they are fixed",
+                        path.display(),
+                        labels.join(", ")
+                    ),
+                });
                 true
             }
             Err(error) => {
@@ -15410,15 +17071,35 @@ impl KernelLabApp {
             return Vec::new();
         };
         let mut commands = Vec::new();
+        let plane = self.document.datum_plane(feature).is_some();
         if self.feature_has_an_editor(feature) {
-            commands.push(TimelineContextCommand::Edit);
+            commands.push(if plane {
+                TimelineContextCommand::EditPlane
+            } else if node.kind == FeatureKind::DatumAxis {
+                TimelineContextCommand::EditAxis
+            } else if node.kind == FeatureKind::Loft {
+                TimelineContextCommand::EditLoft
+            } else if node.kind == FeatureKind::Revolve {
+                TimelineContextCommand::EditRevolve
+            } else if node.kind == FeatureKind::Sweep {
+                TimelineContextCommand::EditSweep
+            } else {
+                TimelineContextCommand::Edit
+            });
         }
         if !node.state.read_only {
+            commands.push(TimelineContextCommand::Rename);
             commands.push(if node.state.suppressed {
                 TimelineContextCommand::Restore
             } else {
                 TimelineContextCommand::Suppress
             });
+            if node.kind == FeatureKind::DatumPlane {
+                commands.push(TimelineContextCommand::DeletePlane);
+            }
+            if node.kind == FeatureKind::DatumAxis {
+                commands.push(TimelineContextCommand::DeleteAxis);
+            }
         }
         commands
     }
@@ -15432,9 +17113,173 @@ impl KernelLabApp {
             TimelineContextCommand::Edit => {
                 self.begin_extrusion_edit(feature);
             }
+            TimelineContextCommand::EditPlane => {
+                self.begin_plane_edit(feature);
+            }
+            TimelineContextCommand::EditLoft => {
+                self.begin_loft_edit(feature);
+            }
+            TimelineContextCommand::EditRevolve => {
+                self.begin_revolve_edit(feature);
+            }
+            TimelineContextCommand::EditSweep => {
+                self.begin_sweep_edit(feature);
+            }
+            TimelineContextCommand::Rename => self.begin_feature_rename(feature),
             TimelineContextCommand::Suppress | TimelineContextCommand::Restore => {
                 self.toggle_feature_suppression(feature);
             }
+            TimelineContextCommand::DeletePlane => {
+                self.delete_construction_plane(feature);
+            }
+            TimelineContextCommand::EditAxis => {
+                self.begin_axis_edit(feature);
+            }
+            TimelineContextCommand::DeleteAxis => {
+                self.delete_construction_axis(feature);
+            }
+        }
+    }
+
+    /// Shows or hides a construction plane. Visibility is part of the plane's
+    /// recipe, so it is an undoable edit and the document offers to save it.
+    pub(crate) fn set_construction_plane_visible(&mut self, id: u64, visible: bool) {
+        let Some(feature) = self
+            .construction_planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .map(|plane| plane.feature)
+        else {
+            return;
+        };
+        match self.document.set_datum_plane_visible(feature, visible) {
+            Ok(_) => self.sync_construction_planes_from_document(),
+            Err(error) => {
+                self.document_status = Some(format!("Plane visibility unchanged: {error}"))
+            }
+        }
+    }
+
+    /// The plane feature a Browser row names.
+    pub(crate) fn construction_plane_feature(
+        &self,
+        target: browser::BrowserContextTarget,
+    ) -> Option<FeatureId> {
+        let browser::BrowserContextTarget::ConstructionPlane(id) = target else {
+            return None;
+        };
+        self.construction_planes
+            .iter()
+            .find(|plane| plane.id == id)
+            .map(|plane| plane.feature)
+    }
+
+    /// Opens the rename box on a feature, seeded with its name.
+    pub(crate) fn begin_feature_rename(&mut self, feature: FeatureId) {
+        if let Some(node) = self.document.feature(feature) {
+            self.plane_rename = Some((feature, node.label.clone()));
+        }
+    }
+
+    /// Renames a feature: the history chip and, for a plane, its card in the
+    /// viewport and its Browser row all read the new name.
+    fn apply_feature_rename(&mut self, feature: FeatureId, label: &str) {
+        let label = label.trim();
+        if label.is_empty() {
+            self.document_status = Some("A name cannot be empty".to_owned());
+            return;
+        }
+        match self.document.rename_feature(feature, label) {
+            Ok(_) => {
+                self.sync_construction_planes_from_document();
+                self.sync_construction_axes_from_document();
+                self.sync_feature_preview_from_document();
+                self.document_status = Some(format!("Renamed to {label}"));
+            }
+            Err(error) => self.document_status = Some(format!("Rename rejected: {error}")),
+        }
+    }
+
+    /// Deletes a construction plane nothing depends on. A plane something is
+    /// built on is refused by the name of what is built on it.
+    pub(crate) fn delete_construction_plane(&mut self, feature: FeatureId) {
+        if self.pending_operation.is_some() {
+            return;
+        }
+        let name = self
+            .document
+            .feature(feature)
+            .map_or_else(|| "The plane".to_owned(), |node| node.label.clone());
+        match self.document.remove_datum_plane(feature) {
+            Ok(_) => {
+                if self.selected_construction_plane == Some(feature.get()) {
+                    self.selected_construction_plane = None;
+                }
+                if self.selected_history_feature == Some(feature) {
+                    self.selected_history_feature = None;
+                }
+                self.stale_planes.remove(&feature);
+                self.history_scrub_position = self.document.history_position();
+                self.sync_construction_planes_from_document();
+                self.sync_feature_preview_from_document();
+                self.document_status = Some(format!("{name} deleted"));
+            }
+            Err(artificer_model::DocumentError::FeatureInUse { dependent, .. }) => {
+                let dependent = self
+                    .document
+                    .feature(dependent)
+                    .map_or_else(|| dependent.to_string(), |node| node.label.clone());
+                self.document_status = Some(format!(
+                    "{name} cannot be deleted: {dependent} is built on it. Delete or move that first."
+                ));
+            }
+            Err(error) => self.document_status = Some(format!("Delete rejected: {error}")),
+        }
+    }
+
+    /// The small box a feature is renamed in: Enter or Rename applies it,
+    /// Escape or Cancel leaves the name as it was.
+    pub(crate) fn show_feature_rename_box(&mut self, context: &egui::Context) {
+        let Some((feature, mut text)) = self.plane_rename.clone() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Rename")
+            .id(egui::Id::new("feature_rename_box"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .show(context, |ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut text)
+                        .desired_width(220.0)
+                        .hint_text("Name"),
+                );
+                field.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Feature name")
+                });
+                if !field.has_focus() && !field.lost_focus() {
+                    field.request_focus();
+                }
+                if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    apply = true;
+                }
+                ui.horizontal(|ui| {
+                    apply |= ui.button("Rename").clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if apply {
+            self.plane_rename = None;
+            self.apply_feature_rename(feature, &text);
+        } else if cancel {
+            self.plane_rename = None;
+        } else {
+            self.plane_rename = Some((feature, text));
         }
     }
 
@@ -15476,6 +17321,51 @@ impl KernelLabApp {
         self.timeline_context_menu = Some(menu);
     }
 
+    /// The solid a staged loft or revolve would build, with the body an add
+    /// or a cut draws it in place of, for the viewport to show.
+    ///
+    /// It takes the two editors rather than the app so the viewport can hold
+    /// the answer while it borrows the rest of the app mutably.
+    fn staged_solid_preview<'a>(
+        staged_loft: &'a Option<loft::StagedLoft>,
+        staged_revolve: &'a Option<revolve::StagedRevolve>,
+        staged_sweep: &'a Option<sweep::StagedSweep>,
+    ) -> Option<(
+        Option<BodyId>,
+        &'a OperationReport,
+        &'a artificer_kernel::DebugScene,
+    )> {
+        if let Some(staged) = staged_loft.as_ref() {
+            let preview = staged.preview.as_ref()?;
+            return Some((
+                staged
+                    .target
+                    .filter(|_| staged.operation != LoftOperation::New),
+                &preview.report,
+                &preview.scene,
+            ));
+        }
+        if let Some(staged) = staged_revolve.as_ref() {
+            let preview = staged.preview.as_ref()?;
+            return Some((
+                staged
+                    .target
+                    .filter(|_| staged.operation != artificer_protocol::SolidOperation::New),
+                &preview.report,
+                &preview.scene,
+            ));
+        }
+        let staged = staged_sweep.as_ref()?;
+        let preview = staged.preview.as_ref()?;
+        Some((
+            staged
+                .target
+                .filter(|_| staged.operation != artificer_protocol::SolidOperation::New),
+            &preview.report,
+            &preview.scene,
+        ))
+    }
+
     /// Whether this feature has a 3D editor to reopen.
     #[must_use]
     pub fn feature_has_an_editor(&self, feature: FeatureId) -> bool {
@@ -15484,8 +17374,15 @@ impl KernelLabApp {
             .iter()
             .find(|node| node.id == feature)
             .is_some_and(|node| {
-                matches!(node.action, ReplayAction::SketchRegionExtrusion(_))
-                    && !node.state.read_only
+                matches!(
+                    node.action,
+                    ReplayAction::SketchRegionExtrusion(_)
+                        | ReplayAction::DatumPlane(_)
+                        | ReplayAction::DatumAxis(_)
+                        | ReplayAction::SketchLoft(_)
+                        | ReplayAction::SketchRevolve(_)
+                        | ReplayAction::SketchSweep(_)
+                ) && !node.state.read_only
             })
     }
 
@@ -15583,6 +17480,32 @@ impl KernelLabApp {
     /// Puts the editor's own fields where the recipe says the feature stands.
     fn seed_extrusion_editor_from_recipe(&mut self, recipe: &SketchRegionExtrusion) {
         self.extrusion_distance = recipe.distance;
+        // A distance that follows variables reopens as the expression, so
+        // confirming the edit keeps the link rather than freezing a number.
+        self.extrusion_distance_link = recipe.distance_expression.as_ref().map(|expression| {
+            let names = self
+                .document
+                .parameters()
+                .records()
+                .iter()
+                .map(|record| (record.id, record.spec.key.clone()))
+                .collect::<BTreeMap<_, _>>();
+            DistanceLink {
+                text: format_parameter_binding(
+                    &ParameterBinding::Expression {
+                        expression: expression.clone(),
+                    },
+                    &|id| names.get(&id).cloned(),
+                ),
+                expression: expression.clone(),
+                value: recipe.distance,
+            }
+        });
+        self.extrusion_expression_draft = self
+            .extrusion_distance_link
+            .as_ref()
+            .map(|link| link.text.clone())
+            .unwrap_or_default();
         self.extrusion_draft_degrees = recipe.draft_degrees;
         self.extrusion_second_distance = recipe.second_distance;
         self.extrusion_symmetric = recipe
@@ -15616,6 +17539,23 @@ impl KernelLabApp {
                 }
             }
         });
+        for (side, plane) in [recipe.up_to_plane, recipe.second_up_to_plane]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(plane) = plane else {
+                continue;
+            };
+            if self
+                .construction_planes
+                .iter()
+                .any(|candidate| candidate.feature == plane)
+            {
+                self.extrusion_extents[side] = ExtrusionExtentIntent::ToPlane(plane);
+            } else {
+                lost_a_face = true;
+            }
+        }
         // The recipe's length is the last one measured, and the face may have
         // moved since without the recipe being rewritten: replay measures
         // again on every rebuild. Measuring again here is what makes the
@@ -15661,6 +17601,7 @@ impl KernelLabApp {
             mode: self.extrusion_mode,
             second_distance: self.extrusion_second_distance,
             up_to_faces: self.extrusion_extents.map(ExtrusionExtentIntent::face),
+            up_to_planes: self.extrusion_extents.map(ExtrusionExtentIntent::plane),
             boolean_target,
             editing_feature: Some(feature),
         });
@@ -15700,6 +17641,9 @@ impl KernelLabApp {
         let mut edited = original.clone();
         edited.distance = self.extrusion_distance;
         edited.draft_degrees = self.extrusion_draft_degrees;
+        edited.distance_expression = self
+            .live_distance_link(self.extrusion_distance)
+            .map(|link| link.expression.clone());
         edited.second_distance = self
             .extrusion_second_distance
             .filter(|_| self.sketch_support.target_face().is_none());
@@ -15712,6 +17656,9 @@ impl KernelLabApp {
         edited.second_up_to_face = faces[1]
             .clone()
             .filter(|_| edited.second_distance.is_some());
+        let planes = self.extrusion_extents.map(ExtrusionExtentIntent::plane);
+        edited.up_to_plane = planes[0];
+        edited.second_up_to_plane = planes[1].filter(|_| edited.second_distance.is_some());
         // The regions the canvas has picked are what the user just looked at.
         // An empty selection means the editor never re-resolved them, so the
         // recipe keeps the set it already had rather than losing its profile.
@@ -15719,17 +17666,50 @@ impl KernelLabApp {
         if !regions.is_empty() {
             edited.regions = regions;
         }
+        if edited.up_to_face.is_some() || edited.up_to_plane.is_some() {
+            // A side that ends at a face has no distance to follow.
+            edited.distance_expression = None;
+        }
         if let Err(error) = edited.validate() {
             self.document_status = Some(format!("That change is not a valid extrusion: {error}"));
             return;
         }
+        let parameter_inputs = edited
+            .parameter_references()
+            .into_iter()
+            .collect::<Vec<_>>();
 
         self.pending_operation = None;
         self.reset_extrusion_extents();
-        match self
+        // The planes a side ends at are inputs, so the input list follows
+        // the edit: a plane newly ended at joins it, one let go of leaves.
+        let inputs = self
             .document
-            .replace_feature_action(feature, ReplayAction::SketchRegionExtrusion(edited))
-        {
+            .feature(feature)
+            .map(|node| {
+                node.inputs
+                    .iter()
+                    .copied()
+                    .filter(|input| {
+                        !matches!(input, FeatureInput::Feature(id) if self.document.is_datum_plane(*id))
+                    })
+                    .chain(edited.end_planes().map(FeatureInput::Feature))
+                    .fold(Vec::new(), |mut inputs, input| {
+                        if !inputs.contains(&input) {
+                            inputs.push(input);
+                        }
+                        inputs
+                    })
+            })
+            .unwrap_or_default();
+        self.extrusion_distance_link = None;
+        self.extrusion_expression_draft.clear();
+        match self.document.replace_feature_recipe(
+            feature,
+            ReplayAction::SketchRegionExtrusion(edited),
+            inputs,
+            parameter_inputs,
+        ) {
             Ok(_) => {
                 self.move_history_cursor(self.document.features().len());
                 self.selected_history_feature = Some(feature);
@@ -15783,8 +17763,6 @@ impl KernelLabApp {
     /// floating inspector. Keeping them out also keeps the inspector short
     /// enough that its tail never scrolls out of reach.
     fn workspace_settings_cards(&mut self, ui: &mut egui::Ui) {
-        self.document_parameter_controls(ui);
-        ui.add_space(5.0);
         collapsible_card(ui, "navigation_scheme", "NAVIGATION", true, |ui| {
             self.navigation_card(ui);
         });
@@ -16776,6 +18754,18 @@ impl KernelLabApp {
                 );
             } else if let Some(reason) = parameter.read_only_reason {
                 ui.label(RichText::new(reason).small().color(theme::muted()));
+            } else if parameter.follows_variables {
+                // Said once, where the value is: this is not a copy.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Follows its variables and changes when they do · a plain number unlinks it",
+                        )
+                        .small()
+                        .color(theme::muted()),
+                    )
+                    .wrap(),
+                );
             }
         }
     }
@@ -17430,7 +19420,7 @@ impl KernelLabApp {
                 if !contextual {
                 collapsible_card(ui, "sketch_plane", "SKETCH PLANE", true, |ui| {
                     ui.label(
-                        RichText::new(self.sketch_support.label())
+                        RichText::new(self.support_label(&self.sketch_support))
                             .color(theme::accent())
                             .strong(),
                     );
@@ -17575,6 +19565,39 @@ impl KernelLabApp {
                         };
                         if response.clicked()
                             && let Ok(subject) = self.sketch.finish_polyline_draft()
+                        {
+                            self.commit_sketch_stroke(subject);
+                        }
+                    }
+
+                    if matches!(
+                        self.active_sketch_tool,
+                        ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline
+                    ) && !progress.awaiting_confirmation
+                    {
+                        let can_finish = self.sketch.spline_draft_can_finish();
+                        let response = ui.add_enabled(
+                            can_finish,
+                            egui::Button::new("Finish spline").corner_radius(5),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                can_finish,
+                                "Finish spline",
+                            )
+                        });
+                        let response = if can_finish {
+                            response.on_hover_text(
+                                "Stage the spline through the points placed so far; the green tick or Enter then commits it. Click the first point instead to close it into a loop.",
+                            )
+                        } else {
+                            response.on_disabled_hover_text(
+                                "Place at least two distinct points before finishing the spline.",
+                            )
+                        };
+                        if response.clicked()
+                            && let Ok(subject) = self.sketch.finish_spline_draft()
                         {
                             self.commit_sketch_stroke(subject);
                         }
@@ -17973,6 +19996,13 @@ impl KernelLabApp {
                             .color(theme::muted()),
                         );
                         ui.label(
+                            RichText::new(
+                                "Sized when it was inserted · insert it again from the library for another size",
+                            )
+                            .small()
+                            .color(theme::muted()),
+                        );
+                        ui.label(
                             RichText::new(format!("Variant {}…", &binding_digest[..12]))
                                 .small()
                                 .monospace()
@@ -18286,9 +20316,66 @@ impl KernelLabApp {
                     ui.add_space(5.0);
                 }
 
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StagePlane { .. }))
+                {
+                    card(ui, "construction_plane", "CONSTRUCTION PLANE", &mut |ui| {
+                        self.plane_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageAxis { .. }))
+                {
+                    card(ui, "construction_axis", "CONSTRUCTION AXIS", &mut |ui| {
+                        self.axis_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageLoft { .. }))
+                {
+                    card(ui, "loft", "LOFT", &mut |ui| {
+                        self.loft_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(
+                        self.pending_operation,
+                        Some(PendingOperation::StageRevolve { .. })
+                    )
+                {
+                    card(ui, "revolve", "REVOLVE", &mut |ui| {
+                        self.revolve_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if shows(ContextualSubject::PendingOperation)
+                    && matches!(self.pending_operation, Some(PendingOperation::StageSweep { .. }))
+                {
+                    card(ui, "sweep", "SWEEP", &mut |ui| {
+                        self.sweep_feature_controls(ui);
+                    });
+                    ui.add_space(5.0);
+                }
+
                 if (shows(ContextualSubject::PendingOperation)
                     || shows(ContextualSubject::Feature))
                     && (!self.sketch.entities().is_empty() || self.sketch_finished)
+                    && !matches!(
+                        self.pending_operation,
+                        Some(
+                            PendingOperation::StagePlane { .. }
+                                | PendingOperation::StageLoft { .. }
+                                | PendingOperation::StageRevolve { .. }
+                                | PendingOperation::StageSweep { .. }
+                        )
+                    )
                 {
                     card(ui, "sketch_feature", "SKETCH FEATURE", &mut |ui| {
                         self.extrusion_controls(ui);
@@ -18309,122 +20396,66 @@ impl KernelLabApp {
         if rounded == 0.0 { 0.0 } else { rounded }
     }
 
-    fn document_parameter_controls(&mut self, ui: &mut egui::Ui) {
-        let records = self.document.parameters().records().to_vec();
-        collapsible_card(ui, "document_parameters", "PARAMETERS", false, |ui| {
-            if records.is_empty() {
-                ui.label(
-                    RichText::new("No document parameters yet")
-                        .small()
-                        .color(theme::muted()),
-                );
-            }
-            for record in records {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(&record.spec.label).color(theme::text()));
-                        ui.label(
-                            RichText::new(&record.spec.key)
-                                .small()
-                                .monospace()
-                                .color(theme::muted()),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let staged = match self.pending_operation {
-                            Some(PendingOperation::SetParameterLiteral {
-                                parameter,
-                                value,
-                                ..
-                            }) if parameter == record.id => Some(value),
-                            _ => None,
-                        };
-                        match &record.binding {
-                            ParameterBinding::Literal { value } => {
-                                let Some(base) = ParameterLiteralDraft::from_value(value) else {
-                                    ui.label(RichText::new("choice").small().color(theme::muted()));
-                                    return;
-                                };
-                                let mut edited = staged.unwrap_or(base);
-                                let enabled = self.pending_operation.is_none() || staged.is_some();
-                                let changed = match &mut edited {
-                                    ParameterLiteralDraft::Quantity { magnitude, unit } => {
-                                        let suffix = match unit {
-                                            ParameterUnit::Micrometer => " µm",
-                                            ParameterUnit::Millimeter => " mm",
-                                            ParameterUnit::Centimeter => " cm",
-                                            ParameterUnit::Meter => " m",
-                                            ParameterUnit::Inch => " in",
-                                            ParameterUnit::Foot => " ft",
-                                            ParameterUnit::Radian => " rad",
-                                            ParameterUnit::Degree => "°",
-                                            ParameterUnit::Scalar => "",
-                                        };
-                                        ui.add_enabled(
-                                            enabled,
-                                            egui::DragValue::new(magnitude)
-                                                .speed(0.1)
-                                                .max_decimals(4)
-                                                .suffix(suffix),
-                                        )
-                                        .changed()
-                                    }
-                                    ParameterLiteralDraft::Integer(value) => ui
-                                        .add_enabled(enabled, egui::DragValue::new(value))
-                                        .changed(),
-                                    ParameterLiteralDraft::Boolean(value) => ui
-                                        .add_enabled(enabled, egui::Checkbox::without_text(value))
-                                        .changed(),
-                                };
-                                if changed {
-                                    self.pending_operation =
-                                        Some(PendingOperation::SetParameterLiteral {
-                                            parameter: record.id,
-                                            base,
-                                            value: edited,
-                                        });
-                                }
-                            }
-                            ParameterBinding::Expression { .. } => {
-                                ui.label(
-                                    RichText::new("expression").small().color(theme::accent()),
-                                );
-                            }
-                            ParameterBinding::Unresolved => {
-                                ui.label(RichText::new("required").small().color(theme::warn()));
-                            }
-                        }
-                    });
-                });
-                ui.separator();
-            }
-            let can_add = self.pending_operation.is_none() && self.history_is_at_end();
-            let add = ui.add_enabled(
-                can_add,
-                egui::Button::new("+ Length parameter")
-                    .min_size(egui::vec2(ui.available_width(), 28.0)),
-            );
-            if add.clicked() {
-                let mut ordinal = self.document.parameters().len() as u32 + 1;
-                while self
-                    .document
-                    .parameters()
-                    .get_by_key(&format!("UserLength{ordinal}"))
-                    .is_some()
-                {
-                    ordinal = ordinal.saturating_add(1);
+    /// Works every sketch that follows a variable out again after one
+    /// changed (ADR 0054), inside the variable's own undo step. A sketch
+    /// that cannot take the new value abandons the change, so the document
+    /// is left exactly as it was and the reason is the refusal.
+    fn follow_variables_in_sketches(&mut self) -> Result<(), String> {
+        let keep_connected = self.sketch.snap_settings().keep_points_connected;
+        match sketch_links::follow_variables(&mut self.document, keep_connected) {
+            Ok(followed) => {
+                if !followed.is_empty() {
+                    self.refresh_sketch_payloads_from_document();
                 }
-                self.pending_operation = Some(PendingOperation::AddUserLengthParameter {
-                    ordinal,
-                    value_mm: 10.0,
-                });
+                Ok(())
             }
-            ui.label(
-                RichText::new("Changes remain staged until Enter or the green tick")
-                    .small()
-                    .color(theme::good()),
-            );
-        });
+            Err(error) => {
+                self.document.abandon_last_edit();
+                self.restore_runtime_from_document();
+                Err(error)
+            }
+        }
+    }
+
+    /// Brings every sketch record's copy of its document payload, and the
+    /// regions drawn from it, up to date after the document changed them
+    /// without the canvas: a followed variable, a renamed one.
+    fn refresh_sketch_payloads_from_document(&mut self) {
+        for sketch in &mut self.sketches {
+            let Some(id) = sketch.id else {
+                continue;
+            };
+            let Some(payload) = self
+                .document
+                .sketch(id)
+                .and_then(|record| self.document.sketch_payload(id, record.geometry_revision))
+            else {
+                continue;
+            };
+            if sketch.portable_payload.as_ref() == Some(payload) {
+                continue;
+            }
+            sketch.portable_payload = Some(payload.clone());
+            sketch.overlay_regions = payload_overlay_regions(payload);
+        }
+    }
+
+    /// The canvas worked its own linked values out again because the
+    /// variables changed. Where it holds a sketch the document has already
+    /// followed, the two now agree and the sketch stays as finished as it
+    /// was; a sketch still being drawn has simply been edited.
+    fn canvas_followed_variables(&mut self) {
+        let document_agrees = self
+            .active_sketch_index
+            .and_then(|index| self.sketches.get(index))
+            .and_then(|record| record.portable_payload.as_ref())
+            .and_then(SketchPayload::authoring)
+            .is_some_and(|authoring| same_links_and_geometry(authoring, self.sketch.authoring()));
+        if document_agrees {
+            self.sync_active_sketch_record();
+        } else {
+            self.publish_committed_sketch_edit();
+        }
     }
 
     fn rebuild_after_parameter_change(&mut self) {
@@ -18542,6 +20573,12 @@ impl KernelLabApp {
                 } else {
                     "End this side at a typed distance."
                 });
+                // Asking for a distance ends the explanation of why a face
+                // was not to be had, whether or not the side was already at
+                // one: the note was about that ask, and this is a new one.
+                if response.clicked() && !wants_face {
+                    self.extrusion_extent_notes[side] = None;
+                }
                 if response.clicked() && to_face != wants_face {
                     if wants_face {
                         self.arm_extrusion_face_pick(side);
@@ -18552,6 +20589,9 @@ impl KernelLabApp {
                 }
             }
         });
+        if let Some(note) = &self.extrusion_extent_notes[side] {
+            ui.label(RichText::new(note.as_str()).small().color(theme::warn()));
+        }
         match self.extrusion_extents[side] {
             ExtrusionExtentIntent::Distance => {
                 changed |= self.extrusion_distance_field(ui, side, unit);
@@ -18559,16 +20599,29 @@ impl KernelLabApp {
             ExtrusionExtentIntent::PickingFace => {
                 changed |= self.extrusion_target_chooser(ui, side, unit);
             }
-            ExtrusionExtentIntent::ToFace(face) => {
+            extent @ (ExtrusionExtentIntent::ToFace(_) | ExtrusionExtentIntent::ToPlane(_)) => {
                 let distance = if side == 0 {
                     self.extrusion_distance.abs()
                 } else {
                     self.extrusion_second_distance.unwrap_or_default()
                 };
-                let ends_at = self.extrusion_extent_face_summary(face).map_or_else(
-                    || format!("Face #{}", face.entity),
-                    |summary| format!("Ends at {summary}"),
-                );
+                let ends_at = match extent {
+                    ExtrusionExtentIntent::ToFace(face) => {
+                        self.extrusion_extent_face_summary(face).map_or_else(
+                            || format!("Face #{}", face.entity),
+                            |summary| format!("Ends at {summary}"),
+                        )
+                    }
+                    ExtrusionExtentIntent::ToPlane(plane) => {
+                        self.document.feature(plane).map_or_else(
+                            || "Ends at a plane".to_owned(),
+                            |node| format!("Ends at {}", node.label),
+                        )
+                    }
+                    ExtrusionExtentIntent::Distance | ExtrusionExtentIntent::PickingFace => {
+                        String::new()
+                    }
+                };
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("{ends_at} · {}", unit.format(distance)))
@@ -18606,7 +20659,8 @@ impl KernelLabApp {
         unit: units::LengthUnit,
     ) -> bool {
         let targets = self.remembered_extrusion_targets(side);
-        if targets.is_empty() {
+        let planes = self.extrusion_plane_targets(side);
+        if targets.is_empty() && planes.is_empty() {
             ui.label(
                 RichText::new("Nothing on this side is parallel to the sketch plane")
                     .small()
@@ -18647,8 +20701,30 @@ impl KernelLabApp {
                 chosen = Some(target.face);
             }
         }
+        let mut chosen_plane = None;
+        for (plane, name, reach) in &planes {
+            let response = ui
+                .add(
+                    egui::Button::new(
+                        RichText::new(format!("{} · {name}", unit.format(*reach))).small(),
+                    )
+                    .wrap()
+                    .corner_radius(3),
+                )
+                .on_hover_text(format!(
+                    "Sweeps {} to construction plane {name}; the length follows the plane when it moves",
+                    unit.format(*reach)
+                ));
+            if response.clicked() {
+                chosen_plane = Some(*plane);
+            }
+        }
         if let Some(face) = chosen {
             self.adopt_extrusion_extent_face(face);
+            return true;
+        }
+        if let Some(plane) = chosen_plane {
+            self.adopt_extrusion_extent_plane(side, plane);
             return true;
         }
         false
@@ -18721,6 +20797,93 @@ impl KernelLabApp {
         }
     }
 
+    /// The plane editor's typed half (ADR 0048): what the plane is built
+    /// from, its offset, its angle when it turns about an edge, and which way
+    /// it faces. The arrow and the arc drive the same values.
+    fn plane_controls(&mut self, ui: &mut egui::Ui) {
+        let Some(staged) = self.staged_plane.clone() else {
+            return;
+        };
+        let editing = matches!(
+            self.pending_operation,
+            Some(PendingOperation::StagePlane { editing: Some(_) })
+        );
+        status_line(
+            ui,
+            if editing {
+                "EDITING PLANE"
+            } else {
+                "PLANE PREVIEW"
+            },
+            theme::warn(),
+        );
+        ui.label(
+            RichText::new(format!(
+                "{} · {}",
+                self.staged_plane_label(),
+                staged.describe()
+            ))
+            .small()
+            .color(theme::muted()),
+        );
+        let unit = self.length_unit();
+        let mut offset = staged.offset;
+        let response = ui
+            .add(
+                unit.drag_value(&mut offset)
+                    .speed(0.1)
+                    .range(
+                        -artificer_model::datum::MAX_DATUM_OFFSET
+                            ..=artificer_model::datum::MAX_DATUM_OFFSET,
+                    )
+                    .prefix("Offset "),
+            )
+            .on_hover_text(
+                "How far the plane stands from what it is built on, along that surface's normal. Drag the arrow in the viewport, or type a length.",
+            );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "Plane offset")
+        });
+        if response.changed() {
+            self.set_staged_plane_offset(offset);
+        }
+        if staged.takes_an_angle() {
+            let mut angle = staged.angle_degrees;
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut angle)
+                        .speed(0.5)
+                        .range(-180.0..=180.0)
+                        .max_decimals(2)
+                        .prefix("Angle ")
+                        .suffix("°"),
+                )
+                .on_hover_text(
+                    "How far the plane turns about the edge, from the face it starts on. Positive lifts it off the face. Drag the arc in the viewport, or type an angle.",
+                );
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::DragValue, true, "Plane angle")
+            });
+            if response.changed() {
+                self.set_staged_plane_angle(angle);
+            }
+        }
+        let mut flip = staged.flip;
+        let response = ui
+            .checkbox(&mut flip, "Flip normal")
+            .on_hover_text(
+                "Face the other way. The plane stays where it is; what is sketched on it looks at it from the other side.",
+            );
+        if response.changed() {
+            self.set_staged_plane_flip(flip);
+        }
+        ui.label(
+            RichText::new("Enter or the tick confirms · Escape abandons")
+                .small()
+                .color(theme::muted()),
+        );
+    }
+
     fn extrusion_controls(&mut self, ui: &mut egui::Ui) {
         let profile = self.sketch.certified_profile_status();
         let eligibility = self.sketch_extrusion_eligibility();
@@ -18758,7 +20921,7 @@ impl KernelLabApp {
         ui.label(
             RichText::new(format!(
                 "{} · revision {}",
-                self.sketch_support.label(),
+                self.support_label(&self.sketch_support),
                 self.sketch_revision
             ))
             .small()
@@ -18834,7 +20997,8 @@ impl KernelLabApp {
             }
             // The same field, written as arithmetic over document variables:
             // `depth`, `plate_width / 2`. Evaluated on Enter into the drag
-            // value above, so what commits is always a plain number.
+            // value above; an entry that names variables stays linked to
+            // them, so the extrusion follows when they change.
             let expression = ui.add(
                 egui::TextEdit::singleline(&mut self.extrusion_expression_draft)
                     .desired_width(ui.available_width().min(190.0))
@@ -18847,6 +21011,15 @@ impl KernelLabApp {
                     "Extrusion distance expression",
                 )
             });
+            if let Some(follows) = self.extrusion_distance_follows() {
+                ui.label(
+                    RichText::new(format!(
+                        "Follows {follows} · changing the variable rebuilds this extrusion"
+                    ))
+                    .small()
+                    .color(theme::accent()),
+                );
+            }
             if expression.lost_focus() && !self.extrusion_expression_draft.trim().is_empty() {
                 match self
                     .sketch
@@ -18854,6 +21027,8 @@ impl KernelLabApp {
                 {
                     Some(value) if (-1_000.0..=1_000.0).contains(&value) => {
                         self.extrusion_distance = value;
+                        self.extrusion_distance_link =
+                            self.distance_link_for(&self.extrusion_expression_draft, value);
                         intent_changed = true;
                     }
                     Some(value) => {
@@ -19658,13 +21833,13 @@ impl KernelLabApp {
             ui,
             "sketch_canvas_breadcrumb",
             title_rect,
-            &format!("Sketch · {}", self.sketch_support.label()),
+            &format!("Sketch · {}", self.support_label(&self.sketch_support)),
             theme::accent(),
         );
         let accessible_plane = if self.sketch_is_face_supported() {
             format!(
                 "{} · face-aligned orthographic sketch",
-                self.sketch_support.label()
+                self.support_label(&self.sketch_support)
             )
         } else {
             format!(
@@ -20056,7 +22231,17 @@ impl KernelLabApp {
             sketch_overlays.push(overlay);
         }
         sketch_overlays.extend(self.visible_reference_plane_overlays());
-        let selected_sketch_regions = self.selected_sketch_region_selections();
+        sketch_overlays.extend(self.construction_axis_overlays());
+        // While a loft is staged, its sections are what is picked.
+        let selected_sketch_regions = if self.loft_pick_active() {
+            self.loft_region_selections()
+        } else if self.revolve_pick_active() {
+            self.revolve_region_selections()
+        } else if self.sweep_pick_active() {
+            self.sweep_region_selections()
+        } else {
+            self.selected_sketch_region_selections()
+        };
         let reference_plane_bounds = self.visible_reference_plane_bounds();
         let active_body = self
             .active_body_id()
@@ -20084,13 +22269,35 @@ impl KernelLabApp {
             .show(ui, |ui| {
                 ui.set_min_size(viewport_size);
                 ui.set_max_size(viewport_size);
-                let body_instances = self
+                // A staged loft is drawn as what confirming would build: in
+                // place of the body an add or a cut changes, or beside the
+                // bodies as a new one.
+                let loft_preview = Self::staged_solid_preview(
+                    &self.staged_loft,
+                    &self.staged_revolve,
+                    &self.staged_sweep,
+                );
+                let mut body_instances = self
                     .bodies
                     .iter()
                     .filter(|body| body.visible)
                     .filter_map(|body| {
                         let source_bounds = body.body.report.bounds?;
                         let body_key = viewport::BodyInstanceKey::new(body.id.get());
+                        if let Some((Some(target), report, scene)) = loft_preview
+                            && target == body.id
+                        {
+                            let bounds = report.bounds.unwrap_or(source_bounds);
+                            return Some(
+                                viewport::DocumentBodyInstance::new(
+                                    body_key,
+                                    scene,
+                                    Some(bounds),
+                                    bounds_center(source_bounds),
+                                )
+                                .with_base_transform(self.occurrence_transform_for_body(body.id)),
+                            );
+                        }
                         // A cut candidate is a privately evaluated body shown
                         // in place of the committed one, and its faces belong
                         // to a snapshot nothing outside the preview holds. A
@@ -20155,6 +22362,19 @@ impl KernelLabApp {
                         )
                     })
                     .collect::<Vec<_>>();
+                if let Some((None, report, scene)) = loft_preview
+                    && let Some(bounds) = report.bounds
+                {
+                    body_instances.push(
+                        viewport::DocumentBodyInstance::new(
+                            viewport::BodyInstanceKey::new(loft::LOFT_PREVIEW_BODY_KEY),
+                            scene,
+                            Some(bounds),
+                            bounds_center(bounds),
+                        )
+                        .with_tint(Some(loft::LOFT_PREVIEW_TINT)),
+                    );
+                }
                 // A finished sketch is content even when no body exists yet:
                 // the placeholder must not replace the viewport while there is
                 // still something to look at.
@@ -20251,6 +22471,15 @@ impl KernelLabApp {
                         self.sync_pending_sketch_extrusion_inputs();
                         self.sketch_extrusion_issue = None;
                     }
+                    match output.datum_drag {
+                        Some(viewport::DatumHandleDrag::Offset { offset, .. }) => {
+                            self.set_staged_plane_offset(offset);
+                        }
+                        Some(viewport::DatumHandleDrag::Angle { angle_degrees, .. }) => {
+                            self.set_staged_plane_angle(angle_degrees);
+                        }
+                        None => {}
+                    }
                     if let Some(delta) = output.edge_finish_distance_delta {
                         self.edge_finish_distance =
                             (self.edge_finish_distance + delta).clamp(0.001, 10_000.0);
@@ -20290,6 +22519,42 @@ impl KernelLabApp {
                             let additive = ui.input(|input| input.modifiers.shift);
                             self.select_model_edge(edge, additive);
                             self.apply_tangent_edge_chain();
+                        }
+                    } else if self.loft_pick_active() {
+                        // The loft editor owns clicks on sketch regions: each
+                        // one is a section, in the order they are clicked.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_loft_region(region.sketch_index, region.anchor, additive);
+                        }
+                    } else if self.revolve_axis_pick_armed() {
+                        // Picking the axis: a line of the sketch or a
+                        // construction axis, else a straight model edge.
+                        if let Some(line) = output.selected_line {
+                            self.pick_revolve_axis_line(line);
+                        } else if let Some(edge) = output.selected_edge {
+                            self.pick_revolve_axis_edge(edge);
+                        } else if output.selected_face.is_some()
+                            || output.selected_sketch_region.is_some()
+                        {
+                            self.document_status = Some(
+                                "A revolve turns about a line · click a sketch line, a construction axis or a straight edge".into(),
+                            );
+                        }
+                    } else if self.revolve_pick_active() {
+                        // The revolve editor owns clicks on sketch regions:
+                        // each one is its profile.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_revolve_region(region.sketch_index, region.anchor, additive);
+                        }
+                    } else if self.sweep_pick_active() {
+                        // The sweep editor owns clicks on sketch regions:
+                        // each one is its profile. Its path is chosen on
+                        // the card.
+                        if let Some(region) = output.selected_sketch_region {
+                            let additive = ui.input(|input| input.modifiers.shift);
+                            self.pick_sweep_region(region.sketch_index, region.anchor, additive);
                         }
                     } else if self.extrusion_face_pick_armed() {
                         // A side waiting for its face owns the next click on
@@ -20976,7 +23241,10 @@ impl KernelLabApp {
             let selected_model_entry = entries.iter().rposition(|entry| {
                 !matches!(
                     entry.kind,
-                    FeaturePreviewKind::Origin | FeaturePreviewKind::Sketch
+                    FeaturePreviewKind::Origin
+                        | FeaturePreviewKind::Sketch
+                        | FeaturePreviewKind::Plane
+                        | FeaturePreviewKind::Axis
                 )
             });
             let mut requested_mode = None;
@@ -21046,7 +23314,19 @@ impl KernelLabApp {
                                     &accessible_label,
                                 )
                             });
-                            let response = if sketch_entry {
+                            let response = if entry.kind == FeaturePreviewKind::Plane {
+                                response.on_hover_text(if entry.label().ends_with(" · held") {
+                                    "Construction plane · what it was built on no longer resolves, so it stands where it last was. Right-click to edit it."
+                                } else {
+                                    "Construction plane · right-click to edit, rename, suppress or delete it"
+                                })
+                            } else if entry.kind == FeaturePreviewKind::Axis {
+                                response.on_hover_text(if entry.label().ends_with(" · held") {
+                                    "Construction axis · what it was built on no longer resolves, so it stands where it last was. Right-click to edit it."
+                                } else {
+                                    "Construction axis · a revolve can turn about it · right-click to edit, rename or delete it"
+                                })
+                            } else if sketch_entry {
                                 response.on_hover_text(if !active_sketch_support_current {
                                     "Historical face sketch; replay-safe, but direct geometry editing is not enabled yet."
                                 } else if entry.finished {
@@ -21132,6 +23412,11 @@ impl KernelLabApp {
             }
             if let Some(feature) = selected_feature {
                 self.selected_history_feature = Some(feature);
+                // A plane's chip picks the plane itself, so the viewport shows
+                // which card it is and Sketch opens on it.
+                if self.document.is_datum_plane(feature) {
+                    self.selected_construction_plane = Some(feature.get());
+                }
                 self.show_properties_tab();
             }
             match requested_mode {
@@ -21166,17 +23451,19 @@ impl eframe::App for KernelLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.sketch_dimension_keys = DimensionKeyClaims::default();
         // Dimension and recipe fields accept document variables by name, so
-        // the canvas carries the current evaluated table, with lengths in the
-        // document unit so that `plate_width / 2` means what `40 / 2` does.
+        // the canvas carries the current evaluated table, canonical and
+        // knowing what each value measures.
         let unit = self.length_unit();
         self.sketch.set_length_unit(unit);
         self.part_library.set_length_unit(unit);
         let named_values = if self.document.parameters().is_empty() {
             BTreeMap::new()
         } else {
-            self.evaluated_variable_values(unit)
+            self.evaluated_variable_values()
         };
-        self.sketch.set_named_values(named_values);
+        if self.sketch.set_named_values(named_values) {
+            self.canvas_followed_variables();
+        }
         let operation_at_frame_start = self.pending_operation;
         if let Some(focused) = ui.ctx().memory(|memory| memory.focused()) {
             self.last_focused_editor = Some(focused);
@@ -21398,6 +23685,7 @@ impl eframe::App for KernelLabApp {
         self.show_model_context_menu(ui.ctx());
         self.show_browser_context_menu(ui.ctx());
         self.show_timeline_context_menu(ui.ctx());
+        self.show_feature_rename_box(ui.ctx());
         self.edge_finish_editor(ui.ctx());
         self.document_properties_window(ui.ctx());
         self.export_window(ui.ctx());
@@ -21413,6 +23701,10 @@ impl eframe::App for KernelLabApp {
         {
             self.pending_operation = Some(PendingOperation::LibraryInsertion { staging_id });
         }
+        if self.part_library.take_save_request() {
+            self.open_save_part_dialog();
+        }
+        self.save_part_window(ui.ctx());
 
         match confirmation_action {
             Some(ConfirmationAction::FinishSketch) => {
@@ -21422,6 +23714,13 @@ impl eframe::App for KernelLabApp {
                 self.enter_model_mode();
             }
             _ => {}
+        }
+        // With nothing pending, a bare Escape drops a tool that is waiting
+        // for operands. The selection is left exactly as it was: the tool
+        // never owned it (ADR 0041).
+        if cancel_pending && operation_at_frame_start.is_none() && self.disarm_tool() {
+            self.armed_resume = None;
+            self.document_status = Some("Tool disarmed · the selection is kept".to_owned());
         }
         cancel_pending = (cancel_pending
             && operation_at_frame_start.is_some()
@@ -21931,6 +24230,15 @@ fn view_cube_orbit_ring(
     } else {
         y_axis.coordinates[1].atan2(x_axis.coordinates[1])
     };
+    // Edge-on, the ring is a line through the cube and says nothing; it
+    // fades in as world Z turns toward the viewer and the ellipse opens.
+    let facing = view
+        .project_direction(Vector3::new(0.0, 0.0, 1.0))
+        .depth
+        .abs() as f32;
+    let visibility = ((facing - VIEW_CUBE_RING_EDGE_ON_FACING)
+        / (VIEW_CUBE_RING_FULL_FACING - VIEW_CUBE_RING_EDGE_ON_FACING))
+        .clamp(0.0, 1.0);
     let mut side_arrows = [-1.0_f64, 1.0].map(|sign| {
         let azimuth = nearest_azimuth + sign * VIEW_CUBE_SIDE_ARROW_AZIMUTH;
         let point = ring_point(azimuth, VIEW_CUBE_SIDE_ARROW_RADIUS);
@@ -21951,20 +24259,27 @@ fn view_cube_orbit_ring(
         } else {
             direction.normalized()
         };
+        // What the arrow says is "turn that way", which is a screen-horizontal
+        // intention whatever the ring is doing. Edge-on, the tangent already
+        // is horizontal. As the ring opens into a circle the tangent at ±θ
+        // from the nearest point tilts by θ, and read literally it sends the
+        // camera up a slope that is not there — from straight above, the
+        // arrows leaned thirty degrees. So the tangent is leaned back toward
+        // horizontal as the ring opens, by the ring's own openness, and the
+        // ring itself is left to show the travel.
+        let toward = (position.x - cube_center.x).signum();
+        let horizontal = egui::vec2(if toward == 0.0 { sign as f32 } else { toward }, 0.0);
+        let leaned = direction * (1.0 - visibility) + horizontal * visibility;
+        let direction = if leaned.length_sq() < 1.0e-4 {
+            horizontal
+        } else {
+            leaned.normalized()
+        };
         (position, direction)
     });
     if side_arrows[0].0.x > side_arrows[1].0.x {
         side_arrows.swap(0, 1);
     }
-    // Edge-on, the ring is a line through the cube and says nothing; it
-    // fades in as world Z turns toward the viewer and the ellipse opens.
-    let facing = view
-        .project_direction(Vector3::new(0.0, 0.0, 1.0))
-        .depth
-        .abs() as f32;
-    let visibility = ((facing - VIEW_CUBE_RING_EDGE_ON_FACING)
-        / (VIEW_CUBE_RING_FULL_FACING - VIEW_CUBE_RING_EDGE_ON_FACING))
-        .clamp(0.0, 1.0);
     ViewCubeOrbitRing {
         near,
         far,
@@ -22434,40 +24749,6 @@ fn translucent(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
-fn default_catalog_root() -> PathBuf {
-    if let Some(root) = std::env::var_os("ARTIFICER_CATALOG_DIR").filter(|value| !value.is_empty())
-    {
-        return PathBuf::from(root);
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("Artificer")
-            .join("catalog");
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(local_data) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-        return PathBuf::from(local_data).join("Artificer").join("catalog");
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty())
-        {
-            return PathBuf::from(data_home).join("artificer").join("catalog");
-        }
-        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-            return PathBuf::from(home)
-                .join(".local")
-                .join("share")
-                .join("artificer")
-                .join("catalog");
-        }
-    }
-    std::env::temp_dir().join("artificer-catalog")
-}
-
 /// The theme choice and edited palettes live beside the catalog, in the
 /// per-user Artificer data directory.
 /// One sketch's exact authored curves in its own plane, ready for the DXF
@@ -22543,6 +24824,18 @@ fn sketch_export_curves_from_entities(entities: &[SketchEntity]) -> Vec<export::
     let mut curves = Vec::new();
     for entity in entities {
         match entity.geometry {
+            // Presentation entities keep only a spline's drawn outline, so
+            // the outline is what this fallback can write.
+            SketchGeometry::Spline { .. } => {
+                if let Some(outline) = entity.geometry.display_polyline() {
+                    for [start, end] in outline.segments() {
+                        curves.push(export::SketchExportCurve::Line {
+                            start: [start.u, start.v],
+                            end: [end.u, end.v],
+                        });
+                    }
+                }
+            }
             SketchGeometry::Segment { start, end } => {
                 curves.push(export::SketchExportCurve::Line {
                     start: [start.u, start.v],
@@ -22592,26 +24885,20 @@ fn sketch_export_curves_from_entities(entities: &[SketchEntity]) -> Vec<export::
     curves
 }
 
-fn theme_preferences_path() -> PathBuf {
+fn theme_preferences_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("ARTIFICER_THEME_PATH").filter(|value| !value.is_empty()) {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    default_catalog_root()
-        .parent()
-        .map_or_else(default_catalog_root, Path::to_path_buf)
-        .join("theme.json")
+    user_data::data_directory().map(|data| data.join("theme.json"))
 }
 
-fn user_preferences_path() -> PathBuf {
+fn user_preferences_path() -> Option<PathBuf> {
     if let Some(path) =
         std::env::var_os("ARTIFICER_PREFERENCES_PATH").filter(|value| !value.is_empty())
     {
-        return PathBuf::from(path);
+        return Some(PathBuf::from(path));
     }
-    default_catalog_root()
-        .parent()
-        .map_or_else(default_catalog_root, Path::to_path_buf)
-        .join("preferences.json")
+    user_data::data_directory().map(|data| data.join("preferences.json"))
 }
 
 /// Where an export should land when the user has not said otherwise.
@@ -22640,10 +24927,11 @@ fn default_document_path() -> PathBuf {
     {
         return PathBuf::from(path);
     }
-    let catalog = default_catalog_root();
-    catalog
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
+    // With no per-user folder, the working folder: the workspace is then at
+    // least somewhere a person can see, rather than somewhere the system
+    // empties.
+    user_data::data_directory()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("current.artificer")
 }
 
@@ -23327,6 +25615,17 @@ fn points_coincide(left: Point3, right: Point3) -> bool {
 ///
 /// A payload with no authoring graph is a legacy one whose profile *is* its
 /// geometry, so it never takes this route.
+/// Whether two sketches say the same thing, whatever edits brought each
+/// there: the canvas and the document follow a variable separately, so the
+/// revisions they count differ even where the sketches agree.
+fn same_links_and_geometry(first: &SketchDefinition, second: &SketchDefinition) -> bool {
+    first.operations() == second.operations()
+        && first.points() == second.points()
+        && first.entities() == second.entities()
+        && first.constraints() == second.constraints()
+        && first.value_links() == second.value_links()
+}
+
 fn same_authored_sketch(committed: &SketchPayload, candidate: &SketchPayload) -> bool {
     committed.frame == candidate.frame
         && committed.support == candidate.support
@@ -23399,7 +25698,7 @@ fn compile_single_authoring_region(authoring: &SketchDefinition) -> Option<Plana
     .map(|compiled| compiled.profile)
 }
 
-fn authoring_region_signatures_for_profile(
+pub(crate) fn authoring_region_signatures_for_profile(
     authoring: &SketchDefinition,
     profile: &PlanarProfile2,
 ) -> Option<Vec<RegionSignature>> {
@@ -23680,6 +25979,27 @@ impl invocation::InvocationContext for KernelLabApp {
             .is_some_and(|body| {
                 NativeKernel::planar_face_support(&body.body.snapshot, face.face).is_ok()
             })
+    }
+}
+
+/// A catalog failure as the status line says it. The store's own messages
+/// name packages by their content address, which is what a developer
+/// debugging the store needs and a sixty-four character hash is not what
+/// anyone else can act on.
+fn plain_catalog_error(error: &artificer_catalog::CatalogError) -> String {
+    use artificer_catalog::CatalogError;
+    match error {
+        CatalogError::RevisionConflict {
+            definition,
+            revision,
+            ..
+        } => format!(
+            "the library folder already holds a different copy of {definition} revision {revision}"
+        ),
+        CatalogError::DigestMismatch { .. } | CatalogError::ObjectNotFound(_) => {
+            "a part in the library folder is damaged or missing".to_owned()
+        }
+        other => other.to_string(),
     }
 }
 
@@ -24604,6 +26924,188 @@ fn centered_plane_frame(support: &PlanarFaceSupport) -> Result<(PlanarFrame3, f6
     Ok((PlanarFrame3::new(origin, u, v), half_u, half_v))
 }
 
+/// The document origin plane a sketch plane names.
+const fn origin_plane_for_sketch_plane(plane: SketchPlane) -> artificer_model::OriginPlane {
+    match plane {
+        SketchPlane::XY => artificer_model::OriginPlane::Xy,
+        SketchPlane::YZ => artificer_model::OriginPlane::Yz,
+        SketchPlane::XZ => artificer_model::OriginPlane::Xz,
+    }
+}
+
+/// The planar faces an edge bounds, in the order the display scene names
+/// them.
+fn planar_faces_beside_edge(body: &DisplayedBody, edge: EntityRef) -> Vec<EntityRef> {
+    let mut faces = Vec::new();
+    for candidate in body
+        .scene
+        .edges
+        .iter()
+        .filter(|candidate| candidate.source_edge == edge)
+    {
+        for face in candidate.incident_faces.into_iter().flatten() {
+            if !faces.contains(&face)
+                && NativeKernel::planar_face_support(&body.snapshot, face).is_ok()
+            {
+                faces.push(face);
+            }
+        }
+    }
+    faces
+}
+
+/// A planar face as a construction plane sees it: the face's frame with its
+/// outward normal, centred on the face and sized to it.
+fn datum_face_geometry(
+    snapshot: &Snapshot,
+    face: EntityRef,
+) -> Result<DatumFaceGeometry, DatumPlaneError> {
+    let support = NativeKernel::planar_face_support(snapshot, face)
+        .map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    let (frame, half_u, half_v) =
+        centered_plane_frame(&support).map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    Ok(DatumFaceGeometry {
+        frame,
+        half_extent: [half_u, half_v],
+    })
+}
+
+/// A straight edge and the planar face it is turned from, with the direction
+/// from the edge into that face. The kernel answers it, so a script's plane
+/// through an edge and the workbench's are the same plane.
+fn datum_edge_geometry(
+    snapshot: &Snapshot,
+    edge: EntityRef,
+    face: EntityRef,
+) -> Result<DatumEdgeGeometry, DatumPlaneError> {
+    let ends = NativeKernel::straight_edge_ends(snapshot, edge)
+        .map_err(|_| DatumPlaneError::EdgeMissing)?
+        .ok_or(DatumPlaneError::EdgeNotStraight)?;
+    NativeKernel::planar_face_support(snapshot, face)
+        .map_err(|_| DatumPlaneError::FaceNotPlanar)?;
+    let placed = NativeKernel::straight_edge_on_planar_face(snapshot, edge, face)
+        .map_err(|_| DatumPlaneError::EdgeNotOnFace)?;
+    debug_assert_eq!([placed.start, placed.end], ends);
+    Ok(DatumEdgeGeometry {
+        start: placed.start,
+        end: placed.end,
+        face_normal: placed.face_normal,
+        into_face: placed.into_face,
+    })
+}
+
+/// Resolves plane recipes against a rebuild's reports and bodies.
+///
+/// A persistent reference names one producing feature, whose faces live in
+/// one body, so at most one of the searched snapshots can answer; the search
+/// is for which body holds the answer, never for a face that will do instead.
+struct ModelPlaneResolver<'a> {
+    document: &'a ModelDocument,
+    ordered: Vec<FeatureOperationReport<'a>>,
+    snapshots: Vec<&'a Snapshot>,
+    planes: &'a BTreeMap<FeatureId, ResolvedDatumPlane>,
+}
+
+impl<'a> ModelPlaneResolver<'a> {
+    fn new(
+        document: &'a ModelDocument,
+        reports: &'a [(FeatureId, OperationReport)],
+        snapshots: impl IntoIterator<Item = &'a Snapshot>,
+        planes: &'a BTreeMap<FeatureId, ResolvedDatumPlane>,
+    ) -> Self {
+        let ordered = document
+            .features()
+            .iter()
+            .filter_map(|node| {
+                reports
+                    .iter()
+                    .find(|(feature, _)| *feature == node.id)
+                    .map(|(feature, report)| FeatureOperationReport::new(*feature, report))
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        let snapshots = snapshots
+            .into_iter()
+            .filter(|snapshot| seen.insert(snapshot.id()))
+            .collect();
+        Self {
+            document,
+            ordered,
+            snapshots,
+            planes,
+        }
+    }
+
+    fn find(
+        &self,
+        reference: &PersistentRef,
+        within: Option<SnapshotId>,
+    ) -> Result<(EntityRef, &'a Snapshot), PersistentMissingOrAmbiguous> {
+        let mut ambiguous = false;
+        for snapshot in &self.snapshots {
+            if within.is_some_and(|within| within != snapshot.id()) {
+                continue;
+            }
+            match resolve_persistent_ref(reference, &self.ordered, snapshot.id()) {
+                PersistentResolution::Resolved(entity) => return Ok((entity, *snapshot)),
+                PersistentResolution::Ambiguous(_) => ambiguous = true,
+                PersistentResolution::Missing(_) => {}
+            }
+        }
+        Err(if ambiguous {
+            PersistentMissingOrAmbiguous::Ambiguous
+        } else {
+            PersistentMissingOrAmbiguous::Missing
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistentMissingOrAmbiguous {
+    Missing,
+    Ambiguous,
+}
+
+impl DatumPlaneResolver for ModelPlaneResolver<'_> {
+    fn face(&self, face: &DatumFaceRef) -> Result<DatumFaceGeometry, DatumPlaneError> {
+        let (entity, snapshot) = self.find(&face.face, None).map_err(|reason| match reason {
+            PersistentMissingOrAmbiguous::Missing => DatumPlaneError::FaceMissing,
+            PersistentMissingOrAmbiguous::Ambiguous => DatumPlaneError::FaceAmbiguous,
+        })?;
+        datum_face_geometry(snapshot, entity)
+    }
+
+    fn edge(
+        &self,
+        _body: BodyId,
+        edge: &PersistentRef,
+        face: &PersistentRef,
+    ) -> Result<DatumEdgeGeometry, DatumPlaneError> {
+        let (edge, snapshot) = self
+            .find(edge, None)
+            .map_err(|_| DatumPlaneError::EdgeMissing)?;
+        let (face, _) = self
+            .find(face, Some(snapshot.id()))
+            .map_err(|reason| match reason {
+                PersistentMissingOrAmbiguous::Missing => DatumPlaneError::FaceMissing,
+                PersistentMissingOrAmbiguous::Ambiguous => DatumPlaneError::FaceAmbiguous,
+            })?;
+        datum_edge_geometry(snapshot, edge, face)
+    }
+
+    fn plane(&self, plane: FeatureId) -> Result<ResolvedDatumPlane, DatumPlaneError> {
+        self.planes
+            .get(&plane)
+            .copied()
+            .or_else(|| {
+                self.document
+                    .datum_plane(plane)
+                    .map(DatumPlaneRecipe::cached)
+            })
+            .ok_or(DatumPlaneError::UnknownPlane(plane))
+    }
+}
+
 fn reference_plane_corners(frame: PlanarFrame3, half_u: f64, half_v: f64) -> [Point3; 4] {
     [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(su, sv)| {
         Point3::new(
@@ -24647,7 +27149,7 @@ fn bounds_for_points(points: &[Point3]) -> Option<Aabb3> {
     Some(Aabb3::new(min, max))
 }
 
-fn validate_construction_planes(planes: &[ConstructionPlane]) -> Result<(), String> {
+fn validate_construction_planes(planes: &[LegacyConstructionPlane]) -> Result<(), String> {
     let mut ids = BTreeSet::new();
     for plane in planes {
         if plane.id == 0 || !ids.insert(plane.id) {
@@ -25218,18 +27720,27 @@ mod view_cube_ring_tests {
             left.0.x < center().x && right.0.x > center().x,
             "{left:?} {right:?}"
         );
-        for (position, direction) in [left, right] {
+        for (position, _) in [left, right] {
             let offset = position - center();
             assert!(
                 offset.length() > radius && offset.length() < radius + 12.0,
                 "the arrows sit just outside the ring: {offset:?}"
             );
-            let radial = offset.normalized();
-            assert!(
-                radial.dot(direction).abs() < 0.05,
-                "the arrows run along the ring"
-            );
         }
+        // The ring is open, so its tangent at the arrows leans; the arrows
+        // do not follow it. "Turn left" is a horizontal intention from any
+        // angle, and from straight above a tilted arrow only reads as a
+        // mistake.
+        assert!(
+            left.1.x < -0.99 && left.1.y.abs() < 0.05,
+            "left points left: {:?}",
+            left.1
+        );
+        assert!(
+            right.1.x > 0.99 && right.1.y.abs() < 0.05,
+            "right points right: {:?}",
+            right.1
+        );
     }
 
     #[test]
@@ -25370,6 +27881,32 @@ mod extrusion_workbench_tests {
 
     use super::*;
 
+    /// A tube about the world Z axis — radius 1 to 2 and 3 tall — revolved
+    /// from a rectangle on the XZ plane about that sketch's vertical axis:
+    /// the second body several tests need, made the way a person makes one
+    /// (ADR 0055).
+    fn revolve_a_tube(app: &mut KernelLabApp) {
+        app.open_origin_plane_sketch(SketchPlane::XZ);
+        let rectangle = app
+            .sketch
+            .stage_geometry(SketchGeometry::Rectangle {
+                first: SketchPoint::new(1.0, 0.0),
+                opposite: SketchPoint::new(2.0, 3.0),
+            })
+            .expect("the section stages");
+        app.commit_sketch_stroke(rectangle);
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        app.set_revolve_axis(artificer_model::RevolveAxis::SketchAxis {
+            axis: artificer_model::SketchAxisDirection::V,
+        });
+        assert!(
+            app.staged_revolve_has_preview(),
+            "{:?}",
+            app.staged_revolve_issue()
+        );
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+    }
+
     fn point(u: f64, v: f64) -> SketchPoint {
         SketchPoint::new(u, v)
     }
@@ -25468,10 +28005,11 @@ mod extrusion_workbench_tests {
         app.stage_construction_plane();
         assert!(matches!(
             app.pending_operation,
-            Some(PendingOperation::CreateConstructionPlane {
-                source: ConstructionPlaneSource::OnFace { .. },
-                ..
-            })
+            Some(PendingOperation::StagePlane { editing: None })
+        ));
+        assert!(matches!(
+            app.staged_plane.as_ref().map(|staged| &staged.base),
+            Some(StagedPlaneBase::Face { .. })
         ));
         assert!(app.confirm_pending_operation());
         assert_eq!(app.construction_planes.len(), 1);
@@ -25484,11 +28022,8 @@ mod extrusion_workbench_tests {
         app.select_model_face(top, true);
         app.stage_construction_plane();
         assert!(matches!(
-            app.pending_operation,
-            Some(PendingOperation::CreateConstructionPlane {
-                source: ConstructionPlaneSource::BetweenFaces { .. },
-                ..
-            })
+            app.staged_plane.as_ref().map(|staged| &staged.base),
+            Some(StagedPlaneBase::Midplane { .. })
         ));
         assert!(app.confirm_pending_operation());
         let midplane = app.construction_planes.last().unwrap();
@@ -26627,6 +29162,66 @@ mod extrusion_workbench_tests {
                 .as_deref()
                 .is_some_and(|status| status.contains("needs repair"))
         );
+
+        // Saved like this, the file holds an extrusion whose region has
+        // gone. The save says so; it does not refuse the work.
+        let directory = std::env::temp_dir().join(format!(
+            "artificer-unbuilt-save-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("unbuilt.artificer.json");
+        let extrusion_label = app.document.feature(extrusion).unwrap().label.clone();
+        assert_eq!(
+            app.features_awaiting_rebuild(),
+            std::slice::from_ref(&extrusion_label)
+        );
+        assert!(app.save_document_to(&path));
+        let status = app.document_status.clone().unwrap_or_default();
+        assert!(
+            status.contains(&extrusion_label) && status.contains("did not rebuild"),
+            "the save must name what did not rebuild: {status}"
+        );
+        assert!(!app.is_document_dirty());
+
+        // Opened, that extrusion is suppressed instead of the whole file
+        // refusing, the sketch that was edited is there as edited, and
+        // nothing is left waiting on a rebuild.
+        let mut restored = KernelLabApp::default();
+        restored
+            .load_workspace_from_path(&path)
+            .expect("a file with an unbuildable feature still opens");
+        assert_eq!(restored.features_suppressed_on_open(), [extrusion]);
+        let reopened = restored.document.feature(extrusion).unwrap();
+        assert!(reopened.state.suppressed);
+        assert!(
+            restored
+                .document
+                .features()
+                .iter()
+                .all(|feature| feature.state.rebuild == RebuildState::Clean),
+            "the open rebuilds what the suppression touched"
+        );
+        assert!(restored.features_awaiting_rebuild().is_empty());
+        let status = restored.document_status.clone().unwrap_or_default();
+        assert!(
+            status.contains(&extrusion_label) && status.contains("suppressed"),
+            "the open must say what it suppressed and why: {status}"
+        );
+        assert!(
+            restored.is_document_dirty(),
+            "what is open differs from the file by the suppression"
+        );
+        let edited = restored.document.sketch(sketch).unwrap();
+        assert_eq!(
+            edited.geometry_revision,
+            app.document.sketch(sketch).unwrap().geometry_revision
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
@@ -27333,6 +29928,7 @@ mod extrusion_workbench_tests {
             mode,
             second_distance: None,
             up_to_faces: [None, None],
+            up_to_planes: [None, None],
             boolean_target: None,
             editing_feature: None,
         };
@@ -28339,6 +30935,30 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// A host edge projected into a sketch for a dimension is the body's
+    /// line, not the sketch's. The model overlay used to paint it in the
+    /// sketch colour, which put a line on the body that nobody drew.
+    #[test]
+    fn the_model_overlay_leaves_projected_reference_edges_to_the_body() {
+        let mut app = active_rectangle_app();
+        assert!(
+            app.sketch
+                .project_host_edge([point(0.0, -3.0), point(4.0, -3.0)])
+                .is_some(),
+            "a host edge is brought in as the dimension tool would"
+        );
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+
+        let overlays = app.visible_sketch_overlays();
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(
+            overlays[0].segment_count(),
+            4,
+            "the rectangle's four sides and nothing borrowed from the body"
+        );
+    }
+
     #[test]
     fn committed_browser_sketch_reselects_from_document_payload_and_extrudes() {
         let mut app = active_rectangle_app();
@@ -28681,76 +31301,6 @@ mod extrusion_workbench_tests {
         assert_eq!(app.sketch.entities().len(), 2);
     }
 
-    #[test]
-    fn document_parameter_creation_waits_for_visible_confirmation() {
-        let mut app = KernelLabApp::default();
-        let before = app.document.parameters().len();
-        app.pending_operation = Some(PendingOperation::AddUserLengthParameter {
-            ordinal: 1,
-            value_mm: 12.5,
-        });
-        assert_eq!(app.document.parameters().len(), before);
-        assert!(app.confirm_pending_operation());
-        assert_eq!(app.document.parameters().len(), before + 1);
-        let record = app
-            .document
-            .parameters()
-            .get_by_key("UserLength1")
-            .expect("confirmed parameter");
-        assert_eq!(
-            record.binding,
-            ParameterBinding::literal(ParameterValue::quantity(12.5, ParameterUnit::Millimeter))
-        );
-    }
-
-    #[test]
-    fn document_parameter_edit_can_be_cancelled_or_confirmed_atomically() {
-        let mut app = KernelLabApp::default();
-        let parameter = app
-            .document
-            .add_parameter(
-                ParameterSpec::new(
-                    "Width",
-                    "Width",
-                    ParameterType::Quantity(QuantityKind::Length),
-                )
-                .with_display_unit(ParameterUnit::Millimeter),
-                ParameterBinding::literal(ParameterValue::quantity(4.0, ParameterUnit::Millimeter)),
-            )
-            .expect("parameter");
-        let base = ParameterLiteralDraft::Quantity {
-            magnitude: 4.0,
-            unit: ParameterUnit::Millimeter,
-        };
-        app.pending_operation = Some(PendingOperation::SetParameterLiteral {
-            parameter,
-            base,
-            value: ParameterLiteralDraft::Quantity {
-                magnitude: 9.0,
-                unit: ParameterUnit::Millimeter,
-            },
-        });
-        assert!(app.cancel_pending_operation());
-        assert_eq!(
-            app.document.parameter(parameter).unwrap().binding,
-            ParameterBinding::literal(ParameterValue::quantity(4.0, ParameterUnit::Millimeter))
-        );
-
-        app.pending_operation = Some(PendingOperation::SetParameterLiteral {
-            parameter,
-            base,
-            value: ParameterLiteralDraft::Quantity {
-                magnitude: 9.0,
-                unit: ParameterUnit::Millimeter,
-            },
-        });
-        assert!(app.confirm_pending_operation());
-        assert_eq!(
-            app.document.parameter(parameter).unwrap().binding,
-            ParameterBinding::literal(ParameterValue::quantity(9.0, ParameterUnit::Millimeter))
-        );
-    }
-
     /// Appends one committed cuboid body to the workspace and its history.
     fn push_boolean_operand(app: &mut KernelLabApp, label: &str, origin: Point3) -> BodyId {
         crate::push_test_cuboid_body(app, label, origin)
@@ -29054,13 +31604,6 @@ mod extrusion_workbench_tests {
 
     #[test]
     fn solid_feature_presets_stage_before_committing_to_history() {
-        let mut revolve = KernelLabApp::default();
-        let bodies_before = revolve.body_count();
-        revolve.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert_eq!(revolve.body_count(), bodies_before);
-        assert!(revolve.confirm_pending_operation());
-        assert_eq!(revolve.body_count(), bodies_before + 1);
-
         let mut mirror = KernelLabApp::default();
         // Mirror follows the Browser's plane selection; pick YZ explicitly so
         // the flip lands on the X axis.
@@ -29093,8 +31636,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn an_interference_study_measures_every_visible_pair_without_touching_the_document() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2);
         let before = app.document.features().len();
         let digests = app
@@ -29138,8 +31680,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn a_study_leaves_a_heat_map_bound_to_the_facets_it_was_measured_on() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2);
 
         app.run_interference_study();
@@ -29198,8 +31739,7 @@ mod extrusion_workbench_tests {
     #[test]
     fn a_fit_judges_the_study_that_is_already_measured_and_repaints_it() {
         let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         app.run_interference_study();
 
         // A study with no fit measures and does not judge, and its heat map
@@ -29291,8 +31831,7 @@ mod extrusion_workbench_tests {
             app.document_status
         );
 
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         app.run_interference_study();
         let report = app.interference_report().expect("a study");
         assert_eq!(
@@ -29308,8 +31847,7 @@ mod extrusion_workbench_tests {
     fn the_boolean_card_names_both_operands_and_keeps_tools_on_request() {
         let mut app = KernelLabApp::default();
         // Two bodies: the bootstrap cuboid and a second one from a revolve.
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        revolve_a_tube(&mut app);
         assert_eq!(app.bodies.len(), 2, "two bodies to combine");
         let target = app.active_body_id().expect("an active body");
         let other = app
@@ -29772,7 +32310,6 @@ mod extrusion_workbench_tests {
             SolidFeaturePreset::Shell,
             SolidFeaturePreset::Mirror,
             SolidFeaturePreset::LinearPattern,
-            SolidFeaturePreset::Revolve,
         ] {
             let mut app = KernelLabApp::default();
 
@@ -29829,6 +32366,153 @@ mod extrusion_workbench_tests {
                 armed.prompt()
             );
         }
+    }
+
+    /// A fillet pressed first stages from the edges clicked after it: the
+    /// clicks join the selection and the tool runs again against it, which
+    /// is the same path a preselection takes (ADR 0041 stage 4).
+    #[test]
+    fn a_fillet_pressed_first_stages_from_the_edges_clicked_after_it() {
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(app.armed_tool.is_some(), "nothing picked: the tool arms");
+        assert!(app.pending_operation.is_none());
+
+        let body = app.active_body_id().expect("default active body");
+        let edge = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.scene.edges.first())
+            .expect("a body edge")
+            .source_edge;
+        // The click is not additive — Shift was not held — and yet the pick
+        // must join rather than replace, because the tool asked for it.
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                edge,
+            },
+            false,
+        );
+        assert!(
+            app.selected_edges.iter().any(|picked| picked.edge == edge),
+            "the picked edge is in the selection"
+        );
+        assert!(
+            app.pending_operation.is_some(),
+            "one edge satisfies a finish, so the click staged it: {:?}",
+            app.document_status
+        );
+        assert!(app.armed_tool.is_none(), "a staged tool is no longer armed");
+        assert!(app.armed_resume.is_none());
+    }
+
+    /// Extrude pressed first pushes the face clicked after it.
+    #[test]
+    fn extrude_pressed_first_pushes_the_face_clicked_after_it() {
+        let mut app = KernelLabApp::default();
+        app.clear_model_entity_selection();
+        app.workbench_mode = WorkbenchMode::Model;
+        app.extrusion_distance = 1.0;
+        assert!(
+            !app.stage_face_push_pull(),
+            "no face picked: nothing stages"
+        );
+        assert_eq!(
+            app.armed_tool.as_ref().map(|armed| armed.tool),
+            Some("Extrude")
+        );
+
+        let body = app.active_body_id().expect("default active body");
+        let face = app
+            .displayed
+            .as_ref()
+            .and_then(|displayed| {
+                displayed
+                    .scene
+                    .triangles
+                    .iter()
+                    .find(|triangle| triangle.role == FaceRole::PositiveZ)
+            })
+            .expect("a planar cap")
+            .source_face;
+        app.select_model_face(
+            viewport::DocumentFaceSelection {
+                body: viewport::BodyInstanceKey::new(body.get()),
+                face,
+            },
+            false,
+        );
+        assert!(
+            matches!(
+                app.pending_operation,
+                Some(PendingOperation::PushPullFace { target_face, .. }) if target_face == face
+            ),
+            "the clicked face is the one being pushed: {:?} / {:?}",
+            app.pending_operation,
+            app.document_status
+        );
+        assert!(app.armed_tool.is_none());
+    }
+
+    /// From the model workspace, Extrude with a finished but unused sketch
+    /// opens that sketch and asks for its profile, instead of greying out.
+    #[test]
+    fn extrude_from_the_model_workspace_opens_an_unused_sketch_for_its_profile() {
+        // Two circles, as in the report: two profiles, so one has to be
+        // picked before anything can be extruded.
+        let mut app = KernelLabApp::default();
+        for centre in [-6.0, 6.0] {
+            app.sketch
+                .stage_geometry(SketchGeometry::circle(
+                    SketchPoint::new(centre, 0.0),
+                    SketchPoint::new(centre + 3.0, 0.0),
+                ))
+                .expect("circle");
+            app.sketch.commit_pending().expect("commit");
+        }
+        app.sketch_revision = 1;
+        app.feature_preview.commit_sketch_revision(1);
+        app.sketch_finished = false;
+        app.workbench_mode = WorkbenchMode::Sketch;
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation());
+        app.enter_model_mode();
+        assert_eq!(app.workbench_mode, WorkbenchMode::Model);
+        // Finishing stages a preview of its own; the report is about coming
+        // back to the sketch later, with nothing pending.
+        app.cancel_pending_operation();
+        app.clear_model_entity_selection();
+        app.sketch.clear_region_selection();
+        assert!(
+            app.unconsumed_active_sketch_index().is_some(),
+            "the finished sketch is active and unused"
+        );
+        assert!(
+            app.sketch_extrusion_eligibility().wants_profile_pick(),
+            "two profiles: one has to be chosen: {:?} / regions selected {}",
+            app.sketch_extrusion_eligibility(),
+            app.selected_sketch_region_count()
+        );
+
+        let availability = app.command_availability(crate::commands::ModelCommand::Extrude);
+        assert!(
+            availability.is_enabled(),
+            "an unused sketch is what Extrude is for: {}",
+            match &availability {
+                crate::ribbon::CommandAvailability::Enabled => String::new(),
+                crate::ribbon::CommandAvailability::Disabled(reason) => reason.to_string(),
+            }
+        );
+        let context = egui::Context::default();
+        app.run_command(crate::commands::ModelCommand::Extrude, &context);
+        assert_eq!(
+            app.workbench_mode,
+            WorkbenchMode::Sketch,
+            "the sketch opened for its profile to be picked: {:?}",
+            app.document_status
+        );
     }
 
     /// A face feature pressed with nothing picked enters it and asks for a
@@ -30845,6 +33529,180 @@ mod extrusion_workbench_tests {
         );
     }
 
+    /// A drilled rim and a straight block edge picked for one fillet.
+    ///
+    /// The two kinds cannot share a feature, so the preview's kernel ladder
+    /// reaches the faceted tier. Its removal volume used to grow without bound
+    /// there — minutes of work and then a stack overflow, taking the window
+    /// with it while the user was only choosing edges. The tier now declines
+    /// at once, the preview comes back from the rungs past it, and the panel
+    /// still says why the pair cannot commit.
+    #[test]
+    fn a_drilled_rim_and_a_block_edge_preview_promptly_and_explain_themselves() {
+        let mut app = KernelLabApp::default();
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().expect("a body").get());
+        let top = app
+            .displayed
+            .as_ref()
+            .expect("a body")
+            .scene
+            .triangles
+            .iter()
+            .find(|triangle| triangle.role == FaceRole::PositiveZ)
+            .expect("a top face")
+            .source_face;
+        app.select_model_face(viewport::DocumentFaceSelection { body, face: top }, false);
+        app.stage_preset_feature(SolidFeaturePreset::Hole);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let body = viewport::BodyInstanceKey::new(app.active_body_id().expect("a body").get());
+        let (rim, straight) = a_rim_and_a_straight_edge(&app);
+        app.clear_model_entity_selection();
+        app.select_model_edge(viewport::DocumentEdgeSelection { body, edge: rim }, false);
+        app.select_model_edge(
+            viewport::DocumentEdgeSelection {
+                body,
+                edge: straight,
+            },
+            true,
+        );
+        app.edge_finish_distance = 0.2;
+        app.stage_preset_feature(SolidFeaturePreset::Fillet);
+        assert!(app.pending_operation.is_some());
+        let started = Instant::now();
+        let preview = app.current_edge_finish_preview();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the preview took {:?}",
+            started.elapsed()
+        );
+        assert!(preview.is_some(), "a refused set still previews");
+        assert_eq!(
+            app.edge_finish_selection_support(),
+            EdgeFinishSelectionSupport::MixedRimAndStraight
+        );
+    }
+
+    /// A closed fit-point spline drawn on XY extrudes into an exact solid
+    /// (ADR 0050): the volume is the spline's own area times the depth, the
+    /// area taken here from the sketch's curve by the shoelace formula over
+    /// thousands of points, independently of the kernel.
+    #[test]
+    fn a_closed_spline_sketch_extrudes_to_its_area_times_its_depth() {
+        use artificer_sketch::{PointInput, SketchPoint2, SketchRecipe};
+        let mut app = KernelLabApp::default();
+        let points = [(0.0, 0.0), (4.0, -0.5), (5.0, 3.0), (1.0, 4.0), (-1.0, 2.0)]
+            .map(|(u, v)| PointInput::Position(SketchPoint2::new(u, v)))
+            .to_vec();
+        app.sketch
+            .stage_recipe(
+                SketchRecipe::FitPointSpline {
+                    fit_points: points,
+                    degree: 3,
+                    closed: true,
+                },
+                "Spline",
+            )
+            .expect("the spline stages");
+        app.sketch.commit_pending().expect("the spline commits");
+        app.sketch_revision += 1;
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+        assert!(app.sketch.certified_profile_status().can_finish());
+
+        let authoring = app.sketch.authoring();
+        let entity = authoring
+            .active_entities()
+            .next()
+            .expect("the spline is an entity")
+            .id;
+        let curve = authoring
+            .evaluated_curve(entity)
+            .expect("the spline evaluates");
+        let samples = 20_000;
+        let area = (0..samples)
+            .map(|index| {
+                let at = |k: usize| {
+                    curve
+                        .evaluate((k % samples) as f64 / samples as f64)
+                        .expect("inside the domain")
+                };
+                let (a, b) = (at(index), at(index + 1));
+                a.u * b.v - b.u * a.v
+            })
+            .sum::<f64>()
+            .abs()
+            / 2.0;
+
+        app.stage_finish_sketch();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.set_extrusion_distance_intent(2.0);
+        assert!(
+            app.stage_sketch_extrusion(),
+            "{:?}",
+            app.sketch_extrusion_eligibility()
+        );
+        assert!(
+            app.confirm_pending_operation(),
+            "{:?} {:?}",
+            app.document_status,
+            app.sketch_extrusion_issue
+        );
+        assert!(
+            app.sketch_extrusion_issue.is_none(),
+            "{:?}",
+            app.sketch_extrusion_issue
+        );
+        let volume = app.displayed_measures().expect("an extruded body").volume;
+        assert!(
+            ((volume - 2.0 * area) / (2.0 * area)).abs() < 1.0e-6,
+            "volume {volume} against area {area} × 2"
+        );
+    }
+
+    /// An inserted library part is sized by the library, not by its feature.
+    /// The feature card offers nothing to drag, and an edit that reaches the
+    /// feature anyway is refused, so the part and its component record, which
+    /// keeps the length it was inserted at, cannot disagree.
+    #[test]
+    fn a_library_part_is_not_resized_through_its_feature() {
+        let mut app = KernelLabApp::default();
+        app.part_library.set_length_text("125");
+        let staging_id = app.part_library.stage_selected().expect("the part stages");
+        app.pending_operation = Some(PendingOperation::LibraryInsertion { staging_id });
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let feature = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.component_instance.is_some())
+            .expect("the insertion is in the history")
+            .id;
+        let volume = app
+            .displayed_measures()
+            .expect("the part is on screen")
+            .volume;
+
+        app.selected_history_feature = Some(feature);
+        assert!(
+            app.selected_feature_scalars().is_empty(),
+            "the feature card offers no dimension to drag"
+        );
+        assert!(!app.edit_feature_scalar(feature, 0, 900.0));
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("insert it again")),
+            "{:?}",
+            app.document_status
+        );
+        let after = app
+            .displayed_measures()
+            .expect("the part is still there")
+            .volume;
+        assert!((after - volume).abs() < 1.0e-9, "the part kept its size");
+    }
+
     /// The bootstrap block, and the three edges meeting at one of its corners.
     fn block_corner_edges(app: &KernelLabApp) -> Vec<EntityRef> {
         let scene = &app.displayed.as_ref().expect("the bootstrap body").scene;
@@ -31828,11 +34686,21 @@ mod circle_extrude_repro {
         app.commit_sketch_stroke(axis);
         assert!(app.sketch.centreline_axis().is_some());
 
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
+        // Revolve finishes the sketch, takes its only region and starts on
+        // its centreline (ADR 0055).
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
         assert!(
-            app.staged_revolve.is_some(),
-            "the sketch profile and centreline should be captured: {:?}",
-            app.document_status
+            matches!(
+                app.staged_revolve_axis(),
+                Some(artificer_model::RevolveAxis::SketchLine { .. })
+            ),
+            "the centreline is the axis: {:?}",
+            app.staged_revolve_axis()
+        );
+        assert!(
+            app.staged_revolve_has_preview(),
+            "{:?}",
+            app.staged_revolve_issue()
         );
         assert!(app.confirm_pending_operation());
 
@@ -31846,22 +34714,23 @@ mod circle_extrude_repro {
             "revolved volume {volume} should equal {expected}"
         );
         assert!(app.staged_revolve.is_none(), "the staging is spent");
+        let revolve = app
+            .document
+            .features()
+            .iter()
+            .find(|feature| feature.kind == FeatureKind::Revolve)
+            .expect("a revolve feature in the history");
+        assert!(matches!(revolve.action, ReplayAction::SketchRevolve(_)));
     }
 
+    /// With nothing sketched there is nothing to revolve: the command says
+    /// so rather than building a stand-in (ADR 0055).
     #[test]
-    fn revolve_without_a_centreline_still_builds_its_preset_tube() {
-        let mut app = KernelLabApp::default();
-        app.stage_preset_feature(SolidFeaturePreset::Revolve);
-        assert!(app.staged_revolve.is_none());
-        assert!(app.confirm_pending_operation());
-        let volume = app
-            .displayed_measures()
-            .expect("the preset tube should publish measures")
-            .volume;
-        let expected = std::f64::consts::PI * (4.0 - 1.0) * 3.0;
+    fn revolve_needs_a_sketch_to_turn() {
+        let app = KernelLabApp::default();
         assert!(
-            ((volume - expected) / expected).abs() < 1.0e-9,
-            "preset revolve volume {volume} should equal {expected}"
+            !app.command_availability(crate::commands::ModelCommand::Revolve)
+                .is_enabled()
         );
     }
 
@@ -32400,18 +35269,29 @@ mod rejection_summary_tests {
             "a blank document has nothing to lose"
         );
         let before = app.document_revision();
-        // The smallest edit a document takes: one more marker feature.
+        // The smallest edit a document takes: one construction plane.
         let empty = SnapshotAssociation::new(
             app.empty_snapshot.id(),
             app.empty_snapshot.id(),
             app.empty_snapshot.semantic_digest(),
         );
+        let origin = artificer_model::OriginPlane::Xy;
         app.document
             .append_feature(
-                FeatureDraft::new(FeatureKind::DatumPlane, "Plane", ReplayAction::Marker)
-                    .with_commit(empty),
+                FeatureDraft::new(
+                    FeatureKind::DatumPlane,
+                    "Plane",
+                    ReplayAction::DatumPlane(DatumPlaneRecipe::new(
+                        DatumPlaneBase::Origin { plane: origin },
+                        ResolvedDatumPlane {
+                            frame: origin.frame(),
+                            half_extent: [25.0, 25.0],
+                        },
+                    )),
+                )
+                .with_commit(empty),
             )
-            .expect("a marker feature is a valid edit");
+            .expect("a plane is a valid edit");
         assert!(app.document_revision() > before);
         assert!(app.is_document_dirty());
         app.mark_document_saved();
@@ -32601,6 +35481,457 @@ mod view_cube_flight_tests {
             app.face_camera_transition,
             Some(flight),
             "a drag does not cancel the sketch's flight either"
+        );
+    }
+}
+
+/// Construction planes as a user meets them (ADR 0048): placed with an
+/// offset or an angle, kept in the history, edited there, followed by what is
+/// built on them, and a place an extrusion can end.
+#[cfg(test)]
+mod construction_plane_tests {
+    use super::*;
+
+    fn point(u: f64, v: f64) -> SketchPoint {
+        SketchPoint::new(u, v)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "actual={actual:.15}, expected={expected:.15}"
+        );
+    }
+
+    /// The bootstrap body's face whose facets point along `normal`.
+    fn face_facing(app: &KernelLabApp, normal: Vector3) -> viewport::DocumentFaceSelection {
+        let body = app.active_body_id().expect("a body is on screen");
+        let displayed = app.displayed.as_ref().expect("a body is displayed");
+        let face = displayed
+            .scene
+            .triangles
+            .iter()
+            .find(|triangle| {
+                let [a, b, c] = triangle.vertices;
+                let facet = cross_vector(
+                    Vector3::new(b.x - a.x, b.y - a.y, b.z - a.z),
+                    Vector3::new(c.x - a.x, c.y - a.y, c.z - a.z),
+                );
+                normalized_vector(facet).is_some_and(|unit| dot_vector(unit, normal) > 0.999)
+            })
+            .expect("a face points that way")
+            .source_face;
+        viewport::DocumentFaceSelection {
+            body: viewport::BodyInstanceKey::new(body.get()),
+            face,
+        }
+    }
+
+    /// A plane on an origin plane, offset along its normal, committed.
+    fn origin_plane(app: &mut KernelLabApp, plane: SketchPlane, offset: f64) -> ConstructionPlane {
+        app.clear_model_entity_selection();
+        app.selected_construction_plane = None;
+        app.selected_origin_plane = plane;
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(offset);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        app.construction_planes
+            .last()
+            .cloned()
+            .expect("the plane was committed")
+    }
+
+    /// A rectangle drawn on whatever the sketch support now is.
+    fn draw_rectangle(app: &mut KernelLabApp, from: (f64, f64), to: (f64, f64)) {
+        app.sketch
+            .stage_geometry(SketchGeometry::rectangle(
+                point(from.0, from.1),
+                point(to.0, to.1),
+            ))
+            .expect("rectangle stages");
+        app.sketch.commit_pending().expect("rectangle commits");
+        app.sketch_revision = app.sketch_revision.saturating_add(1);
+        app.feature_preview
+            .commit_sketch_revision(app.sketch_revision);
+    }
+
+    fn body_created_by(app: &KernelLabApp, feature: FeatureId) -> &WorkbenchBody {
+        let body = app
+            .document
+            .features()
+            .iter()
+            .find(|node| node.id == feature)
+            .and_then(|node| {
+                node.outputs.iter().find_map(|output| match output {
+                    FeatureOutput::Body(body) => Some(*body),
+                    FeatureOutput::Sketch { .. } => None,
+                })
+            })
+            .expect("the feature made a body");
+        app.bodies
+            .iter()
+            .find(|candidate| candidate.id == body)
+            .expect("the body is on screen")
+    }
+
+    #[test]
+    fn an_offset_plane_is_a_recipe_in_the_history_with_its_own_chip() {
+        let mut app = KernelLabApp::default();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        app.select_model_face(top, false);
+        app.stage_construction_plane();
+        // The staged plane is drawn on the face with an arrow to move it.
+        let handles = app
+            .staged_plane_handles()
+            .expect("a staged plane has handles");
+        assert!(handles.turn.is_none(), "a face plane does not turn");
+        assert_close(handles.anchor.z, 4.0);
+        app.set_staged_plane_offset(3.0);
+        let preview = app.staged_plane_preview().expect("the plane is previewed");
+        assert_close(preview.frame.origin.z, 7.0);
+        assert!(app.confirm_pending_operation());
+
+        let plane = app.construction_planes.last().expect("committed").clone();
+        assert_close(plane.frame.origin.z, 7.0);
+        let recipe = app.document.datum_plane(plane.feature).expect("a recipe");
+        assert!(matches!(recipe.base, DatumPlaneBase::Face(_)));
+        assert_close(recipe.offset, 3.0);
+        // It is in the history as a plane of its own, and its chip offers
+        // the editor, a name, suppression and deletion.
+        let entry = app
+            .feature_preview
+            .entries
+            .iter()
+            .find(|entry| entry.kind == FeaturePreviewKind::Plane)
+            .expect("a plane chip");
+        assert_eq!(entry.label(), plane.name);
+        assert_eq!(
+            app.timeline_context_commands(plane.feature),
+            vec![
+                TimelineContextCommand::EditPlane,
+                TimelineContextCommand::Rename,
+                TimelineContextCommand::Suppress,
+                TimelineContextCommand::DeletePlane,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plane_through_an_edge_turns_about_it() {
+        let mut app = KernelLabApp::default();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        let body = app.active_body_id().expect("a body");
+        let displayed = app.displayed.as_ref().expect("displayed");
+        // An edge of the top face along x at y = 0.
+        let edge = displayed
+            .scene
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.z - 4.0).abs() < 1.0e-9 && point.y.abs() < 1.0e-9)
+            })
+            .expect("the top face's front edge")
+            .source_edge;
+        app.selected_edges = vec![viewport::DocumentEdgeSelection {
+            body: viewport::BodyInstanceKey::new(body.get()),
+            edge,
+        }];
+        app.selected_faces = vec![top];
+        app.stage_construction_plane();
+        let handles = app.staged_plane_handles().expect("handles");
+        assert!(handles.turn.is_some(), "an edge plane has a turning arc");
+        app.set_staged_plane_angle(90.0);
+        let preview = app.staged_plane_preview().expect("previewed");
+        // Upright on the front edge: facing −Y, standing above the face.
+        let normal = frame_normal(preview.frame).expect("normal");
+        assert!((normal.y + 1.0).abs() < 1.0e-9, "{normal:?}");
+        assert!(preview.frame.origin.y.abs() < 1.0e-9);
+        assert!(preview.frame.origin.z > 4.0);
+        // A full turn and a half is the same plane as a half turn back.
+        app.set_staged_plane_angle(450.0);
+        assert_close(app.staged_plane.as_ref().unwrap().angle_degrees, 90.0);
+        assert!(app.confirm_pending_operation());
+        let plane = app.construction_planes.last().expect("committed");
+        let recipe = app.document.datum_plane(plane.feature).expect("recipe");
+        assert!(matches!(recipe.base, DatumPlaneBase::Edge { .. }));
+        assert_close(recipe.angle_degrees, 90.0);
+    }
+
+    #[test]
+    fn a_sketch_on_a_plane_and_its_extrusion_move_with_the_plane() {
+        let mut app = KernelLabApp::default();
+        let plane = origin_plane(&mut app, SketchPlane::XY, 10.0);
+        app.selected_construction_plane = Some(plane.id);
+        app.begin_construction_plane_sketch(plane.id);
+        if let Some(PendingPlaneSketch::Construction(id)) = app.pending_plane_sketch.take() {
+            app.open_construction_plane_sketch(id);
+        }
+        draw_rectangle(&mut app, (0.0, 0.0), (2.0, 2.0));
+        app.set_extrusion_distance_intent(2.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion")
+            .id;
+        let sketch = app
+            .document
+            .sketches()
+            .last()
+            .expect("the sketch is in the document")
+            .id;
+        let payload = app
+            .document
+            .sketch_payload(
+                sketch,
+                app.document.sketch(sketch).unwrap().geometry_revision,
+            )
+            .unwrap();
+        assert_eq!(
+            payload.support,
+            SketchSupportRecipe::DatumPlane {
+                plane: plane.feature
+            }
+        );
+        let centroid = body_created_by(&app, extrusion)
+            .body
+            .snapshot
+            .measures()
+            .centroid
+            .unwrap();
+        assert_close(centroid.z, 11.0);
+
+        // Moving the plane from the history moves the sketch and the body.
+        app.enter_model_mode();
+        assert!(app.begin_plane_edit(plane.feature));
+        assert!(matches!(
+            app.pending_operation,
+            Some(PendingOperation::StagePlane { editing: Some(_) })
+        ));
+        app.set_staged_plane_offset(20.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let centroid = body_created_by(&app, extrusion)
+            .body
+            .snapshot
+            .measures()
+            .centroid
+            .unwrap();
+        assert_close(centroid.z, 21.0);
+        assert_close(app.document.sketch_frame(sketch).unwrap().origin.z, 20.0);
+        assert_eq!(
+            app.document.features().len(),
+            app.document.history_position(),
+            "the edit returns the history to its end"
+        );
+    }
+
+    #[test]
+    fn a_side_that_ends_at_a_plane_follows_the_plane() {
+        let mut app = KernelLabApp::default();
+        let plane = origin_plane(&mut app, SketchPlane::XY, 9.0);
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (5.0, 5.0), (7.0, 7.0));
+        app.set_extrusion_distance_intent(1.0);
+        assert_eq!(app.extrusion_plane_targets(0).len(), 1);
+        app.adopt_extrusion_extent_plane(0, plane.feature);
+        assert_eq!(
+            app.extrusion_extents[0],
+            ExtrusionExtentIntent::ToPlane(plane.feature)
+        );
+        assert_close(app.extrusion_distance, 9.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion");
+        assert!(
+            extrusion
+                .inputs
+                .contains(&FeatureInput::Feature(plane.feature))
+        );
+        let ReplayAction::SketchRegionExtrusion(recipe) = &extrusion.action else {
+            panic!("a region extrusion");
+        };
+        assert_eq!(recipe.up_to_plane, Some(plane.feature));
+        let extrusion = extrusion.id;
+        assert_close(
+            body_created_by(&app, extrusion)
+                .body
+                .snapshot
+                .measures()
+                .volume,
+            4.0 * 9.0,
+        );
+
+        // Lowering the plane shortens the extrusion on the rebuild.
+        app.enter_model_mode();
+        assert!(app.begin_plane_edit(plane.feature));
+        app.set_staged_plane_offset(5.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        assert_close(
+            body_created_by(&app, extrusion)
+                .body
+                .snapshot
+                .measures()
+                .volume,
+            4.0 * 5.0,
+        );
+        // And the plane cannot be deleted from under it.
+        app.delete_construction_plane(plane.feature);
+        assert!(app.document.feature(plane.feature).is_some());
+        assert!(
+            app.document_status
+                .as_deref()
+                .is_some_and(|status| status.contains("is built on it")),
+            "{:?}",
+            app.document_status
+        );
+    }
+
+    #[test]
+    fn a_face_plane_follows_the_face_when_the_body_under_it_changes() {
+        let mut app = KernelLabApp::default();
+        app.begin_new_origin_sketch();
+        draw_rectangle(&mut app, (10.0, 0.0), (14.0, 2.0));
+        app.set_extrusion_distance_intent(6.0);
+        assert!(app.stage_sketch_extrusion());
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let extrusion = app
+            .document
+            .features()
+            .iter()
+            .rev()
+            .find(|node| node.kind == FeatureKind::Extrude)
+            .expect("an extrusion")
+            .id;
+        app.enter_model_mode();
+        let top = face_facing(&app, Vector3::new(0.0, 0.0, 1.0));
+        app.select_model_face(top, false);
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(1.0);
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let plane = app.construction_planes.last().expect("plane").clone();
+        assert_close(plane.frame.origin.z, 7.0);
+
+        // A taller extrusion carries its top face, and the plane on it, up.
+        assert!(app.begin_extrusion_edit(extrusion));
+        app.set_extrusion_distance_intent(10.0);
+        app.sync_pending_sketch_extrusion_inputs();
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+        let moved = app
+            .construction_planes
+            .iter()
+            .find(|candidate| candidate.feature == plane.feature)
+            .expect("the plane is still here");
+        assert_close(moved.frame.origin.z, 11.0);
+        assert!(!moved.stale);
+    }
+
+    #[test]
+    fn an_unused_plane_deletes_and_a_suppressed_one_is_not_drawn() {
+        let mut app = KernelLabApp::default();
+        let kept = origin_plane(&mut app, SketchPlane::YZ, 3.0);
+        let gone = origin_plane(&mut app, SketchPlane::XZ, -2.0);
+        app.delete_construction_plane(gone.feature);
+        assert!(app.document.feature(gone.feature).is_none());
+        assert!(
+            app.construction_planes
+                .iter()
+                .all(|plane| plane.feature != gone.feature)
+        );
+        assert!(app.toggle_feature_suppression(kept.feature));
+        assert!(
+            app.construction_planes
+                .iter()
+                .all(|plane| plane.feature != kept.feature),
+            "a suppressed plane is not drawn"
+        );
+        // Undo brings the suppression back off, and the plane with it.
+        assert!(app.document.undo());
+        app.restore_runtime_from_document();
+        assert!(
+            app.construction_planes
+                .iter()
+                .any(|plane| plane.feature == kept.feature)
+        );
+    }
+
+    #[test]
+    fn a_plane_is_renamed_and_the_name_is_saved() {
+        let mut source = KernelLabApp::default();
+        let plane = origin_plane(&mut source, SketchPlane::XY, 4.0);
+        source.apply_feature_rename(plane.feature, "Datum A");
+        assert_eq!(source.construction_planes.last().unwrap().name, "Datum A");
+        assert!(
+            source
+                .feature_preview
+                .entries
+                .iter()
+                .any(|entry| entry.label() == "Datum A")
+        );
+        source.set_construction_plane_visible(plane.id, false);
+        let json = source.workspace_document_json().unwrap();
+        let mut restored = KernelLabApp::default();
+        restored.load_workspace_json(&json).unwrap();
+        assert_eq!(restored.construction_planes, source.construction_planes);
+        assert!(!restored.construction_planes.last().unwrap().visible);
+    }
+
+    #[test]
+    fn a_version_six_plane_migrates_to_a_fixed_recipe_where_it_stood() {
+        let mut source = KernelLabApp::default();
+        let plane = origin_plane(&mut source, SketchPlane::XY, 6.0);
+        // Rewrite the saved file into the shape a version 6 build wrote: a
+        // marker in the history, and the frame in the workspace envelope.
+        let json = source.workspace_document_json().unwrap();
+        let mut value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+        value["document"]["version"] = serde_json::json!(6);
+        let features = value["document"]["state"]["features"]
+            .as_array_mut()
+            .expect("features");
+        let node = features
+            .iter_mut()
+            .find(|node| node["id"] == serde_json::json!(plane.feature.get()))
+            .expect("the plane feature");
+        node["action"] = serde_json::json!({"type": "marker"});
+        value["construction_planes"] = serde_json::json!([{
+            "id": 1,
+            "name": plane.name,
+            "feature": plane.feature.get(),
+            "frame": plane.frame,
+            "half_u": plane.half_u,
+            "half_v": plane.half_v,
+            "visible": true,
+            "source": {"kind": "from_origin", "plane_index": 0}
+        }]);
+        let legacy = serde_json::to_string(&value).unwrap();
+        let mut restored = KernelLabApp::default();
+        restored
+            .load_workspace_json(&legacy)
+            .expect("a version 6 workspace loads");
+        let migrated = restored
+            .construction_planes
+            .last()
+            .expect("the plane migrated");
+        assert_close(migrated.frame.origin.z, 6.0);
+        let recipe = restored
+            .document
+            .datum_plane(migrated.feature)
+            .expect("a recipe now");
+        assert!(matches!(recipe.base, DatumPlaneBase::Fixed { .. }));
+        assert!(
+            !restored.is_document_dirty(),
+            "migrating on load is not an edit"
         );
     }
 }

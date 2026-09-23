@@ -21,6 +21,7 @@ use artificer_protocol::{
     MAX_EXTRUSION_PROFILE_VERTICES, MAX_PLANAR_PROFILE_CURVES, MAX_PLANAR_PROFILE_LOOPS,
     MAX_PLANAR_PROFILE_REGIONS, PlanarProfile2, PrecisionPolicy,
 };
+use artificer_sketch::expression::{FieldUnit, NamedQuantity, evaluate_entry};
 use artificer_sketch::{
     Angle as CoreAngle, ArrangementCell as CoreArrangementCell,
     ArrangementDiagnostic as CoreArrangementDiagnostic, ArrangementLimits as CoreArrangementLimits,
@@ -40,7 +41,7 @@ use artificer_sketch::{
     SketchOutputRef as CoreOutputRef, SketchPoint2 as CorePoint2, SketchPointId as CorePointId,
     SketchRecipe as CoreRecipe, SketchRevision as CoreSketchRevision, SketchSnapKey as CoreSnapKey,
     SketchTransaction as CoreTransaction, SketchUndoJournal as CoreUndoJournal,
-    SketchValue as CoreValue, TrimCurve as CoreTrimCurve, build_arrangement,
+    SketchValue as CoreValue, SketchValueTarget, TrimCurve as CoreTrimCurve, build_arrangement,
     compile_selected_profile, hit_test_curves, intersect_curves, query_snap_candidates,
     select_trim_span,
 };
@@ -347,6 +348,51 @@ pub enum SketchContextCurve {
 const FULL_TURN_EPSILON: f64 = 1.0e-9;
 
 impl SketchContextCurve {
+    /// This curve as the core evaluates one, or `None` for a span too short
+    /// to bound anything.
+    #[must_use]
+    pub fn evaluated(&self) -> Option<CoreEvaluatedCurve2> {
+        match *self {
+            Self::Segment { start, end } => ((end.u - start.u).hypot(end.v - start.v)
+                > f64::EPSILON)
+                .then(|| CoreEvaluatedCurve2::Line {
+                    start: core_point(start),
+                    end: core_point(end),
+                }),
+            Self::Arc {
+                center,
+                radius,
+                start,
+                end,
+                ..
+            } => {
+                let sweep = end - start;
+                if radius <= f64::EPSILON || sweep.abs() <= f64::EPSILON {
+                    return None;
+                }
+                let direction = if sweep >= 0.0 {
+                    CoreCurveDirection::CounterClockwise
+                } else {
+                    CoreCurveDirection::Clockwise
+                };
+                if sweep.abs() >= std::f64::consts::TAU - 1.0e-9 {
+                    return Some(CoreEvaluatedCurve2::Circle {
+                        center: core_point(center),
+                        radius,
+                        direction,
+                    });
+                }
+                let [first, last] = self.endpoints()?;
+                Some(CoreEvaluatedCurve2::CircularArc {
+                    center: core_point(center),
+                    start: core_point(first),
+                    end: core_point(last),
+                    direction,
+                })
+            }
+        }
+    }
+
     #[must_use]
     pub const fn segment(start: SketchPoint, end: SketchPoint) -> Self {
         Self::Segment { start, end }
@@ -667,9 +713,128 @@ pub enum SketchGeometry {
         start: SketchPoint,
         end: SketchPoint,
     },
+    /// A B-spline from `start` to `end`. The exact curve is the authoring
+    /// graph's; this names its drawn shape (see [`SplineShape`]).
+    Spline {
+        start: SketchPoint,
+        end: SketchPoint,
+        shape: SplineShape,
+    },
 }
 
 const MAX_DISPLAY_CURVE_SEGMENTS: usize = 64;
+
+/// The drawn shape of one spline, named so the `Copy` geometry above can
+/// carry it.
+///
+/// A spline's exact definition lives in the authoring graph; the canvas only
+/// ever draws, measures and hit-tests a sampled outline of it. The outlines
+/// live in a bounded memo keyed by the curve's exact data, so an identical
+/// curve is sampled once and an edit that makes a new curve makes a new key.
+/// A key whose outline has been evicted draws as its chord until the entity
+/// is next derived from the graph, which every refresh does.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SplineShape(u64);
+
+/// Outlines held at once. A sketch rarely holds more than a few dozen
+/// splines; the rest of the room is for the shapes a live edit passes
+/// through.
+const SPLINE_SHAPE_CAPACITY: usize = 4096;
+/// Samples per knot span, so a long spline is drawn as finely as a short one.
+const SPLINE_SAMPLES_PER_SPAN: usize = 24;
+
+type SplineShapeMemo = std::collections::BTreeMap<u64, (u64, std::sync::Arc<[SketchPoint]>)>;
+
+fn spline_shape_memo() -> &'static std::sync::Mutex<(u64, SplineShapeMemo)> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<(u64, SplineShapeMemo)>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new((0, SplineShapeMemo::new())))
+}
+
+impl SplineShape {
+    /// Samples a core B-spline into the memo and returns its key, or `None`
+    /// for a curve that is not a B-spline or cannot be evaluated.
+    fn of(curve: &CoreEvaluatedCurve2) -> Option<Self> {
+        let CoreEvaluatedCurve2::Bspline {
+            control_points,
+            degree,
+            knots,
+            weights,
+        } = curve
+        else {
+            return None;
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(degree, &mut hasher);
+        for point in control_points {
+            std::hash::Hash::hash(&point.u.to_bits(), &mut hasher);
+            std::hash::Hash::hash(&point.v.to_bits(), &mut hasher);
+        }
+        for knot in knots {
+            std::hash::Hash::hash(&knot.to_bits(), &mut hasher);
+        }
+        for weight in weights.iter().flatten() {
+            std::hash::Hash::hash(&weight.to_bits(), &mut hasher);
+        }
+        let key = std::hash::Hasher::finish(&hasher);
+        let mut memo = spline_shape_memo().lock().ok()?;
+        let (clock, shapes) = &mut *memo;
+        *clock += 1;
+        let stamp = *clock;
+        if let Some(entry) = shapes.get_mut(&key) {
+            entry.0 = stamp;
+            return Some(Self(key));
+        }
+        let spans = knots
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0])
+            .count()
+            .max(1);
+        let samples = (spans * SPLINE_SAMPLES_PER_SPAN).clamp(16, 1024);
+        let points = (0..=samples)
+            .map(|index| curve.evaluate(index as f64 / samples as f64).ok())
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(|point| SketchPoint::new(point.u, point.v))
+            .collect::<std::sync::Arc<[SketchPoint]>>();
+        if shapes.len() >= SPLINE_SHAPE_CAPACITY {
+            // Forget the quarter used longest ago.
+            let mut stamps = shapes.values().map(|(stamp, _)| *stamp).collect::<Vec<_>>();
+            stamps.sort_unstable();
+            let cutoff = stamps[stamps.len() / 4];
+            shapes.retain(|_, (stamp, _)| *stamp > cutoff);
+        }
+        shapes.insert(key, (stamp, points));
+        Some(Self(key))
+    }
+
+    /// The same outline moved by `(delta_u, delta_v)`, under a key of its
+    /// own, for a drag preview.
+    fn translated(self, delta_u: f64, delta_v: f64) -> Option<Self> {
+        let points = self.points()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&self.0, &mut hasher);
+        std::hash::Hash::hash(&delta_u.to_bits(), &mut hasher);
+        std::hash::Hash::hash(&delta_v.to_bits(), &mut hasher);
+        let key = std::hash::Hasher::finish(&hasher);
+        let moved = points
+            .iter()
+            .map(|point| SketchPoint::new(point.u + delta_u, point.v + delta_v))
+            .collect::<std::sync::Arc<[SketchPoint]>>();
+        let mut memo = spline_shape_memo().lock().ok()?;
+        let (clock, shapes) = &mut *memo;
+        *clock += 1;
+        shapes.insert(key, (*clock, moved));
+        Some(Self(key))
+    }
+
+    /// The sampled outline, first point to last, if it is still held.
+    #[must_use]
+    pub fn points(self) -> Option<std::sync::Arc<[SketchPoint]>> {
+        let memo = spline_shape_memo().lock().ok()?;
+        memo.1.get(&self.0).map(|(_, points)| points.clone())
+    }
+}
 
 /// Deterministic, renderer-neutral outline for displaying a sketch entity.
 ///
@@ -747,6 +912,7 @@ impl SketchGeometry {
                     && center.distance_squared(end).is_finite()
                     && arc_sweep(center, start, end).is_finite()
             }
+            Self::Spline { start, end, .. } => start.is_finite() && end.is_finite(),
         }
     }
 
@@ -769,6 +935,15 @@ impl SketchGeometry {
                     || center.distance_squared(end) <= MIN_ENTITY_LENGTH.powi(2)
                     || arc_sweep(center, start, end) <= 1.0e-9
             }
+            // A closed spline starts where it ends, so its length, not its
+            // ends, says whether it is anything at all.
+            Self::Spline { shape, .. } => shape.points().is_some_and(|points| {
+                points
+                    .windows(2)
+                    .map(|pair| pair[0].distance_squared(pair[1]).sqrt())
+                    .sum::<f64>()
+                    <= MIN_ENTITY_LENGTH
+            }),
         }
     }
 
@@ -845,6 +1020,20 @@ impl SketchGeometry {
                     .collect();
                 (points, false)
             }
+            Self::Spline { start, end, shape } => {
+                let mut points = shape
+                    .points()
+                    .map_or_else(|| vec![start, end], |points| points.to_vec());
+                // A closed spline repeats its first point at the end; the
+                // outline states the closure instead.
+                let closed = points.len() > 2
+                    && points[0].distance_squared(points[points.len() - 1])
+                        <= MIN_ENTITY_LENGTH.powi(2);
+                if closed {
+                    points.pop();
+                }
+                (points, closed)
+            }
         };
         Some(SketchDisplayPolyline { points, closed })
     }
@@ -864,6 +1053,15 @@ impl SketchGeometry {
             )),
             Self::Circle { center, .. } => Some(center),
             Self::Arc { center, .. } => Some(center),
+            Self::Spline { start, end, shape } => shape
+                .points()
+                .and_then(|points| points.get(points.len() / 2).copied())
+                .or_else(|| {
+                    Some(SketchPoint::new(
+                        (start.u + end.u) * 0.5,
+                        (start.v + end.v) * 0.5,
+                    ))
+                }),
         }
     }
 
@@ -888,6 +1086,11 @@ impl SketchGeometry {
                 center: SketchPoint::new(center.u + delta_u, center.v + delta_v),
                 start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
                 end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+            },
+            Self::Spline { start, end, shape } => Self::Spline {
+                start: SketchPoint::new(start.u + delta_u, start.v + delta_v),
+                end: SketchPoint::new(end.u + delta_u, end.v + delta_v),
+                shape: shape.translated(delta_u, delta_v).unwrap_or(shape),
             },
         }
     }
@@ -1034,6 +1237,11 @@ impl SketchGeometry {
     fn control_points(self) -> GeometryPoints {
         match self {
             Self::Point(point) => GeometryPoints::one(point),
+            // A spline's handles are its ends and the point halfway along;
+            // its shape is edited through its own points, not by stretching.
+            Self::Spline { start, end, .. } => {
+                GeometryPoints::three(start, end, self.center().unwrap_or(start))
+            }
             Self::Segment { start, end } => {
                 let mid = SketchPoint::new((start.u + end.u) * 0.5, (start.v + end.v) * 0.5);
                 GeometryPoints::three(start, end, mid)
@@ -1116,7 +1324,7 @@ pub fn hit_test_drag_handle(
     hit_radius: f32,
 ) -> SketchDragHandle {
     match geometry {
-        SketchGeometry::Point(_) => SketchDragHandle::Translate,
+        SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => SketchDragHandle::Translate,
         SketchGeometry::Segment { start, end } => {
             let start_pos = view.sketch_to_screen(rect, start);
             let end_pos = view.sketch_to_screen(rect, end);
@@ -1455,6 +1663,9 @@ pub struct SelectedRecipeParameter {
     pub editable: bool,
     pub read_only_reason: Option<&'static str>,
     pub error: Option<RecipeParameterError>,
+    /// Whether the value follows document variables: its text is the entry
+    /// it was typed as, and it changes when they do.
+    pub follows_variables: bool,
 }
 
 /// Read-only projection of the selected operation's persistent design intent.
@@ -1479,6 +1690,10 @@ struct RetainedRecipeParameter {
     error: Option<RecipeParameterError>,
     /// Whether the value is a length, shown and read in the document unit.
     length: bool,
+    /// The entry the value follows when it was typed over document
+    /// variables, written with its units: what the sketch keeps as the
+    /// field's value link, and what the field shows.
+    link: Option<String>,
 }
 
 impl RetainedRecipeParameter {
@@ -1499,6 +1714,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1520,6 +1736,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: true,
+            link: None,
         }
     }
 
@@ -1539,6 +1756,7 @@ impl RetainedRecipeParameter {
             read_only_reason: Some("Driven by a model input; edit the owning parameter instead"),
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1566,6 +1784,7 @@ impl RetainedRecipeParameter {
             read_only_reason: None,
             error: None,
             length: false,
+            link: None,
         }
     }
 
@@ -1576,6 +1795,11 @@ impl RetainedRecipeParameter {
             return;
         }
         self.unit = unit.suffix();
+        // A followed entry is written with its units and reads the same in
+        // any unit, so it is shown as it is.
+        if self.link.is_some() {
+            return;
+        }
         if let Some(millimetres) = self.value
             && self.error.is_none()
         {
@@ -1587,6 +1811,11 @@ impl RetainedRecipeParameter {
         matches!(self.domain, ToolNumberDomain::Text)
     }
 
+    /// Whether the value is an angle, shown and read in degrees.
+    fn is_angle(&self) -> bool {
+        self.unit == "°"
+    }
+
     fn view(&self) -> SelectedRecipeParameter {
         SelectedRecipeParameter {
             stable_key: self.stable_key,
@@ -1596,8 +1825,50 @@ impl RetainedRecipeParameter {
             editable: self.value.is_some() || self.is_text(),
             read_only_reason: self.read_only_reason,
             error: self.error,
+            follows_variables: self.link.is_some(),
         }
     }
+
+    /// What an entry typed into this field is read against.
+    fn field_unit(&self, unit: LengthUnit) -> FieldUnit {
+        if self.length {
+            FieldUnit::length(unit.millimetres_per_unit())
+        } else if self.is_angle() {
+            FieldUnit::degrees()
+        } else {
+            FieldUnit::SCALAR
+        }
+    }
+
+    /// A kept entry's value in this field's canonical terms — millimetres,
+    /// degrees, or the number itself — over the named variables.
+    fn evaluate_link(
+        &self,
+        text: &str,
+        names: &BTreeMap<String, NamedQuantity>,
+    ) -> Result<f64, artificer_sketch::expression::ExpressionError> {
+        // A kept entry reads the same in any unit, so millimetres, which
+        // keeps the answer canonical, will do.
+        let value = evaluate_entry(text, self.field_unit(LengthUnit::Millimetre), &|name| {
+            names.get(name).copied()
+        })?;
+        Ok(if self.is_angle() {
+            value.to_degrees()
+        } else {
+            value
+        })
+    }
+}
+
+/// The entry to keep as a field's value link: `Some` when what was typed
+/// names a document variable, written so it reads the same in any unit;
+/// `None` for a plain number, which the recipe keeps on its own.
+fn value_link_for_entry(text: &str, field: FieldUnit) -> Option<String> {
+    let names = artificer_sketch::expression::entry_names(text).ok()?;
+    if names.is_empty() {
+        return None;
+    }
+    artificer_sketch::expression::written_entry(text, field).ok()
 }
 
 #[derive(Clone, Debug)]
@@ -2462,6 +2733,187 @@ fn polygon_driven_diameter(
     }
 }
 
+/// Why a sketch's linked values could not follow the document variables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkedValueError {
+    /// The operation whose recipe field could not follow, or `None` for a
+    /// relation's measurement.
+    pub operation: Option<CoreOperationId>,
+    pub field: String,
+    pub text: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for LinkedValueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the sketch {} that follows {} cannot be set: {}",
+            self.field.replace('_', " "),
+            self.text,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for LinkedValueError {}
+
+/// Works every value link in `authoring` out again over `names` and
+/// replaces each linked recipe with the answer, in operation order.
+///
+/// This is what makes a dimension typed as `width / 2` stay linked to
+/// `width`: whoever owns the variables calls it when one changes, and when
+/// a part is evaluated at new values. Each linked operation is restaged
+/// through the same replacement a typed value would have made — carrying
+/// its joined neighbours when `keep_points_connected` says so — and
+/// committed, so the result is a sketch the canvas itself could have
+/// produced. `Ok(None)` means every linked value already agrees.
+///
+/// A link that no longer reads, names a variable that is not there, comes
+/// to a value its field refuses, or whose replacement the sketch cannot
+/// replay is an error naming the field, and nothing is changed.
+pub fn regenerate_linked_values(
+    authoring: &CoreSketchDefinition,
+    names: &BTreeMap<String, NamedQuantity>,
+    keep_points_connected: bool,
+) -> Result<Option<CoreSketchDefinition>, LinkedValueError> {
+    let mut linked: BTreeMap<CoreOperationId, Vec<(String, String)>> = BTreeMap::new();
+    let mut relations = Vec::new();
+    for link in authoring.value_links() {
+        match &link.target {
+            SketchValueTarget::RecipeField { operation, field } => linked
+                .entry(*operation)
+                .or_default()
+                .push((field.clone(), link.text.clone())),
+            SketchValueTarget::Relation { constraint } => {
+                relations.push((*constraint, link.text.clone()));
+            }
+        }
+    }
+    let mut working = authoring.clone();
+    let mut changed = false;
+    for (operation, links) in linked {
+        let Some(record) = working.operation(operation).filter(|record| record.active) else {
+            continue;
+        };
+        let original = record.recipe.clone();
+        let mut editor = selected_recipe_editor_for(
+            SketchEntityId(0),
+            operation,
+            original.clone(),
+            LengthUnit::Millimetre,
+        );
+        for (field, text) in &links {
+            let refuse = |reason: String| LinkedValueError {
+                operation: Some(operation),
+                field: field.clone(),
+                text: text.clone(),
+                reason,
+            };
+            let Some(parameter) = editor
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.stable_key == field.as_str())
+                .filter(|parameter| parameter.value.is_some())
+            else {
+                return Err(refuse("the recipe no longer has that value".to_owned()));
+            };
+            let value = parameter
+                .evaluate_link(text, names)
+                .map_err(|error| refuse(error.to_string()))
+                .and_then(|value| {
+                    validate_tool_value(value, parameter.domain)
+                        .map_err(|error| refuse(error.label().to_owned()))
+                })?;
+            parameter.value = Some(value);
+        }
+        let refuse = |reason: &str| LinkedValueError {
+            operation: Some(operation),
+            field: links[0].0.clone(),
+            text: links[0].1.clone(),
+            reason: reason.to_owned(),
+        };
+        let recipe = rebuilt_selected_recipe(&editor)
+            .map_err(|()| refuse("the value does not fit the recipe"))?;
+        if recipe == original {
+            continue;
+        }
+        let inputs = Default::default();
+        let precision = PrecisionPolicy::default();
+        let label = "Follow variables";
+        let transaction = if keep_points_connected {
+            working.stage_replace_pulling_followers(operation, recipe, label, &inputs, precision)
+        } else {
+            working.stage_replace(operation, recipe, label, &inputs, precision)
+        }
+        .map_err(|_| refuse("the sketch cannot be rebuilt with it"))?;
+        working
+            .commit(transaction, CoreConfirmationSource::GreenTick)
+            .map_err(|_| refuse("the sketch cannot be rebuilt with it"))?;
+        changed = true;
+    }
+    // Relations are solved over what the recipes place, so they follow
+    // after them, each restated the way retyping its dimension would.
+    for (constraint, text) in relations {
+        let Some(kind) = working
+            .constraints()
+            .get(&constraint)
+            .map(|record| record.kind.clone())
+        else {
+            continue;
+        };
+        let refuse = |reason: String| LinkedValueError {
+            operation: None,
+            field: "distance".to_owned(),
+            text: text.clone(),
+            reason,
+        };
+        let value = evaluate_entry(&text, FieldUnit::length(1.0), &|name| {
+            names.get(name).copied()
+        })
+        .map_err(|error| refuse(error.to_string()))?;
+        let value =
+            relation_measurement(value).map_err(|error| refuse(error.label().to_owned()))?;
+        let transaction = match working.stage_relation_measurement(
+            constraint,
+            value,
+            relation_held_point(&kind),
+            "Follow variables",
+            PrecisionPolicy::default(),
+        ) {
+            Ok(transaction) => transaction,
+            Err(artificer_sketch::SketchTransactionError::NoChange) => continue,
+            Err(error) => return Err(refuse(error.to_string())),
+        };
+        working
+            .commit(transaction, CoreConfirmationSource::GreenTick)
+            .map_err(|error| refuse(error.to_string()))?;
+        changed = true;
+    }
+    Ok(changed.then_some(working))
+}
+
+/// The end a retyped relation holds still: a distance between two points is
+/// measured from its first, as its dimension box does; a distance measured
+/// from an edge holds that edge itself, whatever is named here.
+fn relation_held_point(kind: &CoreConstraintKind) -> Option<CorePointId> {
+    match *kind {
+        CoreConstraintKind::Distance { first, .. } => Some(first),
+        _ => kind.referenced_points().first().copied(),
+    }
+}
+
+/// A relation's measurement as its dimension box would take it.
+fn relation_measurement(value: f64) -> Result<f64, DimensionInputError> {
+    if !value.is_finite() {
+        Err(DimensionInputError::NonFinite)
+    } else if value <= MIN_ENTITY_LENGTH {
+        Err(DimensionInputError::NonPositive)
+    } else {
+        Ok(value)
+    }
+}
+
 fn rebuilt_selected_recipe(editor: &SelectedRecipeEditor) -> Result<CoreRecipe, ()> {
     let mut recipe = editor.original_recipe.clone();
     match &mut recipe {
@@ -2929,6 +3381,7 @@ struct DimensionEditOriginal {
     geometry: SketchGeometry,
     fields: Vec<DimensionField>,
     three_point_arc: Option<ThreePointArcConstraint>,
+    links: Vec<(SketchDimensionKind, String)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2951,12 +3404,19 @@ struct DimensionSession {
     focus_next_frame: bool,
     serial: u64,
     three_point_arc: Option<ThreePointArcConstraint>,
+    /// The entries typed over document variables, by the dimension they
+    /// were typed into, written with their units. They become value links
+    /// on the operation the draft stages, where a field of it states the
+    /// same value.
+    links: Vec<(SketchDimensionKind, String)>,
 }
 
 impl DimensionSession {
     fn from_geometry(target: DimensionTarget, geometry: SketchGeometry, serial: u64) -> Self {
         let phase = match geometry {
-            SketchGeometry::Point(_) => DimensionPhase::Point,
+            // A spline has no typed dimensions of its own yet: the point
+            // phase offers none for it.
+            SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => DimensionPhase::Point,
             SketchGeometry::Segment { .. } => DimensionPhase::Line,
             SketchGeometry::Rectangle { .. } => DimensionPhase::Rectangle,
             SketchGeometry::Circle { .. } => DimensionPhase::Circle,
@@ -3015,6 +3475,7 @@ impl DimensionSession {
             focus_next_frame: false,
             serial,
             three_point_arc: None,
+            links: Vec::new(),
         }
     }
 
@@ -3283,6 +3744,7 @@ impl DimensionSession {
             geometry: self.geometry,
             fields: self.fields.clone(),
             three_point_arc: self.three_point_arc,
+            links: self.links.clone(),
         });
         self.error = None;
         self.focus_next_frame = true;
@@ -3341,6 +3803,15 @@ impl DimensionSession {
             self.fields = previous_fields;
             return Err(error);
         }
+        let field = if kind.is_angle() {
+            FieldUnit::degrees()
+        } else {
+            FieldUnit::length(entry.unit.millimetres_per_unit())
+        };
+        self.links.retain(|(linked, _)| *linked != kind);
+        if let Some(link) = value_link_for_entry(&self.buffer, field) {
+            self.links.push((kind, link));
+        }
         self.error = None;
         Ok(())
     }
@@ -3361,6 +3832,7 @@ impl DimensionSession {
         self.geometry = original.geometry;
         self.fields = original.fields;
         self.three_point_arc = original.three_point_arc;
+        self.links = original.links;
         self.active = None;
         self.buffer.clear();
         self.error = None;
@@ -3396,6 +3868,7 @@ impl DimensionSession {
             return;
         }
         self.geometry = match self.geometry {
+            spline @ SketchGeometry::Spline { .. } => spline,
             SketchGeometry::Point(_) => SketchGeometry::point(SketchPoint::new(
                 self.value(SketchDimensionKind::U),
                 self.value(SketchDimensionKind::V),
@@ -3626,7 +4099,7 @@ fn dimension_fields_for_geometry(
 
 fn dimension_phase_for_geometry(geometry: SketchGeometry) -> DimensionPhase {
     match geometry {
-        SketchGeometry::Point(_) => DimensionPhase::Point,
+        SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => DimensionPhase::Point,
         SketchGeometry::Segment { .. } => DimensionPhase::Line,
         SketchGeometry::Rectangle { .. } => DimensionPhase::Rectangle,
         SketchGeometry::Circle { .. } => DimensionPhase::Circle,
@@ -3655,201 +4128,52 @@ fn dimension_phase_accepts_geometry(phase: DimensionPhase, geometry: SketchGeome
     )
 }
 
-/// Evaluates a plain arithmetic entry over named document variables.
-///
-/// The grammar mirrors the parametric table's textual form minus units:
-/// numbers, names, `+ - * /`, parentheses, unary minus. Everything here is a
-/// bare magnitude — lengths in millimetres — because that is what dimension
-/// fields hold. Returns `None` for anything that fails to parse or divide.
-fn evaluate_named_expression(text: &str, names: &BTreeMap<String, f64>) -> Option<f64> {
-    struct Evaluator<'entry> {
-        tokens: Vec<NamedToken>,
-        cursor: usize,
-        names: &'entry BTreeMap<String, f64>,
-    }
-    #[derive(Clone, Debug, PartialEq)]
-    enum NamedToken {
-        Number(f64),
-        Name(String),
-        Plus,
-        Minus,
-        Star,
-        Slash,
-        Open,
-        Close,
-    }
-    fn tokenize(text: &str) -> Option<Vec<NamedToken>> {
-        let mut tokens = Vec::new();
-        let mut characters = text.chars().peekable();
-        while let Some(&character) = characters.peek() {
-            match character {
-                ' ' | '\t' => {
-                    characters.next();
-                }
-                '+' => {
-                    characters.next();
-                    tokens.push(NamedToken::Plus);
-                }
-                '-' => {
-                    characters.next();
-                    tokens.push(NamedToken::Minus);
-                }
-                '*' => {
-                    characters.next();
-                    tokens.push(NamedToken::Star);
-                }
-                '/' => {
-                    characters.next();
-                    tokens.push(NamedToken::Slash);
-                }
-                '(' => {
-                    characters.next();
-                    tokens.push(NamedToken::Open);
-                }
-                ')' => {
-                    characters.next();
-                    tokens.push(NamedToken::Close);
-                }
-                '0'..='9' | '.' => {
-                    let mut digits = String::new();
-                    while let Some(&digit) = characters.peek() {
-                        if digit.is_ascii_digit() || digit == '.' {
-                            digits.push(digit);
-                            characters.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    // An exponent: `1e3`, `2.5E-2`. The `e` belongs to the
-                    // number only when a digit follows it, directly or after
-                    // one sign; otherwise it starts a name as it always did.
-                    if let Some(&marker) = characters.peek()
-                        && matches!(marker, 'e' | 'E')
-                    {
-                        let mut ahead = characters.clone();
-                        ahead.next();
-                        let sign = ahead.next_if(|piece| *piece == '+' || *piece == '-');
-                        if ahead.peek().is_some_and(char::is_ascii_digit) {
-                            digits.push(marker);
-                            characters.next();
-                            if let Some(sign) = sign {
-                                digits.push(sign);
-                                characters.next();
-                            }
-                            while let Some(&piece) = characters.peek() {
-                                if piece.is_ascii_digit() {
-                                    digits.push(piece);
-                                    characters.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    tokens.push(NamedToken::Number(digits.parse().ok()?));
-                }
-                letter if letter.is_alphabetic() || letter == '_' => {
-                    let mut name = String::new();
-                    while let Some(&piece) = characters.peek() {
-                        if piece.is_alphanumeric() || piece == '_' {
-                            name.push(piece);
-                            characters.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    tokens.push(NamedToken::Name(name));
-                }
-                _ => return None,
-            }
-        }
-        Some(tokens)
-    }
-    impl Evaluator<'_> {
-        fn expression(&mut self) -> Option<f64> {
-            let mut left = self.term()?;
-            loop {
-                match self.tokens.get(self.cursor) {
-                    Some(NamedToken::Plus) => {
-                        self.cursor += 1;
-                        left += self.term()?;
-                    }
-                    Some(NamedToken::Minus) => {
-                        self.cursor += 1;
-                        left -= self.term()?;
-                    }
-                    _ => return Some(left),
-                }
-            }
-        }
-        fn term(&mut self) -> Option<f64> {
-            let mut left = self.factor()?;
-            loop {
-                match self.tokens.get(self.cursor) {
-                    Some(NamedToken::Star) => {
-                        self.cursor += 1;
-                        left *= self.factor()?;
-                    }
-                    Some(NamedToken::Slash) => {
-                        self.cursor += 1;
-                        let divisor = self.factor()?;
-                        left /= divisor;
-                    }
-                    _ => return Some(left),
-                }
-            }
-        }
-        fn factor(&mut self) -> Option<f64> {
-            let token = self.tokens.get(self.cursor)?.clone();
-            self.cursor += 1;
-            match token {
-                NamedToken::Minus => Some(-self.factor()?),
-                NamedToken::Plus => self.factor(),
-                NamedToken::Number(value) => Some(value),
-                NamedToken::Name(name) => self.names.get(&name).copied(),
-                NamedToken::Open => {
-                    let inner = self.expression()?;
-                    match self.tokens.get(self.cursor) {
-                        Some(NamedToken::Close) => {
-                            self.cursor += 1;
-                            Some(inner)
-                        }
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }
-        }
-    }
-    let tokens = tokenize(text)?;
-    // A bare number is not this evaluator's business, and an entry with no
-    // name in it gains nothing from it either; requiring a name keeps plain
-    // typo'd numbers reporting "not a number" rather than evaluating oddly.
-    if !tokens
-        .iter()
-        .any(|token| matches!(token, NamedToken::Name(_)))
-    {
-        return None;
-    }
-    let mut evaluator = Evaluator {
-        tokens,
-        cursor: 0,
-        names,
-    };
-    let value = evaluator.expression()?;
-    (evaluator.cursor == evaluator.tokens.len() && value.is_finite()).then_some(value)
+/// Evaluates an entry that names document variables, with the grammar every
+/// numeric field shares ([`artificer_sketch::expression`]), for a field of
+/// `field`'s unit. The answer is canonical — millimetres for a length,
+/// radians for an angle, the number itself otherwise — and `None` stands for
+/// an entry that does not read, names nothing defined, or mixes units.
+fn evaluate_named_expression(
+    text: &str,
+    names: &BTreeMap<String, NamedQuantity>,
+    field: FieldUnit,
+) -> Option<f64> {
+    evaluate_entry(text, field, &|name| names.get(name).copied()).ok()
+}
+
+/// Reads a length entry: a number in `unit` or in the unit it carries, or an
+/// expression over named variables whose bare terms are in `unit`. Returns
+/// millimetres.
+fn parse_length_entry(
+    unit: LengthUnit,
+    text: &str,
+    names: &BTreeMap<String, NamedQuantity>,
+) -> Result<f64, LengthParseError> {
+    unit.parse_entry(text, |text| {
+        evaluate_named_expression(text, names, FieldUnit::length(unit.millimetres_per_unit()))
+    })
+}
+
+/// Reads an angle entry in degrees: a plain number, or an expression over
+/// named variables whose bare terms are degrees — an angle variable counts
+/// as the angle it is, whatever unit it was defined in. Returns degrees.
+fn parse_degrees_entry(text: &str, names: &BTreeMap<String, NamedQuantity>) -> Option<f64> {
+    let text = text.trim();
+    text.parse::<f64>().ok().or_else(|| {
+        evaluate_named_expression(text, names, FieldUnit::degrees()).map(f64::to_degrees)
+    })
 }
 
 /// What a typed dimension is read against: the document variables it may
 /// name, and the unit a bare length is in.
 #[derive(Clone, Copy)]
 struct DimensionEntry<'a> {
-    names: &'a BTreeMap<String, f64>,
+    names: &'a BTreeMap<String, NamedQuantity>,
     unit: LengthUnit,
 }
 
 #[cfg(test)]
-static NO_NAMED_VALUES: BTreeMap<String, f64> = BTreeMap::new();
+static NO_NAMED_VALUES: BTreeMap<String, NamedQuantity> = BTreeMap::new();
 
 #[cfg(test)]
 impl DimensionEntry<'static> {
@@ -3874,14 +4198,9 @@ fn parse_dimension_value(
     // An angle is degrees, typed or computed. A length is read in the
     // entry's unit, or the unit it carries, and comes back in millimetres.
     let value = if kind.is_angle() {
-        text.parse::<f64>().map_or_else(
-            |_| evaluate_named_expression(text, entry.names).ok_or(DimensionInputError::NotANumber),
-            Ok,
-        )?
+        parse_degrees_entry(text, entry.names).ok_or(DimensionInputError::NotANumber)?
     } else {
-        entry
-            .unit
-            .parse_entry(text, |text| evaluate_named_expression(text, entry.names))
+        parse_length_entry(entry.unit, text, entry.names)
             .map_err(|_| DimensionInputError::NotANumber)?
     };
     if !value.is_finite() {
@@ -4060,6 +4379,7 @@ fn sketch_insert_label(entity: SketchEntity) -> &'static str {
         SketchGeometry::Rectangle { .. } => "Add sketch rectangle",
         SketchGeometry::Circle { .. } => "Add sketch circle",
         SketchGeometry::Arc { .. } => "Add sketch arc",
+        SketchGeometry::Spline { .. } => "Add spline",
     }
 }
 
@@ -4070,6 +4390,9 @@ const fn core_point(point: SketchPoint) -> CorePoint2 {
 fn core_recipe_for_entity(entity: SketchEntity) -> Option<CoreRecipe> {
     let point_input = |point| CorePointInput::Position(core_point(point));
     match entity.geometry {
+        // A spline is only ever staged from its own recipe; its drawn
+        // outline is not a definition to rebuild one from.
+        SketchGeometry::Spline { .. } => None,
         SketchGeometry::Point(position) => Some(CoreRecipe::Point {
             position: core_point(position),
         }),
@@ -4393,13 +4716,18 @@ fn legacy_geometry_from_core(curve: CoreEvaluatedCurve2) -> SketchGeometry {
             let center = point(center);
             SketchGeometry::circle(center, SketchPoint::new(center.u + radius, center.v))
         }
-        CoreEvaluatedCurve2::Bspline { control_points, .. } => {
+        ref spline @ CoreEvaluatedCurve2::Bspline {
+            ref control_points, ..
+        } => {
             let start = control_points
                 .first()
                 .map(|p| point(*p))
                 .unwrap_or_default();
             let end = control_points.last().map(|p| point(*p)).unwrap_or_default();
-            SketchGeometry::segment(start, end)
+            match SplineShape::of(spline) {
+                Some(shape) => SketchGeometry::Spline { start, end, shape },
+                None => SketchGeometry::segment(start, end),
+            }
         }
     }
 }
@@ -4829,6 +5157,10 @@ pub struct PendingSketchEdit {
     /// beside a red original, because accepting the typed value is the
     /// commit. Only the selected-feature parameter editor stages one.
     in_place: bool,
+    /// Entries the draft's dimension boxes were typed as over document
+    /// variables, to link on the operation this edit inserts when it is
+    /// confirmed.
+    draft_links: Vec<(SketchDimensionKind, String)>,
 }
 
 struct PendingCorePresentation {
@@ -5402,7 +5734,13 @@ pub struct SketchCanvasState {
     /// (millimetres for lengths). Dimension and recipe fields accept these
     /// names in arithmetic entries: `width`, `width / 2 + 5`. The workbench
     /// refreshes the map from the document's parameter table.
-    named_values: BTreeMap<String, f64>,
+    named_values: BTreeMap<String, NamedQuantity>,
+    /// The named values changed while an edit was pending, so the values
+    /// that follow them are still to be worked out again.
+    linked_values_stale: bool,
+    /// Why the values that follow the named values could not, the last
+    /// time they were worked out again.
+    linked_value_issue: Option<LinkedValueError>,
 }
 
 impl Default for SketchCanvasState {
@@ -5455,6 +5793,8 @@ impl Default for SketchCanvasState {
             last_context_fit_key: None,
             support_curves: Vec::new(),
             named_values: BTreeMap::new(),
+            linked_values_stale: false,
+            linked_value_issue: None,
         }
     }
 }
@@ -5567,6 +5907,8 @@ impl SketchCanvasState {
             let _ = self.rebuild_presentation_from_authoring();
             return false;
         }
+        // What was restored followed the variables as they were then.
+        self.linked_values_stale = !self.authoring.value_links().is_empty();
         true
     }
 
@@ -5582,6 +5924,7 @@ impl SketchCanvasState {
             let _ = self.rebuild_presentation_from_authoring();
             return false;
         }
+        self.linked_values_stale = !self.authoring.value_links().is_empty();
         true
     }
 
@@ -5628,10 +5971,10 @@ impl SketchCanvasState {
             u8::try_from(self.exact_tool.descriptor().acquisition_phases.len()).unwrap_or(u8::MAX);
         let completed_points = if self.pending.is_some() {
             required_points
-        } else if self.exact_tool == ToolVariant::ChainedPolyline {
+        } else if self.exact_tool == ToolVariant::ChainedPolyline || self.draws_a_spline() {
             // A polyline's second acquisition phase is intentionally
-            // repeatable. Keep the palette on that phase until the complete
-            // local chain is staged as one operation.
+            // repeatable, and so is a spline's. Keep the palette on that
+            // phase until the complete local chain is staged as one operation.
             u8::from(!self.polyline_vertices.is_empty())
         } else if matches!(
             self.exact_tool,
@@ -6012,26 +6355,92 @@ impl SketchCanvasState {
 
     /// Publishes the document's evaluated variables for numeric entries: a
     /// dimension box or recipe field can then name them in arithmetic, so a
-    /// rectangle's width can be `plate_width / 2`. Lengths arrive in the
-    /// canvas's length unit, so that arithmetic means what a typed number
-    /// beside it means; angles are degrees.
-    pub fn set_named_values(&mut self, values: BTreeMap<String, f64>) {
+    /// rectangle's width can be `plate_width / 2`. Each value is canonical —
+    /// millimetres for a length, radians for an angle — and says what it
+    /// measures, so an angle variable in an angle box reads as the angle it
+    /// is and a length in an angle box is refused rather than misread.
+    ///
+    /// Values typed over them keep following them (ADR 0054): when they
+    /// change, every linked recipe is worked out again, as soon as no edit is
+    /// pending. Returns whether the sketch's geometry changed.
+    pub fn set_named_values(&mut self, values: BTreeMap<String, NamedQuantity>) -> bool {
         if self.named_values != values {
             self.named_values = values;
+            self.linked_values_stale = !self.authoring.value_links().is_empty();
         }
+        if self.linked_values_stale && self.pending.is_none() {
+            self.linked_values_stale = false;
+            return self.follow_named_values();
+        }
+        false
     }
 
-    /// Evaluates one numeric entry over the published document variables —
-    /// the same arithmetic the dimension boxes accept. A bare number, or an
-    /// expression's answer, is in the canvas's length unit; a suffix names
-    /// its own unit; millimetres come back.
+    /// Works the linked values out again at the current named values and
+    /// shows the result, keeping the selection on the operation it was on.
+    /// A value that cannot follow leaves the sketch as it was and is
+    /// reported by [`Self::linked_value_issue`].
+    fn follow_named_values(&mut self) -> bool {
+        let followed = match regenerate_linked_values(
+            &self.authoring,
+            &self.named_values,
+            self.snap.keep_points_connected,
+        ) {
+            Ok(Some(followed)) => followed,
+            Ok(None) => {
+                self.linked_value_issue = None;
+                return false;
+            }
+            Err(error) => {
+                self.linked_value_issue = Some(error);
+                return false;
+            }
+        };
+        let selected_operation = self
+            .selected
+            .and_then(|selected| self.operation_by_ui.get(&selected).copied());
+        let previous = std::mem::replace(&mut self.authoring, followed);
+        if self.rebuild_presentation_from_authoring().is_err() {
+            self.authoring = previous;
+            let _ = self.rebuild_presentation_from_authoring();
+            return false;
+        }
+        self.linked_value_issue = None;
+        if let Some(operation) = selected_operation
+            && let Some(entity) = self
+                .operation_by_ui
+                .iter()
+                .find_map(|(entity, owner)| (*owner == operation).then_some(*entity))
+        {
+            self.set_selected(Some(entity));
+        }
+        true
+    }
+
+    /// Why the values that follow the named values could not follow them
+    /// the last time they changed, if they could not.
+    #[must_use]
+    pub const fn linked_value_issue(&self) -> Option<&LinkedValueError> {
+        self.linked_value_issue.as_ref()
+    }
+
+    /// Renames a named value wherever this sketch's values follow it, as the
+    /// document does when a variable is renamed. Returns whether anything
+    /// changed.
+    pub fn rename_named_value(&mut self, from: &str, to: &str) -> bool {
+        if !self.authoring.rename_in_value_links(from, to) {
+            return false;
+        }
+        self.rebuild_selected_recipe_editor();
+        true
+    }
+
+    /// Evaluates one length entry over the published document variables —
+    /// the same arithmetic the dimension boxes accept. A bare number, or a
+    /// bare term in an expression, is in the canvas's length unit; a suffix
+    /// names its own unit; millimetres come back.
     #[must_use]
     pub fn evaluate_value_entry(&self, text: &str) -> Option<f64> {
-        self.length_unit
-            .parse_entry(text, |text| {
-                evaluate_named_expression(text, &self.named_values)
-            })
-            .ok()
+        parse_length_entry(self.length_unit, text, &self.named_values).ok()
     }
 
     /// Publishes the sketch support's analytic curves as snap references.
@@ -6054,6 +6463,19 @@ impl SketchCanvasState {
             .copied()
             .filter(|curve| curve.is_finite())
             .collect();
+        // The face's boundary closes regions too: the face minus what was
+        // drawn is a region a user can pick and extrude, and the sketch's
+        // own definition carries the boundary so a replay closes the same
+        // regions the canvas did.
+        let evaluated = self
+            .support_curves
+            .iter()
+            .filter_map(SketchContextCurve::evaluated)
+            .collect::<Vec<_>>();
+        if self.authoring.set_support_curves(evaluated) {
+            self.analytic_regions.revision = None;
+            self.refresh_analytic_regions();
+        }
     }
 
     #[must_use]
@@ -6275,7 +6697,7 @@ impl SketchCanvasState {
         let old_selected = std::mem::take(&mut self.analytic_regions.selected);
         let old_anchors = std::mem::take(&mut self.analytic_regions.selection_anchors);
         let precision = PrecisionPolicy::default();
-        let arrangement = self
+        let mut arrangement = self
             .authoring
             .arrangement_inputs()
             .ok()
@@ -6283,6 +6705,12 @@ impl SketchCanvasState {
             .unwrap_or_else(|| {
                 build_arrangement(&[], &precision, CoreArrangementLimits::default())
             });
+        // The face's outline and its hole rims close regions alongside the
+        // strokes, so "the face minus what was drawn" is a region that can be
+        // picked. A cell bounded by support curves alone is the host's own
+        // face with nothing drawn across it, and is not a region of the
+        // sketch at all.
+        arrangement.cells.retain(|cell| !cell.is_support_only());
         let boundary_tolerance = precision
             .linear_agreement
             .max(precision.modeling_resolution);
@@ -6308,9 +6736,28 @@ impl SketchCanvasState {
             }
         }
         let mut explicit = self.analytic_regions.explicit && !selected.is_empty();
+        // One region closed by strokes alone is what the user drew, and is
+        // taken unasked. A region the face's own boundary helps close is
+        // offered, never assumed: a rectangle on a face makes two cells, the
+        // rectangle and the face around it, and the rectangle is the one
+        // meant.
+        let drawn = arrangement
+            .cells
+            .iter()
+            .filter(|cell| !cell.touches_support())
+            .count();
+        let sole = if drawn == 1 {
+            arrangement
+                .cells
+                .iter()
+                .find(|cell| !cell.touches_support())
+        } else if arrangement.cells.len() == 1 {
+            arrangement.cells.first()
+        } else {
+            None
+        };
         if selected.is_empty()
-            && arrangement.cells.len() == 1
-            && let Some(cell) = arrangement.cells.first()
+            && let Some(cell) = sole
         {
             selected.insert(cell.signature.clone());
             if let Some(anchor) = arrangement.cell_interior_sample(cell, &precision) {
@@ -6449,12 +6896,18 @@ impl SketchCanvasState {
                     .map(|record| record.provenance.operation)
             })?;
             let recipe = self.authoring.operation(operation)?.recipe.clone();
-            Some(selected_recipe_editor_for(
-                subject,
-                operation,
-                recipe,
-                self.length_unit,
-            ))
+            let mut editor =
+                selected_recipe_editor_for(subject, operation, recipe, self.length_unit);
+            // A value that follows variables shows the entry it follows.
+            for parameter in &mut editor.parameters {
+                if parameter.value.is_some()
+                    && let Some(text) = self.authoring.value_link(operation, parameter.stable_key)
+                {
+                    parameter.text = text.to_owned();
+                    parameter.link = Some(text.to_owned());
+                }
+            }
+            Some(editor)
         });
     }
 
@@ -6576,14 +7029,17 @@ impl SketchCanvasState {
             // length is read in the document unit, or the unit it carries,
             // and judged in millimetres.
             let evaluated = if parameter.length {
-                unit.parse_entry(&parameter.text, |text| {
-                    evaluate_named_expression(text, named_values)
-                })
-                .map_err(tool_input_error_for_length)
-                .and_then(|millimetres| validate_tool_value(millimetres, domain))
+                parse_length_entry(unit, &parameter.text, named_values)
+                    .map_err(tool_input_error_for_length)
+                    .and_then(|millimetres| validate_tool_value(millimetres, domain))
             } else {
                 validate_tool_number(&parameter.text, domain).or_else(|error| {
-                    evaluate_named_expression(&parameter.text, named_values)
+                    let named = if parameter.is_angle() {
+                        parse_degrees_entry(&parameter.text, named_values)
+                    } else {
+                        evaluate_named_expression(&parameter.text, named_values, FieldUnit::SCALAR)
+                    };
+                    named
                         .ok_or(error)
                         .and_then(|value| validate_tool_value(value, domain))
                 })
@@ -6591,6 +7047,10 @@ impl SketchCanvasState {
             match evaluated {
                 Ok(value) => {
                     parameter.value = Some(value);
+                    // Typed over a variable, the value keeps following it;
+                    // a plain number is a plain number again.
+                    parameter.link =
+                        value_link_for_entry(&parameter.text, parameter.field_unit(unit));
                     Some(value)
                 }
                 Err(error) => {
@@ -6603,10 +7063,22 @@ impl SketchCanvasState {
         let recipe = rebuilt_selected_recipe(self.selected_recipe_editor.as_ref()?).ok()?;
         // Typing an angle or a length is as deliberate as dragging the same
         // endpoint would have been, so it carries its joined neighbours the
-        // same way.
+        // same way. The fields' links ride in the same edit, so they are
+        // confirmed, cancelled and undone with the values they produced.
         let transaction = self
             .stage_deliberate_replacement(operation, recipe, "Edit sketch parameters")
-            .ok();
+            .ok()
+            .and_then(|mut transaction| {
+                let editor = self.selected_recipe_editor.as_ref()?;
+                for parameter in &editor.parameters {
+                    if parameter.value.is_some() {
+                        transaction
+                            .set_value_link(operation, parameter.stable_key, parameter.link.clone())
+                            .ok()?;
+                    }
+                }
+                Some(transaction)
+            });
         let Some(transaction) = transaction else {
             let editor = self.selected_recipe_editor.as_mut()?;
             let parameter = editor
@@ -6899,6 +7371,7 @@ impl SketchCanvasState {
             core_entities: vec![None],
             retired_entities: Vec::new(),
             in_place: false,
+            draft_links: Vec::new(),
         });
         let existing_draft = self.dimension_session.take().filter(|session| {
             session.target == DimensionTarget::Draft
@@ -7024,6 +7497,7 @@ impl SketchCanvasState {
             core_entities,
             retired_entities,
             in_place,
+            draft_links: Vec::new(),
         });
         self.dimension_session = None;
         self.refresh_profile_analysis();
@@ -7213,6 +7687,18 @@ impl SketchCanvasState {
         let coincidences = self.auto_coincidences(&transaction);
         if !coincidences.is_empty() {
             let _ = transaction.append_constraints(coincidences);
+        }
+        // A drafted insertion keeps following the variables its boxes were
+        // typed over. The boxes may still be open on the pending geometry,
+        // in which case they say last what was typed.
+        if !pending.in_place {
+            let links = match &self.dimension_session {
+                Some(session) if session.target == DimensionTarget::Pending(subject) => {
+                    session.links.clone()
+                }
+                _ => pending.draft_links.clone(),
+            };
+            link_draft_values(&mut transaction, &links, &self.named_values);
         }
         let inserted_core_entities = transaction
             .impact()
@@ -7507,6 +7993,176 @@ impl SketchCanvasState {
         )?;
         self.clear_creation_draft();
         Ok(subject)
+    }
+
+    /// Whether the active tool draws a spline, through fit points or on a
+    /// control polygon. Its accepted points share the polyline's store: one
+    /// tool is live at a time, and clearing a draft clears either.
+    #[must_use]
+    pub const fn draws_a_spline(&self) -> bool {
+        matches!(
+            self.exact_tool,
+            ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline
+        )
+    }
+
+    /// Whether the spline being drawn has points enough to finish.
+    #[must_use]
+    pub fn spline_draft_can_finish(&self) -> bool {
+        self.draws_a_spline() && self.pending.is_none() && self.polyline_vertices.len() >= 2
+    }
+
+    /// Stages the spline drawn so far as one exact recipe, left open.
+    pub fn finish_spline_draft(&mut self) -> Result<SketchEntityId, SketchEditError> {
+        self.stage_spline_draft(false)
+    }
+
+    /// The degree a spline through `count` points is drawn at: cubic when
+    /// there are points enough, and as high as they allow when there are not.
+    const fn spline_degree(count: usize) -> usize {
+        if count > 3 {
+            3
+        } else if count > 1 {
+            count - 1
+        } else {
+            1
+        }
+    }
+
+    fn spline_recipe(&self, points: &[SketchPoint], closed: bool) -> Option<CoreRecipe> {
+        let inputs = points
+            .iter()
+            .copied()
+            .map(|point| CorePointInput::Position(core_point(point)))
+            .collect::<Vec<_>>();
+        match self.exact_tool {
+            ToolVariant::FitPointSpline => Some(CoreRecipe::FitPointSpline {
+                degree: Self::spline_degree(points.len() + usize::from(closed)),
+                fit_points: inputs,
+                closed,
+            }),
+            ToolVariant::ControlVertexSpline => {
+                // A closed polygon returns to its first vertex, which the
+                // recipe adds; the knots are for the polygon as closed.
+                let count = points.len() + usize::from(closed);
+                let degree = Self::spline_degree(count);
+                Some(CoreRecipe::ControlVertexSpline {
+                    control_points: inputs,
+                    degree,
+                    knots: artificer_sketch::clamped_uniform_knots(count, degree),
+                    weights: None,
+                    closed,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn stage_spline_draft(&mut self, closed: bool) -> Result<SketchEntityId, SketchEditError> {
+        if !self.draws_a_spline() {
+            return Err(SketchEditError::NoPendingEdit);
+        }
+        let minimum = if closed { 3 } else { 2 };
+        if self.polyline_vertices.len() < minimum {
+            return Err(SketchEditError::DegenerateGeometry);
+        }
+        let points = self.polyline_vertices.clone();
+        let recipe = self
+            .spline_recipe(&points, closed)
+            .ok_or(SketchEditError::NoPendingEdit)?;
+        let subject = self.stage_recipe(recipe, "Add spline")?;
+        self.clear_creation_draft();
+        Ok(subject)
+    }
+
+    /// Takes one click of a spline: a new point, or — on the first point,
+    /// with three or more down — the close that finishes it as a loop.
+    fn accept_spline_point(&mut self, pointer: SketchPoint) -> Option<SketchEntityId> {
+        if self.pending.is_some() || !self.draws_a_spline() {
+            return None;
+        }
+        if self.polyline_vertices.len() >= 3
+            && polyline_points_coincident(pointer, self.polyline_vertices[0])
+        {
+            return self.stage_spline_draft(true).ok();
+        }
+        if self
+            .polyline_vertices
+            .iter()
+            .any(|existing| polyline_points_coincident(*existing, pointer))
+        {
+            return None;
+        }
+        self.polyline_vertices.push(pointer);
+        None
+    }
+
+    fn finish_spline_at_pointer(&mut self, point: SketchPoint) -> Option<SketchEntityId> {
+        // As with a chain, the first click of a double-click has already
+        // placed this point; take one here only if there are too few.
+        if self.polyline_vertices.len() < 2
+            && let Some(subject) = self.accept_spline_point(point)
+        {
+            return Some(subject);
+        }
+        self.finish_spline_draft().ok()
+    }
+
+    /// The spline a tool would draw through its points and `pointer`, for
+    /// the preview. A control-vertex spline shows its clamped curve.
+    fn spline_preview_curve(&self, pointer: Option<SketchPoint>) -> Option<CoreEvaluatedCurve2> {
+        if !self.draws_a_spline() {
+            return None;
+        }
+        let mut points = self
+            .polyline_vertices
+            .iter()
+            .copied()
+            .map(core_point)
+            .collect::<Vec<_>>();
+        if let Some(pointer) = pointer
+            && !self
+                .polyline_vertices
+                .iter()
+                .any(|existing| polyline_points_coincident(*existing, pointer))
+        {
+            points.push(core_point(pointer));
+        }
+        if points.len() < 2 {
+            return None;
+        }
+        let degree = Self::spline_degree(points.len());
+        match self.exact_tool {
+            ToolVariant::FitPointSpline => {
+                artificer_sketch::fit_point_spline_curve(&points, degree, false).ok()
+            }
+            ToolVariant::ControlVertexSpline => Some(CoreEvaluatedCurve2::Bspline {
+                knots: artificer_sketch::clamped_uniform_knots(points.len(), degree),
+                control_points: points,
+                degree,
+                weights: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Escape abandons a spline being drawn; the sketch is left as it was.
+    fn cancel_spline_layer(&mut self) -> bool {
+        if self.pending.is_some() || !self.draws_a_spline() || self.polyline_vertices.is_empty() {
+            return false;
+        }
+        self.clear_creation_draft();
+        true
+    }
+
+    /// Backspace takes back the last point of a spline being drawn.
+    fn backspace_spline_point(&mut self) -> bool {
+        if self.pending.is_some() || !self.draws_a_spline() || self.polyline_vertices.is_empty() {
+            return false;
+        }
+        self.polyline_vertices.pop();
+        self.pointer_preview = None;
+        true
     }
 
     fn begin_polyline_segment(&mut self, start: SketchPoint) {
@@ -7879,6 +8535,7 @@ impl SketchCanvasState {
                 SketchGeometry::Rectangle { .. } => result.closed_rectangles += 1,
                 SketchGeometry::Circle { .. } => result.closed_circles += 1,
                 SketchGeometry::Arc { .. } => result.open_arcs += 1,
+                SketchGeometry::Spline { .. } => result.open_segments += 1,
             }
         }
         let diagnostics = self.profile_analysis.diagnostics;
@@ -8053,6 +8710,27 @@ impl SketchCanvasState {
         self.certified_profile = analysis.status;
         self.profile_analysis = analysis;
         self.refresh_analytic_regions();
+        // The certified path draws its loops from lines, arcs and circles, so
+        // a sketch with a spline in it is read from the exact arrangement
+        // instead, which bounds regions with splines as it does with any
+        // other curve: closed where it has cells, open where it has none.
+        if self.certified_profile == CertifiedProfileStatus::CurvesNeedCertification
+            && let Some(arrangement) = &self.analytic_regions.arrangement
+        {
+            let cells = &arrangement.cells;
+            let holes = cells.iter().map(|cell| cell.holes.len()).sum::<usize>();
+            self.certified_profile = if cells.is_empty() {
+                CertifiedProfileStatus::Open
+            } else {
+                CertifiedProfileStatus::ClosedRegions {
+                    regions: cells.len(),
+                    loops: cells.len() + holes,
+                    holes,
+                    analytic: true,
+                }
+            };
+            self.profile_analysis.status = self.certified_profile;
+        }
     }
 
     #[must_use]
@@ -8067,7 +8745,7 @@ impl SketchCanvasState {
         }
 
         let model_radius = f64::from(self.snap.endpoint_radius_points) / self.view.points_per_unit;
-        if self.exact_tool == ToolVariant::ChainedPolyline
+        if (self.exact_tool == ToolVariant::ChainedPolyline || self.draws_a_spline())
             && self.polyline_vertices.len() >= 3
             && let Some(first) = self.polyline_vertices.first().copied()
             && self
@@ -8351,9 +9029,7 @@ impl SketchCanvasState {
             | ToolVariant::PerpendicularRelation
             | ToolVariant::EqualLengthRelation
             | ToolVariant::TangentRelation
-            | ToolVariant::CollinearRelation
-            | ToolVariant::FitPointSpline
-            | ToolVariant::ControlVertexSpline => None,
+            | ToolVariant::CollinearRelation => None,
             ToolVariant::Point => self.stage_geometry(SketchGeometry::point(point)).ok(),
             ToolVariant::Text => {
                 if self.active_tool_parameter_issue().is_some() {
@@ -8386,6 +9062,9 @@ impl SketchCanvasState {
                 }
             }
             ToolVariant::ChainedPolyline => self.accept_polyline_vertex(point),
+            ToolVariant::FitPointSpline | ToolVariant::ControlVertexSpline => {
+                self.accept_spline_point(point)
+            }
             ToolVariant::Centreline => {
                 if let Some(start) = self.creation_anchor.take() {
                     self.update_dimension_pointer(point);
@@ -9007,6 +9686,14 @@ impl SketchCanvasState {
             .map(|(_, segment)| segment)
     }
 
+    /// Brings a straight host-body edge into the sketch as pinned reference
+    /// geometry, as naming it for a dimension does. The entity it returns is
+    /// the sketch's own copy, never drawn as a stroke and never part of a
+    /// profile.
+    pub fn project_host_edge(&mut self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
+        self.project_support_segment(segment)
+    }
+
     /// Brings a host edge into the sketch as pinned reference geometry.
     ///
     /// The body's topology is not the sketch's to own, so this is a copy rather
@@ -9017,33 +9704,60 @@ impl SketchCanvasState {
     fn project_support_segment(&mut self, segment: [SketchPoint; 2]) -> Option<CoreEntityId> {
         // A projection is a committed edit, and committing one underneath a
         // staged edit would leave the gate holding a transaction built against
-        // a definition that no longer exists.
+        // a definition that no longer exists. A stroke still at the gate is
+        // one the user has plainly moved past — they are measuring from it —
+        // so it is confirmed first rather than silently blocking the pick,
+        // which is how "dimension to the face's edge" came to do nothing at
+        // all: the circle just drawn was still pending, and nothing said so.
         if self.pending.is_some() {
-            return None;
+            // Confirming ends the gesture as far as the canvas is concerned
+            // and forgets the half-named pair; this pair is the reason for
+            // the confirmation, so it is kept across it.
+            let named = std::mem::take(&mut self.relation_operands);
+            let committed = self.commit_pending();
+            self.relation_operands = named;
+            if let Err(error) = committed {
+                self.relation_diagnostic = Some(format!(
+                    "The body's edge cannot be brought into the sketch while this edit is \
+                     staged: {error:?}. Confirm or cancel it first."
+                ));
+                return None;
+            }
         }
         if let Some(existing) = self.projected_edge_matching(segment) {
             return Some(existing);
         }
         let [start, end] = segment;
-        let transaction = self
-            .authoring
-            .stage(
-                CoreRecipe::ProjectedEdge {
-                    start: CorePointInput::Position(core_point(start)),
-                    end: CorePointInput::Position(core_point(end)),
-                },
-                "Project body edge",
-            )
-            .ok()?;
-        let projected = transaction.impact().inserted_entities.first().copied()?;
-        self.undo_journal
+        let Ok(transaction) = self.authoring.stage(
+            CoreRecipe::ProjectedEdge {
+                start: CorePointInput::Position(core_point(start)),
+                end: CorePointInput::Position(core_point(end)),
+            },
+            "Project body edge",
+        ) else {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        };
+        let Some(projected) = transaction.impact().inserted_entities.first().copied() else {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        };
+        if self
+            .undo_journal
             .confirm(
                 &mut self.authoring,
                 transaction,
                 CoreConfirmationSource::GreenTick,
                 PrecisionPolicy::default(),
             )
-            .ok()?;
+            .is_err()
+        {
+            self.relation_diagnostic =
+                Some("The body's edge could not be projected into the sketch.".to_owned());
+            return None;
+        }
         self.pin_projected_edge(projected);
         self.reconcile_active_core_entities();
         self.refresh_profile_analysis();
@@ -9280,6 +9994,21 @@ impl SketchCanvasState {
             self.relation_diagnostic = None;
             return DimensionPointPick::opened_a_pair(operand);
         }
+        // The pair is complete. A stroke still at the gate goes through it
+        // now, so the relation can be staged against a settled definition.
+        if self.pending.is_some() {
+            let named = std::mem::take(&mut self.relation_operands);
+            let committed = self.commit_pending();
+            self.relation_operands = named;
+            if let Err(error) = committed {
+                self.relation_diagnostic = Some(format!(
+                    "The dimension cannot be placed while this edit is staged: {error:?}. \
+                     Confirm or cancel it first."
+                ));
+                self.clear_relation_acquisition();
+                return DimensionPointPick::default();
+            }
+        }
         let staged = self.stage_relation(ToolVariant::DistanceRelation);
         let constraint = staged.and_then(|_| {
             self.point_to_point_dimensions()
@@ -9392,13 +10121,25 @@ impl SketchCanvasState {
         else {
             return false;
         };
+        // A distance that follows a variable opens on the entry it follows.
+        let text = self.authoring.relation_link(constraint).map_or_else(
+            || self.length_unit.format_value(dimension.value),
+            str::to_owned,
+        );
         self.relation_dimension_edit = Some(RelationDimensionEdit {
             constraint,
-            text: self.length_unit.format_value(dimension.value),
+            text,
             focus_wanted: true,
             error: None,
         });
         true
+    }
+
+    /// The entry a dimension drawn between points follows, if it follows
+    /// one (ADR 0054).
+    #[must_use]
+    pub fn relation_dimension_follows(&self, constraint: CoreConstraintId) -> Option<&str> {
+        self.authoring.relation_link(constraint)
     }
 
     /// The dimension currently open for typing, with its text and any refusal.
@@ -9451,17 +10192,42 @@ impl SketchCanvasState {
                 return None;
             }
         };
-        let transaction = match self.authoring.stage_relation_measurement(
-            constraint,
-            value,
-            Some(dimension.first),
-            "Dimension",
-            PrecisionPolicy::default(),
-        ) {
+        // Typed over a variable, the distance keeps following it; a plain
+        // number is a plain number again.
+        let link = value_link_for_entry(
+            &text,
+            FieldUnit::length(self.length_unit.millimetres_per_unit()),
+        );
+        let staged = self
+            .authoring
+            .stage_relation_measurement(
+                constraint,
+                value,
+                Some(dimension.first),
+                "Dimension",
+                PrecisionPolicy::default(),
+            )
+            .and_then(|mut transaction| {
+                transaction.set_relation_link(constraint, link.clone())?;
+                Ok(transaction)
+            });
+        let transaction = match staged {
             Ok(transaction) => transaction,
+            // The entry came to the distance already held: only the link, if
+            // it changed, is an edit.
             Err(artificer_sketch::SketchTransactionError::NoChange) => {
-                self.relation_dimension_edit = None;
-                return None;
+                match self.authoring.stage_value_link(
+                    SketchValueTarget::Relation { constraint },
+                    link,
+                    "Dimension",
+                    PrecisionPolicy::default(),
+                ) {
+                    Ok(transaction) => transaction,
+                    Err(_) => {
+                        self.relation_dimension_edit = None;
+                        return None;
+                    }
+                }
             }
             Err(error) => {
                 if let Some(edit) = self.relation_dimension_edit.as_mut() {
@@ -9964,6 +10730,7 @@ impl SketchCanvasState {
             core_entities: Vec::new(),
             retired_entities: Vec::new(),
             in_place: false,
+            draft_links: Vec::new(),
         });
         self.refresh_profile_analysis();
         Ok(subject)
@@ -10611,7 +11378,8 @@ fn analyze_profile_entities(entities: &[SketchEntity]) -> ProfileAnalysis {
             SketchGeometry::Rectangle { .. } => 4,
             SketchGeometry::Segment { .. }
             | SketchGeometry::Circle { .. }
-            | SketchGeometry::Arc { .. } => 1,
+            | SketchGeometry::Arc { .. }
+            | SketchGeometry::Spline { .. } => 1,
         })
     });
     if authored_curve_count > MAX_PLANAR_PROFILE_CURVES {
@@ -10623,13 +11391,25 @@ fn analyze_profile_entities(entities: &[SketchEntity]) -> ProfileAnalysis {
         );
     }
 
+    // A spline bounds regions in the authoring graph, but this certified
+    // path draws its profiles from lines, arcs and circles only; a sketch
+    // with one says its curves need certification rather than guessing.
+    if entities
+        .iter()
+        .any(|entity| matches!(entity.geometry, SketchGeometry::Spline { .. }))
+    {
+        return ProfileAnalysis::status(
+            CertifiedProfileStatus::CurvesNeedCertification,
+            diagnostics,
+        );
+    }
     let mut seeds = Vec::new();
     let mut loops = Vec::<CertifiedSketchLoop>::new();
     for entity in entities {
         match entity.geometry {
             // Standalone points are not profile edges. They remain visible
             // sketch geometry without changing the closed-region selection.
-            SketchGeometry::Point(_) => {}
+            SketchGeometry::Point(_) | SketchGeometry::Spline { .. } => {}
             SketchGeometry::Segment { start, end } => seeds.push(ProfileCurveSeed {
                 source: entity.id,
                 subindex: 0,
@@ -11905,15 +12685,20 @@ pub fn show_with_context(
                     // relation and for snapping, and a curve the sketch does
                     // not own yet — a host-body edge — is projected as it is
                     // named.
-                    let dimension_point =
-                        if state.exact_tool == ToolVariant::Dimension && state.pending.is_none() {
-                            state.take_dimension_operand_pick(
-                                sketch_pt,
-                                f64::from(entity_pick_radius) / state.view.points_per_unit,
-                            )
-                        } else {
-                            DimensionPointPick::default()
-                        };
+                    // An edit still at the gate does not stop a dimension
+                    // from naming committed geometry: a click that completes
+                    // the pair confirms that edit on its way, since reaching
+                    // for a measurement is moving past the stroke. Dropping
+                    // the click instead is how "dimension to the face's edge"
+                    // came to do nothing at all.
+                    let dimension_point = if state.exact_tool == ToolVariant::Dimension {
+                        state.take_dimension_operand_pick(
+                            sketch_pt,
+                            f64::from(entity_pick_radius) / state.view.points_per_unit,
+                        )
+                    } else {
+                        DimensionPointPick::default()
+                    };
                     let took_dimension_point = dimension_point.took_click;
                     draft_changed |= took_dimension_point;
                     pending_created = pending_created.or(dimension_point.staged);
@@ -11964,6 +12749,8 @@ pub fn show_with_context(
                         && primary_finish_click
                     {
                         state.finish_polyline_at_pointer(point)
+                    } else if state.draws_a_spline() && primary_finish_click {
+                        state.finish_spline_at_pointer(point)
                     } else {
                         state.handle_creation_click(point)
                     };
@@ -13137,6 +13924,11 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
         paint_snap_marker(painter, rect, state);
         return;
     }
+    if state.draws_a_spline() && !state.polyline_vertices.is_empty() {
+        paint_spline_draft(painter, rect, state);
+        paint_snap_marker(painter, rect, state);
+        return;
+    }
     if state.exact_tool == ToolVariant::ChainedPolyline && !state.polyline_vertices.is_empty() {
         for vertices in state.polyline_vertices.windows(2) {
             paint_geometry(
@@ -13267,6 +14059,49 @@ fn paint_creation_preview(painter: &egui::Painter, rect: Rect, state: &SketchCan
     paint_snap_marker(painter, rect, state);
 }
 
+/// A spline being drawn: the curve through the points so far and the
+/// pointer, the points themselves, and for a control-vertex spline the
+/// polygon that shapes it.
+fn paint_spline_draft(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
+    let pending = sketch_colours().pending;
+    let pointer = state.pointer_preview.map(|snap| snap.point);
+    let to_screen = |point: SketchPoint| state.view.sketch_to_screen(rect, point);
+    if state.exact_tool == ToolVariant::ControlVertexSpline {
+        let polygon = state
+            .polyline_vertices
+            .iter()
+            .copied()
+            .chain(pointer)
+            .map(to_screen)
+            .collect::<Vec<_>>();
+        for pair in polygon.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                Stroke::new(1.0, pending.gamma_multiply(0.45)),
+            );
+        }
+    }
+    if let Some(curve) = state.spline_preview_curve(pointer) {
+        const SAMPLES: usize = 128;
+        let points = (0..=SAMPLES)
+            .filter_map(|index| curve.evaluate(index as f64 / SAMPLES as f64).ok())
+            .map(|point| to_screen(SketchPoint::new(point.u, point.v)))
+            .collect::<Vec<_>>();
+        for pair in points.windows(2) {
+            painter.line_segment([pair[0], pair[1]], Stroke::new(2.0, pending));
+        }
+    }
+    for (index, point) in state.polyline_vertices.iter().copied().enumerate() {
+        let screen = to_screen(point);
+        if index == 0 {
+            // The first point is the close target once there are three.
+            painter.circle_stroke(screen, 5.0, Stroke::new(1.5, pending));
+        } else {
+            painter.circle_filled(screen, 3.5, pending);
+        }
+    }
+}
+
 fn paint_snap_marker(painter: &egui::Painter, rect: Rect, state: &SketchCanvasState) {
     let Some(snap) = state.pointer_preview else {
         return;
@@ -13352,6 +14187,29 @@ fn paint_geometry(
     stroke: Stroke,
 ) {
     match geometry {
+        SketchGeometry::Spline { start, end, shape } => {
+            let points = shape.points();
+            let points = points.as_deref().unwrap_or(&[]);
+            if points.len() >= 2 {
+                for pair in points.windows(2) {
+                    painter.line_segment(
+                        [
+                            view.sketch_to_screen(rect, pair[0]),
+                            view.sketch_to_screen(rect, pair[1]),
+                        ],
+                        stroke,
+                    );
+                }
+            } else {
+                painter.line_segment(
+                    [
+                        view.sketch_to_screen(rect, start),
+                        view.sketch_to_screen(rect, end),
+                    ],
+                    stroke,
+                );
+            }
+        }
         SketchGeometry::Point(point) => {
             painter.circle_filled(view.sketch_to_screen(rect, point), 3.5, stroke.color);
         }
@@ -13574,15 +14432,12 @@ const fn canvas_dimensionable_keys(recipe: &CoreRecipe) -> &'static [&'static st
     }
 }
 
-/// The recipe literal a committed dimension box drives, if the Dimension tool
-/// has armed one.
-fn committed_dimension_parameter(
-    state: &SketchCanvasState,
+/// The recipe field a dimension of `kind` states for the recipe `editor`
+/// shows.
+fn dimension_parameter_key(
     kind: SketchDimensionKind,
-) -> Option<&RetainedRecipeParameter> {
-    if state.exact_tool != ToolVariant::Dimension {
-        return None;
-    }
+    editor: &SelectedRecipeEditor,
+) -> Option<&'static str> {
     let stable_key = match kind {
         SketchDimensionKind::Width => "width",
         SketchDimensionKind::Height => "height",
@@ -13594,42 +14449,41 @@ fn committed_dimension_parameter(
         SketchDimensionKind::AngleDegrees => "angle",
         _ => return None,
     };
-    let editor = state.selected_recipe_editor.as_ref()?;
-    let stable_key = if stable_key == "length"
-        && !editor
+    let has = |key: &str| {
+        editor
             .parameters
             .iter()
-            .any(|parameter| parameter.stable_key == "length")
-    {
-        if editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "overall_length")
-        {
+            .any(|parameter| parameter.stable_key == key)
+    };
+    Some(if stable_key == "length" && !has("length") {
+        if has("overall_length") {
             "overall_length"
-        } else if editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "centre_distance")
-        {
+        } else if has("centre_distance") {
             "centre_distance"
         } else {
             "side"
         }
     } else if (stable_key == "radius" || stable_key == "diameter")
-        && !editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == stable_key)
-        && editor
-            .parameters
-            .iter()
-            .any(|parameter| parameter.stable_key == "width")
+        && !has(stable_key)
+        && has("width")
     {
         "width"
     } else {
         stable_key
-    };
+    })
+}
+
+/// The recipe literal a committed dimension box drives, if the Dimension tool
+/// has armed one.
+fn committed_dimension_parameter(
+    state: &SketchCanvasState,
+    kind: SketchDimensionKind,
+) -> Option<&RetainedRecipeParameter> {
+    if state.exact_tool != ToolVariant::Dimension {
+        return None;
+    }
+    let editor = state.selected_recipe_editor.as_ref()?;
+    let stable_key = dimension_parameter_key(kind, editor)?;
     if state
         .pending
         .as_ref()
@@ -14082,6 +14936,16 @@ fn show_point_to_point_dimensions(
                 FontId::monospace(10.0),
                 colours.dimension.gamma_multiply(0.85),
             );
+            // A distance that follows a variable says which, under its value.
+            if let Some(follows) = state.authoring.relation_link(*constraint) {
+                ui.painter().text(
+                    layout.rect.center_bottom() + Vec2::new(0.0, 2.0),
+                    Align2::CENTER_TOP,
+                    format!("= {follows}"),
+                    FontId::monospace(9.0),
+                    colours.dimension.gamma_multiply(0.7),
+                );
+            }
             if armed {
                 let response =
                     ui.interact(layout.rect, layout.id.with("pick"), egui::Sense::click());
@@ -14744,7 +15608,7 @@ fn show_dimension_widgets(
 
     let mut pending_created = None;
     let polyline_gesture_owned = canvas_owned_keyboard
-        || (state.exact_tool == ToolVariant::ChainedPolyline
+        || ((state.exact_tool == ToolVariant::ChainedPolyline || state.draws_a_spline())
             && !state.polyline_vertices.is_empty()
             && !ui.ctx().egui_wants_keyboard_input());
     let tab_owned = if active_at_start.is_some() {
@@ -14806,7 +15670,7 @@ fn show_dimension_widgets(
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && backspace_pressed
-        && state.backspace_polyline_segment()
+        && (state.backspace_polyline_segment() || state.backspace_spline_point())
     {
         ui.input_mut(|input| {
             input.consume_key(egui::Modifiers::NONE, egui::Key::Backspace);
@@ -14814,9 +15678,17 @@ fn show_dimension_widgets(
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && escape_pressed
-        && state.cancel_polyline_layer()
+        && (state.cancel_polyline_layer() || state.cancel_spline_layer())
     {
         claims.escape = true;
+    } else if active_at_start.is_none()
+        && polyline_gesture_owned
+        && enter_pressed
+        && state.draws_a_spline()
+        && !state.polyline_vertices.is_empty()
+    {
+        claims.enter = true;
+        pending_created = state.finish_spline_draft().ok();
     } else if active_at_start.is_none()
         && polyline_gesture_owned
         && enter_pressed
@@ -14894,7 +15766,93 @@ fn show_dimension_widgets(
     }
 }
 
+/// Links the fields of a drafted insertion to the entries its dimension
+/// boxes were typed as, so a circle drawn with its diameter typed as `w`
+/// keeps following `w` once it is confirmed.
+///
+/// A box and a recipe field do not always state the same number: a
+/// two-point rectangle drawn leftwards keeps a negative width behind a box
+/// that shows its size. So an entry is linked only where the field holds
+/// exactly what the entry comes to, or its negation, which is linked
+/// negated; a box with no field that agrees stays a copy.
+fn link_draft_values(
+    transaction: &mut CoreTransaction,
+    links: &[(SketchDimensionKind, String)],
+    names: &BTreeMap<String, NamedQuantity>,
+) {
+    if links.is_empty() {
+        return;
+    }
+    let mut inserted = transaction.impact().inserted_operations.iter().copied();
+    let (Some(operation), None) = (inserted.next(), inserted.next()) else {
+        return;
+    };
+    let Some(recipe) = transaction
+        .preview()
+        .operation(operation)
+        .map(|record| record.recipe.clone())
+    else {
+        return;
+    };
+    let editor =
+        selected_recipe_editor_for(SketchEntityId(0), operation, recipe, LengthUnit::Millimetre);
+    for (kind, text) in links {
+        let Some(key) = dimension_parameter_key(*kind, &editor) else {
+            continue;
+        };
+        let Some(parameter) = editor
+            .parameters
+            .iter()
+            .find(|parameter| parameter.stable_key == key)
+        else {
+            continue;
+        };
+        let (Some(value), Ok(followed)) = (parameter.value, parameter.evaluate_link(text, names))
+        else {
+            continue;
+        };
+        let agrees = |candidate: f64| {
+            let difference = if parameter.is_angle() {
+                (value - candidate)
+                    .rem_euclid(360.0)
+                    .min((candidate - value).rem_euclid(360.0))
+            } else {
+                (value - candidate).abs()
+            };
+            difference <= 1.0e-9 * value.abs().max(1.0)
+        };
+        let link = if agrees(followed) {
+            text.clone()
+        } else if agrees(-followed)
+            && let Ok(expression) = artificer_sketch::expression::parse_expression(text)
+        {
+            artificer_sketch::expression::Expression::Negate(Box::new(expression)).to_string()
+        } else {
+            continue;
+        };
+        let _ = transaction.set_value_link(operation, key, Some(link));
+    }
+}
+
 fn stage_complete_dimension_draft(state: &mut SketchCanvasState) -> Option<SketchEntityId> {
+    let links = state
+        .dimension_session
+        .as_ref()
+        .filter(|session| session.target == DimensionTarget::Draft)
+        .map(|session| session.links.clone())
+        .unwrap_or_default();
+    let staged = stage_complete_dimension_draft_unlinked(state)?;
+    if let Some(pending) = state.pending.as_mut()
+        && pending.draft_links.is_empty()
+    {
+        pending.draft_links = links;
+    }
+    Some(staged)
+}
+
+fn stage_complete_dimension_draft_unlinked(
+    state: &mut SketchCanvasState,
+) -> Option<SketchEntityId> {
     let (phase, geometry) = state.dimension_session.as_ref().and_then(|session| {
         (session.target == DimensionTarget::Draft).then_some((session.phase, session.geometry))
     })?;
@@ -15041,6 +15999,28 @@ fn geometry_screen_distance(
     position: Pos2,
 ) -> f32 {
     match geometry {
+        SketchGeometry::Spline { start, end, shape } => {
+            let points = shape.points();
+            let points = points.as_deref().unwrap_or(&[]);
+            if points.len() >= 2 {
+                points
+                    .windows(2)
+                    .map(|pair| {
+                        point_segment_distance(
+                            position,
+                            view.sketch_to_screen(rect, pair[0]),
+                            view.sketch_to_screen(rect, pair[1]),
+                        )
+                    })
+                    .fold(f32::INFINITY, f32::min)
+            } else {
+                point_segment_distance(
+                    position,
+                    view.sketch_to_screen(rect, start),
+                    view.sketch_to_screen(rect, end),
+                )
+            }
+        }
         SketchGeometry::Point(point) => view.sketch_to_screen(rect, point).distance(position),
         SketchGeometry::Segment { start, end } => point_segment_distance(
             position,
@@ -15117,6 +16097,9 @@ fn semantic_target(
     canvas_rect: Rect,
 ) -> Option<(Pos2, &'static str)> {
     let (point, kind) = match geometry {
+        spline @ SketchGeometry::Spline { start, .. } => {
+            (spline.center().unwrap_or(start), "spline")
+        }
         SketchGeometry::Point(point) => (point, "point"),
         SketchGeometry::Segment { start, end } => (
             SketchPoint::new(
@@ -16845,6 +17828,154 @@ mod tests {
 
         state.finish_polyline_draft().expect("stage open chain");
         assert!(!state.polyline_draft_can_finish());
+    }
+
+    fn staged_recipe(state: &SketchCanvasState) -> CoreRecipe {
+        let transaction = state
+            .pending()
+            .expect("a staged preview")
+            .core_transaction
+            .as_ref()
+            .expect("exact transaction");
+        transaction
+            .impact()
+            .inserted_operations
+            .iter()
+            .next()
+            .and_then(|id| transaction.preview().operation(*id))
+            .expect("one operation")
+            .recipe
+            .clone()
+    }
+
+    #[test]
+    fn a_fit_point_spline_is_drawn_through_its_clicks_and_finished_with_enter() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        assert!(state.draws_a_spline());
+        let fit = [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(2.0, 1.5),
+            SketchPoint::new(4.0, -0.5),
+            SketchPoint::new(6.0, 1.0),
+        ];
+        for point in fit {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        // The preview runs through every point placed so far.
+        let preview = state.spline_preview_curve(None).expect("a preview curve");
+        let start = preview.evaluate(0.0).unwrap();
+        let end = preview.evaluate(1.0).unwrap();
+        assert!((start.u - 0.0).abs() < 1.0e-9 && (start.v - 0.0).abs() < 1.0e-9);
+        assert!((end.u - 6.0).abs() < 1.0e-9 && (end.v - 1.0).abs() < 1.0e-9);
+        assert!(state.spline_draft_can_finish());
+        state.finish_spline_draft().expect("the spline stages");
+        assert!(matches!(
+            staged_recipe(&state),
+            CoreRecipe::FitPointSpline {
+                ref fit_points,
+                degree: 3,
+                closed: false,
+            } if fit_points.len() == 4
+        ));
+        assert!(state.polyline_vertices.is_empty());
+        state.commit_pending().expect("the spline commits");
+        assert_eq!(state.entities().len(), 1);
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::Open,
+            "an open spline bounds nothing"
+        );
+    }
+
+    #[test]
+    fn clicking_a_spline_s_first_point_closes_it_into_a_region() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(4.0, 0.0),
+            SketchPoint::new(4.0, 3.0),
+            SketchPoint::new(0.0, 3.0),
+        ] {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        state
+            .handle_creation_click(SketchPoint::new(0.0, 0.0))
+            .expect("the first point closes the spline");
+        assert!(matches!(
+            staged_recipe(&state),
+            CoreRecipe::FitPointSpline { closed: true, .. }
+        ));
+        state.commit_pending().expect("the loop commits");
+        let arrangement = state.refreshed_arrangement().expect("an arrangement");
+        assert_eq!(
+            arrangement.cells.len(),
+            1,
+            "a closed spline bounds one region"
+        );
+        // The profile card reads it as the closed exact region it is.
+        assert_eq!(
+            state.certified_profile_status(),
+            CertifiedProfileStatus::ClosedRegions {
+                regions: 1,
+                loops: 1,
+                holes: 0,
+                analytic: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_control_vertex_spline_is_clamped_to_its_polygon() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::ControlVertexSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(1.0, 2.0),
+            SketchPoint::new(3.0, 2.0),
+            SketchPoint::new(4.0, 0.0),
+            SketchPoint::new(6.0, 1.0),
+        ] {
+            assert_eq!(state.handle_creation_click(point), None);
+        }
+        state.finish_spline_draft().expect("the spline stages");
+        let CoreRecipe::ControlVertexSpline {
+            control_points,
+            degree,
+            knots,
+            weights,
+            closed,
+        } = staged_recipe(&state)
+        else {
+            panic!("a control-vertex recipe");
+        };
+        assert_eq!(control_points.len(), 5);
+        assert_eq!(degree, 3);
+        assert_eq!(knots, vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(weights, None);
+        assert!(!closed);
+        state.commit_pending().expect("the spline commits");
+        assert_eq!(state.entities().len(), 1);
+    }
+
+    #[test]
+    fn backspace_takes_back_a_spline_point_and_escape_abandons_it() {
+        let mut state = SketchCanvasState::default();
+        assert!(state.set_exact_tool(ToolVariant::FitPointSpline));
+        for point in [
+            SketchPoint::new(0.0, 0.0),
+            SketchPoint::new(2.0, 1.0),
+            SketchPoint::new(4.0, 0.0),
+        ] {
+            state.handle_creation_click(point);
+        }
+        assert!(state.backspace_spline_point());
+        assert_eq!(state.polyline_vertices.len(), 2);
+        assert!(state.cancel_spline_layer());
+        assert!(state.polyline_vertices.is_empty());
+        assert!(state.pending().is_none());
+        assert!(state.entities().is_empty());
     }
 
     #[test]
@@ -20446,6 +21577,81 @@ mod tests {
         );
     }
 
+    /// A distance between two objects typed over a variable keeps following
+    /// it (ADR 0054): the box reopens on the entry, the canvas moves the far
+    /// end when the variable changes, and a plain number unlinks it.
+    #[test]
+    fn a_distance_between_objects_follows_the_variable_it_is_typed_over() {
+        use artificer_sketch::expression::Dimension;
+        let names = |gap: f64| {
+            BTreeMap::from([(
+                "gap".to_owned(),
+                NamedQuantity {
+                    canonical: gap,
+                    dimension: Dimension::LENGTH,
+                },
+            )])
+        };
+        let (mut state, first, second) = two_separate_lines();
+        state.set_named_values(names(3.0));
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        assert!(state.take_dimension_operand_pick(first, 0.5).took_click);
+        assert!(state.take_dimension_operand_pick(second, 0.5).took_click);
+        state.commit_pending().expect("the dimension commits");
+        let constraint = state.point_to_point_dimensions()[0].constraint;
+
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("gap * 2".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the new distance commits");
+        assert_eq!(
+            state.relation_dimension_follows(constraint),
+            Some("gap * 2")
+        );
+        let separation = |state: &SketchCanvasState| state.point_to_point_dimensions()[0].value;
+        assert!((separation(&state) - 6.0).abs() < 1.0e-9);
+        assert!(state.begin_relation_dimension_edit(constraint));
+        assert_eq!(state.relation_dimension_editor().unwrap().1, "gap * 2");
+        state.cancel_relation_dimension_edit();
+
+        // The variable changes and the distance follows it, from the end it
+        // is measured from.
+        let from = state.point_to_point_dimensions()[0].from;
+        assert!(state.set_named_values(names(5.0)));
+        assert!((separation(&state) - 10.0).abs() < 1.0e-9);
+        assert_eq!(state.point_to_point_dimensions()[0].from, from);
+        let regenerated = regenerate_linked_values(state.authoring(), &names(1.5), true)
+            .expect("the distance follows")
+            .expect("and changes");
+        let distance = regenerated
+            .constraints()
+            .get(&constraint)
+            .and_then(|record| record.kind.measurement())
+            .expect("a measured relation");
+        assert!((distance - 3.0).abs() < 1.0e-9);
+        assert!(
+            regenerate_linked_values(state.authoring(), &names(-1.0), true).is_err(),
+            "a negative distance is refused"
+        );
+
+        // Typing the value it already holds, as a variable, links it without
+        // moving anything; typing a number unlinks it.
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("10".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the unlink commits");
+        assert_eq!(state.relation_dimension_follows(constraint), None);
+        assert!(state.begin_relation_dimension_edit(constraint));
+        state.set_relation_dimension_text("gap * 2".to_owned());
+        assert!(state.accept_relation_dimension_edit().is_some());
+        state.commit_pending().expect("the link commits");
+        assert_eq!(
+            state.relation_dimension_follows(constraint),
+            Some("gap * 2")
+        );
+        assert!((separation(&state) - 10.0).abs() < 1.0e-9);
+    }
+
     /// A click that lands on no point is still a question about the object
     /// under it, so the tool's existing behaviour has to survive untouched.
     #[test]
@@ -20639,6 +21845,175 @@ mod tests {
                 .iter()
                 .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
             "measuring to an edge is an offset, not a separation"
+        );
+    }
+
+    /// Projecting a host edge is a committed edit, and a stroke still at the
+    /// confirmation gate used to block it — silently, so a dimension to the
+    /// face's edge simply never appeared. Reaching for the edge is moving
+    /// past the stroke: the stroke is confirmed and the projection made.
+    #[test]
+    fn a_pending_stroke_is_confirmed_when_a_host_edge_is_projected_past_it() {
+        let (mut state, _, _) = circle_on_a_host_face();
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(2.0, -3.0),
+                SketchPoint::new(3.0, -3.0),
+            ))
+            .expect("a stroke stages");
+        assert!(state.has_pending_edit(), "and waits at the gate");
+        let before = state.entities().len();
+
+        let projected =
+            state.project_host_edge([SketchPoint::new(-4.0, -4.0), SketchPoint::new(-4.0, 4.0)]);
+        assert!(
+            projected.is_some(),
+            "the edge is projected: {:?}",
+            state.relation_diagnostic
+        );
+        assert!(
+            !state.has_pending_edit(),
+            "the stroke that was at the gate went through it"
+        );
+        assert_eq!(
+            state.entities().len(),
+            before + 2,
+            "the confirmed stroke and the projected edge both exist now"
+        );
+        assert!(
+            state
+                .entities()
+                .iter()
+                .any(|entity| entity.role == SketchEntityRole::Reference),
+            "the edge is reference geometry the sketch owns"
+        );
+        assert_eq!(state.relation_diagnostic, None, "nothing to complain about");
+    }
+
+    /// The reported order: a circle confirmed, another stroke drawn and left
+    /// at the gate, then the dimension tool — the circle's centre, the face's
+    /// edge. The pending stroke used to make the second click do nothing.
+    #[test]
+    fn a_dimension_to_a_host_edge_is_placed_with_a_stroke_still_at_the_gate() {
+        let (mut state, centre, edge) = circle_on_a_host_face();
+        assert!(state.set_exact_tool(ToolVariant::Dimension));
+        // Something arrives at the gate with the tool already in hand — an
+        // armed value box does this — and is still there at the second pick.
+        state
+            .stage_geometry(SketchGeometry::segment(
+                SketchPoint::new(2.0, -3.0),
+                SketchPoint::new(3.0, -3.0),
+            ))
+            .expect("a stroke stages");
+        assert!(state.has_pending_edit(), "and waits at the gate");
+
+        assert!(state.take_dimension_operand_pick(centre, 0.5).took_click);
+        let pick = state.take_dimension_operand_pick(edge, 0.5);
+        assert!(
+            pick.staged.is_some(),
+            "the centre and the face's edge are a complete pair: {:?}",
+            state.relation_diagnostic
+        );
+        assert!(
+            staged_constraint_kinds(&state)
+                .iter()
+                .any(|kind| matches!(kind, CoreConstraintKind::PointToLineDistance { .. })),
+            "measuring to an edge is an offset"
+        );
+    }
+
+    /// A sketch on a face offers the face itself, minus what was drawn, as a
+    /// region: the boundary the sketch sits on closes regions too. A circle
+    /// on a rectangular face is two regions — the disc, and the face around
+    /// it — where it used to be one, with the second unpickable although it
+    /// was plainly enclosed.
+    #[test]
+    fn a_face_sketch_offers_the_face_around_what_is_drawn() {
+        let (state, _, _) = circle_on_a_host_face();
+        assert_eq!(
+            state.available_region_count(),
+            2,
+            "the disc and the face around it"
+        );
+        let arrangement = state
+            .analytic_regions
+            .arrangement
+            .as_ref()
+            .expect("regions are built");
+        let mut areas = arrangement
+            .cells
+            .iter()
+            .map(|cell| cell.signed_area.abs())
+            .collect::<Vec<_>>();
+        areas.sort_by(f64::total_cmp);
+        let disc = std::f64::consts::PI;
+        assert!((areas[0] - disc).abs() < 1.0e-9, "the disc: {}", areas[0]);
+        assert!(
+            (areas[1] - (64.0 - disc)).abs() < 1.0e-9,
+            "the eight-by-eight face minus the disc: {}",
+            areas[1]
+        );
+    }
+
+    /// Of the two, the disc is what was drawn and is taken unasked; the face
+    /// around it is closed by the face's own boundary, and is offered — a
+    /// click takes it — but never assumed. A rectangle on a face used to be
+    /// one region and extruded straight away; it still does.
+    #[test]
+    fn what_was_drawn_is_taken_unasked_and_the_face_around_it_is_offered() {
+        let (mut state, _, _) = circle_on_a_host_face();
+        let disc = std::f64::consts::PI;
+        let selected_area = |state: &SketchCanvasState| -> f64 {
+            let arrangement = state
+                .analytic_regions
+                .arrangement
+                .as_ref()
+                .expect("regions are built");
+            state
+                .analytic_regions
+                .selected
+                .iter()
+                .filter_map(|signature| arrangement.cell(signature))
+                .map(|cell| cell.signed_area.abs())
+                .sum()
+        };
+        assert_eq!(state.selected_region_count(), 1, "the disc is taken");
+        assert!(
+            (selected_area(&state) - disc).abs() < 1.0e-9,
+            "the disc, not the face around it: {}",
+            selected_area(&state)
+        );
+        assert!(
+            state.select_region_at_point(SketchPoint::new(3.0, 3.0), false),
+            "the face around the disc can be picked"
+        );
+        assert_eq!(state.selected_region_count(), 1);
+        assert!(
+            (selected_area(&state) - (64.0 - disc)).abs() < 1.0e-9,
+            "the face minus the disc: {}",
+            selected_area(&state)
+        );
+    }
+
+    /// The boundary is context, not a stroke: nothing appears among the
+    /// sketch's entities, nothing can be picked as geometry, and the
+    /// revision does not move.
+    #[test]
+    fn the_face_boundary_is_not_a_stroke_of_the_sketch() {
+        let (state, _, _) = circle_on_a_host_face();
+        assert_eq!(state.entities().len(), 1, "only the circle was drawn");
+        let mut plain = SketchCanvasState::default();
+        plain
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(1.0, 0.0),
+            ))
+            .expect("the circle should stage");
+        plain.commit_pending().expect("the circle should commit");
+        assert_eq!(
+            state.authoring().revision(),
+            plain.authoring().revision(),
+            "the face's boundary is not an edit"
         );
     }
 
@@ -21133,6 +22508,7 @@ mod tests {
 #[cfg(test)]
 mod length_unit_tests {
     use super::*;
+    use artificer_sketch::expression::Dimension;
 
     #[test]
     fn a_value_entry_is_read_in_the_canvas_unit_unless_it_says_otherwise() {
@@ -21142,10 +22518,94 @@ mod length_unit_tests {
         assert_eq!(state.evaluate_value_entry("1"), Some(25.4));
         assert_eq!(state.evaluate_value_entry("10mm"), Some(10.0));
         assert_eq!(state.evaluate_value_entry("1e-1"), Some(2.54));
-        // Variables are published in the canvas unit, so arithmetic on them
-        // means the same as arithmetic on a typed number.
-        state.set_named_values(BTreeMap::from([("width".to_owned(), 2.0)]));
-        assert_eq!(state.evaluate_value_entry("width / 2"), Some(25.4));
+        // Variables are published canonical, in millimetres; a bare term
+        // beside one is in the canvas unit, a bare factor is a number.
+        state.set_named_values(BTreeMap::from([(
+            "width".to_owned(),
+            NamedQuantity {
+                canonical: 50.8,
+                dimension: Dimension::LENGTH,
+            },
+        )]));
+        for (entry, millimetres) in [
+            ("width / 2", 25.4),
+            ("width + 1", 76.2),
+            ("width + 5mm", 55.8),
+        ] {
+            let value = state.evaluate_value_entry(entry).expect(entry);
+            assert!((value - millimetres).abs() < 1.0e-9, "{entry}: {value}");
+        }
+    }
+
+    fn document_variables() -> BTreeMap<String, NamedQuantity> {
+        BTreeMap::from([
+            (
+                "depth".to_owned(),
+                NamedQuantity {
+                    canonical: 20.0,
+                    dimension: Dimension::LENGTH,
+                },
+            ),
+            (
+                "tilt".to_owned(),
+                NamedQuantity {
+                    canonical: 45.0_f64.to_radians(),
+                    dimension: Dimension::ANGLE,
+                },
+            ),
+        ])
+    }
+
+    /// An angle variable is an angle, not a number of radians: in a degree
+    /// box it reads as the degrees it is, and it cannot stand in for a
+    /// length.
+    #[test]
+    fn an_angle_variable_reads_as_its_angle_in_a_degree_box() {
+        let names = document_variables();
+        let entry = DimensionEntry {
+            names: &names,
+            unit: LengthUnit::Millimetre,
+        };
+        let degrees = parse_dimension_value(SketchDimensionKind::AngleDegrees, "tilt", entry)
+            .expect("an angle variable fills an angle box");
+        assert!((degrees - 45.0).abs() < 1.0e-9, "{degrees}");
+        let degrees =
+            parse_dimension_value(SketchDimensionKind::AngleDegrees, "tilt / 3 + 15", entry)
+                .expect("bare terms beside an angle are degrees");
+        assert!((degrees - 30.0).abs() < 1.0e-9, "{degrees}");
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "tilt", entry),
+            Err(DimensionInputError::NotANumber),
+            "an angle is not a length"
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::AngleDegrees, "depth", entry),
+            Err(DimensionInputError::NotANumber),
+            "a length is not an angle"
+        );
+    }
+
+    /// Units written in an expression mean what they say, as they do in the
+    /// Variables panel: `depth + 5mm` is 25 mm in an inch document.
+    #[test]
+    fn a_unit_written_in_an_expression_is_honoured() {
+        let names = document_variables();
+        let inches = DimensionEntry {
+            names: &names,
+            unit: LengthUnit::Inch,
+        };
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth + 5mm", inches),
+            Ok(25.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth * 2", inches),
+            Ok(40.0)
+        );
+        assert_eq!(
+            parse_dimension_value(SketchDimensionKind::Width, "depth + 1", inches),
+            Ok(45.4)
+        );
     }
 
     #[test]
@@ -21206,6 +22666,257 @@ mod length_unit_tests {
             format_dimension_readout(readout, LengthUnit::Inch),
             "W 1.575 in"
         );
+    }
+
+    fn circle_followed_by(entry: &str) -> (SketchCanvasState, SketchEntityId, CoreOperationId) {
+        let mut sketch = SketchCanvasState::default();
+        sketch.set_named_values(document_variables());
+        let circle = sketch
+            .stage_geometry(SketchGeometry::circle(
+                SketchPoint::new(0.0, 0.0),
+                SketchPoint::new(2.0, 0.0),
+            ))
+            .expect("circle should stage");
+        sketch.commit_pending().expect("circle should commit");
+        assert!(sketch.set_selected(Some(circle)) || sketch.selected() == Some(circle));
+        assert_eq!(
+            sketch.set_selected_recipe_parameter_text("diameter", entry.to_owned()),
+            Some(circle)
+        );
+        assert_eq!(sketch.commit_pending(), Ok(circle));
+        let operation = sketch
+            .authoring()
+            .active_operations()
+            .next()
+            .expect("the circle's operation")
+            .id;
+        (sketch, circle, operation)
+    }
+
+    fn diameter_of(sketch: &CoreSketchDefinition) -> f64 {
+        let operation = sketch.active_operations().next().expect("the circle");
+        match &operation.recipe {
+            CoreRecipe::CentrePointCircle {
+                radius: CoreValue::Literal(radius),
+                ..
+            } => 2.0 * radius.get(),
+            other => panic!("not a literal circle: {other:?}"),
+        }
+    }
+
+    /// A dimension typed over a variable keeps the entry, written with its
+    /// units, and shows it; the sketch holds the value it came to.
+    #[test]
+    fn a_dimension_typed_over_a_variable_stays_linked_to_it() {
+        let (mut sketch, _, operation) = circle_followed_by("depth / 2 + 1");
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth / 2 + 1mm")
+        );
+        assert!((diameter_of(sketch.authoring()) - 11.0).abs() < 1.0e-9);
+        let parameter = &sketch.selected_recipe_editor().unwrap().parameters[0];
+        assert_eq!(parameter.text, "depth / 2 + 1mm");
+        assert!(parameter.follows_variables);
+
+        // The written entry reads the same in an inch document.
+        sketch.set_length_unit(LengthUnit::Inch);
+        let parameter = &sketch.selected_recipe_editor().unwrap().parameters[0];
+        assert_eq!(parameter.text, "depth / 2 + 1mm");
+
+        // A plain number is a plain number again.
+        assert!(
+            sketch
+                .set_selected_recipe_parameter_text("diameter", "0.5".to_owned())
+                .is_some()
+        );
+        assert!(sketch.commit_pending().is_ok());
+        assert_eq!(sketch.authoring().value_link(operation, "diameter"), None);
+        assert!((diameter_of(sketch.authoring()) - 12.7).abs() < 1.0e-9);
+        assert!(!sketch.selected_recipe_editor().unwrap().parameters[0].follows_variables);
+
+        // Undo brings the link back with the value it produced.
+        assert!(sketch.undo_local());
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth / 2 + 1mm")
+        );
+    }
+
+    /// Escape drops a link typed but never confirmed.
+    #[test]
+    fn a_cancelled_entry_leaves_no_link() {
+        let (mut sketch, circle, operation) = circle_followed_by("8");
+        assert_eq!(sketch.authoring().value_link(operation, "diameter"), None);
+        assert_eq!(
+            sketch.set_selected_recipe_parameter_text("diameter", "depth".to_owned()),
+            Some(circle)
+        );
+        assert!(sketch.revert_selected_recipe_edit());
+        assert!(sketch.authoring().value_links().is_empty());
+        assert_eq!(
+            sketch.selected_recipe_editor().unwrap().parameters[0].text,
+            "8"
+        );
+    }
+
+    /// When a variable changes the linked recipe is worked out again; when
+    /// nothing changes nothing is rebuilt; and a variable that is gone is
+    /// named, with the sketch left as it was.
+    #[test]
+    fn linked_values_follow_the_variables_they_name() {
+        let (sketch, _, operation) = circle_followed_by("depth * 2");
+        let authoring = sketch.authoring().clone();
+        assert!((diameter_of(&authoring) - 40.0).abs() < 1.0e-9);
+
+        assert_eq!(
+            regenerate_linked_values(&authoring, &document_variables(), true),
+            Ok(None),
+            "the variables already agree with the sketch"
+        );
+
+        let mut names = document_variables();
+        names.get_mut("depth").unwrap().canonical = 7.5;
+        let regenerated = regenerate_linked_values(&authoring, &names, true)
+            .expect("the sketch follows")
+            .expect("and changes");
+        assert!((diameter_of(&regenerated) - 15.0).abs() < 1.0e-9);
+        assert_eq!(
+            regenerated.value_link(operation, "diameter"),
+            Some("depth * 2")
+        );
+        regenerated
+            .validate(PrecisionPolicy::default())
+            .expect("a sketch the canvas could have made");
+        let hydrated = SketchCanvasState::from_authoring(SketchPlane::XY, regenerated)
+            .expect("the followed sketch opens");
+        assert!(hydrated.entities().iter().any(|entity| {
+            entity.geometry
+                == SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(7.5, 0.0))
+        }));
+
+        names.remove("depth");
+        let error = regenerate_linked_values(&authoring, &names, true)
+            .expect_err("a missing variable is refused");
+        assert_eq!(error.field, "diameter");
+        assert!(error.to_string().contains("depth"), "{error}");
+
+        names.insert(
+            "depth".to_owned(),
+            NamedQuantity {
+                canonical: -3.0,
+                dimension: Dimension::LENGTH,
+            },
+        );
+        assert!(
+            regenerate_linked_values(&authoring, &names, true).is_err(),
+            "a negative diameter is refused"
+        );
+    }
+
+    /// The canvas follows the named values it is given: a changed variable
+    /// resizes what follows it and keeps the selection, and one that cannot
+    /// be followed is reported with the sketch left as it was.
+    #[test]
+    fn the_canvas_follows_its_named_values() {
+        let (mut sketch, circle, operation) = circle_followed_by("depth * 2");
+        assert!(
+            !sketch.set_named_values(document_variables()),
+            "nothing moved"
+        );
+        let mut names = document_variables();
+        names.get_mut("depth").unwrap().canonical = 3.0;
+        assert!(sketch.set_named_values(names.clone()));
+        assert!((diameter_of(sketch.authoring()) - 6.0).abs() < 1.0e-9);
+        assert!(sketch.entities().iter().any(|entity| {
+            entity.geometry
+                == SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(3.0, 0.0))
+        }));
+        let selected = sketch.selected().expect("the circle is still selected");
+        assert_eq!(sketch.operation_by_ui.get(&selected), Some(&operation));
+        assert_eq!(
+            sketch.selected_recipe_editor().unwrap().parameters[0].text,
+            "depth * 2"
+        );
+        let _ = circle;
+
+        names.get_mut("depth").unwrap().canonical = -1.0;
+        assert!(!sketch.set_named_values(names));
+        assert!(sketch.linked_value_issue().is_some());
+        assert!((diameter_of(sketch.authoring()) - 6.0).abs() < 1.0e-9);
+
+        assert!(sketch.rename_named_value("depth", "span"));
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("span * 2")
+        );
+    }
+
+    /// A box typed over a variable while drawing links the field it states.
+    #[test]
+    fn a_draft_dimension_typed_over_a_variable_links_what_it_draws() {
+        let names = document_variables();
+        let draft = |entry: &str| {
+            let mut sketch = SketchCanvasState::default();
+            sketch.set_named_values(document_variables());
+            let mut session = DimensionSession::from_geometry(
+                DimensionTarget::Draft,
+                SketchGeometry::circle(SketchPoint::new(0.0, 0.0), SketchPoint::new(2.0, 0.0)),
+                1,
+            );
+            assert!(session.begin_kind(SketchDimensionKind::Diameter, LengthUnit::Millimetre));
+            session.buffer = entry.to_owned();
+            session
+                .accept(DimensionEntry {
+                    names: &names,
+                    unit: LengthUnit::Millimetre,
+                })
+                .expect("the entry reads");
+            let geometry = session.geometry;
+            sketch.dimension_session = Some(session);
+            sketch.stage_geometry(geometry).expect("the circle stages");
+            sketch.commit_pending().expect("the circle commits");
+            sketch
+        };
+
+        let sketch = draft("depth + 2");
+        let operation = sketch.authoring().active_operations().next().unwrap().id;
+        assert!((diameter_of(sketch.authoring()) - 22.0).abs() < 1.0e-9);
+        assert_eq!(
+            sketch.authoring().value_link(operation, "diameter"),
+            Some("depth + 2mm")
+        );
+
+        // A plain number drafts a plain circle.
+        let sketch = draft("22");
+        assert!(sketch.authoring().value_links().is_empty());
+
+        // A box whose number no field states stays a copy.
+        let mut transaction = CoreSketchDefinition::new()
+            .stage(
+                core_recipe_for_entity(SketchEntity {
+                    id: SketchEntityId(1),
+                    geometry: SketchGeometry::circle(
+                        SketchPoint::new(0.0, 0.0),
+                        SketchPoint::new(11.0, 0.0),
+                    ),
+                    role: SketchEntityRole::Profile,
+                })
+                .expect("a circle recipe"),
+                "Circle",
+            )
+            .expect("the circle stages");
+        link_draft_values(
+            &mut transaction,
+            &[(SketchDimensionKind::Diameter, "depth".to_owned())],
+            &names,
+        );
+        assert!(transaction.preview().value_links().is_empty());
+        link_draft_values(
+            &mut transaction,
+            &[(SketchDimensionKind::Diameter, "depth + 2mm".to_owned())],
+            &names,
+        );
+        assert_eq!(transaction.preview().value_links().len(), 1);
     }
 
     #[test]

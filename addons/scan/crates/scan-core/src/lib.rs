@@ -14,18 +14,24 @@
 //! 5. **Canonicalize** ([`snap`]) — snap axes to datums, dimensions to
 //!    round values, and harmonize coplanar/coaxial families, keeping a
 //!    note of every adjustment.
+//! 6. **Freeform** ([`bspline`], [`freeform`]) — trimmed B-spline patches
+//!    over what no analytic surface describes, including analytic facets
+//!    strained across a curved surface, exported by [`step`] as STEP
+//!    `B_SPLINE_SURFACE_WITH_KNOTS` faces.
 //!
 //! [`report::reverse_engineer`] chains stages 3-5 and emits a structured
 //! report ready for feature reconstruction in the kernel.
 
 pub mod bench;
 pub mod blend;
+pub mod bspline;
 pub mod consolidate;
 pub mod constrain;
 pub mod coverage;
 pub mod datum;
 pub mod finalize;
 pub mod fit;
+pub mod freeform;
 pub mod hygiene;
 pub mod instance;
 pub mod kinematic;

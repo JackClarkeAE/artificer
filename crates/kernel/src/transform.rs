@@ -6,7 +6,9 @@
 
 use artificer_protocol::{RotationQuaternion, SimilarityTransform3};
 
-use crate::topology::{Curve2, Curve3, Plane, Point3, Surface, Topology, Vector3};
+use crate::bspline::{array3, point3};
+use crate::ruled::{RailCurve, RuledRail};
+use crate::topology::{Curve2, Curve3, Cylinder, Plane, Point3, Surface, Topology, Vector3};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransformInputError {
@@ -76,6 +78,52 @@ impl Similarity {
     }
 }
 
+/// A cylinder under a similarity: the frame rides along and the radius
+/// scales with it.
+fn transform_cylinder(mut cylinder: Cylinder, transform: Similarity) -> Cylinder {
+    cylinder.origin = transform.transform_point(cylinder.origin);
+    cylinder.axis = transform.transform_vector(cylinder.axis);
+    cylinder.radial_u = transform.transform_vector(cylinder.radial_u);
+    cylinder.radial_v = transform.transform_vector(cylinder.radial_v);
+    cylinder.radius *= transform.scale;
+    cylinder
+}
+
+/// A rail under a similarity: the same curve, moved and scaled, over the same
+/// parameter range, so the same `u` names the image of the same point.
+fn transform_rail(mut rail: RuledRail, transform: Similarity) -> RuledRail {
+    rail.curve = match rail.curve {
+        RailCurve::Line { endpoints } => RailCurve::Line {
+            endpoints: endpoints.map(|point| transform.transform_point(point)),
+        },
+        RailCurve::Circle {
+            center,
+            u,
+            v,
+            radius,
+        } => RailCurve::Circle {
+            center: transform.transform_point(center),
+            u: transform.transform_vector(u),
+            v: transform.transform_vector(v),
+            radius: radius * transform.scale,
+        },
+        RailCurve::Ellipse {
+            center,
+            u,
+            v,
+            major_radius,
+            minor_radius,
+        } => RailCurve::Ellipse {
+            center: transform.transform_point(center),
+            u: transform.transform_vector(u),
+            v: transform.transform_vector(v),
+            major_radius: major_radius * transform.scale,
+            minor_radius: minor_radius * transform.scale,
+        },
+    };
+    rail
+}
+
 /// Clones and transforms all authoritative geometric representations while
 /// retaining incidence, ordering, orientation, and snapshot-local numeric IDs.
 pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Topology {
@@ -86,6 +134,11 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
     }
     for edge in &mut output.edges {
         match &mut edge.value.curve {
+            Curve3::Trace { host, other, .. } => {
+                for cylinder in [host, other] {
+                    *cylinder = transform_cylinder(*cylinder, transform);
+                }
+            }
             Curve3::Line { endpoints } => {
                 *endpoints = endpoints.map(|point| transform.transform_point(point));
             }
@@ -113,6 +166,15 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 *major_radius *= transform.scale;
                 *minor_radius *= transform.scale;
             }
+            // A similarity is affine, and carries a B-spline by its control
+            // points over the same parameter.
+            Curve3::Bspline { curve } => {
+                if let Some(moved) =
+                    curve.mapped(|point| array3(transform.transform_point(point3(point))))
+                {
+                    *curve = moved;
+                }
+            }
         }
     }
 
@@ -121,6 +183,8 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
         Planar,
         Cylindrical,
         /// Both torus parameters are angles; a similarity leaves them fixed.
+        /// A ruled surface's two are fractions of its rails and rungs, and
+        /// a similarity leaves those fixed too.
         Toroidal,
     }
     let mut pcurve_owner = vec![PcurveOwner::Planar; input.coedges.len()];
@@ -133,6 +197,10 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
             // Both sphere parameters are angles, so a similarity leaves them
             // fixed, exactly as for a torus.
             Surface::Sphere(_) => PcurveOwner::Toroidal,
+            Surface::Ruled(_) => PcurveOwner::Toroidal,
+            // A B-spline surface's parameters are its knots', which a
+            // similarity leaves alone.
+            Surface::Bspline(_) => PcurveOwner::Toroidal,
         };
         for loop_key in face.value.loops() {
             if let Some(loop_record) = input.loop_record(loop_key) {
@@ -146,6 +214,14 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
     }
     for (index, coedge) in output.coedges.iter_mut().enumerate() {
         match &mut coedge.value.pcurve {
+            // A similarity leaves both parameters of a cylinder alone — the
+            // azimuth is an angle and the height scales with the axis it is
+            // measured in — so only the carriers move.
+            Curve2::Trace { host, other, .. } => {
+                for cylinder in [host, other] {
+                    *cylinder = transform_cylinder(*cylinder, transform);
+                }
+            }
             Curve2::Line { endpoints } => match pcurve_owner[index] {
                 PcurveOwner::Cylindrical => {
                     for endpoint in endpoints {
@@ -185,6 +261,15 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 *major_radius *= transform.scale;
                 *minor_radius *= transform.scale;
             }
+            // Only a plane carries one; its coordinates are lengths.
+            Curve2::Bspline { curve } => {
+                if pcurve_owner[index] == PcurveOwner::Planar
+                    && let Some(scaled) =
+                        curve.mapped(|point| point.map(|value| value * transform.scale))
+                {
+                    *curve = scaled;
+                }
+            }
         }
     }
     for face in &mut output.faces {
@@ -194,13 +279,8 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 transform.transform_vector(plane.u),
                 transform.transform_vector(plane.v),
             )),
-            Surface::Cylinder(mut cylinder) => {
-                cylinder.origin = transform.transform_point(cylinder.origin);
-                cylinder.axis = transform.transform_vector(cylinder.axis);
-                cylinder.radial_u = transform.transform_vector(cylinder.radial_u);
-                cylinder.radial_v = transform.transform_vector(cylinder.radial_v);
-                cylinder.radius *= transform.scale;
-                Surface::Cylinder(cylinder)
+            Surface::Cylinder(cylinder) => {
+                Surface::Cylinder(transform_cylinder(cylinder, transform))
             }
             Surface::Torus(mut torus) => {
                 torus.origin = transform.transform_point(torus.origin);
@@ -229,6 +309,15 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 // slope (their ratio) is invariant under a similarity.
                 Surface::Cone(cone)
             }
+            Surface::Ruled(mut ruled) => {
+                ruled.rails = ruled.rails.map(|rail| transform_rail(rail, transform));
+                Surface::Ruled(ruled)
+            }
+            Surface::Bspline(surface) => Surface::Bspline(
+                surface
+                    .mapped(|point| transform.transform_point(point))
+                    .unwrap_or(surface),
+            ),
         };
     }
 

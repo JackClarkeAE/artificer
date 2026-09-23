@@ -259,7 +259,7 @@ fn expanded_compact_ribbon_is_unclipped_at_1120_by_700() {
     for (primary_label, chooser_label) in [
         (
             "Single line",
-            "Choose line type; current default: Single line.",
+            "Choose line or spline type; current default: Single line.",
         ),
         (
             "Two-point rectangle",

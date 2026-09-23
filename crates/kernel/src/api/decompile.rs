@@ -11,9 +11,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use artificer_protocol::{EntityKind, EntityRef, Point2, Point3, Tier, Vector3};
+use artificer_protocol::{EntityKind, EntityRef, PlanarFrame3, Point2, Point3, Tier, Vector3};
 
-use crate::api::commands::{ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane};
+use crate::api::commands::{
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane,
+};
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::journal::Journal;
 use crate::api::selectors::{
@@ -202,6 +204,39 @@ impl Writer<'_> {
                     SketchPlane::XZ => "\"XZ\"".to_owned(),
                     SketchPlane::YZ => "\"YZ\"".to_owned(),
                     SketchPlane::OnFace { face } => self.selector(face)?,
+                    SketchPlane::Frame { frame } => plane_text(*frame),
+                    SketchPlane::OffsetFace { face, offset, flip } => format!(
+                        "plane(on: {}{})",
+                        self.selector(face)?,
+                        placement_text(*offset, *flip)
+                    ),
+                    SketchPlane::Midplane {
+                        first,
+                        second,
+                        offset,
+                        flip,
+                    } => format!(
+                        "plane(between: [{}, {}]{})",
+                        self.selector(first)?,
+                        self.selector(second)?,
+                        placement_text(*offset, *flip)
+                    ),
+                    SketchPlane::ThroughEdge {
+                        edge,
+                        face,
+                        angle_degrees,
+                        offset,
+                        flip,
+                    } => format!(
+                        "plane(through: {}{}, angle: {}{})",
+                        self.selector(edge)?,
+                        face.as_ref()
+                            .map(|face| self.selector(face).map(|text| format!(", face: {text}")))
+                            .transpose()?
+                            .unwrap_or_default(),
+                        number(*angle_degrees),
+                        placement_text(*offset, *flip)
+                    ),
                 };
                 let entities = entities
                     .iter()
@@ -236,6 +271,28 @@ impl Writer<'_> {
                             number(*width),
                             number(*height)
                         ),
+                        SketchEntity::Spline { points, closed } => format!(
+                            "spline(points: [{}]{})",
+                            points
+                                .iter()
+                                .map(|point| point2(*point))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            if *closed { ", closed: true" } else { "" }
+                        ),
+                        SketchEntity::ControlSpline {
+                            control_points,
+                            degree,
+                            closed,
+                        } => format!(
+                            "spline(control_points: [{}], degree: {degree}{})",
+                            control_points
+                                .iter()
+                                .map(|point| point2(*point))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            if *closed { ", closed: true" } else { "" }
+                        ),
                     })
                     .collect::<Vec<_>>();
                 format!(
@@ -269,6 +326,20 @@ impl Writer<'_> {
                 let _ = write!(call, ", label: {})", quoted(&label));
                 call
             }
+            ApiCommand::Loft {
+                sections,
+                operation,
+                ..
+            } => format!(
+                "loft(sections: [{}], operation: {}, label: {})",
+                sections
+                    .iter()
+                    .map(|section| self.step_ident(&section.0))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", "),
+                operation_text(*operation),
+                quoted(&label)
+            ),
             ApiCommand::Revolve {
                 sketch,
                 regions,
@@ -276,17 +347,26 @@ impl Writer<'_> {
                 axis_direction,
                 angle_degrees,
                 operation,
+                axis_placement,
                 ..
-            } => format!(
-                "revolve(sketch: {}{}, axis_origin: {}, axis: {}, angle: {}, operation: {}, label: {})",
-                self.step_ident(&sketch.0)?,
-                regions_text(regions),
-                point3(*axis_origin),
-                vector3(*axis_direction),
-                number(*angle_degrees),
-                operation_text(*operation),
-                quoted(&label)
-            ),
+            } => {
+                let axis = match axis_placement {
+                    Some(placement) => format!("axis: {}", self.axis_text(placement)?),
+                    None => format!(
+                        "axis_origin: {}, axis: {}",
+                        point3(*axis_origin),
+                        vector3(*axis_direction)
+                    ),
+                };
+                format!(
+                    "revolve(sketch: {}{}, {axis}, angle: {}, operation: {}, label: {})",
+                    self.step_ident(&sketch.0)?,
+                    regions_text(regions),
+                    number(*angle_degrees),
+                    operation_text(*operation),
+                    quoted(&label)
+                )
+            }
             ApiCommand::PushPull { face, distance, .. } => format!(
                 "push_pull(face: {}, distance: {}, label: {})",
                 self.selector(face)?,
@@ -427,6 +507,35 @@ impl Writer<'_> {
     }
 
     /// A selector as the script language spells it.
+    /// An axis the body places, as `axis(...)` spells it.
+    fn axis_text(&mut self, placement: &AxisPlacement) -> Result<String, ApiError> {
+        let flip = |flip: bool| if flip { ", flip: true" } else { "" };
+        Ok(match placement {
+            AxisPlacement::Along {
+                edge,
+                flip: flipped,
+            } => {
+                format!("axis(along: {}{})", self.selector(edge)?, flip(*flipped))
+            }
+            AxisPlacement::Through {
+                face,
+                flip: flipped,
+            } => {
+                format!("axis(through: {}{})", self.selector(face)?, flip(*flipped))
+            }
+            AxisPlacement::Between {
+                first,
+                second,
+                flip: flipped,
+            } => format!(
+                "axis(between: [{}, {}]{})",
+                self.selector(first)?,
+                self.selector(second)?,
+                flip(*flipped)
+            ),
+        })
+    }
+
     fn selector(&mut self, selector: &EntitySelector) -> Result<String, ApiError> {
         Ok(match selector {
             EntitySelector::ByHistory {
@@ -654,6 +763,54 @@ fn axis_word(direction: Vector3) -> Option<&'static str> {
         }
         _ => return None,
     })
+}
+
+/// A plane as the script spells it: one of the world planes moved along the
+/// side it faces where it is one, and its origin and two axes, exactly as
+/// held, otherwise.
+/// The `offset:` and `flip:` a plane placed by faces or edges carries, each
+/// written only when it is not the default.
+fn placement_text(offset: f64, flip: bool) -> String {
+    let mut text = String::new();
+    if offset != 0.0 {
+        text.push_str(&format!(", offset: {}", number(offset)));
+    }
+    if flip {
+        text.push_str(", flip: true");
+    }
+    text
+}
+
+fn plane_text(frame: PlanarFrame3) -> String {
+    for name in ["XY", "XZ", "YZ"] {
+        let Some(world) = crate::api::scripting::world_plane_frame(name) else {
+            continue;
+        };
+        if world.u != frame.u || world.v != frame.v {
+            continue;
+        }
+        let normal = Vector3::new(
+            frame.u.y * frame.v.z - frame.u.z * frame.v.y,
+            frame.u.z * frame.v.x - frame.u.x * frame.v.z,
+            frame.u.x * frame.v.y - frame.u.y * frame.v.x,
+        );
+        let offset =
+            frame.origin.x * normal.x + frame.origin.y * normal.y + frame.origin.z * normal.z;
+        let moved = Point3::new(normal.x * offset, normal.y * offset, normal.z * offset);
+        if moved == frame.origin {
+            return if offset == 0.0 {
+                format!("plane(from: \"{name}\")")
+            } else {
+                format!("plane(from: \"{name}\", offset: {})", number(offset))
+            };
+        }
+    }
+    format!(
+        "plane(origin: {}, x_axis: {}, y_axis: {})",
+        point3(frame.origin),
+        vector3(frame.u),
+        vector3(frame.v)
+    )
 }
 
 fn regions_text(regions: &[u32]) -> String {

@@ -313,6 +313,13 @@
         "BOOLEAN_PRECISION_POLICY_MISMATCH",
         "BOOLEAN_STALE_OPERAND",
         "BOOLEAN_SURFACE_PAIR_UNSUPPORTED",
+        "BOOLEAN_TRACE_NOT_CLOSED",
+        "BSPLINE_CLEARANCE_INDETERMINATE",
+        "BSPLINE_CURVE_DEGENERATE",
+        "BSPLINE_DEGREE_UNSUPPORTED",
+        "BSPLINE_KNOTS_INVALID",
+        "BSPLINE_RATIONAL_UNSUPPORTED",
+        "BSPLINE_UNCLAMPED_UNSUPPORTED",
         "COEDGE_USE_COUNT",
         "COORDINATE_LIMIT_EXCEEDED",
         "CUBOID_EXTENT_TOO_SMALL",
@@ -330,6 +337,8 @@
         "EDGE_FINISH_DISTANCE_INVALID",
         "EDGE_FINISH_FACETED_APPROXIMATION",
         "EDGE_FINISH_TARGET_INVALID",
+        "EDGE_NOT_ON_FACE",
+        "EDGE_NOT_STRAIGHT",
         "EDGE_USE_COUNT",
         "EDGE_USE_ORIENTATION",
         "ENTITY_NOT_FINITE",
@@ -350,6 +359,7 @@
         "FACE_FEATURE_COORDINATE_LIMIT",
         "FACE_FEATURE_CUT_EXIT_UNRESOLVED",
         "FACE_FEATURE_DISTANCE_NON_POSITIVE",
+        "FACE_FEATURE_EXACT_ROUTE_DECLINED",
         "FACE_FEATURE_FACETED_APPROXIMATION",
         "FACE_FEATURE_FACETED_UNRESOLVED",
         "FACE_FEATURE_FRAME_NOT_ORTHONORMAL",
@@ -393,13 +403,27 @@
         "FACE_PUSH_PULL_TOO_SMALL",
         "FACE_USE_COUNT",
         "HOLE_DIAMETER_INVALID",
+        "HOLE_RIM_DISTANCE_INVALID",
         "LINEAR_PATTERN_DOMAIN_UNSUPPORTED",
         "LOFT_CORNER_NOT_TANGENT",
+        "LOFT_EXACT_ROUTE_DECLINED",
+        "LOFT_FACETED_APPROXIMATION",
+        "LOFT_FACETED_UNRESOLVED",
+        "LOFT_HOLE_COUNT_MISMATCH",
         "LOFT_OFFSET_NON_FINITE",
+        "LOFT_OFFSET_SPLINE_UNSUPPORTED",
+        "LOFT_RUNGS_CROSS",
+        "LOFT_SECTIONS_COPLANAR",
         "LOFT_SECTION_COLLAPSES",
         "LOFT_SECTION_COORDINATE_LIMIT",
+        "LOFT_SECTION_CROSSES_PLANE",
         "LOFT_SECTION_DEGENERATE",
+        "LOFT_SECTION_REGIONS_UNSUPPORTED",
         "LOFT_SECTION_SELF_INTERSECTS",
+        "LOFT_SKIN_FOLDS",
+        "LOFT_TARGET_EMPTY",
+        "LOFT_TOO_FEW_SECTIONS",
+        "LOFT_WALL_DEGENERATE",
         "LOOP_NOT_CLOSED",
         "LOOP_TOO_SHORT",
         "LOOP_USE_COUNT",
@@ -416,6 +440,7 @@
         "PLANAR_PROFILE_LOOP_DISCONNECTED",
         "PLANAR_PROFILE_LOOP_EMPTY",
         "PLANAR_PROFILE_REGIONS_OVERLAP",
+        "PLANAR_PROFILE_SPLINE_UNSUPPORTED",
         "PLANAR_PROFILE_TOO_MANY_CURVES",
         "PLANAR_PROFILE_TOO_MANY_LOOPS",
         "PLANAR_PROFILE_TOO_MANY_REGIONS",
@@ -429,12 +454,16 @@
         "PRECISION_POLICY_MISMATCH",
         "PRISM_EDGE_FINISH_DISTANCE_INVALID",
         "PROTOCOL_VERSION_UNSUPPORTED",
+        "REVOLVE_ANGLE_INVALID",
         "REVOLVE_ANNULUS_DIMENSIONS_INVALID",
         "REVOLVE_AXIS_DEGENERATE",
-        "REVOLVE_OBLIQUE_AXIS_CONTACT",
+        "REVOLVE_EXACT_ROUTE_DECLINED",
+        "REVOLVE_FACETED_APPROXIMATION",
+        "REVOLVE_FACETED_UNRESOLVED",
+        "REVOLVE_HOLE_ON_AXIS",
         "REVOLVE_PROFILE_CROSSES_AXIS",
         "REVOLVE_SECTION_NOT_CONTIGUOUS",
-        "REVOLVE_SINGLE_REGION_ONLY",
+        "REVOLVE_TARGET_EMPTY",
         "RIB_SECTION_INVALID",
         "RIM_BLEND_DISTANCE_INVALID",
         "RIM_LOOP_DISTANCE_INVALID",
@@ -442,6 +471,9 @@
         "SHELL_CORE_UNSUPPORTED",
         "SHELL_DISCONNECTED",
         "SHELL_DOMAIN_UNSUPPORTED",
+        "SHELL_EXACT_ROUTE_DECLINED",
+        "SHELL_FACETED_APPROXIMATION",
+        "SHELL_FACETED_UNRESOLVED",
         "SHELL_OPEN_FACES_UNSUPPORTED",
         "SHELL_OPEN_FACE_INVALID",
         "SHELL_OPEN_REVOLVE_UNSUPPORTED",
@@ -452,6 +484,19 @@
         "SOLID_VOLUME_NON_POSITIVE",
         "STALE_SNAPSHOT",
         "SURFACE_FRAME_INVALID",
+        "SWEEP_APPROXIMATION_TOLERANCE",
+        "SWEEP_EXACT_ROUTE_DECLINED",
+        "SWEEP_FACETED_APPROXIMATION",
+        "SWEEP_FACETED_UNRESOLVED",
+        "SWEEP_PATH_CLOSED",
+        "SWEEP_PATH_CORNER",
+        "SWEEP_PATH_EMPTY",
+        "SWEEP_PATH_GAP",
+        "SWEEP_PATH_INVALID",
+        "SWEEP_PROFILE_ALONG_PATH",
+        "SWEEP_PROFILE_TOO_WIDE",
+        "SWEEP_TARGET_EMPTY",
+        "SWEEP_TOLERANCE_UNMET",
         "TRANSFORM_COORDINATE_LIMIT_EXCEEDED",
         "TRANSFORM_FEATURE_TOO_SMALL",
         "TRANSFORM_INPUT_NON_FINITE",
@@ -480,6 +525,7 @@
         "make_cylinder",
         "sketch",
         "extrude",
+        "loft",
         "revolve",
         "push_pull",
         "drill_hole",
@@ -772,8 +818,88 @@
             "minor_radius"
           ],
           "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "ruled"
+            },
+            "first_rail": {
+              "$ref": "#/$defs/rail"
+            },
+            "second_rail": {
+              "$ref": "#/$defs/rail"
+            }
+          },
+          "required": [
+            "surface",
+            "first_rail",
+            "second_rail"
+          ],
+          "additionalProperties": true,
+          "description": "The straight lines between two exact rails (ADR 0049): the wall of a loft between unlike sections. Reported by its rails, each walked in the direction the rulings pair them."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "surface": {
+              "const": "bspline"
+            },
+            "degree_u": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "degree_v": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "control_points_u": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "control_points_v": {
+              "type": "integer",
+              "minimum": 2
+            }
+          },
+          "required": [
+            "surface",
+            "degree_u",
+            "degree_v",
+            "control_points_u",
+            "control_points_v"
+          ],
+          "additionalProperties": true,
+          "description": "A non-rational B-spline surface (ADR 0050): the wall swept from a spline or skinned through several loft sections. Reported by its degree in each parameter and the size of its control net."
         }
       ]
+    },
+    "rail": {
+      "type": "object",
+      "properties": {
+        "curve": {
+          "type": "string",
+          "enum": [
+            "line",
+            "circular_arc",
+            "elliptical_arc"
+          ]
+        },
+        "start": {
+          "$ref": "#/$defs/point"
+        },
+        "end": {
+          "$ref": "#/$defs/point"
+        }
+      },
+      "required": [
+        "curve",
+        "start",
+        "end"
+      ],
+      "additionalProperties": false,
+      "description": "One rail of a ruled face."
     },
     "face": {
       "type": "object",
@@ -788,7 +914,9 @@
             "cylinder",
             "cone",
             "sphere",
-            "torus"
+            "torus",
+            "ruled",
+            "bspline"
           ]
         },
         "origin": {
@@ -817,6 +945,28 @@
         },
         "minor_radius": {
           "type": "number"
+        },
+        "first_rail": {
+          "$ref": "#/$defs/rail"
+        },
+        "second_rail": {
+          "$ref": "#/$defs/rail"
+        },
+        "degree_u": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "degree_v": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "control_points_u": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "control_points_v": {
+          "type": "integer",
+          "minimum": 2
         },
         "area": {
           "type": "number",
@@ -870,8 +1020,11 @@
           "enum": [
             "line",
             "circular_arc",
-            "elliptical_arc"
-          ]
+            "elliptical_arc",
+            "surface_trace",
+            "bspline"
+          ],
+          "description": "surface_trace: where two cylinders meet in a curve no line, circle or ellipse describes (ADR 0047). It has no frame, so it is reported by its ends and the radii of the two cylinders that generate it. bspline: a non-rational B-spline curve (ADR 0050), reported by its ends, its degree and how many control points it has."
         },
         "start": {
           "$ref": "#/$defs/point"
@@ -896,6 +1049,24 @@
         },
         "sweep_degrees": {
           "type": "number"
+        },
+        "host_radius": {
+          "type": "number",
+          "description": "surface_trace: radius of the cylinder whose azimuth parameterizes the curve."
+        },
+        "other_radius": {
+          "type": "number",
+          "description": "surface_trace: radius of the other cylinder."
+        },
+        "degree": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "bspline: the curve's degree."
+        },
+        "control_points": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "bspline: how many control points the curve has."
         },
         "length": {
           "type": "number",
@@ -946,6 +1117,14 @@
           "minimum": 0
         },
         "tori": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ruled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bspline": {
           "type": "integer",
           "minimum": 0
         }

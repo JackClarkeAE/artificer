@@ -1,9 +1,14 @@
 //! High-level command types for Artificer
 
-use artificer_protocol::{Point2, Point3, Vector3};
+use artificer_protocol::{PlanarFrame3, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::selectors::EntitySelector;
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 fn is_zero(value: &f64) -> bool {
     *value == 0.0
@@ -53,6 +58,47 @@ pub enum SketchPlane {
     OnFace {
         face: EntitySelector,
     },
+    /// Any plane already resolved to a frame: a world plane given by its
+    /// origin and axes, or offset from one of the three above. The frame's
+    /// axes are directions; the kernel normalizes them, and `u × v` is the
+    /// side a sketch on it faces.
+    Frame {
+        frame: PlanarFrame3,
+    },
+    /// A planar face of the current body, its own frame moved `offset` along
+    /// its outward normal (ADR 0048).
+    OffsetFace {
+        face: Box<EntitySelector>,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
+    /// Halfway between two parallel planar faces of the current body, facing
+    /// as the first does, then moved `offset` along that normal.
+    Midplane {
+        first: Box<EntitySelector>,
+        second: Box<EntitySelector>,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
+    /// Through a straight edge of the current body, hinged on it and turned
+    /// `angle_degrees` from the planar face it starts on: 0 lies on the face,
+    /// 90 stands square to it. `face` names which face when the edge bounds
+    /// two planar faces.
+    ThroughEdge {
+        edge: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        face: Option<Box<EntitySelector>>,
+        #[serde(default)]
+        angle_degrees: f64,
+        #[serde(default)]
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
 }
 
 /// A 2D geometric entity in a sketch.
@@ -77,6 +123,22 @@ pub enum SketchEntity {
         origin: Point2,
         width: f64,
         height: f64,
+    },
+    /// A spline through fit points (ADR 0050), drawn as the sketch's
+    /// fit-point tool draws it: cubic when there are four points or more,
+    /// and back to the first point, smooth there, when `closed`.
+    Spline {
+        points: Vec<Point2>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        closed: bool,
+    },
+    /// A spline by its control points (ADR 0050): clamped and uniform, of
+    /// `degree`, and ending on its first control point when `closed`.
+    ControlSpline {
+        control_points: Vec<Point2>,
+        degree: usize,
+        #[serde(default, skip_serializing_if = "is_false")]
+        closed: bool,
     },
 }
 
@@ -128,6 +190,34 @@ impl PatternPlacement {
     }
 }
 
+/// A construction axis the body places, as `axis(...)` names it: found
+/// again against the body as it stands when the step that uses it runs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AxisPlacement {
+    /// Along a straight edge, from its start to its end.
+    Along {
+        edge: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+    /// Through a curved face: the axis of its cylinder, cone, sphere or
+    /// torus.
+    Through {
+        face: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+    /// Where two flat faces meet, running along the first's normal crossed
+    /// with the second's.
+    Between {
+        first: Box<EntitySelector>,
+        second: Box<EntitySelector>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        flip: bool,
+    },
+}
+
 /// Commands for geometry operations.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -164,6 +254,13 @@ pub enum ApiCommand {
         #[serde(default, skip_serializing_if = "is_zero")]
         draft_degrees: f64,
     },
+    /// A loft between the regions of two sketches, each on its own plane
+    /// (ADR 0049). A new body, or an add or cut against the current one.
+    Loft {
+        label: String,
+        sections: Vec<StepLabel>,
+        operation: ExtrudeOp,
+    },
     Revolve {
         label: String,
         sketch: StepLabel,
@@ -173,6 +270,10 @@ pub enum ApiCommand {
         axis_direction: Vector3,
         angle_degrees: f64,
         operation: ExtrudeOp,
+        /// An axis the body places, found again when the revolve runs; it
+        /// stands in for `axis_origin` and `axis_direction`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        axis_placement: Option<AxisPlacement>,
     },
     PushPull {
         label: String,
@@ -252,6 +353,7 @@ impl ApiCommand {
             Self::MakeCylinder { .. } => "make_cylinder",
             Self::Sketch { .. } => "sketch",
             Self::Extrude { .. } => "extrude",
+            Self::Loft { .. } => "loft",
             Self::Revolve { .. } => "revolve",
             Self::PushPull { .. } => "push_pull",
             Self::DrillHole { .. } => "drill_hole",
@@ -274,6 +376,7 @@ impl ApiCommand {
             | Self::MakeCylinder { label, .. }
             | Self::Sketch { label, .. }
             | Self::Extrude { label, .. }
+            | Self::Loft { label, .. }
             | Self::Revolve { label, .. }
             | Self::PushPull { label, .. }
             | Self::DrillHole { label, .. }

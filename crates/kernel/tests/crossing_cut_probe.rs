@@ -11,9 +11,12 @@
 //! That is the history. Two equal-radius bores on perpendicular intersecting
 //! axes meet in two ellipses — the Steinmetz case that ADR 0026 K1 named as the
 //! missing curve vocabulary — and K1 has landed, so this body is now exact and
-//! these gates pin the closed form rather than a bound on the error. The
-//! approximation is still reachable, and still warns, for the bore pairs the
-//! vocabulary does not cover: unequal radii, or axes that do not meet.
+//! these gates pin the closed form rather than a bound on the error. Bores of
+//! unequal radius, or on axes that do not meet, followed with ADR 0047: they
+//! meet in a space quartic the kernel now carries, and are exact too. The
+//! faceted tier's own contract — that an approximation says so — is held by
+//! `report_tests.rs` and `exact_route_decline.rs` on a cut the exact engine
+//! still does not carry.
 
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
@@ -226,20 +229,18 @@ fn the_display_scene_of_a_faceted_body_builds_promptly() {
     );
 }
 
-/// An approximation must say so. Every other report this kernel publishes means
-/// "certified", so the one path that publishes a tessellation has to carry a
-/// caveat the caller can see — otherwise a 0.15%-wrong volume is quoted with
-/// exactly the same authority as an exact one.
-///
-/// Equal radii on crossing axes are exact now, so the approximation has to be
-/// reached by a bore the vocabulary does not cover. A *different* radius is the
-/// smallest such change: what makes the equal case exact is that the `r²`
-/// cancels between the two cylinder equations, leaving the two bisector planes,
-/// and with unequal radii it does not cancel and the seam really is a quartic.
+/// A bore of another radius crossing the first. This was the smallest change
+/// that left the exact domain — the `r²` that cancels between two equal
+/// cylinders' equations does not cancel here, and the seam really is a
+/// quartic — so it was the test that the faceted tier labels itself. The
+/// quartic is carried now (ADR 0047), and the crossing is exact: the cube, less
+/// both bores, plus what they share, `4∫√((64 − y²)(36 − y²)) dy` over the
+/// narrow bore's width, integrated here without the kernel.
 #[test]
-fn the_faceted_fallback_warns_that_it_approximated() {
+fn a_bore_of_another_radius_crossing_the_first_is_exact() {
     let bored = bored_box();
     let side = face_where(&bored, |centre| (centre.x - SIZE).abs() < 1.0e-6);
+    let narrow = RADIUS * 0.75;
     let outcome = through_cut_outcome_at(
         &bored,
         side,
@@ -249,24 +250,45 @@ fn the_faceted_fallback_warns_that_it_approximated() {
             Vector3::new(0.0, 0.0, 1.0),
         ),
         Point2::new(0.0, 0.0),
-        RADIUS * 0.75,
-        "crossing-cut-warning",
-    );
-    let warning = outcome
-        .report
-        .warnings
-        .iter()
-        .find(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION")
-        .expect("a faceted result must warn that it is one");
-    assert_eq!(
-        warning.severity,
-        artificer_protocol::DiagnosticSeverity::Warning,
-        "an approximation is a caveat on a published result, not a refusal"
+        narrow,
+        "crossing-cut-unequal",
     );
     assert!(
-        warning.message.contains("ellipses"),
-        "the warning should name why the exact route is unavailable: {}",
-        warning.message
+        outcome.report.warnings.is_empty(),
+        "an exact crossing carries no caveat: {:?}",
+        outcome.report.warnings
+    );
+    assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
+    // Walked through `y = −r + 2r(3t² − 2t³)`, whose rate vanishes at both
+    // ends, the square roots there become smooth and Simpson converges.
+    let panels = 20_000;
+    let step = 1.0 / f64::from(panels);
+    let shared = (0..=panels)
+        .map(|index| {
+            let t = f64::from(index) * step;
+            let y = (2.0 * narrow).mul_add(t * t * 2.0f64.mul_add(-t, 3.0), -narrow);
+            let rate = 12.0 * narrow * t * (1.0 - t);
+            let weight = if index == 0 || index == panels {
+                1.0
+            } else if index % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            let chords = 4.0
+                * y.mul_add(-y, RADIUS * RADIUS).max(0.0).sqrt()
+                * y.mul_add(-y, narrow * narrow).max(0.0).sqrt();
+            weight * chords * rate
+        })
+        .sum::<f64>()
+        * step
+        / 3.0;
+    let expected =
+        SIZE.powi(3) - std::f64::consts::PI * (RADIUS * RADIUS + narrow * narrow) * SIZE + shared;
+    let volume = outcome.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "the unequal crossing is exact: {volume} vs {expected}"
     );
 }
 

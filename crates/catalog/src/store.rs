@@ -10,10 +10,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CatalogError, ContentDigest, MAX_INDEX_ENTRIES, MAX_PACKAGE_BYTES, PartDefinitionId, PartKind,
-    PartMetadata, PartPackage, PartRevision,
+    PartMetadata, PartPackage, PartRevision, invalid, validate_text,
 };
 
 const OBJECTS_DIRECTORY: &str = "objects";
+const PREVIEWS_DIRECTORY: &str = "previews";
+const PREVIEW_IMAGE_SUFFIX: &str = ".png";
+const PREVIEW_FACTS_SUFFIX: &str = ".json";
+/// The largest preview image the store keeps or hands back.
+pub const MAX_PREVIEW_IMAGE_BYTES: usize = 256 * 1024;
+const MAX_PREVIEW_FACTS_BYTES: usize = 4 * 1024;
+const MAX_PREVIEW_TEXT_BYTES: usize = 128;
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const REFERENCES_DIRECTORY: &str = "refs";
 const OBJECT_SUFFIX: &str = ".part.json";
 const REFERENCE_SUFFIX: &str = ".ref";
@@ -22,6 +30,76 @@ const MAX_SEARCH_TEXT_BYTES: usize = 1_024;
 const MAX_SEARCH_RESULTS: usize = 10_000;
 
 static TEMPORARY_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// What a published part looks like and roughly measures, kept beside its
+/// package so the library can show it without evaluating the part.
+///
+/// A preview is derived rather than authored. It is not part of the package's
+/// content address, and a later build may draw it again; the package it
+/// describes stays immutable either way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartPreview {
+    /// A small PNG of the part in an isometric view fitted to it.
+    pub image_png: Vec<u8>,
+    pub facts: PartPreviewFacts,
+}
+
+/// The measurements a preview was drawn with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartPreviewFacts {
+    /// The drawn part's bounding box along X, Y and Z, in millimetres.
+    pub extents_mm: [f64; 3],
+    /// For each axis, the parameter that sets that extent, if one does; the
+    /// extent is then only the drawn sample's.
+    pub driven_by: [Option<String>; 3],
+    /// The parameter values the part was drawn with, as a person reads them
+    /// ("Length 100 mm"), when it has parameters.
+    pub sample: Option<String>,
+}
+
+impl PartPreviewFacts {
+    fn validate(&self) -> Result<(), CatalogError> {
+        if self
+            .extents_mm
+            .iter()
+            .any(|extent| !extent.is_finite() || *extent < 0.0)
+        {
+            return Err(invalid(
+                "preview extents",
+                "must be finite and not negative",
+            ));
+        }
+        for name in self.driven_by.iter().flatten() {
+            validate_text(
+                name,
+                "preview parameter name",
+                MAX_PREVIEW_TEXT_BYTES,
+                false,
+            )?;
+        }
+        if let Some(sample) = &self.sample {
+            validate_text(sample, "preview sample", MAX_PREVIEW_TEXT_BYTES, false)?;
+        }
+        Ok(())
+    }
+}
+
+impl PartPreview {
+    fn validate(&self) -> Result<(), CatalogError> {
+        if self.image_png.len() > MAX_PREVIEW_IMAGE_BYTES {
+            return Err(CatalogError::ResourceLimit {
+                resource: "preview image",
+                limit: MAX_PREVIEW_IMAGE_BYTES,
+                actual: self.image_png.len(),
+            });
+        }
+        if !self.image_png.starts_with(&PNG_SIGNATURE) {
+            return Err(invalid("preview image", "is not a PNG"));
+        }
+        self.facts.validate()
+    }
+}
 
 /// Compact immutable entry used by the library browser and search index.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +427,25 @@ impl CatalogStore {
         package.verify()?;
         let bytes = package.to_json_bytes()?;
         let digest = package.content_digest();
+        // A revision that already names other content is refused before any
+        // object is written. Checking only after the object was in place left
+        // an unreachable copy behind on every refused publish.
+        let definition = package.definition();
+        let reference_path = self.reference_path(definition.id(), definition.revision());
+        if reference_path.exists() {
+            let existing = parse_reference_bytes(&read_limited_regular_file(
+                &reference_path,
+                MAX_REFERENCE_BYTES,
+            )?)?;
+            if existing != digest {
+                return Err(CatalogError::RevisionConflict {
+                    definition: definition.id().clone(),
+                    revision: definition.revision(),
+                    existing,
+                    attempted: digest,
+                });
+            }
+        }
         let object_path = self.object_path(digest);
         let object_parent = object_path
             .parent()
@@ -356,10 +453,8 @@ impl CatalogStore {
         ensure_directory(object_parent)?;
         atomic_create_or_verify(&object_path, &bytes, MAX_PACKAGE_BYTES)?;
 
-        let definition = package.definition();
         let reference_directory = self.reference_directory(definition.id());
         ensure_directory(&reference_directory)?;
-        let reference_path = self.reference_path(definition.id(), definition.revision());
         let reference_bytes = format!("{digest}\n").into_bytes();
         match atomic_create_or_compare(&reference_path, &reference_bytes, MAX_REFERENCE_BYTES)? {
             CreateOutcome::Created | CreateOutcome::Identical => {}
@@ -423,6 +518,59 @@ impl CatalogStore {
             )));
         }
         Ok(package)
+    }
+
+    /// Keeps a preview beside a published package, replacing any earlier one.
+    ///
+    /// Only a package in the store can have a preview. The image and its
+    /// facts are each replaced atomically, the image first, so a reader sees
+    /// either the old pair, the new pair, or the new image with the old
+    /// facts — never a half-written file.
+    pub fn save_preview(
+        &self,
+        digest: ContentDigest,
+        preview: &PartPreview,
+    ) -> Result<(), CatalogError> {
+        if !self.object_path(digest).exists() {
+            return Err(CatalogError::ObjectNotFound(digest));
+        }
+        preview.validate()?;
+        let facts = serde_json::to_vec(&preview.facts)?;
+        let (image_path, facts_path) = self.preview_paths(digest);
+        atomic_replace(&image_path, &preview.image_png, MAX_PREVIEW_IMAGE_BYTES)?;
+        atomic_replace(&facts_path, &facts, MAX_PREVIEW_FACTS_BYTES)?;
+        Ok(())
+    }
+
+    /// The preview kept for a package, if there is a readable one.
+    ///
+    /// A missing, oversized or malformed preview is `None` rather than an
+    /// error: it is derived data, and the answer is to draw it again.
+    pub fn preview(&self, digest: ContentDigest) -> Result<Option<PartPreview>, CatalogError> {
+        let (image_path, facts_path) = self.preview_paths(digest);
+        if !image_path.exists() || !facts_path.exists() {
+            return Ok(None);
+        }
+        let Ok(image_png) = read_limited_regular_file(&image_path, MAX_PREVIEW_IMAGE_BYTES) else {
+            return Ok(None);
+        };
+        let Ok(facts) = read_limited_regular_file(&facts_path, MAX_PREVIEW_FACTS_BYTES) else {
+            return Ok(None);
+        };
+        let Ok(facts) = serde_json::from_slice::<PartPreviewFacts>(&facts) else {
+            return Ok(None);
+        };
+        let preview = PartPreview { image_png, facts };
+        Ok(preview.validate().is_ok().then_some(preview))
+    }
+
+    fn preview_paths(&self, digest: ContentDigest) -> (PathBuf, PathBuf) {
+        let hex = digest.to_hex();
+        let directory = self.root.join(PREVIEWS_DIRECTORY).join(&hex[..2]);
+        (
+            directory.join(format!("{}{PREVIEW_IMAGE_SUFFIX}", &hex[2..])),
+            directory.join(format!("{}{PREVIEW_FACTS_SUFFIX}", &hex[2..])),
+        )
     }
 
     /// Reconstructs the disposable search index and tolerantly reports corrupt
@@ -784,6 +932,55 @@ fn atomic_create_or_compare(
     }
 }
 
+/// Replaces a derived file atomically: the new bytes are written and synced
+/// under a temporary name, then renamed over the old file.
+fn atomic_replace(path: &Path, bytes: &[u8], limit: usize) -> Result<(), CatalogError> {
+    if bytes.len() > limit {
+        return Err(CatalogError::ResourceLimit {
+            resource: "catalog atomic write",
+            limit,
+            actual: bytes.len(),
+        });
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && !metadata.file_type().is_file()
+    {
+        return Err(CatalogError::UnsafeFilesystemEntry(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        CatalogError::UnsafeFilesystemEntry("catalog destination has no parent".into())
+    })?;
+    ensure_directory(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| CatalogError::UnsafeFilesystemEntry("invalid destination name".into()))?;
+    let unique = TEMPORARY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        unique
+    ));
+    let written = (|| -> Result<(), std::io::Error> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_directory(parent)
+}
+
 /// Flushes a directory entry so a freshly published object survives a crash.
 ///
 /// This is a POSIX durability step: creating a link is not necessarily on disk
@@ -914,6 +1111,83 @@ mod tests {
         assert_eq!(results[0].required_parameter_count(), 1);
     }
 
+    fn preview() -> PartPreview {
+        let mut image_png = PNG_SIGNATURE.to_vec();
+        image_png.extend_from_slice(b"rest of a png");
+        PartPreview {
+            image_png,
+            facts: PartPreviewFacts {
+                extents_mm: [20.0, 20.0, 100.0],
+                driven_by: [None, None, Some("Length".into())],
+                sample: Some("Length 100 mm".into()),
+            },
+        }
+    }
+
+    #[test]
+    fn a_preview_is_kept_beside_its_package_and_can_be_drawn_again() {
+        let directory = TestDirectory::new("preview");
+        let store = CatalogStore::open(&directory.0).unwrap();
+        let package = package(
+            "vendor.bracket",
+            PartRevision::new(1, 0, 0),
+            r#"{"value":1}"#,
+        );
+        let digest = package.content_digest();
+        assert!(matches!(
+            store.save_preview(digest, &preview()),
+            Err(CatalogError::ObjectNotFound(_))
+        ));
+        store.publish(&package).unwrap();
+        assert_eq!(store.preview(digest).unwrap(), None);
+
+        store.save_preview(digest, &preview()).unwrap();
+        assert_eq!(store.preview(digest).unwrap(), Some(preview()));
+
+        let mut redrawn = preview();
+        redrawn.image_png.push(1);
+        redrawn.facts.sample = Some("Length 50 mm".into());
+        store.save_preview(digest, &redrawn).unwrap();
+        assert_eq!(store.preview(digest).unwrap(), Some(redrawn));
+
+        // A preview is derived: publishing again and reopening keep it, and
+        // the index never mistakes it for a package.
+        store.publish(&package).unwrap();
+        let reopened = CatalogStore::open(&directory.0).unwrap();
+        assert_eq!(reopened.index_snapshot().unwrap().len(), 1);
+        assert!(reopened.rejected_snapshot().unwrap().is_empty());
+        assert!(reopened.preview(digest).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_preview_that_is_not_a_png_or_not_sane_is_refused() {
+        let directory = TestDirectory::new("preview-refused");
+        let store = CatalogStore::open(&directory.0).unwrap();
+        let package = package(
+            "vendor.bracket",
+            PartRevision::new(1, 0, 0),
+            r#"{"value":1}"#,
+        );
+        let digest = store.publish(&package).unwrap();
+
+        let mut not_png = preview();
+        not_png.image_png = b"GIF89a".to_vec();
+        assert!(store.save_preview(digest, &not_png).is_err());
+        let mut bad_extent = preview();
+        bad_extent.facts.extents_mm[1] = f64::NAN;
+        assert!(store.save_preview(digest, &bad_extent).is_err());
+        let mut too_big = preview();
+        too_big.image_png.resize(MAX_PREVIEW_IMAGE_BYTES + 1, 0);
+        assert!(store.save_preview(digest, &too_big).is_err());
+        assert_eq!(store.preview(digest).unwrap(), None);
+
+        // A damaged file on disk reads as no preview, to be drawn again.
+        store.save_preview(digest, &preview()).unwrap();
+        let (image, _) = store.preview_paths(digest);
+        fs::write(&image, b"damaged").unwrap();
+        assert_eq!(store.preview(digest).unwrap(), None);
+    }
+
     #[test]
     fn published_revision_is_immutable() {
         let directory = TestDirectory::new("revision-conflict");
@@ -926,6 +1200,9 @@ mod tests {
             store.publish(&replacement),
             Err(CatalogError::RevisionConflict { .. })
         ));
+        // A refused publish writes nothing: no unreachable copy of the
+        // replacement is left in the object store.
+        assert!(!store.object_path(replacement.content_digest()).exists());
         assert_eq!(
             store
                 .resolve(first.definition().id(), PartRevision::new(1, 0, 0))

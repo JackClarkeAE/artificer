@@ -32,6 +32,8 @@ pub(crate) enum BrowserContextTarget {
     Sketch(usize),
     ConstructionPlane(u64),
     OriginPlane(SketchPlane),
+    /// A construction axis row, by its feature.
+    ConstructionAxis(artificer_model::FeatureId),
 }
 
 /// The Browser's floating right-click menu.
@@ -66,8 +68,17 @@ enum BrowserContextCommand {
     HideSketch,
     ShowSketch,
     SelectPlane,
+    EditPlane,
+    RenamePlane,
     HidePlane,
     ShowPlane,
+    DeletePlane,
+    SelectAxis,
+    EditAxis,
+    RenameAxis,
+    HideAxis,
+    ShowAxis,
+    DeleteAxis,
 }
 
 impl BrowserContextCommand {
@@ -88,8 +99,17 @@ impl BrowserContextCommand {
             Self::HideSketch => "Hide this sketch",
             Self::ShowSketch => "Show this sketch",
             Self::SelectPlane => "Select this plane",
+            Self::EditPlane => "Edit this plane",
+            Self::RenamePlane => "Rename…",
             Self::HidePlane => "Hide this plane",
             Self::ShowPlane => "Show this plane",
+            Self::DeletePlane => "Delete this plane",
+            Self::SelectAxis => "Select this axis",
+            Self::EditAxis => "Edit this axis",
+            Self::RenameAxis => "Rename this axis…",
+            Self::HideAxis => "Hide this axis",
+            Self::ShowAxis => "Show this axis",
+            Self::DeleteAxis => "Delete this axis",
         }
     }
 }
@@ -347,8 +367,7 @@ impl KernelLabApp {
                     .default_open(true)
                     .show(ui, |ui| {
                         for plane in SketchPlane::ALL {
-                            let has_other_plane_sketch =
-                                !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
+                            let has_other_plane_sketch = self.sketch_open_on_another_plane(plane);
                             let enabled =
                                 self.pending_operation.is_none() && !has_other_plane_sketch;
                             let selected = self.selected_origin_plane == plane
@@ -378,7 +397,7 @@ impl KernelLabApp {
                             }
                             if has_other_plane_sketch {
                                 response.on_disabled_hover_text(
-                                    "This first profile slice owns one plane per document.",
+                                    "Finish the sketch being drawn before choosing another plane.",
                                 );
                             }
                         }
@@ -454,17 +473,88 @@ impl KernelLabApp {
                                 });
                             }
                         });
-                        if let Some((id, visible)) = visibility_change
-                            && let Some(plane) = self
-                                .construction_planes
-                                .iter_mut()
-                                .find(|plane| plane.id == id)
-                        {
-                            plane.visible = visible;
+                        if let Some((id, visible)) = visibility_change {
+                            self.set_construction_plane_visible(id, visible);
                         }
                         if let Some(id) = selected_plane {
                             self.selected_construction_plane = Some(id);
                             self.clear_model_entity_selection();
+                        }
+                    }
+                    if !self.construction_axes.is_empty() {
+                        let rows = self
+                            .construction_axes
+                            .iter()
+                            .map(|axis| {
+                                (
+                                    axis.feature,
+                                    axis.name.clone(),
+                                    axis.visible,
+                                    self.selected_history_feature == Some(axis.feature),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let mut visibility_change = None;
+                        let mut selected_axis = None;
+                        egui::CollapsingHeader::new(
+                            RichText::new(format!("Axes ({})", rows.len()))
+                                .font(FontId::proportional(12.0))
+                                .color(theme::text())
+                                .strong(),
+                        )
+                        .id_salt("browser_construction_axes")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for (feature, name, visible, selected) in rows {
+                                ui.horizontal(|ui| {
+                                    let action_label = if visible {
+                                        format!("Hide {name}")
+                                    } else {
+                                        format!("Show {name}")
+                                    };
+                                    if visibility_toggle(ui, visible, &action_label).clicked() {
+                                        visibility_change = Some((feature, !visible));
+                                    }
+                                    let response = browser_row_button(
+                                        ui,
+                                        CommandIcon::Axis,
+                                        None,
+                                        name.clone(),
+                                        (ui.available_width() - 2.0).max(24.0),
+                                        selected,
+                                    );
+                                    // As for a plane row: "Axis 1" alone would
+                                    // collide with its history stop.
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            format!("Select {name}"),
+                                        )
+                                    });
+                                    let response = response.on_hover_text(format!(
+                                        "{name} · a revolve can turn about it; right-click to edit, rename, hide or delete it"
+                                    ));
+                                    if response.clicked() {
+                                        selected_axis = Some(feature);
+                                    }
+                                    if response.secondary_clicked() {
+                                        let position = response
+                                            .interact_pointer_pos()
+                                            .unwrap_or_else(|| response.rect.left_bottom());
+                                        context_request = Some((
+                                            position,
+                                            BrowserContextTarget::ConstructionAxis(feature),
+                                        ));
+                                    }
+                                });
+                            }
+                        });
+                        if let Some((feature, visible)) = visibility_change {
+                            self.set_construction_axis_visible(feature, visible);
+                        }
+                        if let Some(feature) = selected_axis {
+                            self.selected_history_feature = Some(feature);
                         }
                     }
                     let body_rows = self
@@ -569,7 +659,7 @@ impl KernelLabApp {
                             (
                                 index,
                                 sketch.ordinal,
-                                sketch.support.label(),
+                                self.support_label(&sketch.support),
                                 sketch.finished,
                                 sketch.visible,
                                 sketch.consumed,
@@ -650,7 +740,7 @@ impl KernelLabApp {
                             &format!(
                                 "Sketch {} · {} · empty",
                                 self.feature_preview.current_sketch_ordinal(),
-                                self.sketch_support.label()
+                                self.support_label(&self.sketch_support)
                             ),
                             theme::accent(),
                         );
@@ -743,6 +833,12 @@ impl KernelLabApp {
     #[must_use]
     pub fn browser_selected_sketch_index(&self) -> Option<usize> {
         self.browser_selected_sketch
+    }
+
+    /// Whether a sketch still being drawn holds a plane other than `plane`.
+    /// A finished one does not: the next sketch may go on any plane.
+    fn sketch_open_on_another_plane(&self, plane: SketchPlane) -> bool {
+        !self.sketch_finished && !self.sketch.entities().is_empty() && self.sketch.plane() != plane
     }
 
     /// One left click on an origin plane row, shared with the context menu's
@@ -914,15 +1010,41 @@ impl KernelLabApp {
                 if self.selected_construction_plane != Some(id) {
                     commands.push(BrowserContextCommand::SelectPlane);
                 }
+                if self.feature_has_an_editor(plane.feature) {
+                    commands.push(BrowserContextCommand::EditPlane);
+                }
+                commands.push(BrowserContextCommand::RenamePlane);
                 commands.push(if plane.visible {
                     BrowserContextCommand::HidePlane
                 } else {
                     BrowserContextCommand::ShowPlane
                 });
+                commands.push(BrowserContextCommand::DeletePlane);
+            }
+            BrowserContextTarget::ConstructionAxis(feature) => {
+                let Some(axis) = self
+                    .construction_axes
+                    .iter()
+                    .find(|axis| axis.feature == feature)
+                else {
+                    return commands;
+                };
+                if self.selected_history_feature != Some(feature) {
+                    commands.push(BrowserContextCommand::SelectAxis);
+                }
+                if self.feature_has_an_editor(feature) {
+                    commands.push(BrowserContextCommand::EditAxis);
+                }
+                commands.push(BrowserContextCommand::RenameAxis);
+                commands.push(if axis.visible {
+                    BrowserContextCommand::HideAxis
+                } else {
+                    BrowserContextCommand::ShowAxis
+                });
+                commands.push(BrowserContextCommand::DeleteAxis);
             }
             BrowserContextTarget::OriginPlane(plane) => {
-                let has_other_plane_sketch =
-                    !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
+                let has_other_plane_sketch = self.sketch_open_on_another_plane(plane);
                 let already_selected = self.selected_origin_plane == plane
                     && self.selected_construction_plane.is_none();
                 if !has_other_plane_sketch && !already_selected {
@@ -1075,22 +1197,63 @@ impl KernelLabApp {
                     self.clear_model_entity_selection();
                 }
                 BrowserContextTarget::OriginPlane(plane) => {
-                    let has_other_plane_sketch =
-                        !self.sketch.entities().is_empty() && self.sketch.plane() != plane;
-                    if !has_other_plane_sketch {
+                    if !self.sketch_open_on_another_plane(plane) {
                         self.select_origin_plane(plane);
                     }
                 }
-                BrowserContextTarget::Body(_) | BrowserContextTarget::Sketch(_) => {}
+                BrowserContextTarget::Body(_)
+                | BrowserContextTarget::Sketch(_)
+                | BrowserContextTarget::ConstructionAxis(_) => {}
             },
             BrowserContextCommand::HidePlane | BrowserContextCommand::ShowPlane => {
-                if let BrowserContextTarget::ConstructionPlane(id) = target
-                    && let Some(plane) = self
-                        .construction_planes
-                        .iter_mut()
-                        .find(|plane| plane.id == id)
-                {
-                    plane.visible = command == BrowserContextCommand::ShowPlane;
+                if let BrowserContextTarget::ConstructionPlane(id) = target {
+                    self.set_construction_plane_visible(
+                        id,
+                        command == BrowserContextCommand::ShowPlane,
+                    );
+                }
+            }
+            BrowserContextCommand::EditPlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.begin_plane_edit(feature);
+                }
+            }
+            BrowserContextCommand::RenamePlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.begin_feature_rename(feature);
+                }
+            }
+            BrowserContextCommand::DeletePlane => {
+                if let Some(feature) = self.construction_plane_feature(target) {
+                    self.delete_construction_plane(feature);
+                }
+            }
+            BrowserContextCommand::SelectAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.selected_history_feature = Some(feature);
+                }
+            }
+            BrowserContextCommand::EditAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.begin_axis_edit(feature);
+                }
+            }
+            BrowserContextCommand::RenameAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.begin_feature_rename(feature);
+                }
+            }
+            BrowserContextCommand::HideAxis | BrowserContextCommand::ShowAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.set_construction_axis_visible(
+                        feature,
+                        command == BrowserContextCommand::ShowAxis,
+                    );
+                }
+            }
+            BrowserContextCommand::DeleteAxis => {
+                if let BrowserContextTarget::ConstructionAxis(feature) = target {
+                    self.delete_construction_axis(feature);
                 }
             }
         }
@@ -1100,10 +1263,7 @@ impl KernelLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ConstructionPlane, ConstructionPlaneSource};
-    use artificer_protocol::{
-        EntityId, EntityKind, EntityRef, PlanarFrame3, Point3, SnapshotId, Vector3,
-    };
+    use artificer_protocol::Point3;
 
     /// A default document plus one standalone cuboid, so body selection has
     /// two all-planar bodies to work with.
@@ -1118,30 +1278,24 @@ mod tests {
         app.browser_selected_bodies.iter().copied().collect()
     }
 
-    /// A synthetic offset plane parallel to YZ at `x`, active at every
-    /// history stop because it belongs to no feature.
-    fn offset_yz_plane(app: &KernelLabApp, id: u64, x: f64) -> ConstructionPlane {
-        ConstructionPlane {
-            id,
-            name: format!("Offset {id}"),
-            feature: None,
-            frame: PlanarFrame3::new(
-                Point3::new(x, 0.0, 0.0),
-                Vector3::new(0.0, 1.0, 0.0),
-                Vector3::new(0.0, 0.0, 1.0),
-            ),
-            half_u: 10.0,
-            half_v: 10.0,
-            visible: true,
-            source: ConstructionPlaneSource::OnFace {
-                body: app.bodies[0].id,
-                face: EntityRef {
-                    snapshot: SnapshotId::ZERO,
-                    entity: EntityId(1),
-                    kind: EntityKind::Face,
-                },
-            },
-        }
+    /// A construction plane parallel to YZ at `x`, made the way a user makes
+    /// one: the YZ origin plane picked, the Plane command, an offset typed,
+    /// and the tick. Returns the plane's Browser identity.
+    fn offset_yz_plane(app: &mut KernelLabApp, x: f64) -> u64 {
+        app.clear_model_entity_selection();
+        app.selected_construction_plane = None;
+        app.selected_origin_plane = SketchPlane::YZ;
+        app.stage_construction_plane();
+        app.set_staged_plane_offset(x);
+        assert!(app.confirm_pending_operation());
+        let plane = app
+            .construction_planes
+            .last()
+            .expect("the plane was committed");
+        assert!((plane.frame.origin.x - x).abs() < 1.0e-12);
+        let id = plane.id;
+        app.selected_construction_plane = None;
+        id
     }
 
     #[test]
@@ -1219,25 +1373,42 @@ mod tests {
             vec![BrowserContextCommand::SelectPlane],
         );
 
-        // Construction planes offer selection and their visibility flip.
-        let plane = offset_yz_plane(&app, 7, 5.0);
-        app.construction_planes.push(plane);
+        // Construction planes offer selection, their editor, a new name,
+        // their visibility flip and deletion (ADR 0048).
+        let plane = offset_yz_plane(&mut app, 5.0);
         assert_eq!(
-            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(7)),
+            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(plane)),
             vec![
                 BrowserContextCommand::SelectPlane,
+                BrowserContextCommand::EditPlane,
+                BrowserContextCommand::RenamePlane,
                 BrowserContextCommand::HidePlane,
+                BrowserContextCommand::DeletePlane,
             ],
         );
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(7),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
-        assert_eq!(app.selected_construction_plane, Some(7));
+        assert_eq!(app.selected_construction_plane, Some(plane));
         assert_eq!(
-            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(7)),
-            vec![BrowserContextCommand::HidePlane],
+            app.browser_context_commands(BrowserContextTarget::ConstructionPlane(plane)),
+            vec![
+                BrowserContextCommand::EditPlane,
+                BrowserContextCommand::RenamePlane,
+                BrowserContextCommand::HidePlane,
+                BrowserContextCommand::DeletePlane,
+            ],
         );
+        // Hiding is a document edit: the plane stays hidden through a
+        // runtime restore, and the document has something to save.
+        let saved = app.document.revision();
+        app.run_browser_context_command(
+            BrowserContextCommand::HidePlane,
+            BrowserContextTarget::ConstructionPlane(plane),
+        );
+        assert!(app.document.revision() > saved);
+        assert!(!app.construction_planes.last().unwrap().visible);
     }
 
     #[test]
@@ -1273,11 +1444,10 @@ mod tests {
     #[test]
     fn mirror_commits_across_the_selected_construction_plane() {
         let mut app = KernelLabApp::default();
-        let plane = offset_yz_plane(&app, 11, 5.0);
-        app.construction_planes.push(plane);
+        let plane = offset_yz_plane(&mut app, 5.0);
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(11),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
         let before = app.displayed_measures().unwrap().centroid.unwrap().x;
         app.stage_preset_feature(SolidFeaturePreset::Mirror);
@@ -1297,11 +1467,10 @@ mod tests {
         let mut app = app_with_two_bodies();
         let first = app.bodies[0].ordinal;
         let second = app.bodies[1].ordinal;
-        let plane = offset_yz_plane(&app, 21, 5.0);
-        app.construction_planes.push(plane);
+        let plane = offset_yz_plane(&mut app, 5.0);
         app.run_browser_context_command(
             BrowserContextCommand::SelectPlane,
-            BrowserContextTarget::ConstructionPlane(21),
+            BrowserContextTarget::ConstructionPlane(plane),
         );
         app.browser_body_row_clicked(0, first, egui::Modifiers::NONE);
         app.browser_body_row_clicked(1, second, egui::Modifiers::COMMAND);
@@ -1325,5 +1494,74 @@ mod tests {
                 10.0 - before,
             );
         }
+    }
+
+    /// A construction axis has a Browser row with a menu like a plane's:
+    /// select, edit, rename, hide or show, delete.
+    #[test]
+    fn a_construction_axis_row_offers_what_a_plane_row_does() {
+        let mut app = KernelLabApp::default();
+        let edge = app
+            .displayed
+            .as_ref()
+            .expect("the block is displayed")
+            .scene
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.endpoints
+                    .iter()
+                    .all(|point| (point.x - 2.0).abs() < 1.0e-9 && point.y.abs() < 1.0e-9)
+            })
+            .expect("the block's upright edge")
+            .source_edge;
+        let recipe = app
+            .edge_axis_recipe(crate::viewport::DocumentEdgeSelection {
+                body: crate::viewport::BodyInstanceKey::new(
+                    app.active_body_id().expect("a body").get(),
+                ),
+                edge,
+            })
+            .expect("the edge makes an axis");
+        let (axis, _) = app
+            .append_construction_axis(recipe)
+            .expect("the axis is appended");
+        let target = BrowserContextTarget::ConstructionAxis(axis);
+        app.selected_history_feature = None;
+        assert_eq!(
+            app.browser_context_commands(target),
+            vec![
+                BrowserContextCommand::SelectAxis,
+                BrowserContextCommand::EditAxis,
+                BrowserContextCommand::RenameAxis,
+                BrowserContextCommand::HideAxis,
+                BrowserContextCommand::DeleteAxis,
+            ]
+        );
+
+        app.run_browser_context_command(BrowserContextCommand::SelectAxis, target);
+        assert_eq!(app.selected_history_feature, Some(axis));
+        assert!(
+            !app.browser_context_commands(target)
+                .contains(&BrowserContextCommand::SelectAxis)
+        );
+
+        // Hidden, it is not drawn and the menu offers to show it; the
+        // document keeps the choice.
+        app.run_browser_context_command(BrowserContextCommand::HideAxis, target);
+        assert!(app.construction_axis_overlays().is_empty());
+        assert!(
+            app.browser_context_commands(target)
+                .contains(&BrowserContextCommand::ShowAxis)
+        );
+        assert!(matches!(
+            &app.document.feature(axis).expect("the axis").action,
+            artificer_model::ReplayAction::DatumAxis(recipe) if !recipe.visible
+        ));
+        app.run_browser_context_command(BrowserContextCommand::ShowAxis, target);
+        assert_eq!(app.construction_axis_overlays().len(), 1);
+
+        app.run_browser_context_command(BrowserContextCommand::DeleteAxis, target);
+        assert!(app.construction_axes.is_empty());
     }
 }

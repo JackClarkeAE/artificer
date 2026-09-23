@@ -153,10 +153,14 @@ fn test_circle_tangent_slot_and_perpendicular_triangle_cut() {
         let is_axial = (p0.x - p1.x).abs() < 1.0e-4 && (p0.y - p1.y).abs() < 1.0e-4;
         let r0 = (p0.x - 30.0).hypot(p0.y - 20.0);
         let r1 = (p1.x - 30.0).hypot(p1.y - 20.0);
+        // Strictly inside the bore's half turn: the two generators at
+        // y = 20 are where the slot's walls leave the bore tangentially,
+        // which the exact result draws as the tangent rails they are. The
+        // seams this probe exists to catch are the facet seams between them.
         let on_cyl = (r0 - 8.0).abs() < 1.0e-3
             && (r1 - 8.0).abs() < 1.0e-3
-            && p0.y <= 20.001
-            && p1.y <= 20.001;
+            && p0.y < 19.999
+            && p1.y < 19.999;
 
         if on_cyl && is_axial && !edge.is_smooth {
             cylinder_facet_visible_seams += 1;
@@ -290,10 +294,14 @@ fn test_circle_tangent_slot_and_perpendicular_pentagon_cut() {
         let is_axial = (p0.x - p1.x).abs() < 1.0e-4 && (p0.y - p1.y).abs() < 1.0e-4;
         let r0 = (p0.x - 30.0).hypot(p0.y - 20.0);
         let r1 = (p1.x - 30.0).hypot(p1.y - 20.0);
+        // Strictly inside the bore's half turn: the two generators at
+        // y = 20 are where the slot's walls leave the bore tangentially,
+        // which the exact result draws as the tangent rails they are. The
+        // seams this probe exists to catch are the facet seams between them.
         let on_cyl = (r0 - 8.0).abs() < 1.0e-3
             && (r1 - 8.0).abs() < 1.0e-3
-            && p0.y <= 20.001
-            && p1.y <= 20.001;
+            && p0.y < 19.999
+            && p1.y < 19.999;
 
         if on_cyl && is_axial && !edge.is_smooth {
             cylinder_facet_visible_seams += 1;

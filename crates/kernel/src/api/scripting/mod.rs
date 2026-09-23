@@ -27,11 +27,12 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use artificer_protocol::{EntityKind, Point2, Point3, Vector3};
+use artificer_protocol::{EntityKind, PlanarFrame3, Point2, Point3, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::api::commands::{
-    ApiCommand, ExtrudeOp, PatternPlacement, SketchConstraint, SketchEntity, SketchPlane, StepLabel,
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchConstraint, SketchEntity,
+    SketchPlane, StepLabel,
 };
 use crate::api::debug::{ApiError, ApiErrorCode};
 use crate::api::scripting::ast::{
@@ -473,6 +474,7 @@ const BUILTINS: &[&str] = &[
     "circle",
     "arc",
     "rect",
+    "spline",
     "sketch",
     "extrude",
     "revolve",
@@ -1378,6 +1380,52 @@ impl<'a> Interp<'a> {
                 start_angle: args.number("start_angle")?.to_radians(),
                 end_angle: args.number("end_angle")?.to_radians(),
             })),
+            // A spline through fit points, or by its control points
+            // (ADR 0050).
+            "spline" => {
+                let closed = match args.values.get("closed") {
+                    None => false,
+                    Some(Value::Bool(flag)) => *flag,
+                    Some(other) => {
+                        return Err(ScriptError::eval(format!(
+                            "spline(): `closed` is true or false, got {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                let points = |value: &Value| -> Result<Vec<Point2>, ScriptError> {
+                    match value {
+                        Value::Array(items) => items.iter().map(Value::as_point2).collect(),
+                        other => Err(ScriptError::eval(format!(
+                            "spline(): points are an array of [x, y] arrays, got {}",
+                            other.describe()
+                        ))),
+                    }
+                };
+                match (args.values.get("points"), args.values.get("control_points")) {
+                    (Some(fit), None) => Ok(Value::Entity(SketchEntity::Spline {
+                        points: points(fit)?,
+                        closed,
+                    })),
+                    (None, Some(control)) => {
+                        let degree = args.number_or("degree", 3.0)?;
+                        if !((1.0..=5.0).contains(&degree) && degree.fract() == 0.0) {
+                            return Err(ScriptError::eval(
+                                "spline(): `degree` is a whole number from 1 to 5",
+                            ));
+                        }
+                        Ok(Value::Entity(SketchEntity::ControlSpline {
+                            control_points: points(control)?,
+                            degree: degree as usize,
+                            closed,
+                        }))
+                    }
+                    _ => Err(ScriptError::eval(
+                        "spline() takes either `points`, the points it passes through, or \
+                         `control_points`, the polygon that shapes it",
+                    )),
+                }
+            }
             "rect" => {
                 let width = args.number("width")?;
                 let height = args.number("height")?;
@@ -1409,15 +1457,59 @@ impl<'a> Interp<'a> {
                 operation: args.operation()?,
                 draft_degrees: args.number_or("draft", 0.0)?,
             })),
-            "revolve" => Ok(Value::Command(ApiCommand::Revolve {
-                label: args.label()?,
-                sketch: args.required("sketch")?.as_step()?,
-                regions: args.regions()?,
-                axis_origin: args.point3_or("axis_origin", origin)?,
-                axis_direction: args.vector3_or("axis", up)?,
-                angle_degrees: args.number_or("angle", 360.0)?,
-                operation: args.operation()?,
-            })),
+            "loft" => {
+                let sections = match args.required("sections")? {
+                    Value::Array(items) => items
+                        .iter()
+                        .map(Value::as_step)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    other => {
+                        return Err(ScriptError::eval(format!(
+                            "loft(): `sections` is an array of sketches, got {}",
+                            other.describe()
+                        )));
+                    }
+                };
+                Ok(Value::Command(ApiCommand::Loft {
+                    label: args.label()?,
+                    sections,
+                    operation: args.operation()?,
+                }))
+            }
+            "plane" => script_plane(&args).map(Value::Plane),
+            "axis" => script_axis(&args).map(Value::Axis),
+            "revolve" => {
+                // `axis` is a direction through `axis_origin`, or an
+                // axis(...) that says where it runs itself.
+                let (axis_origin, axis_direction, axis_placement) = match args.values.get("axis") {
+                    Some(Value::Axis(axis)) => {
+                        if args.values.contains_key("axis_origin") {
+                            return Err(ScriptError::eval(
+                                "revolve(): an axis(...) says where it runs; leave out `axis_origin`",
+                            ));
+                        }
+                        match axis {
+                            ScriptAxis::Line { origin, direction } => (*origin, *direction, None),
+                            ScriptAxis::Placed(placement) => (origin, up, Some(placement.clone())),
+                        }
+                    }
+                    _ => (
+                        args.point3_or("axis_origin", origin)?,
+                        args.vector3_or("axis", up)?,
+                        None,
+                    ),
+                };
+                Ok(Value::Command(ApiCommand::Revolve {
+                    label: args.label()?,
+                    sketch: args.required("sketch")?.as_step()?,
+                    regions: args.regions()?,
+                    axis_origin,
+                    axis_direction,
+                    angle_degrees: args.number_or("angle", 360.0)?,
+                    operation: args.operation()?,
+                    axis_placement,
+                }))
+            }
             // ---- face and edge features ------------------------------------
             "drill" => Ok(Value::Command(ApiCommand::DrillHole {
                 label: args.label()?,
@@ -1556,7 +1648,7 @@ impl<'a> Interp<'a> {
                 }))
             }
             other => Err(ScriptError::eval(format!(
-                "Unknown function `{other}`; the features are box, cylinder, sketch, extrude, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, union, difference and intersection{}",
+                "Unknown function `{other}`; the features are box, cylinder, sketch, plane, extrude, loft, revolve, drill, push_pull, fillet, chamfer, mirror, pattern, union, difference and intersection{}",
                 if self.functions.is_empty() {
                     String::new()
                 } else {
@@ -1821,8 +1913,25 @@ enum Value {
         step: StepLabel,
         faces: BTreeMap<String, EntitySelector>,
     },
+    /// A plane named by `plane(...)`, for `sketch(on: ...)`: a frame in
+    /// space, or a plane placed by the body's faces and edges, which is
+    /// resolved when the sketch runs.
+    Plane(SketchPlane),
+    /// An axis named by `axis(...)`, for `revolve(axis: ...)`: a line in
+    /// space, or one placed by the body's edges and faces, which is resolved
+    /// when the revolve runs.
+    Axis(ScriptAxis),
     /// What a function without a `return` value evaluates to.
     Unit,
+}
+
+/// What `axis(...)` names.
+#[derive(Clone, Debug, PartialEq)]
+enum ScriptAxis {
+    /// A line in space, fixed as written.
+    Line { origin: Point3, direction: Vector3 },
+    /// A line the body places.
+    Placed(AxisPlacement),
 }
 
 impl Value {
@@ -1844,6 +1953,8 @@ impl Value {
                     faces.keys().cloned().collect::<Vec<_>>().join(", ")
                 }
             ),
+            Self::Plane(_) => "a plane".to_owned(),
+            Self::Axis(_) => "an axis".to_owned(),
             Self::Unit => "nothing".to_owned(),
         }
     }
@@ -2218,17 +2329,265 @@ fn sketch_plane(value: &Value) -> Result<SketchPlane, ScriptError> {
             "XZ" => Ok(SketchPlane::XZ),
             "YZ" => Ok(SketchPlane::YZ),
             _ => Err(ScriptError::eval(format!(
-                "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, not \"{name}\""
+                "sketch(): `on` is \"XY\", \"XZ\", \"YZ\", a plane(...) or a face selector, not \"{name}\""
             ))),
         },
         Value::Selector(selector) => Ok(SketchPlane::OnFace {
             face: selector.clone(),
         }),
+        Value::Plane(plane) => Ok(plane.clone()),
         other => Err(ScriptError::eval(format!(
-            "sketch(): `on` is \"XY\", \"XZ\", \"YZ\" or a face selector, got {}",
+            "sketch(): `on` is \"XY\", \"XZ\", \"YZ\", a plane(...) or a face selector, got {}",
             other.describe()
         ))),
     }
+}
+
+/// The frame of one of the three world planes: its origin, and the axes a
+/// sketch on it uses, whose cross product is the side it faces.
+pub(crate) fn world_plane_frame(name: &str) -> Option<PlanarFrame3> {
+    let origin = Point3::new(0.0, 0.0, 0.0);
+    let (u, v) = match name.to_ascii_uppercase().as_str() {
+        "XY" => (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 0.0)),
+        "XZ" => (Vector3::new(1.0, 0.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        "YZ" => (Vector3::new(0.0, 1.0, 0.0), Vector3::new(0.0, 0.0, 1.0)),
+        _ => return None,
+    };
+    Some(PlanarFrame3::new(origin, u, v))
+}
+
+/// `plane(...)`: a plane for `sketch(on: ...)`.
+///
+/// The forms placed by the body (ADR 0048) are resolved when the sketch runs,
+/// against the body as it then stands:
+///
+/// - `plane(on: face, offset: d)` is the face's own frame moved `d` along its
+///   outward normal.
+/// - `plane(between: [a, b], offset: d)` is halfway between two parallel
+///   faces, facing as the first does.
+/// - `plane(through: edge, face: f, angle: a)` hangs off a straight edge,
+///   turned `a` degrees from the face `f` (the edge's only planar face when
+///   left out).
+///
+/// Each takes `flip: true` to face the other way. The rest are frames in
+/// space, fixed as they are written.
+fn script_plane(args: &Args<'_>) -> Result<SketchPlane, ScriptError> {
+    let offset = args.number_or("offset", 0.0)?;
+    let flip = match args.values.get("flip") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(ScriptError::eval(format!(
+                "plane(): `flip` is true or false, got {}",
+                other.describe()
+            )));
+        }
+    };
+    if let Some(face) = args.values.get("on") {
+        return Ok(SketchPlane::OffsetFace {
+            face: Box::new(face.as_selector()?),
+            offset,
+            flip,
+        });
+    }
+    if let Some(faces) = args.values.get("between") {
+        let faces = faces.as_selectors()?;
+        let [first, second] = <[EntitySelector; 2]>::try_from(faces).map_err(|faces| {
+            ScriptError::eval(format!(
+                "plane(): `between` is an array of two faces, got {}",
+                faces.len()
+            ))
+        })?;
+        return Ok(SketchPlane::Midplane {
+            first: Box::new(first),
+            second: Box::new(second),
+            offset,
+            flip,
+        });
+    }
+    if let Some(edge) = args.values.get("through") {
+        return Ok(SketchPlane::ThroughEdge {
+            edge: Box::new(edge.as_selector()?),
+            face: args
+                .values
+                .get("face")
+                .map(Value::as_selector)
+                .transpose()?
+                .map(Box::new),
+            angle_degrees: args.number_or("angle", 0.0)?,
+            offset,
+            flip,
+        });
+    }
+    if flip {
+        return Err(ScriptError::eval(
+            "plane(): `flip` goes with `on`, `between` or `through`; a frame in space faces the way its axes say",
+        ));
+    }
+    world_plane(args).map(|frame| SketchPlane::Frame { frame })
+}
+
+/// `axis(...)`: an axis for `revolve(axis: ...)`.
+///
+/// - `axis(from: "Z")` is a world axis through the origin.
+/// - `axis(origin: [...], direction: [...])` is a line in space.
+/// - `axis(along: edge)` runs along a straight edge, from its start to its
+///   end.
+/// - `axis(through: face)` is a curved face's own axis: a cylinder's, a
+///   cone's, a sphere's or a torus's.
+/// - `axis(between: [a, b])` is where two flat faces meet.
+///
+/// The last three are placed by the body and resolved when the revolve
+/// runs, against the body as it then stands. Each form takes `flip: true`
+/// to run the other way, which turns a partial revolve the other way.
+fn script_axis(args: &Args<'_>) -> Result<ScriptAxis, ScriptError> {
+    let flip = match args.values.get("flip") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(other) => {
+            return Err(ScriptError::eval(format!(
+                "axis(): `flip` is true or false, got {}",
+                other.describe()
+            )));
+        }
+    };
+    if let Some(edge) = args.values.get("along") {
+        return Ok(ScriptAxis::Placed(AxisPlacement::Along {
+            edge: Box::new(edge.as_selector()?),
+            flip,
+        }));
+    }
+    if let Some(face) = args.values.get("through") {
+        return Ok(ScriptAxis::Placed(AxisPlacement::Through {
+            face: Box::new(face.as_selector()?),
+            flip,
+        }));
+    }
+    if let Some(faces) = args.values.get("between") {
+        let faces = faces.as_selectors()?;
+        let [first, second] = <[EntitySelector; 2]>::try_from(faces).map_err(|faces| {
+            ScriptError::eval(format!(
+                "axis(): `between` is an array of two flat faces, got {}",
+                faces.len()
+            ))
+        })?;
+        return Ok(ScriptAxis::Placed(AxisPlacement::Between {
+            first: Box::new(first),
+            second: Box::new(second),
+            flip,
+        }));
+    }
+    let sign = if flip { -1.0 } else { 1.0 };
+    if let Some(from) = args.values.get("from") {
+        let name = from.as_string()?;
+        let direction = match name.to_ascii_uppercase().as_str() {
+            "X" => Vector3::new(sign, 0.0, 0.0),
+            "Y" => Vector3::new(0.0, sign, 0.0),
+            "Z" => Vector3::new(0.0, 0.0, sign),
+            _ => {
+                return Err(ScriptError::eval(format!(
+                    "axis(): `from` is \"X\", \"Y\" or \"Z\", not \"{name}\""
+                )));
+            }
+        };
+        return Ok(ScriptAxis::Line {
+            origin: Point3::new(0.0, 0.0, 0.0),
+            direction,
+        });
+    }
+    let origin = args.point3_or("origin", Point3::new(0.0, 0.0, 0.0))?;
+    let direction = args.required("direction").map_err(|_| {
+        ScriptError::eval(
+            "axis(): give `from`, `origin` and `direction`, `along` an edge, `through` a curved face, or `between` two flat faces",
+        )
+    })?;
+    let direction = direction.as_vector3()?;
+    let length =
+        (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
+    if !length.is_finite() || length == 0.0 {
+        return Err(ScriptError::eval(
+            "axis(): `direction` must be a non-zero direction",
+        ));
+    }
+    Ok(ScriptAxis::Line {
+        origin,
+        direction: Vector3::new(sign * direction.x, sign * direction.y, sign * direction.z),
+    })
+}
+
+/// A plane in space as a frame: a world plane moved along its normal, or
+/// one given by its origin and axes.
+///
+/// - `plane(from: "XY", offset: 30)` is a world plane moved along the side it
+///   faces — +Z for XY, −Y for XZ, +X for YZ, the sides their sketches face.
+/// - `plane(origin: [...], normal: [...], x_axis: [...])` faces `normal`,
+///   with its `u` axis along `x_axis` turned into the plane.
+/// - `plane(origin: [...], x_axis: [...], y_axis: [...])` takes its two axes
+///   as given, which is how a decompiled script writes a plane back exactly.
+fn world_plane(args: &Args<'_>) -> Result<PlanarFrame3, ScriptError> {
+    let length =
+        |vector: Vector3| (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+    if let Some(from) = args.values.get("from") {
+        let name = from.as_string()?;
+        let frame = world_plane_frame(name).ok_or_else(|| {
+            ScriptError::eval(format!(
+                "plane(): `from` is \"XY\", \"XZ\" or \"YZ\", not \"{name}\""
+            ))
+        })?;
+        let offset = args.number_or("offset", 0.0)?;
+        if !offset.is_finite() {
+            return Err(ScriptError::eval(
+                "plane(): `offset` must be a finite length",
+            ));
+        }
+        let (u, v) = (frame.u, frame.v);
+        let normal = Vector3::new(
+            u.y * v.z - u.z * v.y,
+            u.z * v.x - u.x * v.z,
+            u.x * v.y - u.y * v.x,
+        );
+        return Ok(PlanarFrame3::new(
+            Point3::new(normal.x * offset, normal.y * offset, normal.z * offset),
+            u,
+            v,
+        ));
+    }
+    let origin = args.point3_or("origin", Point3::new(0.0, 0.0, 0.0))?;
+    let x_axis = args.required("x_axis")?.as_vector3()?;
+    if let Some(y_axis) = args.values.get("y_axis") {
+        return Ok(PlanarFrame3::new(origin, x_axis, y_axis.as_vector3()?));
+    }
+    let normal = args.required("normal")?.as_vector3()?;
+    let normal_length = length(normal);
+    if !normal_length.is_finite() || normal_length == 0.0 {
+        return Err(ScriptError::eval(
+            "plane(): `normal` must be a non-zero direction",
+        ));
+    }
+    let n = Vector3::new(
+        normal.x / normal_length,
+        normal.y / normal_length,
+        normal.z / normal_length,
+    );
+    let along = x_axis.x * n.x + x_axis.y * n.y + x_axis.z * n.z;
+    let u = Vector3::new(
+        x_axis.x - n.x * along,
+        x_axis.y - n.y * along,
+        x_axis.z - n.z * along,
+    );
+    let u_length = length(u);
+    if !u_length.is_finite() || u_length <= 1.0e-9 * length(x_axis).max(1.0) {
+        return Err(ScriptError::eval(
+            "plane(): `x_axis` must not run along `normal`; it names the direction in the plane its sketches take as x",
+        ));
+    }
+    let u = Vector3::new(u.x / u_length, u.y / u_length, u.z / u_length);
+    let v = Vector3::new(
+        n.y * u.z - n.z * u.y,
+        n.z * u.x - n.x * u.z,
+        n.x * u.y - n.y * u.x,
+    );
+    Ok(PlanarFrame3::new(origin, u, v))
 }
 
 fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
@@ -2237,7 +2596,7 @@ fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
         Value::Entity(_) => std::slice::from_ref(value),
         other => {
             return Err(ScriptError::eval(format!(
-                "sketch(): `entities` is an array of line(), circle(), arc() or rect() calls, got {}",
+                "sketch(): `entities` is an array of line(), circle(), arc(), rect() or spline() calls, got {}",
                 other.describe()
             )));
         }
@@ -2247,7 +2606,7 @@ fn sketch_entities(value: &Value) -> Result<Vec<SketchEntity>, ScriptError> {
         .map(|item| match item {
             Value::Entity(entity) => Ok(entity.clone()),
             other => Err(ScriptError::eval(format!(
-                "sketch(): every entity is a line(), circle(), arc() or rect(), got {}",
+                "sketch(): every entity is a line(), circle(), arc(), rect() or spline(), got {}",
                 other.describe()
             ))),
         })

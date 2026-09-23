@@ -150,8 +150,11 @@ fn public_mixed_profile_command_is_exact_deterministic_and_source_mapped() {
     }
 }
 
+/// A profile flush with the face's own edge is the commonest boss there is,
+/// and since ADR 0045 it is a union glued along that edge rather than a
+/// refusal. The input snapshot is a value and stays what it was either way.
 #[test]
-fn rejected_tangent_profile_retains_the_input_snapshot() {
+fn a_profile_flush_with_the_face_edge_is_a_boss_glued_there() {
     let input = cuboid();
     let target = NativeKernel::debug_scene(&input)
         .triangles
@@ -163,7 +166,7 @@ fn rejected_tangent_profile_retains_the_input_snapshot() {
     let before_id = input.id();
     let before_digest = input.semantic_digest();
     let before_measures = input.measures();
-    let error = NativeKernel::execute(
+    let outcome = NativeKernel::execute(
         &input,
         &ExecuteRequest {
             protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -185,10 +188,13 @@ fn rejected_tangent_profile_retains_the_input_snapshot() {
         },
         &CancellationToken::new(),
     )
-    .expect_err("support tangency is outside the regularized positive domain");
-    assert_eq!(
-        error.diagnostics[0].code.as_str(),
-        "FACE_FEATURE_PROFILE_OUTSIDE_FACE"
+    .expect("a boss flush with the face's edge is glued there");
+    assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
+    let expected = 4.0 * 4.0 * 4.0 + 2.0 * 2.0 * 1.0;
+    let volume = outcome.snapshot.measures().volume;
+    assert!(
+        ((volume - expected) / expected).abs() < 1.0e-9,
+        "exactly the boss: {volume} vs {expected}"
     );
     assert_eq!(input.id(), before_id);
     assert_eq!(input.semantic_digest(), before_digest);

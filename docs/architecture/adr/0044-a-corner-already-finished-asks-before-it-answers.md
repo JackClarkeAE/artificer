@@ -177,3 +177,24 @@ first is the only thing anyone could have meant.
 
 Nothing here changes what the kernel refuses. The vocabulary is untouched; the
 workbench stopped treating a refusal as the end of the conversation.
+
+### The second answer is also the ladder's exact fallback
+
+The owned corner blend derives its seam and its run-outs for faces that are
+mutually square, and a corner that leans — the apex of a gable, where two
+slope edges meet with the ridge crease as the third edge and no face square
+to another — left it with nothing to say but `DomainUnsupported`, after
+which the faceted tier failed to weld and the user read a sentence about
+regularized corner blends. The shape standing apart makes is exact there:
+each edge's removal cut from the body as it is, the two bands meeting along
+whatever seam the general engine finds, which ADR 0045's engine resolves for
+planes and cylinders at any angle. Where the owned blend *would* have
+answered, the two shapes coincide, so this is the same finish by another
+route rather than a different finish.
+
+The ladder therefore tries the stand-apart construction whenever the owned
+blend declines or gives an uncertain refusal, before the faceted tier, and
+reports it as `edge-finish/standing-apart`. What the user asked for has not
+changed: a finish told to stand apart still never falls back, because there
+the shape was the request.
+

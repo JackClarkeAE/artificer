@@ -375,3 +375,222 @@ fn bound_typed_inputs_are_retained_for_commit_time_revalidation() {
         .validate_with_inputs(&inputs, PrecisionPolicy::default())
         .expect("bound graph replays");
 }
+
+#[test]
+fn a_value_link_travels_with_its_edit_and_leaves_with_its_operation() {
+    let mut sketch = SketchDefinition::new();
+    let mut transaction = sketch
+        .stage(line((0.0, 0.0), (10.0, 0.0)), "Line")
+        .expect("stage");
+    let operation = transaction
+        .preview()
+        .active_operations()
+        .next()
+        .expect("the staged line")
+        .id;
+
+    // A link must read and must name a variable.
+    for refused in ["", "5mm", "width +"] {
+        assert!(
+            transaction
+                .set_value_link(operation, "length", Some(refused.to_owned()))
+                .is_err(),
+            "{refused:?}"
+        );
+    }
+    assert!(transaction.preview().value_links().is_empty());
+
+    assert_eq!(
+        transaction.set_value_link(operation, "length", Some("width / 2".to_owned())),
+        Ok(true)
+    );
+    assert_eq!(
+        transaction.set_value_link(operation, "angle", Some("tilt".to_owned())),
+        Ok(true)
+    );
+    assert_eq!(
+        transaction.set_value_link(operation, "angle", Some("tilt".to_owned())),
+        Ok(false),
+        "the same link again changes nothing"
+    );
+    assert!(sketch.value_links().is_empty(), "nothing until the tick");
+
+    // A cancelled edit takes its links with it.
+    let _ = transaction.clone().cancel();
+    assert!(sketch.value_links().is_empty());
+
+    let mut journal = SketchUndoJournal::default();
+    journal
+        .confirm(
+            &mut sketch,
+            transaction,
+            ConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        )
+        .expect("commit");
+    assert_eq!(sketch.value_link(operation, "length"), Some("width / 2"));
+    assert_eq!(sketch.value_link(operation, "angle"), Some("tilt"));
+    assert_eq!(sketch.value_link(operation, "start"), None);
+
+    // Saved and read back, the links are the same.
+    let json = serde_json::to_string(&sketch).expect("serialize");
+    let restored: SketchDefinition = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(restored, sketch);
+    restored
+        .validate(PrecisionPolicy::default())
+        .expect("a kept link validates");
+
+    // A renamed variable is renamed where it is used.
+    let mut renamed = sketch.clone();
+    assert!(renamed.rename_in_value_links("width", "span"));
+    assert_eq!(renamed.value_link(operation, "length"), Some("span / 2"));
+    assert!(!renamed.rename_in_value_links("depth", "height"));
+
+    // Unlinking is an edit like any other.
+    let mut transaction = sketch
+        .stage_replace(
+            operation,
+            line((0.0, 0.0), (12.0, 0.0)),
+            "Edit",
+            &SketchInputValues::default(),
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the edit");
+    assert_eq!(
+        transaction.set_value_link(operation, "angle", None),
+        Ok(true)
+    );
+    journal
+        .confirm(
+            &mut sketch,
+            transaction,
+            ConfirmationSource::GreenTick,
+            PrecisionPolicy::default(),
+        )
+        .expect("commit");
+    assert_eq!(sketch.value_link(operation, "angle"), None);
+    assert_eq!(sketch.value_link(operation, "length"), Some("width / 2"));
+
+    // Undo brings the unlinked value back, linked.
+    assert!(journal.undo(&mut sketch));
+    assert_eq!(sketch.value_link(operation, "angle"), Some("tilt"));
+    assert!(journal.redo(&mut sketch));
+
+    // Retiring the operation retires its links.
+    let transaction = sketch
+        .stage_retire_operation(
+            operation,
+            RetirementPolicy::RejectDependents,
+            "Delete",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the retirement");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    assert!(sketch.value_links().is_empty());
+}
+
+#[test]
+fn a_link_the_sketch_cannot_keep_does_not_load() {
+    let mut sketch = SketchDefinition::new();
+    let transaction = sketch
+        .stage(line((0.0, 0.0), (10.0, 0.0)), "Line")
+        .expect("stage");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    let mut json: serde_json::Value = serde_json::to_value(&sketch).expect("serialize");
+    let field = |operation: u64, field: &str, text: &str| {
+        serde_json::json!({
+            "target": { "kind": "recipe_field", "operation": operation, "field": field },
+            "text": text,
+        })
+    };
+    for links in [
+        serde_json::json!([field(9, "length", "width")]),
+        serde_json::json!([field(1, "length", "12")]),
+        serde_json::json!([field(1, "length", "width"), field(1, "angle", "tilt")]),
+        serde_json::json!([{ "target": { "kind": "relation", "constraint": 4 }, "text": "width" }]),
+    ] {
+        json["value_links"] = links.clone();
+        let loaded: SketchDefinition = serde_json::from_value(json.clone()).expect("decode");
+        assert!(
+            loaded.validate(PrecisionPolicy::default()).is_err(),
+            "{links}"
+        );
+    }
+}
+
+#[test]
+fn a_relation_measurement_can_follow_a_variable_and_leaves_with_its_relation() {
+    let mut sketch = SketchDefinition::new();
+    let transaction = sketch
+        .stage(line((0.0, 0.0), (10.0, 0.0)), "Line")
+        .expect("stage");
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    let operation = &sketch.operations()[0];
+    let point = |role| match operation.outputs.get(&OutputRole::Point(role)) {
+        Some(SketchOutputRef::Point(point)) => *point,
+        other => panic!("no point for {role:?}: {other:?}"),
+    };
+    let (start, end) = (point(PointOutputRole::Start), point(PointOutputRole::End));
+    let relation = sketch
+        .add_constraint(
+            artificer_sketch::SketchConstraintKind::Distance {
+                first: start,
+                second: end,
+                distance: 10.0,
+            },
+            PrecisionPolicy::default(),
+        )
+        .expect("a distance the line already has");
+
+    let mut transaction = sketch
+        .stage_relation_measurement(
+            relation,
+            20.0,
+            Some(start),
+            "Dimension",
+            PrecisionPolicy::default(),
+        )
+        .expect("stage the new distance");
+    assert_eq!(
+        transaction.set_relation_link(relation, Some("width * 2".to_owned())),
+        Ok(true)
+    );
+    sketch
+        .commit(transaction, ConfirmationSource::GreenTick)
+        .expect("commit");
+    assert_eq!(sketch.relation_link(relation), Some("width * 2"));
+    let json = serde_json::to_string(&sketch).expect("serialize");
+    let restored: SketchDefinition = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(restored, sketch);
+    restored
+        .validate(PrecisionPolicy::default())
+        .expect("a kept relation link validates");
+
+    // A relation that holds no number cannot be linked.
+    let mut transaction = sketch
+        .stage(line((0.0, 5.0), (10.0, 5.0)), "Second line")
+        .expect("stage");
+    assert!(
+        transaction
+            .set_relation_link(
+                artificer_sketch::SketchConstraintId::new(99).expect("an id"),
+                Some("width".to_owned())
+            )
+            .is_err()
+    );
+    let _ = transaction.cancel();
+
+    // Removing the relation removes its link.
+    let mut removed = sketch.clone();
+    assert!(removed.remove_constraint(relation));
+    assert_eq!(removed.relation_link(relation), None);
+    removed
+        .validate(PrecisionPolicy::default())
+        .expect("no link is left behind");
+}

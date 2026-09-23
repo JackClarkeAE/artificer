@@ -130,21 +130,29 @@ fn a_refused_second_crossing_bore_leaves_the_body_it_was_given_untouched() {
         "two vertical bores are exact: {base_volume} should be {expected_base}"
     );
 
-    // The first crossing bore is the faceted tier's to own, and it says so.
+    // The first crossing bore: two equal bores crossing is the general
+    // engine's since ADR 0045, exact and unlabelled. Were it ever to fall
+    // to the faceted tier again, that tier says so by name.
     let first = NativeKernel::execute(
         &base,
         &crossing_bore(&base, 25.0, "first-crossing-bore"),
         &CancellationToken::new(),
     )
-    .expect("the first crossing bore closes on the faceted tier");
+    .expect("the first crossing bore closes");
+    let faceted = first
+        .report
+        .warnings
+        .iter()
+        .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION");
+    assert_eq!(
+        faceted,
+        first.report.rung.as_deref() == Some("face-feature/faceted"),
+        "an approximation is labelled exactly when the faceted tier answered: {:?}",
+        first.report
+    );
     assert!(
-        first
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.code.as_str() == "FACE_FEATURE_FACETED_APPROXIMATION"),
-        "a crossing bore is a labelled approximation: {:?}",
-        first.report.warnings
+        first.snapshot.measures().volume < base_volume,
+        "a cut removes material"
     );
     let crossed = first.snapshot;
     let crossed_id = crossed.id();

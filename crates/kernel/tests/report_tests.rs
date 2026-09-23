@@ -126,9 +126,10 @@ fn every_built_step_names_its_rung_and_tier() {
 
 #[test]
 fn a_faceted_step_marks_the_body_approximate() {
-    // A cut that crosses earlier holes leaves the exact ladder; the report
-    // says so on the step and on the body.
-    let source = include_str!("../examples/three_holes_and_cut.art");
+    // A hole drilled through a blended rim leaves the exact ladder — the
+    // blend's torus meets the hole off its axis — and the report says so on
+    // the step and on the body.
+    let source = include_str!("../examples/blend_then_drill.art");
     let mut session = Session::new();
     let outcome = session.run_script(source, &BTreeMap::new(), &CancellationToken::default());
     assert!(outcome.succeeded(), "{:?}", outcome.failure);
@@ -543,8 +544,11 @@ fn reports_conform_to_the_published_schema() {
     for source in [
         FLANGED_HUB,
         include_str!("../examples/three_holes_and_cut.art"),
+        include_str!("../examples/blend_then_drill.art"),
         include_str!("../examples/bearing_mount.art"),
         include_str!("../examples/filleted_flange.art"),
+        include_str!("../examples/square_to_circle_loft.art"),
+        include_str!("../examples/spline_vase.art"),
         "let b = box(size: [10, 10, 10], label: \"b\");\ndrill(face: faces(\">Z\"), center: [0, 0], diameter: 0.000001, depth: 5, label: \"tiny\");\n",
         "let b = box(size: [10, 10, 10], label: \"b\"\n",
     ] {

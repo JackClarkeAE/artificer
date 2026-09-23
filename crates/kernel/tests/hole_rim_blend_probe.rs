@@ -165,6 +165,7 @@ fn carrier_counts(snapshot: &Snapshot) -> (usize, usize, usize, usize) {
             DisplaySurface::Cone { .. } => counts.1 += 1,
             DisplaySurface::Sphere { .. } => counts.2 += 1,
             DisplaySurface::Torus { .. } => counts.3 += 1,
+            DisplaySurface::Ruled { .. } | DisplaySurface::Bspline { .. } => {}
         }
     }
     counts

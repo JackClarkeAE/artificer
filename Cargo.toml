@@ -21,7 +21,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.99.7"
+version = "0.99.8"
 edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-or-later"
@@ -41,6 +41,7 @@ egui_wgpu = { package = "egui-wgpu", version = "=0.35.0", default-features = fal
 wgpu = { version = "29.0", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
+png = "0.18"
 sha2 = "0.10"
 thiserror = "2.0"
 rayon = "1.11"

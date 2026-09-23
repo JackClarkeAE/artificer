@@ -318,6 +318,18 @@ pub enum ParameterizedKernelError {
     InvalidPersistentTarget,
     #[error("every bindable kernel length in the retained template must be finite and positive")]
     InvalidTemplateLength,
+    #[error("the distance expression did not evaluate: {0}")]
+    DistanceExpression(String),
+    #[error("the distance expression does not come to a length")]
+    DistanceNotALength,
+    #[error("the distance expression comes to zero or a non-finite length")]
+    InvalidDistanceValue,
+    #[error("the angle expression did not evaluate: {0}")]
+    AngleExpression(String),
+    #[error("the angle expression does not come to an angle")]
+    AngleNotAnAngle,
+    #[error("the angle expression comes to nothing, less, or more than a full turn")]
+    InvalidAngleValue,
 }
 
 fn canonical_length(
@@ -366,9 +378,13 @@ fn validate_supported_command(command: &KernelCommand) -> Result<(), Parameteriz
         // live in the profile and the axis, which parameterization reaches
         // through the sketch rather than through the command.
         | KernelCommand::RevolvePlanarProfile { .. }
+        | KernelCommand::SweepPlanarProfile { .. }
         // A drafted loft's distance and offset drive each other through the
         // draft angle; binding one alone would silently change the angle.
         | KernelCommand::LoftPlanarProfileOffset { .. }
+        // A loft between sections carries its lengths in the sections'
+        // frames and profiles, not as a scalar of its own.
+        | KernelCommand::LoftPlanarSections { .. }
         | KernelCommand::DrillHole { .. }
         | KernelCommand::AddRib { .. }
         | KernelCommand::MirrorSnapshot { .. }

@@ -18,7 +18,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 pub use store::{
-    CatalogEntry, CatalogIndex, CatalogStore, IndexRebuildReport, RejectedCatalogEntry, SearchQuery,
+    CatalogEntry, CatalogIndex, CatalogStore, IndexRebuildReport, MAX_PREVIEW_IMAGE_BYTES,
+    PartPreview, PartPreviewFacts, RejectedCatalogEntry, SearchQuery,
 };
 
 /// Stable package-format marker written into every catalog object.

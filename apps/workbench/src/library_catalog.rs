@@ -51,8 +51,8 @@ pub enum LibraryCatalogError {
         actual: String,
     },
     DefinitionRevisionMismatch {
-        expected: u32,
-        actual: u32,
+        expected: String,
+        actual: String,
     },
     DefinitionDigestMismatch {
         expected: String,
@@ -286,7 +286,8 @@ pub fn resolve_store_insertion(
 ) -> Result<ResolvedLibraryPart, LibraryCatalogError> {
     verify_intent_identity(intent)?;
     let definition = PartDefinitionId::parse(&intent.definition_key)?;
-    let revision = PartRevision::new(intent.definition_revision, 0, 0);
+    let [major, minor, patch] = intent.definition_revision;
+    let revision = PartRevision::new(major, minor, patch);
     let package = store.resolve(&definition, revision)?;
     resolve_insertion(&package, intent)
 }
@@ -361,9 +362,9 @@ pub fn verify_builtin_package_contract(package: &PartPackage) -> Result<(), Libr
     }
     if definition.revision() != builtin_part_revision() {
         return Err(LibraryCatalogError::PackageContract(format!(
-            "revision {} does not match {}.0.0",
+            "revision {} does not match {}",
             definition.revision(),
-            ALUMINIUM_EXTRUSION_20X20_REVISION
+            builtin_part_revision()
         )));
     }
     if definition.kind() != PartKind::Parametric {
@@ -391,8 +392,31 @@ pub fn verify_builtin_package_contract(package: &PartPackage) -> Result<(), Libr
     verify_model_recipe(&document)
 }
 
-fn builtin_part_revision() -> PartRevision {
-    PartRevision::new(ALUMINIUM_EXTRUSION_20X20_REVISION, 0, 0)
+/// The built-in definition's full revision: its authored major, and a minor
+/// that follows the native document schema the package embeds.
+///
+/// The embedded document records the schema it was written in, so every
+/// schema bump changes the package's bytes and content address even though
+/// the part is the same. A store keeps one package per revision and refuses a
+/// second, so a build that published the part under one schema and a later
+/// build that published it again under the same revision met a conflict,
+/// and the store was never used again. Giving each schema its own revision
+/// lets both live side by side, and a document that pinned the older one
+/// still names exactly what it was built from.
+#[must_use]
+pub fn builtin_part_revision() -> PartRevision {
+    PartRevision::new(
+        ALUMINIUM_EXTRUSION_20X20_REVISION,
+        CURRENT_DOCUMENT_VERSION,
+        0,
+    )
+}
+
+/// The built-in revision as the presentation card carries it.
+#[must_use]
+pub fn builtin_part_revision_parts() -> [u32; 3] {
+    let revision = builtin_part_revision();
+    [revision.major(), revision.minor(), revision.patch()]
 }
 
 fn builtin_model_recipe() -> Result<ModelDocument, LibraryCatalogError> {
@@ -542,7 +566,13 @@ fn bind_recipe_command(
         | ReplayAction::TargetedKernel(_)
         | ReplayAction::ParameterizedKernel(_)
         | ReplayAction::SketchRegionExtrusion(_)
-        | ReplayAction::Boolean(_) => Err(LibraryCatalogError::RecipeContract(
+        | ReplayAction::Boolean(_)
+        | ReplayAction::DatumPlane(_)
+        | ReplayAction::DatumAxis(_)
+        | ReplayAction::SketchLoft(_)
+        | ReplayAction::SketchRevolve(_)
+        | ReplayAction::SketchSweep(_)
+        | ReplayAction::KernelChain(_) => Err(LibraryCatalogError::RecipeContract(
             "the parameterized root recipe did not resolve to an independent kernel command".into(),
         )),
     }
@@ -555,10 +585,13 @@ fn verify_intent_identity(intent: &PartInsertionIntent) -> Result<(), LibraryCat
             actual: intent.definition_key.clone(),
         });
     }
-    if intent.definition_revision != ALUMINIUM_EXTRUSION_20X20_REVISION {
+    if intent.definition_revision != builtin_part_revision_parts() {
         return Err(LibraryCatalogError::DefinitionRevisionMismatch {
-            expected: ALUMINIUM_EXTRUSION_20X20_REVISION,
-            actual: intent.definition_revision,
+            expected: builtin_part_revision().to_string(),
+            actual: {
+                let [major, minor, patch] = intent.definition_revision;
+                format!("{major}.{minor}.{patch}")
+            },
         });
     }
     if intent.display_name != ALUMINIUM_EXTRUSION_20X20_NAME {
@@ -578,7 +611,7 @@ fn intent_length(intent: &PartInsertionIntent) -> Result<f64, LibraryCatalogErro
                 assignment.key.clone(),
             ));
         }
-        if length.replace(assignment.value_mm).is_some() {
+        if length.replace(assignment.value).is_some() {
             return Err(LibraryCatalogError::DuplicateParameter(
                 assignment.key.clone(),
             ));
@@ -661,13 +694,13 @@ mod tests {
         PartInsertionIntent {
             staging_id: 7,
             definition_key: ALUMINIUM_EXTRUSION_20X20_KEY.into(),
-            definition_revision: ALUMINIUM_EXTRUSION_20X20_REVISION,
+            definition_revision: builtin_part_revision_parts(),
             definition_digest,
             display_name: ALUMINIUM_EXTRUSION_20X20_NAME.into(),
             parameters: vec![PartParameterAssignment {
                 key: LENGTH_PARAMETER_KEY.into(),
                 display_name: "Length".into(),
-                value_mm: length_mm,
+                value: length_mm,
                 source: ParameterValueSource::Entered,
             }],
         }
@@ -686,7 +719,11 @@ mod tests {
             first.definition().id().as_str(),
             ALUMINIUM_EXTRUSION_20X20_KEY
         );
-        assert_eq!(first.definition().revision(), PartRevision::new(1, 0, 0));
+        assert_eq!(
+            first.definition().revision(),
+            PartRevision::new(1, CURRENT_DOCUMENT_VERSION, 0),
+            "the minor revision follows the schema the package embeds"
+        );
         assert_eq!(first.definition().parameters().len(), 1);
         assert!(first.definition().parameters()[0].requires_input());
 
@@ -786,7 +823,7 @@ mod tests {
         ));
 
         let mut wrong_revision = intent(10.0);
-        wrong_revision.definition_revision += 1;
+        wrong_revision.definition_revision[0] += 1;
         assert!(matches!(
             resolve_builtin_insertion(&wrong_revision),
             Err(LibraryCatalogError::DefinitionRevisionMismatch { .. })

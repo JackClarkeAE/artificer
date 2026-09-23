@@ -7,8 +7,11 @@
 mod analytic_extrusion;
 pub mod api;
 pub mod brep;
+mod bspline;
+mod coaxial_boolean;
 mod corner_blend;
 mod cuboid;
+mod cylinder_trace;
 mod describe;
 mod edge_finish;
 mod edge_finish_apart;
@@ -20,8 +23,11 @@ mod faceted_boolean;
 // (ADR 0023 frontier, milestone B). It is complete and unit-tested; the band,
 // sphere-corner, and ledge assembly that consumes it is still to come.
 mod analytic_boolean;
+mod hole_rim_blend;
 #[allow(dead_code)]
 mod loft;
+mod loft_sections;
+mod loft_skin;
 mod loop_offset;
 mod mirror;
 mod pattern;
@@ -32,11 +38,14 @@ mod profile_boolean;
 mod push_pull;
 mod revolve;
 mod rim_loop_blend;
+mod ruled;
 mod section_revolve;
 mod sew;
 mod shell;
+mod spline_profile;
 mod step_export;
 mod surface_intersection;
+mod sweep_profile;
 mod topology;
 mod transform;
 mod validator;
@@ -54,11 +63,11 @@ use artificer_protocol::{
     Diagnostic as ProtocolDiagnostic, DiagnosticCode as ProtocolDiagnosticCode,
     DiagnosticMeasurement, DiagnosticSeverity, EntityId as ProtocolEntityId, EntityKind, EntityRef,
     ExecuteRequest, FaceExtrusionOperation, HistoryRecord, HistoryRelation, KernelCommand,
-    KernelError, KernelErrorCode, KernelStage, NumericInterval, OperationReport, OperationRole,
-    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
+    KernelError, KernelErrorCode, KernelStage, LoftOperation, NumericInterval, OperationReport,
+    OperationRole, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2,
     Point2 as ProtocolPoint2, Point3 as ProtocolPoint3, PrecisionPolicy, QuantityKind,
-    SemanticDigest, SnapshotId, TopologyCounts as ProtocolTopologyCounts, ValidationProfile,
-    ValidationReport as ProtocolValidationReport, Vector3 as ProtocolVector3,
+    SemanticDigest, SnapshotId, SolidOperation, TopologyCounts as ProtocolTopologyCounts,
+    ValidationProfile, ValidationReport as ProtocolValidationReport, Vector3 as ProtocolVector3,
 };
 use sha2::{Digest, Sha256};
 
@@ -82,7 +91,8 @@ use crate::topology::{
 use crate::transform::{Similarity, TransformInputError, transform_topology};
 
 pub use crate::describe::{
-    EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, SurfaceCounts,
+    EdgeDescription, EdgeGeometry, FaceDescription, FaceGeometry, RailGeometry, RailKind,
+    SurfaceCounts,
 };
 pub use crate::step_export::{StepBody, StepPlacement};
 pub use crate::topology::FaceRole;
@@ -259,6 +269,108 @@ pub enum DisplaySurface {
         minor_radius: f64,
         angular_sign: f64,
     },
+    /// The straight lines between two rails (ADR 0049), `(1 − v)·C₀(u) +
+    /// v·C₁(u)`. It has no revolved frame: [`Self::frame`] reports none, and
+    /// its silhouette comes from [`Self::ruled_silhouette`].
+    Ruled { rails: [DisplayRail; 2] },
+    /// A B-spline surface (ADR 0050). It has no revolved frame either, and
+    /// its silhouette comes from [`Self::spline_silhouette`].
+    Bspline { surface: DisplaySpline },
+}
+
+/// The surface of a B-spline display carrier: a handle the kernel evaluates
+/// for presentation, and nothing a consumer can build or take apart. Two are
+/// equal when their surfaces are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplaySpline(bspline::SplineSurface);
+
+/// One rail of a ruled display carrier: a conic walked from `start` to `end`
+/// in its own parameter as `u` runs from zero to one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DisplayRail {
+    Line {
+        start: ProtocolPoint3,
+        end: ProtocolPoint3,
+    },
+    /// `center + u·a·cos t + v·b·sin t`; a circle has `a = b`.
+    Conic {
+        center: ProtocolPoint3,
+        u: ProtocolVector3,
+        v: ProtocolVector3,
+        major_radius: f64,
+        minor_radius: f64,
+        start: f64,
+        end: f64,
+    },
+}
+
+impl DisplayRail {
+    fn internal(self) -> ruled::RuledRail {
+        match self {
+            Self::Line { start, end } => ruled::RuledRail {
+                curve: ruled::RailCurve::Line {
+                    endpoints: [internal_point(start), internal_point(end)],
+                },
+                range: topology::ParameterRange::new(0.0, 1.0),
+            },
+            Self::Conic {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+                start,
+                end,
+            } => ruled::RuledRail {
+                curve: ruled::RailCurve::Ellipse {
+                    center: internal_point(center),
+                    u: Vector3::new(u.x, u.y, u.z),
+                    v: Vector3::new(v.x, v.y, v.z),
+                    major_radius,
+                    minor_radius,
+                },
+                range: topology::ParameterRange::new(start, end),
+            },
+        }
+    }
+
+    fn from_internal(rail: ruled::RuledRail) -> Self {
+        match rail.curve {
+            ruled::RailCurve::Line { endpoints } => Self::Line {
+                start: protocol_point(endpoints[0]),
+                end: protocol_point(endpoints[1]),
+            },
+            ruled::RailCurve::Circle {
+                center,
+                u,
+                v,
+                radius,
+            } => Self::Conic {
+                center: protocol_point(center),
+                u: protocol_vector(u),
+                v: protocol_vector(v),
+                major_radius: radius,
+                minor_radius: radius,
+                start: rail.range.start,
+                end: rail.range.end,
+            },
+            ruled::RailCurve::Ellipse {
+                center,
+                u,
+                v,
+                major_radius,
+                minor_radius,
+            } => Self::Conic {
+                center: protocol_point(center),
+                u: protocol_vector(u),
+                v: protocol_vector(v),
+                major_radius,
+                minor_radius,
+                start: rail.range.start,
+                end: rail.range.end,
+            },
+        }
+    }
 }
 
 impl DisplaySurface {
@@ -266,6 +378,15 @@ impl DisplaySurface {
     /// parameterisation.
     #[must_use]
     pub fn evaluate(self, u: f64, v: f64) -> ProtocolPoint3 {
+        if let Self::Ruled { rails } = self {
+            let surface = ruled::RuledSurface {
+                rails: rails.map(DisplayRail::internal),
+            };
+            return protocol_point(surface.evaluate(topology::Point2::new(u, v)));
+        }
+        if let Self::Bspline { surface } = self {
+            return protocol_point(surface.0.evaluate(topology::Point2::new(u, v)));
+        }
         let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
         let angle = angular_sign * u;
         let (sin, cos) = topology::seam_snapped_sin_cos(angle);
@@ -294,6 +415,7 @@ impl DisplaySurface {
                     minor_radius * sin_v,
                 )
             }
+            Self::Ruled { .. } | Self::Bspline { .. } => (0.0, 0.0),
         };
         ProtocolPoint3::new(
             radial.x.mul_add(ring, axis.x.mul_add(lift, origin.x)),
@@ -302,7 +424,9 @@ impl DisplaySurface {
         )
     }
 
-    /// `(origin, axis, radial_u, radial_v, angular_sign)`, shared by every arm.
+    /// `(origin, axis, radial_u, radial_v, angular_sign)`, shared by every
+    /// revolved arm. A ruled carrier has no such frame and reports zeros,
+    /// with a zero angular sign.
     #[must_use]
     pub const fn frame(
         self,
@@ -346,7 +470,170 @@ impl DisplaySurface {
                 angular_sign,
                 ..
             } => (origin, axis, radial_u, radial_v, angular_sign),
+            Self::Ruled { .. } | Self::Bspline { .. } => {
+                let zero = ProtocolVector3::new(0.0, 0.0, 0.0);
+                (ProtocolPoint3::new(0.0, 0.0, 0.0), zero, zero, zero, 0.0)
+            }
         }
+    }
+
+    /// The chords along which a B-spline carrier turns away from a viewer
+    /// looking along `view`, within `domain`; empty for any other carrier.
+    ///
+    /// Presentation samples (ADR 0026, rule 3). The sign of `n · view` is
+    /// read on a grid over every span cell, and each grid cell where it
+    /// changes contributes the chord between the points on its sides where
+    /// the linear reading of it vanishes — the marching-squares contour of
+    /// the silhouette, as fine as the grid.
+    #[must_use]
+    pub fn spline_silhouette(
+        self,
+        domain: [[f64; 2]; 2],
+        view: [f64; 3],
+    ) -> Vec<[ProtocolPoint3; 2]> {
+        let Self::Bspline { surface } = self else {
+            return Vec::new();
+        };
+        let surface = surface.0;
+        let [[u_min, u_max], [v_min, v_max]] = domain;
+        if !(u_min < u_max && v_min < v_max) {
+            return Vec::new();
+        }
+        let view = Vector3::new(view[0], view[1], view[2]);
+        let samples = |direction: usize, from: f64, to: f64| {
+            let spans = surface.spans(direction, from, to);
+            let per_span = (96 / spans.len().max(1)).clamp(2, 16);
+            let mut samples = vec![from];
+            for (low, high) in spans {
+                for step in 1..=per_span {
+                    samples.push((high - low).mul_add(step as f64 / per_span as f64, low));
+                }
+            }
+            samples
+        };
+        let us = samples(0, u_min, u_max);
+        let vs = samples(1, v_min, v_max);
+        let facing = |u: f64, v: f64| {
+            let normal = surface.normal(topology::Point2::new(u, v));
+            let value = normal.dot(view);
+            if value.abs() <= 1.0e-12 * normal.length() * view.length() {
+                0.0
+            } else {
+                value
+            }
+        };
+        let values = us
+            .iter()
+            .map(|u| vs.iter().map(|v| facing(*u, *v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let crossing = |from: f64, to: f64| {
+            ((from < 0.0) != (to < 0.0))
+                .then(|| from / (from - to))
+                .filter(|fraction| fraction.is_finite())
+        };
+        let mut chords = Vec::new();
+        for i in 0..us.len() - 1 {
+            for j in 0..vs.len() - 1 {
+                let corners = [
+                    (us[i], vs[j], values[i][j]),
+                    (us[i + 1], vs[j], values[i + 1][j]),
+                    (us[i + 1], vs[j + 1], values[i + 1][j + 1]),
+                    (us[i], vs[j + 1], values[i][j + 1]),
+                ];
+                let mut points = Vec::with_capacity(4);
+                for side in 0..4 {
+                    let (u0, v0, f0) = corners[side];
+                    let (u1, v1, f1) = corners[(side + 1) % 4];
+                    if let Some(t) = crossing(f0, f1) {
+                        points.push(((u1 - u0).mul_add(t, u0), (v1 - v0).mul_add(t, v0)));
+                    }
+                }
+                for pair in points.chunks_exact(2) {
+                    chords.push([pair[0], pair[1]].map(|(u, v)| {
+                        protocol_point(surface.evaluate(topology::Point2::new(u, v)))
+                    }));
+                }
+            }
+        }
+        chords
+    }
+
+    /// The chords along which a ruled carrier turns away from a viewer
+    /// looking along `view`, within `domain`; empty for any other carrier.
+    ///
+    /// The normal `(∂S/∂u) × (∂S/∂v)` of a ruled surface is linear in `v`
+    /// along each rung, so `n · view` is known exactly along every rung from
+    /// its two ends. Presentation sweeps `u` in strips and, in each, joins
+    /// the points where `n · view` changes sign around the strip's boundary —
+    /// along a rung, where the linear form solves in one division, or along
+    /// a rail. A developable wall, whose silhouette is a whole rung, and a
+    /// twisted one, whose silhouette crosses the rungs, are both found.
+    #[must_use]
+    pub fn ruled_silhouette(
+        self,
+        domain: [[f64; 2]; 2],
+        view: [f64; 3],
+    ) -> Vec<[ProtocolPoint3; 2]> {
+        let Self::Ruled { rails } = self else {
+            return Vec::new();
+        };
+        let surface = ruled::RuledSurface {
+            rails: rails.map(DisplayRail::internal),
+        };
+        let [[u_min, u_max], [v_min, v_max]] = domain;
+        if !(u_min < u_max && v_min < v_max) {
+            return Vec::new();
+        }
+        let view = Vector3::new(view[0], view[1], view[2]);
+        // A value within rounding of zero is zero, and zero counts with the
+        // positive side, so a silhouette lying exactly along the rung two
+        // walls share is drawn by one of them and not lost between both.
+        let facing = |u: f64, v: f64| {
+            let normal = surface.normal(topology::Point2::new(u, v));
+            let value = normal.dot(view);
+            if value.abs() <= 1.0e-12 * normal.length() * view.length() {
+                0.0
+            } else {
+                value
+            }
+        };
+        // Where a linear form through `from` and `to` crosses zero, as a
+        // fraction of the way along.
+        let crossing = |from: f64, to: f64| {
+            ((from < 0.0) != (to < 0.0))
+                .then(|| from / (from - to))
+                .filter(|fraction| fraction.is_finite())
+        };
+        const STEPS: usize = 64;
+        let mut chords = Vec::new();
+        let at = |step: usize| (u_max - u_min).mul_add(step as f64 / STEPS as f64, u_min);
+        let mut left = (facing(at(0), v_min), facing(at(0), v_max));
+        for step in 0..STEPS {
+            let (u0, u1) = (at(step), at(step + 1));
+            let right = (facing(u1, v_min), facing(u1, v_max));
+            let mut points = Vec::with_capacity(4);
+            if let Some(t) = crossing(left.0, right.0) {
+                points.push(((u1 - u0).mul_add(t, u0), v_min));
+            }
+            if let Some(t) = crossing(right.0, right.1) {
+                points.push((u1, (v_max - v_min).mul_add(t, v_min)));
+            }
+            if let Some(t) = crossing(right.1, left.1) {
+                points.push(((u0 - u1).mul_add(t, u1), v_max));
+            }
+            if let Some(t) = crossing(left.1, left.0) {
+                points.push((u0, (v_min - v_max).mul_add(t, v_max)));
+            }
+            for pair in points.chunks_exact(2) {
+                chords.push(
+                    [pair[0], pair[1]].map(|(u, v)| {
+                        protocol_point(surface.evaluate(topology::Point2::new(u, v)))
+                    }),
+                );
+            }
+            left = right;
+        }
+        chords
     }
 }
 
@@ -443,6 +730,29 @@ impl FaceBoundaryCurve2 {
             }
         }
     }
+}
+
+/// A straight edge and the planar face a construction plane is turned from
+/// (ADR 0048): the edge's ends in its own direction, the face's outward
+/// normal, and the unit direction from the edge into the face.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StraightEdgeOnFace {
+    pub start: ProtocolPoint3,
+    pub end: ProtocolPoint3,
+    pub face_normal: ProtocolVector3,
+    pub into_face: ProtocolVector3,
+}
+
+/// The axis of a curved face, as a construction axis through it sees it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceAxis {
+    /// The middle of the stretch of the axis the face covers.
+    pub origin: ProtocolPoint3,
+    /// The unit direction of the face's carrier axis.
+    pub direction: ProtocolVector3,
+    /// Half that stretch; zero for a face that covers none of it, such as a
+    /// flat ring of a torus.
+    pub half_length: f64,
 }
 
 /// Exact read-only placement and boundary for a planar B-rep face.
@@ -568,7 +878,7 @@ impl NativeKernel {
         // arm names its own; a ladder with several rungs names the one that
         // answered. The report carries it so a consumer can tell an exact
         // construction from the faceted tier without parsing prose.
-        let mut rung: &'static str = "";
+        let rung: &'static str;
         let (topology, history_mode) = match &request.command {
             KernelCommand::MakeCuboid {
                 origin,
@@ -642,13 +952,85 @@ impl NativeKernel {
                 profile,
                 axis,
                 angle,
+                operation,
             } => {
-                validate_extrusion_source(input)?;
+                if *operation == SolidOperation::New {
+                    validate_extrusion_source(input)?;
+                }
                 let revolved =
                     revolve::validate_revolve(*frame, profile, *axis, *angle, request.precision)
                         .map_err(|reason| revolve_input_error(input.id, reason))?;
-                rung = "revolve/full-turn";
-                (revolve::build_revolve(&revolved), HistoryMode::Generated)
+                let tool = revolve::build_revolve(&revolved);
+                match operation {
+                    SolidOperation::New => {
+                        rung = if revolved.is_partial() {
+                            "revolve/partial-turn"
+                        } else {
+                            "revolve/full-turn"
+                        };
+                        (tool, HistoryMode::Generated)
+                    }
+                    SolidOperation::Add | SolidOperation::Cut => {
+                        let (topology, answered) = tool_boolean(
+                            input,
+                            tool,
+                            *operation == SolidOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                            &REVOLVE_BOOLEAN,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
+                }
+            }
+            KernelCommand::SweepPlanarProfile {
+                frame,
+                profile,
+                path,
+                orientation,
+                operation,
+            } => {
+                if *operation == SolidOperation::New {
+                    validate_extrusion_source(input)?;
+                }
+                // A skinned sweep that is added or cut is a tool for the
+                // faceted tier, and is skinned to that tier's tolerance.
+                let budget = if *operation == SolidOperation::New {
+                    sweep_profile::SkinBudget::Precision
+                } else {
+                    sweep_profile::SkinBudget::FacetedTool
+                };
+                let swept = sweep_profile::sweep(
+                    *frame,
+                    profile,
+                    path,
+                    *orientation,
+                    request.precision,
+                    budget,
+                )
+                .map_err(|reason| sweep_input_error(input.id, reason))?;
+                if let Some(approximation) = swept.approximation {
+                    warnings.push(sweep_approximation_warning(approximation));
+                }
+                match operation {
+                    SolidOperation::New => {
+                        rung = swept.rung;
+                        (swept.topology, HistoryMode::Generated)
+                    }
+                    SolidOperation::Add | SolidOperation::Cut => {
+                        let (topology, answered) = tool_boolean(
+                            input,
+                            swept.topology,
+                            *operation == SolidOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                            &SWEEP_BOOLEAN,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
+                }
             }
             KernelCommand::TransformSnapshot { transform } => {
                 validate_transform_source(input)?;
@@ -686,7 +1068,20 @@ impl NativeKernel {
                 distance,
             } => {
                 validate_extrusion_source(input)?;
-                if profile_contains_analytic_curves(profile) {
+                if spline_profile::profile_contains_splines(profile) {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "extrusion/spline-profile";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if profile_contains_analytic_curves(profile) {
                     let extrusion = validate_analytic_profile_extrusion(
                         *frame,
                         profile,
@@ -720,7 +1115,32 @@ impl NativeKernel {
                     .precision
                     .modeling_resolution
                     .max(request.precision.min_feature_size);
-                if offset.abs() <= minimum {
+                let splines = spline_profile::profile_contains_splines(profile);
+                if splines && offset.abs() <= minimum {
+                    let regions = spline_profile::validate_spline_profile_extrusion(
+                        *frame,
+                        profile,
+                        *distance,
+                        request.precision,
+                    )
+                    .map_err(|reason| spline_profile_error(input.id, reason))?;
+                    rung = "loft/straight";
+                    (
+                        spline_profile::build_spline_extrusion(&regions),
+                        HistoryMode::Generated,
+                    )
+                } else if splines {
+                    // The offset of a spline is not a spline of any degree,
+                    // so the drafted section would have no exact carrier.
+                    return Err(planar_profile_error(
+                        input.id,
+                        KernelErrorCode::Unsupported,
+                        "LOFT_OFFSET_SPLINE_UNSUPPORTED",
+                        "a drafted loft offsets its section, and the offset of a B-spline is not \
+                         a B-spline, so a profile with splines cannot be drafted. Loft between \
+                         the profile and a scaled copy of it instead.",
+                    ));
+                } else if offset.abs() <= minimum {
                     // No draft is a straight extrusion; build it as one so the
                     // walls are the cylinders and planes an extrusion makes.
                     let extrusion = validate_analytic_profile_extrusion(
@@ -743,6 +1163,42 @@ impl NativeKernel {
                     )
                     .map_err(|reason| loft_input_error(input.id, reason))?;
                     (loft::build_offset_loft(&loft), HistoryMode::Generated)
+                }
+            }
+            KernelCommand::LoftPlanarSections {
+                sections,
+                operation,
+            } => {
+                if *operation == LoftOperation::New {
+                    validate_extrusion_source(input)?;
+                }
+                // Two sections are ruled (ADR 0049); three or more are
+                // skinned by one smooth B-spline wall per column (ADR 0050).
+                let (tool, built) = if sections.len() > 2 {
+                    let loft = loft_skin::validate_skinned_loft(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_skin::build_skinned_loft(&loft), "loft/skinned")
+                } else {
+                    let loft = loft_sections::validate_loft_sections(sections, request.precision)
+                        .map_err(|reason| loft_sections_error(input.id, reason))?;
+                    (loft_sections::build_loft_sections(&loft), "loft/sections")
+                };
+                match operation {
+                    LoftOperation::New => {
+                        rung = built;
+                        (tool, HistoryMode::Generated)
+                    }
+                    LoftOperation::Add | LoftOperation::Cut => {
+                        let (topology, answered) = loft_boolean(
+                            input,
+                            tool,
+                            *operation == LoftOperation::Add,
+                            request.precision,
+                            &mut warnings,
+                        )?;
+                        rung = answered;
+                        (topology, HistoryMode::RegularizedFaceFeature)
+                    }
                 }
             }
             KernelCommand::ExtrudeFaceProfile {
@@ -779,6 +1235,26 @@ impl NativeKernel {
                         exit_face,
                     },
                 )
+            }
+            KernelCommand::ExtrudeFacePlanarProfile {
+                target_face,
+                frame,
+                profile,
+                distance,
+                operation,
+            } if spline_profile::profile_contains_splines(profile) => {
+                let (topology, answered) = spline_face_feature(
+                    input,
+                    *target_face,
+                    *frame,
+                    profile,
+                    *distance,
+                    *operation,
+                    request.precision,
+                    &mut warnings,
+                )?;
+                rung = answered;
+                (topology, HistoryMode::RegularizedFaceFeature)
             }
             KernelCommand::ExtrudeFacePlanarProfile {
                 target_face,
@@ -891,69 +1367,89 @@ impl NativeKernel {
                         )
                         .ok()
                         .map(|tool| build_analytic_extrusion(&tool));
-                        let exact = analytic_tool.as_ref().and_then(|tool| {
-                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, tool)
-                                .then(|| {
-                                    analytic_boolean::build_analytic_boolean(
-                                        &input.topology,
-                                        tool,
-                                        BooleanOperation::Difference,
-                                        request.precision,
-                                    )
-                                    .ok()
-                                })
-                                .flatten()
-                        });
-                        if let Some(topology) = exact {
-                            // The faces are the engine's own records, matched
-                            // back to history the way every regularized
-                            // Boolean's are.
-                            rung = "face-feature/analytic-boolean";
-                            (topology, None, true)
-                        } else {
-                            rung = "face-feature/faceted";
-                            // Crossing curved voids use the faceted Boolean tier.
-                            // The ordinary display tessellation may contain
-                            // thousands of triangles for a single circle and is
-                            // an unsuitable Boolean operand (two crossed bores
-                            // previously caused explosive BSP fragmentation).
-                            // Bound this construction mesh independently; the
-                            // immutable analytic predecessor remains untouched.
-                            let mut boolean_input = input.clone();
-                            let mut boolean_precision = request.precision;
-                            boolean_precision.max_subdivisions =
-                                boolean_precision.max_subdivisions.min(4);
-                            boolean_input.precision = Some(boolean_precision);
-                            let scene = NativeKernel::authoritative_scene(&boolean_input);
-                            let topology = faceted_boolean::subtract_crossing_profile(
-                                &scene,
-                                *frame,
-                                profile,
-                                plane.normal / normal_length * -1.0,
-                                *distance,
-                                // NOTE: this is deliberately the request's budget,
-                                // not the clamped `boolean_precision` above, even
-                                // though the comment on that clamp reads as though
-                                // both meshes should share it. Handing the cutter
-                                // the clamped budget halves the fragmentation
-                                // (2959 -> 1551 faces) but drops one bore's panel
-                                // fan below the eight-normal threshold in
-                                // `presentation_prismatic_feature_roles`, so its
-                                // seams stop being recognised as one logical
-                                // cylinder and are drawn as creases instead. Change
-                                // it together with the coplanar merge that removes
-                                // the fan altogether, not before.
+                        let exact = match analytic_tool.as_ref() {
+                            None => Err(ExactRouteDecline::Tool),
+                            Some(tool)
+                                if !analytic_boolean::operands_in_engine_vocabulary(
+                                    &input.topology,
+                                    tool,
+                                ) =>
+                            {
+                                Err(ExactRouteDecline::Vocabulary)
+                            }
+                            Some(tool) => analytic_boolean::build_analytic_boolean(
+                                &input.topology,
+                                tool,
+                                BooleanOperation::Difference,
                                 request.precision,
                             )
-                            .map_err(|reason| planar_profile_input_error(input.id, reason))?;
-                            certify_faceted_candidate(input.id, &topology, request.precision)?;
-                            // The result is a tessellation, not a certified solid.
-                            // Say so: every other report this kernel publishes means
-                            // "exact", so a caller with no way to tell the
-                            // difference will quote this body's volume as though it
-                            // were.
-                            warnings.push(faceted_cut_warning());
-                            (topology, None, true)
+                            .map_err(ExactRouteDecline::from_engine)
+                            .and_then(|topology| exact_candidate(topology, request.precision)),
+                        };
+                        match exact {
+                            Ok(topology) => {
+                                // The faces are the engine's own records,
+                                // matched back to history the way every
+                                // regularized Boolean's are.
+                                rung = "face-feature/analytic-boolean";
+                                (topology, None, true)
+                            }
+                            Err(decline) => {
+                                rung = "face-feature/faceted";
+                                // Crossing curved voids use the faceted Boolean tier.
+                                // The ordinary display tessellation may contain
+                                // thousands of triangles for a single circle and is
+                                // an unsuitable Boolean operand (two crossed bores
+                                // previously caused explosive BSP fragmentation).
+                                // Bound this construction mesh independently; the
+                                // immutable analytic predecessor remains untouched.
+                                let scene =
+                                    NativeKernel::faceted_operand_scene(input, request.precision);
+                                let topology = faceted_boolean::subtract_crossing_profile(
+                                    &scene,
+                                    *frame,
+                                    profile,
+                                    plane.normal / normal_length * -1.0,
+                                    *distance,
+                                    // NOTE: this is deliberately the request's budget,
+                                    // not the clamped `boolean_precision` above, even
+                                    // though the comment on that clamp reads as though
+                                    // both meshes should share it. Handing the cutter
+                                    // the clamped budget halves the fragmentation
+                                    // (2959 -> 1551 faces) but drops one bore's panel
+                                    // fan below the eight-normal threshold in
+                                    // `presentation_prismatic_feature_roles`, so its
+                                    // seams stop being recognised as one logical
+                                    // cylinder and are drawn as creases instead. Change
+                                    // it together with the coplanar merge that removes
+                                    // the fan altogether, not before.
+                                    request.precision,
+                                )
+                                .map_err(|reason| {
+                                    with_exact_route_decline(
+                                        planar_profile_input_error(input.id, reason),
+                                        decline,
+                                    )
+                                })?;
+                                certify_faceted_candidate(input.id, &topology, request.precision)
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
+                                certify_faceted_change(
+                                    input.id,
+                                    &input.topology,
+                                    &topology,
+                                    *operation,
+                                    request.precision,
+                                )
+                                .map_err(|error| with_exact_route_decline(error, decline))?;
+                                // The result is a tessellation, not a certified solid.
+                                // Say so: every other report this kernel publishes means
+                                // "exact", so a caller with no way to tell the
+                                // difference will quote this body's volume as though it
+                                // were — and say why the exact route stood aside.
+                                warnings.push(faceted_cut_warning());
+                                warnings.push(decline.diagnostic(DiagnosticSeverity::Warning));
+                                (topology, None, true)
+                            }
                         }
                     }
                     Err(PlanarProfileInputError::FaceFeature(
@@ -1025,40 +1521,53 @@ impl NativeKernel {
                         };
                         // Past the prism reductions, the general analytic
                         // engine carries any body of planes and cylinders —
-                        // one already bored at an angle, say. Its tool
+                        // one already bored at an angle, say. A cut's tool
                         // overshoots the face so no cap lies on the face's
-                        // own plane; the overshoot lies outside the body for
-                        // a cut and inside it for an add, and changes nothing.
-                        let analytic = || -> Option<Topology> {
-                            let overshoot =
-                                (*distance * 0.01).max(request.precision.min_feature_size * 8.0);
-                            let analytic_origin = match operation {
-                                FaceExtrusionOperation::Cut => tool_origin,
-                                FaceExtrusionOperation::Add => ProtocolPoint3::new(
-                                    tool_origin.x - unit.x * overshoot,
-                                    tool_origin.y - unit.y * overshoot,
-                                    tool_origin.z - unit.z * overshoot,
-                                ),
+                        // own plane; the overshoot lies outside the body and
+                        // removes nothing. An add's tool stands exactly on
+                        // the face: its cap is a coincident face the engine
+                        // resolves (ADR 0045), and an overshoot into the body
+                        // would poke out again under any part of the profile
+                        // that hangs over the face's edge, and publish that
+                        // sliver as material.
+                        let analytic = || -> Result<Topology, ExactRouteDecline> {
+                            let overshoot = match operation {
+                                FaceExtrusionOperation::Cut => {
+                                    (*distance * 0.01).max(request.precision.min_feature_size * 8.0)
+                                }
+                                FaceExtrusionOperation::Add => 0.0,
                             };
                             let tool = validate_analytic_profile_extrusion(
-                                PlanarFrame3::new(analytic_origin, frame.u, frame.v),
+                                PlanarFrame3::new(tool_origin, frame.u, frame.v),
                                 profile,
                                 *distance + overshoot,
                                 request.precision,
                             )
-                            .ok()
-                            .map(|tool| build_analytic_extrusion(&tool))?;
-                            analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool)
-                                .then(|| {
-                                    analytic_boolean::build_analytic_boolean(
-                                        &input.topology,
-                                        &tool,
-                                        boolean_operation,
-                                        request.precision,
-                                    )
-                                    .ok()
-                                })
-                                .flatten()
+                            .map(|tool| build_analytic_extrusion(&tool))
+                            .map_err(|_| ExactRouteDecline::Tool)?;
+                            if !analytic_boolean::operands_in_engine_vocabulary(
+                                &input.topology,
+                                &tool,
+                            ) {
+                                return Err(ExactRouteDecline::Vocabulary);
+                            }
+                            let topology = analytic_boolean::build_analytic_boolean(
+                                &input.topology,
+                                &tool,
+                                boolean_operation,
+                                request.precision,
+                            )
+                            .map_err(ExactRouteDecline::from_engine)
+                            .and_then(|topology| exact_candidate(topology, request.precision))?;
+                            // An add whose profile misses the face has no
+                            // interface, and the union of two solids that
+                            // never meet is two solids, not a boss.
+                            if *operation == FaceExtrusionOperation::Add
+                                && topology.solids.len() != 1
+                            {
+                                return Err(ExactRouteDecline::Empty);
+                            }
+                            Ok(topology)
                         };
                         let prism = prism_boolean::build_prism_boolean(
                             &input.topology,
@@ -1066,47 +1575,71 @@ impl NativeKernel {
                             boolean_operation,
                             request.precision,
                         );
-                        // An add whose profile misses the face has no
-                        // interface, and stays a refusal; only a cut goes on
-                        // to the general engine.
-                        let analytic_cut = || -> Option<Topology> {
-                            (*operation == FaceExtrusionOperation::Cut)
-                                .then(analytic)
-                                .flatten()
-                        };
+                        // Both operations go on to the general engine. A cut
+                        // is the difference it certifies; an add is the union
+                        // — which since ADR 0045 resolves a boss whose rim
+                        // coincides with the face's own boundary or a hole's,
+                        // the commonest boss there is.
                         let topology = match prism {
-                            Ok(topology) => topology,
-                            Err(_) if analytic_cut().is_some() => {
-                                analytic_cut().expect("checked above")
-                            }
-                            Err(_) if *operation == FaceExtrusionOperation::Cut => {
-                                let mut boolean_input = input.clone();
-                                let mut boolean_precision = request.precision;
-                                boolean_precision.max_subdivisions =
-                                    boolean_precision.max_subdivisions.min(4);
-                                boolean_input.precision = Some(boolean_precision);
-                                let scene = NativeKernel::authoritative_scene(&boolean_input);
-                                let topology = faceted_boolean::subtract_crossing_profile(
-                                    &scene,
-                                    *frame,
-                                    profile,
-                                    Vector3::new(-unit.x, -unit.y, -unit.z),
-                                    *distance,
-                                    request.precision,
-                                )
-                                .map_err(|reason| planar_profile_input_error(input.id, reason))?;
-                                certify_faceted_candidate(input.id, &topology, request.precision)?;
-                                warnings.push(faceted_cut_warning());
+                            Ok(topology) => {
+                                rung = "face-feature/exact-prism";
                                 topology
                             }
-                            Err(_) => {
-                                return Err(planar_profile_input_error(
-                                    input.id,
-                                    PlanarProfileInputError::FaceFeature(
-                                        FaceFeatureInputError::ProfileOutsideFace,
-                                    ),
-                                ));
-                            }
+                            Err(_) => match analytic() {
+                                Ok(topology) => {
+                                    rung = "face-feature/analytic-boolean";
+                                    topology
+                                }
+                                Err(decline) if *operation == FaceExtrusionOperation::Cut => {
+                                    rung = "face-feature/faceted";
+                                    let scene = NativeKernel::faceted_operand_scene(
+                                        input,
+                                        request.precision,
+                                    );
+                                    let topology = faceted_boolean::subtract_crossing_profile(
+                                        &scene,
+                                        *frame,
+                                        profile,
+                                        Vector3::new(-unit.x, -unit.y, -unit.z),
+                                        *distance,
+                                        request.precision,
+                                    )
+                                    .map_err(|reason| {
+                                        with_exact_route_decline(
+                                            planar_profile_input_error(input.id, reason),
+                                            decline,
+                                        )
+                                    })?;
+                                    certify_faceted_candidate(
+                                        input.id,
+                                        &topology,
+                                        request.precision,
+                                    )
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
+                                    certify_faceted_change(
+                                        input.id,
+                                        &input.topology,
+                                        &topology,
+                                        *operation,
+                                        request.precision,
+                                    )
+                                    .map_err(|error| with_exact_route_decline(error, decline))?;
+                                    warnings.push(faceted_cut_warning());
+                                    warnings.push(decline.diagnostic(DiagnosticSeverity::Warning));
+                                    topology
+                                }
+                                Err(decline) => {
+                                    return Err(with_exact_route_decline(
+                                        planar_profile_input_error(
+                                            input.id,
+                                            PlanarProfileInputError::FaceFeature(
+                                                FaceFeatureInputError::ProfileOutsideFace,
+                                            ),
+                                        ),
+                                        decline,
+                                    ));
+                                }
+                            },
                         };
                         (topology, None, true)
                     }
@@ -1335,49 +1868,88 @@ impl NativeKernel {
                         profile,
                         axis,
                         angle,
-                        open: false,
+                        open,
+                        clip,
                     } => {
                         let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
                             frame,
                             profile,
                             axis,
                             angle,
+                            operation: SolidOperation::New,
                         })?;
-                        let topology =
-                            shell::hollow(&input.topology, &core.topology).ok_or_else(|| {
-                                simple_invalid_input(
-                                    input.id,
-                                    "SHELL_CORE_UNSUPPORTED",
-                                    "The shell core is not a single closed solid to enclose.",
+                        // A partial turn's core is turned a full turn and
+                        // then loses the prism standing along the axis that
+                        // keeps one wall along each closed wedge face. The
+                        // prism's walls are planes parallel to the axis, so
+                        // against planes and coaxial cylinders the cut is
+                        // exact; a cone meets them in a hyperbola, which
+                        // takes the faceted tier with its label.
+                        let (core, faceted) = match clip {
+                            None => (core, false),
+                            Some(clip) => {
+                                let prism = core_from_empty(KernelCommand::ExtrudePlanarProfile {
+                                    frame: clip.frame,
+                                    profile: clip.profile,
+                                    distance: clip.distance,
+                                })?;
+                                let (topology, answered) = tool_boolean(
+                                    &core,
+                                    prism.topology,
+                                    false,
+                                    request.precision,
+                                    &mut warnings,
+                                    &SHELL_BOOLEAN,
+                                )?;
+                                let digest = semantic_digest(&topology, request.precision);
+                                (
+                                    Snapshot {
+                                        id: snapshot_id(digest),
+                                        semantic_digest: digest,
+                                        precision: Some(request.precision),
+                                        topology,
+                                        measures: SnapshotMeasures::default(),
+                                    },
+                                    answered == SHELL_BOOLEAN.rungs[2],
                                 )
-                            })?;
-                        rung = "shell/closed-revolve";
-                        (topology, HistoryMode::Generated)
-                    }
-                    shell::ShellPlan::Revolved {
-                        frame,
-                        profile,
-                        axis,
-                        angle,
-                        open: true,
-                    } => {
-                        // An open cap's core reaches past the body, so the
-                        // wall there is taken away rather than enclosed.
-                        let core = core_from_empty(KernelCommand::RevolvePlanarProfile {
-                            frame,
-                            profile,
-                            axis,
-                            angle,
-                        })?;
-                        let opened = BooleanRequest {
-                            protocol_version: CURRENT_PROTOCOL_VERSION,
-                            request_id: artificer_protocol::RequestId::new("shell::open"),
-                            expected_target_snapshot: input.id,
-                            expected_tool_snapshot: core.id(),
-                            precision: request.precision,
-                            operation: BooleanOperation::Difference,
+                            }
                         };
-                        let mut outcome = Self::execute_boolean(
+                        if !open {
+                            let topology = shell::hollow(&input.topology, &core.topology)
+                                .ok_or_else(|| {
+                                    simple_invalid_input(
+                                        input.id,
+                                        "SHELL_CORE_UNSUPPORTED",
+                                        "The shell core is not a single closed solid to enclose.",
+                                    )
+                                })?;
+                            rung = if faceted {
+                                "shell/faceted"
+                            } else {
+                                "shell/closed-revolve"
+                            };
+                            (topology, HistoryMode::Generated)
+                        } else {
+                            if faceted {
+                                // A faceted core cannot be taken away exactly,
+                                // and the body's own cones are what faceted it.
+                                return Err(simple_invalid_input(
+                                    input.id,
+                                    "SHELL_OPEN_REVOLVE_UNSUPPORTED",
+                                    "Opening a revolved body's cap takes the wall away through the Boolean engine, which does not carry this body's surfaces yet. A closed shell of the same body needs no Boolean.",
+                                ));
+                            }
+                            // An open cap's core reaches past the body, so the
+                            // wall there is taken away rather than enclosed.
+                            let opened = BooleanRequest {
+                                protocol_version: CURRENT_PROTOCOL_VERSION,
+                                request_id: artificer_protocol::RequestId::new("shell::open"),
+                                expected_target_snapshot: input.id,
+                                expected_tool_snapshot: core.id(),
+                                precision: request.precision,
+                                operation: BooleanOperation::Difference,
+                            };
+                            let mut outcome = Self::execute_boolean(
                             input, &core, &opened, cancellation,
                         )
                         .map_err(|inner| {
@@ -1400,8 +1972,9 @@ impl NativeKernel {
                                 diagnostics,
                             )
                         })?;
-                        outcome.report.rung = Some("shell/open-revolve".to_owned());
-                        return Ok(outcome);
+                            outcome.report.rung = Some("shell/open-revolve".to_owned());
+                            return Ok(outcome);
+                        }
                     }
                 }
             }
@@ -1751,8 +2324,29 @@ impl NativeKernel {
         // full imprint/classify/regularize/sew pipeline for operands whose
         // faces it can carry. Everything is exact; nothing tessellates.
         let mut rung = "boolean/prism";
+        // Two coaxial bodies of revolution combine in their shared section,
+        // exactly, cones, spheres and tori included (ADR 0026 F4).
+        let coaxial = match &analytic {
+            Ok(_) => None,
+            Err(_) => coaxial_boolean::coaxial_boolean(
+                &target.topology,
+                &tool.topology,
+                request.operation,
+                request.precision,
+            )
+            .ok()
+            .filter(|topology| {
+                validator::validate(topology, request.precision.linear_agreement)
+                    .diagnostics
+                    .is_empty()
+            }),
+        };
         let topology = match analytic {
             Ok(topology) => topology,
+            Err(_) if coaxial.is_some() => {
+                rung = "boolean/coaxial";
+                coaxial.expect("checked above")
+            }
             Err(_) => {
                 if analytic_boolean::operands_in_engine_vocabulary(&target.topology, &tool.topology)
                 {
@@ -1780,6 +2374,44 @@ impl NativeKernel {
                                     "BOOLEAN_EMPTY_OR_UNRESOLVED_RESULT",
                                     KernelStage::Construction,
                                     "The selected operation produced no publishable closed component.",
+                                )],
+                            ));
+                        }
+                        Err(analytic_boolean::AnalyticBooleanError::CarrierPair(pair)) => {
+                            let [first, second] = *pair;
+                            // The engine names the pair the two faces actually
+                            // bring together, which a scan of every carrier
+                            // pair cannot: a pair the faces never bring
+                            // together is no refusal at all.
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_SURFACE_PAIR_UNSUPPORTED",
+                                    KernelStage::Construction,
+                                    &format!(
+                                        "The {} and {} carriers meet in a curve outside this kernel's line and circle vocabulary.",
+                                        surface_intersection::surface_name(first),
+                                        surface_intersection::surface_name(second)
+                                    ),
+                                )],
+                            ));
+                        }
+                        Err(analytic_boolean::AnalyticBooleanError::TraceUnclosed) => {
+                            return Err(error(
+                                KernelErrorCode::Unsupported,
+                                KernelStage::Construction,
+                                target.id,
+                                "the Boolean operands leave the regularized analytic domain",
+                                vec![simple_diagnostic(
+                                    "BOOLEAN_TRACE_NOT_CLOSED",
+                                    KernelStage::Construction,
+                                    "Two cylinders meet in a space quartic, which this kernel \
+                                     carries exactly, but on one face the curves of the section \
+                                     did not close into a boundary: one ends inside the face, and \
+                                     the closure refuses rather than guess how it continues.",
                                 )],
                             ));
                         }
@@ -2204,6 +2836,137 @@ impl NativeKernel {
         Ok(snapshot.topology.edges[record].value.length())
     }
 
+    /// Returns the two ends of one authoritative straight B-rep edge, in the
+    /// edge's own direction, or `None` when the edge is curved.
+    ///
+    /// A construction plane turned about an edge (ADR 0048) needs the line
+    /// itself, which the display scene only approximates.
+    pub fn straight_edge_ends(
+        snapshot: &Snapshot,
+        edge: EntityRef,
+    ) -> Result<Option<[ProtocolPoint3; 2]>, KernelError> {
+        let record = resolve_measure_entity(snapshot, edge, EntityKind::Edge, "edge")?;
+        let edge = snapshot.topology.edges[record].value;
+        if !matches!(edge.curve, topology::Curve3::Line { .. }) {
+            return Ok(None);
+        }
+        Ok(Some(edge.endpoints().map(protocol_point)))
+    }
+
+    /// Returns the axis of a cylindrical, conical, toroidal or spherical
+    /// face, centred on and reaching over the stretch of the axis the face's
+    /// boundary covers, or `None` for a face with no axis (ADR 0055: a
+    /// construction axis through a curved face).
+    pub fn face_axis(
+        snapshot: &Snapshot,
+        face: EntityRef,
+    ) -> Result<Option<FaceAxis>, KernelError> {
+        let record = resolve_measure_entity(snapshot, face, EntityKind::Face, "face")?;
+        let topology = &snapshot.topology;
+        let value = &topology.faces[record].value;
+        let (origin, axis) = match value.surface {
+            topology::Surface::Cylinder(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Cone(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Torus(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Sphere(carrier) => (carrier.origin, carrier.axis),
+            topology::Surface::Plane(_)
+            | topology::Surface::Ruled(_)
+            | topology::Surface::Bspline(_) => return Ok(None),
+        };
+        let length = axis.length();
+        if !(length.is_finite() && length > 1.0e-12) {
+            return Ok(None);
+        }
+        let axis = axis / length;
+        // How far along the axis the face's boundary reaches, either way.
+        let (low, high) = value
+            .loops()
+            .filter_map(|loop_key| topology.loop_record(loop_key))
+            .flat_map(|record| record.value.coedges.iter())
+            .filter_map(|coedge| topology.coedge(*coedge))
+            .filter_map(|coedge| topology.edge(coedge.value.edge))
+            .flat_map(|edge| edge.value.vertices)
+            .map(|vertex| (topology.vertices[vertex.0].value.point - origin).dot(axis))
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), along| {
+                (low.min(along), high.max(along))
+            });
+        let (low, high) = if low <= high { (low, high) } else { (0.0, 0.0) };
+        Ok(Some(FaceAxis {
+            origin: protocol_point(origin + axis * f64::midpoint(low, high)),
+            direction: ProtocolVector3::new(axis.x, axis.y, axis.z),
+            half_length: (high - low) * 0.5,
+        }))
+    }
+
+    /// Returns the faces on either side of one edge, in topology order: two
+    /// for an ordinary edge, one for a seam that a face meets itself along.
+    pub fn edge_faces(snapshot: &Snapshot, edge: EntityRef) -> Result<Vec<EntityRef>, KernelError> {
+        let record = resolve_measure_entity(snapshot, edge, EntityKind::Edge, "edge")?;
+        Ok(edge_incident_faces(snapshot)
+            .get(record)
+            .map(|faces| faces.iter().flatten().copied().collect())
+            .unwrap_or_default())
+    }
+
+    /// Returns a straight edge as a construction plane turned about it sees
+    /// it (ADR 0048): its ends, the outward normal of a planar face that
+    /// holds it, and the direction from the edge into that face.
+    ///
+    /// The direction is found by asking which side of the edge the face is
+    /// on, a hair from the edge's middle. A face is not always convex, so its
+    /// middle is not always inside every edge; its boundary is. An edge that
+    /// is curved, or that is not on the face's boundary in a way that says
+    /// which side the face is on, is refused by name.
+    pub fn straight_edge_on_planar_face(
+        snapshot: &Snapshot,
+        edge: EntityRef,
+        face: EntityRef,
+    ) -> Result<StraightEdgeOnFace, KernelError> {
+        let ends = Self::straight_edge_ends(snapshot, edge)?.ok_or_else(|| {
+            simple_invalid_input(
+                snapshot.id,
+                "EDGE_NOT_STRAIGHT",
+                "A plane turns about a straight edge; this edge is curved.",
+            )
+        })?;
+        let support = Self::planar_face_support(snapshot, face)?;
+        let frame = support.frame;
+        let unit = |vector: Vector3| {
+            let length = vector.length();
+            (length.is_finite() && length > 1.0e-12).then(|| vector / length)
+        };
+        let normal = unit(
+            Vector3::new(frame.u.x, frame.u.y, frame.u.z)
+                .cross(Vector3::new(frame.v.x, frame.v.y, frame.v.z)),
+        );
+        let not_on_face = || {
+            simple_invalid_input(
+                snapshot.id,
+                "EDGE_NOT_ON_FACE",
+                "The edge is not on the boundary of the face it is turned from.",
+            )
+        };
+        let (start, end) = (internal_point(ends[0]), internal_point(ends[1]));
+        let along = end - start;
+        let length = along.length();
+        let normal = normal.filter(|_| length > 1.0e-9).ok_or_else(not_on_face)?;
+        let across = unit(normal.cross(along)).ok_or_else(not_on_face)?;
+        let middle = start + along * 0.5;
+        let step = (length * 1.0e-3).max(1.0e-4);
+        let inside = |sign: f64| point_in_face_support(&support, middle + across * (sign * step));
+        let into_face = match (inside(1.0), inside(-1.0)) {
+            (true, false) => across,
+            (false, true) => across * -1.0,
+            _ => return Err(not_on_face()),
+        };
+        Ok(StraightEdgeOnFace {
+            start: ends[0],
+            end: ends[1],
+            face_normal: protocol_vector(normal),
+            into_face: protocol_vector(into_face),
+        })
+    }
+
     /// Returns the exact model-space area of one authoritative B-rep face.
     pub fn face_area(snapshot: &Snapshot, face: EntityRef) -> Result<f64, KernelError> {
         let record = resolve_measure_entity(snapshot, face, EntityKind::Face, "face")?;
@@ -2255,6 +3018,28 @@ impl NativeKernel {
                     )
                 });
             }
+            Surface::Ruled(ruled) => {
+                return ruled_face_area(&snapshot.topology, face, ruled).ok_or_else(|| {
+                    error(
+                        KernelErrorCode::InvalidInput,
+                        KernelStage::Preflight,
+                        snapshot.id,
+                        "the requested ruled face area could not be evaluated",
+                        Vec::new(),
+                    )
+                });
+            }
+            Surface::Bspline(surface) => {
+                return spline_face_area(&snapshot.topology, face, surface).ok_or_else(|| {
+                    error(
+                        KernelErrorCode::InvalidInput,
+                        KernelStage::Preflight,
+                        snapshot.id,
+                        "the requested B-spline face area could not be evaluated",
+                        Vec::new(),
+                    )
+                });
+            }
         };
         Ok(parameter_area * jacobian)
     }
@@ -2289,6 +3074,18 @@ impl NativeKernel {
     #[must_use]
     pub fn authoritative_scene(snapshot: &Snapshot) -> DebugScene {
         Self::scene_with_budget(ComputePool::global(), snapshot, ChordBudget::Authoritative)
+    }
+
+    /// A body as the faceted Boolean tier takes it: sampled as
+    /// [`Self::authoritative_scene`] is, with at most sixteen chords to a
+    /// curved face, except that B-spline faces and edges are sampled at the
+    /// display chord tolerance (see `ChordBudget::FacetedOperand`).
+    fn faceted_operand_scene(snapshot: &Snapshot, precision: PrecisionPolicy) -> DebugScene {
+        let mut operand = snapshot.clone();
+        let mut precision = precision;
+        precision.max_subdivisions = precision.max_subdivisions.min(4);
+        operand.precision = Some(precision);
+        Self::scene_with_budget(ComputePool::global(), &operand, ChordBudget::FacetedOperand)
     }
 
     /// How far the display facets of each face and the face they stand for
@@ -2334,7 +3131,10 @@ impl NativeKernel {
         budget: ChordBudget,
     ) -> DebugScene {
         let precision = snapshot.precision.unwrap_or_default();
-        let fallback = if matches!(budget, ChordBudget::Authoritative) {
+        let fallback = if matches!(
+            budget,
+            ChordBudget::Authoritative | ChordBudget::FacetedOperand
+        ) {
             TessellationFallback::Refuse
         } else {
             TessellationFallback::Display
@@ -2438,6 +3238,42 @@ impl NativeKernel {
                             ));
                         }
                     }
+                    // The ruled tessellator knows each vertex's parameters,
+                    // so its normals come from them rather than from
+                    // inverting the vertex back onto the surface.
+                    Surface::Ruled(ruled) => {
+                        for (vertices, normals) in tessellate_ruled_face(
+                            &snapshot.topology,
+                            &face.value,
+                            ruled,
+                            budget,
+                            precision,
+                        ) {
+                            triangles.push(DebugTriangle {
+                                vertices: vertices.map(protocol_point),
+                                normals: normals.map(protocol_vector),
+                                source_face,
+                                role: snapshot.topology.faces[index].value.role,
+                            });
+                        }
+                    }
+                    // So does the B-spline tessellator's.
+                    Surface::Bspline(surface) => {
+                        for (vertices, normals) in tessellate_spline_face(
+                            &snapshot.topology,
+                            &face.value,
+                            surface,
+                            budget,
+                            precision,
+                        ) {
+                            triangles.push(DebugTriangle {
+                                vertices: vertices.map(protocol_point),
+                                normals: normals.map(protocol_vector),
+                                source_face,
+                                role: snapshot.topology.faces[index].value.role,
+                            });
+                        }
+                    }
                 }
                 triangles
             },
@@ -2498,6 +3334,43 @@ impl NativeKernel {
             carriers: display_carriers(snapshot),
         }
     }
+}
+
+/// Whether a point in a face's plane lies inside the face's outer boundary
+/// and outside every hole in it, judged on the face's own polygon.
+fn point_in_face_support(support: &PlanarFaceSupport, point: Point3) -> bool {
+    let frame = support.frame;
+    let (u, v) = (
+        Vector3::new(frame.u.x, frame.u.y, frame.u.z),
+        Vector3::new(frame.v.x, frame.v.y, frame.v.z),
+    );
+    let offset = point - internal_point(frame.origin);
+    let (uu, uv, vv) = (u.dot(u), u.dot(v), v.dot(v));
+    let determinant = uu * vv - uv * uv;
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return false;
+    }
+    let (pu, pv) = (offset.dot(u), offset.dot(v));
+    let x = (pu * vv - pv * uv) / determinant;
+    let y = (pv * uu - pu * uv) / determinant;
+    let contains = |polygon: &[ProtocolPoint2]| {
+        let mut inside = false;
+        let mut previous = polygon.last().copied();
+        for current in polygon.iter().copied() {
+            if let Some(prior) = previous
+                && (current.y > y) != (prior.y > y)
+            {
+                let crossing =
+                    prior.x + (y - prior.y) * (current.x - prior.x) / (current.y - prior.y);
+                if x < crossing {
+                    inside = !inside;
+                }
+            }
+            previous = Some(current);
+        }
+        inside
+    };
+    contains(&support.boundary) && !support.inner_boundaries.iter().any(|hole| contains(hole))
 }
 
 /// The faces on either side of every edge, in topology order.
@@ -2578,6 +3451,12 @@ fn display_carriers(snapshot: &Snapshot) -> Vec<DisplayCarrier> {
                     major_radius: torus.major_radius,
                     minor_radius: torus.minor_radius,
                     angular_sign: torus.angular_sign,
+                },
+                Surface::Ruled(ruled) => DisplaySurface::Ruled {
+                    rails: ruled.rails.map(DisplayRail::from_internal),
+                },
+                Surface::Bspline(surface) => DisplaySurface::Bspline {
+                    surface: DisplaySpline(surface),
                 },
             };
             Some(DisplayCarrier {
@@ -2929,6 +3808,12 @@ fn presentation_edge_classification(
         .evaluate((edge.parameter_range.start + edge.parameter_range.end) * 0.5);
     let first_surface = topology.faces[*first].value.surface;
     let second_surface = topology.faces[*second].value.surface;
+    let along_whole_edge =
+        |surface: Surface| matches!(surface, Surface::Ruled(_) | Surface::Bspline(_));
+    if along_whole_edge(first_surface) || along_whole_edge(second_surface) {
+        return ruled_edge_classification(topology, [*first, *second], edge_index)
+            .unwrap_or_else(hard);
+    }
     let normal = |surface: Surface| -> Option<Vector3> {
         let normal = match surface {
             Surface::Plane(plane) => plane.normal,
@@ -2982,6 +3867,8 @@ fn presentation_edge_classification(
                 }
                 relative - cylinder.axis * (relative.dot(cylinder.axis) / axis_denominator)
             }
+            // Classified along the whole edge by `ruled_edge_classification`.
+            Surface::Ruled(_) | Surface::Bspline(_) => return None,
         };
         let length = normal.length();
         (length > f64::EPSILON).then(|| normal / length)
@@ -3151,14 +4038,214 @@ fn presentation_edge_classification(
     }
 }
 
+/// The presentation class of an edge with a ruled face on either side.
+///
+/// A ruled surface's normal turns along a rung, so the two faces are
+/// compared at five points along the whole edge, not at its middle: a rung
+/// where two walls meet at a square corner at one end and tangentially at
+/// the other is a crease, and only an edge whose normals agree everywhere
+/// along it is tangent. Two walls that are one ruled surface split at a
+/// rung — the halves of a full circle's wall — are one carrier, and the
+/// rung between them is a seam that does not draw.
+fn ruled_edge_classification(
+    topology: &Topology,
+    faces: [usize; 2],
+    edge_index: usize,
+) -> Option<PresentationEdgeClassification> {
+    let edge = topology.edges.get(edge_index)?.value;
+    let range = edge.parameter_range;
+    let normal_at = |face_index: usize, fraction: f64| -> Option<Vector3> {
+        let face = &topology.faces.get(face_index)?.value;
+        match face.surface {
+            Surface::Ruled(_) | Surface::Bspline(_) => {
+                let coedge = face
+                    .loops()
+                    .filter_map(|loop_key| topology.loop_record(loop_key))
+                    .flat_map(|loop_record| loop_record.value.coedges.iter())
+                    .filter_map(|coedge_key| topology.coedge(*coedge_key))
+                    .find(|coedge| coedge.value.edge.0 == edge_index)?
+                    .value;
+                let along = match coedge.orientation {
+                    Orientation::Forward => fraction,
+                    Orientation::Reverse => 1.0 - fraction,
+                };
+                let span = coedge.parameter_range;
+                let parameters = coedge
+                    .pcurve
+                    .evaluate((span.end - span.start).mul_add(along, span.start));
+                match face.surface {
+                    Surface::Ruled(ruled) => ruled.unit_normal(parameters),
+                    Surface::Bspline(surface) => surface.unit_normal(parameters),
+                    _ => None,
+                }
+            }
+            surface => {
+                let point = edge
+                    .curve
+                    .evaluate((range.end - range.start).mul_add(fraction, range.start));
+                surface.outward_normal_at(point)
+            }
+        }
+    };
+    let mut worst = 1.0_f64;
+    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let first = normal_at(faces[0], fraction)?;
+        let second = normal_at(faces[1], fraction)?;
+        worst = worst.min(first.dot(second).abs());
+    }
+    let same_carrier = match (
+        topology.faces[faces[0]].value.surface,
+        topology.faces[faces[1]].value.surface,
+    ) {
+        (Surface::Ruled(first), Surface::Ruled(second)) => {
+            first.rails.iter().zip(&second.rails).all(|(left, right)| {
+                left.curve == right.curve
+                    && (left.range.end - left.range.start) == (right.range.end - right.range.start)
+            })
+        }
+        // Two faces on one stored surface are one carrier split along an
+        // isocurve: equal handles are equal content.
+        (Surface::Bspline(first), Surface::Bspline(second)) => first == second,
+        _ => false,
+    };
+    let low_dihedral = worst >= 15.0_f64.to_radians().cos();
+    let smooth = same_carrier && low_dihedral;
+    Some(PresentationEdgeClassification {
+        smooth,
+        tangent: !smooth && !same_carrier && worst >= 1.0 - 1.0e-9,
+        coplanar_subdivision: false,
+        same_feature_side_role: None,
+    })
+}
+
+/// Why the exact route declined a face feature, kept so that whatever tier
+/// answers instead — or refuses — can say what it was standing in for.
+#[derive(Clone, Copy, Debug)]
+enum ExactRouteDecline {
+    /// The body or the tool carries a face class the engine cannot sew.
+    Vocabulary,
+    /// Two faces that meet lie on carriers outside the intersection matrix,
+    /// named by class.
+    CarrierPair {
+        first: &'static str,
+        second: &'static str,
+    },
+    /// A contact the engine does not classify.
+    Contact,
+    /// The curve two cylinders share is carried, but on one of the faces a
+    /// curve of the section ends inside the face, and the closure refuses to
+    /// guess how it continues.
+    TraceUnclosed,
+    /// The exact result was empty.
+    Empty,
+    /// The prism tool itself could not be built from the profile.
+    Tool,
+    /// The exact engine built a candidate that the solid validator did not
+    /// pass: a defect in the exact route, not a limit of it.
+    Invalid,
+}
+
+impl ExactRouteDecline {
+    fn from_engine(error: analytic_boolean::AnalyticBooleanError) -> Self {
+        match error {
+            analytic_boolean::AnalyticBooleanError::CarrierPair(pair) => Self::CarrierPair {
+                first: surface_intersection::surface_name(pair[0]),
+                second: surface_intersection::surface_name(pair[1]),
+            },
+            analytic_boolean::AnalyticBooleanError::TraceUnclosed => Self::TraceUnclosed,
+            analytic_boolean::AnalyticBooleanError::DomainUnsupported => Self::Contact,
+            analytic_boolean::AnalyticBooleanError::EmptyResult => Self::Empty,
+        }
+    }
+
+    fn sentence(self) -> String {
+        match self {
+            Self::Vocabulary => "the body carries a face class — a torus, a cone, a sphere or a \
+                                 ruled wall — that the exact engine cannot sew"
+                .to_owned(),
+            Self::CarrierPair { first, second } => format!(
+                "the {first} and {second} carriers meet in a curve outside this kernel's line and \
+                 circle vocabulary"
+            ),
+            Self::Contact => "the operands meet tangentially or share geometry the exact engine \
+                              does not classify"
+                .to_owned(),
+            Self::TraceUnclosed => "two cylinders meet in a space quartic, which this kernel \
+                                    carries exactly, but on one face the curves of the section did \
+                                    not close into a boundary: one ends inside the face, and the \
+                                    closure refuses rather than guess how it continues"
+                .to_owned(),
+            Self::Empty => "the exact operation produced no material".to_owned(),
+            Self::Tool => "the profile could not be swept into an exact tool".to_owned(),
+            Self::Invalid => "the exact engine built a body that did not pass the solid \
+                              validator, which is a defect in the exact route rather than a \
+                              limit of it"
+                .to_owned(),
+        }
+    }
+
+    /// The diagnostic every report of this feature carries: a warning beside
+    /// an approximation, an error beside a refusal. The code is the same
+    /// either way, because the fact it states is.
+    fn diagnostic(self, severity: DiagnosticSeverity) -> ProtocolDiagnostic {
+        self.diagnostic_coded("FACE_FEATURE_EXACT_ROUTE_DECLINED", severity)
+    }
+
+    /// The same statement under another feature's code.
+    fn diagnostic_coded(self, code: &str, severity: DiagnosticSeverity) -> ProtocolDiagnostic {
+        let mut diagnostic = simple_diagnostic(
+            code,
+            KernelStage::Construction,
+            &format!(
+                "The exact route declined this feature first: {}.",
+                self.sentence()
+            ),
+        );
+        diagnostic.severity = severity;
+        diagnostic
+    }
+}
+
+/// The exact engine's body, held to the solid validator before it is taken.
+///
+/// The commit gate validates whatever a rung hands it, and refuses a body that
+/// fails — which, for the exact route, used to end the operation even where
+/// the faceted tier could have answered. An exact candidate that is not a
+/// valid solid is a defect in the exact route; the step still deserves an
+/// answer, labelled as the approximation it is, and the report names the
+/// defect as the reason the exact route stood aside.
+fn exact_candidate(
+    topology: Topology,
+    precision: PrecisionPolicy,
+) -> Result<Topology, ExactRouteDecline> {
+    if validator::validate(&topology, precision.linear_agreement)
+        .diagnostics
+        .is_empty()
+    {
+        Ok(topology)
+    } else {
+        Err(ExactRouteDecline::Invalid)
+    }
+}
+
+/// A faceted-tier refusal with the exact route's reason in front of it: a
+/// message about tessellation for a problem that was about vocabulary is
+/// the wrong message.
+fn with_exact_route_decline(mut error: KernelError, decline: ExactRouteDecline) -> KernelError {
+    error
+        .diagnostics
+        .insert(0, decline.diagnostic(DiagnosticSeverity::Error));
+    error
+}
+
 fn faceted_cut_warning() -> ProtocolDiagnostic {
     approximation_warning(
         "FACE_FEATURE_FACETED_APPROXIMATION",
         "This cut crosses geometry that the exact rewrite cannot split - curved walls, or an \
          interior void with material resuming beyond it - so the body was rebuilt from a \
          tessellation. Its faces, edges, and measures approximate the true solid rather than \
-         certifying it: two round bores that cross meet in ellipses, which are outside this \
-         kernel's line-and-circle curve vocabulary.",
+         certifying it. Why the exact route stood aside is the \
+         FACE_FEATURE_EXACT_ROUTE_DECLINED diagnostic beside this one.",
     )
 }
 
@@ -3174,6 +4261,53 @@ fn certify_faceted_candidate(
     if validation.diagnostics.is_empty() {
         return Ok(());
     }
+    faceted_candidate_refusal(snapshot, validation)
+}
+
+/// A faceted candidate that is closed but cannot be the answer: a cut that
+/// left the body with more material than it started with, or an add that
+/// left it with less. Closedness is what the validator certifies, and a
+/// tessellated rebuild can be perfectly closed around the wrong material —
+/// which is a wrong answer published as an approximation, the one failure a
+/// kernel must not have. Volume is the cheapest invariant that catches it.
+fn certify_faceted_change(
+    snapshot: SnapshotId,
+    before: &Topology,
+    after: &Topology,
+    operation: FaceExtrusionOperation,
+    precision: PrecisionPolicy,
+) -> Result<(), KernelError> {
+    let was = validator::calculate_measures(before).signed_volume.abs();
+    let is = validator::calculate_measures(after).signed_volume.abs();
+    let slack = precision.approximation_budget.max(1.0e-9) * was.max(1.0);
+    let (wrong_way, verb, direction) = match operation {
+        FaceExtrusionOperation::Cut => (is > was + slack, "cut", "more"),
+        FaceExtrusionOperation::Add => (is < was - slack, "add", "less"),
+    };
+    if !wrong_way {
+        return Ok(());
+    }
+    let message = format!(
+        "The tessellated rebuild closed, but a {verb} left the body with {direction} material \
+         ({was:.6} before, {is:.6} after), which no {verb} can. Nothing is published."
+    );
+    Err(error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Construction,
+        snapshot,
+        "the faceted rebuild is closed but is not this operation",
+        vec![simple_diagnostic(
+            "FACE_FEATURE_FACETED_UNRESOLVED",
+            KernelStage::Construction,
+            &message,
+        )],
+    ))
+}
+
+fn faceted_candidate_refusal(
+    snapshot: SnapshotId,
+    validation: validator::ValidationReport,
+) -> Result<(), KernelError> {
     let mut diagnostics = vec![simple_diagnostic(
         "FACE_FEATURE_FACETED_UNRESOLVED",
         KernelStage::Construction,
@@ -3194,6 +4328,421 @@ fn certify_faceted_candidate(
         "the faceted cut could not be regularized into a closed solid",
         diagnostics,
     ))
+}
+
+/// How one feature that builds a tool body and combines it with the body
+/// names the rungs of the Boolean ladder and its own refusals and warnings.
+struct ToolBoolean {
+    /// What the tool is, in the messages: "loft" or "spline profile".
+    noun: &'static str,
+    empty: &'static str,
+    declined: &'static str,
+    unresolved: &'static str,
+    approximation: &'static str,
+    /// The rungs, in order: the prism reduction, the analytic engine, the
+    /// faceted tier.
+    rungs: [&'static str; 3],
+    /// The rung for two coaxial bodies of revolution combined in their
+    /// shared section (ADR 0026 F4).
+    coaxial: &'static str,
+}
+
+/// A loft added to or cut from a body (ADR 0049).
+const LOFT_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "loft",
+    empty: "LOFT_TARGET_EMPTY",
+    declined: "LOFT_EXACT_ROUTE_DECLINED",
+    unresolved: "LOFT_FACETED_UNRESOLVED",
+    approximation: "LOFT_FACETED_APPROXIMATION",
+    rungs: [
+        "loft/boolean-prism",
+        "loft/boolean-analytic",
+        "loft/faceted",
+    ],
+    coaxial: "loft/boolean-coaxial",
+};
+
+/// A sweep added to or cut from a body (ADR 0055). A straight sweep is a
+/// prism and answers exactly; a skinned one's B-spline walls take the
+/// faceted tier, skinned to that tier's own chord tolerance.
+const SWEEP_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "sweep",
+    empty: "SWEEP_TARGET_EMPTY",
+    declined: "SWEEP_EXACT_ROUTE_DECLINED",
+    unresolved: "SWEEP_FACETED_UNRESOLVED",
+    approximation: "SWEEP_FACETED_APPROXIMATION",
+    rungs: [
+        "sweep/boolean-prism",
+        "sweep/boolean-analytic",
+        "sweep/faceted",
+    ],
+    coaxial: "sweep/boolean-coaxial",
+};
+
+/// A revolve added to or cut from a body (ADR 0055). A revolve whose
+/// faces are all planes and coaxial cylinders is a prism along its axis and
+/// answers exactly. One turned about the body's own axis, with any faces,
+/// answers exactly in the two bodies' shared section (ADR 0026 F4). A cone,
+/// torus or sphere about another axis takes the faceted tier.
+const REVOLVE_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "revolve",
+    empty: "REVOLVE_TARGET_EMPTY",
+    declined: "REVOLVE_EXACT_ROUTE_DECLINED",
+    unresolved: "REVOLVE_FACETED_UNRESOLVED",
+    approximation: "REVOLVE_FACETED_APPROXIMATION",
+    rungs: [
+        "revolve/boolean-prism",
+        "revolve/boolean-analytic",
+        "revolve/faceted",
+    ],
+    coaxial: "revolve/boolean-coaxial",
+};
+
+/// The wedge wall taken off a partial turn's shell core (ADR 0055). The
+/// core's planes and coaxial cylinders meet the prism's planes in lines and
+/// answer exactly; a cone meets them in a hyperbola and takes the faceted
+/// tier.
+const SHELL_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "shell core",
+    empty: "SHELL_CORE_UNSUPPORTED",
+    declined: "SHELL_EXACT_ROUTE_DECLINED",
+    unresolved: "SHELL_FACETED_UNRESOLVED",
+    approximation: "SHELL_FACETED_APPROXIMATION",
+    rungs: [
+        "shell/closed-revolve",
+        "shell/closed-revolve",
+        "shell/faceted",
+    ],
+    coaxial: "shell/closed-revolve",
+};
+
+/// A spline profile added to or cut from a face (ADR 0050), which answers
+/// as every other face feature does.
+const SPLINE_FACE_BOOLEAN: ToolBoolean = ToolBoolean {
+    noun: "spline profile",
+    empty: "FACE_FEATURE_TARGET_MISSING",
+    declined: "FACE_FEATURE_EXACT_ROUTE_DECLINED",
+    unresolved: "FACE_FEATURE_FACETED_UNRESOLVED",
+    approximation: "FACE_FEATURE_FACETED_APPROXIMATION",
+    rungs: [
+        "face-feature/exact-prism",
+        "face-feature/analytic-boolean",
+        "face-feature/faceted",
+    ],
+    coaxial: "face-feature/coaxial-section",
+};
+
+/// A loft added to or cut from a body, through the Boolean ladder.
+fn loft_boolean(
+    input: &Snapshot,
+    tool: Topology,
+    add: bool,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<(Topology, &'static str), KernelError> {
+    tool_boolean(input, tool, add, precision, warnings, &LOFT_BOOLEAN)
+}
+
+/// A tool body added to or cut from a body, through the Boolean ladder: the
+/// prism reduction, then the analytic engine where it carries both operands,
+/// then the faceted tier with its label. Returns the body and the rung that
+/// answered.
+///
+/// The tool is certified as a solid before it meets the body, so an invalid
+/// tool never reaches any tier. A tool whose walls are all planes, cylinders
+/// or cones — a frustum, say — is inside the exact engines' reach; a ruled
+/// wall (ADR 0049) or a B-spline wall (ADR 0050) is not, and the engines
+/// decline it by name.
+fn tool_boolean(
+    input: &Snapshot,
+    tool: Topology,
+    add: bool,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+    labels: &ToolBoolean,
+) -> Result<(Topology, &'static str), KernelError> {
+    let noun = labels.noun;
+    if input.topology.solids.is_empty() {
+        let message = format!(
+            "An add or cut {noun} needs a body to combine with; a {noun} of its own is a new \
+             body."
+        );
+        return Err(error(
+            KernelErrorCode::InvalidInput,
+            KernelStage::Preflight,
+            input.id,
+            message.clone(),
+            vec![simple_diagnostic(
+                labels.empty,
+                KernelStage::Preflight,
+                &message,
+            )],
+        ));
+    }
+    let tool_validation = validator::validate(&tool, precision.linear_agreement);
+    if !tool_validation.diagnostics.is_empty() {
+        return Err(error(
+            KernelErrorCode::ValidationFailed,
+            KernelStage::Validation,
+            input.id,
+            format!("the {noun} failed solid validation before it was combined with the body"),
+            protocol_validation(input.id, ValidationProfile::Solid, &tool_validation).diagnostics,
+        ));
+    }
+    let (operation, face_operation) = if add {
+        (BooleanOperation::Union, FaceExtrusionOperation::Add)
+    } else {
+        (BooleanOperation::Difference, FaceExtrusionOperation::Cut)
+    };
+    if let Ok(topology) =
+        prism_boolean::build_prism_boolean(&input.topology, &tool, operation, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, labels.rungs[0]));
+    }
+    // Two coaxial bodies of revolution combine in their shared section,
+    // exactly, whatever carriers the section builder makes of it.
+    if let Ok(topology) =
+        coaxial_boolean::coaxial_boolean(&input.topology, &tool, operation, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, labels.coaxial));
+    }
+    let decline = if analytic_boolean::operands_in_engine_vocabulary(&input.topology, &tool) {
+        match analytic_boolean::build_analytic_boolean(&input.topology, &tool, operation, precision)
+            .map_err(ExactRouteDecline::from_engine)
+            .and_then(|topology| exact_candidate(topology, precision))
+        {
+            Ok(topology) => return Ok((topology, labels.rungs[1])),
+            Err(decline) => decline,
+        }
+    } else {
+        ExactRouteDecline::Vocabulary
+    };
+    let declined = |mut refusal: KernelError| {
+        for diagnostic in &mut refusal.diagnostics {
+            if diagnostic.code.as_str() == "FACE_FEATURE_FACETED_UNRESOLVED" {
+                diagnostic.code = ProtocolDiagnosticCode::new(labels.unresolved);
+            }
+        }
+        refusal.diagnostics.insert(
+            0,
+            decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Error),
+        );
+        refusal
+    };
+    // The faceted tier works on the body and the tool as tessellated at a
+    // bounded budget, as the face-feature tier does: a dense tessellation is
+    // an unsuitable Boolean operand.
+    let mut boolean_precision = precision;
+    boolean_precision.max_subdivisions = boolean_precision.max_subdivisions.min(4);
+    let scene_of = |topology: &Topology| {
+        let digest = semantic_digest(topology, boolean_precision);
+        NativeKernel::faceted_operand_scene(
+            &Snapshot {
+                id: snapshot_id(digest),
+                semantic_digest: digest,
+                precision: Some(boolean_precision),
+                topology: topology.clone(),
+                measures: SnapshotMeasures::default(),
+            },
+            boolean_precision,
+        )
+    };
+    let topology = faceted_boolean::combine_bodies(
+        &scene_of(&input.topology),
+        &scene_of(&tool),
+        add,
+        precision,
+    )
+    .ok_or_else(|| {
+        declined(error(
+            KernelErrorCode::Unsupported,
+            KernelStage::Construction,
+            input.id,
+            format!("the faceted tier could not combine the {noun} with the body"),
+            vec![simple_diagnostic(
+                labels.unresolved,
+                KernelStage::Construction,
+                &format!(
+                    "The {noun} and the body were rebuilt from their tessellations, but the \
+                     rebuilt shell did not close within the approximation budget."
+                ),
+            )],
+        ))
+    })?;
+    certify_faceted_candidate(input.id, &topology, precision).map_err(declined)?;
+    certify_faceted_change(
+        input.id,
+        &input.topology,
+        &topology,
+        face_operation,
+        precision,
+    )
+    .map_err(declined)?;
+    warnings.push(approximation_warning(
+        labels.approximation,
+        &format!(
+            "The exact Boolean engines do not carry this {noun}'s walls, so the {noun} and the \
+             body were combined from their tessellations. The result's faces, edges and \
+             measures approximate the true solid rather than certifying it. Why the exact route \
+             stood aside is the {} diagnostic beside this one.",
+            labels.declined
+        ),
+    ));
+    warnings.push(decline.diagnostic_coded(labels.declined, DiagnosticSeverity::Warning));
+    Ok((topology, labels.rungs[2]))
+}
+
+/// A spline profile added to or cut from a planar face (ADR 0050): the
+/// profile swept into a tool body standing on the face — below it for a cut,
+/// overshooting the face so no cap lies on its plane, and above it for an
+/// add — and combined with the body through the Boolean ladder. A B-spline
+/// wall is outside the exact engines' vocabulary, so the ladder answers on
+/// its faceted tier, with its label, as it does for a ruled wall.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_feature(
+    input: &Snapshot,
+    target_face: EntityRef,
+    frame: PlanarFrame3,
+    profile: &PlanarProfile2,
+    distance: f64,
+    operation: FaceExtrusionOperation,
+    precision: PrecisionPolicy,
+    warnings: &mut Vec<ProtocolDiagnostic>,
+) -> Result<(Topology, &'static str), KernelError> {
+    let refuse = |reason: FaceFeatureInputError| {
+        planar_profile_input_error(input.id, PlanarProfileInputError::FaceFeature(reason))
+    };
+    if target_face.snapshot != input.id {
+        return Err(refuse(FaceFeatureInputError::TargetSnapshotMismatch));
+    }
+    if target_face.kind != EntityKind::Face {
+        return Err(refuse(FaceFeatureInputError::TargetNotFace));
+    }
+    let target = input
+        .topology
+        .faces
+        .iter()
+        .find(|face| face.id.get() == target_face.entity.0)
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetMissing))?;
+    let plane = target
+        .value
+        .surface
+        .as_plane()
+        .ok_or_else(|| refuse(FaceFeatureInputError::TargetNotPlanar))?;
+    let normal_length = plane.normal.length();
+    if !normal_length.is_finite() || normal_length <= f64::EPSILON {
+        return Err(refuse(FaceFeatureInputError::TargetDegenerate));
+    }
+    let outward = plane.normal / normal_length;
+    let normalized = analytic_extrusion::normalize_frame(frame, precision)
+        .map_err(|reason| planar_profile_input_error(input.id, reason))?;
+    // The sketch lies in the face's plane and faces out of it, as every
+    // face feature's does.
+    let off_plane = (normalized.origin - plane.origin).dot(outward).abs();
+    if normalized.normal.dot(outward) < 1.0 - precision.angular_agreement_radians.max(1.0e-12)
+        || off_plane > precision.modeling_resolution
+    {
+        return Err(refuse(FaceFeatureInputError::FrameOffTargetPlane));
+    }
+    let add = operation == FaceExtrusionOperation::Add;
+    // A cut's tool starts below the face and rises through it; an add's
+    // stands on it.
+    let overshoot = if add {
+        0.0
+    } else {
+        (distance * 0.01).max(precision.min_feature_size * 8.0)
+    };
+    let origin = if add {
+        frame.origin
+    } else {
+        ProtocolPoint3::new(
+            frame.origin.x - outward.x * distance,
+            frame.origin.y - outward.y * distance,
+            frame.origin.z - outward.z * distance,
+        )
+    };
+    let regions = spline_profile::validate_spline_profile_extrusion(
+        PlanarFrame3::new(origin, frame.u, frame.v),
+        profile,
+        distance + overshoot,
+        precision,
+    )
+    .map_err(|reason| spline_profile_error(input.id, reason))?;
+    let tool = spline_profile::build_spline_extrusion(&regions);
+    tool_boolean(input, tool, add, precision, warnings, &SPLINE_FACE_BOOLEAN)
+}
+
+/// The named refusal for a profile with splines.
+fn spline_profile_error(
+    snapshot: SnapshotId,
+    reason: spline_profile::SplineProfileError,
+) -> KernelError {
+    use spline_profile::SplineProfileError;
+    match reason {
+        SplineProfileError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        SplineProfileError::Spline(reason) => bspline_input_error(snapshot, reason),
+        SplineProfileError::Degenerate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_CURVE_DEGENERATE",
+            "a spline in the profile stalls — its rate vanishes at a cusp, or at an end whose \
+             first two control points coincide — so a wall swept from it would have no side to \
+             face there",
+        ),
+        SplineProfileError::Indeterminate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::NumericallyIndeterminate,
+            "BSPLINE_CLEARANCE_INDETERMINATE",
+            "two curves of the profile come so close that subdividing them could not settle \
+             whether they stay the feature floor apart; move them apart or join them",
+        ),
+    }
+}
+
+/// The named refusal for a spline the kernel does not carry.
+fn bspline_input_error(snapshot: SnapshotId, reason: bspline::SplineError) -> KernelError {
+    use bspline::SplineError;
+    match reason {
+        SplineError::Degree => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_DEGREE_UNSUPPORTED",
+            "the kernel carries B-splines of degree one to five; the quadrature its measures use \
+             is exact on every knot span up to degree five",
+        ),
+        SplineError::Rational => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_RATIONAL_UNSUPPORTED",
+            "the spline carries weights that differ, which makes it a rational spline; the \
+             kernel carries non-rational B-splines only (ADR 0050)",
+        ),
+        SplineError::Unclamped => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "BSPLINE_UNCLAMPED_UNSUPPORTED",
+            "the spline's knot vector is not clamped: each end must repeat degree + 1 times, so \
+             the curve starts and ends on its end control points",
+        ),
+        SplineError::Knots => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "BSPLINE_KNOTS_INVALID",
+            "the spline's knot vector does not match its control points: it must have control \
+             points + degree + 1 knots, never falling, with no interior knot repeated more than \
+             the degree",
+        ),
+        SplineError::NonFinite => planar_profile_input_error(
+            snapshot,
+            PlanarProfileInputError::Extrusion(ExtrusionInputError::NonFinite),
+        ),
+    }
 }
 
 /// The edge-finish ladder beyond the six-plane cuboid: each exact rung runs
@@ -3275,12 +4824,45 @@ fn regularized_edge_finish(
         ) => {}
     }
 
+    // The rim of a hole through any wall: a torus or cone band built in
+    // place between the grown hole and the sunk bore ring, one closed edge
+    // with no corners to close.
+    match hole_rim_blend::build_hole_rim_blend(
+        input.id,
+        &input.topology,
+        targets,
+        kind,
+        distance,
+        precision,
+    ) {
+        Ok(topology)
+            if validator::validate(&topology, precision.linear_agreement)
+                .diagnostics
+                .is_empty() =>
+        {
+            return Ok((topology, "edge-finish/hole-rim-blend"));
+        }
+        Ok(_) => {}
+        Err(hole_rim_blend::HoleRimBlendError::DistanceInvalid) => {
+            return Err(simple_invalid_input(
+                input.id,
+                "HOLE_RIM_DISTANCE_INVALID",
+                "The rim finish must fit within the wall around the hole and the depth of the bore.",
+            ));
+        }
+        Err(
+            hole_rim_blend::HoleRimBlendError::TargetInvalid
+            | hole_rim_blend::HoleRimBlendError::DomainUnsupported,
+        ) => {}
+    }
+
     // The last exact rung: convex edges between planar faces, with a sphere or
     // a triangle closing every corner the selection completes. Its refusals
     // are its own, and a refusal it is certain of stops the ladder rather than
     // spending the faceted tier's seconds to reach the same answer with a
     // vaguer sentence.
     let mut owned_refusal = None;
+    let mut declined_silently = false;
     match vertex_blend::build_vertex_blend(
         input.id,
         &input.topology,
@@ -3290,13 +4872,36 @@ fn regularized_edge_finish(
         precision,
     ) {
         Ok(topology) => return Ok((topology, "edge-finish/vertex-blend")),
-        Err(vertex_blend::VertexBlendError::DomainUnsupported) => {}
+        Err(vertex_blend::VertexBlendError::DomainUnsupported) => declined_silently = true,
         Err(vertex_blend::VertexBlendError::Refused(refusal)) => {
             if refusal.certain {
                 return Err(vertex_blend_error(input.id, &refusal));
             }
             owned_refusal = Some(refusal);
         }
+    }
+
+    // A corner the owned blend cannot write — two edges meeting where the
+    // faces lean, as at the apex of a gable — is still exact as the shape
+    // ADR 0044 made for a finish standing apart: each edge's removal cut
+    // from the body as it is, the bands meeting along whatever seam the
+    // general engine finds. Where the owned blend would have answered, the
+    // two shapes coincide, so this is the same finish by another route
+    // rather than a different finish; and it is exact, which the tier below
+    // is not. It is taken only where the owned blend had nothing to say: a
+    // refusal it *named* — a corner an earlier feature finished, which ADR
+    // 0044 answers with a question — stands. And it is taken only where the
+    // removal tools' oversize runs out into air rather than on into
+    // material, which a pocket's rim does not.
+    if declined_silently
+        && edge_finish_apart::edges_run_out_of_the_body(&input.topology, targets, distance)
+        && let Ok(topology) =
+            edge_finish_apart::build_edge_finishes_apart(input, targets, kind, distance, precision)
+        && validator::validate(&topology, precision.linear_agreement)
+            .diagnostics
+            .is_empty()
+    {
+        return Ok((topology, "edge-finish/standing-apart"));
     }
 
     let scene = NativeKernel::authoritative_scene(input);
@@ -3553,9 +5158,24 @@ fn resolve_measure_entity(
 /// presentation budget. Reusing the kernel budget (10 nm by default) for
 /// display would emit thousands of segments per circle on palm-sized turned
 /// parts and drown the interactive viewport.
+/// The chord tolerance the faceted Boolean tier samples a B-spline of this
+/// size at (`ChordBudget::FacetedOperand`).
+pub(crate) fn faceted_spline_tolerance(size: f64, precision: PrecisionPolicy) -> f64 {
+    ChordBudget::FacetedOperand.spline_tolerance(size.max(precision.min_feature_size), precision)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ChordBudget {
     Authoritative,
+    /// The operands of a faceted Boolean. Arcs and ruled walls are sampled
+    /// as `Authoritative`, under the subdivision cap the tier sets, which
+    /// leaves a half-turn face at 16 chords, some 0.005 of its radius off.
+    /// A B-spline has no such cap on the whole face, only on each knot span,
+    /// so a skinned wall of a hundred spans sampled at the kernel budget
+    /// runs to hundreds of thousands of facets, far past what the tier can
+    /// split. It is sampled at the display chord tolerance instead, the
+    /// same few thousandths the tier's arcs are left at.
+    FacetedOperand,
     Display,
     /// Display sampling additionally coarsened for bodies that project small
     /// on screen. The multiplier is clamped, and `arc_subdivisions` keeps its
@@ -3573,7 +5193,7 @@ impl ChordBudget {
         // chords per full circle) while bounding density for large parts.
         let display = (radius * 4.0e-4).clamp(5.0e-3, 0.1).max(authoritative);
         let tolerance = match self {
-            Self::Authoritative => authoritative,
+            Self::Authoritative | Self::FacetedOperand => authoritative,
             Self::Display => display,
             Self::DisplayScaled(scale) => {
                 if scale < 1.0 {
@@ -3584,6 +5204,14 @@ impl ChordBudget {
             }
         };
         tolerance.min(radius)
+    }
+
+    /// The chord tolerance for a B-spline of this size.
+    pub(crate) fn spline_tolerance(self, size: f64, precision: PrecisionPolicy) -> f64 {
+        match self {
+            Self::FacetedOperand => Self::Display.tolerance(size, precision),
+            _ => self.tolerance(size, precision),
+        }
     }
 }
 
@@ -3684,6 +5312,16 @@ fn chord_deviations(
             Curve3::Circle { radius, .. } => sagitta(radius, sweep),
             // The semi-major axis bounds the sagitta of every chord.
             Curve3::Ellipse { major_radius, .. } => sagitta(major_radius, sweep),
+            // A trace bends no more tightly than the tighter of the two
+            // cylinders it runs on, so their smaller radius bounds its
+            // sagitta the way a semi-major axis bounds an ellipse's.
+            Curve3::Trace { host, other, .. } => {
+                sagitta(host.radius.abs().min(other.radius.abs()), sweep)
+            }
+            // The tessellator's own figure for a B-spline edge.
+            Curve3::Bspline { curve } => {
+                spline_curve_deviation(curve, edge.parameter_range, budget, precision)
+            }
         }
     };
     topology
@@ -3716,6 +5354,14 @@ fn chord_deviations(
                 (Surface::Torus(torus), Some((u_min, u_max, v_min, v_max))) => {
                     sagitta(torus.major_radius + torus.minor_radius, u_max - u_min)
                         + sagitta(torus.minor_radius, v_max - v_min)
+                }
+                // The tessellator's own figure: the rails' sagitta plus the
+                // twist a quad of the band can stand off its two triangles.
+                (Surface::Ruled(ruled), Some(domain)) => {
+                    ruled_columns(ruled, domain, budget, precision).1
+                }
+                (Surface::Bspline(surface), Some(domain)) => {
+                    spline_surface_deviation(topology, face, surface, domain, budget, precision)
                 }
             };
             let rim = face
@@ -3762,6 +5408,13 @@ fn sampled_edge_segments(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 2]> {
+    if let Curve3::Bspline { curve } = edge.curve {
+        let samples = spline_curve_samples(curve, edge.parameter_range, budget, precision);
+        return samples
+            .windows(2)
+            .map(|pair| [curve.point(pair[0]), curve.point(pair[1])])
+            .collect();
+    }
     let subdivisions = match edge.curve {
         Curve3::Line { .. } => 1,
         Curve3::Circle { radius, .. } => arc_subdivisions(
@@ -3777,6 +5430,13 @@ fn sampled_edge_segments(
             budget,
             precision,
         ),
+        Curve3::Trace { host, other, .. } => arc_subdivisions(
+            host.radius.abs().min(other.radius.abs()),
+            edge.parameter_range.end - edge.parameter_range.start,
+            budget,
+            precision,
+        ),
+        Curve3::Bspline { .. } => unreachable!("sampled above"),
     };
     (0..subdivisions)
         .map(|index| {
@@ -3839,6 +5499,21 @@ fn sampled_loop_polygon(
         let coedge = topology.coedge(*coedge_key)?.value;
         let edge = topology.edge(coedge.edge)?.value;
         let range = edge.parameter_range;
+        // A B-spline edge is walked at the parameters its own chords end on,
+        // the same list the edge tessellation takes, forwards or backwards.
+        if let Curve3::Bspline { curve } = edge.curve {
+            let samples = spline_curve_samples(curve, range, budget, precision);
+            let last = samples.len() - 1;
+            match coedge.orientation {
+                Orientation::Forward => {
+                    polygon.extend(samples[..last].iter().map(|t| curve.point(*t)));
+                }
+                Orientation::Reverse => {
+                    polygon.extend(samples[1..].iter().rev().map(|t| curve.point(*t)));
+                }
+            }
+            continue;
+        }
         let subdivisions = match edge.curve {
             Curve3::Line { .. } => 1,
             Curve3::Circle { radius, .. } => {
@@ -3847,6 +5522,13 @@ fn sampled_loop_polygon(
             Curve3::Ellipse { major_radius, .. } => {
                 arc_subdivisions(major_radius, range.end - range.start, budget, precision)
             }
+            Curve3::Trace { host, other, .. } => arc_subdivisions(
+                host.radius.abs().min(other.radius.abs()),
+                range.end - range.start,
+                budget,
+                precision,
+            ),
+            Curve3::Bspline { .. } => unreachable!("walked above"),
         };
         // Sample in the edge's own forward parameterization and reverse the
         // resulting points, rather than reversing the interval and sampling
@@ -3942,6 +5624,9 @@ fn face_frame_loop_curves(
                     end,
                 }
             }
+            // Nor for a trace, which is not planar at all, nor yet for a
+            // B-spline.
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => return None,
         };
         if curve.is_finite() {
             curves.push(curve);
@@ -4193,6 +5878,18 @@ fn tessellate_sphere_face(
     triangles
 }
 
+/// Area of a ruled face over its rectangular parameter domain, by the same
+/// quadrature the body's measures use (ADR 0049).
+fn ruled_face_area(
+    topology: &Topology,
+    face: &topology::Face,
+    ruled: ruled::RuledSurface,
+) -> Option<f64> {
+    let domain = face_parameter_bounds(topology, face)?;
+    let area = ruled.measures(domain, ruled.rails[0].point(0.0)).area;
+    area.is_finite().then_some(area)
+}
+
 /// Exact lateral area of a cone-frustum face from its rectangular p-curve
 /// bounds: `A = sqrt(1 + slope^2) * sweep * mean_ring_radius * dv`.
 fn cone_face_area(topology: &Topology, face: &topology::Face, cone: topology::Cone) -> Option<f64> {
@@ -4267,6 +5964,428 @@ fn tessellate_cone_face(
         let d = cone.evaluate(topology::Point2::new(u0, v_max));
         triangles.push([a, b, c]);
         triangles.push([a, c, d]);
+    }
+    triangles
+}
+
+/// How many columns a ruled face's display strip needs, and how far those
+/// facets can then sit from the face.
+///
+/// A ruled face is tessellated as one band of quads between its rails, like
+/// a cone's: its rungs are straight, so nothing is lost along `v`. Across
+/// `u` two things bend it away from its chords. A rail that is an arc sags
+/// from its chord, as any arc does. And a wall whose two rails do not run
+/// parallel is twisted: a quad of it spanning `du` is a hyperbolic
+/// paraboloid, which stands off the two triangles of its corners by at most
+/// a quarter of the twist `∂²S/∂u∂v` — its part across the wall, the part
+/// along it moves nothing off the wall — times `du`. The column count covers
+/// both, and is a multiple of each rail's own edge chord count, so the
+/// face's samples along a rail are the edge's own samples or lie between
+/// them.
+fn ruled_columns(
+    ruled: ruled::RuledSurface,
+    domain: (f64, f64, f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> (usize, f64) {
+    let (u_min, u_max, _, _) = domain;
+    let fraction = (u_max - u_min).abs();
+    let maximum = 1_usize << precision.max_subdivisions.min(12);
+    let mut base = 1_usize;
+    let mut bends = Vec::new();
+    for rail in ruled.rails {
+        if let Some(radius) = rail.curve.bending_radius() {
+            let sweep = rail.sweep() * fraction;
+            let count = arc_subdivisions(radius.abs(), sweep, budget, precision);
+            base = least_common_multiple(base, count).min(maximum);
+            bends.push((radius.abs(), sweep));
+        }
+    }
+    let twist = (0..=16)
+        .map(|index| {
+            let u = (u_max - u_min).mul_add(f64::from(index) / 16.0, u_min);
+            let twist = ruled.rails[1].rate(u) - ruled.rails[0].rate(u);
+            [0.0, 0.5, 1.0]
+                .into_iter()
+                .map(|v| {
+                    ruled
+                        .unit_normal(topology::Point2::new(u, v))
+                        .map_or(twist.length(), |normal| twist.dot(normal).abs())
+                })
+                .fold(0.0_f64, f64::max)
+        })
+        .fold(0.0_f64, f64::max);
+    let tolerance = budget.tolerance(ruled.scale().max(precision.min_feature_size), precision);
+    let needed = (twist * fraction / (4.0 * tolerance)).ceil();
+    let columns = if needed.is_finite() && needed > base as f64 {
+        let multiple = (needed / base as f64).ceil() as usize;
+        base.saturating_mul(multiple).min(maximum).max(base)
+    } else {
+        base
+    };
+    let columns = columns.max(1);
+    let deviation = bends
+        .iter()
+        .map(|(radius, sweep)| chord_sagitta(*radius, sweep / columns as f64))
+        .fold(0.0_f64, f64::max)
+        + twist * fraction / (4.0 * columns as f64);
+    (columns, deviation)
+}
+
+fn least_common_multiple(first: usize, second: usize) -> usize {
+    let (mut a, mut b) = (first.max(1), second.max(1));
+    let product = a.saturating_mul(b);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    product / a
+}
+
+/// One band of quads between a ruled face's rails, each vertex with the
+/// surface's own normal at its parameters.
+fn tessellate_ruled_face(
+    topology: &Topology,
+    face: &topology::Face,
+    ruled: ruled::RuledSurface,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<([Point3; 3], [Vector3; 3])> {
+    let Some(domain) = face_parameter_bounds(topology, face) else {
+        return Vec::new();
+    };
+    let (u_min, u_max, v_min, v_max) = domain;
+    // A loop walked clockwise in the parameters faces the other way.
+    let flipped = validator::face_parameter_area_and_moment(topology, face)
+        .is_some_and(|(area, _)| area < 0.0);
+    let (columns, _) = ruled_columns(ruled, domain, budget, precision);
+    let sample = |u: f64, v: f64| {
+        let parameters = topology::Point2::new(u, v);
+        let normal = ruled
+            .unit_normal(parameters)
+            .map(|normal| if flipped { normal * -1.0 } else { normal });
+        (ruled.evaluate(parameters), normal)
+    };
+    let mut triangles = Vec::with_capacity(columns * 2);
+    let mut low = sample(u_min, v_min);
+    let mut high = sample(u_min, v_max);
+    for column in 0..columns {
+        let u = (u_max - u_min).mul_add((column + 1) as f64 / columns as f64, u_min);
+        let next_low = sample(u, v_min);
+        let next_high = sample(u, v_max);
+        let quad = [low, next_low, next_high, high];
+        for corners in [[0, 1, 2], [0, 2, 3]] {
+            let mut vertices = corners.map(|corner| quad[corner].0);
+            if flipped {
+                vertices.swap(1, 2);
+            }
+            let facet = facet_normal(vertices);
+            let mut normals = corners.map(|corner| quad[corner].1.unwrap_or(facet));
+            if flipped {
+                normals.swap(1, 2);
+            }
+            triangles.push((vertices, normals));
+        }
+        low = next_low;
+        high = next_high;
+    }
+    triangles
+}
+
+/// Area of a B-spline face over its rectangular parameter domain, by the
+/// same quadrature the body's measures use (ADR 0050).
+fn spline_face_area(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+) -> Option<f64> {
+    let domain = face_parameter_bounds(topology, face)?;
+    let area = surface
+        .measures(domain, bspline::point3(surface.points()[0]))
+        .area;
+    area.is_finite().then_some(area)
+}
+
+/// The most steps any one knot span is cut into by the tessellators.
+fn spline_steps_per_span(precision: PrecisionPolicy) -> usize {
+    1_usize << precision.max_subdivisions.min(8)
+}
+
+/// The parameters a B-spline edge is tessellated at, from the start of its
+/// range to the end: every knot, and between knots the power of two of
+/// equal steps the span's second-derivative bound asks for.
+fn spline_curve_samples(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance =
+        budget.spline_tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve.samples(
+        range.start,
+        range.end,
+        tolerance,
+        spline_steps_per_span(precision),
+    )
+}
+
+/// How far the chords of a B-spline edge can sit from it: on each span, its
+/// second-derivative bound times the square of the step, over eight.
+fn spline_curve_deviation(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let tolerance =
+        budget.spline_tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve
+        .spans(range.start, range.end)
+        .into_iter()
+        .map(|(low, high)| {
+            let bound = curve.curvature_bound(low, high);
+            let steps = bspline::span_steps(
+                bound,
+                high - low,
+                tolerance,
+                spline_steps_per_span(precision),
+            );
+            let step = (high - low) / steps as f64;
+            bound * step * step / 8.0
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The parameters along one direction of a B-spline face: the surface's own
+/// sampling of every span, merged with every parameter the face's boundary
+/// edges along that direction are sampled at, so each edge's chords end on
+/// vertices of the face. Both samplings cut a span into a power of two of
+/// equal steps from the same two knots, so where they meet they meet to the
+/// bit.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_samples(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    direction: usize,
+    (from, to): (f64, f64),
+    (across_from, across_to): (f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance =
+        budget.spline_tolerance(surface.scale().max(precision.min_feature_size), precision);
+    let most = spline_steps_per_span(precision);
+    let mut samples = vec![from];
+    for span in surface.spans(direction, from, to) {
+        // The surface bends along this direction by its second derivative,
+        // and a cell's twist bends its two triangles off it too.
+        let bound = surface
+            .spans(1 - direction, across_from, across_to)
+            .into_iter()
+            .map(|across| {
+                let (u_span, v_span) = if direction == 0 {
+                    (span, across)
+                } else {
+                    (across, span)
+                };
+                let [along_u, along_v, twist] = surface.curvature_bounds(u_span, v_span);
+                let along = if direction == 0 { along_u } else { along_v };
+                along + twist * (across.1 - across.0)
+            })
+            .fold(0.0, f64::max);
+        let steps = bspline::span_steps(bound, span.1 - span.0, tolerance, most);
+        for step in 1..=steps {
+            samples.push(if step == steps {
+                span.1
+            } else {
+                (span.1 - span.0).mul_add(step as f64 / steps as f64, span.0)
+            });
+        }
+    }
+    // Every boundary edge along this direction whose curve is a B-spline,
+    // read into the surface's parameter through the pcurve's affine map.
+    for loop_key in face.loops() {
+        let Some(loop_record) = topology.loop_record(loop_key) else {
+            continue;
+        };
+        for coedge_key in &loop_record.value.coedges {
+            let Some(coedge) = topology.coedge(*coedge_key) else {
+                continue;
+            };
+            let Some(edge) = topology.edge(coedge.value.edge) else {
+                continue;
+            };
+            let Curve3::Bspline { curve } = edge.value.curve else {
+                continue;
+            };
+            let [start, end] = coedge.value.pcurve_endpoints();
+            let fixed = if direction == 0 {
+                start.y == end.y
+            } else {
+                start.x == end.x
+            };
+            if !fixed {
+                continue;
+            }
+            let (first, last) = match coedge.value.orientation {
+                Orientation::Forward => (start, end),
+                Orientation::Reverse => (end, start),
+            };
+            let (first, last) = if direction == 0 {
+                (first.x, last.x)
+            } else {
+                (first.y, last.y)
+            };
+            let range = edge.value.parameter_range;
+            let width = range.end - range.start;
+            if width == 0.0 {
+                continue;
+            }
+            let alpha = (last - first) / width;
+            let beta = alpha.mul_add(-range.start, first);
+            for t in spline_curve_samples(curve, range, budget, precision) {
+                // Exact when the edge's parameter is the surface's, or its
+                // negation after a mirror.
+                samples.push(if alpha == 1.0 && beta == 0.0 {
+                    t
+                } else if alpha == -1.0 && beta == 0.0 {
+                    -t
+                } else {
+                    alpha.mul_add(t, beta)
+                });
+            }
+        }
+    }
+    samples.retain(|sample| *sample >= from && *sample <= to);
+    samples.sort_by(f64::total_cmp);
+    let floor = 1.0e-12 * (to - from).abs();
+    samples.dedup_by(|second, first| (*second - *first).abs() <= floor);
+    samples
+}
+
+/// How far the facets of a B-spline face can sit from it: over every span
+/// cell, the bilinear interpolation error of a cell of its steps,
+/// `(|S_uu|·du² + 2|S_uv|·du·dv + |S_vv|·dv²)/8`.
+fn spline_surface_deviation(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    domain: (f64, f64, f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let (u_min, u_max, v_min, v_max) = domain;
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let widest = |samples: &[f64], low: f64, high: f64| {
+        samples
+            .windows(2)
+            .filter(|pair| pair[0] >= low && pair[1] <= high)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0, f64::max)
+    };
+    let mut worst = 0.0_f64;
+    for u_span in surface.spans(0, u_min, u_max) {
+        let du = widest(&us, u_span.0, u_span.1);
+        for v_span in surface.spans(1, v_min, v_max) {
+            let dv = widest(&vs, v_span.0, v_span.1);
+            let [uu, vv, uv] = surface.curvature_bounds(u_span, v_span);
+            worst = worst.max((uu * du * du + 2.0 * uv * du * dv + vv * dv * dv) / 8.0);
+        }
+    }
+    worst
+}
+
+/// A grid of quads over a B-spline face's parameter rectangle, each vertex
+/// with the surface's own normal at its parameters.
+fn tessellate_spline_face(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<([Point3; 3], [Vector3; 3])> {
+    let Some((u_min, u_max, v_min, v_max)) = face_parameter_bounds(topology, face) else {
+        return Vec::new();
+    };
+    // A loop walked clockwise in the parameters faces the other way.
+    let flipped = validator::face_parameter_area_and_moment(topology, face)
+        .is_some_and(|(area, _)| area < 0.0);
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let grid = us
+        .iter()
+        .map(|u| {
+            vs.iter()
+                .map(|v| {
+                    let parameters = topology::Point2::new(*u, *v);
+                    let normal = surface
+                        .unit_normal(parameters)
+                        .map(|normal| if flipped { normal * -1.0 } else { normal });
+                    (surface.evaluate(parameters), normal)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(2 * us.len() * vs.len());
+    for i in 0..us.len().saturating_sub(1) {
+        for j in 0..vs.len().saturating_sub(1) {
+            let quad = [
+                grid[i][j],
+                grid[i + 1][j],
+                grid[i + 1][j + 1],
+                grid[i][j + 1],
+            ];
+            for corners in [[0, 1, 2], [0, 2, 3]] {
+                let mut vertices = corners.map(|corner| quad[corner].0);
+                if flipped {
+                    vertices.swap(1, 2);
+                }
+                let facet = facet_normal(vertices);
+                let mut normals = corners.map(|corner| quad[corner].1.unwrap_or(facet));
+                if flipped {
+                    normals.swap(1, 2);
+                }
+                triangles.push((vertices, normals));
+            }
+        }
     }
     triangles
 }
@@ -4389,6 +6508,43 @@ fn tessellate_harmonic_cylinder_face(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Bspline { .. } => return None,
+                Curve2::Trace { .. } => {
+                    // Where the piece crosses this azimuth. On the face that
+                    // holds the parameter the abscissa is the parameter and
+                    // the crossing is direct; on the other it is not, so the
+                    // crossings are bracketed on a sampling and bisected.
+                    const SAMPLES: usize = 96;
+                    let at = |fraction: f64| {
+                        coedge
+                            .pcurve
+                            .evaluate((range.end - range.start).mul_add(fraction, range.start))
+                    };
+                    let mut previous = at(0.0);
+                    if (previous.x - theta).abs() <= tolerance {
+                        note(previous.y);
+                    }
+                    for step in 1..=SAMPLES {
+                        let fraction = step as f64 / SAMPLES as f64;
+                        let current = at(fraction);
+                        if (previous.x - theta) * (current.x - theta) < 0.0 {
+                            let (mut low, mut high) = ((fraction - 1.0 / SAMPLES as f64), fraction);
+                            let below = previous.x < theta;
+                            for _ in 0..60 {
+                                let middle = 0.5 * (low + high);
+                                if (at(middle).x < theta) == below {
+                                    low = middle;
+                                } else {
+                                    high = middle;
+                                }
+                            }
+                            note(at(0.5 * (low + high)).y);
+                        } else if (current.x - theta).abs() <= tolerance {
+                            note(current.y);
+                        }
+                        previous = current;
+                    }
+                }
             }
         }
         (low.is_finite() && high.is_finite() && high >= low).then_some((low, high))
@@ -5319,6 +7475,73 @@ fn loft_input_error(snapshot: SnapshotId, reason: loft::LoftInputError) -> Kerne
     }
 }
 
+fn loft_sections_error(
+    snapshot: SnapshotId,
+    reason: loft_sections::LoftSectionsError,
+) -> KernelError {
+    use loft_sections::LoftSectionsError;
+    match reason {
+        LoftSectionsError::Profile(reason) => planar_profile_input_error(snapshot, reason),
+        LoftSectionsError::TooFewSections => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_TOO_FEW_SECTIONS",
+            "a loft needs at least two sections",
+        ),
+        LoftSectionsError::RegionCount => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTION_REGIONS_UNSUPPORTED",
+            "each loft section must be exactly one region: one outer loop, with any holes \
+             inside it",
+        ),
+        LoftSectionsError::Spline(reason) => spline_profile_error(snapshot, reason),
+        LoftSectionsError::Coplanar => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTIONS_COPLANAR",
+            "the two sections lie on one plane, so there is nothing between them to loft",
+        ),
+        LoftSectionsError::CrossesPlane => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SECTION_CROSSES_PLANE",
+            "a section reaches onto or through the other section's plane, so the loft would \
+             fold through itself; each section must lie wholly beyond the other's plane",
+        ),
+        LoftSectionsError::HoleCountMismatch => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "LOFT_HOLE_COUNT_MISMATCH",
+            "the two sections have different numbers of holes; a loft pairs each hole with one \
+             hole of the other section",
+        ),
+        LoftSectionsError::RungsCross => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_RUNGS_CROSS",
+            "the straight rungs between the sections cross, or the walls between them do, so \
+             the loft would pass through itself. Turn or redraw a section so its corners line \
+             up with the other's.",
+        ),
+        LoftSectionsError::WallDegenerate => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_WALL_DEGENERATE",
+            "a wall between the sections pinches to a point or folds flat: somewhere its rung \
+             runs along its rails, and a wall there has no side to face",
+        ),
+        LoftSectionsError::SkinFolds => planar_profile_error(
+            snapshot,
+            KernelErrorCode::InvalidInput,
+            "LOFT_SKIN_FOLDS",
+            "the smooth surface through the sections turns back on itself between two of them: \
+             somewhere it runs against the direction the sections are stacked in. Space the \
+             sections more evenly, or loft them two at a time.",
+        ),
+    }
+}
+
 fn planar_profile_input_error(
     snapshot: SnapshotId,
     reason: PlanarProfileInputError,
@@ -5368,6 +7591,14 @@ fn planar_profile_input_error(
             "PLANAR_PROFILE_ANALYTIC_ROUTE_REQUIRED",
             "the profile contains analytic curves that require the native analytic extrusion path",
         ),
+        PlanarProfileInputError::SplineCurve => planar_profile_error(
+            snapshot,
+            KernelErrorCode::Unsupported,
+            "PLANAR_PROFILE_SPLINE_UNSUPPORTED",
+            "the profile carries a B-spline curve, and this operation does not: a spline profile \
+             can be extruded, added or cut on a face, and lofted (ADR 0050), but not revolved \
+             or drafted",
+        ),
         PlanarProfileInputError::OverlappingRegions => planar_profile_error(
             snapshot,
             KernelErrorCode::InvalidInput,
@@ -5402,14 +7633,97 @@ fn planar_profile_error(
     )
 }
 
+fn sweep_input_error(snapshot: SnapshotId, reason: sweep_profile::SweepInputError) -> KernelError {
+    use sweep_profile::SweepInputError;
+    let (diagnostic, message) = match reason {
+        SweepInputError::Profile(reason) => return planar_profile_input_error(snapshot, reason),
+        SweepInputError::Loft(reason) => return loft_sections_error(snapshot, reason),
+        SweepInputError::PathEmpty => (
+            "SWEEP_PATH_EMPTY".to_owned(),
+            "A sweep needs a path of at least one segment.".to_owned(),
+        ),
+        SweepInputError::PathInvalid { segment } => (
+            "SWEEP_PATH_INVALID".to_owned(),
+            format!(
+                "Path segment {segment} is not finite, has no length, or is not a sound arc or clamped spline."
+            ),
+        ),
+        SweepInputError::PathGap { segment } => (
+            "SWEEP_PATH_GAP".to_owned(),
+            format!("Path segment {segment} does not begin where the one before it ends."),
+        ),
+        SweepInputError::PathCorner { segment } => (
+            "SWEEP_PATH_CORNER".to_owned(),
+            format!(
+                "The path turns a corner where segment {segment} begins; a sweep's path must be tangent where its segments meet."
+            ),
+        ),
+        SweepInputError::PathClosed => (
+            "SWEEP_PATH_CLOSED".to_owned(),
+            "The path ends where it begins; a sweep along a closed path is not supported yet.".to_owned(),
+        ),
+        SweepInputError::ProfileAlongPath => (
+            "SWEEP_PROFILE_ALONG_PATH".to_owned(),
+            "The path starts along the profile's own plane, so the profile would be swept edge-on.".to_owned(),
+        ),
+        SweepInputError::ProfileTooWide => (
+            "SWEEP_PROFILE_TOO_WIDE".to_owned(),
+            "The profile reaches past the path's centre of curvature where the path bends most tightly, so the swept wall would fold through itself.".to_owned(),
+        ),
+        SweepInputError::ToleranceUnmet {
+            deviation,
+            tolerance,
+        } => (
+            "SWEEP_TOLERANCE_UNMET".to_owned(),
+            format!(
+                "Even the most copies of the profile left the skinned sweep {deviation:.3e} from the true sweep, beyond the approximation budget of {tolerance:.3e}."
+            ),
+        ),
+    };
+    error(
+        KernelErrorCode::Unsupported,
+        KernelStage::Preflight,
+        snapshot,
+        "the sweep's profile and path leave the certified domain",
+        vec![simple_diagnostic(
+            &diagnostic,
+            KernelStage::Preflight,
+            &message,
+        )],
+    )
+}
+
+/// A skinned sweep is published with the departure from the true sweep it
+/// met, and the budget it was held to (ADR 0055).
+fn sweep_approximation_warning(approximation: sweep_profile::Approximation) -> ProtocolDiagnostic {
+    let mut warning = approximation_warning(
+        "SWEEP_APPROXIMATION_TOLERANCE",
+        &format!(
+            "The sweep is skinned through {} copies of the profile along the path. Its walls \
+             pass through every copy exactly and are within {:.3e} of the true sweep between \
+             them, inside the approximation budget of {:.3e}.",
+            approximation.sections, approximation.deviation, approximation.tolerance
+        ),
+    );
+    warning.measurement = Some(DiagnosticMeasurement {
+        quantity: QuantityKind::Length,
+        measured: approximation.deviation,
+        allowed: NumericInterval {
+            min: None,
+            max: Some(approximation.tolerance),
+        },
+    });
+    warning
+}
+
 fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError) -> KernelError {
     let (diagnostic, message) = match reason {
         revolve::RevolveInputError::Profile(reason) => {
             return planar_profile_input_error(snapshot, reason);
         }
-        revolve::RevolveInputError::SingleRegionOnly => (
-            "REVOLVE_SINGLE_REGION_ONLY",
-            "A revolve sweeps exactly one material region without holes; a hole would sweep a cavity of revolution, which needs a Boolean rather than a section chain.",
+        revolve::RevolveInputError::HoleOnAxis => (
+            "REVOLVE_HOLE_ON_AXIS",
+            "A hole in the profile reaches the axis. A hole sweeps a cavity, or a channel through a partial revolve, only while it stays clear of the axis all the way round.",
         ),
         revolve::RevolveInputError::DegenerateAxis => (
             "REVOLVE_AXIS_DEGENERATE",
@@ -5419,13 +7733,13 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
             "REVOLVE_PROFILE_CROSSES_AXIS",
             "The profile has material on both sides of the axis; the sweep would pass through itself.",
         ),
-        revolve::RevolveInputError::ObliqueAxisContact => (
-            "REVOLVE_OBLIQUE_AXIS_CONTACT",
-            "A straight profile segment meets the axis obliquely. It would sweep a cone apex, which is a singular point rather than a pole, and stays outside the certified domain.",
-        ),
         revolve::RevolveInputError::SectionNotContiguous => (
             "REVOLVE_SECTION_NOT_CONTIGUOUS",
             "The profile does not form one contiguous section: it must close on itself clear of the axis, or begin and end on the axis.",
+        ),
+        revolve::RevolveInputError::AngleInvalid => (
+            "REVOLVE_ANGLE_INVALID",
+            "A partial revolve turns through more than nothing and less than a full turn, from a start within one turn, and both the turn and the gap it leaves must be wider than the minimum feature at the profile's outermost radius; use a full turn to close the gap.",
         ),
     };
     error(
@@ -5601,6 +7915,8 @@ fn validate_transform_candidate(
                 Surface::Torus(torus) => torus.origin,
                 Surface::Cone(cone) => cone.origin,
                 Surface::Sphere(sphere) => sphere.origin,
+                Surface::Ruled(ruled) => ruled.rails[0].point(0.0),
+                Surface::Bspline(surface) => bspline::point3(surface.points()[0]),
             };
             [point.x, point.y, point.z]
         }))
@@ -5644,6 +7960,26 @@ fn validate_transform_candidate(
                 center.x.abs() + major_radius + minor_radius,
                 center.y.abs() + major_radius + minor_radius,
             ],
+            // The two carriers and the branch are what make this curve the
+            // one it is, so they are what the digest sees.
+            Curve2::Trace {
+                host,
+                other,
+                branch,
+                ..
+            } => vec![
+                host.radius.abs() + other.radius.abs(),
+                host.origin.x.abs() + host.origin.y.abs() + host.origin.z.abs(),
+                other.origin.x.abs() + other.origin.y.abs() + other.origin.z.abs(),
+                branch,
+            ],
+            // The control polygon holds the curve, so its reach is the
+            // curve's.
+            Curve2::Bspline { curve } => curve
+                .points()
+                .iter()
+                .flat_map(|point| [point[0].abs(), point[1].abs()])
+                .collect(),
         };
         endpoints.into_iter().chain(carrier)
     });
@@ -5675,6 +8011,7 @@ fn validate_transform_candidate(
                 endpoints[0].distance(endpoints[1])
             }
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => edge.value.length(),
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => edge.value.length(),
         };
         shortest = shortest.min(represented);
     }
@@ -5717,6 +8054,7 @@ fn validate_transform_candidate(
                     endpoints[0].distance(endpoints[1])
                 }
                 Curve3::Circle { .. } | Curve3::Ellipse { .. } => after.value.length(),
+                Curve3::Trace { .. } | Curve3::Bspline { .. } => after.value.length(),
             };
             (represented - expected).abs()
         })
@@ -7428,6 +9766,14 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             hash_f64(&mut hasher, edge.value.parameter_range.start);
             hash_f64(&mut hasher, edge.value.parameter_range.end);
         }
+        // The content of the spline, never the handle to it: the handle's
+        // address depends on the order splines were made in.
+        if let Curve3::Bspline { curve } = edge.value.curve {
+            hasher.update(b"bspline-curve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
+            hash_f64(&mut hasher, edge.value.parameter_range.start);
+            hash_f64(&mut hasher, edge.value.parameter_range.end);
+        }
     }
     hash_collection_header(&mut hasher, b"coedges", topology.coedges.len());
     for coedge in &topology.coedges {
@@ -7489,6 +9835,12 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             ] {
                 hash_f64(&mut hasher, value);
             }
+            hash_f64(&mut hasher, coedge.value.parameter_range.start);
+            hash_f64(&mut hasher, coedge.value.parameter_range.end);
+        }
+        if let Curve2::Bspline { curve } = coedge.value.pcurve {
+            hasher.update(b"bspline-pcurve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
             hash_f64(&mut hasher, coedge.value.parameter_range.start);
             hash_f64(&mut hasher, coedge.value.parameter_range.end);
         }
@@ -7559,6 +9911,75 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
                 hash_f64(&mut hasher, cone.slope);
                 hash_f64(&mut hasher, cone.angular_sign);
             }
+            Surface::Ruled(ruled) => {
+                hasher.update(b"ruled-surface-v0");
+                for rail in ruled.rails {
+                    match rail.curve {
+                        ruled::RailCurve::Line { endpoints } => {
+                            hasher.update(b"line-rail");
+                            hash_point(&mut hasher, endpoints[0]);
+                            hash_point(&mut hasher, endpoints[1]);
+                        }
+                        ruled::RailCurve::Circle {
+                            center,
+                            u,
+                            v,
+                            radius,
+                        } => {
+                            hasher.update(b"circle-rail");
+                            hash_point(&mut hasher, center);
+                            for vector in [u, v] {
+                                hash_f64(&mut hasher, vector.x);
+                                hash_f64(&mut hasher, vector.y);
+                                hash_f64(&mut hasher, vector.z);
+                            }
+                            hash_f64(&mut hasher, radius);
+                        }
+                        ruled::RailCurve::Ellipse {
+                            center,
+                            u,
+                            v,
+                            major_radius,
+                            minor_radius,
+                        } => {
+                            hasher.update(b"ellipse-rail");
+                            hash_point(&mut hasher, center);
+                            for vector in [u, v] {
+                                hash_f64(&mut hasher, vector.x);
+                                hash_f64(&mut hasher, vector.y);
+                                hash_f64(&mut hasher, vector.z);
+                            }
+                            hash_f64(&mut hasher, major_radius);
+                            hash_f64(&mut hasher, minor_radius);
+                        }
+                    }
+                    hash_f64(&mut hasher, rail.range.start);
+                    hash_f64(&mut hasher, rail.range.end);
+                }
+            }
+            Surface::Bspline(surface) => {
+                hasher.update(b"bspline-surface-v0");
+                let [degree_u, degree_v] = surface.degree();
+                let [count_u, count_v] = surface.counts();
+                let [knots_u, knots_v] = surface.knots();
+                hash_u64(&mut hasher, degree_u as u64);
+                hash_u64(&mut hasher, degree_v as u64);
+                hash_u64(&mut hasher, count_u as u64);
+                hash_u64(&mut hasher, count_v as u64);
+                hash_collection_header(&mut hasher, b"knots-u", knots_u.len());
+                for knot in knots_u {
+                    hash_f64(&mut hasher, *knot);
+                }
+                hash_collection_header(&mut hasher, b"knots-v", knots_v.len());
+                for knot in knots_v {
+                    hash_f64(&mut hasher, *knot);
+                }
+                for point in surface.points() {
+                    for component in point {
+                        hash_f64(&mut hasher, *component);
+                    }
+                }
+            }
         }
         hash_u64(&mut hasher, face.value.outer_loop.0 as u64);
         // Preserve established digests for the pre-hole representation while
@@ -7618,6 +10039,26 @@ fn hash_precision(hasher: &mut Sha256, precision: PrecisionPolicy) {
     }
     hash_u64(hasher, u64::from(precision.max_iterations));
     hash_u64(hasher, u64::from(precision.max_subdivisions));
+}
+
+/// A B-spline curve's content: degree, knots and control points, in order.
+fn hash_spline_curve<const D: usize>(
+    hasher: &mut Sha256,
+    degree: usize,
+    knots: &[f64],
+    points: &[[f64; D]],
+) {
+    hash_u64(hasher, degree as u64);
+    hash_collection_header(hasher, b"knots", knots.len());
+    for knot in knots {
+        hash_f64(hasher, *knot);
+    }
+    hash_collection_header(hasher, b"points", points.len());
+    for point in points {
+        for component in point {
+            hash_f64(hasher, *component);
+        }
+    }
 }
 
 fn hash_point(hasher: &mut Sha256, point: Point3) {
@@ -8239,7 +10680,9 @@ mod tests {
                         Surface::Cylinder(_)
                         | Surface::Torus(_)
                         | Surface::Cone(_)
-                        | Surface::Sphere(_) => None,
+                        | Surface::Sphere(_)
+                        | Surface::Ruled(_)
+                        | Surface::Bspline(_) => None,
                     })
                     .collect::<Vec<_>>();
                 (incident.len() == 2
@@ -8731,8 +11174,13 @@ mod tests {
             "turned drill volume {} should equal {expected}",
             turned_drill.snapshot.measures().volume
         );
-        // Two cylinders on skew axes meet in a curve no vocabulary here
-        // names, and the refusal says which carriers those are.
+        // Two cylinders on skew axes meet in a space quartic (ADR 0047). The
+        // matrix names that curve, the section it leaves closes, and the
+        // difference is exact: its volume is the upright's less the lens the
+        // two share, which is measured here by a quadrature of its own —
+        // slice the lens across the skew cylinder's axis and each slice is a
+        // chord of one circle times a chord of the other — so the oracle
+        // owes nothing to the kernel's trace arithmetic.
         let skew = NativeKernel::execute(
             &NativeKernel::empty(),
             &ExecuteRequest {
@@ -8743,8 +11191,8 @@ mod tests {
                 command: KernelCommand::MakeRevolvedAnnulus {
                     frame: PlanarFrame3::new(
                         ProtocolPoint3::new(0.0, -5.0, 5.0),
-                        ProtocolVector3::new(1.0, 0.0, 0.0),
                         ProtocolVector3::new(0.0, 0.0, 1.0),
+                        ProtocolVector3::new(1.0, 0.0, 0.0),
                     ),
                     inner_radius: 0.0,
                     outer_radius: 1.5,
@@ -8755,26 +11203,53 @@ mod tests {
         )
         .expect("a cylinder along y")
         .snapshot;
-        let refused = NativeKernel::execute_boolean(
+        let bitten = NativeKernel::execute_boolean(
             &upright,
             &skew,
             &boolean_request(&upright, &skew, BooleanOperation::Difference),
             &CancellationToken::new(),
         )
-        .expect_err("skew cylinders meet in a quartic");
+        .expect("skew cylinders meet in a trace the engine closes exactly");
         assert!(
-            refused.diagnostics.iter().any(|diagnostic| {
-                diagnostic.code.as_str() == "BOOLEAN_SURFACE_PAIR_UNSUPPORTED"
-            }),
-            "unexpected refusal: {refused:?}"
+            bitten.report.warnings.is_empty(),
+            "an exact result carries no approximation warning: {:?}",
+            bitten.report.warnings
         );
-        // The refusal names the pair rather than the whole operand.
+        assert!(NativeKernel::validate(&bitten.snapshot, ValidationProfile::Solid).valid);
+        // The lens: `x ∈ [1, 1.5]`, where the upright's disc has the chord
+        // `2√(1 − (x − 2)²)` and the skew cylinder the chord `2√(2.25 − x²)`.
+        // Walked through `x = 1 + ½s²(3 − 2s)`, whose rate vanishes at both
+        // ends, the square roots there become smooth and composite Simpson
+        // converges to the last digits.
+        let lens = {
+            let panels = 20_000;
+            let step = 1.0 / f64::from(panels);
+            (0..=panels)
+                .map(|index| {
+                    let s = f64::from(index) * step;
+                    let x = 0.5f64.mul_add(s * s * 2.0f64.mul_add(-s, 3.0), 1.0);
+                    let rate = 3.0 * s * (1.0 - s);
+                    let chords = 4.0
+                        * (1.0 - (x - 2.0).powi(2)).max(0.0).sqrt()
+                        * x.mul_add(-x, 2.25).max(0.0).sqrt();
+                    let weight = if index == 0 || index == panels {
+                        1.0
+                    } else if index % 2 == 1 {
+                        4.0
+                    } else {
+                        2.0
+                    };
+                    weight * chords * rate
+                })
+                .sum::<f64>()
+                * step
+                / 3.0
+        };
+        let expected = std::f64::consts::PI.mul_add(20.0, -lens);
         assert!(
-            refused
-                .diagnostics
-                .iter()
-                .any(|diagnostic| { diagnostic.message.matches("cylinder").count() >= 2 }),
-            "the refusal should name the carrier pair: {refused:?}"
+            ((bitten.snapshot.measures().volume - expected) / expected).abs() < 1.0e-9,
+            "bitten volume {} should equal {expected}",
+            bitten.snapshot.measures().volume
         );
     }
 
@@ -11187,25 +13662,28 @@ mod tests {
         assert_ne!(first.snapshot.id(), second.snapshot.id());
         assert!(second.snapshot.measures().volume < first.snapshot.measures().volume);
         assert!(NativeKernel::validate(&second.snapshot, ValidationProfile::Solid).valid);
+        // The two bores are equal and their axes cross, so they meet in the
+        // Steinmetz pair of ellipses and the body is exact: no caveat, the
+        // closed-form volume, and the six planes plus four half-bore walls —
+        // the crossing adds no face. This body used to reach the faceted tier,
+        // where it published 834 edges after the coplanar merge; the bounds
+        // below were written for that route and still guard it, but the exact
+        // body sits far inside them.
+        assert!(
+            second.report.warnings.is_empty(),
+            "an exact crossing publishes no caveat: {:?}",
+            second.report.warnings
+        );
+        let radius = 0.75_f64;
+        let bore = std::f64::consts::PI * radius * radius;
+        let exact = 16.0f64.mul_add(radius.powi(3) / 3.0, bore.mul_add(-5.0, 24.0));
+        assert!(
+            ((second.snapshot.measures().volume - exact) / exact).abs() < 1.0e-12,
+            "two crossing bores are the closed form: {} vs {exact}",
+            second.snapshot.measures().volume
+        );
+        assert_eq!(second.snapshot.counts().faces, 10);
         let presentation = NativeKernel::debug_scene(&second.snapshot);
-        // The planar fragment fan must not reach the screen. This used to be
-        // stated as a ratio — visible edges had to stay under a seventh of the
-        // total — because the fan was there and the question was whether its
-        // seams were being drawn. The coplanar merge removes the fan itself, so
-        // the ratio no longer measures anything: it was counting the smooth
-        // interior seams, and removing them raises it while improving the
-        // drawing.
-        //
-        // The measurement that replaced it is a better statement of the same
-        // intent. This body publishes 4,470 edges without the merge and 834
-        // with it. Of those, 519 draw without the merge and 366 with it — not
-        // because any line went missing, but because a line that arrived as
-        // several collinear pieces now arrives as one edge, the vertices
-        // between them having been dissolved as corners to nobody.
-        //
-        // So bound the total, and pin the direction: the merge takes seams
-        // out and joins collinear runs, and neither can put a new line on
-        // the screen.
         let visible_edges = presentation
             .edges
             .iter()
@@ -11217,8 +13695,8 @@ mod tests {
             presentation.edges.len(),
         );
         assert!(
-            (300..=519).contains(&visible_edges),
-            "the merge may join drawn lines; it may not add one: {visible_edges} visible"
+            visible_edges <= 519,
+            "a crossing may not draw more lines than its faceted form did: {visible_edges} visible"
         );
         let logical_cylindrical_sides = second
             .snapshot
@@ -11235,11 +13713,18 @@ mod tests {
             "two analytic circle cuts must retain at most two logical side owners, got \
              {logical_cylindrical_sides:?}"
         );
+        // Each cut's side is one carrier: exact cylinder walls, and the seam
+        // between a wall's own halves draws smooth, as the faceted route's
+        // panels had to be recognised as one prismatic carrier to do.
         let topology = &second.snapshot.topology;
-        let prismatic_roles = presentation_prismatic_feature_roles(topology);
-        assert_eq!(
-            prismatic_roles, logical_cylindrical_sides,
-            "each circle cut must publish one coherent prismatic carrier"
+        assert!(
+            topology.faces.iter().all(|face| match face.value.role {
+                FaceRole::FeatureSide(role) if logical_cylindrical_sides.contains(&role) => {
+                    matches!(face.value.surface, Surface::Cylinder(_))
+                }
+                _ => true,
+            }),
+            "each circle cut must publish its side as a cylinder, not panels"
         );
         let smooth = presentation_smooth_edge_flags(topology);
         let incidence = edge_incident_face_indices(topology);
@@ -11247,7 +13732,7 @@ mod tests {
             let classification = presentation_edge_classification(topology, &incidence, edge_index);
             classification
                 .same_feature_side_role
-                .filter(|role| prismatic_roles.contains(role))
+                .filter(|role| logical_cylindrical_sides.contains(role))
                 .is_none_or(|_| *smooth)
         }));
     }

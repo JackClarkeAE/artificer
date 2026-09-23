@@ -9,7 +9,10 @@
 //! fillet's tangency rims are recognisably smooth and therefore refused.
 //!
 //! Full circles keep the two-semicircle representation of ADR 0016, with
-//! seam vertices at azimuth `0` and `π`.
+//! seam vertices at azimuth `0` and `π`. A partial turn (ADR 0055) splits each
+//! carrier halfway round instead, and is closed by two planar wedge faces;
+//! [`extract_rz_section`] refuses those, so a partial revolve does not enter
+//! the rim-blend or shell readings of a section.
 
 use artificer_protocol::{EdgeFinishKind, EntityKind, EntityRef, PrecisionPolicy, SnapshotId};
 
@@ -50,6 +53,9 @@ pub(crate) struct RzSection {
     /// sweeps a tube rather than a solid with a cap or pole on the axis. The
     /// last segment then meets the first ring instead of a new one.
     closed: bool,
+    /// How far the section turns from azimuth zero, `radial_u`: a full
+    /// turn, or less for a partial revolve read back from its topology.
+    sweep: f64,
 }
 
 impl RzSection {
@@ -72,6 +78,7 @@ impl RzSection {
             segments,
             roles,
             closed,
+            sweep: FULL_TURN,
         }
     }
 }
@@ -92,6 +99,11 @@ impl RzSection {
         self.radial_u
     }
 
+    /// The direction the turn runs towards from `radial_u`.
+    pub(crate) const fn radial_v(&self) -> Vector3 {
+        self.radial_v
+    }
+
     /// The section chain, in order.
     pub(crate) fn segments(&self) -> &[Segment] {
         &self.segments
@@ -102,6 +114,11 @@ impl RzSection {
     /// points both sit on it.
     pub(crate) const fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// How far the section turns: a full turn, or less.
+    pub(crate) const fn sweep(&self) -> f64 {
+        self.sweep
     }
 }
 
@@ -116,9 +133,25 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
 
     // Each curved carrier appears as two half-faces; collect one section
     // segment per carrier and require the pairing to be exact.
-    let mut pieces: Vec<(Segment, FaceRole, usize)> = Vec::new();
+    // Each piece carries the azimuth it spans, for a curved band, so that a
+    // partial turn's sweep can be read back from its carriers.
+    let mut pieces: Vec<(Segment, FaceRole, usize, f64)> = Vec::new();
+    // Each wedge face as the direction its half-plane leaves the axis in,
+    // and its outward normal.
+    let mut wedges: Vec<(Vector3, Vector3)> = Vec::new();
     for face in &topology.faces {
         let piece = match face.value.surface {
+            // A plane holding the axis is one of the two wedge faces that
+            // close a partial turn: the section itself, not a piece of it.
+            Surface::Plane(plane)
+                if plane.normal.dot(axis).abs() <= agreement
+                    && on_axis(plane.origin, center, axis, agreement) =>
+            {
+                let direction = wedge_direction(topology, &face.value, center, axis)
+                    .ok_or(RimBlendError::DomainUnsupported)?;
+                wedges.push((direction, plane.normal));
+                continue;
+            }
             Surface::Plane(plane) => {
                 if plane.normal.cross(axis).length() > agreement {
                     return Err(RimBlendError::DomainUnsupported);
@@ -137,6 +170,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                         },
                         face.value.role,
                         1,
+                        0.0,
                     )
                 } else {
                     (
@@ -146,6 +180,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                         },
                         face.value.role,
                         1,
+                        0.0,
                     )
                 }
             }
@@ -155,7 +190,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 {
                     return Err(RimBlendError::DomainUnsupported);
                 }
-                let (_, _, low, high) = parameter_bounds(topology, &face.value)?;
+                let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let base = (cylinder.origin - center).dot(axis);
                 (
                     Segment::Line {
@@ -164,6 +199,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                     },
                     face.value.role,
                     2,
+                    u_high - u_low,
                 )
             }
             Surface::Cone(cone) => {
@@ -172,7 +208,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 {
                     return Err(RimBlendError::DomainUnsupported);
                 }
-                let (_, _, low, high) = parameter_bounds(topology, &face.value)?;
+                let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let base = (cone.origin - center).dot(axis);
                 (
                     Segment::Line {
@@ -181,6 +217,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                     },
                     face.value.role,
                     2,
+                    u_high - u_low,
                 )
             }
             Surface::Sphere(sphere) => {
@@ -194,7 +231,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 // the sphere's own height. Closing this arm is what lets a
                 // revolved sphere re-enter the blend ladder: a builder whose
                 // output the extractor rejects would be a one-way door.
-                let (_, _, low, high) = parameter_bounds(topology, &face.value)?;
+                let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let center_height = (sphere.origin - center).dot(axis);
                 // A concave band carries its axis against the section's, which
                 // negates its minor angle with it. Reading the face's own
@@ -222,6 +259,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                     },
                     face.value.role,
                     2,
+                    u_high - u_low,
                 )
             }
             Surface::Torus(torus) => {
@@ -230,7 +268,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                 {
                     return Err(RimBlendError::DomainUnsupported);
                 }
-                let (_, _, low, high) = parameter_bounds(topology, &face.value)?;
+                let (u_low, u_high, low, high) = parameter_bounds(topology, &face.value)?;
                 let ring_height = (torus.origin - center).dot(axis);
                 // As for a sphere: a band whose axis runs against the section's
                 // measures its minor angle the other way.
@@ -257,7 +295,13 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
                     },
                     face.value.role,
                     2,
+                    u_high - u_low,
                 )
+            }
+            // A ruled wall is not a surface of revolution: the body is not
+            // one this section describes.
+            Surface::Ruled(_) | Surface::Bspline(_) => {
+                return Err(RimBlendError::DomainUnsupported);
             }
         };
         pieces.push(piece);
@@ -267,12 +311,15 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
     // yield one section segment.
     let mut segments: Vec<(Segment, FaceRole)> = Vec::new();
     let mut seen = vec![false; pieces.len()];
+    // The azimuth every curved carrier's two halves span between them.
+    let mut sweeps = Vec::new();
     for index in 0..pieces.len() {
         if seen[index] {
             continue;
         }
-        let (segment, role, expected) = pieces[index];
+        let (segment, role, expected, span) = pieces[index];
         let mut matches = 1;
+        let mut swept = span;
         for other in index + 1..pieces.len() {
             if seen[other] {
                 continue;
@@ -280,14 +327,49 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
             if segments_agree(segment, pieces[other].0, agreement) {
                 seen[other] = true;
                 matches += 1;
+                swept += pieces[other].3;
             }
         }
         seen[index] = true;
         if matches != expected {
             return Err(RimBlendError::DomainUnsupported);
         }
+        if expected == 2 {
+            sweeps.push(swept);
+        }
         segments.push((segment, role));
     }
+    // A full turn has no wedge faces; a partial one has its two, and every
+    // carrier spans the same azimuth.
+    let (sweep, radial_u, radial_v) = match wedges.as_slice() {
+        [] => (FULL_TURN, radial_u, radial_v),
+        [first, second] => {
+            let sweep = sweeps
+                .first()
+                .copied()
+                .ok_or(RimBlendError::DomainUnsupported)?;
+            if sweeps
+                .iter()
+                .any(|other| (other - sweep).abs() > 1.0e-9 * FULL_TURN)
+                || sweep >= FULL_TURN
+            {
+                return Err(RimBlendError::DomainUnsupported);
+            }
+            // The turn begins at the wedge whose material lies ahead of it,
+            // turning about the axis; the other has its material behind.
+            // Azimuth zero is read from the faces themselves, since a
+            // carrier's own frame need not start where the material does.
+            let ahead =
+                |(direction, normal): (Vector3, Vector3)| normal.dot(axis.cross(direction)) < 0.0;
+            let start = match (ahead(*first), ahead(*second)) {
+                (true, false) => first.0,
+                (false, true) => second.0,
+                _ => return Err(RimBlendError::DomainUnsupported),
+            };
+            (sweep, start, axis.cross(start))
+        }
+        _ => return Err(RimBlendError::DomainUnsupported),
+    };
 
     let (chained, closed) = chain_section(segments, agreement)?;
     let (segments, roles) = chained.into_iter().unzip();
@@ -299,6 +381,7 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
         segments,
         roles,
         closed,
+        sweep,
     })
 }
 
@@ -317,7 +400,9 @@ fn section_frame(
             Surface::Torus(torus) => {
                 Some((torus.axis, torus.radial_u, torus.radial_v, torus.origin))
             }
-            Surface::Plane(_) | Surface::Sphere(_) => None,
+            Surface::Plane(_) | Surface::Sphere(_) | Surface::Ruled(_) | Surface::Bspline(_) => {
+                None
+            }
         };
         if let Some((axis, radial_u, radial_v, origin)) = frame {
             // Anchor the section frame on the axis at the carrier's own
@@ -325,7 +410,18 @@ fn section_frame(
             return Ok((axis, radial_u, radial_v, origin));
         }
     }
-    Err(RimBlendError::DomainUnsupported)
+    // A body turned from arcs alone, a ball, has only spheres to say where
+    // its axis is.
+    topology
+        .faces
+        .iter()
+        .find_map(|face| match face.value.surface {
+            Surface::Sphere(sphere) => {
+                Some((sphere.axis, sphere.radial_u, sphere.radial_v, sphere.origin))
+            }
+            _ => None,
+        })
+        .ok_or(RimBlendError::DomainUnsupported)
 }
 
 fn section_scale(topology: &Topology) -> f64 {
@@ -344,6 +440,34 @@ fn section_scale(topology: &Topology) -> f64 {
         .fold(1.0_f64, f64::max)
 }
 
+/// The direction a wedge face's half-plane leaves the axis in: towards the
+/// boundary point of the face farthest from the axis.
+pub(crate) fn wedge_direction(
+    topology: &Topology,
+    face: &Face,
+    center: Point3,
+    axis: Vector3,
+) -> Option<Vector3> {
+    let Surface::Plane(plane) = face.surface else {
+        return None;
+    };
+    let loop_record = topology.loop_record(face.outer_loop)?;
+    let mut farthest: Option<Vector3> = None;
+    for coedge_key in &loop_record.value.coedges {
+        let coedge = topology.coedge(*coedge_key)?.value;
+        for point in coedge.pcurve_endpoints() {
+            let offset = plane.origin + plane.u * point.x + plane.v * point.y - center;
+            let radial = offset - axis * offset.dot(axis);
+            if farthest.is_none_or(|best| radial.length() > best.length()) {
+                farthest = Some(radial);
+            }
+        }
+    }
+    let radial = farthest?;
+    let length = radial.length();
+    (length.is_finite() && length > f64::EPSILON).then(|| radial / length)
+}
+
 fn on_axis(point: Point3, center: Point3, axis: Vector3, agreement: f64) -> bool {
     let offset = point - center;
     (offset - axis * offset.dot(axis)).length() <= agreement
@@ -352,6 +476,13 @@ fn on_axis(point: Point3, center: Point3, axis: Vector3, agreement: f64) -> bool
 /// The `(inner, outer)` radii of a cap face: `(0, r)` for a full disk, and
 /// the two rim radii for the washer face of a tube.
 fn cap_radii(topology: &Topology, face: &Face) -> Result<(f64, f64), RimBlendError> {
+    // A partial turn's cap is a sector: one loop of arcs and the two
+    // straight sides joining them, to the axis or to an inner rim.
+    if face.inner_loops.is_empty()
+        && let Some(radii) = sector_radii(topology, face.outer_loop)?
+    {
+        return Ok(radii);
+    }
     let outer = loop_circle_radius(topology, face.outer_loop)?;
     match face.inner_loops.as_slice() {
         [] => Ok((0.0, outer)),
@@ -362,6 +493,45 @@ fn cap_radii(topology: &Topology, face: &Face) -> Result<(f64, f64), RimBlendErr
             }
             Ok((inner, outer))
         }
+        _ => Err(RimBlendError::DomainUnsupported),
+    }
+}
+
+/// The `(inner, outer)` radii of a sector cap's one loop, or `None` for a
+/// loop with no straight side, which is a full rim.
+fn sector_radii(
+    topology: &Topology,
+    loop_key: LoopKey,
+) -> Result<Option<(f64, f64)>, RimBlendError> {
+    let loop_record = topology
+        .loop_record(loop_key)
+        .ok_or(RimBlendError::DomainUnsupported)?;
+    let mut radii = Vec::<f64>::new();
+    let mut straight = false;
+    for coedge_key in &loop_record.value.coedges {
+        let coedge = topology
+            .coedge(*coedge_key)
+            .ok_or(RimBlendError::DomainUnsupported)?
+            .value;
+        match coedge.pcurve {
+            Curve2::Circle { radius, .. } => {
+                if !radii
+                    .iter()
+                    .any(|existing| (existing - radius).abs() <= 1.0e-9 * (1.0 + radius.abs()))
+                {
+                    radii.push(radius);
+                }
+            }
+            Curve2::Line { .. } => straight = true,
+            _ => return Err(RimBlendError::DomainUnsupported),
+        }
+    }
+    if !straight {
+        return Ok(None);
+    }
+    match radii.as_slice() {
+        [outer] => Ok(Some((0.0, *outer))),
+        [first, second] => Ok(Some((first.min(*second), first.max(*second)))),
         _ => Err(RimBlendError::DomainUnsupported),
     }
 }
@@ -440,20 +610,35 @@ fn segments_agree(first: Segment, second: Segment, agreement: f64) -> bool {
                 radius: first_radius,
                 start: first_start,
                 end: first_end,
-                ..
+                start_angle: first_angle,
+                sweep: first_sweep,
             },
             Segment::Arc {
                 center: second_center,
                 radius: second_radius,
                 start: second_start,
                 end: second_end,
-                ..
+                start_angle: second_angle,
+                sweep: second_sweep,
             },
         ) => {
+            // The two halves of one circle share their ends; the point
+            // halfway round tells them apart.
+            let middle = |center: Point2, radius: f64, angle: f64, sweep: f64| {
+                let halfway = angle + sweep / 2.0;
+                Point2::new(
+                    center.x + radius * halfway.cos(),
+                    center.y + radius * halfway.sin(),
+                )
+            };
             same_point(first_center, second_center)
                 && (first_radius - second_radius).abs() <= agreement
                 && ((same_point(first_start, second_start) && same_point(first_end, second_end))
                     || (same_point(first_start, second_end) && same_point(first_end, second_start)))
+                && same_point(
+                    middle(first_center, first_radius, first_angle, first_sweep),
+                    middle(second_center, second_radius, second_angle, second_sweep),
+                )
         }
         _ => false,
     }
@@ -467,7 +652,9 @@ fn chain_section(
     mut pieces: Vec<(Segment, FaceRole)>,
     agreement: f64,
 ) -> Result<(Vec<(Segment, FaceRole)>, bool), RimBlendError> {
-    if pieces.len() < 2 {
+    // One piece is enough: a ball's section is a single arc from pole to
+    // pole.
+    if pieces.is_empty() {
         return Err(RimBlendError::DomainUnsupported);
     }
     let same_point = |a: Point2, b: Point2| (a.x - b.x).hypot(a.y - b.y) <= agreement;
@@ -553,7 +740,9 @@ fn reversed(segment: Segment) -> Segment {
             start_angle: start_angle + sweep,
             sweep: -sweep,
         },
-        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
+        other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. }) => {
+            other.reversed()
+        }
     }
 }
 
@@ -636,15 +825,21 @@ pub(crate) fn build_rim_blend(
     vertices.dedup();
 
     let blended = blend_section(&section, &vertices, kind, distance, precision)?;
-    Ok(build_revolved_topology(&RzSection {
-        center: section.center,
-        axis: section.axis,
-        radial_u: section.radial_u,
-        radial_v: section.radial_v,
-        roles: blended.1,
-        segments: blended.0,
-        closed: section.closed,
-    }))
+    // A partial turn is rebuilt through the same span, its wedge faces
+    // taking the blended section.
+    Ok(build_turned_topology(
+        &RzSection {
+            center: section.center,
+            axis: section.axis,
+            radial_u: section.radial_u,
+            radial_v: section.radial_v,
+            roles: blended.1,
+            segments: blended.0,
+            closed: section.closed,
+            sweep: section.sweep,
+        },
+        section.sweep,
+    ))
 }
 
 type BlendedSection = (Vec<Segment>, Vec<FaceRole>);
@@ -780,9 +975,15 @@ const fn map_corner_error(error: CornerBlendError) -> RimBlendError {
 // Revolving a section
 // ---------------------------------------------------------------------------
 
+/// The three azimuth stations of a turn: where it starts, halfway, and where
+/// it ends. A full turn ends where it starts.
+const STATIONS: usize = 3;
+
 #[derive(Clone, Copy)]
 struct RimCircle {
-    vertices: [VertexKey; 2],
+    /// The ring's vertices at each station. A full turn's last is its first.
+    vertices: [VertexKey; STATIONS],
+    /// The two arcs between consecutive stations, each at most half a turn.
     edges: [EdgeKey; 2],
 }
 
@@ -798,36 +999,66 @@ struct Pole {
     edge: EdgeKey,
 }
 
-/// The ring a section vertex sweeps: a real circle, or a pole on the axis.
+/// The ring a section vertex sweeps: a real circle, a pole on the axis, or,
+/// for a partial turn, the bare axis point a planar cap is centred on.
 #[derive(Clone, Copy)]
 enum Ring {
     Circle(RimCircle),
     Pole(Pole),
+    Axis(VertexKey),
 }
 
 impl Ring {
     const fn as_circle(self) -> Option<RimCircle> {
         match self {
             Self::Circle(circle) => Some(circle),
-            Self::Pole(_) => None,
+            Self::Pole(_) | Self::Axis(_) => None,
         }
     }
 
-    const fn vertex(self, half: usize) -> VertexKey {
+    /// The ring's vertex at `station`; every station of an axis point is the
+    /// one vertex.
+    const fn vertex(self, station: usize) -> VertexKey {
         match self {
-            Self::Circle(circle) => circle.vertices[half],
+            Self::Circle(circle) => circle.vertices[station],
             Self::Pole(pole) => pole.vertex,
+            Self::Axis(vertex) => vertex,
         }
     }
+}
+
+/// The edges one section segment leaves in the two wedge faces of a partial
+/// turn: its generators at the first and last stations, and whether they run
+/// the way the chain does.
+#[derive(Clone, Copy)]
+struct WedgeUse {
+    generators: [EdgeKey; 2],
+    along_chain: bool,
 }
 
 struct Builder<'a> {
     topology: Topology,
     next_id: u64,
     section: &'a RzSection,
+    /// How far the section turns: a full turn, or less.
+    sweep: f64,
 }
 
 impl Builder<'_> {
+    fn partial(&self) -> bool {
+        self.sweep < FULL_TURN
+    }
+
+    /// The azimuth of each station.
+    fn stations(&self) -> [f64; STATIONS] {
+        [0.0, self.sweep / 2.0, self.sweep]
+    }
+
+    /// The unit radial direction at `azimuth`.
+    fn radial(&self, azimuth: f64) -> Vector3 {
+        self.section.radial_u * azimuth.cos() + self.section.radial_v * azimuth.sin()
+    }
+
     fn point(&self, radius: f64, azimuth: f64, height: f64) -> Point3 {
         self.section.center
             + self.section.radial_u * (radius * azimuth.cos())
@@ -858,10 +1089,20 @@ impl Builder<'_> {
         key
     }
 
-    /// One full circle as two exact semicircle edges.
+    fn vertex_point(&self, vertex: VertexKey) -> Point3 {
+        self.topology.vertices[vertex.0].value.point
+    }
+
+    /// One ring as two exact arcs, split halfway round the turn.
     fn rim_circle(&mut self, radius: f64, height: f64) -> RimCircle {
+        let [_, middle, end] = self.stations();
         let near = self.vertex(self.point(radius, 0.0, height));
-        let far = self.vertex(self.point(radius, HALF_TURN, height));
+        let far = self.vertex(self.point(radius, middle, height));
+        let last = if self.partial() {
+            self.vertex(self.point(radius, end, height))
+        } else {
+            near
+        };
         let curve = Curve3::Circle {
             center: self.section.center + self.section.axis * height,
             u: self.section.radial_u,
@@ -871,27 +1112,31 @@ impl Builder<'_> {
         let first = self.edge(Edge {
             vertices: [near, far],
             curve,
-            parameter_range: ParameterRange::new(0.0, HALF_TURN),
+            parameter_range: ParameterRange::new(0.0, middle),
         });
         let second = self.edge(Edge {
-            vertices: [far, near],
+            vertices: [far, last],
             curve,
-            parameter_range: ParameterRange::new(HALF_TURN, FULL_TURN),
+            parameter_range: ParameterRange::new(middle, end),
         });
         RimCircle {
-            vertices: [near, far],
+            vertices: [near, far, last],
             edges: [first, second],
         }
     }
 
     /// The ring a section vertex sweeps. A point on the axis is a pole only
-    /// when a curve meets it; a radial line ending on the axis closes a full
-    /// disk cap and sweeps no ring at all.
+    /// when a curved band meets it: an arc, or a slanted line sweeping a cone
+    /// to its apex. A radial line ending on the axis closes a planar cap
+    /// instead: a full disk sweeps no ring at all, and a sector is centred on
+    /// the bare axis point its two straight sides meet at.
     fn ring_at(&mut self, point: Point2, curved: bool) -> Option<Ring> {
         if point.x > 0.0 {
             Some(Ring::Circle(self.rim_circle(point.x, point.y)))
         } else if curved {
             Some(Ring::Pole(self.pole(point.y)))
+        } else if self.partial() {
+            Some(Ring::Axis(self.vertex(self.point(0.0, 0.0, point.y))))
         } else {
             None
         }
@@ -911,23 +1156,21 @@ impl Builder<'_> {
         Pole { vertex, edge }
     }
 
-    /// The seam generator of an arc section segment, with either end free to
-    /// be a pole where every azimuth converges on the one pole vertex.
-    #[allow(clippy::too_many_arguments)]
+    /// The generator of an arc section segment at one station, with either
+    /// end free to be a pole where every azimuth converges on the one pole
+    /// vertex. It runs from `low` to `high` over `angles`.
     fn seam_minor_arc_ring(
         &mut self,
-        low: Ring,
-        high: Ring,
-        half: usize,
-        azimuth: f64,
+        (low, high): (Ring, Ring),
+        station: usize,
         arc_center: Point2,
         radius: f64,
         angles: (f64, f64),
     ) -> EdgeKey {
-        let radial = self.section.radial_u * azimuth.cos() + self.section.radial_v * azimuth.sin();
+        let radial = self.radial(self.stations()[station]);
         let center = self.section.center + radial * arc_center.x + self.section.axis * arc_center.y;
         self.edge(Edge {
-            vertices: [low.vertex(half), high.vertex(half)],
+            vertices: [low.vertex(station), high.vertex(station)],
             curve: Curve3::Circle {
                 center,
                 u: radial,
@@ -938,17 +1181,26 @@ impl Builder<'_> {
         })
     }
 
-    /// The seam generator of a line section segment: a straight edge in the
-    /// azimuth plane joining the two rings.
-    fn seam_line(&mut self, from: (&RimCircle, usize), to: (&RimCircle, usize)) -> EdgeKey {
-        let start = self.topology.vertices[from.0.vertices[from.1].0]
-            .value
-            .point;
-        let end = self.topology.vertices[to.0.vertices[to.1].0].value.point;
-        self.edge(Edge::line(
-            [from.0.vertices[from.1], to.0.vertices[to.1]],
-            [start, end],
-        ))
+    /// A straight generator: an edge in one station's half-plane joining two
+    /// ring vertices.
+    fn seam_line(&mut self, from: VertexKey, to: VertexKey) -> EdgeKey {
+        let start = self.vertex_point(from);
+        let end = self.vertex_point(to);
+        self.edge(Edge::line([from, to], [start, end]))
+    }
+
+    /// A line section segment's generator at every station, from `low` to
+    /// `high`. A full turn's last station is its first, so it reuses that
+    /// generator rather than laying a second one on top of it.
+    fn line_generators(&mut self, low: Ring, high: Ring) -> [EdgeKey; STATIONS] {
+        let first = self.seam_line(low.vertex(0), high.vertex(0));
+        let middle = self.seam_line(low.vertex(1), high.vertex(1));
+        let last = if self.partial() {
+            self.seam_line(low.vertex(2), high.vertex(2))
+        } else {
+            first
+        };
+        [first, middle, last]
     }
 
     fn push_loop(&mut self, uses: Vec<(EdgeKey, Orientation, Curve2, ParameterRange)>) -> LoopKey {
@@ -1000,6 +1252,8 @@ impl Builder<'_> {
     }
 }
 
+type CoedgeUse = (EdgeKey, Orientation, Curve2, ParameterRange);
+
 fn line_pcurve(start: Point2, end: Point2) -> (Curve2, ParameterRange) {
     Curve2::line_segment([start, end])
 }
@@ -1010,13 +1264,22 @@ fn cap_circle_pcurve(
     reverse: bool,
     mirrored: bool,
 ) -> (Curve2, ParameterRange) {
+    let start = if half == 0 { 0.0 } else { HALF_TURN };
+    let range = (start, start + HALF_TURN);
+    cap_arc_pcurve(
+        radius,
+        if reverse { (range.1, range.0) } else { range },
+        mirrored,
+    )
+}
+
+/// A rim arc drawn in a cap's own plane, from azimuth `range.0` to `range.1`.
+fn cap_arc_pcurve(radius: f64, range: (f64, f64), mirrored: bool) -> (Curve2, ParameterRange) {
     let (u, v) = if mirrored {
         (Vector2::new(0.0, 1.0), Vector2::new(1.0, 0.0))
     } else {
         (Vector2::new(1.0, 0.0), Vector2::new(0.0, 1.0))
     };
-    let start = if half == 0 { 0.0 } else { HALF_TURN };
-    let range = ParameterRange::new(start, start + HALF_TURN);
     (
         Curve2::Circle {
             center: Point2::new(0.0, 0.0),
@@ -1024,24 +1287,132 @@ fn cap_circle_pcurve(
             v,
             radius,
         },
-        if reverse { range.reversed() } else { range },
+        ParameterRange::new(range.0, range.1),
     )
 }
 
-/// Revolves a closed (r, z) section a full turn.
-pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
+/// A point at `radius` and `azimuth` in a cap's own plane.
+fn cap_point(radius: f64, azimuth: f64, mirrored: bool) -> Point2 {
+    let (x, y) = (radius * azimuth.cos(), radius * azimuth.sin());
+    if mirrored {
+        Point2::new(y, x)
+    } else {
+        Point2::new(x, y)
+    }
+}
+
+/// Revolves a closed (r, z) section through `sweep` radians, from the
+/// section's own half-plane (azimuth zero) towards `radial_v`.
+///
+/// Every curved carrier is split halfway round the turn, so each of its two
+/// faces spans at most half a turn and a pole's one degenerate edge is always
+/// shared by two faces in opposite senses. A full turn is the case whose
+/// split falls at `π`, with seams at azimuth `0` and `π` (ADR 0016). Anything
+/// less is closed by two planar wedge faces: the section itself at azimuth
+/// zero, and its turned copy at `sweep`.
+pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology {
+    build_turned_region(section, &[], sweep)
+}
+
+/// Revolves a region with holes through `sweep` radians. `outer` runs
+/// anticlockwise and every hole clockwise, all in the one section frame, so
+/// material lies on the left of each chain and the builder faces every band
+/// the right way without knowing which is which.
+///
+/// Swept a full turn, each hole is a cavity: a closed shell of its own,
+/// facing into it, held as an inner shell of the solid. Swept less, it is a
+/// channel open at both ends, and its outline is a hole in each of the two
+/// wedge faces.
+pub(crate) fn build_turned_region(outer: &RzSection, holes: &[RzSection], sweep: f64) -> Topology {
     let mut builder = Builder {
         topology: Topology::default(),
         next_id: 1,
-        section,
+        section: outer,
+        sweep: sweep.min(FULL_TURN),
     };
+    let swept = sweep_section(&mut builder, outer);
+    let outer_faces = builder.topology.faces.len();
+    let mut swept_holes = Vec::with_capacity(holes.len());
+    for hole in holes {
+        let first = builder.topology.faces.len();
+        let (circles, wedges) = sweep_section(&mut builder, hole);
+        swept_holes.push((hole, circles, wedges, first..builder.topology.faces.len()));
+    }
+
+    if builder.partial() {
+        let hole_wedges = swept_holes
+            .iter()
+            .map(|(hole, circles, wedges, _)| (*hole, circles.as_slice(), wedges.as_slice()))
+            .collect::<Vec<_>>();
+        push_wedges(&mut builder, (outer, &swept.0, &swept.1), &hole_wedges);
+    }
+
+    // A partial turn, or a region without holes, is one closed shell. A full
+    // turn's holes are cavities, each a shell of its own inside the first.
+    let cavities = if builder.partial() {
+        Vec::new()
+    } else {
+        swept_holes
+            .into_iter()
+            .map(|(_, _, _, faces)| faces)
+            .collect::<Vec<_>>()
+    };
+    let outer_range = if cavities.is_empty() {
+        0..builder.topology.faces.len()
+    } else {
+        0..outer_faces
+    };
+    let shell_key = ShellKey(builder.topology.shells.len());
+    let shell_id = builder.allocate();
+    builder.topology.shells.push(Record {
+        id: shell_id,
+        value: Shell {
+            faces: outer_range.map(FaceKey).collect(),
+        },
+    });
+    let mut inner_shells = Vec::with_capacity(cavities.len());
+    for faces in cavities {
+        let key = ShellKey(builder.topology.shells.len());
+        let id = builder.allocate();
+        builder.topology.shells.push(Record {
+            id,
+            value: Shell {
+                faces: faces.map(FaceKey).collect(),
+            },
+        });
+        inner_shells.push(key);
+    }
+    let solid_id = builder.allocate();
+    builder.topology.solids.push(Record {
+        id: solid_id,
+        value: Solid {
+            outer_shell: shell_key,
+            inner_shells,
+        },
+    });
+    builder.topology
+}
+
+/// The rings and faces one section chain sweeps, and the generators it
+/// leaves for the wedge faces of a partial turn.
+fn sweep_section(
+    builder: &mut Builder<'_>,
+    section: &RzSection,
+) -> (Vec<Option<Ring>>, Vec<Option<WedgeUse>>) {
     let count = section.segments.len();
+    let stations = builder.stations();
 
     // One circle per section vertex with r > 0. Vertex `index` is the start of
     // segment `index`; the final vertex is the end of the last segment.
+    // A segment sweeps a curved band, not a planar cap, when it is an arc or
+    // a line that is not radial.
+    let curved = |segment: &Segment| match *segment {
+        Segment::Line { start, end } => (end.y - start.y).abs() > axis_agreement(section),
+        _ => true,
+    };
     let mut circles: Vec<Option<Ring>> = Vec::with_capacity(count + 1);
     for segment in &section.segments {
-        circles.push(builder.ring_at(segment.start(), matches!(segment, Segment::Arc { .. })));
+        circles.push(builder.ring_at(segment.start(), curved(segment)));
     }
     if section.closed {
         // A tube's chain returns to where it started, so the final ring is the
@@ -1050,16 +1421,21 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
         circles.push(circles[0]);
     } else {
         let last = section.segments[count - 1];
-        circles.push(builder.ring_at(last.end(), matches!(last, Segment::Arc { .. })));
+        circles.push(builder.ring_at(last.end(), curved(&last)));
     }
 
+    let mut wedges: Vec<Option<WedgeUse>> = vec![None; count];
     for (index, segment) in section.segments.iter().enumerate() {
         let role = section.roles[index];
         let start = segment.start();
         let end = segment.end();
         match *segment {
-            Segment::Line { .. } if start.x <= 0.0 || end.x <= 0.0 => {
-                // A radial line touching the axis is a full-disk cap.
+            Segment::Line { .. }
+                if (start.x <= 0.0 || end.x <= 0.0)
+                    && (end.y - start.y).abs() <= axis_agreement(section) =>
+            {
+                // A radial line touching the axis is a planar cap: a full disk,
+                // or a sector for a partial turn.
                 let (circle, radius, height, outward_up) = if start.x <= 0.0 {
                     (
                         circles[index + 1].and_then(Ring::as_circle),
@@ -1077,30 +1453,6 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                     )
                 };
                 let Some(circle) = circle else { continue };
-                let uses = if outward_up {
-                    vec![
-                        {
-                            let (pcurve, range) = cap_circle_pcurve(radius, 0, false, false);
-                            (circle.edges[0], Orientation::Forward, pcurve, range)
-                        },
-                        {
-                            let (pcurve, range) = cap_circle_pcurve(radius, 1, false, false);
-                            (circle.edges[1], Orientation::Forward, pcurve, range)
-                        },
-                    ]
-                } else {
-                    vec![
-                        {
-                            let (pcurve, range) = cap_circle_pcurve(radius, 0, true, true);
-                            (circle.edges[0], Orientation::Reverse, pcurve, range)
-                        },
-                        {
-                            let (pcurve, range) = cap_circle_pcurve(radius, 1, true, true);
-                            (circle.edges[1], Orientation::Reverse, pcurve, range)
-                        },
-                    ]
-                };
-                let loop_key = builder.push_loop(uses);
                 let plane = if outward_up {
                     Plane::new(
                         section.center + section.axis * height,
@@ -1114,6 +1466,37 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                         section.radial_u,
                     )
                 };
+                let uses = if builder.partial() {
+                    let (Some(from), Some(to)) = (circles[index], circles[index + 1]) else {
+                        continue;
+                    };
+                    // The sector's straight sides run with the chain, from
+                    // the rim in to the axis or from the axis out.
+                    let generators = [
+                        builder.seam_line(from.vertex(0), to.vertex(0)),
+                        builder.seam_line(from.vertex(2), to.vertex(2)),
+                    ];
+                    wedges[index] = Some(WedgeUse {
+                        generators,
+                        along_chain: true,
+                    });
+                    sector_cap(&stations, circle, radius, generators, outward_up)
+                } else if outward_up {
+                    (0..2)
+                        .map(|half| {
+                            let (pcurve, range) = cap_circle_pcurve(radius, half, false, false);
+                            (circle.edges[half], Orientation::Forward, pcurve, range)
+                        })
+                        .collect()
+                } else {
+                    (0..2)
+                        .map(|half| {
+                            let (pcurve, range) = cap_circle_pcurve(radius, half, true, true);
+                            (circle.edges[half], Orientation::Reverse, pcurve, range)
+                        })
+                        .collect()
+                };
+                let loop_key = builder.push_loop(uses);
                 builder.push_face(Surface::Plane(plane), loop_key, role);
             }
             Segment::Line { .. }
@@ -1136,6 +1519,44 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                 };
                 let (inner_radius, outer_radius) = (start.x.min(end.x), start.x.max(end.x));
                 let height = start.y;
+                let plane = if outward_up {
+                    Plane::new(
+                        section.center + section.axis * height,
+                        section.radial_u,
+                        section.radial_v,
+                    )
+                } else {
+                    Plane::new(
+                        section.center + section.axis * height,
+                        section.radial_v,
+                        section.radial_u,
+                    )
+                };
+                if builder.partial() {
+                    let (from, to) = if outward_up {
+                        (outer, inner)
+                    } else {
+                        (inner, outer)
+                    };
+                    let generators = [
+                        builder.seam_line(from.vertices[0], to.vertices[0]),
+                        builder.seam_line(from.vertices[2], to.vertices[2]),
+                    ];
+                    wedges[index] = Some(WedgeUse {
+                        generators,
+                        along_chain: true,
+                    });
+                    let uses = sector_annulus(
+                        &stations,
+                        (inner, inner_radius),
+                        (outer, outer_radius),
+                        generators,
+                        outward_up,
+                    );
+                    let loop_key = builder.push_loop(uses);
+                    builder.push_face(Surface::Plane(plane), loop_key, role);
+                    continue;
+                }
                 let boundary = |circle: &RimCircle, radius: f64, hole: bool| {
                     let reverse = outward_up == hole;
                     let orientation = if reverse {
@@ -1153,19 +1574,6 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                 };
                 let outer_loop = builder.push_loop(boundary(&outer, outer_radius, false));
                 let inner_loop = builder.push_loop(boundary(&inner, inner_radius, true));
-                let plane = if outward_up {
-                    Plane::new(
-                        section.center + section.axis * height,
-                        section.radial_u,
-                        section.radial_v,
-                    )
-                } else {
-                    Plane::new(
-                        section.center + section.axis * height,
-                        section.radial_v,
-                        section.radial_u,
-                    )
-                };
                 builder.push_face_with_holes(
                     Surface::Plane(plane),
                     outer_loop,
@@ -1174,9 +1582,6 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                 );
             }
             Segment::Line { .. } => {
-                // A slanted line reaching the axis would sweep a cone apex,
-                // which is a sharp singularity rather than a pole; that stays
-                // outside the certified domain.
                 // A section travelling down the page has material on the other
                 // side of the band: it is the bore of a tube or the inside of
                 // a cup, not an outside wall. The band is built from its lower
@@ -1190,18 +1595,29 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                 } else {
                     (start, end)
                 };
+                // Either end may be a cone's apex, a pole on the axis.
                 let (Some(low), Some(high)) = (
-                    circles[if descending { index + 1 } else { index }].and_then(Ring::as_circle),
-                    circles[if descending { index } else { index + 1 }].and_then(Ring::as_circle),
+                    circles[if descending { index + 1 } else { index }],
+                    circles[if descending { index } else { index + 1 }],
                 ) else {
                     continue;
                 };
-                let seams = [
-                    builder.seam_line((&low, 0), (&high, 0)),
-                    builder.seam_line((&low, 1), (&high, 1)),
-                ];
+                let seams = builder.line_generators(low, high);
+                wedges[index] = Some(WedgeUse {
+                    generators: [seams[0], seams[2]],
+                    along_chain: !descending,
+                });
                 let angular_sign = if descending { -1.0 } else { 1.0 };
                 let slope = (top.x - base.x) / (top.y - base.y);
+                let height = top.y - base.y;
+                // A cone is anchored at a ring with a radius, so a band
+                // whose base is the apex is anchored at its top instead and
+                // runs up to zero from below.
+                let (anchor, parameters) = if base.x > 0.0 {
+                    (base, (0.0, height))
+                } else {
+                    (top, (-height, 0.0))
+                };
                 let surface = if slope.abs() <= f64::EPSILON {
                     Surface::Cylinder(Cylinder {
                         origin: section.center + section.axis * base.y,
@@ -1213,118 +1629,386 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
                     })
                 } else {
                     Surface::Cone(Cone {
-                        origin: section.center + section.axis * base.y,
+                        origin: section.center + section.axis * anchor.y,
                         axis: section.axis,
                         radial_u: section.radial_u,
                         radial_v: section.radial_v,
-                        base_radius: base.x,
+                        base_radius: anchor.x,
                         slope,
                         angular_sign,
                     })
                 };
                 push_band(
-                    &mut builder,
-                    surface,
-                    Ring::Circle(low),
-                    Ring::Circle(high),
-                    seams,
-                    (0.0, top.y - base.y),
-                    role,
-                    descending,
+                    builder, surface, low, high, seams, parameters, role, descending,
                 );
             }
             Segment::Arc {
                 center: arc_center,
                 radius,
                 start_angle,
-                sweep,
+                sweep: arc_sweep,
                 ..
             } => {
-                let (Some(low), Some(high)) = (circles[index], circles[index + 1]) else {
+                // An arc swept clockwise is the concave case: the band's
+                // material is on the far side, exactly as for a descending
+                // line. It is built the same way — from its lower parameter
+                // end, so the minor angle always increases, with the angular
+                // sign alone reversing the face. (Flipping the carrier's axis
+                // as well, as this once did, negates the minor angle with it;
+                // the two reversals cancel and leave the face inside out.)
+                let reversed = arc_sweep < 0.0;
+                let (from, to) = (circles[index], circles[index + 1]);
+                let (Some(low), Some(high), angles) = (if reversed {
+                    (to, from, (start_angle + arc_sweep, start_angle))
+                } else {
+                    (from, to, (start_angle, start_angle + arc_sweep))
+                }) else {
                     continue;
                 };
-                // An arc swept the other way round is the concave case: the
-                // band's material is on the far side. A torus and a sphere
-                // reverse through a flipped axis rather than through the
-                // angular sign alone, which negates the minor angle with it —
-                // so the face's own parameters are the negated ones while the
-                // seam edge keeps the section's.
-                let reversed = sweep < 0.0;
-                let sense = if reversed { -1.0 } else { 1.0 };
-                let seam_angles = (start_angle, start_angle + sweep);
-                let angles = (sense * seam_angles.0, sense * seam_angles.1);
-                let seams = [
-                    builder.seam_minor_arc_ring(low, high, 0, 0.0, arc_center, radius, seam_angles),
-                    builder.seam_minor_arc_ring(
-                        low,
-                        high,
-                        1,
-                        HALF_TURN,
-                        arc_center,
-                        radius,
-                        seam_angles,
-                    ),
-                ];
+                let first = builder.seam_minor_arc_ring((low, high), 0, arc_center, radius, angles);
+                let middle =
+                    builder.seam_minor_arc_ring((low, high), 1, arc_center, radius, angles);
+                let last = if builder.partial() {
+                    builder.seam_minor_arc_ring((low, high), 2, arc_center, radius, angles)
+                } else {
+                    first
+                };
+                wedges[index] = Some(WedgeUse {
+                    generators: [first, last],
+                    along_chain: !reversed,
+                });
+                let angular_sign = if reversed { -1.0 } else { 1.0 };
                 // An arc centred on the axis sweeps a sphere. Emitting a torus
                 // of zero major radius instead would be a carrier whose
                 // parameterization collapses onto its own spine.
                 let origin = section.center + section.axis * arc_center.y;
-                let axis = section.axis * sense;
                 let surface = if arc_center.x <= axis_agreement(section) {
                     Surface::Sphere(Sphere {
                         origin,
-                        axis,
+                        axis: section.axis,
                         radial_u: section.radial_u,
                         radial_v: section.radial_v,
                         radius,
-                        angular_sign: sense,
+                        angular_sign,
                     })
                 } else {
                     Surface::Torus(Torus {
                         origin,
-                        axis,
+                        axis: section.axis,
                         radial_u: section.radial_u,
                         radial_v: section.radial_v,
                         major_radius: arc_center.x,
                         minor_radius: radius,
-                        angular_sign: sense,
+                        angular_sign,
                     })
                 };
                 push_band(
-                    &mut builder,
+                    builder,
                     surface,
                     low,
                     high,
-                    seams,
+                    [first, middle, last],
                     angles,
                     role,
                     reversed,
                 );
             }
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                 unreachable!("revolved sections carry lines and arcs only")
             }
         }
     }
 
-    let shell_key = ShellKey(builder.topology.shells.len());
-    let shell_id = builder.allocate();
-    let face_count = builder.topology.faces.len();
-    builder.topology.shells.push(Record {
-        id: shell_id,
-        value: Shell {
-            faces: (0..face_count).map(FaceKey).collect(),
-        },
-    });
-    let solid_id = builder.allocate();
-    builder.topology.solids.push(Record {
-        id: solid_id,
-        value: Solid {
-            outer_shell: shell_key,
-            inner_shells: Vec::new(),
-        },
-    });
-    builder.topology
+    (circles, wedges)
+}
+
+/// The boundary of a sector cap: out from the axis along the first station,
+/// round the rim, and back in along the last — anticlockwise about the cap's
+/// outward normal either way up. The generators run with the chain: inward
+/// for a cap with material below (`outward_up`), outward otherwise.
+fn sector_cap(
+    stations: &[f64; STATIONS],
+    circle: RimCircle,
+    radius: f64,
+    generators: [EdgeKey; 2],
+    outward_up: bool,
+) -> Vec<CoedgeUse> {
+    let [first, middle, last] = *stations;
+    let centre = Point2::new(0.0, 0.0);
+    if outward_up {
+        vec![
+            {
+                let (pcurve, range) = line_pcurve(centre, cap_point(radius, first, false));
+                (generators[0], Orientation::Reverse, pcurve, range)
+            },
+            {
+                let (pcurve, range) = cap_arc_pcurve(radius, (first, middle), false);
+                (circle.edges[0], Orientation::Forward, pcurve, range)
+            },
+            {
+                let (pcurve, range) = cap_arc_pcurve(radius, (middle, last), false);
+                (circle.edges[1], Orientation::Forward, pcurve, range)
+            },
+            {
+                let (pcurve, range) = line_pcurve(cap_point(radius, last, false), centre);
+                (generators[1], Orientation::Forward, pcurve, range)
+            },
+        ]
+    } else {
+        vec![
+            {
+                let (pcurve, range) = line_pcurve(centre, cap_point(radius, last, true));
+                (generators[1], Orientation::Forward, pcurve, range)
+            },
+            {
+                let (pcurve, range) = cap_arc_pcurve(radius, (last, middle), true);
+                (circle.edges[1], Orientation::Reverse, pcurve, range)
+            },
+            {
+                let (pcurve, range) = cap_arc_pcurve(radius, (middle, first), true);
+                (circle.edges[0], Orientation::Reverse, pcurve, range)
+            },
+            {
+                let (pcurve, range) = line_pcurve(cap_point(radius, first, true), centre);
+                (generators[0], Orientation::Reverse, pcurve, range)
+            },
+        ]
+    }
+}
+
+/// The boundary of an annular sector: one loop round both rims and the two
+/// straight sides, anticlockwise about the face's outward normal. The
+/// generators run with the chain: inward for a face with material below
+/// (`outward_up`), outward otherwise.
+fn sector_annulus(
+    stations: &[f64; STATIONS],
+    (inner, inner_radius): (RimCircle, f64),
+    (outer, outer_radius): (RimCircle, f64),
+    generators: [EdgeKey; 2],
+    outward_up: bool,
+) -> Vec<CoedgeUse> {
+    let [first, middle, last] = *stations;
+    let mirrored = !outward_up;
+    let arc = |circle: RimCircle, radius: f64, span: usize, forward: bool| {
+        let range = if span == 0 {
+            (first, middle)
+        } else {
+            (middle, last)
+        };
+        let (pcurve, range) = cap_arc_pcurve(
+            radius,
+            if forward { range } else { (range.1, range.0) },
+            mirrored,
+        );
+        let orientation = if forward {
+            Orientation::Forward
+        } else {
+            Orientation::Reverse
+        };
+        (circle.edges[span], orientation, pcurve, range)
+    };
+    let side = |edge: EdgeKey, azimuth: f64, outward: bool, orientation: Orientation| {
+        let (from, to) = if outward {
+            (inner_radius, outer_radius)
+        } else {
+            (outer_radius, inner_radius)
+        };
+        let (pcurve, range) = line_pcurve(
+            cap_point(from, azimuth, mirrored),
+            cap_point(to, azimuth, mirrored),
+        );
+        (edge, orientation, pcurve, range)
+    };
+    if outward_up {
+        vec![
+            side(generators[0], first, true, Orientation::Reverse),
+            arc(outer, outer_radius, 0, true),
+            arc(outer, outer_radius, 1, true),
+            side(generators[1], last, false, Orientation::Forward),
+            arc(inner, inner_radius, 1, false),
+            arc(inner, inner_radius, 0, false),
+        ]
+    } else {
+        vec![
+            side(generators[1], last, true, Orientation::Forward),
+            arc(outer, outer_radius, 1, false),
+            arc(outer, outer_radius, 0, false),
+            side(generators[0], first, false, Orientation::Reverse),
+            arc(inner, inner_radius, 0, true),
+            arc(inner, inner_radius, 1, true),
+        ]
+    }
+}
+
+/// One section chain as it appears in the two wedge faces: its generators at
+/// the first station, in chain order, and at the last, against it. A chain
+/// that closes through the axis is closed in both by the one axis edge they
+/// share.
+fn wedge_outline(
+    builder: &mut Builder<'_>,
+    section: &RzSection,
+    circles: &[Option<Ring>],
+    wedges: &[Option<WedgeUse>],
+) -> (Vec<CoedgeUse>, Vec<CoedgeUse>) {
+    let segments = &section.segments;
+    // The axis edge runs the way the section closes: from the chain's last
+    // point back down to its first.
+    let axis_edge = if section.closed {
+        None
+    } else {
+        match (circles.last().copied().flatten(), circles[0]) {
+            (Some(last), Some(first)) => {
+                let (from, to) = (last.vertex(0), first.vertex(0));
+                Some(builder.seam_line(from, to))
+            }
+            _ => None,
+        }
+    };
+    let closing = segments
+        .first()
+        .zip(segments.last())
+        .map(|(first, last)| (last.end(), first.start()));
+
+    // At azimuth zero the plane's frame is (radial, axis), so the section
+    // appears exactly as it is, anticlockwise about the outward normal
+    // `radial × axis = -radial_v`.
+    let mut start_uses = Vec::with_capacity(segments.len() + 1);
+    for (segment, wedge) in segments.iter().zip(wedges) {
+        let Some(wedge) = wedge else { continue };
+        let (pcurve, range) = section_pcurve(*segment, false);
+        let orientation = if wedge.along_chain {
+            Orientation::Forward
+        } else {
+            Orientation::Reverse
+        };
+        start_uses.push((wedge.generators[0], orientation, pcurve, range));
+    }
+    if let (Some(edge), Some((from, to))) = (axis_edge, closing) {
+        let (pcurve, range) = line_pcurve(from, to);
+        start_uses.push((edge, Orientation::Forward, pcurve, range));
+    }
+
+    // At the end of the sweep the frame is (axis, radial), whose normal is
+    // the direction of turning; the section is drawn with its coordinates
+    // swapped and walked backwards, which is anticlockwise again.
+    let mut end_uses = Vec::with_capacity(segments.len() + 1);
+    if let (Some(edge), Some((from, to))) = (axis_edge, closing) {
+        let (pcurve, range) = line_pcurve(swapped(to), swapped(from));
+        end_uses.push((edge, Orientation::Reverse, pcurve, range));
+    }
+    for (segment, wedge) in segments.iter().zip(wedges).rev() {
+        let Some(wedge) = wedge else { continue };
+        let (pcurve, range) = section_pcurve(*segment, true);
+        let orientation = if wedge.along_chain {
+            Orientation::Reverse
+        } else {
+            Orientation::Forward
+        };
+        end_uses.push((wedge.generators[1], orientation, pcurve, range));
+    }
+    (start_uses, end_uses)
+}
+
+/// One section chain as swept: the section, its rings, and its wedge uses.
+type SweptSection<'a> = (&'a RzSection, &'a [Option<Ring>], &'a [Option<WedgeUse>]);
+
+/// The two planar faces that close a partial turn: the section at azimuth
+/// zero, and its turned copy at the end of the sweep. A hole's chain runs
+/// clockwise, so its outline in each is already the right way round for a
+/// hole in the face.
+fn push_wedges(
+    builder: &mut Builder<'_>,
+    (outer, circles, wedges): SweptSection<'_>,
+    holes: &[SweptSection<'_>],
+) {
+    let section = builder.section;
+    let end = builder.sweep;
+    let (outer_start, outer_end) = wedge_outline(builder, outer, circles, wedges);
+    let hole_outlines = holes
+        .iter()
+        .map(|(hole, circles, wedges)| wedge_outline(builder, hole, circles, wedges))
+        .collect::<Vec<_>>();
+
+    let start_loop = builder.push_loop(outer_start);
+    let start_holes = hole_outlines
+        .iter()
+        .map(|(start, _)| builder.push_loop(start.clone()))
+        .collect();
+    builder.push_face_with_holes(
+        Surface::Plane(Plane::new(section.center, section.radial_u, section.axis)),
+        start_loop,
+        start_holes,
+        FaceRole::ExtrusionBottom,
+    );
+
+    let end_loop = builder.push_loop(outer_end);
+    let end_holes = hole_outlines
+        .into_iter()
+        .map(|(_, end)| builder.push_loop(end))
+        .collect();
+    builder.push_face_with_holes(
+        Surface::Plane(Plane::new(
+            section.center,
+            section.axis,
+            builder.radial(end),
+        )),
+        end_loop,
+        end_holes,
+        FaceRole::ExtrusionTop,
+    );
+}
+
+/// A section segment drawn in a wedge face's plane: as `(r, z)` in chain
+/// order for the first wedge, or as `(z, r)` against the chain for the last.
+fn section_pcurve(segment: Segment, swap: bool) -> (Curve2, ParameterRange) {
+    match segment {
+        Segment::Line { start, end } => {
+            if swap {
+                line_pcurve(swapped(end), swapped(start))
+            } else {
+                line_pcurve(start, end)
+            }
+        }
+        Segment::Arc {
+            center,
+            radius,
+            start_angle,
+            sweep,
+            ..
+        } => {
+            let (center, u, v, range) = if swap {
+                (
+                    swapped(center),
+                    Vector2::new(0.0, 1.0),
+                    Vector2::new(1.0, 0.0),
+                    ParameterRange::new(start_angle + sweep, start_angle),
+                )
+            } else {
+                (
+                    center,
+                    Vector2::new(1.0, 0.0),
+                    Vector2::new(0.0, 1.0),
+                    ParameterRange::new(start_angle, start_angle + sweep),
+                )
+            };
+            (
+                Curve2::Circle {
+                    center,
+                    u,
+                    v,
+                    radius,
+                },
+                range,
+            )
+        }
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            unreachable!("revolved sections carry lines and arcs only")
+        }
+    }
+}
+
+const fn swapped(point: Point2) -> Point2 {
+    Point2::new(point.y, point.x)
 }
 
 /// Opposite senses for the two halves sharing one degenerate pole edge.
@@ -1346,36 +2030,36 @@ fn axis_agreement(section: &RzSection) -> f64 {
     1.0e-9 * extent
 }
 
-/// Emits the two half-faces of one revolved section segment.
+/// Emits the two faces of one revolved section segment, split halfway round
+/// the turn.
 ///
 /// `reversed` marks a band whose material lies on the far side — a bore, a cup
-/// wall, a concave blend. Its carrier is already parameterized the other way
-/// round in azimuth, so each half covers the opposite rim edge, traversed the
-/// opposite way; everything else about the loop is unchanged.
+/// wall, a concave blend. Its carrier is parameterized the other way round in
+/// azimuth (`u` is minus the azimuth, taken in `[2π - sweep, 2π]`), so each
+/// face covers the other arc of the rim, traversed the other way; everything
+/// else about the loop is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn push_band(
     builder: &mut Builder<'_>,
     surface: Surface,
     low: Ring,
     high: Ring,
-    seams: [EdgeKey; 2],
+    seams: [EdgeKey; STATIONS],
     parameters: (f64, f64),
     role: FaceRole,
     reversed: bool,
 ) {
     let (v_low, v_high) = parameters;
+    let [_, middle, end] = builder.stations();
     for half in 0..2 {
-        let (u0, u1) = if half == 0 {
-            (0.0, HALF_TURN)
-        } else {
-            (HALF_TURN, FULL_TURN)
+        // The face's azimuth span in its own `u`, the generators at its two
+        // ends, and the rim arc it runs along.
+        let (u0, u1, seam_down, seam_up, rim) = match (reversed, half) {
+            (false, 0) => (0.0, middle, seams[0], seams[1], 0),
+            (false, _) => (middle, end, seams[1], seams[2], 1),
+            (true, 0) => (FULL_TURN - end, FULL_TURN - middle, seams[2], seams[1], 1),
+            (true, _) => (FULL_TURN - middle, FULL_TURN, seams[1], seams[0], 0),
         };
-        let (seam_up, seam_down) = if half == 0 {
-            (seams[1], seams[0])
-        } else {
-            (seams[0], seams[1])
-        };
-        let rim = if reversed { 1 - half } else { half };
         let (forward, backward) = if reversed {
             (Orientation::Reverse, Orientation::Forward)
         } else {
@@ -1387,10 +2071,12 @@ fn push_band(
         let (low_edge, low_sense) = match low {
             Ring::Circle(circle) => (circle.edges[rim], forward),
             Ring::Pole(pole) => (pole.edge, half_sense(rim)),
+            Ring::Axis(_) => unreachable!("a curved band ends at a rim or a pole"),
         };
         let (high_edge, high_sense) = match high {
             Ring::Circle(circle) => (circle.edges[rim], backward),
             Ring::Pole(pole) => (pole.edge, half_sense(rim).reversed()),
+            Ring::Axis(_) => unreachable!("a curved band ends at a rim or a pole"),
         };
         let uses = vec![
             {

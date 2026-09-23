@@ -36,7 +36,7 @@ by tests, and **proposed** is a plan not yet executed.
 | [0023](0023-carrier-unified-rims-and-exact-rim-blends.md) | Carrier-unified rims and exact rim blends | Implemented | — |
 | 0024 | *never written* | — | — |
 | [0025](0025-analytic-surface-intersections.md) | Analytic surface intersections and the Boolean domain oracle | Implemented | 0045 (tangency and coincidence) |
-| [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | — |
+| [0026](0026-second-expansion-programme.md) | The second expansion programme | Accepted (Phase 1 delivered) | 0049 (the splines row) |
 | [0027](0027-sketch-edits-commit-on-acceptance.md) | Sketch strokes and typed dimensions commit on acceptance, on the canvas or in the panel | Accepted and implemented | — |
 | [0028](0028-workbench-command-registry-and-contextual-properties.md) | The workbench command registry, ribbon tabs, and contextual properties | Accepted and implemented | — |
 | [0029](0029-velopack-installers-and-in-app-updates.md) | Velopack installers and in-app updates | Accepted and implemented | — |
@@ -56,6 +56,16 @@ by tests, and **proposed** is a plan not yet executed.
 | [0043](0043-two-edges-of-a-corner-meet-in-a-seam.md) | Two edges of a corner meet in a seam | Implemented | 0034 |
 | [0044](0044-a-corner-already-finished-asks-before-it-answers.md) | A corner already finished asks before it answers | Accepted and implemented | 0034, 0043, 0045 |
 | [0045](0045-a-boolean-that-resolves-what-it-touches.md) | A Boolean that resolves what it touches | Implemented | 0025, 0044 |
+| [0046](0046-a-hole-rim-is-one-closed-edge.md) | A hole rim is one closed edge | Implemented | 0023, 0034 |
+| [0047](0047-the-curve-two-cylinders-share.md) | The curve two cylinders share | Implemented | 0025, 0026, 0045 |
+| [0048](0048-a-construction-plane-is-a-feature.md) | A construction plane is a feature | Implemented | 0008, 0014, 0036, 0037, 0041 |
+| [0049](0049-ruled-and-spline-surfaces-enter-the-vocabulary.md) | Ruled and spline surfaces enter the vocabulary | Accepted (K-A and K-B implemented) | 0025, 0045, 0047, 0050; supersedes 0026's splines row |
+| [0050](0050-b-spline-curves-and-surfaces-as-carriers.md) | B-spline curves and surfaces as carriers | Accepted and implemented | 0026, 0047, 0049 |
+| [0051](0051-a-loft-is-a-feature.md) | A loft is a feature | Implemented (workbench) | 0036, 0041, 0048, 0049 |
+| [0052](0052-an-extrusion-distance-can-follow-a-variable.md) | An extrusion distance can follow a variable | Implemented | 0014, 0017, 0021 |
+| [0053](0053-a-part-can-be-saved-into-the-library.md) | A part can be saved into the library, and placed at any values | Implemented | 0017, 0018, 0052 |
+| [0054](0054-a-sketch-dimension-can-follow-a-variable.md) | A sketch dimension can follow a variable | Implemented | 0021, 0052, 0053 |
+| [0055](0055-revolve-and-sweep-are-features.md) | Revolve and sweep are features | Accepted (R1–R3, S1–S3 and construction axes implemented) | 0023, 0026, 0041, 0049, 0050, 0051 |
 
 The 0024 gap is deliberate and recorded rather than backfilled: renumbering
 published records would break every reference that already points at 0025.

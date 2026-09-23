@@ -116,7 +116,7 @@ the CLI prints them; the JSON-RPC server returns them as the error object.
 | Array | `[1, 2, 3]`, `corners[i]` | A 2-array is a 2D point; a 3-array is a 3D point or vector. `a[i]` reads element `i`, counting from 0. |
 | Step | `let b = box(...)` | The bound name of an executed step; passed to Booleans and used for methods. |
 | Body | `let s = standoff(...)` | What a function returns: a step plus the faces it exports, read as `s.top` (section 14). |
-| Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)` | Only valid inside `sketch(entities: [...])`. |
+| Sketch entity | `line(...)`, `circle(...)`, `arc(...)`, `rect(...)`, `spline(...)` | Only valid inside `sketch(entities: [...])`. |
 | Selector | `faces(">Z")`, `nearest(...)`, `b.face("...")`, `faces(">Z").edges()` | Names a face or edge of the current body, or a set of edges, resolved when the step runs. |
 
 ---
@@ -191,8 +191,8 @@ let profile = sketch(on: "XY", label: "profile", entities: [
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
-| `entities` | yes | An array of `line`, `circle`, `arc`, `rect`. |
+| `on` | yes | `"XY"`, `"XZ"`, `"YZ"`, a `plane(...)` — in space, or placed by the body's faces and edges — or a face selector such as `faces(">Z")` or `plate.face("top_face")`. |
+| `entities` | yes | An array of `line`, `circle`, `arc`, `rect`, `spline`. |
 | `label` | no | Step label. |
 
 **Coordinates.** On a world plane, 2D coordinates are that plane's axes with
@@ -200,6 +200,72 @@ the origin at the world origin: `"XY"` maps `[x, y]` to world `(x, y, 0)`;
 `"XZ"` maps `[x, z]` to `(x, 0, z)`; `"YZ"` maps `[y, z]` to `(0, y, z)`. On
 a face, the origin is the **centre of the face** and the axes are the face's
 own; a circle at `[0, 0]` is centred on the face.
+
+### Planes: `plane(...)`
+
+A sketch can sit on any plane in space, not only the three world planes and
+the body's faces. `plane(...)` names one:
+
+```art
+let raised = plane(from: "XY", offset: 30);            // XY lifted 30 along +Z
+let tilted = plane(origin: [0, 0, 40], normal: [0, 1, 1], x_axis: [1, 0, 0]);
+let exact = plane(origin: [0, 0, 40], x_axis: [1, 0, 0], y_axis: [0, 0.6, 0.8]);
+let top = sketch(on: tilted, entities: [circle(radius: 8)], label: "top");
+```
+
+| Form | Meaning |
+|---|---|
+| `plane(from: "XY", offset: d)` | A world plane moved `d` along the side its sketches face: +Z for `"XY"`, −Y for `"XZ"`, +X for `"YZ"`. `offset` defaults to 0. |
+| `plane(origin: [x, y, z], normal: [x, y, z], x_axis: [x, y, z])` | Faces `normal`; the sketch's `x` runs along `x_axis` turned into the plane, and its `y` is `normal × x`. `origin` defaults to the world origin. |
+| `plane(origin: [...], x_axis: [...], y_axis: [...])` | The two axes as given; the plane faces `x_axis × y_axis`. This is how a decompiled script writes a plane back exactly. |
+| `plane(on: face, offset: d)` | A planar face's own frame — the one `sketch(on: face)` uses — moved `d` along the face's outward normal. |
+| `plane(between: [a, b], offset: d)` | Halfway between two parallel planar faces, through the midpoint of their centres, with the first face's axes and normal. |
+| `plane(through: edge, face: f, angle: a, offset: d)` | Hinged on a straight edge like a door: `x` runs along the edge and `y` leans away from it, turned `a` degrees from the face `f` — at 0 it lies on the face, facing out with it; at 90 it stands square to it. `face` may be left out when the edge bounds only one planar face. |
+
+The sketch's 2D coordinates are the plane's own `x` and `y`, from its
+origin. The last three are placed by the current body and resolved when a
+feature first uses the sketch, against the body as it then stands; each takes
+`flip: true` to face the other way, and each is refused by name where it
+cannot be placed — faces that are not parallel, an edge that is curved or not
+on the face, or an edge between two planar faces with no `face:` to say
+which. They are the script forms of the workbench's construction planes (ADR
+0048) and follow the same conventions.
+
+```art
+let b = box(size: [40, 40, 10], label: "b");
+let above = plane(on: faces(">Z"), offset: 20);
+let middle = plane(between: [faces("<X"), faces(">X")]);
+let leaning = plane(through: nearest(point: [20, 0, 10], kind: "edge"), face: faces(">Z"), angle: 60);
+```
+
+### Axes: `axis(...)`
+
+A revolve turns about an axis. `axis(...)` names one, the script form of
+the workbench's construction axes:
+
+```art
+let up = axis(from: "Z");                                   // the world Z axis
+let slanted = axis(origin: [10, 0, 0], direction: [0, 0, 1]);
+let b = box(size: [40, 40, 10], label: "b");
+let hinge = axis(along: nearest(point: [0, 0, 5], kind: "edge"));
+let corner = axis(between: [faces("<X"), faces("<Y")]);
+revolve(sketch: ring, axis: hinge, label: "turned");
+```
+
+| Form | Meaning |
+|---|---|
+| `axis(from: "X")` | A world axis through the origin: `"X"`, `"Y"` or `"Z"`. |
+| `axis(origin: [x, y, z], direction: [x, y, z])` | A line in space. `origin` defaults to the world origin. |
+| `axis(along: edge)` | Along a straight edge, from its start to its end. |
+| `axis(through: face)` | A curved face's own axis: a cylinder's, a cone's, a sphere's or a torus's. |
+| `axis(between: [a, b])` | Where two flat faces meet, running along the first's normal crossed with the second's. |
+
+Every form takes `flip: true` to run the other way, which turns a partial
+revolve the other way. The last three are placed by the current body and
+resolved when the revolve runs, against the body as it then stands; each is
+refused by name where it cannot be placed: a curved edge, a flat face with
+no axis, or two faces that are parallel. A decompiled script writes a placed
+axis back as the `axis(...)` that made it.
 
 **Regions.** Closed loops become regions. A loop inside another loop is a
 hole in it, so the sketch above is a plate with a hole. Intersecting loops
@@ -215,6 +281,29 @@ chain end to end into a closed loop; a loop may close along the revolve axis.
 | `arc(center:, radius:, start_angle:, end_angle:)` | `radius` or `diameter`; angles in degrees, counter-clockwise | Part of a loop with lines or other arcs. |
 | `rect(width:, height:, origin: [x, y])` | `origin` is the minimum corner | A closed loop. |
 | `rect(width:, height:, center: [x, y])` | centred | `rect(width:, height:)` alone is centred on `[0, 0]`. |
+| `spline(points: [[x, y], ...], closed: false)` | at least two points; three when `closed` | A smooth curve through the points. Open, it is part of a loop with lines, arcs or other splines; `closed: true` makes it a loop of its own. |
+| `spline(control_points: [[x, y], ...], degree: 3, closed: false)` | at least two points; `degree` from 1 to 5, default 3, and lowered to one less than the number of points when there are fewer | A curve drawn by its control points instead, on uniform knots: it starts on the first and ends on the last, and is pulled toward the others. `closed: true` runs it back to the first point, with a corner there unless the points either side line up with it. |
+
+**Splines.** A spline is a B-spline curve (ADR 0050), carried exactly: the
+fit-point form is the curve of degree `min(3, n − 1)` through the points at
+their chord-length parameters, and a closed one is the cubic through the
+points and back to the first, with one tangent either side of the seam.
+Either form writes a clamped, non-rational B-spline, the one the sketcher's
+own spline tools draw. Extruded, a spline sweeps a wall that is a B-spline
+surface, and the body is exact and measured exactly. A spline must not touch
+itself or the rest of its loop, and must not stall — two coincident control
+points at an end make a curve with no direction there, refused as
+`BSPLINE_CURVE_DEGENERATE`.
+
+```art
+let blob = sketch(on: "XY", entities: [
+    spline(points: [[18, 0], [9, 11], [-6, 13], [-17, 2], [-10, -10], [6, -12]], closed: true),
+], label: "blob");
+let slot = sketch(on: "XY", entities: [
+    spline(control_points: [[10, 0], [8, 7], [-8, 7], [-10, 0]], degree: 2),
+    line(start: [-10, 0], end: [10, 0]),
+], label: "slot");
+```
 
 ---
 
@@ -226,7 +315,7 @@ chain end to end into a closed loop; a loop may close along the revolve axis.
 let base = extrude(sketch: profile, distance: 6, label: "base");
 extrude(sketch: pocket, distance: 3, operation: "cut", label: "pocket_cut");
 let boss = extrude(sketch: boss_profile, distance: 12, operation: "add", label: "boss");
-let frustum = extrude(sketch: square, distance: 10, draft: 5, label: "frustum");
+let frustum = extrude(sketch: square, distance: 10, draft: -5, label: "frustum");
 ```
 
 | Argument | Required | Meaning |
@@ -234,12 +323,91 @@ let frustum = extrude(sketch: square, distance: 10, draft: 5, label: "frustum");
 | `sketch` | yes | The sketch step. |
 | `distance` | yes | Extrusion length along the sketch plane's normal. |
 | `operation` | no | `"new"` (default), `"add"` (also `"join"`, `"union"`), `"cut"` (also `"subtract"`). |
-| `draft` | no | Draft angle in degrees; the section shrinks toward the far end. New bodies only. |
+| `draft` | no | Draft angle in degrees. Positive leans the walls outward, so the section grows toward the far end; negative leans them inward, as the `frustum` above does. New bodies only. |
 | `regions` | no | Which regions to extrude, by index, when a sketch has several. Default: all. |
 
 `"add"` and `"cut"` need a sketch drawn **on a face** of the current body
 (`sketch(on: faces(">Z"), ...)`). A sketch on a world plane can only make a
 new body; join it with `union` afterwards if that is what you want.
+
+A sketch with a spline extrudes exactly as a new body. Added or cut, its
+B-spline walls are more than the exact Boolean engines carry yet, so the
+step is built on the faceted tier and says so (rung `face-feature/faceted`,
+tier `approximate`). A `draft` offsets the section, and the offset of a
+spline is not a spline: a drafted extrusion of a sketch with a spline is
+refused (`LOFT_OFFSET_SPLINE_UNSUPPORTED`).
+
+### `loft`
+
+```art
+let base = sketch(on: plane(from: "XY"), entities: [rect(width: 60, height: 60)], label: "base");
+let spigot = sketch(on: plane(from: "XY", offset: 80), entities: [circle(diameter: 40)], label: "spigot");
+let duct = loft(sections: [base, spigot], label: "duct");
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `sections` | yes | Two sketches or more, each on a plane of its own. |
+| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`. |
+| `label` | no | Step label. |
+
+The body runs from the first section to the last, through the others in
+order. The sketches may be on any planes that are not the same plane —
+parallel, offset sideways, tilted, or not parallel at all — as long as no
+section reaches through its neighbours' planes. Each sketch must be one
+region: an outer loop of lines, arcs, circles and splines, with holes if
+every section has the same number of them.
+
+**How the sections pair up.** Corners pair with corners. With as many
+segments on both sides they pair in order, starting wherever makes the
+straight rungs between the sections shortest. With different numbers each
+side is split, exactly, where the other has a corner, at the same fraction of
+the way round: a square to a circle rules each side of the square to a
+quarter of the circle, the circle cut where it comes nearest the square's
+first corner. Two circles pair at equal angles. Holes pair with the hole in
+the other section whose centre is nearest.
+
+**What the walls are.** Two straight edges in one plane make a flat wall,
+and two arcs about one axis make a cone or a cylinder, so a frustum or a
+tapered boss is built from the same exact surfaces an extrusion is. Every
+other wall is a ruled surface — the straight lines between its two edges —
+which is exact and measured exactly (ADR 0049). The Boolean engines do not
+carry ruled walls yet: an `"add"` or `"cut"` loft whose walls are all flat,
+conical or cylindrical is exact; one with ruled walls is built on the
+faceted tier and says so (rung `loft/faceted`, tier `approximate`).
+
+**Splines in a section.** A spline piece is ruled to the piece it pairs
+with by a B-spline wall, exact like the others (ADR 0050). Where an arc
+pairs with a spline, the arc is carried by its cubic fit, within half the
+model's linear agreement of the circle (half a picometre by default), so
+the two can share one wall. A smooth loft carries its arcs the same way.
+
+**Three sections or more.** A loft through several sections is smooth: the
+sections are put into one correspondence by the rules above, applied from
+each section to the next, and every wall is one B-spline surface through
+all of them, cubic along the loft from four sections and quadratic through
+three. The walls pass through every section exactly and bend smoothly
+through the middle ones, with no crease there; the first and last sections
+are the caps. The loft's shape between two sections depends on where the
+sections are along it, so one set of sections spaced differently makes a
+different body.
+
+```art
+let foot = sketch(on: plane(from: "XY"), entities: [rect(width: 40, height: 40)], label: "foot");
+let belly = sketch(on: plane(from: "XY", offset: 40), entities: [circle(diameter: 64)], label: "belly");
+let lip = sketch(on: plane(from: "XY", offset: 120), entities: [circle(diameter: 36)], label: "lip");
+let vase = loft(sections: [foot, belly, lip], label: "vase");
+```
+
+A loft is refused by name when its rungs or walls would cross
+(`LOFT_RUNGS_CROSS`), a wall would pinch to a point (`LOFT_WALL_DEGENERATE`),
+two neighbouring sections share a plane (`LOFT_SECTIONS_COPLANAR`), one
+reaches through a neighbour's plane (`LOFT_SECTION_CROSSES_PLANE`), or their
+holes do not pair (`LOFT_HOLE_COUNT_MISMATCH`). A smooth loft can do one
+thing a ruled one cannot: bend back on itself between two sections, when
+the sections are spaced so unevenly that the curve through them overshoots.
+That is refused too (`LOFT_SKIN_FOLDS`); space the sections more evenly or
+add one where the loft turns.
 
 ### `revolve`
 
@@ -253,10 +421,11 @@ let ring = revolve(sketch: section, axis: [0, 0, 1], label: "ring");
 | Argument | Required | Meaning |
 |---|---|---|
 | `sketch` | yes | A sketch whose plane contains the axis. |
-| `axis` | no | Axis direction. Default `[0, 0, 1]`. |
-| `axis_origin` | no | A point on the axis. Default `[0, 0, 0]`. |
-| `angle` | no | Degrees. Default and only supported value: `360`. |
+| `axis` | no | Axis direction, or an `axis(...)`. Default `[0, 0, 1]`. |
+| `axis_origin` | no | A point on the axis, with a direction. Default `[0, 0, 0]`; an `axis(...)` says where it runs itself. |
+| `angle` | no | Degrees. Default `360`, a full turn. Less turns that far right-handed about `axis`, and closes the solid with the section at each end; a negative angle turns the other way. |
 | `regions` | no | As for `extrude`. |
+| `operation` | no | `"new"` (default), `"add"` or `"cut"`, as for `extrude`: an add or cut joins the revolve to, or takes it from, the current body. Turned about the body's own axis, as a groove in a shaft is, it is exact whatever its faces; about another axis, a cone, sphere or torus face takes the faceted tier. |
 
 The section must lie on one side of the axis (touching it is fine). A section
 drawn on `"XZ"` about `[0, 0, 1]` is the usual `(r, z)` half-section: `x` is
@@ -408,7 +577,12 @@ exactly, and so do the cylinders of a filleted vertical edge.
 axis or on itself. The offset happens in the section, which carries the
 whole boundary, so a two-diameter turned hub, a tapered post and a tube
 all hollow to one wall measured square to the surface. Every open face
-must then be a cap square to the axis.
+must then be a cap square to the axis, or a wedge face of a partial turn.
+A partial turn keeps one wall along each closed wedge face, and past half a
+turn that wall bends round the axis. Opening a wedge face, up to half a
+turn, cuts the body away as a cutaway; beyond half a turn it is refused. A
+partial cone's closed shell is faceted and labelled (`shell/faceted`),
+since its wall meets the wedge wall in a hyperbola.
 
 Refusals are by name. A wall that leaves no floor or no core, or one
 thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
@@ -417,9 +591,11 @@ thicker than half the narrowest neck, is `SHELL_WALL_INVALID` or
 `SHELL_BLEND_UNSUPPORTED`: the inner surface would be the offset of a
 torus or a sphere with the material on the far side of the tube, which
 this release's carriers do not express, so shell first and blend after.
-Opening a cap takes the wall away through the Boolean engine, so a body
-whose surfaces that engine does not carry yet — a cone, today — is
-`SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the same body shells closed.
+Opening a cap takes the wall away through the Boolean engine. A body of
+revolution and its core turn about one axis, so the wall comes away in
+their shared section, exactly, cones included. A partial cone's core is
+faceted, so opening it is `SHELL_OPEN_REVOLVE_UNSUPPORTED`, while the
+same body shells closed.
 
 ### `union`, `difference`, `intersection`
 
@@ -742,16 +918,21 @@ For an agent, the rules that make this reliable:
 - Pick selector points that stay on the face or edge you mean after every
   earlier step has run. `faces(">Z")` means the highest upward face.
 - For a fillet on a round rim, name both half-circle edges.
-- Keep cuts inside the face you drill from; a cut that runs into other
-  features may fall to the faceted tier and take much longer.
+- Cuts may cross each other freely where they meet flat faces and round
+  bores or slots — of any radius, on any axis — and stay exact. A cut that
+  runs into a blend's rounded band may fall to the faceted tier and take
+  much longer; drill before you fillet.
 - Angles are degrees, everywhere.
 - Test with `cargo run -p artificer-api-server -- run part.art`; the output
   names the failing step and why.
 
 ## 13. Not in 0.3
 
-Partial revolves, sweeps and lofts between arbitrary sections, concave
-fillets between a boss and its plate, text as sketch geometry from a
+Sweeps, revolved splines, drafted splines, exact Booleans with a loft's
+ruled or B-spline walls or a spline extrusion's, or with a cone, sphere or
+torus turned about another axis than the body's (they fall to the faceted
+tier),
+concave fillets between a boss and its plate, text as sketch geometry from a
 script, and threads. A script builds parts; joints and occurrences belong
 to a document, so a mechanism is assembled in the workbench and analysed
 through section 18 rather than written here. `shell` covers prisms and

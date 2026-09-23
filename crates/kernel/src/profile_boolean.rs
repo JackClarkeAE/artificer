@@ -223,6 +223,64 @@ pub(crate) fn imprinted_first_loops(
         .collect()
 }
 
+/// Loose pieces split wherever one crosses or touches another, so that they
+/// meet only at their ends: a planar arrangement a face walk can trace.
+///
+/// A section's curves can cross where no edge of the other solid is — the
+/// pinch of a Steinmetz seam is two ellipses crossing where the cylinders
+/// are tangent — and a walk that did not know it would trace one loop
+/// through the crossing where there are two cells. The cuts come from the
+/// Boolean's own crossing code, and both pieces take the very point it
+/// finds, so the pieces either side of a crossing meet there to the bit.
+pub(crate) fn split_at_mutual_crossings(
+    pieces: &[Segment],
+    precision: PrecisionPolicy,
+) -> Result<Vec<Segment>, ProfileBooleanError> {
+    let tolerances = Tolerances::from(precision);
+    // A point on a straight piece that runs along a parameter direction is put
+    // on it exactly. Where one piece's end lands on another's interior the
+    // crossing adopts that end, and the end came from its own arithmetic — a
+    // ring chord cut there would lose its level by the difference, which the
+    // sewer reads as a helix.
+    let aligned = |piece: Segment, point: Point2| -> Point2 {
+        let Segment::Line { start, end } = piece else {
+            return point;
+        };
+        let level = |a: f64, b: f64| (a - b).abs() <= 1.0e-12 * a.abs().max(b.abs()).max(1.0);
+        Point2::new(
+            if level(start.x, end.x) {
+                start.x
+            } else {
+                point.x
+            },
+            if level(start.y, end.y) {
+                start.y
+            } else {
+                point.y
+            },
+        )
+    };
+    let mut cuts: Vec<Vec<Cut>> = vec![Vec::new(); pieces.len()];
+    for first in 0..pieces.len() {
+        for second in first + 1..pieces.len() {
+            for crossing in segment_crossings(pieces[first], pieces[second], tolerances)? {
+                let point = aligned(pieces[second], aligned(pieces[first], crossing.point));
+                if let Some(parameter) = crossing.first_interior {
+                    cuts[first].push(Cut { parameter, point });
+                }
+                if let Some(parameter) = crossing.second_interior {
+                    cuts[second].push(Cut { parameter, point });
+                }
+            }
+        }
+    }
+    let mut split = Vec::with_capacity(pieces.len());
+    for (piece, cuts) in pieces.iter().zip(&cuts) {
+        split.extend(split_segment(*piece, cuts, tolerances)?);
+    }
+    Ok(split)
+}
+
 /// Every region's loops, welded and oriented, concatenated into one set.
 fn oriented_loop_sets(
     regions: &[ProfileRegion],
@@ -349,9 +407,9 @@ pub(crate) fn chain_welded_segments(
                     start_angle,
                     sweep,
                 },
-                other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
-                    other.with_endpoints(start, end)
-                }
+                other @ (Segment::Ellipse { .. }
+                | Segment::Harmonic { .. }
+                | Segment::Trace { .. }) => other.with_endpoints(start, end),
             }
         })
         .collect();
@@ -586,6 +644,7 @@ fn reverse_segment(segment: Segment) -> Segment {
             sweep: -sweep,
         },
         other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => other.reversed(),
+        trace @ Segment::Trace { .. } => trace.reversed(),
     }
 }
 
@@ -647,6 +706,7 @@ fn weld_loop(
             other @ (Segment::Ellipse { .. } | Segment::Harmonic { .. }) => {
                 other.with_endpoints(expected, other.end())
             }
+            trace @ Segment::Trace { .. } => trace.with_endpoints(expected, trace.end()),
         };
     }
     Ok(segments)
@@ -766,7 +826,9 @@ fn segment_length(segment: Segment) -> f64 {
     match segment {
         Segment::Line { start, end } => (end.x - start.x).hypot(end.y - start.y),
         Segment::Arc { radius, sweep, .. } => radius * sweep.abs(),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.length(),
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+            segment.length()
+        }
     }
 }
 
@@ -804,6 +866,11 @@ fn parameter_of(segment: Segment, point: Point2) -> f64 {
             arc_fraction(across.atan2(along), start_angle, sweep)
         }
         Segment::Harmonic { start, end, .. } => (point.x - start.x) / (end.x - start.x),
+        // A trace piece is a graph over its own face's azimuth, so the
+        // abscissa is the parameter, moved by the shift.
+        Segment::Trace {
+            shift, from, to, ..
+        } => (point.x - shift.x - from) / (to - from),
     }
 }
 
@@ -844,6 +911,7 @@ fn evaluate(segment: Segment, parameter: f64) -> Point2 {
             )
         }
         Segment::Ellipse { .. } | Segment::Harmonic { .. } => segment.point_at(parameter),
+        trace @ Segment::Trace { .. } => trace.point_at(parameter),
     }
 }
 
@@ -948,6 +1016,33 @@ fn carrier_overlap(first: Segment, second: Segment, tolerances: Tolerances) -> O
             Some(Overlap {
                 ends: [at(low), at(high)],
                 same_way: (s1 >= 0.0) == (s2 >= 0.0),
+            })
+        }
+        // Two section chords on one cylinder along the same oblique trace:
+        // the edge where a bore meets a wall that a tool's own wall then
+        // continues. The carrier is a graph over the azimuth, so the shared
+        // stretch is the overlap of the two azimuth spans.
+        (
+            Segment::Harmonic {
+                mean,
+                amplitude,
+                phase,
+                start: p0,
+                end: p1,
+            },
+            Segment::Harmonic {
+                start: q0, end: q1, ..
+            },
+        ) if harmonics_share_carrier(first, second, tolerances) => {
+            let low = p0.x.min(p1.x).max(q0.x.min(q1.x));
+            let high = p0.x.max(p1.x).min(q0.x.max(q1.x));
+            if high - low <= tolerances.minimum {
+                return None;
+            }
+            let at = |x: f64| Point2::new(x, amplitude.mul_add((x - phase).cos(), mean));
+            Some(Overlap {
+                ends: [at(low), at(high)],
+                same_way: (p1.x >= p0.x) == (q1.x >= q0.x),
             })
         }
         _ => None,
@@ -1287,6 +1382,27 @@ fn section_carrier_crossings(
                 phase,
                 ..
             } => point.y - (mean + amplitude * (point.x - phase).cos()),
+            Segment::Trace {
+                host,
+                other,
+                branch,
+                shift,
+                ..
+            } => {
+                // Height above this piece's own root, as for a harmonic.
+                // The quadratic `a·y² + b·y + c` is the curve's implicit
+                // form too, but it vanishes on *both* roots, and a piece is
+                // one of them: a carrier that crossed the other root would
+                // read as crossing this piece, at a point the piece never
+                // reaches, and the abscissa alone — which is all a graph's
+                // parameter looks at — would place it inside the span.
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                point.y - shift.y - trace.height_clamped(point.x - shift.x)
+            }
         }
     };
     // The chord's whole carrier is not bounded for a harmonic, so sample the
@@ -1383,6 +1499,24 @@ fn section_carrier_crossings(
         }
     }
     candidates.dedup_by(|a, b| (a.x - b.x).hypot(a.y - b.y) <= tolerances.agreement);
+    // A crossing with a straight carrier is put on it exactly. It was found
+    // walking the chord, so it lies on the chord to the last bit and on the
+    // line only to the bisection's last step — and a ring chord on a
+    // cylinder cut at such a point comes out a hundred-billionth off level,
+    // which to the sewer is a helix. The chord is defined by its own
+    // parameters, not by its ends, so moving its end by that much onto the
+    // line moves nothing it is made of.
+    if let Segment::Line { start, end } = other {
+        let (dx, dy) = (end.x - start.x, end.y - start.y);
+        let square = dx.mul_add(dx, dy * dy);
+        if square > 0.0 {
+            for candidate in &mut candidates {
+                let along =
+                    (candidate.x - start.x).mul_add(dx, (candidate.y - start.y) * dy) / square;
+                *candidate = Point2::new(dx.mul_add(along, start.x), dy.mul_add(along, start.y));
+            }
+        }
+    }
     Ok(candidates)
 }
 
@@ -1439,13 +1573,19 @@ fn arc_spans_overlap(first: Segment, second: Segment) -> bool {
     else {
         return false;
     };
+    // Strictly inside the span: an end that lands on the other arc's start
+    // or end is a vertex the two share, not a stretch they share. Two halves
+    // of one circle split at the same points do exactly that, and reading
+    // the shared vertex as an overlap refused the pair the coincidence rule
+    // exists to resolve.
     let inside = |angle: f64, start: f64, sweep: f64| {
         let progress = if sweep >= 0.0 {
             (angle - start).rem_euclid(std::f64::consts::TAU)
         } else {
             (start - angle).rem_euclid(std::f64::consts::TAU)
         };
-        progress < sweep.abs()
+        let ends = 1.0e-9;
+        progress > ends && progress < sweep.abs() - ends
     };
     inside(b_start, a_start, a_sweep)
         || inside(b_start + b_sweep, a_start, a_sweep)
@@ -1502,6 +1642,29 @@ fn split_segment(
         return Ok(vec![segment]);
     }
 
+    // A line is cut on itself. A cut can adopt another piece's vertex, which
+    // came from that piece's arithmetic and sits a few ulps off this line;
+    // cut there, a line along a parameter direction would no longer run
+    // along it. The foot of the perpendicular is on the line exactly, and
+    // welding brings the other piece's vertex to it.
+    let ordered: Vec<Cut> = match segment {
+        Segment::Line { start, end } => {
+            let (dx, dy) = (end.x - start.x, end.y - start.y);
+            let square = dx.mul_add(dx, dy * dy);
+            ordered
+                .into_iter()
+                .map(|cut| {
+                    let along =
+                        (cut.point.x - start.x).mul_add(dx, (cut.point.y - start.y) * dy) / square;
+                    Cut {
+                        parameter: cut.parameter,
+                        point: Point2::new(dx.mul_add(along, start.x), dy.mul_add(along, start.y)),
+                    }
+                })
+                .collect()
+        }
+        _ => ordered,
+    };
     let mut result = Vec::with_capacity(ordered.len() + 1);
     let mut cursor = segment.start();
     let mut cursor_parameter = 0.0;
@@ -1564,6 +1727,24 @@ fn sub_segment(
             sweep: sweep * (end_parameter - start_parameter),
         },
         section @ Segment::Harmonic { .. } => section.with_endpoints(start, end),
+        Segment::Trace {
+            host,
+            other,
+            branch,
+            shift,
+            from,
+            to,
+            ..
+        } => Segment::Trace {
+            host,
+            other,
+            branch,
+            shift,
+            from: (to - from).mul_add(start_parameter, from),
+            to: (to - from).mul_add(end_parameter, from),
+            start,
+            end,
+        },
     }
 }
 
@@ -1572,7 +1753,10 @@ fn sub_segment(
 /// holes need no distinction here. The loops are pre-wrapped once per
 /// operand: classification samples every piece, and cloning the segment
 /// lists per sample would dominate the whole stage.
-fn point_in_loops(point: Point2, loops: &[crate::analytic_extrusion::AnalyticLoop]) -> bool {
+pub(crate) fn point_in_loops(
+    point: Point2,
+    loops: &[crate::analytic_extrusion::AnalyticLoop],
+) -> bool {
     let mut inside = false;
     for profile_loop in loops {
         if crate::analytic_extrusion::point_inside_loop(point, profile_loop) {
@@ -1582,7 +1766,7 @@ fn point_in_loops(point: Point2, loops: &[crate::analytic_extrusion::AnalyticLoo
     inside
 }
 
-fn wrap_loops(loops: &[Vec<Segment>]) -> Vec<crate::analytic_extrusion::AnalyticLoop> {
+pub(crate) fn wrap_loops(loops: &[Vec<Segment>]) -> Vec<crate::analytic_extrusion::AnalyticLoop> {
     loops
         .iter()
         .map(|segments| crate::analytic_extrusion::AnalyticLoop {
@@ -1647,25 +1831,68 @@ fn point_key(point: Point2) -> (u64, u64) {
 /// the exact-identity chaining below sees the arrangement the geometry means
 /// rather than the one the arithmetic produced.
 fn weld_piece_endpoints(pieces: Vec<Piece>, tolerances: Tolerances) -> Vec<Piece> {
-    let mut representatives: Vec<Point2> = Vec::new();
-    let mut canonical = |point: Point2| -> Point2 {
-        if let Some(found) = representatives.iter().find(|candidate| {
-            (candidate.x - point.x).hypot(candidate.y - point.y) <= tolerances.minimum
-        }) {
-            return *found;
+    weld_aligned(
+        pieces.into_iter().map(|piece| piece.segment).collect(),
+        tolerances.minimum,
+    )
+    .into_iter()
+    .map(|segment| Piece { segment })
+    .collect()
+}
+
+/// Pieces with every cluster of ends within `weld` of one another made one
+/// point, so a walk can key on exact bits.
+///
+/// The point a cluster becomes keeps every straight piece through it running
+/// the way it ran: its abscissa is a vertical line's, if one ends there, and
+/// its ordinate a horizontal line's. Ends that meet arrive by different
+/// arithmetic and agree only to the last few bits. On a plane that is
+/// harmless, but on a cylinder a vertical line is a generator and a
+/// horizontal one a ring, and a line that took its neighbour's azimuth or
+/// height would run neither way — to the sewer, a helix. A curve's ends carry
+/// no such constraint, since a curve is its own parameters, so they are the
+/// ones that move.
+pub(crate) fn weld_aligned(pieces: Vec<Segment>, weld: f64) -> Vec<Segment> {
+    let mut seeds: Vec<Point2> = Vec::new();
+    let mut cluster = |point: Point2| -> usize {
+        if let Some(found) = seeds
+            .iter()
+            .position(|seed| (seed.x - point.x).hypot(seed.y - point.y) <= weld)
+        {
+            return found;
         }
-        representatives.push(point);
-        point
+        seeds.push(point);
+        seeds.len() - 1
+    };
+    let ends: Vec<[usize; 2]> = pieces
+        .iter()
+        .map(|piece| [cluster(piece.start()), cluster(piece.end())])
+        .collect();
+    let level = |a: f64, b: f64| (a - b).abs() <= 1.0e-12 * a.abs().max(b.abs()).max(1.0);
+    let mut abscissas: Vec<Option<f64>> = vec![None; seeds.len()];
+    let mut ordinates: Vec<Option<f64>> = vec![None; seeds.len()];
+    for (piece, [first, last]) in pieces.iter().zip(&ends) {
+        if let Segment::Line { start, end } = piece {
+            if level(start.x, end.x) {
+                abscissas[*first] = Some(start.x);
+                abscissas[*last] = Some(start.x);
+            }
+            if level(start.y, end.y) {
+                ordinates[*first] = Some(start.y);
+                ordinates[*last] = Some(start.y);
+            }
+        }
+    }
+    let point = |index: usize| {
+        Point2::new(
+            abscissas[index].unwrap_or(seeds[index].x),
+            ordinates[index].unwrap_or(seeds[index].y),
+        )
     };
     pieces
         .into_iter()
-        .map(|piece| {
-            let start = canonical(piece.segment.start());
-            let end = canonical(piece.segment.end());
-            Piece {
-                segment: piece.segment.with_endpoints(start, end),
-            }
-        })
+        .zip(ends)
+        .map(|(piece, [first, last])| piece.with_endpoints(point(first), point(last)))
         .collect()
 }
 

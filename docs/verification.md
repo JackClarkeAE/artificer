@@ -64,11 +64,24 @@ are stable, slash-separated paths:
 | --- | --- |
 | `primitive/cuboid`, `primitive/revolved-annulus` | A box or a cylinder. |
 | `extrusion/polygon`, `extrusion/linear-profile`, `extrusion/analytic-profile` | A new body from a sketch; the last two carry arcs and circles exactly. |
+| `extrusion/spline-profile` | A new body from a sketch with a spline in it (ADR 0050): each spline sweeps a B-spline wall, exactly. |
 | `revolve/full-turn` | A revolved section. |
+| `revolve/partial-turn` | A section turned through less than a full turn (ADR 0055 R3): its curved faces are split halfway round the turn, and two planar wedge faces, the section and its turned copy, close it. |
+| `revolve/boolean-prism`, `revolve/boolean-analytic` | A revolve added to or cut from the body exactly (ADR 0055): its faces came out planes and coaxial cylinders. |
+| `revolve/boolean-coaxial`, `sweep/boolean-coaxial`, `loft/boolean-coaxial`, `face-feature/coaxial-section`, `boolean/coaxial` | A body of revolution added to, cut from or combined with a body turned about the same axis: the Boolean of the two `(r, z)` sections, turned again (ADR 0026 F4). Exact for every carrier the section builder makes, cones, spheres and tori included. |
+| `revolve/faceted` | A revolve added to or cut from the body on the faceted tier, because it has a cone, torus or sphere face the exact engines do not carry and it does not turn about the body's own axis. Carries `REVOLVE_FACETED_APPROXIMATION` and the reason, `REVOLVE_EXACT_ROUTE_DECLINED`. |
+| `sweep/straight` | A profile swept along a straight path (ADR 0055): lofted to its copy at the far end, with planes, cylinders and ruled walls. Exact. |
+| `sweep/revolve` | A profile swept along one circular arc about an axis in its own plane, turned with the path: a partial revolve. Exact. |
+| `sweep/skinned` | A profile swept along any other path: skinned through copies of it along the path, graded in wherever the skin strays. Carries `SWEEP_APPROXIMATION_TOLERANCE`, measuring the worst departure from the true sweep against the approximation budget. |
+| `sweep/boolean-prism`, `sweep/boolean-analytic`, `sweep/faceted` | A sweep added to or cut from the body, on the same ladder as a revolve's. A skinned sweep takes the faceted tier, skinned to that tier's own chord tolerance rather than the approximation budget, and carries `SWEEP_FACETED_APPROXIMATION` and the reason, `SWEEP_EXACT_ROUTE_DECLINED`; its `SWEEP_APPROXIMATION_TOLERANCE` states the looser tolerance it met. |
 | `loft/straight`, `loft/offset-section` | An extrusion, drafted or not, built as a loft. |
+| `loft/sections` | A new body lofted between two planar sections (ADR 0049): planes, cylinders and cones where exact, ruled walls otherwise, and B-spline walls ruled between the rows where a section has a spline (ADR 0050). |
+| `loft/skinned` | A new body lofted smoothly through three planar sections or more (ADR 0050): every wall one B-spline surface through all the sections, smooth across the middle ones. |
+| `loft/boolean-prism`, `loft/boolean-analytic` | A loft added to or cut from the body, exactly, by the prism reduction or the general engine: every wall came out a plane, a cylinder or a cone. |
+| `loft/faceted` | A loft added to or cut from the body on the faceted tier, because a wall is ruled or a B-spline and the exact engines do not carry it. Carries `LOFT_FACETED_APPROXIMATION` and the reason, `LOFT_EXACT_ROUTE_DECLINED`. |
 | `face-feature/exact-prism` | An add or cut on a face that the exact prism path owns. |
 | `face-feature/analytic-boolean` | A cut that crossed earlier geometry, rebuilt exactly by the analytic Boolean engine. |
-| `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier. |
+| `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier; also every add or cut whose profile has a spline, whose B-spline walls the exact engines do not carry (ADR 0050). |
 | `drill/exact-prism`, `rib/exact-prism`, `push-pull/planar` | The kernel's own drill, rib and push/pull. |
 | `edge-finish/analytic`, `edge-finish/prism`, `edge-finish/rim-blend`, `edge-finish/rim-loop-blend`, `edge-finish/logical-successor` | Exact fillets and chamfers, by the rung that carried them. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
@@ -77,7 +90,8 @@ are stable, slash-separated paths:
 | `pattern/replay` | A feature pattern; the instance steps `<label>/<n>` under it carry the rungs that built each instance. |
 | `pattern/exact-instances`, `pattern/boolean` | A whole-body pattern: copies that clear one another placed as solids of one body, or copies that overlap joined through the Boolean ladder. |
 | `shell/open-prism`, `shell/closed-prism` | A shell of a prism: the open face's inward offset cut as a pocket, or a core one wall in from every face enclosed as a void. |
-| `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section. |
+| `shell/open-revolve`, `shell/closed-revolve` | A shell of a solid of revolution, offset in its own section; a partial turn's core also loses a prism along the axis that keeps one wall along each closed wedge face. |
+| `shell/faceted` | A shell whose pocket, or whose partial turn's core, the exact rungs could not cut; a partial cone's wedge wall meets its conical core in a hyperbola. A cut core carries `SHELL_FACETED_APPROXIMATION` and the reason, `SHELL_EXACT_ROUTE_DECLINED`. |
 | `transform/similarity` | A rigid transform. |
 
 A rung ending in `/faceted` is the approximate tier; the step also carries
@@ -90,11 +104,20 @@ digest is a function of that geometry alone.
 Every face in `body.faces` carries its carrier with the numbers that define
 it (`surface`: `plane` with `origin`; `cylinder` with
 `origin`, `axis`, `radius`; `cone` with `apex`, `axis`, `half_angle_degrees`;
-`sphere`; `torus`), an exact `area`, a `centre` (the area centroid of a
+`sphere`; `torus`; `ruled` with `first_rail` and `second_rail`, each a
+`line`, `circular_arc` or `elliptical_arc` with its `start` and `end`;
+`bspline` with `degree_u`, `degree_v`, `control_points_u` and
+`control_points_v`), an
+exact `area`, a `centre` (the area centroid of a
 planar face; a point at the parametric centre of a curved one), the outward
 `normal` there, the number of `loops` (one, plus one per hole), a one-line
 `summary`, and its `names`. Edges carry their curve (`line`, `circular_arc`,
-`elliptical_arc`), exact `length`, `midpoint`, `summary` and `names`.
+`elliptical_arc`, `surface_trace` — where two cylinders meet in a curve
+none of those describes, reported by its ends and the two radii
+`host_radius` and `other_radius` — or `bspline`, reported by its ends, its
+`degree` and its number of `control_points`), exact `length`, `midpoint`,
+`summary` and `names`. The body's `surfaces` count carries `bspline` beside
+the other kinds.
 
 The same description is available for one selected entity through the
 JSON-RPC method `query.describe`, which takes a selector, and through
@@ -230,8 +253,11 @@ JSON-RPC server or the command line rather than directly.
 carrier (plane, cylinder, cone, sphere, torus as the five STEP elementary
 surfaces), every edge its exact curve (`line`, `circle`, `ellipse`), every
 coedge an `oriented_edge`, cavities as `brep_with_voids`, in millimetres.
-Nothing is tessellated, so a reader recovers the volume and area the
-kernel measures. `--faceted` writes the display triangles as a STEP
+Where two cylinders meet in a quartic, which STEP has no entity for, the
+edge is an `intersection_curve` naming both cylinders. Its 3D curve is a
+cubic B-spline within `1e-7` mm of the true curve, a tenth of the file's
+declared accuracy (ADR 0047). Nothing is tessellated, so a reader recovers
+the volume and area the kernel measures. `--faceted` writes the display triangles as a STEP
 surface model instead, for mesh consumers. Over JSON-RPC the methods are
 `export.step` and `export.step_faceted`; in Rust, `export_step`,
 `export_step_bodies` (several bodies as one product) and
@@ -242,6 +268,8 @@ The exporter's own test reads every fixture back as a B-rep: references
 resolve, loops chain and close, every edge is used by exactly two faces in
 opposite senses, every vertex lies on its edge's curve, and every face's
 `same_sense` agrees with the kernel's outward normal at the face centre.
+An intersection curve's spline is also evaluated by de Boor's recursion
+across every knot span, and each point must lie on both named cylinders.
 The independent check is the OpenCascade oracle of ADR 0001:
 `tools/oracle-occt/step_measure.py` imports a file with OCCT and prints
 its volume and area, and with `ARTIFICER_STEP_ORACLE` pointing at it the

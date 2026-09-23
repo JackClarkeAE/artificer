@@ -6,18 +6,19 @@ use std::time::Instant;
 use crate::{CancellationToken, ExecutionOutcome, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, EdgeFinishKind,
-    ExecuteRequest, KernelCommand, OperationReport, PlanarAxis2, PlanarCurve2, PlanarFrame3,
-    PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3, PrecisionPolicy, RequestId,
-    RevolveAngle, SnapshotId, Tier, Vector3,
+    ExecuteRequest, KernelCommand, LoftOperation, LoftSection, OperationReport, PlanarAxis2,
+    PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2, Point3,
+    PrecisionPolicy, RequestId, RevolveAngle, SnapshotId, SolidOperation, Tier, Vector3,
 };
 
 use artificer_protocol::FaceExtrusionOperation;
 
 use crate::api::commands::{
-    ApiCommand, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane, StepLabel,
+    ApiCommand, AxisPlacement, ExtrudeOp, PatternPlacement, SketchEntity, SketchPlane, StepLabel,
 };
 use crate::api::debug::{ApiError, ApiErrorCode, CommandResult, EntityInfo};
 use crate::api::journal::{Journal, JournalEntry};
+use crate::api::planes;
 use crate::api::query::QueryHandle;
 use crate::api::selectors::{EntitySelector, resolve_selector, resolve_selector_set};
 use crate::api::snapshot::{SnapshotOptions, SnapshotOutput, render_snapshot};
@@ -659,9 +660,9 @@ impl Session {
     fn starts_new_body(command: &ApiCommand) -> bool {
         match command {
             ApiCommand::MakeBox { .. } | ApiCommand::MakeCylinder { .. } => true,
-            ApiCommand::Extrude { operation, .. } | ApiCommand::Revolve { operation, .. } => {
-                *operation == ExtrudeOp::New
-            }
+            ApiCommand::Extrude { operation, .. }
+            | ApiCommand::Revolve { operation, .. }
+            | ApiCommand::Loft { operation, .. } => *operation == ExtrudeOp::New,
             _ => false,
         }
     }
@@ -962,6 +963,27 @@ impl Session {
                     }
                 }
             }
+            ApiCommand::Loft {
+                sections,
+                operation,
+                ..
+            } => {
+                let sections = sections
+                    .iter()
+                    .map(|sketch| {
+                        self.build_sketch_profile(sketch)
+                            .map(|(frame, profile)| LoftSection { frame, profile })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(KernelCommand::LoftPlanarSections {
+                    sections,
+                    operation: match operation {
+                        ExtrudeOp::New => LoftOperation::New,
+                        ExtrudeOp::Add => LoftOperation::Add,
+                        ExtrudeOp::Cut => LoftOperation::Cut,
+                    },
+                })
+            }
             ApiCommand::Revolve {
                 sketch,
                 regions,
@@ -969,20 +991,28 @@ impl Session {
                 axis_direction,
                 angle_degrees,
                 operation,
+                axis_placement,
                 ..
             } => {
-                if *operation != ExtrudeOp::New {
+                // An axis the body places is found where the body now has
+                // it; a line in space is used as written.
+                let (axis_origin, axis_direction) = match axis_placement {
+                    Some(placement) => &self.placed_axis(placement)?,
+                    None => &(*axis_origin, *axis_direction),
+                };
+                // A full turn, or a partial one measured right-handed about
+                // the axis direction; a negative angle turns the other way.
+                let angle = if (angle_degrees.abs() - 360.0).abs() <= 1.0e-9 {
+                    RevolveAngle::FullTurn
+                } else if angle_degrees.is_finite() && angle_degrees.abs() < 360.0 {
+                    let sweep = angle_degrees.abs().to_radians();
+                    RevolveAngle::partial(if *angle_degrees < 0.0 { -sweep } else { 0.0 }, sweep)
+                } else {
                     return Err(ApiError::new(
                         ApiErrorCode::InvalidInput,
-                        "Revolve builds a new body; add and cut revolves are not supported",
+                        "A revolve turns through at most 360 degrees either way",
                     ));
-                }
-                if (angle_degrees - 360.0).abs() > 1.0e-9 {
-                    return Err(ApiError::new(
-                        ApiErrorCode::InvalidInput,
-                        "Only a full 360 degree revolve is supported",
-                    ));
-                }
+                };
                 let (frame, profile) = self.build_sketch_profile(sketch)?;
                 let profile = select_regions(profile, regions)?;
                 // The axis must lie in the sketch plane: project its origin
@@ -1015,7 +1045,12 @@ impl Session {
                     frame,
                     profile,
                     axis: PlanarAxis2 { start, end },
-                    angle: RevolveAngle::FullTurn,
+                    angle,
+                    operation: match operation {
+                        ExtrudeOp::New => SolidOperation::New,
+                        ExtrudeOp::Add => SolidOperation::Add,
+                        ExtrudeOp::Cut => SolidOperation::Cut,
+                    },
                 })
             }
             ApiCommand::BooleanUnion { .. }
@@ -1098,6 +1133,34 @@ impl Session {
                             .map_err(ApiError::from)?;
                         support.frame
                     }
+                    SketchPlane::Frame { frame } => *frame,
+                    SketchPlane::OffsetFace { face, offset, flip } => {
+                        let face = self.planar_face_frame(face)?;
+                        planes::placed(face, *offset, *flip)?
+                    }
+                    SketchPlane::Midplane {
+                        first,
+                        second,
+                        offset,
+                        flip,
+                    } => {
+                        let middle = planes::midplane(
+                            self.planar_face_frame(first)?,
+                            self.planar_face_frame(second)?,
+                        )?;
+                        planes::placed(middle, *offset, *flip)?
+                    }
+                    SketchPlane::ThroughEdge {
+                        edge,
+                        face,
+                        angle_degrees,
+                        offset,
+                        flip,
+                    } => {
+                        let hinge = self.straight_edge_on_face(edge, face.as_deref())?;
+                        let turned = planes::through_edge(hinge, *angle_degrees)?;
+                        planes::placed(turned, *offset, *flip)?
+                    }
                 };
 
                 let loops = sketch_loops(entities)?;
@@ -1109,6 +1172,154 @@ impl Session {
                 "Target step is not a Sketch",
             )),
         }
+    }
+
+    /// The line an `axis(...)` placed by the body names, as the body now
+    /// stands: a point on it and its unit direction.
+    fn placed_axis(&self, placement: &AxisPlacement) -> Result<(Point3, Vector3), ApiError> {
+        let resolve = |selector: &EntitySelector| {
+            resolve_selector(
+                selector,
+                &self.snapshot,
+                &self.step_order,
+                &self.step_reports,
+            )
+        };
+        let unit = |vector: Vector3| {
+            let length = (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt();
+            (length.is_finite() && length > 1.0e-12)
+                .then(|| Vector3::new(vector.x / length, vector.y / length, vector.z / length))
+        };
+        let cross = |a: Vector3, b: Vector3| {
+            Vector3::new(
+                a.y * b.z - a.z * b.y,
+                a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x,
+            )
+        };
+        let (origin, direction, flip) = match placement {
+            AxisPlacement::Along { edge, flip } => {
+                let ends = NativeKernel::straight_edge_ends(&self.snapshot, resolve(edge)?)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "axis(along:) needs a straight edge",
+                        )
+                    })?;
+                let along = Vector3::new(
+                    ends[1].x - ends[0].x,
+                    ends[1].y - ends[0].y,
+                    ends[1].z - ends[0].z,
+                );
+                let direction = unit(along).ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "axis(along:) edge has no length",
+                    )
+                })?;
+                (ends[0], direction, *flip)
+            }
+            AxisPlacement::Through { face, flip } => {
+                let axis = NativeKernel::face_axis(&self.snapshot, resolve(face)?)
+                    .map_err(ApiError::from)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "axis(through:) needs a curved face: a cylinder, cone, sphere or torus",
+                        )
+                    })?;
+                (axis.origin, axis.direction, *flip)
+            }
+            AxisPlacement::Between {
+                first,
+                second,
+                flip,
+            } => {
+                let first = self.planar_face_frame(first)?;
+                let second = self.planar_face_frame(second)?;
+                let (first_normal, second_normal) =
+                    (cross(first.u, first.v), cross(second.u, second.v));
+                let along = cross(first_normal, second_normal);
+                let squared = along.x * along.x + along.y * along.y + along.z * along.z;
+                let direction = unit(along).filter(|_| squared > 1.0e-18).ok_or_else(|| {
+                    ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        "axis(between:) needs two flat faces that meet; these are parallel",
+                    )
+                })?;
+                // The point on both planes nearest the world origin:
+                // (d₁ n₂ × l + d₂ l × n₁) / |l|², with l = n₁ × n₂.
+                let dot = |a: Vector3, b: Point3| a.x * b.x + a.y * b.y + a.z * b.z;
+                let (d1, d2) = (
+                    dot(first_normal, first.origin),
+                    dot(second_normal, second.origin),
+                );
+                let (a, b) = (cross(second_normal, along), cross(along, first_normal));
+                let origin = Point3::new(
+                    (d1 * a.x + d2 * b.x) / squared,
+                    (d1 * a.y + d2 * b.y) / squared,
+                    (d1 * a.z + d2 * b.z) / squared,
+                );
+                (origin, direction, *flip)
+            }
+        };
+        let direction = if flip {
+            Vector3::new(-direction.x, -direction.y, -direction.z)
+        } else {
+            direction
+        };
+        Ok((origin, direction))
+    }
+
+    /// The frame of the planar face a selector names, as a sketch on that face
+    /// would use it.
+    fn planar_face_frame(&self, face: &EntitySelector) -> Result<PlanarFrame3, ApiError> {
+        let face_ref =
+            resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?;
+        NativeKernel::planar_face_support(&self.snapshot, face_ref)
+            .map(|support| support.frame)
+            .map_err(ApiError::from)
+    }
+
+    /// The straight edge a selector names, with the planar face a plane is
+    /// turned from: the one named, or the only planar face the edge bounds.
+    fn straight_edge_on_face(
+        &self,
+        edge: &EntitySelector,
+        face: Option<&EntitySelector>,
+    ) -> Result<crate::StraightEdgeOnFace, ApiError> {
+        let edge_ref =
+            resolve_selector(edge, &self.snapshot, &self.step_order, &self.step_reports)?;
+        let face_ref = match face {
+            Some(face) => {
+                resolve_selector(face, &self.snapshot, &self.step_order, &self.step_reports)?
+            }
+            None => {
+                let planar = NativeKernel::edge_faces(&self.snapshot, edge_ref)
+                    .map_err(ApiError::from)?
+                    .into_iter()
+                    .filter(|face| NativeKernel::planar_face_support(&self.snapshot, *face).is_ok())
+                    .collect::<Vec<_>>();
+                match planar.as_slice() {
+                    [only] => *only,
+                    [] => {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "plane(): the edge bounds no planar face to turn the plane from",
+                        ));
+                    }
+                    _ => {
+                        return Err(ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            "plane(): the edge bounds two planar faces; name the one the plane turns from with `face:`",
+                        ));
+                    }
+                }
+            }
+        };
+        NativeKernel::straight_edge_on_planar_face(&self.snapshot, edge_ref, face_ref)
+            .map_err(ApiError::from)
     }
 
     /// The face a sketch was drawn on, when it was drawn on one.
@@ -1268,6 +1479,21 @@ fn moved_entities(
                 start_angle: start_angle + rotation_degrees.to_radians(),
                 end_angle: end_angle + rotation_degrees.to_radians(),
             }),
+            // A fit is carried by a similarity: the fit through moved
+            // points is the moved fit.
+            SketchEntity::Spline { points, closed } => moved.push(SketchEntity::Spline {
+                points: points.iter().map(|point| map(*point)).collect(),
+                closed: *closed,
+            }),
+            SketchEntity::ControlSpline {
+                control_points,
+                degree,
+                closed,
+            } => moved.push(SketchEntity::ControlSpline {
+                control_points: control_points.iter().map(|point| map(*point)).collect(),
+                degree: *degree,
+                closed: *closed,
+            }),
             SketchEntity::Rectangle {
                 origin,
                 width,
@@ -1344,6 +1570,14 @@ fn footprint_points(entities: &[SketchEntity]) -> Vec<Point2> {
                 Point2::new(origin.x + width, origin.y + height),
                 Point2::new(origin.x, origin.y + height),
             ]),
+            // A spline lies inside its control polygon.
+            SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
+                if let Ok(Some((PlanarCurve2::Bspline { control_points, .. }, _))) =
+                    entity_spline(entity)
+                {
+                    points.extend(control_points);
+                }
+            }
         }
     }
     points
@@ -1394,8 +1628,91 @@ fn set_endpoint(curve: &mut PlanarCurve2, at_start: bool, point: Point2) {
                 *end = point;
             }
         }
-        PlanarCurve2::Circle { .. } | PlanarCurve2::Bspline { .. } => {}
+        // A clamped spline starts and ends on its end control points.
+        PlanarCurve2::Bspline { control_points, .. } => {
+            let slot = if at_start {
+                control_points.first_mut()
+            } else {
+                control_points.last_mut()
+            };
+            if let Some(slot) = slot {
+                *slot = point;
+            }
+        }
+        PlanarCurve2::Circle { .. } => {}
     }
+}
+
+/// The B-spline a fit-point `spline(...)` draws through `points` (ADR 0050),
+/// as the sketch's own fit-point tool draws it: cubic when there are four
+/// points or more, and closed back to the first point, smooth there, when
+/// `closed`. `None` when the points are too few or two neighbours coincide.
+#[must_use]
+pub fn fit_point_spline(points: &[Point2], closed: bool) -> Option<PlanarCurve2> {
+    let data = points
+        .iter()
+        .map(|point| [point.x, point.y])
+        .collect::<Vec<_>>();
+    let curve = crate::bspline::fit_points(&data, closed)?;
+    Some(PlanarCurve2::Bspline {
+        degree: curve.degree(),
+        control_points: curve
+            .points()
+            .iter()
+            .map(|point| Point2::new(point[0], point[1]))
+            .collect(),
+        knots: curve.knots().to_vec(),
+        weights: None,
+    })
+}
+
+/// A spline given by its control points: clamped, on a uniform knot vector,
+/// returning to its first control point when `closed`.
+fn control_point_spline(control_points: &[Point2], degree: usize, closed: bool) -> PlanarCurve2 {
+    let mut points = control_points.to_vec();
+    if closed && let Some(first) = control_points.first() {
+        points.push(*first);
+    }
+    let degree = degree.min(points.len().saturating_sub(1)).max(1);
+    PlanarCurve2::Bspline {
+        degree,
+        knots: crate::bspline::clamped_uniform_knots(points.len(), degree),
+        control_points: points,
+        weights: None,
+    }
+}
+
+/// The spline of a sketch entity, or why there is none.
+fn entity_spline(entity: &SketchEntity) -> Result<Option<(PlanarCurve2, bool)>, ApiError> {
+    Ok(match entity {
+        SketchEntity::Spline { points, closed } => {
+            let curve = fit_point_spline(points, *closed).ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCode::InvalidInput,
+                    "A fit-point spline needs at least two distinct points, three when closed, \
+                     and no two neighbours at one place",
+                )
+            })?;
+            Some((curve, *closed))
+        }
+        SketchEntity::ControlSpline {
+            control_points,
+            degree,
+            closed,
+        } => {
+            if control_points.len() < 2 {
+                return Err(ApiError::new(
+                    ApiErrorCode::InvalidInput,
+                    "A control-point spline needs at least two control points",
+                ));
+            }
+            Some((
+                control_point_spline(control_points, *degree, *closed),
+                *closed,
+            ))
+        }
+        _ => None,
+    })
 }
 
 fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, ApiError> {
@@ -1433,6 +1750,17 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
                 start: *start,
                 end: *end,
             }),
+            // A closed spline is a loop of its own; an open one joins the
+            // lines and arcs it meets end to end.
+            SketchEntity::Spline { .. } | SketchEntity::ControlSpline { .. } => {
+                if let Some((curve, closed)) = entity_spline(entity)? {
+                    if closed {
+                        loops.push(vec![curve]);
+                    } else {
+                        open.push(curve);
+                    }
+                }
+            }
             SketchEntity::Arc {
                 center,
                 radius,
@@ -1486,6 +1814,42 @@ fn sketch_loops(entities: &[SketchEntity]) -> Result<Vec<Vec<PlanarCurve2>>, Api
                     ArcDirection::Clockwise => ArcDirection::CounterClockwise,
                 },
             },
+            // The same locus walked the other way: the control points in
+            // reverse, on the knots reflected in the middle of the domain,
+            // with the ends kept exact.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => {
+                let (first, last) = (
+                    knots.first().copied().unwrap_or(0.0),
+                    knots.last().copied().unwrap_or(1.0),
+                );
+                let count = knots.len();
+                PlanarCurve2::Bspline {
+                    degree: *degree,
+                    control_points: control_points.iter().rev().copied().collect(),
+                    knots: knots
+                        .iter()
+                        .rev()
+                        .enumerate()
+                        .map(|(index, knot)| {
+                            if index <= *degree {
+                                first
+                            } else if index + degree + 1 >= count {
+                                last
+                            } else {
+                                first + last - knot
+                            }
+                        })
+                        .collect(),
+                    weights: weights
+                        .as_ref()
+                        .map(|weights| weights.iter().rev().copied().collect()),
+                }
+            }
             other => other.clone(),
         }
     };
@@ -1574,9 +1938,29 @@ fn loop_polygon(curves: &[PlanarCurve2]) -> Vec<Point2> {
                     ));
                 }
             }
-            PlanarCurve2::Bspline { control_points, .. } => {
-                polygon.extend(control_points.iter().copied());
-            }
+            // The curve itself, finely, where the kernel carries it; its
+            // control polygon, which holds it, where it does not.
+            PlanarCurve2::Bspline {
+                degree,
+                control_points,
+                knots,
+                weights,
+            } => match crate::spline_profile::spline_from_protocol(
+                *degree,
+                control_points,
+                knots,
+                weights.as_deref(),
+            ) {
+                Ok(spline) => {
+                    let (start, end) = spline.domain();
+                    for index in 0..64 {
+                        let point =
+                            spline.point((end - start).mul_add(f64::from(index) / 64.0, start));
+                        polygon.push(Point2::new(point.x, point.y));
+                    }
+                }
+                Err(_) => polygon.extend(control_points.iter().copied()),
+            },
         }
     }
     polygon

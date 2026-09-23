@@ -16,6 +16,8 @@
 //! each of its three axes, so it opens on any face; an extrusion opens on
 //! its caps.
 
+use std::f64::consts::{PI, TAU};
+
 use artificer_protocol::{
     ArcDirection, EntityKind, EntityRef, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2,
     PlanarRegion2, Point2 as ProtocolPoint2, Point3 as ProtocolPoint3, PrecisionPolicy, SnapshotId,
@@ -26,7 +28,7 @@ use artificer_protocol::{PlanarAxis2, RevolveAngle};
 
 use crate::analytic_extrusion::{Segment, topology_loop_segments};
 use crate::loop_offset::{LoopOffsetError, ReflexPolicy, mitred_inward_offset};
-use crate::section_revolve::extract_rz_section;
+use crate::section_revolve::{extract_rz_section, wedge_direction};
 use crate::topology::{Plane, Point2, Point3, Surface, Topology, Vector3};
 
 /// Why a shell was refused.
@@ -78,7 +80,7 @@ impl ShellError {
             }
             Self::OpenFaceInvalid => "Every open face must be a face of the supplied snapshot.",
             Self::OpenFacesUnsupported => {
-                "A shell opens on one face, on two opposite faces, or on none; on a revolved body every open face must be a cap square to the axis."
+                "A shell opens on one face, on two opposite faces, or on none; on a revolved body every open face must be a cap square to the axis, or a wedge face of a turn of at most half."
             }
             Self::SelfIntersects => {
                 "The wall is thicker than half the narrowest neck of the open face, so the offset boundary crosses itself."
@@ -113,13 +115,25 @@ pub(crate) enum ShellPlan {
     /// The core of a revolved body, as the section offset one wall inward
     /// and turned about the same axis. An open cap's run is carried past
     /// the body so the difference opens it rather than meeting it head on.
+    /// A partial turn's core is turned a full turn and then loses `clip`.
     Revolved {
         frame: PlanarFrame3,
         profile: PlanarProfile2,
         axis: PlanarAxis2,
         angle: RevolveAngle,
         open: bool,
+        clip: Option<WedgeClip>,
     },
+}
+
+/// The prism a partial turn's core loses, standing along the axis: every
+/// point within one wall of a closed wedge face, and the empty wedge the
+/// turn leaves, less what lies past an open wedge face.
+#[derive(Clone, Debug)]
+pub(crate) struct WedgeClip {
+    pub(crate) frame: PlanarFrame3,
+    pub(crate) profile: PlanarProfile2,
+    pub(crate) distance: f64,
 }
 
 /// The body read as a prism about one planar cap.
@@ -172,6 +186,15 @@ pub(crate) fn plan_shell(
         // back as a revolve.
         Err(ShellError::DomainUnsupported) => {
             plan_revolved_shell(topology, &open_indices, wall, precision)
+        }
+        // Open faces the prism cannot take, a cap with a wedge face or a
+        // cap with both, may still suit the revolved reading. Where the
+        // body is no solid of revolution, the prism's reason stands.
+        Err(ShellError::OpenFacesUnsupported) => {
+            match plan_revolved_shell(topology, &open_indices, wall, precision) {
+                Err(ShellError::DomainUnsupported) => Err(ShellError::OpenFacesUnsupported),
+                revolved => revolved,
+            }
         }
         Err(other) => Err(other),
     }
@@ -291,7 +314,11 @@ fn cap_prism(
                 other_normal.dot(normal).abs() <= agreement
             }
             Surface::Cylinder(cylinder) => cylinder.axis.cross(normal).length() <= agreement,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => false,
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => false,
         };
         if !along {
             return Err(ShellError::DomainUnsupported);
@@ -405,7 +432,7 @@ fn curve(segment: Segment, start: Point2, end: Point2) -> Option<PlanarCurve2> {
                 })
             }
         }
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => None,
     }
 }
 
@@ -462,22 +489,51 @@ fn plan_revolved_shell(
         })
         .fold(1.0_f64, f64::max);
     let agreement = precision.linear_agreement.max(1.0e-9) * scale;
+    let sweep = section.sweep();
+    let partial = sweep < TAU - 1.0e-9;
 
-    // Every open face must be a cap square to the axis; its height along
-    // the axis is what locates the section run it stands for.
+    // Every open face must be a cap square to the axis, whose height along
+    // the axis locates the section run it stands for, or one of a partial
+    // turn's two wedge faces.
     let mut heights = Vec::with_capacity(open_indices.len());
+    let mut open_wedges = [false; 2];
     for index in open_indices {
-        let Surface::Plane(plane) = topology.faces[*index].value.surface else {
+        let face = &topology.faces[*index].value;
+        let Surface::Plane(plane) = face.surface else {
             return Err(ShellError::OpenFacesUnsupported);
         };
         let length = plane.normal.length();
-        if !length.is_finite()
-            || length <= f64::EPSILON
-            || plane.normal.cross(axis).length() > agreement * length
-        {
+        if !length.is_finite() || length <= f64::EPSILON {
             return Err(ShellError::OpenFacesUnsupported);
         }
-        heights.push((plane.origin - center).dot(axis));
+        if plane.normal.cross(axis).length() <= agreement * length {
+            heights.push((plane.origin - center).dot(axis));
+            continue;
+        }
+        // A wedge face holds the axis. Which of the two it is shows in the
+        // way it leaves the axis: at azimuth zero, or at the sweep.
+        let radial = |point: Point3| {
+            let offset = point - center;
+            offset - axis * offset.dot(axis)
+        };
+        let direction = wedge_direction(topology, face, center, axis);
+        let (Some(direction), true) = (
+            direction,
+            partial
+                && plane.normal.dot(axis).abs() <= agreement * length
+                && radial(plane.origin).length() <= agreement,
+        ) else {
+            return Err(ShellError::OpenFacesUnsupported);
+        };
+        let end = section.radial_u() * sweep.cos() + section.radial_v() * sweep.sin();
+        let at_end = direction.dot(end) > direction.dot(section.radial_u());
+        open_wedges[usize::from(at_end)] = true;
+    }
+    // Past a wedge face the core runs into the empty part of the turn, and
+    // beyond half a turn that part is narrower near the axis than the wall
+    // the other wedge face keeps.
+    if open_wedges.contains(&true) && sweep > PI + 1.0e-9 {
+        return Err(ShellError::OpenFacesUnsupported);
     }
 
     // A section arc is a blend band or a dome. Offsetting it inward is
@@ -585,6 +641,41 @@ fn plan_revolved_shell(
         .collect::<Option<Vec<_>>>()
         .ok_or(ShellError::DomainUnsupported)?;
 
+    let clip = if partial {
+        // The core's extent in the section: how far out it reaches, and
+        // the heights it spans along the axis.
+        let reach = starts.iter().map(|point| point.x).fold(0.0_f64, f64::max);
+        let (low, high) = starts
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+                (low.min(point.y), high.max(point.y))
+            });
+        let minimum = precision
+            .min_feature_size
+            .max(precision.modeling_resolution);
+        let outline = wedge_clip_outline(sweep, open_wedges, wall, reach, minimum)?;
+        let base = center + axis * (low - wall);
+        let (radial_u, radial_v) = (section.radial_u(), section.radial_v());
+        Some(WedgeClip {
+            // `radial_u × radial_v` is the axis, so the prism rises along
+            // it from one wall below the core to one wall above.
+            frame: PlanarFrame3 {
+                origin: ProtocolPoint3::new(base.x, base.y, base.z),
+                u: ProtocolVector3::new(radial_u.x, radial_u.y, radial_u.z),
+                v: ProtocolVector3::new(radial_v.x, radial_v.y, radial_v.z),
+            },
+            profile: PlanarProfile2 {
+                regions: vec![PlanarRegion2 {
+                    outer: PlanarLoop2 { curves: outline },
+                    holes: Vec::new(),
+                }],
+            },
+            distance: high - low + 2.0 * wall,
+        })
+    } else {
+        None
+    };
+
     let radial_u = section.radial_u();
     Ok(ShellPlan::Revolved {
         frame: PlanarFrame3 {
@@ -601,7 +692,169 @@ fn plan_revolved_shell(
         axis: PlanarAxis2::new(ProtocolPoint2::new(0.0, 0.0), ProtocolPoint2::new(0.0, 1.0)),
         angle: RevolveAngle::FullTurn,
         open: !open_indices.is_empty(),
+        clip,
     })
+}
+
+/// The outline, square to the axis, of what a partial turn's core loses,
+/// drawn counter-clockwise in `(radial_u, radial_v)` with the axis at the
+/// origin and the turn running from `+u` towards `+v` through `sweep`.
+///
+/// The core keeps what lies at least one wall inside each closed wedge
+/// face's plane, and runs one wall past an open one. Up to half a turn the
+/// kept region is the wedge between those two lines; the outline is the
+/// rest of a disc reaching one wall beyond the core. Beyond half a turn the
+/// empty wedge is the convex part, and what the core loses is every point
+/// within one wall of it: the empty wedge, a band one wall wide along each
+/// face, and the disc one wall about the axis where the bands meet.
+fn wedge_clip_outline(
+    sweep: f64,
+    open: [bool; 2],
+    wall: f64,
+    reach: f64,
+    minimum: f64,
+) -> Result<Vec<PlanarCurve2>, ShellError> {
+    type P = (f64, f64);
+    let point = |(x, y): P| ProtocolPoint2::new(x, y);
+    let line = |start: P, end: P| PlanarCurve2::Line {
+        start: point(start),
+        end: point(end),
+    };
+    let arc = |center: P, start: P, end: P| PlanarCurve2::CircularArc {
+        center: point(center),
+        start: point(start),
+        end: point(end),
+        direction: ArcDirection::CounterClockwise,
+    };
+    // The rim of the disc about the axis, counter-clockwise from `start`
+    // to `end`, in two arcs meeting halfway, so neither passes half a turn.
+    let rim = |start: P, end: P| {
+        let from = start.1.atan2(start.0);
+        let mut to = end.1.atan2(end.0);
+        if to <= from {
+            to += TAU;
+        }
+        let middle = f64::midpoint(from, to);
+        let radius = start.0.hypot(start.1);
+        let halfway = (radius * middle.cos(), radius * middle.sin());
+        [
+            arc((0.0, 0.0), start, halfway),
+            arc((0.0, 0.0), halfway, end),
+        ]
+    };
+    let dot = |a: P, b: P| a.0 * b.0 + a.1 * b.1;
+    let along = |from: P, direction: P, distance: f64| {
+        (
+            from.0 + direction.0 * distance,
+            from.1 + direction.1 * distance,
+        )
+    };
+    // Where the ray from `from` along the unit `direction` leaves the
+    // circle of `radius` about the axis.
+    let exit = |from: P, direction: P, radius: f64| {
+        let projection = dot(from, direction);
+        along(
+            from,
+            direction,
+            -projection + (projection * projection - dot(from, from) + radius * radius).sqrt(),
+        )
+    };
+
+    // Each wedge face's direction from the axis, and the unit normal into
+    // the material there.
+    let (start_direction, start_normal) = ((1.0, 0.0), (0.0, 1.0));
+    let end_direction = (sweep.cos(), sweep.sin());
+    let end_normal = (sweep.sin(), -sweep.cos());
+    // The line each side of the core stands on: one wall in, or one out.
+    let offset = |open: bool| if open { -wall } else { wall };
+    let (start_offset, end_offset) = (offset(open[0]), offset(open[1]));
+
+    if (sweep - PI).abs() <= 1.0e-9 {
+        // Half a turn: both faces lie in one plane, and each side keeps
+        // its own line, with a step at the axis where they differ.
+        let radius = reach + 2.0 * wall;
+        let start_exit = (
+            (radius * radius - start_offset * start_offset).sqrt(),
+            start_offset,
+        );
+        let end_exit = (
+            -(radius * radius - end_offset * end_offset).sqrt(),
+            end_offset,
+        );
+        let mut outline = rim(end_exit, start_exit).to_vec();
+        if (start_offset - end_offset).abs() <= f64::EPSILON {
+            outline.push(line(start_exit, end_exit));
+        } else {
+            outline.push(line(start_exit, (0.0, start_offset)));
+            outline.push(line((0.0, start_offset), (0.0, end_offset)));
+            outline.push(line((0.0, end_offset), end_exit));
+        }
+        return Ok(outline);
+    }
+
+    // Where two lines, each `normal · p = offset`, cross.
+    let crossing = |first: (P, f64), second: (P, f64)| {
+        let ((a, b), e) = first;
+        let ((c, d), f) = second;
+        let determinant = a * d - b * c;
+        ((e * d - b * f) / determinant, (a * f - e * c) / determinant)
+    };
+
+    if sweep < PI {
+        // The kept region is the wedge between the two lines, whose apex
+        // must fall inside the core for any core to remain.
+        let apex = crossing((start_normal, start_offset), (end_normal, end_offset));
+        // How near the kept wedge comes to the axis: zero if it holds the
+        // axis, else the nearer of the apex and the foot of the axis on
+        // either line, where that foot lies on the wedge's own edge.
+        let kept = |p: P| {
+            dot(start_normal, p) >= start_offset - minimum
+                && dot(end_normal, p) >= end_offset - minimum
+        };
+        let nearest = if kept((0.0, 0.0)) {
+            0.0
+        } else {
+            [(start_normal, start_offset), (end_normal, end_offset)]
+                .into_iter()
+                .map(|(normal, offset)| (normal.0 * offset, normal.1 * offset))
+                .filter(|foot| kept(*foot))
+                .map(|foot| dot(foot, foot).sqrt())
+                .chain(std::iter::once(dot(apex, apex).sqrt()))
+                .fold(f64::INFINITY, f64::min)
+        };
+        if !nearest.is_finite() || nearest >= reach - minimum {
+            return Err(ShellError::WallInvalid);
+        }
+        let radius = reach.max(dot(apex, apex).sqrt()) + 2.0 * wall;
+        let start_exit = exit(apex, start_direction, radius);
+        let end_exit = exit(apex, end_direction, radius);
+        let [first, second] = rim(end_exit, start_exit);
+        return Ok(vec![
+            line(apex, end_exit),
+            first,
+            second,
+            line(start_exit, apex),
+        ]);
+    }
+
+    // Beyond half a turn both faces are closed. The bands along them meet
+    // the disc about the axis at the feet of the two lines.
+    if reach <= wall + minimum {
+        return Err(ShellError::WallInvalid);
+    }
+    let radius = reach + 2.0 * wall;
+    let start_foot = along((0.0, 0.0), start_normal, wall);
+    let end_foot = along((0.0, 0.0), end_normal, wall);
+    let start_exit = exit(start_foot, start_direction, radius);
+    let end_exit = exit(end_foot, end_direction, radius);
+    let [first, second] = rim(end_exit, start_exit);
+    Ok(vec![
+        line(start_exit, start_foot),
+        arc((0.0, 0.0), start_foot, end_foot),
+        line(end_foot, end_exit),
+        first,
+        second,
+    ])
 }
 
 /// A straight run moved `distance` away from the material, which for a
@@ -645,7 +898,7 @@ fn reversed(segment: Segment) -> Option<Segment> {
             start_angle: start_angle + sweep,
             sweep: -sweep,
         }),
-        Segment::Ellipse { .. } | Segment::Harmonic { .. } => None,
+        Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => None,
     }
 }
 
@@ -694,10 +947,21 @@ fn reverse_face(topology: &mut Topology, face_index: usize) -> Option<()> {
             cone.angular_sign = -cone.angular_sign;
             |point: Point2| Point2::new(-point.x, point.y)
         }
+        // A ruled surface walks `u` the other way along both rails, which
+        // mirrors its unit parameter square about `u = ½`.
+        Surface::Ruled(ruled) => {
+            *ruled = ruled.reversed_u();
+            |point: Point2| Point2::new(1.0 - point.x, point.y)
+        }
+        // A B-spline surface walks `u` the other way over the negated domain.
+        Surface::Bspline(surface) => {
+            *surface = surface.reversed_u();
+            |point: Point2| Point2::new(-point.x, point.y)
+        }
         // A torus and a sphere pin their frame to their angular sign, so
         // the outward normal is always the geometric one: the material
         // lies inside the tube, and no edit of the frame moves it out.
         Surface::Torus(_) | Surface::Sphere(_) => return None,
     };
-    crate::mirror::reverse_face_loops(topology, face_index, mirror).ok()
+    crate::mirror::reverse_face_loops(topology, face_index, mirror, &|cylinder| cylinder).ok()
 }

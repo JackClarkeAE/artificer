@@ -169,7 +169,7 @@ fn mirror_loop(source: &[Segment], axis: f64) -> Vec<Segment> {
                 start_angle: canonical_azimuth(-(start_angle + sweep)),
                 sweep,
             },
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                 unreachable!("planar profiles carry lines and arcs only")
             }
         })
@@ -272,7 +272,11 @@ pub(crate) fn extract_prism(
         let parallel = match face.value.surface {
             Surface::Plane(plane) => plane.normal.dot(normal).abs() <= agreement,
             Surface::Cylinder(cylinder) => cylinder.axis.cross(normal).length() <= agreement,
-            Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => false,
+            Surface::Torus(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Ruled(_)
+            | Surface::Bspline(_) => false,
         };
         if !parallel {
             return Err(PrismEdgeFinishError::DomainUnsupported);
@@ -607,7 +611,7 @@ fn protocol_loop(segments: &[Segment]) -> PlanarLoop2 {
                             ArcDirection::Clockwise
                         },
                     },
-                    Segment::Ellipse { .. } | Segment::Harmonic { .. } => {
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
                         unreachable!("planar profiles carry lines and arcs only")
                     }
                 }

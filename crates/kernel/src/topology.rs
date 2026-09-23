@@ -276,6 +276,23 @@ pub(crate) enum Curve3 {
         major_radius: f64,
         minor_radius: f64,
     },
+    /// Where two cylinders meet that are not coaxial, parallel, or of equal
+    /// radius on crossing axes: a space quartic, closed form as a quadratic
+    /// root over `host`'s azimuth (ADR 0047, [`crate::cylinder_trace`]).
+    ///
+    /// The parameter is `host`'s azimuth throughout, on both faces the curve
+    /// separates, so the two read the same point at the same parameter.
+    Trace {
+        host: Cylinder,
+        other: Cylinder,
+        branch: f64,
+    },
+    /// A non-rational, clamped B-spline curve (ADR 0050): the edge of a
+    /// spline profile's wall, a section of a smooth loft, and a rung between
+    /// two of its walls. The parameter is the spline's own.
+    Bspline {
+        curve: crate::bspline::SplineCurve3,
+    },
 }
 
 impl Curve3 {
@@ -321,6 +338,17 @@ impl Curve3 {
                 let parameter = parameter.rem_euclid(std::f64::consts::TAU);
                 center + u * (major_radius * parameter.cos()) + v * (minor_radius * parameter.sin())
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .point_clamped(parameter),
+            Self::Bspline { curve } => curve.point(parameter),
         }
     }
 
@@ -337,6 +365,17 @@ impl Curve3 {
                 minor_radius,
                 ..
             } => u * (-major_radius * parameter.sin()) + v * (minor_radius * parameter.cos()),
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .tangent_clamped(parameter),
+            Self::Bspline { curve } => curve.tangent(parameter),
         }
     }
 
@@ -362,6 +401,13 @@ impl Curve3 {
                     && major_radius.is_finite()
                     && minor_radius.is_finite()
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+            } => host.is_finite() && other.is_finite() && branch.is_finite(),
+            // A stored spline is finite by construction.
+            Self::Bspline { .. } => true,
         }
     }
 }
@@ -513,6 +559,22 @@ impl Edge {
                 self.parameter_range.end,
             )
             .abs(),
+            Curve3::Trace {
+                host,
+                other,
+                branch,
+            } => crate::cylinder_trace::CylinderTrace {
+                host,
+                other,
+                branch,
+            }
+            .arc_length(self.parameter_range.start, self.parameter_range.end)
+            .abs(),
+            // Gauss–Legendre on every knot span: ADR 0026's standing for an
+            // integral with no elementary antiderivative.
+            Curve3::Bspline { curve } => curve
+                .length(self.parameter_range.start, self.parameter_range.end)
+                .abs(),
         }
     }
 
@@ -555,6 +617,29 @@ pub(crate) enum Curve2 {
         v: Vector2,
         major_radius: f64,
         minor_radius: f64,
+    },
+    /// The trace of [`Curve3::Trace`] in one of the two faces it separates,
+    /// read over `host`'s azimuth whichever face this is.
+    ///
+    /// On the host's own face that is the graph `(x, y(x))` itself, moved by
+    /// `shift`. On the other's it is the same point mapped into that face's
+    /// coordinates, with the azimuth taken within half a turn of `shift.x` —
+    /// the azimuth of the face's own window the piece lies in, which keeps
+    /// the piece continuous wherever the mapping's arctangent jumps — and
+    /// the height moved by `shift.y`. Both faces share one parameter, which
+    /// is what lets the sewer weld their two uses of the edge.
+    Trace {
+        host: Cylinder,
+        other: Cylinder,
+        branch: f64,
+        on_other: bool,
+        shift: Point2,
+    },
+    /// A B-spline edge's curve in a plane's own coordinates (ADR 0050): the
+    /// projection of the space curve, which for a curve lying in the plane
+    /// is the same B-spline with its control points projected.
+    Bspline {
+        curve: crate::bspline::SplineCurve2,
     },
 }
 
@@ -608,6 +693,32 @@ impl Curve2 {
                     center.y + major_radius * cos * u.y + minor_radius * sin * v.y,
                 )
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+            } => {
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                // `shift` places the result in this face's own parameter
+                // window; the walk's parameter is the host's azimuth either
+                // way, and is not shifted with it.
+                if on_other {
+                    let point = trace.on_other_near(parameter, shift.x);
+                    Point2::new(point.x, point.y + shift.y)
+                } else {
+                    Point2::new(
+                        parameter + shift.x,
+                        trace.height_clamped(parameter) + shift.y,
+                    )
+                }
+            }
+            Self::Bspline { curve } => curve.point(parameter),
         }
     }
 
@@ -637,6 +748,27 @@ impl Curve2 {
                     -major_radius * sin * u.y + minor_radius * cos * v.y,
                 )
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                on_other,
+                shift,
+            } => {
+                let trace = crate::cylinder_trace::CylinderTrace {
+                    host,
+                    other,
+                    branch,
+                };
+                let _ = shift;
+                if on_other {
+                    let rate = trace.on_other_rate(parameter);
+                    Vector2::new(rate.x, rate.y)
+                } else {
+                    Vector2::new(1.0, trace.slope_clamped(parameter))
+                }
+            }
+            Self::Bspline { curve } => curve.tangent(parameter),
         }
     }
 
@@ -667,6 +799,14 @@ impl Curve2 {
                     && major_radius.is_finite()
                     && minor_radius.is_finite()
             }
+            Self::Trace {
+                host,
+                other,
+                branch,
+                shift,
+                ..
+            } => host.is_finite() && other.is_finite() && branch.is_finite() && shift.is_finite(),
+            Self::Bspline { .. } => true,
         }
     }
 }
@@ -884,6 +1024,13 @@ pub(crate) enum Surface {
     /// it; the builder that emits one is still to come.
     #[allow(dead_code)]
     Sphere(Sphere),
+    /// The straight lines between two exact rails (ADR 0049): the wall of a
+    /// loft between unlike sections, where no elementary carrier is exact.
+    Ruled(crate::ruled::RuledSurface),
+    /// A non-rational, clamped B-spline surface (ADR 0050): the wall a spline
+    /// profile sweeps, and every wall of a smooth loft through several
+    /// sections.
+    Bspline(crate::bspline::SplineSurface),
 }
 
 impl Surface {
@@ -894,6 +1041,8 @@ impl Surface {
             Self::Torus(torus) => torus.evaluate(point),
             Self::Cone(cone) => cone.evaluate(point),
             Self::Sphere(sphere) => sphere.evaluate(point),
+            Self::Ruled(ruled) => ruled.evaluate(point),
+            Self::Bspline(surface) => surface.evaluate(point),
         }
     }
 
@@ -904,6 +1053,8 @@ impl Surface {
             Self::Torus(torus) => torus.is_finite(),
             Self::Cone(cone) => cone.is_finite(),
             Self::Sphere(sphere) => sphere.is_finite(),
+            Self::Ruled(ruled) => ruled.is_finite(),
+            Self::Bspline(surface) => surface.is_finite(),
         }
     }
 
@@ -956,6 +1107,16 @@ impl Surface {
                     frame_orientation(sphere.radial_u, sphere.radial_v, axis, sphere.angular_sign)?;
                 unit_vector(point - sphere.origin).map(|normal| normal * sign)
             }
+            // A ruled surface has no closed-form normal in the point alone:
+            // the point is inverted to its parameters first. Callers that
+            // already hold the parameters use `RuledSurface::unit_normal`.
+            Self::Ruled(ruled) => ruled
+                .invert(point, None)
+                .and_then(|parameters| ruled.unit_normal(parameters)),
+            // Nor has a B-spline surface; the same holds.
+            Self::Bspline(surface) => surface
+                .invert(point, None)
+                .and_then(|parameters| surface.unit_normal(parameters)),
         }
     }
 
@@ -999,20 +1160,32 @@ impl Surface {
                     + sphere.axis * (sphere.radius * point.y.cos());
                 azimuthal * tangent.x + meridian * tangent.y
             }
+            Self::Ruled(ruled) => ruled.map_tangent(point, tangent),
+            Self::Bspline(surface) => surface.map_tangent(point, tangent),
         }
     }
 
     pub(crate) const fn as_plane(self) -> Option<Plane> {
         match self {
             Self::Plane(plane) => Some(plane),
-            Self::Cylinder(_) | Self::Torus(_) | Self::Cone(_) | Self::Sphere(_) => None,
+            Self::Cylinder(_)
+            | Self::Torus(_)
+            | Self::Cone(_)
+            | Self::Sphere(_)
+            | Self::Ruled(_)
+            | Self::Bspline(_) => None,
         }
     }
 
     pub(crate) fn as_plane_mut(&mut self) -> Option<&mut Plane> {
         match self {
             Self::Plane(plane) => Some(plane),
-            Self::Cylinder(_) | Self::Torus(_) | Self::Cone(_) | Self::Sphere(_) => None,
+            Self::Cylinder(_)
+            | Self::Torus(_)
+            | Self::Cone(_)
+            | Self::Sphere(_)
+            | Self::Ruled(_)
+            | Self::Bspline(_) => None,
         }
     }
 }

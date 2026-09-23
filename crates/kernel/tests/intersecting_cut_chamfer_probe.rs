@@ -140,6 +140,43 @@ fn chamfer_cube_with_circle_and_slot_cuts() {
         },
     );
 
+    // The slot is a 10 by 6 rectangle with both ends scooped inward by discs
+    // of radius 3, the left one on the pocket's own axis; where it runs into
+    // the pocket, the pocket has already taken the half-annulus strip
+    // `|y − 20| ≤ 3, 3 ≤ r ≤ 6` around that axis. Both are 20 deep, so the
+    // slot removes 20 × (its area less the strip), exactly: this cut used to
+    // reach the faceted tier, and is the analytic Boolean's now. The strip is
+    // `∫ 2r·asin(3/r) dr` over `[3, 6]`, walked through a map whose rate
+    // vanishes at the ends so the square-root cusp at `r = 3` is smooth.
+    let strip = {
+        let panels = 20_000;
+        let step = 1.0 / f64::from(panels);
+        (0..=panels)
+            .map(|index| {
+                let t = f64::from(index) * step;
+                let r = 3.0f64.mul_add(t * t * 2.0f64.mul_add(-t, 3.0), 3.0);
+                let rate = 18.0 * t * (1.0 - t);
+                let weight = if index == 0 || index == panels {
+                    1.0
+                } else if index % 2 == 1 {
+                    4.0
+                } else {
+                    2.0
+                };
+                weight * 2.0 * r * (3.0 / r).min(1.0).asin() * rate
+            })
+            .sum::<f64>()
+            * step
+            / 3.0
+    };
+    let slot_area = 9.0f64.mul_add(-std::f64::consts::PI, 60.0);
+    let expected = 20.0f64.mul_add(-(slot_area - strip), circle_cut.measures().volume);
+    let slot_volume = slot_cut.measures().volume;
+    assert!(
+        ((slot_volume - expected) / expected).abs() < 1.0e-9,
+        "the slot cut is exact: {slot_volume} vs {expected}"
+    );
+
     // 3. Chamfer one outer top edge of the cube, for a valid solid whose
     //    volume lost at most the full 45-degree wedge along the edge.
     //

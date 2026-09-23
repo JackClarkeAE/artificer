@@ -169,9 +169,180 @@ pub fn refine_least_squares(
     params
 }
 
+/// A symmetric positive-definite matrix held as its lower band, solved
+/// by Cholesky factorization inside that band.
+///
+/// Least-squares systems over local bases — a B-spline's control net
+/// is the case here — couple each unknown only to its near neighbours,
+/// so every non-zero sits within a fixed distance of the diagonal and
+/// the factor never fills in outside it. That makes the solve
+/// `O(n b^2)` rather than the `O(n^3)` of [`solve_linear`], which is
+/// the difference between milliseconds and seconds at a thousand
+/// unknowns.
+#[derive(Clone, Debug)]
+pub struct BandedSpd {
+    n: usize,
+    band: usize,
+    /// Row `i` holds columns `i - band ..= i`, left to right.
+    data: Vec<f64>,
+}
+
+impl BandedSpd {
+    pub fn new(n: usize, band: usize) -> Self {
+        Self {
+            n,
+            band,
+            data: vec![0.0; n * (band + 1)],
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.n
+    }
+
+    fn slot(&self, row: usize, column: usize) -> usize {
+        row * (self.band + 1) + (column + self.band - row)
+    }
+
+    /// Adds `value` at `(i, j)` and, by symmetry, `(j, i)`. Entries
+    /// outside the band are a caller error and are ignored in release.
+    pub fn add(&mut self, i: usize, j: usize, value: f64) {
+        let (row, column) = if i >= j { (i, j) } else { (j, i) };
+        debug_assert!(
+            row - column <= self.band,
+            "({i}, {j}) lies outside the band"
+        );
+        if row - column <= self.band {
+            let slot = self.slot(row, column);
+            self.data[slot] += value;
+        }
+    }
+
+    pub fn get(&self, i: usize, j: usize) -> f64 {
+        let (row, column) = if i >= j { (i, j) } else { (j, i) };
+        if row - column > self.band {
+            return 0.0;
+        }
+        self.data[self.slot(row, column)]
+    }
+
+    /// The largest diagonal entry, for scaling a ridge.
+    pub fn max_diagonal(&self) -> f64 {
+        (0..self.n).map(|i| self.get(i, i)).fold(0.0, f64::max)
+    }
+
+    /// Solves `A x = b` for three right-hand sides at once (the three
+    /// coordinates of a control net share one matrix). `None` when the
+    /// matrix is not numerically positive definite.
+    pub fn solve3(mut self, rhs: &[[f64; 3]]) -> Option<Vec<[f64; 3]>> {
+        let (n, band) = (self.n, self.band);
+        if rhs.len() != n {
+            return None;
+        }
+        let scale = self.max_diagonal();
+        if !(scale.is_finite() && scale > 0.0) {
+            return None;
+        }
+        // In-place Cholesky, lower factor within the band.
+        for j in 0..n {
+            let start = j.saturating_sub(band);
+            let mut pivot = self.data[self.slot(j, j)];
+            for k in start..j {
+                let value = self.data[self.slot(j, k)];
+                pivot -= value * value;
+            }
+            if pivot.is_nan() || pivot <= 1e-14 * scale {
+                return None;
+            }
+            let pivot = pivot.sqrt();
+            let diagonal = self.slot(j, j);
+            self.data[diagonal] = pivot;
+            for i in j + 1..(j + band + 1).min(n) {
+                let mut sum = self.data[self.slot(i, j)];
+                for k in i.saturating_sub(band)..j {
+                    sum -= self.data[self.slot(i, k)] * self.data[self.slot(j, k)];
+                }
+                let slot = self.slot(i, j);
+                self.data[slot] = sum / pivot;
+            }
+        }
+        // Forward then back substitution.
+        let mut x: Vec<[f64; 3]> = rhs.to_vec();
+        for i in 0..n {
+            for k in i.saturating_sub(band)..i {
+                let factor = self.data[self.slot(i, k)];
+                let known = x[k];
+                for (value, from) in x[i].iter_mut().zip(known) {
+                    *value -= factor * from;
+                }
+            }
+            let pivot = self.data[self.slot(i, i)];
+            for value in &mut x[i] {
+                *value /= pivot;
+            }
+        }
+        for i in (0..n).rev() {
+            for k in i + 1..(i + band + 1).min(n) {
+                let factor = self.data[self.slot(k, i)];
+                let known = x[k];
+                for (value, from) in x[i].iter_mut().zip(known) {
+                    *value -= factor * from;
+                }
+            }
+            let pivot = self.data[self.slot(i, i)];
+            for value in &mut x[i] {
+                *value /= pivot;
+            }
+        }
+        x.iter().flatten().all(|v| v.is_finite()).then_some(x)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn banded_cholesky_matches_the_dense_solve() {
+        // A pentadiagonal SPD matrix: 4 on the diagonal, -1 at distance
+        // one, 0.25 at distance two.
+        let n = 9;
+        let mut banded = BandedSpd::new(n, 2);
+        let mut dense = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            banded.add(i, i, 4.0);
+            dense[i][i] = 4.0;
+            if i + 1 < n {
+                banded.add(i + 1, i, -1.0);
+                dense[i + 1][i] = -1.0;
+                dense[i][i + 1] = -1.0;
+            }
+            if i + 2 < n {
+                banded.add(i, i + 2, 0.25);
+                dense[i + 2][i] = 0.25;
+                dense[i][i + 2] = 0.25;
+            }
+        }
+        let rhs: Vec<[f64; 3]> = (0..n).map(|i| [i as f64, 1.0, (i as f64).sin()]).collect();
+        let x = banded.solve3(&rhs).expect("positive definite");
+        for column in 0..3 {
+            let b: Vec<f64> = rhs.iter().map(|r| r[column]).collect();
+            let expected = solve_linear(dense.clone(), b).expect("dense");
+            for i in 0..n {
+                assert!((x[i][column] - expected[i]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn a_banded_matrix_that_is_not_positive_definite_is_refused() {
+        let mut banded = BandedSpd::new(3, 1);
+        banded.add(0, 0, 1.0);
+        banded.add(1, 1, 1.0);
+        banded.add(1, 0, 2.0);
+        banded.add(2, 2, 1.0);
+        assert!(banded.solve3(&[[1.0; 3]; 3]).is_none());
+    }
 
     #[test]
     fn eigen_recovers_known_spectrum() {
