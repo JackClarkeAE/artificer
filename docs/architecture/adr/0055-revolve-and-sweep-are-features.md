@@ -706,3 +706,36 @@ gone.
   - a fillet on a cone's base rim, exact to 10⁻⁹ by Pappus on the kite and
     sector it removes;
   - in the workbench, a triangle against its centreline.
+
+### Holes and several regions (R4)
+
+A profile with a hole, or with more than one region, used to be refused
+(`REVOLVE_SINGLE_REGION_ONLY`). The plan's preferred route was the coaxial
+Boolean of ADR 0026 F4. It was not needed: the section builder sweeps each
+loop, and a region is built whole.
+- **Validation.** `validate_revolve` takes every loop of every region.
+  - A region's outer loop runs anticlockwise and each hole clockwise, so
+    material lies on the left of every chain.
+  - All the loops together must keep to one side of the axis.
+  - A hole must stay clear of the axis all the way round, or it is refused
+    as `REVOLVE_HOLE_ON_AXIS`. The code replaces the old one.
+- **Building** (`build_turned_region`). The builder faces every band from
+  the chain's direction alone, so a clockwise hole comes out facing into
+  the hole with no case of its own.
+  - **A full turn.** Each hole is a cavity: a closed shell of its own,
+    held as an inner shell of the solid.
+  - **A partial turn.** Each hole is a channel. Its outline is a hole in
+    both wedge faces, which is already the right way round, since the
+    chain runs clockwise.
+- **Several regions.** Each region is built on its own and the topologies
+  are merged, one solid each. A single region is built exactly as before,
+  entity for entity.
+- **Adding and cutting.** These follow the ladder as before. Two rings of
+  planes and coaxial cylinders cut a block exactly.
+- **Tests.** Volumes are checked by Pappus:
+  - a tube with a round cavity, and a cylinder with a square one, a full
+    turn and a quarter and three quarters of one;
+  - STEP export without approximation;
+  - two regions, a full turn and a half, as two solids;
+  - two rings cut into a block exactly;
+  - in the workbench, a circle drawn inside the section.

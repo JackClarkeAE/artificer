@@ -26,17 +26,20 @@ use artificer_protocol::{
     PlanarFrame3, PlanarProfile2, PrecisionPolicy, RevolveAngle,
 };
 
-use crate::analytic_extrusion::{Segment, normalize_frame, parse_loop, reversed_loop};
+use crate::analytic_extrusion::{
+    AnalyticLoop, Segment, merge_topologies, normalize_frame, parse_loop, reversed_loop,
+};
 use crate::planar_profile::PlanarProfileInputError;
-use crate::section_revolve::{RzSection, build_turned_topology};
+use crate::section_revolve::{RzSection, build_turned_region};
 use crate::topology::{FaceRole, Point2, Topology, Vector3};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RevolveInputError {
     /// The profile itself is not a certified planar region.
     Profile(PlanarProfileInputError),
-    /// v1 revolves exactly one region without holes.
-    SingleRegionOnly,
+    /// A hole in the profile reaches the axis, so it would not sweep a
+    /// cavity or a channel clear of it.
+    HoleOnAxis,
     /// The axis endpoints coincide, so there is no axis.
     DegenerateAxis,
     /// Material lies on both sides of the axis; the sweep would self-intersect.
@@ -59,9 +62,12 @@ impl From<PlanarProfileInputError> for RevolveInputError {
 
 #[derive(Debug)]
 pub(crate) struct ValidatedRevolve {
-    section: RzSection,
-    /// How far the section turns from its frame's azimuth zero: a full turn,
-    /// or less.
+    /// Each region's section and the sections of its holes, all in the one
+    /// section frame. A region's section runs anticlockwise and a hole's
+    /// clockwise, so material is on the left of every chain.
+    regions: Vec<(RzSection, Vec<RzSection>)>,
+    /// How far the sections turn from their frame's azimuth zero: a full
+    /// turn, or less.
     sweep: f64,
 }
 
@@ -72,12 +78,25 @@ impl ValidatedRevolve {
     }
 }
 
+/// The solid a revolve sweeps: one per region, each hole a cavity inside it
+/// for a full turn or a channel through it for less.
 #[must_use]
 pub(crate) fn build_revolve(revolve: &ValidatedRevolve) -> Topology {
-    build_turned_topology(&revolve.section, revolve.sweep)
+    // One region is built exactly as it always was, entity for entity.
+    if let [(outer, holes)] = revolve.regions.as_slice() {
+        return build_turned_region(outer, holes, revolve.sweep);
+    }
+    merge_topologies(
+        revolve
+            .regions
+            .iter()
+            .map(|(outer, holes)| build_turned_region(outer, holes, revolve.sweep))
+            .collect(),
+    )
 }
 
-/// Certifies a profile and axis, and rewrites the profile as a section chain.
+/// Certifies a profile and axis, and rewrites every loop of the profile as a
+/// section chain.
 pub(crate) fn validate_revolve(
     frame: PlanarFrame3,
     profile: &PlanarProfile2,
@@ -109,11 +128,6 @@ pub(crate) fn validate_revolve(
     if profile.curve_count() > MAX_PLANAR_PROFILE_CURVES {
         return Err(PlanarProfileInputError::TooManyCurves.into());
     }
-    // A hole in the profile sweeps a cavity of revolution, which the single
-    // section chain cannot express; it needs the coaxial Boolean rung.
-    if profile.regions.len() != 1 || !profile.regions[0].holes.is_empty() {
-        return Err(RevolveInputError::SingleRegionOnly);
-    }
     if !frame.is_finite() || !axis.is_finite() {
         return Err(PlanarProfileInputError::Extrusion(
             crate::extrusion::ExtrusionInputError::NonFinite,
@@ -125,20 +139,43 @@ pub(crate) fn validate_revolve(
         .modeling_resolution
         .max(precision.min_feature_size);
     let frame = normalize_frame(frame, precision)?;
-    let mut region = parse_loop(
-        &profile.regions[0].outer,
-        minimum,
-        precision.linear_agreement,
-    )?;
-    if region.signed_area.abs() <= minimum * minimum {
-        return Err(PlanarProfileInputError::Extrusion(
+    let area_too_small = || {
+        RevolveInputError::from(PlanarProfileInputError::Extrusion(
             crate::extrusion::ExtrusionInputError::AreaTooSmall,
-        )
-        .into());
+        ))
+    };
+    // Every loop, each region's outer one anticlockwise and its holes
+    // clockwise, so that material is on the left of every one.
+    let mut regions =
+        Vec::<(AnalyticLoop, Vec<AnalyticLoop>)>::with_capacity(profile.regions.len());
+    for region in &profile.regions {
+        let mut outer = parse_loop(&region.outer, minimum, precision.linear_agreement)?;
+        if outer.signed_area.abs() <= minimum * minimum {
+            return Err(area_too_small());
+        }
+        if outer.signed_area < 0.0 {
+            outer = reversed_loop(outer);
+        }
+        let mut holes = Vec::with_capacity(region.holes.len());
+        for hole in &region.holes {
+            let mut hole = parse_loop(hole, minimum, precision.linear_agreement)?;
+            if hole.signed_area.abs() <= minimum * minimum {
+                return Err(area_too_small());
+            }
+            if hole.signed_area > 0.0 {
+                hole = reversed_loop(hole);
+            }
+            holes.push(hole);
+        }
+        regions.push((outer, holes));
     }
-    if region.signed_area < 0.0 {
-        region = reversed_loop(region);
-    }
+    let every_point = || {
+        regions
+            .iter()
+            .flat_map(|(outer, holes)| std::iter::once(outer).chain(holes))
+            .flat_map(|profile_loop| &profile_loop.segments)
+            .flat_map(|segment| [segment.start(), segment.end()])
+    };
 
     // The axis in the profile's own frame, and the radial direction that makes
     // `(radial, axis)` right-handed there.
@@ -154,23 +191,17 @@ pub(crate) fn validate_revolve(
     let radius_of = |point: Point2, radial: Point2| {
         (point.x - origin.x).mul_add(radial.x, (point.y - origin.y) * radial.y)
     };
-    let extent = region
-        .segments
-        .iter()
-        .flat_map(|segment| [segment.start(), segment.end()])
-        .fold(1.0_f64, |extent, point| {
-            extent.max(point.x.abs().max(point.y.abs()))
-        });
+    let extent = every_point().fold(1.0_f64, |extent, point| {
+        extent.max(point.x.abs().max(point.y.abs()))
+    });
     let on_axis = precision.linear_agreement.max(1.0e-12) * extent;
     let side = |radial: Point2| {
-        region
-            .segments
-            .iter()
-            .flat_map(|segment| [segment.start(), segment.end()])
-            .map(|point| radius_of(point, radial))
-            .fold((false, false), |(negative, positive), radius| {
+        every_point().map(|point| radius_of(point, radial)).fold(
+            (false, false),
+            |(negative, positive), radius| {
                 (negative || radius < -on_axis, positive || radius > on_axis)
-            })
+            },
+        )
     };
     let reversed_axis = match side(radial) {
         (true, true) => return Err(RevolveInputError::ProfileCrossesAxis),
@@ -196,59 +227,81 @@ pub(crate) fn validate_revolve(
         )
     };
     let phase = radial.y.atan2(radial.x);
-    let mut chain = Vec::with_capacity(region.segments.len());
-    for segment in &region.segments {
-        let start = to_section(segment.start());
-        let end = to_section(segment.end());
-        let section = match *segment {
-            Segment::Line { .. } => {
-                let start_on_axis = start.x <= on_axis;
-                let end_on_axis = end.x <= on_axis;
-                if start_on_axis && end_on_axis {
-                    // The axis-collinear closure. It sweeps nothing and emits
-                    // no face; the builder closes the chain through the axis.
-                    continue;
+    // One loop as a section chain, and whether it closes on itself.
+    let chain_of =
+        |profile_loop: &AnalyticLoop| -> Result<(Vec<Segment>, bool), RevolveInputError> {
+            let mut chain = Vec::with_capacity(profile_loop.segments.len());
+            for segment in &profile_loop.segments {
+                let start = to_section(segment.start());
+                let end = to_section(segment.end());
+                let section = match *segment {
+                    Segment::Line { .. } => {
+                        if start.x <= on_axis && end.x <= on_axis {
+                            // The axis-collinear closure. It sweeps nothing and
+                            // emits no face; the builder closes the chain through
+                            // the axis.
+                            continue;
+                        }
+                        // A slanted line reaching the axis sweeps a cone to its
+                        // apex, which closes through a pole as a sphere does.
+                        Segment::Line { start, end }
+                    }
+                    Segment::Arc {
+                        center,
+                        radius,
+                        start_angle,
+                        sweep,
+                        ..
+                    } => Segment::Arc {
+                        center: to_section(center),
+                        start,
+                        end,
+                        radius,
+                        start_angle: start_angle - phase,
+                        sweep,
+                    },
+                    Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
+                        unreachable!("revolve profiles carry lines and arcs only")
+                    }
+                };
+                chain.push(section);
+            }
+            let Some(first) = chain.first().copied() else {
+                return Err(RevolveInputError::SectionNotContiguous);
+            };
+            for pair in chain.windows(2) {
+                if !meets(pair[0].end(), pair[1].start(), on_axis) {
+                    return Err(RevolveInputError::SectionNotContiguous);
                 }
-                // A slanted line reaching the axis sweeps a cone to its
-                // apex, which closes through a pole as a sphere does.
-                Segment::Line { start, end }
             }
-            Segment::Arc {
-                center,
-                radius,
-                start_angle,
-                sweep,
-                ..
-            } => Segment::Arc {
-                center: to_section(center),
-                start,
-                end,
-                radius,
-                start_angle: start_angle - phase,
-                sweep,
-            },
-            Segment::Ellipse { .. } | Segment::Harmonic { .. } | Segment::Trace { .. } => {
-                unreachable!("revolve profiles carry lines and arcs only")
+            let last = chain[chain.len() - 1];
+            let closed = meets(last.end(), first.start(), on_axis);
+            // A chain that does not close on itself must begin and end on the
+            // axis, because the axis is then what closes it.
+            let closes_through_axis = first.start().x <= on_axis && last.end().x <= on_axis;
+            if !(closed || closes_through_axis) {
+                return Err(RevolveInputError::SectionNotContiguous);
             }
+            Ok((chain, closed))
         };
-        chain.push(section);
-    }
-
-    let Some(first) = chain.first().copied() else {
-        return Err(RevolveInputError::SectionNotContiguous);
-    };
-    for pair in chain.windows(2) {
-        if !meets(pair[0].end(), pair[1].start(), on_axis) {
-            return Err(RevolveInputError::SectionNotContiguous);
+    let mut chains = Vec::with_capacity(regions.len());
+    for (outer, holes) in &regions {
+        let outer = chain_of(outer)?;
+        let mut hole_chains = Vec::with_capacity(holes.len());
+        for hole in holes {
+            let (chain, closed) = chain_of(hole)?;
+            // A hole sweeps a cavity or a channel only while it stays clear
+            // of the axis all the way round.
+            if !closed
+                || chain
+                    .iter()
+                    .any(|segment| segment.start().x <= on_axis || segment.end().x <= on_axis)
+            {
+                return Err(RevolveInputError::HoleOnAxis);
+            }
+            hole_chains.push(chain);
         }
-    }
-    let last = chain[chain.len() - 1];
-    let closed = meets(last.end(), first.start(), on_axis);
-    // A chain that does not close on itself must begin and end on the axis,
-    // because the axis is then what closes it.
-    let closes_through_axis = first.start().x <= on_axis && last.end().x <= on_axis;
-    if !(closed || closes_through_axis) {
-        return Err(RevolveInputError::SectionNotContiguous);
+        chains.push((outer, hole_chains));
     }
 
     // The span, in the section frame's own azimuth. About a reversed axis the
@@ -256,7 +309,12 @@ pub(crate) fn validate_revolve(
     let (begin, sweep) = match turn {
         None => (0.0, TAU),
         Some((start, sweep)) => {
-            let outermost = chain.iter().map(outermost_radius).fold(0.0_f64, f64::max);
+            let outermost = chains
+                .iter()
+                .flat_map(|((outer, _), holes)| std::iter::once(outer).chain(holes))
+                .flatten()
+                .map(outermost_radius)
+                .fold(0.0_f64, f64::max);
             if sweep * outermost < minimum || (TAU - sweep) * outermost < minimum {
                 return Err(RevolveInputError::AngleInvalid);
             }
@@ -268,9 +326,6 @@ pub(crate) fn validate_revolve(
         }
     };
 
-    let roles = (0..chain.len())
-        .map(|index| FaceRole::ExtrusionSide(u32::try_from(index).unwrap_or(u32::MAX)))
-        .collect();
     let center = frame.point(origin, 0.0);
     let axis_direction = frame.u * along.x + frame.v * along.y;
     let profile_radial = frame.u * radial.x + frame.v * radial.y;
@@ -283,8 +338,18 @@ pub(crate) fn validate_revolve(
         let radial_u = profile_radial * begin.cos() + profile_tangent * begin.sin();
         (radial_u, cross(axis_direction, radial_u))
     };
-    Ok(ValidatedRevolve {
-        section: RzSection::from_parts(
+    // Every segment of every loop names its own side face.
+    let mut next_role = 0_u32;
+    let mut section = |chain: Vec<Segment>, closed: bool| {
+        let roles = chain
+            .iter()
+            .map(|_| {
+                let role = FaceRole::ExtrusionSide(next_role);
+                next_role = next_role.saturating_add(1);
+                role
+            })
+            .collect();
+        RzSection::from_parts(
             center,
             axis_direction,
             radial_u,
@@ -292,9 +357,17 @@ pub(crate) fn validate_revolve(
             chain,
             roles,
             closed,
-        ),
-        sweep,
-    })
+        )
+    };
+    let regions = chains
+        .into_iter()
+        .map(|((outer, closed), holes)| {
+            let outer = section(outer, closed);
+            let holes = holes.into_iter().map(|hole| section(hole, true)).collect();
+            (outer, holes)
+        })
+        .collect();
+    Ok(ValidatedRevolve { regions, sweep })
 }
 
 /// The farthest a section segment reaches from the axis: its endpoints, or an

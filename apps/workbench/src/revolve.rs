@@ -1228,6 +1228,7 @@ mod tests {
     use artificer_model::FeatureOutput;
 
     const PI: f64 = std::f64::consts::PI;
+    const TAU: f64 = std::f64::consts::TAU;
 
     /// A 1 × 3 rectangle at `r` in [1, 2] on the XZ plane, beside a
     /// centreline drawn up the sketch's vertical axis, still being drawn.
@@ -1543,6 +1544,37 @@ mod tests {
         app.commit_sketch_stroke(closing);
         assert!(app.stage_revolve(), "{:?}", app.document_status);
         assert_close(preview_volume(&app), PI * 4.0 * 3.0 / 3.0, "cone");
+        assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
+    }
+
+    /// A circle drawn inside the section is a hole in its region, and the
+    /// revolve sweeps it as a ring-shaped cavity: the tube less a torus, by
+    /// Pappus.
+    #[test]
+    fn a_hole_in_the_section_revolves_into_a_cavity() {
+        let mut app = KernelLabApp::default();
+        rectangle_beside_a_centreline(&mut app);
+        let hole = app
+            .sketch
+            .stage_geometry(SketchGeometry::Circle {
+                center: SketchPoint::new(1.5, 1.5),
+                rim: SketchPoint::new(1.75, 1.5),
+            })
+            .expect("the hole stages");
+        app.commit_sketch_stroke(hole);
+        assert!(app.stage_revolve(), "{:?}", app.document_status);
+        // The sketch has two regions now, the ring and the disc inside it;
+        // the ring is the one to turn.
+        let sketch_index = app.sketches.len() - 1;
+        let ring = app.sketch_region_anchors(app.sketches[sketch_index].id.expect("finished"));
+        let anchor = ring
+            .into_iter()
+            .find(|anchor| (anchor[0] - 1.5).hypot(anchor[1] - 1.5) > 0.3)
+            .expect("the ring offers an anchor");
+        assert!(app.pick_revolve_region(sketch_index, anchor, false));
+        let tube = PI * (4.0 - 1.0) * 3.0;
+        let torus = PI * 0.25 * 0.25 * TAU * 1.5;
+        assert_close(preview_volume(&app), tube - torus, "tube with a cavity");
         assert!(app.confirm_pending_operation(), "{:?}", app.document_status);
     }
 

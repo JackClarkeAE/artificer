@@ -443,8 +443,11 @@ fn a_pointed_cone_cuts_a_block() {
     assert!(NativeKernel::validate(&outcome.snapshot, ValidationProfile::Solid).valid);
 }
 
-#[test]
-fn a_profile_with_a_hole_is_refused() {
+/// The tube r in [1, 9], z in [0, 9] with a round hole of radius 1 at
+/// r = 5 in its section: a full turn leaves a torus-shaped cavity inside the
+/// tube, Pappus's torus less; a quarter turn leaves a channel through both
+/// end faces, and a quarter of the volume.
+fn holed_tube() -> (PlanarProfile2, f64) {
     let mut profile = polygon(&[(1.0, 0.0), (9.0, 0.0), (9.0, 9.0), (1.0, 9.0)]);
     profile.regions[0].holes.push(PlanarLoop2 {
         curves: vec![PlanarCurve2::Circle {
@@ -453,14 +456,102 @@ fn a_profile_with_a_hole_is_refused() {
             direction: ArcDirection::Clockwise,
         }],
     });
-    let error = revolve(profile, "revolve-hole").expect_err("a hole must refuse in v1");
-    assert!(
-        error
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code.as_str() == "REVOLVE_SINGLE_REGION_ONLY"),
-        "unexpected refusal: {error:?}"
-    );
+    (profile, PI * (81.0 - 1.0) * 9.0 - PI * TAU * 5.0)
+}
+
+/// A solid cylinder r in [0, 6], z in [0, 6] with a square hole r in [2, 4],
+/// z in [2, 4]: the cavity is a square-sectioned ring.
+fn holed_cylinder() -> (PlanarProfile2, f64) {
+    let mut profile = polygon(&[(0.0, 0.0), (6.0, 0.0), (6.0, 6.0), (0.0, 6.0)]);
+    profile.regions[0].holes.push(PlanarLoop2::from_polygon(&[
+        Point2::new(2.0, 2.0),
+        Point2::new(2.0, 4.0),
+        Point2::new(4.0, 4.0),
+        Point2::new(4.0, 2.0),
+    ]));
+    (profile, PI * 36.0 * 6.0 - PI * (16.0 - 4.0) * 2.0)
+}
+
+#[test]
+fn a_hole_in_the_profile_sweeps_a_cavity_or_a_channel() {
+    for (what, (profile, full)) in [("tube", holed_tube()), ("cylinder", holed_cylinder())] {
+        let solid = revolve(profile.clone(), "revolve-hole")
+            .unwrap_or_else(|error| panic!("{what}: {:?}", error.diagnostics));
+        assert_volume(&solid, full, what);
+        let step = NativeKernel::export_step(&solid, what).expect("the hollow part exports");
+        assert!(!step.contains("B_SPLINE_SURFACE"), "{what}: exact");
+        for (turn, share) in [(PI / 2.0, 0.25), (1.5 * PI, 0.75)] {
+            let partial = revolve_through(
+                profile.clone(),
+                axis(),
+                RevolveAngle::partial(0.0, turn),
+                "revolve-hole-partial",
+            )
+            .unwrap_or_else(|error| panic!("{what}, {share} turn: {:?}", error.diagnostics));
+            assert_volume(&partial, full * share, what);
+        }
+    }
+}
+
+/// Two regions of one profile turn into two solids of one body: two tubes,
+/// r in [1, 2] and [4, 5], both 3 tall.
+#[test]
+fn several_regions_sweep_several_solids() {
+    let profile = PlanarProfile2 {
+        regions: [
+            [(1.0, 0.0), (2.0, 0.0), (2.0, 3.0), (1.0, 3.0)],
+            [(4.0, 0.0), (5.0, 0.0), (5.0, 3.0), (4.0, 3.0)],
+        ]
+        .iter()
+        .map(|corners| PlanarRegion2 {
+            outer: PlanarLoop2::from_polygon(
+                &corners
+                    .iter()
+                    .map(|(x, y)| Point2::new(*x, *y))
+                    .collect::<Vec<_>>(),
+            ),
+            holes: vec![],
+        })
+        .collect(),
+    };
+    let both = PI * (4.0 - 1.0) * 3.0 + PI * (25.0 - 16.0) * 3.0;
+    let solids = revolve(profile.clone(), "revolve-regions")
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+    assert_volume(&solids, both, "two tubes");
+    let half = revolve_through(
+        profile.clone(),
+        axis(),
+        RevolveAngle::partial(0.0, PI),
+        "half",
+    )
+    .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+    assert_volume(&half, both / 2.0, "two half tubes");
+    // Both rings cut from the block at once, exactly: planes and coaxial
+    // cylinders, sunk 3 into its top face.
+    let sunk = PlanarProfile2 {
+        regions: profile
+            .regions
+            .into_iter()
+            .map(|region| PlanarRegion2 {
+                outer: PlanarLoop2::from_polygon(
+                    &region
+                        .outer
+                        .curves
+                        .iter()
+                        .map(|curve| match curve {
+                            PlanarCurve2::Line { start, .. } => Point2::new(start.x, start.y - 3.0),
+                            _ => unreachable!("the regions are polygons"),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                holes: vec![],
+            })
+            .collect(),
+    };
+    let outcome = revolve_into(&block(), sunk, SolidOperation::Cut)
+        .unwrap_or_else(|error| panic!("{:?}", error.diagnostics));
+    assert_volume(&outcome.snapshot, 32_000.0 - both, "block less two rings");
+    assert_eq!(outcome.report.tier(), Tier::Exact);
 }
 
 /// The axis is directed, but which way it points is presentation, not

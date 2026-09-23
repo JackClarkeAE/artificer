@@ -1133,12 +1133,94 @@ pub(crate) fn build_revolved_topology(section: &RzSection) -> Topology {
 /// less is closed by two planar wedge faces: the section itself at azimuth
 /// zero, and its turned copy at `sweep`.
 pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology {
+    build_turned_region(section, &[], sweep)
+}
+
+/// Revolves a region with holes through `sweep` radians. `outer` runs
+/// anticlockwise and every hole clockwise, all in the one section frame, so
+/// material lies on the left of each chain and the builder faces every band
+/// the right way without knowing which is which.
+///
+/// Swept a full turn, each hole is a cavity: a closed shell of its own,
+/// facing into it, held as an inner shell of the solid. Swept less, it is a
+/// channel open at both ends, and its outline is a hole in each of the two
+/// wedge faces.
+pub(crate) fn build_turned_region(outer: &RzSection, holes: &[RzSection], sweep: f64) -> Topology {
     let mut builder = Builder {
         topology: Topology::default(),
         next_id: 1,
-        section,
+        section: outer,
         sweep: sweep.min(FULL_TURN),
     };
+    let swept = sweep_section(&mut builder, outer);
+    let outer_faces = builder.topology.faces.len();
+    let mut swept_holes = Vec::with_capacity(holes.len());
+    for hole in holes {
+        let first = builder.topology.faces.len();
+        let (circles, wedges) = sweep_section(&mut builder, hole);
+        swept_holes.push((hole, circles, wedges, first..builder.topology.faces.len()));
+    }
+
+    if builder.partial() {
+        let hole_wedges = swept_holes
+            .iter()
+            .map(|(hole, circles, wedges, _)| (*hole, circles.as_slice(), wedges.as_slice()))
+            .collect::<Vec<_>>();
+        push_wedges(&mut builder, (outer, &swept.0, &swept.1), &hole_wedges);
+    }
+
+    // A partial turn, or a region without holes, is one closed shell. A full
+    // turn's holes are cavities, each a shell of its own inside the first.
+    let cavities = if builder.partial() {
+        Vec::new()
+    } else {
+        swept_holes
+            .into_iter()
+            .map(|(_, _, _, faces)| faces)
+            .collect::<Vec<_>>()
+    };
+    let outer_range = if cavities.is_empty() {
+        0..builder.topology.faces.len()
+    } else {
+        0..outer_faces
+    };
+    let shell_key = ShellKey(builder.topology.shells.len());
+    let shell_id = builder.allocate();
+    builder.topology.shells.push(Record {
+        id: shell_id,
+        value: Shell {
+            faces: outer_range.map(FaceKey).collect(),
+        },
+    });
+    let mut inner_shells = Vec::with_capacity(cavities.len());
+    for faces in cavities {
+        let key = ShellKey(builder.topology.shells.len());
+        let id = builder.allocate();
+        builder.topology.shells.push(Record {
+            id,
+            value: Shell {
+                faces: faces.map(FaceKey).collect(),
+            },
+        });
+        inner_shells.push(key);
+    }
+    let solid_id = builder.allocate();
+    builder.topology.solids.push(Record {
+        id: solid_id,
+        value: Solid {
+            outer_shell: shell_key,
+            inner_shells,
+        },
+    });
+    builder.topology
+}
+
+/// The rings and faces one section chain sweeps, and the generators it
+/// leaves for the wedge faces of a partial turn.
+fn sweep_section(
+    builder: &mut Builder<'_>,
+    section: &RzSection,
+) -> (Vec<Option<Ring>>, Vec<Option<WedgeUse>>) {
     let count = section.segments.len();
     let stations = builder.stations();
 
@@ -1379,14 +1461,7 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                     })
                 };
                 push_band(
-                    &mut builder,
-                    surface,
-                    low,
-                    high,
-                    seams,
-                    parameters,
-                    role,
-                    descending,
+                    builder, surface, low, high, seams, parameters, role, descending,
                 );
             }
             Segment::Arc {
@@ -1450,7 +1525,7 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
                     })
                 };
                 push_band(
-                    &mut builder,
+                    builder,
                     surface,
                     low,
                     high,
@@ -1466,28 +1541,7 @@ pub(crate) fn build_turned_topology(section: &RzSection, sweep: f64) -> Topology
         }
     }
 
-    if builder.partial() {
-        push_wedges(&mut builder, &circles, &wedges);
-    }
-
-    let shell_key = ShellKey(builder.topology.shells.len());
-    let shell_id = builder.allocate();
-    let face_count = builder.topology.faces.len();
-    builder.topology.shells.push(Record {
-        id: shell_id,
-        value: Shell {
-            faces: (0..face_count).map(FaceKey).collect(),
-        },
-    });
-    let solid_id = builder.allocate();
-    builder.topology.solids.push(Record {
-        id: solid_id,
-        value: Solid {
-            outer_shell: shell_key,
-            inner_shells: Vec::new(),
-        },
-    });
-    builder.topology
+    (circles, wedges)
 }
 
 /// The boundary of a sector cap: out from the axis along the first station,
@@ -1608,13 +1662,17 @@ fn sector_annulus(
     }
 }
 
-/// The two planar faces that close a partial turn: the section at azimuth
-/// zero, and its turned copy at the end of the sweep. A section that closes
-/// through the axis is closed in both by the one axis edge they share.
-fn push_wedges(builder: &mut Builder<'_>, circles: &[Option<Ring>], wedges: &[Option<WedgeUse>]) {
-    let section = builder.section;
+/// One section chain as it appears in the two wedge faces: its generators at
+/// the first station, in chain order, and at the last, against it. A chain
+/// that closes through the axis is closed in both by the one axis edge they
+/// share.
+fn wedge_outline(
+    builder: &mut Builder<'_>,
+    section: &RzSection,
+    circles: &[Option<Ring>],
+    wedges: &[Option<WedgeUse>],
+) -> (Vec<CoedgeUse>, Vec<CoedgeUse>) {
     let segments = &section.segments;
-    let end = builder.sweep;
     // The axis edge runs the way the section closes: from the chain's last
     // point back down to its first.
     let axis_edge = if section.closed {
@@ -1651,12 +1709,6 @@ fn push_wedges(builder: &mut Builder<'_>, circles: &[Option<Ring>], wedges: &[Op
         let (pcurve, range) = line_pcurve(from, to);
         start_uses.push((edge, Orientation::Forward, pcurve, range));
     }
-    let start_loop = builder.push_loop(start_uses);
-    builder.push_face(
-        Surface::Plane(Plane::new(section.center, section.radial_u, section.axis)),
-        start_loop,
-        FaceRole::ExtrusionBottom,
-    );
 
     // At the end of the sweep the frame is (axis, radial), whose normal is
     // the direction of turning; the section is drawn with its coordinates
@@ -1676,14 +1728,54 @@ fn push_wedges(builder: &mut Builder<'_>, circles: &[Option<Ring>], wedges: &[Op
         };
         end_uses.push((wedge.generators[1], orientation, pcurve, range));
     }
-    let end_loop = builder.push_loop(end_uses);
-    builder.push_face(
+    (start_uses, end_uses)
+}
+
+/// One section chain as swept: the section, its rings, and its wedge uses.
+type SweptSection<'a> = (&'a RzSection, &'a [Option<Ring>], &'a [Option<WedgeUse>]);
+
+/// The two planar faces that close a partial turn: the section at azimuth
+/// zero, and its turned copy at the end of the sweep. A hole's chain runs
+/// clockwise, so its outline in each is already the right way round for a
+/// hole in the face.
+fn push_wedges(
+    builder: &mut Builder<'_>,
+    (outer, circles, wedges): SweptSection<'_>,
+    holes: &[SweptSection<'_>],
+) {
+    let section = builder.section;
+    let end = builder.sweep;
+    let (outer_start, outer_end) = wedge_outline(builder, outer, circles, wedges);
+    let hole_outlines = holes
+        .iter()
+        .map(|(hole, circles, wedges)| wedge_outline(builder, hole, circles, wedges))
+        .collect::<Vec<_>>();
+
+    let start_loop = builder.push_loop(outer_start);
+    let start_holes = hole_outlines
+        .iter()
+        .map(|(start, _)| builder.push_loop(start.clone()))
+        .collect();
+    builder.push_face_with_holes(
+        Surface::Plane(Plane::new(section.center, section.radial_u, section.axis)),
+        start_loop,
+        start_holes,
+        FaceRole::ExtrusionBottom,
+    );
+
+    let end_loop = builder.push_loop(outer_end);
+    let end_holes = hole_outlines
+        .into_iter()
+        .map(|(_, end)| builder.push_loop(end))
+        .collect();
+    builder.push_face_with_holes(
         Surface::Plane(Plane::new(
             section.center,
             section.axis,
             builder.radial(end),
         )),
         end_loop,
+        end_holes,
         FaceRole::ExtrusionTop,
     );
 }

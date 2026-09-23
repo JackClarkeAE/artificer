@@ -7625,9 +7625,9 @@ fn revolve_input_error(snapshot: SnapshotId, reason: revolve::RevolveInputError)
         revolve::RevolveInputError::Profile(reason) => {
             return planar_profile_input_error(snapshot, reason);
         }
-        revolve::RevolveInputError::SingleRegionOnly => (
-            "REVOLVE_SINGLE_REGION_ONLY",
-            "A revolve sweeps exactly one material region without holes; a hole would sweep a cavity of revolution, which needs a Boolean rather than a section chain.",
+        revolve::RevolveInputError::HoleOnAxis => (
+            "REVOLVE_HOLE_ON_AXIS",
+            "A hole in the profile reaches the axis. A hole sweeps a cavity, or a channel through a partial revolve, only while it stays clear of the axis all the way round.",
         ),
         revolve::RevolveInputError::DegenerateAxis => (
             "REVOLVE_AXIS_DEGENERATE",
