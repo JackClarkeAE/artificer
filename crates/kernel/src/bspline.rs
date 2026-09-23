@@ -294,6 +294,12 @@ fn curve_point<const D: usize>(
 }
 
 /// The point, first and second derivatives of a curve at `t`.
+///
+/// The derivatives are taken of the control points less the span's first
+/// one. The derivatives of the basis sum to zero, so that changes nothing
+/// but the rounding: the weights grow as the knots close up, and combined
+/// with coordinates far from the origin they would cancel to a rate that
+/// kept only the last few bits of those coordinates.
 fn curve_derivatives<const D: usize>(
     degree: usize,
     knots: &[f64],
@@ -304,10 +310,13 @@ fn curve_derivatives<const D: usize>(
     let clamped = t.clamp(knots[degree], knots[count]);
     let span = find_span(degree, knots, count, clamped);
     let ders = basis(degree, knots, span, clamped, 2);
+    let first = span - degree;
+    let anchor = point(first);
+    let relative = |index: usize| sub(point(index), anchor);
     [
         curve_point(degree, knots, count, t, point),
-        combine(&ders[1], degree, span - degree, point),
-        combine(&ders[2], degree, span - degree, point),
+        combine(&ders[1], degree, first, &relative),
+        combine(&ders[2], degree, first, &relative),
     ]
 }
 
@@ -379,6 +388,20 @@ pub(crate) const fn point2(value: [f64; 2]) -> Point2 {
 
 pub(crate) const fn array2(point: Point2) -> [f64; 2] {
     [point.x, point.y]
+}
+
+/// The least step, in model space, a nearest-point walk near `point` can
+/// still tell from rounding: a few units in the last place of the point's
+/// largest coordinate, and never less than a few of a unit length's.
+///
+/// A point on a surface is a sum of a dozen or more products of control
+/// points and basis functions, each rounded in the last place of its
+/// coordinates, so where those coordinates are large the point — and the
+/// distance to it, and the Newton step that distance gives — carries an
+/// error of that size, and a step no longer than it is noise.
+pub(crate) fn settled_length(point: Point3) -> f64 {
+    let size = point.x.abs().max(point.y.abs()).max(point.z.abs());
+    16.0 * f64::EPSILON * size.max(1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1004,13 @@ pub(crate) fn line_curve(start: Point3, end: Point3) -> Option<SplineCurve3> {
 /// sampled finely on every piece, is within half the tolerance. The pieces
 /// are laid end to end with every joint a knot of full multiplicity, so the
 /// joints are points of the arc exactly.
+///
+/// The fit is made and measured about the centre, and only its control
+/// points are carried out to it: measured where it lies, a fit a hundred
+/// kilometres out would be judged against the rounding of its coordinates
+/// rather than its own error. Once carried there, no curve is nearer the arc
+/// than those coordinates can hold, so the tolerance is never taken below a
+/// few units in their last place.
 pub(crate) fn arc_curve(
     center: Point3,
     u: Vector3,
@@ -1000,9 +1030,11 @@ pub(crate) fn arc_curve(
     {
         return None;
     }
+    let tolerance = tolerance.max(settled_length(center));
+    // Points about the centre, as vectors from it.
     let at = |angle: f64| {
         let (sin, cos) = angle.sin_cos();
-        center + u * (radius * cos) + v * (radius * sin)
+        u * (radius * cos) + v * (radius * sin)
     };
     let rate = |angle: f64| {
         let (sin, cos) = angle.sin_cos();
@@ -1034,17 +1066,16 @@ pub(crate) fn arc_curve(
                 end,
             ];
             if piece == 0 {
-                points.push(array3(control[0]));
+                points.push(array3(center + control[0]));
             }
-            points.extend(control[1..].iter().map(|point| array3(*point)));
+            points.extend(control[1..].iter().map(|point| array3(center + *point)));
             for sample in 1..16 {
                 let t = f64::from(sample) / 16.0;
                 let s = 1.0 - t;
-                let point = control[0].as_vector() * (s * s * s)
-                    + control[1].as_vector() * (3.0 * s * s * t)
-                    + control[2].as_vector() * (3.0 * s * t * t)
-                    + control[3].as_vector() * (t * t * t);
-                let radial = Point3::new(point.x, point.y, point.z) - center;
+                let radial = control[0] * (s * s * s)
+                    + control[1] * (3.0 * s * s * t)
+                    + control[2] * (3.0 * s * t * t)
+                    + control[3] * (t * t * t);
                 let in_plane = u * radial.dot(u) + v * radial.dot(v);
                 worst = worst
                     .max((in_plane.length() - radius).abs())
@@ -1127,23 +1158,25 @@ fn interpolate<const D: usize>(
     if unknowns == 0 {
         return Some(points);
     }
-    let mut matrix = vec![vec![0.0; unknowns]; unknowns];
+    let mut equations = Vec::with_capacity(unknowns);
     let mut rhs = vec![[0.0; D]; unknowns];
     for row in 0..unknowns {
         let parameter = parameters[row + 1];
         let span = find_span(degree, knots, count, parameter);
         let values = basis(degree, knots, span, parameter, 0)[0];
         rhs[row] = data[row + 1];
+        let mut terms = Vec::with_capacity(degree + 1);
         for (offset, value) in values.iter().enumerate().take(degree + 1) {
             let index = span - degree + offset;
             if index == 0 || index == count - 1 {
                 rhs[row] = sub(rhs[row], scale(points[index], *value));
             } else {
-                matrix[row][index - 1] = *value;
+                terms.push((index - 1, *value));
             }
         }
+        equations.push(Equation::from_terms(&terms));
     }
-    let rhs = solve(matrix, rhs)?;
+    let rhs = solve(equations, rhs)?;
     points[1..count - 1].copy_from_slice(&rhs);
     points
         .iter()
@@ -1226,65 +1259,133 @@ pub(crate) fn fit_points(points: &[[f64; 2]], closed: bool) -> Option<SplineCurv
     control[total_points - 1] = points[0];
     control[total_points - 2] = sub(points[0], scale(seam, last_span / 3.0));
     let unknowns = total_points - 4;
-    let mut matrix = vec![vec![0.0; unknowns]; unknowns];
+    let mut equations = Vec::with_capacity(unknowns);
     let mut rhs = vec![[0.0; 2]; unknowns];
-    for row in 0..unknowns {
+    for (row, known) in rhs.iter_mut().enumerate() {
         let k = row + 1;
         let span = find_span(degree, &knots, total_points, parameters[k]);
         let values = basis(degree, &knots, span, parameters[k], 0)[0];
-        rhs[row] = data[k];
+        *known = data[k];
+        let mut terms = Vec::with_capacity(degree + 1);
         for (offset, value) in values.iter().enumerate().take(degree + 1) {
             let index = span - degree + offset;
             if (2..total_points - 2).contains(&index) {
-                matrix[row][index - 2] = *value;
+                terms.push((index - 2, *value));
             } else {
-                rhs[row] = sub(rhs[row], scale(control[index], *value));
+                *known = sub(*known, scale(control[index], *value));
             }
         }
+        equations.push(Equation::from_terms(&terms));
     }
-    let solved = solve(matrix, rhs)?;
+    let solved = solve(equations, rhs)?;
     control[2..total_points - 2].copy_from_slice(&solved);
     SplineCurve2::new(degree, knots, control).ok()
 }
 
-/// `A·x = b` for a small dense system, by Gaussian elimination with partial
-/// pivoting in a fixed order, each unknown a point.
-fn solve<const D: usize>(
-    mut matrix: Vec<Vec<f64>>,
-    mut rhs: Vec<[f64; D]>,
-) -> Option<Vec<[f64; D]>> {
+/// One equation of a banded system: its coefficients from column `first`
+/// on, and zero in every column outside them.
+struct Equation {
+    first: usize,
+    coefficients: Vec<f64>,
+}
+
+impl Equation {
+    /// The equation with `terms`, `(column, coefficient)` in rising columns.
+    fn from_terms(terms: &[(usize, f64)]) -> Self {
+        let first = terms.first().map_or(0, |(column, _)| *column);
+        let mut coefficients = Vec::with_capacity(terms.len());
+        for (column, coefficient) in terms {
+            coefficients.resize(column - first, 0.0);
+            coefficients.push(*coefficient);
+        }
+        Self {
+            first,
+            coefficients,
+        }
+    }
+
+    /// One past the last column the equation holds.
+    fn end(&self) -> usize {
+        self.first + self.coefficients.len()
+    }
+
+    fn at(&self, column: usize) -> f64 {
+        column
+            .checked_sub(self.first)
+            .and_then(|offset| self.coefficients.get(offset))
+            .copied()
+            .unwrap_or(0.0)
+    }
+}
+
+/// `A·x = b`, each unknown a point, by Gaussian elimination with partial
+/// pivoting in a fixed order, over the band the equations fill.
+///
+/// Interpolation's matrix is banded: row `i` holds only the `p + 1` basis
+/// functions that do not vanish at its parameter, which rise with `i`. A row
+/// further down than the band reaches below the diagonal has nothing in the
+/// column being eliminated, so the pivot search and the elimination stop at
+/// the band's foot, and each row is only as wide as the pivot rows swapped
+/// into it make it. That is the dense elimination exactly — every step it
+/// would take outside the band subtracts a zero — at a cost that grows with
+/// the number of rows rather than its cube: a sweep's walls are interpolated
+/// through a copy of the profile for every row, and there are hundreds.
+fn solve<const D: usize>(mut rows: Vec<Equation>, mut rhs: Vec<[f64; D]>) -> Option<Vec<[f64; D]>> {
     let size = rhs.len();
+    if rows.len() != size {
+        return None;
+    }
+    let below = rows
+        .iter()
+        .enumerate()
+        .map(|(row, equation)| row.saturating_sub(equation.first))
+        .max()
+        .unwrap_or(0);
     for column in 0..size {
+        let foot = (column + below).min(size - 1);
         let mut pivot = column;
-        for row in column + 1..size {
-            if matrix[row][column].abs() > matrix[pivot][column].abs() {
+        for row in column + 1..=foot {
+            if rows[row].at(column).abs() > rows[pivot].at(column).abs() {
                 pivot = row;
             }
         }
-        let magnitude = matrix[pivot][column].abs();
+        let magnitude = rows[pivot].at(column).abs();
         if magnitude.is_nan() || magnitude <= 1.0e-14 {
             return None;
         }
-        matrix.swap(column, pivot);
+        rows.swap(column, pivot);
         rhs.swap(column, pivot);
-        for row in column + 1..size {
-            let factor = matrix[row][column] / matrix[column][column];
+        let (upper, lower) = rows.split_at_mut(column + 1);
+        let source = &upper[column];
+        let end = source.end();
+        for (offset, target) in lower[..foot - column].iter_mut().enumerate() {
+            let factor = target.at(column) / source.at(column);
             if factor == 0.0 {
                 continue;
             }
-            let (upper, lower) = matrix.split_at_mut(row);
-            for (target, source) in lower[0][column..].iter_mut().zip(&upper[column][column..]) {
-                *target -= factor * source;
+            // A row with something in this column starts at or before it;
+            // it is widened to hold everything the pivot row reaches.
+            if end > target.end() {
+                target.coefficients.resize(end - target.first, 0.0);
             }
+            for entry in column..end {
+                target.coefficients[entry - target.first] -= factor * source.at(entry);
+            }
+            let row = column + 1 + offset;
             rhs[row] = sub(rhs[row], scale(rhs[column], factor));
         }
     }
-    for row in (0..size).rev() {
+    for (row, equation) in rows.iter().enumerate().rev() {
         let mut value = rhs[row];
-        for entry in row + 1..size {
-            value = sub(value, scale(rhs[entry], matrix[row][entry]));
+        for (entry, solved) in rhs
+            .iter()
+            .enumerate()
+            .take(equation.end().min(size))
+            .skip(row + 1)
+        {
+            value = sub(value, scale(*solved, equation.at(entry)));
         }
-        rhs[row] = scale(value, 1.0 / matrix[row][row]);
+        rhs[row] = scale(value, 1.0 / equation.at(row));
     }
     rhs.iter()
         .all(|point| point.iter().all(|component| component.is_finite()))
@@ -1550,6 +1651,12 @@ impl SplineSurface {
     }
 
     /// The point and every partial derivative up to the second.
+    ///
+    /// As for a curve, the derivatives are taken of the control points less
+    /// the cell's first one, which the vanishing sums of the basis
+    /// derivatives leave them unchanged by, so that far from the origin they
+    /// do not cancel down to the rounding of the coordinates. The point
+    /// itself is evaluated whole.
     pub(crate) fn jet(self, point: Point2) -> SurfaceJet {
         let [pu, pv] = self.0.degree;
         let [nu, nv] = self.0.counts;
@@ -1561,10 +1668,14 @@ impl SplineSurface {
         let span_v = find_span(pv, knots_v, nv, v);
         let ders_u = basis(pu, knots_u, span_u, u, 2);
         let ders_v = basis(pv, knots_v, span_v, v, 2);
+        let anchor = self.control(span_u - pu, span_v - pv);
         let mut terms = [[0.0; 3]; 6];
         for (s, j) in (span_v - pv..=span_v).enumerate() {
-            let along =
-                [0, 1, 2].map(|k| combine(&ders_u[k], pu, span_u - pu, &|i| self.control(i, j)));
+            let along = [0, 1, 2].map(|k| {
+                combine(&ders_u[k], pu, span_u - pu, &|i| {
+                    sub(self.control(i, j), anchor)
+                })
+            });
             // (k, l): ∂^{k+l}/∂u^k ∂v^l, in the order point, u, v, uu, uv, vv.
             for (slot, (k, l)) in [(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2)]
                 .into_iter()
@@ -1836,6 +1947,14 @@ impl SplineSurface {
     /// cell. A step that would move away is halved, parameters stay inside
     /// the domain, and a walk that has not settled within the iteration
     /// limit is refused rather than returned.
+    ///
+    /// The walk has settled when a step no longer brings the point nearer,
+    /// or when it moves the point by no more than the rounding of the
+    /// coordinates the point is computed in. Far from the origin that
+    /// rounding, not the parameters' own, bounds how still the walk can get:
+    /// at a hundred kilometres a point is only known to about `10⁻¹¹`, and a
+    /// test on the parameter step alone would chase that noise until the
+    /// iterations ran out.
     pub(crate) fn invert(self, target: Point3, seed: Option<Point2>) -> Option<Point2> {
         if !target.is_finite() {
             return None;
@@ -1896,9 +2015,14 @@ impl SplineSurface {
                 return Some(current);
             };
             let moved = (next.x - current.x).abs().max((next.y - current.y).abs());
+            let carried = (jet.u * (next.x - current.x) + jet.v * (next.y - current.y)).length();
+            let stalled = next_value >= value;
             current = next;
             value = next_value;
-            if moved <= 4.0 * f64::EPSILON * width.max(1.0) {
+            if moved <= 4.0 * f64::EPSILON * width.max(1.0)
+                || stalled
+                || carried <= settled_length(jet.point)
+            {
                 return Some(current);
             }
         }
@@ -2150,6 +2274,88 @@ mod tests {
             array3(center + u * (radius * 0.3f64.cos()) + v * (radius * 0.3f64.sin())),
             1.0e-12
         ));
+    }
+
+    /// The dense elimination the banded one replaced, kept here as the
+    /// reference it must agree with.
+    fn dense_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<[f64; 3]>) -> Option<Vec<[f64; 3]>> {
+        let size = rhs.len();
+        for column in 0..size {
+            let mut pivot = column;
+            for row in column + 1..size {
+                if matrix[row][column].abs() > matrix[pivot][column].abs() {
+                    pivot = row;
+                }
+            }
+            if matrix[pivot][column].abs() <= 1.0e-14 {
+                return None;
+            }
+            matrix.swap(column, pivot);
+            rhs.swap(column, pivot);
+            for row in column + 1..size {
+                let factor = matrix[row][column] / matrix[column][column];
+                if factor == 0.0 {
+                    continue;
+                }
+                let (upper, lower) = matrix.split_at_mut(row);
+                for (target, source) in lower[0][column..].iter_mut().zip(&upper[column][column..])
+                {
+                    *target -= factor * source;
+                }
+                rhs[row] = sub(rhs[row], scale(rhs[column], factor));
+            }
+        }
+        for row in (0..size).rev() {
+            let mut value = rhs[row];
+            for entry in row + 1..size {
+                value = sub(value, scale(rhs[entry], matrix[row][entry]));
+            }
+            rhs[row] = scale(value, 1.0 / matrix[row][row]);
+        }
+        Some(rhs)
+    }
+
+    /// Interpolation's systems, solved over their band, come out as the
+    /// dense elimination gives them, to the bit.
+    #[test]
+    fn the_banded_solve_is_the_dense_one() {
+        for (count, degree) in [(4, 3), (9, 2), (40, 3), (257, 3), (30, 5)] {
+            // Uneven chord-length parameters, so that pivoting has work.
+            let mut parameters = vec![0.0];
+            for index in 1..count {
+                let step = 1.0 + 0.9 * (index as f64 * 1.7).sin();
+                parameters.push(parameters[index - 1] + step);
+            }
+            let total = parameters[count - 1];
+            let parameters = parameters
+                .iter()
+                .map(|value| value / total)
+                .collect::<Vec<_>>();
+            let knots = interpolation_knots(&parameters, degree);
+            let unknowns = count - 2;
+            let mut matrix = vec![vec![0.0; unknowns]; unknowns];
+            let mut equations = Vec::new();
+            let mut rhs = Vec::new();
+            for row in 0..unknowns {
+                let parameter = parameters[row + 1];
+                let span = find_span(degree, &knots, count, parameter);
+                let values = basis(degree, &knots, span, parameter, 0)[0];
+                let mut terms = Vec::new();
+                for (offset, value) in values.iter().enumerate().take(degree + 1) {
+                    let index = span - degree + offset;
+                    if index != 0 && index != count - 1 {
+                        matrix[row][index - 1] = *value;
+                        terms.push((index - 1, *value));
+                    }
+                }
+                equations.push(Equation::from_terms(&terms));
+                let angle = row as f64 * 0.37;
+                rhs.push([angle.cos() * 1.0e5, angle.sin(), row as f64]);
+            }
+            let dense = dense_solve(matrix, rhs.clone()).expect("solves");
+            let banded = solve(equations, rhs).expect("solves");
+            assert_eq!(dense, banded, "{count} points of degree {degree}");
+        }
     }
 
     #[test]
