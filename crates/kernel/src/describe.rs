@@ -55,6 +55,15 @@ pub enum FaceGeometry {
         first_rail: RailGeometry,
         second_rail: RailGeometry,
     },
+    /// A B-spline surface (ADR 0050), reported by its degree along each
+    /// parameter and the size of its control net: what kind of surface it
+    /// is, which the net itself, of no fixed size, would not say at a glance.
+    Bspline {
+        degree_u: u32,
+        degree_v: u32,
+        control_points_u: u32,
+        control_points_v: u32,
+    },
 }
 
 /// One rail of a ruled face: the kind of curve and where it starts and ends.
@@ -87,7 +96,7 @@ impl RailKind {
 
 impl FaceGeometry {
     /// The surface kind as one lowercase word: `plane`, `cylinder`, `cone`,
-    /// `sphere`, `torus`, or `ruled`.
+    /// `sphere`, `torus`, `ruled`, or `bspline`.
     #[must_use]
     pub const fn surface_kind(&self) -> &'static str {
         match self {
@@ -97,6 +106,7 @@ impl FaceGeometry {
             Self::Sphere { .. } => "sphere",
             Self::Torus { .. } => "torus",
             Self::Ruled { .. } => "ruled",
+            Self::Bspline { .. } => "bspline",
         }
     }
 }
@@ -158,6 +168,14 @@ pub enum EdgeGeometry {
         host_radius: f64,
         other_radius: f64,
     },
+    /// A B-spline curve (ADR 0050), reported by its ends, its degree and how
+    /// many control points it has.
+    Bspline {
+        start: ProtocolPoint3,
+        end: ProtocolPoint3,
+        degree: u32,
+        control_points: u32,
+    },
 }
 
 impl EdgeGeometry {
@@ -169,6 +187,7 @@ impl EdgeGeometry {
             Self::CircularArc { .. } => "circle",
             Self::EllipticalArc { .. } => "ellipse",
             Self::SurfaceTrace { .. } => "trace",
+            Self::Bspline { .. } => "bspline",
         }
     }
 }
@@ -198,12 +217,22 @@ pub struct SurfaceCounts {
     /// carrier existed, which had none.
     #[serde(default)]
     pub ruled: u64,
+    /// B-spline walls (ADR 0050). Absent from a report written before the
+    /// carrier existed, which had none.
+    #[serde(default)]
+    pub bspline: u64,
 }
 
 impl SurfaceCounts {
     #[must_use]
     pub const fn total(self) -> u64 {
-        self.planes + self.cylinders + self.cones + self.spheres + self.tori + self.ruled
+        self.planes
+            + self.cylinders
+            + self.cones
+            + self.spheres
+            + self.tori
+            + self.ruled
+            + self.bspline
     }
 }
 
@@ -242,6 +271,7 @@ impl NativeKernel {
                 Surface::Sphere(_) => counts.spheres += 1,
                 Surface::Torus(_) => counts.tori += 1,
                 Surface::Ruled(_) => counts.ruled += 1,
+                Surface::Bspline(_) => counts.bspline += 1,
             }
         }
         counts
@@ -378,6 +408,12 @@ impl NativeKernel {
                 host_radius: host.radius,
                 other_radius: other.radius,
             },
+            Curve3::Bspline { curve } => EdgeGeometry::Bspline {
+                start: protocol_point(start),
+                end: protocol_point(end),
+                degree: u32::try_from(curve.degree()).unwrap_or(u32::MAX),
+                control_points: u32::try_from(curve.count()).unwrap_or(u32::MAX),
+            },
         };
         let midpoint = edge_record.curve.evaluate((range.start + range.end) * 0.5);
         let length = edge_record.length();
@@ -420,6 +456,15 @@ impl NativeKernel {
                 "where two cylinders meet, radii {} and {}, length {}, midpoint {}",
                 number(host_radius),
                 number(other_radius),
+                number(length),
+                point_text(midpoint)
+            ),
+            EdgeGeometry::Bspline {
+                degree,
+                control_points,
+                ..
+            } => format!(
+                "B-spline, degree {degree}, {control_points} control points, length {}, midpoint {}",
                 number(length),
                 point_text(midpoint)
             ),
@@ -487,6 +532,17 @@ fn face_geometry(surface: Surface) -> Option<FaceGeometry> {
                 second_rail: rail(ruled.rails[1]),
             }
         }
+        Surface::Bspline(surface) => {
+            let [degree_u, degree_v] = surface.degree();
+            let [count_u, count_v] = surface.counts();
+            let small = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+            FaceGeometry::Bspline {
+                degree_u: small(degree_u),
+                degree_v: small(degree_v),
+                control_points_u: small(count_u),
+                control_points_v: small(count_v),
+            }
+        }
     })
 }
 
@@ -546,6 +602,15 @@ fn face_summary(geometry: &FaceGeometry, normal: Vector3, centre: Point3, loops:
             "ruled, between {} and {}",
             first_rail.curve.words(),
             second_rail.curve.words()
+        ),
+        FaceGeometry::Bspline {
+            degree_u,
+            degree_v,
+            control_points_u,
+            control_points_v,
+        } => format!(
+            "B-spline, degree {degree_u} by {degree_v}, {control_points_u} by {control_points_v} \
+             control points"
         ),
     };
     format!("{kind}{holes}, centre {}", point_text(centre))

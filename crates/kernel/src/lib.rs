@@ -7,6 +7,7 @@
 mod analytic_extrusion;
 pub mod api;
 pub mod brep;
+mod bspline;
 mod corner_blend;
 mod cuboid;
 mod cylinder_trace;
@@ -268,7 +269,16 @@ pub enum DisplaySurface {
     /// v·C₁(u)`. It has no revolved frame: [`Self::frame`] reports none, and
     /// its silhouette comes from [`Self::ruled_silhouette`].
     Ruled { rails: [DisplayRail; 2] },
+    /// A B-spline surface (ADR 0050). It has no revolved frame either, and
+    /// its silhouette comes from [`Self::spline_silhouette`].
+    Bspline { surface: DisplaySpline },
 }
+
+/// The surface of a B-spline display carrier: a handle the kernel evaluates
+/// for presentation, and nothing a consumer can build or take apart. Two are
+/// equal when their surfaces are.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplaySpline(bspline::SplineSurface);
 
 /// One rail of a ruled display carrier: a conic walked from `start` to `end`
 /// in its own parameter as `u` runs from zero to one.
@@ -370,6 +380,9 @@ impl DisplaySurface {
             };
             return protocol_point(surface.evaluate(topology::Point2::new(u, v)));
         }
+        if let Self::Bspline { surface } = self {
+            return protocol_point(surface.0.evaluate(topology::Point2::new(u, v)));
+        }
         let (origin, axis, radial_u, radial_v, angular_sign) = self.frame();
         let angle = angular_sign * u;
         let (sin, cos) = topology::seam_snapped_sin_cos(angle);
@@ -398,7 +411,7 @@ impl DisplaySurface {
                     minor_radius * sin_v,
                 )
             }
-            Self::Ruled { .. } => (0.0, 0.0),
+            Self::Ruled { .. } | Self::Bspline { .. } => (0.0, 0.0),
         };
         ProtocolPoint3::new(
             radial.x.mul_add(ring, axis.x.mul_add(lift, origin.x)),
@@ -453,11 +466,92 @@ impl DisplaySurface {
                 angular_sign,
                 ..
             } => (origin, axis, radial_u, radial_v, angular_sign),
-            Self::Ruled { .. } => {
+            Self::Ruled { .. } | Self::Bspline { .. } => {
                 let zero = ProtocolVector3::new(0.0, 0.0, 0.0);
                 (ProtocolPoint3::new(0.0, 0.0, 0.0), zero, zero, zero, 0.0)
             }
         }
+    }
+
+    /// The chords along which a B-spline carrier turns away from a viewer
+    /// looking along `view`, within `domain`; empty for any other carrier.
+    ///
+    /// Presentation samples (ADR 0026, rule 3). The sign of `n · view` is
+    /// read on a grid over every span cell, and each grid cell where it
+    /// changes contributes the chord between the points on its sides where
+    /// the linear reading of it vanishes — the marching-squares contour of
+    /// the silhouette, as fine as the grid.
+    #[must_use]
+    pub fn spline_silhouette(
+        self,
+        domain: [[f64; 2]; 2],
+        view: [f64; 3],
+    ) -> Vec<[ProtocolPoint3; 2]> {
+        let Self::Bspline { surface } = self else {
+            return Vec::new();
+        };
+        let surface = surface.0;
+        let [[u_min, u_max], [v_min, v_max]] = domain;
+        if !(u_min < u_max && v_min < v_max) {
+            return Vec::new();
+        }
+        let view = Vector3::new(view[0], view[1], view[2]);
+        let samples = |direction: usize, from: f64, to: f64| {
+            let spans = surface.spans(direction, from, to);
+            let per_span = (96 / spans.len().max(1)).clamp(2, 16);
+            let mut samples = vec![from];
+            for (low, high) in spans {
+                for step in 1..=per_span {
+                    samples.push((high - low).mul_add(step as f64 / per_span as f64, low));
+                }
+            }
+            samples
+        };
+        let us = samples(0, u_min, u_max);
+        let vs = samples(1, v_min, v_max);
+        let facing = |u: f64, v: f64| {
+            let normal = surface.normal(topology::Point2::new(u, v));
+            let value = normal.dot(view);
+            if value.abs() <= 1.0e-12 * normal.length() * view.length() {
+                0.0
+            } else {
+                value
+            }
+        };
+        let values = us
+            .iter()
+            .map(|u| vs.iter().map(|v| facing(*u, *v)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let crossing = |from: f64, to: f64| {
+            ((from < 0.0) != (to < 0.0))
+                .then(|| from / (from - to))
+                .filter(|fraction| fraction.is_finite())
+        };
+        let mut chords = Vec::new();
+        for i in 0..us.len() - 1 {
+            for j in 0..vs.len() - 1 {
+                let corners = [
+                    (us[i], vs[j], values[i][j]),
+                    (us[i + 1], vs[j], values[i + 1][j]),
+                    (us[i + 1], vs[j + 1], values[i + 1][j + 1]),
+                    (us[i], vs[j + 1], values[i][j + 1]),
+                ];
+                let mut points = Vec::with_capacity(4);
+                for side in 0..4 {
+                    let (u0, v0, f0) = corners[side];
+                    let (u1, v1, f1) = corners[(side + 1) % 4];
+                    if let Some(t) = crossing(f0, f1) {
+                        points.push(((u1 - u0).mul_add(t, u0), (v1 - v0).mul_add(t, v0)));
+                    }
+                }
+                for pair in points.chunks_exact(2) {
+                    chords.push([pair[0], pair[1]].map(|(u, v)| {
+                        protocol_point(surface.evaluate(topology::Point2::new(u, v)))
+                    }));
+                }
+            }
+        }
+        chords
     }
 
     /// The chords along which a ruled carrier turns away from a viewer
@@ -2601,6 +2695,17 @@ impl NativeKernel {
                     )
                 });
             }
+            Surface::Bspline(surface) => {
+                return spline_face_area(&snapshot.topology, face, surface).ok_or_else(|| {
+                    error(
+                        KernelErrorCode::InvalidInput,
+                        KernelStage::Preflight,
+                        snapshot.id,
+                        "the requested B-spline face area could not be evaluated",
+                        Vec::new(),
+                    )
+                });
+            }
         };
         Ok(parameter_area * jacobian)
     }
@@ -2803,6 +2908,23 @@ impl NativeKernel {
                             });
                         }
                     }
+                    // So does the B-spline tessellator's.
+                    Surface::Bspline(surface) => {
+                        for (vertices, normals) in tessellate_spline_face(
+                            &snapshot.topology,
+                            &face.value,
+                            surface,
+                            budget,
+                            precision,
+                        ) {
+                            triangles.push(DebugTriangle {
+                                vertices: vertices.map(protocol_point),
+                                normals: normals.map(protocol_vector),
+                                source_face,
+                                role: snapshot.topology.faces[index].value.role,
+                            });
+                        }
+                    }
                 }
                 triangles
             },
@@ -2946,6 +3068,9 @@ fn display_carriers(snapshot: &Snapshot) -> Vec<DisplayCarrier> {
                 },
                 Surface::Ruled(ruled) => DisplaySurface::Ruled {
                     rails: ruled.rails.map(DisplayRail::from_internal),
+                },
+                Surface::Bspline(surface) => DisplaySurface::Bspline {
+                    surface: DisplaySpline(surface),
                 },
             };
             Some(DisplayCarrier {
@@ -3297,7 +3422,9 @@ fn presentation_edge_classification(
         .evaluate((edge.parameter_range.start + edge.parameter_range.end) * 0.5);
     let first_surface = topology.faces[*first].value.surface;
     let second_surface = topology.faces[*second].value.surface;
-    if matches!(first_surface, Surface::Ruled(_)) || matches!(second_surface, Surface::Ruled(_)) {
+    let along_whole_edge =
+        |surface: Surface| matches!(surface, Surface::Ruled(_) | Surface::Bspline(_));
+    if along_whole_edge(first_surface) || along_whole_edge(second_surface) {
         return ruled_edge_classification(topology, [*first, *second], edge_index)
             .unwrap_or_else(hard);
     }
@@ -3355,7 +3482,7 @@ fn presentation_edge_classification(
                 relative - cylinder.axis * (relative.dot(cylinder.axis) / axis_denominator)
             }
             // Classified along the whole edge by `ruled_edge_classification`.
-            Surface::Ruled(_) => return None,
+            Surface::Ruled(_) | Surface::Bspline(_) => return None,
         };
         let length = normal.length();
         (length > f64::EPSILON).then(|| normal / length)
@@ -3544,7 +3671,7 @@ fn ruled_edge_classification(
     let normal_at = |face_index: usize, fraction: f64| -> Option<Vector3> {
         let face = &topology.faces.get(face_index)?.value;
         match face.surface {
-            Surface::Ruled(ruled) => {
+            Surface::Ruled(_) | Surface::Bspline(_) => {
                 let coedge = face
                     .loops()
                     .filter_map(|loop_key| topology.loop_record(loop_key))
@@ -3560,7 +3687,11 @@ fn ruled_edge_classification(
                 let parameters = coedge
                     .pcurve
                     .evaluate((span.end - span.start).mul_add(along, span.start));
-                ruled.unit_normal(parameters)
+                match face.surface {
+                    Surface::Ruled(ruled) => ruled.unit_normal(parameters),
+                    Surface::Bspline(surface) => surface.unit_normal(parameters),
+                    _ => None,
+                }
             }
             surface => {
                 let point = edge
@@ -3586,6 +3717,9 @@ fn ruled_edge_classification(
                     && (left.range.end - left.range.start) == (right.range.end - right.range.start)
             })
         }
+        // Two faces on one stored surface are one carrier split along an
+        // isocurve: equal handles are equal content.
+        (Surface::Bspline(first), Surface::Bspline(second)) => first == second,
         _ => false,
     };
     let low_dihedral = worst >= 15.0_f64.to_radians().cos();
@@ -4485,6 +4619,10 @@ fn chord_deviations(
             Curve3::Trace { host, other, .. } => {
                 sagitta(host.radius.abs().min(other.radius.abs()), sweep)
             }
+            // The tessellator's own figure for a B-spline edge.
+            Curve3::Bspline { curve } => {
+                spline_curve_deviation(curve, edge.parameter_range, budget, precision)
+            }
         }
     };
     topology
@@ -4522,6 +4660,9 @@ fn chord_deviations(
                 // twist a quad of the band can stand off its two triangles.
                 (Surface::Ruled(ruled), Some(domain)) => {
                     ruled_columns(ruled, domain, budget, precision).1
+                }
+                (Surface::Bspline(surface), Some(domain)) => {
+                    spline_surface_deviation(topology, face, surface, domain, budget, precision)
                 }
             };
             let rim = face
@@ -4568,6 +4709,13 @@ fn sampled_edge_segments(
     budget: ChordBudget,
     precision: PrecisionPolicy,
 ) -> Vec<[Point3; 2]> {
+    if let Curve3::Bspline { curve } = edge.curve {
+        let samples = spline_curve_samples(curve, edge.parameter_range, budget, precision);
+        return samples
+            .windows(2)
+            .map(|pair| [curve.point(pair[0]), curve.point(pair[1])])
+            .collect();
+    }
     let subdivisions = match edge.curve {
         Curve3::Line { .. } => 1,
         Curve3::Circle { radius, .. } => arc_subdivisions(
@@ -4589,6 +4737,7 @@ fn sampled_edge_segments(
             budget,
             precision,
         ),
+        Curve3::Bspline { .. } => unreachable!("sampled above"),
     };
     (0..subdivisions)
         .map(|index| {
@@ -4651,6 +4800,21 @@ fn sampled_loop_polygon(
         let coedge = topology.coedge(*coedge_key)?.value;
         let edge = topology.edge(coedge.edge)?.value;
         let range = edge.parameter_range;
+        // A B-spline edge is walked at the parameters its own chords end on,
+        // the same list the edge tessellation takes, forwards or backwards.
+        if let Curve3::Bspline { curve } = edge.curve {
+            let samples = spline_curve_samples(curve, range, budget, precision);
+            let last = samples.len() - 1;
+            match coedge.orientation {
+                Orientation::Forward => {
+                    polygon.extend(samples[..last].iter().map(|t| curve.point(*t)));
+                }
+                Orientation::Reverse => {
+                    polygon.extend(samples[1..].iter().rev().map(|t| curve.point(*t)));
+                }
+            }
+            continue;
+        }
         let subdivisions = match edge.curve {
             Curve3::Line { .. } => 1,
             Curve3::Circle { radius, .. } => {
@@ -4665,6 +4829,7 @@ fn sampled_loop_polygon(
                 budget,
                 precision,
             ),
+            Curve3::Bspline { .. } => unreachable!("walked above"),
         };
         // Sample in the edge's own forward parameterization and reverse the
         // resulting points, rather than reversing the interval and sampling
@@ -4760,8 +4925,9 @@ fn face_frame_loop_curves(
                     end,
                 }
             }
-            // Nor for a trace, which is not planar at all.
-            Curve3::Trace { .. } => return None,
+            // Nor for a trace, which is not planar at all, nor yet for a
+            // B-spline.
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => return None,
         };
         if curve.is_finite() {
             curves.push(curve);
@@ -5226,6 +5392,302 @@ fn tessellate_ruled_face(
     triangles
 }
 
+/// Area of a B-spline face over its rectangular parameter domain, by the
+/// same quadrature the body's measures use (ADR 0050).
+fn spline_face_area(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+) -> Option<f64> {
+    let domain = face_parameter_bounds(topology, face)?;
+    let area = surface
+        .measures(domain, bspline::point3(surface.points()[0]))
+        .area;
+    area.is_finite().then_some(area)
+}
+
+/// The most steps any one knot span is cut into by the tessellators.
+fn spline_steps_per_span(precision: PrecisionPolicy) -> usize {
+    1_usize << precision.max_subdivisions.min(8)
+}
+
+/// The parameters a B-spline edge is tessellated at, from the start of its
+/// range to the end: every knot, and between knots the power of two of
+/// equal steps the span's second-derivative bound asks for.
+fn spline_curve_samples(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve.samples(
+        range.start,
+        range.end,
+        tolerance,
+        spline_steps_per_span(precision),
+    )
+}
+
+/// How far the chords of a B-spline edge can sit from it: on each span, its
+/// second-derivative bound times the square of the step, over eight.
+fn spline_curve_deviation(
+    curve: bspline::SplineCurve3,
+    range: topology::ParameterRange,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let tolerance = budget.tolerance(curve.size().max(precision.min_feature_size), precision);
+    curve
+        .spans(range.start, range.end)
+        .into_iter()
+        .map(|(low, high)| {
+            let bound = curve.curvature_bound(low, high);
+            let steps = bspline::span_steps(
+                bound,
+                high - low,
+                tolerance,
+                spline_steps_per_span(precision),
+            );
+            let step = (high - low) / steps as f64;
+            bound * step * step / 8.0
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The parameters along one direction of a B-spline face: the surface's own
+/// sampling of every span, merged with every parameter the face's boundary
+/// edges along that direction are sampled at, so each edge's chords end on
+/// vertices of the face. Both samplings cut a span into a power of two of
+/// equal steps from the same two knots, so where they meet they meet to the
+/// bit.
+#[allow(clippy::too_many_arguments)]
+fn spline_face_samples(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    direction: usize,
+    (from, to): (f64, f64),
+    (across_from, across_to): (f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<f64> {
+    let tolerance = budget.tolerance(surface.scale().max(precision.min_feature_size), precision);
+    let most = spline_steps_per_span(precision);
+    let mut samples = vec![from];
+    for span in surface.spans(direction, from, to) {
+        // The surface bends along this direction by its second derivative,
+        // and a cell's twist bends its two triangles off it too.
+        let bound = surface
+            .spans(1 - direction, across_from, across_to)
+            .into_iter()
+            .map(|across| {
+                let (u_span, v_span) = if direction == 0 {
+                    (span, across)
+                } else {
+                    (across, span)
+                };
+                let [along_u, along_v, twist] = surface.curvature_bounds(u_span, v_span);
+                let along = if direction == 0 { along_u } else { along_v };
+                along + twist * (across.1 - across.0)
+            })
+            .fold(0.0, f64::max);
+        let steps = bspline::span_steps(bound, span.1 - span.0, tolerance, most);
+        for step in 1..=steps {
+            samples.push(if step == steps {
+                span.1
+            } else {
+                (span.1 - span.0).mul_add(step as f64 / steps as f64, span.0)
+            });
+        }
+    }
+    // Every boundary edge along this direction whose curve is a B-spline,
+    // read into the surface's parameter through the pcurve's affine map.
+    for loop_key in face.loops() {
+        let Some(loop_record) = topology.loop_record(loop_key) else {
+            continue;
+        };
+        for coedge_key in &loop_record.value.coedges {
+            let Some(coedge) = topology.coedge(*coedge_key) else {
+                continue;
+            };
+            let Some(edge) = topology.edge(coedge.value.edge) else {
+                continue;
+            };
+            let Curve3::Bspline { curve } = edge.value.curve else {
+                continue;
+            };
+            let [start, end] = coedge.value.pcurve_endpoints();
+            let fixed = if direction == 0 {
+                start.y == end.y
+            } else {
+                start.x == end.x
+            };
+            if !fixed {
+                continue;
+            }
+            let (first, last) = match coedge.value.orientation {
+                Orientation::Forward => (start, end),
+                Orientation::Reverse => (end, start),
+            };
+            let (first, last) = if direction == 0 {
+                (first.x, last.x)
+            } else {
+                (first.y, last.y)
+            };
+            let range = edge.value.parameter_range;
+            let width = range.end - range.start;
+            if width == 0.0 {
+                continue;
+            }
+            let alpha = (last - first) / width;
+            let beta = alpha.mul_add(-range.start, first);
+            for t in spline_curve_samples(curve, range, budget, precision) {
+                // Exact when the edge's parameter is the surface's, or its
+                // negation after a mirror.
+                samples.push(if alpha == 1.0 && beta == 0.0 {
+                    t
+                } else if alpha == -1.0 && beta == 0.0 {
+                    -t
+                } else {
+                    alpha.mul_add(t, beta)
+                });
+            }
+        }
+    }
+    samples.retain(|sample| *sample >= from && *sample <= to);
+    samples.sort_by(f64::total_cmp);
+    let floor = 1.0e-12 * (to - from).abs();
+    samples.dedup_by(|second, first| (*second - *first).abs() <= floor);
+    samples
+}
+
+/// How far the facets of a B-spline face can sit from it: over every span
+/// cell, the bilinear interpolation error of a cell of its steps,
+/// `(|S_uu|·du² + 2|S_uv|·du·dv + |S_vv|·dv²)/8`.
+fn spline_surface_deviation(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    domain: (f64, f64, f64, f64),
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> f64 {
+    let (u_min, u_max, v_min, v_max) = domain;
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let widest = |samples: &[f64], low: f64, high: f64| {
+        samples
+            .windows(2)
+            .filter(|pair| pair[0] >= low && pair[1] <= high)
+            .map(|pair| pair[1] - pair[0])
+            .fold(0.0, f64::max)
+    };
+    let mut worst = 0.0_f64;
+    for u_span in surface.spans(0, u_min, u_max) {
+        let du = widest(&us, u_span.0, u_span.1);
+        for v_span in surface.spans(1, v_min, v_max) {
+            let dv = widest(&vs, v_span.0, v_span.1);
+            let [uu, vv, uv] = surface.curvature_bounds(u_span, v_span);
+            worst = worst.max((uu * du * du + 2.0 * uv * du * dv + vv * dv * dv) / 8.0);
+        }
+    }
+    worst
+}
+
+/// A grid of quads over a B-spline face's parameter rectangle, each vertex
+/// with the surface's own normal at its parameters.
+fn tessellate_spline_face(
+    topology: &Topology,
+    face: &topology::Face,
+    surface: bspline::SplineSurface,
+    budget: ChordBudget,
+    precision: PrecisionPolicy,
+) -> Vec<([Point3; 3], [Vector3; 3])> {
+    let Some((u_min, u_max, v_min, v_max)) = face_parameter_bounds(topology, face) else {
+        return Vec::new();
+    };
+    // A loop walked clockwise in the parameters faces the other way.
+    let flipped = validator::face_parameter_area_and_moment(topology, face)
+        .is_some_and(|(area, _)| area < 0.0);
+    let us = spline_face_samples(
+        topology,
+        face,
+        surface,
+        0,
+        (u_min, u_max),
+        (v_min, v_max),
+        budget,
+        precision,
+    );
+    let vs = spline_face_samples(
+        topology,
+        face,
+        surface,
+        1,
+        (v_min, v_max),
+        (u_min, u_max),
+        budget,
+        precision,
+    );
+    let grid = us
+        .iter()
+        .map(|u| {
+            vs.iter()
+                .map(|v| {
+                    let parameters = topology::Point2::new(*u, *v);
+                    let normal = surface
+                        .unit_normal(parameters)
+                        .map(|normal| if flipped { normal * -1.0 } else { normal });
+                    (surface.evaluate(parameters), normal)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut triangles = Vec::with_capacity(2 * us.len() * vs.len());
+    for i in 0..us.len().saturating_sub(1) {
+        for j in 0..vs.len().saturating_sub(1) {
+            let quad = [
+                grid[i][j],
+                grid[i + 1][j],
+                grid[i + 1][j + 1],
+                grid[i][j + 1],
+            ];
+            for corners in [[0, 1, 2], [0, 2, 3]] {
+                let mut vertices = corners.map(|corner| quad[corner].0);
+                if flipped {
+                    vertices.swap(1, 2);
+                }
+                let facet = facet_normal(vertices);
+                let mut normals = corners.map(|corner| quad[corner].1.unwrap_or(facet));
+                if flipped {
+                    normals.swap(1, 2);
+                }
+                triangles.push((vertices, normals));
+            }
+        }
+    }
+    triangles
+}
+
 fn tessellate_cylinder_face(
     topology: &Topology,
     face: &topology::Face,
@@ -5344,6 +5806,7 @@ fn tessellate_harmonic_cylinder_face(
                 }
                 Curve2::Circle { .. } => return None,
                 Curve2::Ellipse { .. } => return None,
+                Curve2::Bspline { .. } => return None,
                 Curve2::Trace { .. } => {
                     // Where the piece crosses this azimuth. On the face that
                     // holds the parameter the abscissa is the parameter and
@@ -6666,6 +7129,7 @@ fn validate_transform_candidate(
                 Surface::Cone(cone) => cone.origin,
                 Surface::Sphere(sphere) => sphere.origin,
                 Surface::Ruled(ruled) => ruled.rails[0].point(0.0),
+                Surface::Bspline(surface) => bspline::point3(surface.points()[0]),
             };
             [point.x, point.y, point.z]
         }))
@@ -6722,6 +7186,13 @@ fn validate_transform_candidate(
                 other.origin.x.abs() + other.origin.y.abs() + other.origin.z.abs(),
                 branch,
             ],
+            // The control polygon holds the curve, so its reach is the
+            // curve's.
+            Curve2::Bspline { curve } => curve
+                .points()
+                .iter()
+                .flat_map(|point| [point[0].abs(), point[1].abs()])
+                .collect(),
         };
         endpoints.into_iter().chain(carrier)
     });
@@ -6753,7 +7224,7 @@ fn validate_transform_candidate(
                 endpoints[0].distance(endpoints[1])
             }
             Curve3::Circle { .. } | Curve3::Ellipse { .. } => edge.value.length(),
-            Curve3::Trace { .. } => edge.value.length(),
+            Curve3::Trace { .. } | Curve3::Bspline { .. } => edge.value.length(),
         };
         shortest = shortest.min(represented);
     }
@@ -6796,7 +7267,7 @@ fn validate_transform_candidate(
                     endpoints[0].distance(endpoints[1])
                 }
                 Curve3::Circle { .. } | Curve3::Ellipse { .. } => after.value.length(),
-                Curve3::Trace { .. } => after.value.length(),
+                Curve3::Trace { .. } | Curve3::Bspline { .. } => after.value.length(),
             };
             (represented - expected).abs()
         })
@@ -8508,6 +8979,14 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             hash_f64(&mut hasher, edge.value.parameter_range.start);
             hash_f64(&mut hasher, edge.value.parameter_range.end);
         }
+        // The content of the spline, never the handle to it: the handle's
+        // address depends on the order splines were made in.
+        if let Curve3::Bspline { curve } = edge.value.curve {
+            hasher.update(b"bspline-curve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
+            hash_f64(&mut hasher, edge.value.parameter_range.start);
+            hash_f64(&mut hasher, edge.value.parameter_range.end);
+        }
     }
     hash_collection_header(&mut hasher, b"coedges", topology.coedges.len());
     for coedge in &topology.coedges {
@@ -8569,6 +9048,12 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
             ] {
                 hash_f64(&mut hasher, value);
             }
+            hash_f64(&mut hasher, coedge.value.parameter_range.start);
+            hash_f64(&mut hasher, coedge.value.parameter_range.end);
+        }
+        if let Curve2::Bspline { curve } = coedge.value.pcurve {
+            hasher.update(b"bspline-pcurve-v0");
+            hash_spline_curve(&mut hasher, curve.degree(), curve.knots(), curve.points());
             hash_f64(&mut hasher, coedge.value.parameter_range.start);
             hash_f64(&mut hasher, coedge.value.parameter_range.end);
         }
@@ -8685,6 +9170,29 @@ fn semantic_digest(topology: &Topology, precision: PrecisionPolicy) -> SemanticD
                     hash_f64(&mut hasher, rail.range.end);
                 }
             }
+            Surface::Bspline(surface) => {
+                hasher.update(b"bspline-surface-v0");
+                let [degree_u, degree_v] = surface.degree();
+                let [count_u, count_v] = surface.counts();
+                let [knots_u, knots_v] = surface.knots();
+                hash_u64(&mut hasher, degree_u as u64);
+                hash_u64(&mut hasher, degree_v as u64);
+                hash_u64(&mut hasher, count_u as u64);
+                hash_u64(&mut hasher, count_v as u64);
+                hash_collection_header(&mut hasher, b"knots-u", knots_u.len());
+                for knot in knots_u {
+                    hash_f64(&mut hasher, *knot);
+                }
+                hash_collection_header(&mut hasher, b"knots-v", knots_v.len());
+                for knot in knots_v {
+                    hash_f64(&mut hasher, *knot);
+                }
+                for point in surface.points() {
+                    for component in point {
+                        hash_f64(&mut hasher, *component);
+                    }
+                }
+            }
         }
         hash_u64(&mut hasher, face.value.outer_loop.0 as u64);
         // Preserve established digests for the pre-hole representation while
@@ -8744,6 +9252,26 @@ fn hash_precision(hasher: &mut Sha256, precision: PrecisionPolicy) {
     }
     hash_u64(hasher, u64::from(precision.max_iterations));
     hash_u64(hasher, u64::from(precision.max_subdivisions));
+}
+
+/// A B-spline curve's content: degree, knots and control points, in order.
+fn hash_spline_curve<const D: usize>(
+    hasher: &mut Sha256,
+    degree: usize,
+    knots: &[f64],
+    points: &[[f64; D]],
+) {
+    hash_u64(hasher, degree as u64);
+    hash_collection_header(hasher, b"knots", knots.len());
+    for knot in knots {
+        hash_f64(hasher, *knot);
+    }
+    hash_collection_header(hasher, b"points", points.len());
+    for point in points {
+        for component in point {
+            hash_f64(hasher, *component);
+        }
+    }
 }
 
 fn hash_point(hasher: &mut Sha256, point: Point3) {
@@ -9366,7 +9894,8 @@ mod tests {
                         | Surface::Torus(_)
                         | Surface::Cone(_)
                         | Surface::Sphere(_)
-                        | Surface::Ruled(_) => None,
+                        | Surface::Ruled(_)
+                        | Surface::Bspline(_) => None,
                     })
                     .collect::<Vec<_>>();
                 (incident.len() == 2

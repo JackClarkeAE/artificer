@@ -261,7 +261,9 @@ pub(crate) fn extract_rz_section(topology: &Topology) -> Result<RzSection, RimBl
             }
             // A ruled wall is not a surface of revolution: the body is not
             // one this section describes.
-            Surface::Ruled(_) => return Err(RimBlendError::DomainUnsupported),
+            Surface::Ruled(_) | Surface::Bspline(_) => {
+                return Err(RimBlendError::DomainUnsupported);
+            }
         };
         pieces.push(piece);
     }
@@ -320,7 +322,9 @@ fn section_frame(
             Surface::Torus(torus) => {
                 Some((torus.axis, torus.radial_u, torus.radial_v, torus.origin))
             }
-            Surface::Plane(_) | Surface::Sphere(_) | Surface::Ruled(_) => None,
+            Surface::Plane(_) | Surface::Sphere(_) | Surface::Ruled(_) | Surface::Bspline(_) => {
+                None
+            }
         };
         if let Some((axis, radial_u, radial_v, origin)) = frame {
             // Anchor the section frame on the axis at the carrier's own

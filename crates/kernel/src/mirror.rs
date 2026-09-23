@@ -11,10 +11,12 @@
 //! parameters, and each face is then reversed by the kernel's own
 //! convention, the one the Boolean engine uses: a plane swaps its axes, a
 //! revolved carrier negates its angular sign, a ruled carrier walks its rails
-//! the other way, the pcurves go through the matching in-plane mirror, and
-//! every loop walks the other way. Edges and
-//! vertices keep their identities, so history maps one to one.
+//! the other way, a B-spline surface walks `u` the other way over its negated
+//! domain, the pcurves go through the matching in-plane mirror, and every
+//! loop walks the other way. Edges and vertices keep their identities, so
+//! history maps one to one.
 
+use crate::bspline::{array2, array3, point2, point3};
 use crate::ruled::RailCurve;
 use crate::topology::{
     Curve2, Curve3, Cylinder, ParameterRange, Plane, Point2, Point3, Surface, Topology, Vector2,
@@ -79,6 +81,14 @@ pub(crate) fn mirror_topology(
                 *center = reflect_point(*center);
                 *u = reflect_vector(*u);
                 *v = reflect_vector(*v);
+            }
+            // A reflection is affine, and an affine image of a B-spline is
+            // the B-spline of the images of its control points, over the
+            // same parameter.
+            Curve3::Bspline { curve } => {
+                *curve = curve
+                    .mapped(|point| array3(reflect_point(point3(point))))
+                    .ok_or(MirrorError::UnsupportedPcurve)?;
             }
         }
     }
@@ -169,6 +179,16 @@ pub(crate) fn mirror_topology(
                     }
                     *ruled = ruled.reversed_u();
                     |point: Point2| Point2::new(1.0 - point.x, point.y)
+                }
+                // The net reflects as the edges do, so the same parameters
+                // name the reflected point; walking `u` the other way over
+                // its negated domain turns the normal out again.
+                Surface::Bspline(surface) => {
+                    *surface = surface
+                        .mapped(reflect_point)
+                        .ok_or(MirrorError::UnsupportedPcurve)?
+                        .reversed_u();
+                    |point: Point2| Point2::new(-point.x, point.y)
                 }
             }
         };
@@ -312,6 +332,16 @@ pub(crate) fn reverse_face_loops(
                         };
                         coedge.parameter_range = ParameterRange::new(-range.end, -range.start);
                     }
+                }
+                // The in-plane mirror is linear, and carries a B-spline by its
+                // control points; the reversed walk runs the range backwards.
+                Curve2::Bspline { curve } => {
+                    coedge.pcurve = Curve2::Bspline {
+                        curve: curve
+                            .mapped(|point| array2(mirror(point2(point))))
+                            .ok_or(MirrorError::UnsupportedPcurve)?,
+                    };
+                    coedge.parameter_range = ParameterRange::new(range.end, range.start);
                 }
                 Curve2::Harmonic {
                     mean,

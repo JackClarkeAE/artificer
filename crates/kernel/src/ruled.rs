@@ -536,7 +536,7 @@ pub(crate) struct RailSplines {
 
 /// Ten-point Gauss–Legendre nodes and weights on `[−1, 1]`, the rule the
 /// trace's integrals use.
-const GAUSS_NODES: [(f64, f64); 10] = [
+pub(crate) const GAUSS_NODES: [(f64, f64); 10] = [
     (-0.973_906_528_517_171_7, 0.066_671_344_308_688_1),
     (-0.865_063_366_688_984_5, 0.149_451_349_150_580_6),
     (-0.679_409_568_299_024_4, 0.219_086_362_515_982),

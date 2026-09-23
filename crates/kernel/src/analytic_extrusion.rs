@@ -1159,7 +1159,11 @@ pub(crate) fn topology_loop_segments(
             match coedge.pcurve {
                 // Section traces are never planar profile pieces; the
                 // analytic Boolean reads them through `topology_loop_chords`.
-                Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
+                // A B-spline is not a piece either engine carries (ADR 0050).
+                Curve2::Harmonic { .. }
+                | Curve2::Ellipse { .. }
+                | Curve2::Trace { .. }
+                | Curve2::Bspline { .. } => None,
                 Curve2::Line { .. } => Some(Segment::Line { start, end }),
                 Curve2::Circle {
                     center,
@@ -1245,6 +1249,9 @@ pub(crate) fn topology_loop_chords(topology: &Topology, loop_key: LoopKey) -> Op
                 Curve2::Line { .. } | Curve2::Circle { .. } => {
                     topology_loop_segments_one(coedge, start, end)
                 }
+                // The analytic Boolean does not carry a B-spline edge; its
+                // callers decline the body before they get here.
+                Curve2::Bspline { .. } => None,
                 Curve2::Trace {
                     host,
                     other,
@@ -1323,7 +1330,10 @@ fn topology_loop_segments_one(
                     * determinant.signum(),
             })
         }
-        Curve2::Harmonic { .. } | Curve2::Ellipse { .. } | Curve2::Trace { .. } => None,
+        Curve2::Harmonic { .. }
+        | Curve2::Ellipse { .. }
+        | Curve2::Trace { .. }
+        | Curve2::Bspline { .. } => None,
     }
 }
 

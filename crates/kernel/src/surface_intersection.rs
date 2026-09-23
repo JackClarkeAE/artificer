@@ -898,6 +898,7 @@ pub(crate) const fn surface_name(surface: Surface) -> &'static str {
         Surface::Sphere(_) => "sphere",
         Surface::Torus(_) => "torus",
         Surface::Ruled(_) => "ruled",
+        Surface::Bspline(_) => "B-spline",
     }
 }
 
@@ -970,6 +971,7 @@ mod tests {
                 (ring.hypot(height) - torus.minor_radius).abs()
             }
             Surface::Ruled(ruled) => ruled.distance_to(point, None).unwrap_or(f64::INFINITY),
+            Surface::Bspline(surface) => surface.distance_to(point, None).unwrap_or(f64::INFINITY),
         }
     }
 
@@ -1045,6 +1047,9 @@ mod tests {
                     (ring.hypot(height) - torus.minor_radius).abs()
                 }
                 Surface::Ruled(ruled) => ruled.distance_to(point, None).unwrap_or(f64::INFINITY),
+                Surface::Bspline(surface) => {
+                    surface.distance_to(point, None).unwrap_or(f64::INFINITY)
+                }
             };
             assert!(
                 residual < 1.0e-12,

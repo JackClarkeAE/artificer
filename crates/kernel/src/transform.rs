@@ -6,6 +6,7 @@
 
 use artificer_protocol::{RotationQuaternion, SimilarityTransform3};
 
+use crate::bspline::{array3, point3};
 use crate::ruled::{RailCurve, RuledRail};
 use crate::topology::{Curve2, Curve3, Cylinder, Plane, Point3, Surface, Topology, Vector3};
 
@@ -165,6 +166,15 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 *major_radius *= transform.scale;
                 *minor_radius *= transform.scale;
             }
+            // A similarity is affine, and carries a B-spline by its control
+            // points over the same parameter.
+            Curve3::Bspline { curve } => {
+                if let Some(moved) =
+                    curve.mapped(|point| array3(transform.transform_point(point3(point))))
+                {
+                    *curve = moved;
+                }
+            }
         }
     }
 
@@ -188,6 +198,9 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
             // fixed, exactly as for a torus.
             Surface::Sphere(_) => PcurveOwner::Toroidal,
             Surface::Ruled(_) => PcurveOwner::Toroidal,
+            // A B-spline surface's parameters are its knots', which a
+            // similarity leaves alone.
+            Surface::Bspline(_) => PcurveOwner::Toroidal,
         };
         for loop_key in face.value.loops() {
             if let Some(loop_record) = input.loop_record(loop_key) {
@@ -248,6 +261,15 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 *major_radius *= transform.scale;
                 *minor_radius *= transform.scale;
             }
+            // Only a plane carries one; its coordinates are lengths.
+            Curve2::Bspline { curve } => {
+                if pcurve_owner[index] == PcurveOwner::Planar
+                    && let Some(scaled) =
+                        curve.mapped(|point| point.map(|value| value * transform.scale))
+                {
+                    *curve = scaled;
+                }
+            }
         }
     }
     for face in &mut output.faces {
@@ -291,6 +313,11 @@ pub(crate) fn transform_topology(input: &Topology, transform: Similarity) -> Top
                 ruled.rails = ruled.rails.map(|rail| transform_rail(rail, transform));
                 Surface::Ruled(ruled)
             }
+            Surface::Bspline(surface) => Surface::Bspline(
+                surface
+                    .mapped(|point| transform.transform_point(point))
+                    .unwrap_or(surface),
+            ),
         };
     }
 

@@ -11,8 +11,11 @@
 //! surface STEP has no entity for, the ruled wall of a loft (ADR 0049), is a
 //! `b_spline_surface_with_knots`: exactly, where both rails are lines, and
 //! otherwise within that same tenth, bounded by its rails, which are exact
-//! edges like any other. Two half faces per revolved carrier and their seam
-//! edges are ordinary topology. Cavities are `brep_with_voids`.
+//! edges like any other. A B-spline curve or surface (ADR 0050) is a
+//! `b_spline_curve_with_knots` or `b_spline_surface_with_knots` exactly,
+//! since that is what the kernel holds. Two half faces per revolved carrier
+//! and their seam edges are ordinary topology. Cavities are
+//! `brep_with_voids`.
 //!
 //! Every surface is written so that its STEP normal is the direction the
 //! kernel's own parameterisation calls outward; where the kernel's face is
@@ -613,6 +616,22 @@ impl BodyWriter<'_> {
                     "INTERSECTION_CURVE('',#{curve},(#{host},#{other}),.CURVE_3D.)"
                 ))
             }
+            // The kernel's own B-spline, written as itself: its degree, its
+            // control points and its knots, nothing fitted.
+            Curve3::Bspline { curve } => {
+                let points: Vec<u64> = curve
+                    .points()
+                    .iter()
+                    .map(|point| self.point(crate::bspline::point3(*point)))
+                    .collect();
+                let (multiplicities, knots) = knot_lists(curve.knots());
+                self.file.entity(format!(
+                    "B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({multiplicities}),\
+                     ({knots}),.UNSPECIFIED.)",
+                    curve.degree(),
+                    ids(&points),
+                ))
+            }
             Curve3::Ellipse {
                 center,
                 u,
@@ -792,8 +811,60 @@ impl BodyWriter<'_> {
                     true,
                 )
             }
+            // A B-spline surface is written exactly as the kernel holds it.
+            // Its normal is `∂S/∂u × ∂S/∂v` in STEP as in the kernel, which
+            // the builders point out of the material, so the sense agrees.
+            Surface::Bspline(surface) => {
+                let [degree_u, degree_v] = surface.degree();
+                let [count_u, count_v] = surface.counts();
+                let mut rows = Vec::with_capacity(count_u);
+                for i in 0..count_u {
+                    let row: Vec<u64> = (0..count_v)
+                        .map(|j| {
+                            self.point(crate::bspline::point3(surface.points()[i * count_v + j]))
+                        })
+                        .collect();
+                    rows.push(format!("({})", ids(&row)));
+                }
+                let [knots_u, knots_v] = surface.knots();
+                let (multiplicities_u, values_u) = knot_lists(knots_u);
+                let (multiplicities_v, values_v) = knot_lists(knots_v);
+                (
+                    self.file.entity(format!(
+                        "B_SPLINE_SURFACE_WITH_KNOTS('',{degree_u},{degree_v},({}),\
+                         .UNSPECIFIED.,.F.,.F.,.F.,({multiplicities_u}),({multiplicities_v}),\
+                         ({values_u}),({values_v}),.UNSPECIFIED.)",
+                        rows.join(","),
+                    )),
+                    true,
+                )
+            }
         })
     }
+}
+
+/// A full knot vector as STEP writes it: the distinct knots, and how many
+/// times each appears.
+fn knot_lists(knots: &[f64]) -> (String, String) {
+    let mut distinct: Vec<(f64, usize)> = Vec::new();
+    for knot in knots {
+        match distinct.last_mut() {
+            Some((value, count)) if *value == *knot => *count += 1,
+            _ => distinct.push((*knot, 1)),
+        }
+    }
+    (
+        distinct
+            .iter()
+            .map(|(_, count)| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        distinct
+            .iter()
+            .map(|(knot, _)| real(*knot))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 fn unit(vector: Vector3) -> Option<Vector3> {
