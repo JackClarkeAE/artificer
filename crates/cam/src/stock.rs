@@ -121,6 +121,161 @@ impl LatheStock {
     }
 }
 
+/// The mill's stock as a heightmap over the stock top: each cell holds the
+/// height of the material left in it, and each tool position lowers every
+/// cell under the tool's footprint to the tip's height. Exact for flat end
+/// mills on 2.5D geometry, which is what this slice makes, and the model
+/// every hobby simulator uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MillStock {
+    pub min: Point2,
+    pub cell: f64,
+    pub columns: usize,
+    pub rows: usize,
+    pub bottom: f64,
+    pub top: f64,
+    pub heights: Vec<f32>,
+}
+
+impl MillStock {
+    /// The largest grid on either axis.
+    pub const MAX_CELLS: usize = 512;
+
+    /// A box from `min` to `max` in work coordinates, gridded at about
+    /// `cell` millimetres, capped at [`Self::MAX_CELLS`] a side.
+    #[must_use]
+    pub fn new(
+        min: artificer_protocol::Point3,
+        max: artificer_protocol::Point3,
+        cell: f64,
+    ) -> Self {
+        let width = (max.x - min.x).max(1.0e-6);
+        let depth = (max.y - min.y).max(1.0e-6);
+        let cell = cell
+            .max(width / Self::MAX_CELLS as f64)
+            .max(depth / Self::MAX_CELLS as f64);
+        let columns = ((width / cell).ceil() as usize).clamp(1, Self::MAX_CELLS);
+        let rows = ((depth / cell).ceil() as usize).clamp(1, Self::MAX_CELLS);
+        // Spread the cells over the box exactly.
+        let cell = (width / columns as f64).max(depth / rows as f64);
+        Self {
+            min: Point2::new(min.x, min.y),
+            cell,
+            columns,
+            rows,
+            bottom: min.z,
+            top: max.z,
+            heights: vec![max.z as f32; columns * rows],
+        }
+    }
+
+    /// The grid a plan's simulation uses: cells an eighth of the smallest
+    /// tool, and never coarser than a hundred and twentieth of the stock's
+    /// narrower side, so a small part is still resolved.
+    #[must_use]
+    pub fn for_tools(
+        min: artificer_protocol::Point3,
+        max: artificer_protocol::Point3,
+        smallest_tool_diameter: f64,
+    ) -> Self {
+        let narrow = (max.x - min.x).min(max.y - min.y).max(1.0e-6);
+        let cell = (smallest_tool_diameter / 8.0)
+            .min(narrow / 120.0)
+            .max(1.0e-3);
+        Self::new(min, max, cell)
+    }
+
+    #[must_use]
+    pub fn cell_center(&self, column: usize, row: usize) -> Point2 {
+        Point2::new(
+            self.cell.mul_add(column as f64 + 0.5, self.min.x),
+            self.cell.mul_add(row as f64 + 0.5, self.min.y),
+        )
+    }
+
+    /// The height of the material at a point, or `None` outside the stock.
+    #[must_use]
+    pub fn height_at(&self, x: f64, y: f64) -> Option<f64> {
+        let column = ((x - self.min.x) / self.cell).floor();
+        let row = ((y - self.min.y) / self.cell).floor();
+        if column < 0.0 || row < 0.0 {
+            return None;
+        }
+        let (column, row) = (column as usize, row as usize);
+        if column >= self.columns || row >= self.rows {
+            return None;
+        }
+        Some(f64::from(self.heights[row * self.columns + column]))
+    }
+
+    /// Lowers every cell whose centre lies within `radius` of `(x, y)` to
+    /// `z`, never below the bottom.
+    pub fn lower_disc(&mut self, x: f64, y: f64, radius: f64, z: f64) {
+        let z = z.max(self.bottom) as f32;
+        let column_low = (((x - radius) - self.min.x) / self.cell).floor().max(0.0) as usize;
+        let column_high = (((x + radius) - self.min.x) / self.cell).ceil().max(0.0) as usize;
+        let row_low = (((y - radius) - self.min.y) / self.cell).floor().max(0.0) as usize;
+        let row_high = (((y + radius) - self.min.y) / self.cell).ceil().max(0.0) as usize;
+        let radius_squared = radius * radius;
+        for row in row_low..row_high.min(self.rows) {
+            let cy = self.cell.mul_add(row as f64 + 0.5, self.min.y);
+            for column in column_low..column_high.min(self.columns) {
+                let cx = self.cell.mul_add(column as f64 + 0.5, self.min.x);
+                let dx = cx - x;
+                let dy = cy - y;
+                if dx.mul_add(dx, dy * dy) <= radius_squared {
+                    let index = row * self.columns + column;
+                    if self.heights[index] > z {
+                        self.heights[index] = z;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The material left, in cubic millimetres.
+    #[must_use]
+    pub fn volume(&self) -> f64 {
+        let area = self.cell * self.cell;
+        self.heights
+            .iter()
+            .map(|height| (f64::from(*height) - self.bottom).max(0.0) * area)
+            .sum()
+    }
+
+    /// The volume of one cell from bottom to top: the unit the volume gate
+    /// is stated in.
+    #[must_use]
+    pub fn cell_volume(&self) -> f64 {
+        self.cell * self.cell * (self.top - self.bottom)
+    }
+
+    /// How many cells have a neighbour at a different height, or lie on the
+    /// stock's edge: where the model's error lives.
+    #[must_use]
+    pub fn boundary_cells(&self) -> usize {
+        let mut count = 0;
+        for row in 0..self.rows {
+            for column in 0..self.columns {
+                let here = self.heights[row * self.columns + column];
+                let edge =
+                    row == 0 || column == 0 || row + 1 == self.rows || column + 1 == self.columns;
+                let differs =
+                    |r: usize, c: usize| (self.heights[r * self.columns + c] - here).abs() > 1.0e-6;
+                if edge
+                    || differs(row - 1, column)
+                    || differs(row + 1, column)
+                    || differs(row, column - 1)
+                    || differs(row, column + 1)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
 /// The volume a section loop sweeps about the `z` axis: `2π · ∫ r dA`, the
 /// first moment about the axis, exact for lines and arcs by Green's theorem.
 #[must_use]
@@ -283,6 +438,30 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(bar, before);
+    }
+
+    #[test]
+    fn a_heightmap_loses_what_a_disc_lowers() {
+        use artificer_protocol::Point3;
+        let mut stock = MillStock::new(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(20.0, 10.0, 5.0),
+            0.5,
+        );
+        assert_eq!((stock.columns, stock.rows), (40, 20));
+        assert!((stock.volume() - 1000.0).abs() < 1.0e-9);
+        stock.lower_disc(10.0, 5.0, 3.0, 2.0);
+        let removed = 1000.0 - stock.volume();
+        // A Ø6 disc three deep, to within the cells on its rim.
+        let expected = std::f64::consts::PI * 9.0 * 3.0;
+        assert!(
+            (removed - expected).abs() < 0.05 * expected,
+            "{removed} vs {expected}"
+        );
+        assert_eq!(stock.height_at(10.0, 5.0), Some(2.0));
+        assert_eq!(stock.height_at(1.0, 1.0), Some(5.0));
+        assert_eq!(stock.height_at(-1.0, 1.0), None);
+        assert!(stock.boundary_cells() > 0);
     }
 
     #[test]

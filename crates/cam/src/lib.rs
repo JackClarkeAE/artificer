@@ -13,6 +13,7 @@
 //! feeds and speeds from the handbooks, and LinuxCNC's G-code dialect.
 
 pub mod geom;
+pub mod milling;
 pub mod plan;
 pub mod recognise;
 pub mod simulate;
@@ -40,9 +41,7 @@ pub fn plan_setup(
 ) -> Result<Plan, CamRefusal> {
     match setup {
         Setup::Turned(turned) => turning::plan_turning(turned, library, material),
-        Setup::Milled(_) => Err(CamRefusal::Pocket {
-            detail: "milling is planned in the next slice".to_owned(),
-        }),
+        Setup::Milled(milled) => milling::plan_milling(milled, library, material),
         Setup::MillTurn(mill_turn) => Err(CamRefusal::MillTurnNotPlanned {
             faces: mill_turn.milled_faces.clone(),
         }),

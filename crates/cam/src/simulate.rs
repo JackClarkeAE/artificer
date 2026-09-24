@@ -11,7 +11,7 @@ use artificer_protocol::{PlanarLoop2, PlanarRegion2, Point2, Point3};
 use crate::CamRefusal;
 use crate::geom;
 use crate::plan::{FeedRate, Machine, Move, Plan, Spindle};
-use crate::stock::LatheStock;
+use crate::stock::{LatheStock, MillStock};
 use crate::tools::{Tool, rpm_for};
 use crate::turning::{swept_region, tool_region};
 
@@ -411,31 +411,200 @@ pub fn motion_at(ends: &[f64], seconds: f64) -> Option<(usize, f64)> {
     Some((index, fraction))
 }
 
-/// The tool's position part-way along a motion.
+/// The tool's position part-way along a motion, on the arc itself for an
+/// arc rather than on a chord of it.
 #[must_use]
 pub fn position_along(motion: &Motion, machine: Machine, fraction: f64) -> Point3 {
-    let points = motion.sampled(machine, 0.01);
-    if points.len() < 2 {
-        return motion.to;
-    }
-    let total = points
-        .windows(2)
-        .map(|pair| crate::space::length(crate::space::sub(pair[1], pair[0])))
-        .sum::<f64>();
-    let mut target = total * fraction.clamp(0.0, 1.0);
-    for pair in points.windows(2) {
-        let step = crate::space::length(crate::space::sub(pair[1], pair[0]));
-        if target <= step || step <= 0.0 {
-            let t = if step <= 0.0 { 1.0 } else { target / step };
-            return Point3::new(
-                (pair[1].x - pair[0].x).mul_add(t, pair[0].x),
-                (pair[1].y - pair[0].y).mul_add(t, pair[0].y),
-                (pair[1].z - pair[0].z).mul_add(t, pair[0].z),
+    let t = fraction.clamp(0.0, 1.0);
+    match motion.kind {
+        MotionKind::Rapid | MotionKind::Feed => Point3::new(
+            (motion.to.x - motion.from.x).mul_add(t, motion.from.x),
+            (motion.to.y - motion.from.y).mul_add(t, motion.from.y),
+            (motion.to.z - motion.from.z).mul_add(t, motion.from.z),
+        ),
+        MotionKind::Arc { center, clockwise } => {
+            let (from, to) = plane_points(motion.from, motion.to, machine);
+            let (radius, start_angle, sweep) = geom::arc_parameters(
+                center,
+                from,
+                to,
+                if clockwise {
+                    artificer_protocol::ArcDirection::Clockwise
+                } else {
+                    artificer_protocol::ArcDirection::CounterClockwise
+                },
             );
+            let p = geom::on_circle(center, radius, sweep.mul_add(t, start_angle));
+            match machine {
+                Machine::Mill => Point3::new(
+                    p.x,
+                    p.y,
+                    (motion.to.z - motion.from.z).mul_add(t, motion.from.z),
+                ),
+                Machine::Lathe => Point3::new(p.x, 0.0, p.y),
+            }
         }
-        target -= step;
     }
-    motion.to
+}
+
+/// How many motions apart the mill simulation keeps a whole heightmap, so
+/// scrubbing replays from the nearest one rather than from the start.
+pub const KEYFRAME_LIMIT: usize = 48;
+
+/// A mill simulation: the heightmap at keyframes, replayed on demand.
+#[derive(Clone, Debug)]
+pub struct MillSimulation {
+    pub motions: Vec<Motion>,
+    pub initial: MillStock,
+    /// `(motion index, stock after it)` at intervals.
+    pub keyframes: Vec<(usize, MillStock)>,
+    pub final_stock: MillStock,
+    pub ends: Vec<f64>,
+    pub collisions: Vec<Collision>,
+    pub total_seconds: f64,
+    /// Every cutting motion's tool radius, for replay.
+    radii: Vec<f64>,
+}
+
+impl MillSimulation {
+    /// Runs `motions` over `stock` with the plan's tools.
+    pub fn run(plan: &Plan, motions: Vec<Motion>, stock: MillStock) -> Result<Self, CamRefusal> {
+        let mut current = stock.clone();
+        let mut ends = Vec::with_capacity(motions.len());
+        let mut collisions = Vec::new();
+        let mut keyframes = Vec::new();
+        let interval = (motions.len() / KEYFRAME_LIMIT).max(1);
+        let mut clock = 0.0;
+        let mut previous_tool = None;
+        let mut radii = Vec::with_capacity(motions.len());
+        for (index, motion) in motions.iter().enumerate() {
+            if previous_tool.is_some_and(|tool| tool != motion.tool) {
+                clock += plan.tool_change_seconds;
+            }
+            previous_tool = Some(motion.tool);
+            clock += motion_seconds(motion, Machine::Mill, plan.rapid_rate);
+            ends.push(clock);
+            let radius = plan.tool(motion.tool).map_or(0.0, Tool::radius);
+            radii.push(radius);
+            if radius <= 0.0 {
+                collisions.push(Collision {
+                    motion: index,
+                    line: motion.line,
+                    detail: format!("tool T{} is not in the plan", motion.tool),
+                });
+                continue;
+            }
+            if motion.is_cutting() {
+                apply_mill_motion(&mut current, motion, radius);
+            } else if let Some(detail) = rapid_through_stock(&current, motion, radius) {
+                collisions.push(Collision {
+                    motion: index,
+                    line: motion.line,
+                    detail,
+                });
+            }
+            if index % interval == 0 {
+                keyframes.push((index, current.clone()));
+            }
+        }
+        Ok(Self {
+            motions,
+            initial: stock,
+            keyframes,
+            final_stock: current,
+            ends,
+            collisions,
+            total_seconds: clock,
+            radii,
+        })
+    }
+
+    /// The stock as it stands after motion `index`, replayed from the
+    /// nearest keyframe.
+    #[must_use]
+    pub fn stock_after(&self, index: usize) -> MillStock {
+        let (mut from, mut stock) = match self.keyframes.binary_search_by(|(at, _)| at.cmp(&index))
+        {
+            Ok(found) => return self.keyframes[found].1.clone(),
+            Err(0) => (0, self.initial.clone()),
+            Err(insert) => {
+                let (at, stock) = &self.keyframes[insert - 1];
+                (*at + 1, stock.clone())
+            }
+        };
+        if from == 0 && self.keyframes.first().is_some_and(|(at, _)| *at == 0) {
+            from = 1;
+            stock = self.keyframes[0].1.clone();
+        }
+        for motion_index in from..=index.min(self.motions.len().saturating_sub(1)) {
+            let motion = &self.motions[motion_index];
+            if motion.is_cutting() {
+                apply_mill_motion(&mut stock, motion, self.radii[motion_index]);
+            }
+        }
+        stock
+    }
+
+    /// The motion in progress at `seconds`, and how far along it is.
+    #[must_use]
+    pub fn at(&self, seconds: f64) -> Option<(usize, f64)> {
+        motion_at(&self.ends, seconds)
+    }
+}
+
+/// Lowers the heightmap under a cutting motion, sampled every half cell.
+pub fn apply_mill_motion(stock: &mut MillStock, motion: &Motion, radius: f64) {
+    let points = motion.sampled(Machine::Mill, stock.cell * 0.25);
+    let step = stock.cell * 0.5;
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let length = crate::space::length(crate::space::sub(b, a));
+        let count = (length / step).ceil().max(1.0) as usize;
+        for sample in 0..=count {
+            let t = sample as f64 / count as f64;
+            let x = (b.x - a.x).mul_add(t, a.x);
+            let y = (b.y - a.y).mul_add(t, a.y);
+            let z = (b.z - a.z).mul_add(t, a.z);
+            stock.lower_disc(x, y, radius, z);
+        }
+    }
+    if points.len() == 1 {
+        stock.lower_disc(points[0].x, points[0].y, radius, points[0].z);
+    }
+}
+
+/// Whether a rapid would drive the tool's bottom into remaining stock.
+///
+/// The footprint is probed a cell inside its rim, because a cell whose
+/// centre lies just outside the tool is a cell the tool never lowered, and
+/// a cell cut to the bottom holds no material at all.
+fn rapid_through_stock(stock: &MillStock, motion: &Motion, radius: f64) -> Option<String> {
+    let length = motion.length(Machine::Mill);
+    let count = (length / (stock.cell * 0.5)).ceil().max(1.0) as usize;
+    let probe = (radius - stock.cell).max(0.0);
+    for sample in 0..=count {
+        let t = sample as f64 / count as f64;
+        let x = (motion.to.x - motion.from.x).mul_add(t, motion.from.x);
+        let y = (motion.to.y - motion.from.y).mul_add(t, motion.from.y);
+        let z = (motion.to.z - motion.from.z).mul_add(t, motion.from.z);
+        for (dx, dy) in [
+            (0.0, 0.0),
+            (probe, 0.0),
+            (-probe, 0.0),
+            (0.0, probe),
+            (0.0, -probe),
+        ] {
+            if let Some(height) = stock.height_at(x + dx, y + dy)
+                && height > z + 1.0e-6
+                && height > stock.bottom + 1.0e-9
+            {
+                return Some(format!(
+                    "rapid at ({x:.3}, {y:.3}, {z:.3}) passes through stock standing at z = {height:.3}"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The tool region at a lathe position, as a loop in `(r, z)`.
