@@ -210,7 +210,14 @@ pub fn hex_conductivity() -> Conductivity {
 /// its 24 nodal displacements.
 #[must_use]
 pub fn centre_strain(displacements: &[f64; 24], h: f64) -> [f64; 6] {
-    let b = strain_displacement([0.0, 0.0, 0.0]);
+    strain_at(displacements, h, [0.0, 0.0, 0.0])
+}
+
+/// The six strain components at one natural point (each coordinate in
+/// `-1..=1`) of an element of side `h`, from its 24 nodal displacements.
+#[must_use]
+pub fn strain_at(displacements: &[f64; 24], h: f64, point: [f64; 3]) -> [f64; 6] {
+    let b = strain_displacement(point);
     let mut strain = [0.0; 6];
     for (row, component) in strain.iter_mut().enumerate() {
         let mut sum = 0.0;

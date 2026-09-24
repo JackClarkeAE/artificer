@@ -34,12 +34,18 @@
 pub mod element;
 pub mod material;
 pub mod mesh;
+pub mod sample;
 pub mod solver;
+pub mod structural;
 
 pub use artificer_kernel::{CancellationToken, SurfaceCell, VoxelGrid};
 pub use material::{MATERIALS, Material, material_by_key};
 pub use mesh::VoxelMesh;
+pub use sample::FieldSampler;
 pub use solver::{Progress, SolveOutcome};
+pub use structural::{
+    Conditions, Load, StructuralError, StructuralResult, StructuralStudy, Support, solve_static,
+};
 
 /// How finely a body is voxelised: how many cells span its longest side.
 ///
