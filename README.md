@@ -25,6 +25,16 @@
 
 ---
 
+## What is new in 0.99.83
+
+Fixes from testing 0.99.82, each with a regression test that fails on the old code.
+
+- **Auto-CAM plans a chamfered, bored cylinder.** The turning planner took the chamfer at the part-off end, which faces the chuck, for an undercut. It is ordinary lathe work: the parting blade's front corner traces a chamfer or round there before parting off, and the plan carries it as a Back corner operation. A longer chuck-facing taper is still refused by name as needing a second setup.
+- **A drilled cylinder is a tube.** A cylinder with a hole drilled through it was not read as a solid of revolution, so both its rims could not be chamfered in one call and CAM milled it. The drill's cylinder runs its axis down from the face it was drilled from, and the section reader now measures such a carrier's height the right way round.
+- **A stroke drawn across the face's edge is one region.** On a face with holes in it, a rectangle drawn half off the face could not be picked as a profile and nothing drawn afterwards would extrude. The sketch now groups the cells the face's own outline and rims split a stroke into, takes the drawn shape unasked, and lights and picks it as one; the extrusion preflight refuses only a profile wholly off the face or wholly inside a hole, and the kernel builds the rest as a Boolean. Letting those through fixed two prism-engine faults a part-way notch on a holed plate hit, so it is exact rather than tessellated.
+- **Bodies stay in view behind a sketch on a plane.** Sketching on a construction plane, or on an origin plane with a body in the document, showed an empty canvas; the body is now projected behind the sketch as it always was for a sketch on a face, on either side of the plane.
+- **A cut leaves no second body.** A cut from an origin-plane sketch is a sweep folded into the body by a Boolean, and the swept tool lingered as a hidden Body 2. A body a Boolean spends now leaves the body list, keeps its number, and returns only where the history stands before the Boolean; the Boolean's result is archived so the history cursor can leave and return to it; and a cut whose sweep misses the body says so.
+
 ## What is new in 0.99.82
 
 The first slice of the general-geometry programme (ADR 0056), and two new tabs. Seven tracks, each built in its own tree against the same gates, each landing a minimal version that is markedly more than the kernel or the workbench could do before. Where a result is approximate it says so, with the measured deviation, as every approximate result here always has.
