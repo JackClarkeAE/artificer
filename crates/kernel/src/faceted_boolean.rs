@@ -583,6 +583,40 @@ const MAX_SOURCE_POLYGONS: usize = 4_096;
 /// the reason the exact rungs gave.
 const MAX_CUTTER_POLYGONS: usize = MAX_SOURCE_POLYGONS;
 
+/// The BSP's split epsilon, scaled by the body (ADR 0056 G1, the review's
+/// §2.5). The review calls the faceted tier's tolerances scale-dependent in
+/// the wrong way — a fixed number — because a body ten thousand times the
+/// size of another is represented ten thousand times more coarsely, and an
+/// epsilon that ignored that would classify a real crossing as coincident.
+///
+/// The old floor stays: `linear`, `modeling_resolution` and `1e-8`, times
+/// sixteen, which is what every current body used. Added to it is the point
+/// agreement at the body's own scale (`linear · scale`). At the unit-to-
+/// hundreds scale of every fixture that agreement sits below the modeling-
+/// resolution floor, so those bodies are unchanged to the bit; only a body
+/// orders of magnitude larger lifts the epsilon to stay proportional to the
+/// coordinates the BSP splits.
+fn faceted_epsilon(precision: PrecisionPolicy, scale: f64) -> f64 {
+    let floor = precision
+        .linear_agreement
+        .max(precision.modeling_resolution)
+        .max(1.0e-8);
+    let scaled = crate::agreement::Agreement::from(precision).point(scale);
+    floor.max(scaled) * 16.0
+}
+
+/// The largest coordinate magnitude among a scene's triangle vertices,
+/// floored at one: the scale its epsilon is relative to.
+fn scene_scale(scene: &DebugScene) -> f64 {
+    crate::agreement::scale_of_points(
+        scene
+            .triangles
+            .iter()
+            .flat_map(|triangle| triangle.vertices)
+            .map(internal_point),
+    )
+}
+
 pub(crate) fn finish_edges(
     source_topology: Option<&Topology>,
     scene: &DebugScene,
@@ -609,11 +643,8 @@ pub(crate) fn finish_edges(
         return None;
     }
 
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
+    let scale = source_topology.map_or_else(|| scene_scale(scene), Topology::coordinate_scale);
+    let epsilon = faceted_epsilon(precision, scale);
     let source_polygons = source_topology
         .and_then(|topology| planar_topology_polygons(topology, epsilon))
         .unwrap_or_else(|| {
@@ -1282,12 +1313,9 @@ pub(crate) fn subtract_crossing_profile(
     // Iterated plane splitting can reach the same intersection through a
     // different arithmetic path on neighbouring polygons.  Keep the BSP
     // classifier above model resolution while remaining two orders of
-    // magnitude below the default display approximation.
-    let epsilon = precision
-        .linear_agreement
-        .max(precision.modeling_resolution)
-        .max(1.0e-8)
-        * 16.0;
+    // magnitude below the default display approximation, and scaled by the
+    // body so a part far from the origin splits as cleanly as one at it.
+    let epsilon = faceted_epsilon(precision, scene_scale(scene));
     let source_polygons = scene
         .triangles
         .iter()
@@ -1344,13 +1372,46 @@ pub(crate) fn subtract_crossing_profile(
 /// whose operands the exact engines do not carry — a loft's ruled walls
 /// (ADR 0049). The tool's faces become feature faces, as a cutter's are, so
 /// the panels of one of its walls read as one surface. The caller still runs
+/// How the faceted Boolean tier can refuse rather than build. A tier that
+/// declined by returning nothing told a caller nothing; a body over the
+/// polygon budget now says so by name, and a cancelled one is a cancellation,
+/// not a decline (ADR 0056 R3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FacetedRefusal {
+    /// The two operands' tessellations together exceed the tier's polygon
+    /// budget: the count reached and the ceiling it passed.
+    BudgetExceeded { polygons: usize, ceiling: usize },
+    /// The cancellation token was set while the tier was building.
+    Cancelled,
+}
+
+/// The largest tessellation, in polygons, the faceted tier will attempt for
+/// one operand before it refuses (ADR 0056 R3).
+///
+/// The old fixed 4,096 becomes a budget: a hard ceiling still bounds the
+/// BSP's superlinear cost, but the request's own subdivision knob raises it,
+/// so a caller that asked for a finer result is allowed proportionally more
+/// polygons before the tier gives up. The default policy
+/// (`max_subdivisions = 64`) lands at four times the old cap.
+pub(crate) fn source_polygon_ceiling(precision: PrecisionPolicy) -> usize {
+    /// The most polygons any request may ask this tier to carry, whatever its
+    /// budget: past here the BSP's cost is measured in minutes.
+    const HARD_CEILING: usize = 262_144;
+    let knob = precision
+        .max_subdivisions
+        .max(precision.max_iterations)
+        .max(1) as usize;
+    (MAX_SOURCE_POLYGONS.saturating_mul(knob) / 16).clamp(MAX_SOURCE_POLYGONS, HARD_CEILING)
+}
+
 /// the ordinary solid validator before commit.
 pub(crate) fn combine_bodies(
     body: &DebugScene,
     tool: &DebugScene,
     add: bool,
     precision: PrecisionPolicy,
-) -> Option<Topology> {
+    cancellation: &crate::CancellationToken,
+) -> Result<Option<Topology>, FacetedRefusal> {
     // Both operands are the kernel's own tessellations, whose shared corners
     // agree to rounding, so a point is on a plane when it is within the
     // linear agreement of it, not the modelling resolution. Judged at the
@@ -1397,11 +1458,20 @@ pub(crate) fn combine_bodies(
             )
         })
         .collect::<Vec<_>>();
-    if body_polygons.is_empty()
-        || tool_polygons.is_empty()
-        || body_polygons.len() + tool_polygons.len() > 2 * MAX_SOURCE_POLYGONS
-    {
-        return None;
+    if body_polygons.is_empty() || tool_polygons.is_empty() {
+        return Ok(None);
+    }
+    // The cap is a budget now: past the precision-driven ceiling the tier
+    // refuses by name rather than declining without one, so a caller learns
+    // the count it reached and the ceiling it passed instead of a bare
+    // nothing (ADR 0056 R3).
+    let polygons = body_polygons.len() + tool_polygons.len();
+    let ceiling = 2 * source_polygon_ceiling(precision);
+    if polygons > ceiling {
+        return Err(FacetedRefusal::BudgetExceeded { polygons, ceiling });
+    }
+    if cancellation.is_cancelled() {
+        return Err(FacetedRefusal::Cancelled);
     }
     // Only the body near the tool can change, so only that part of it goes
     // through the Boolean: the body is split at a box around the tool, the
@@ -1425,7 +1495,13 @@ pub(crate) fn combine_bodies(
         None => (body_polygons, Vec::new(), Vec::new()),
     };
     if near.is_empty() {
-        return None;
+        return Ok(None);
+    }
+    // The BSP build, clip and heal below run for as long as the polygon count
+    // (now bounded by the budget) takes; poll cancellation across each so a
+    // large tier operation can be stopped.
+    if cancellation.is_cancelled() {
+        return Err(FacetedRefusal::Cancelled);
     }
     let body = BspNode::from_polygons(near.into_iter().chain(caps).collect(), epsilon);
     let tool = BspNode::from_polygons(tool_polygons, epsilon);
@@ -1434,6 +1510,9 @@ pub(crate) fn combine_bodies(
     } else {
         subtracted_polygons(body, tool)
     };
+    if cancellation.is_cancelled() {
+        return Err(FacetedRefusal::Cancelled);
+    }
     let polygons = result
         .into_iter()
         .filter(|polygon| polygon.role != BOX_ROLE)
@@ -1444,12 +1523,12 @@ pub(crate) fn combine_bodies(
         .max(precision.modeling_resolution)
         .max(precision.min_feature_size)
         * 512.0;
-    topology_from_polygons_with_heal_limit(
+    Ok(topology_from_polygons_with_heal_limit(
         polygons,
         epsilon,
         Some(maximum_healed_cycle_span),
         Rebuild::Strict,
-    )
+    ))
 }
 
 fn cutter_from_profile(

@@ -23,8 +23,15 @@ pub const MAX_EXTRUSION_PROFILE_VERTICES: usize = 256;
 /// request may ask the native kernel to perform. They are intentionally
 /// independent of display tessellation: every entry is an exact profile curve.
 pub const MAX_PLANAR_PROFILE_REGIONS: usize = 32;
-pub const MAX_PLANAR_PROFILE_LOOPS: usize = 128;
-pub const MAX_PLANAR_PROFILE_CURVES: usize = 1_024;
+// Raised for Track R (ADR 0056): the profile Boolean's crossing pass is now
+// sub-quadratic (a segment grid, `profile_boolean`), so a profile of many
+// thousands of curves imprints in near-linear time rather than O(curves²),
+// and the wire ceilings that once guarded that cost can be an order of
+// magnitude higher. The custom deserialisation visitors below read these
+// constants, so the new ceilings bound an untrusted payload exactly as the
+// old ones did.
+pub const MAX_PLANAR_PROFILE_LOOPS: usize = 1_024;
+pub const MAX_PLANAR_PROFILE_CURVES: usize = 16_384;
 
 /// Wire-format ceiling for the sections of one loft.
 ///

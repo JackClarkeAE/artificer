@@ -117,6 +117,9 @@ struct OperandFaces<'a> {
     topology: &'a Topology,
     regions: Vec<Option<Vec<Vec<Segment>>>>,
     extents: Vec<Option<FaceExtent>>,
+    index: crate::face_index::FaceIndex,
+    /// The whole solid's box; a face clear of it is outside the solid.
+    bounds: Option<FaceExtent>,
 }
 
 impl<'a> OperandFaces<'a> {
@@ -126,7 +129,7 @@ impl<'a> OperandFaces<'a> {
             .iter()
             .map(|face| face_region(topology, &face.value).ok())
             .collect::<Vec<_>>();
-        let extents = topology
+        let extents: Vec<Option<FaceExtent>> = topology
             .faces
             .iter()
             .zip(&regions)
@@ -136,10 +139,14 @@ impl<'a> OperandFaces<'a> {
                     .and_then(|region| face_extent(&face.value, region))
             })
             .collect();
+        let index = crate::face_index::FaceIndex::new(&extents);
+        let bounds = crate::face_index::union_extent(&extents);
         Self {
             topology,
             regions,
             extents,
+            index,
+            bounds,
         }
     }
 
@@ -203,9 +210,14 @@ fn collect_operand_pieces(
                 loops
             };
             if section.is_empty() {
-                // Untouched face: wholesale in-or-out of the other solid.
-                let inside =
-                    face_sample_inside(own, &face.value, &piece_loops, other.topology, precision)?;
+                // Untouched face: wholesale in-or-out of the other solid. One
+                // clear of the other solid's whole box is outside it (a solid
+                // is bounded), so it skips the ray cast over every far face.
+                let inside = if faces_apart(own_extent, other.bounds, precision) {
+                    false
+                } else {
+                    face_sample_inside(own, &face.value, &piece_loops, other.topology, precision)?
+                };
                 let keep = match operation_2d {
                     BooleanOperation::Difference => !inside,
                     BooleanOperation::Intersection => inside,
@@ -352,9 +364,9 @@ fn without_repeated_pieces(pieces: Vec<Segment>, precision: PrecisionPolicy) -> 
 /// plane, a cylinder face's whole drum over its height range. Faces on a
 /// carrier the engine does not carry have no extent, and gate nothing.
 #[derive(Clone, Copy, Debug)]
-struct FaceExtent {
-    min: Point3,
-    max: Point3,
+pub(crate) struct FaceExtent {
+    pub(crate) min: Point3,
+    pub(crate) max: Point3,
 }
 
 fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
@@ -481,7 +493,7 @@ fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
 /// Whether two faces can be told apart by their extents alone, so that a
 /// carrier pair the intersection matrix refuses is one the Boolean never
 /// needs. Unknown extents keep the refusal.
-fn faces_apart(
+pub(crate) fn faces_apart(
     own: Option<FaceExtent>,
     other: Option<FaceExtent>,
     precision: PrecisionPolicy,
@@ -526,7 +538,8 @@ fn coincident_overlays(
     precision: PrecisionPolicy,
 ) -> Result<Vec<CoincidentOverlay>, AnalyticBooleanError> {
     let mut overlays = Vec::new();
-    for (index, other_face) in other.topology.faces.iter().enumerate() {
+    for index in other.index.candidates(own_extent) {
+        let other_face = &other.topology.faces[index];
         if faces_apart(own_extent, other.extents[index], precision) {
             continue;
         }
@@ -591,11 +604,13 @@ fn section_on_face(
     precision: PrecisionPolicy,
 ) -> Result<Vec<ProfileRegion>, AnalyticBooleanError> {
     let mut pieces: Vec<Segment> = Vec::new();
-    for (index, other_face) in other.topology.faces.iter().enumerate() {
-        // The section is closed by pieces from every face the carrier
-        // crosses, near this face or not, so a pair the matrix answers is
-        // always taken. Only a pair it refuses is asked whether the two
-        // faces could meet at all.
+    // Only faces whose extents come near this one can put a piece on it: a
+    // curve clipped to a far face's region lands outside this face (see
+    // `face_index`); a small body indexes to every face, the exhaustive scan.
+    // A candidate pair the matrix answers is still always taken, and only a
+    // pair it refuses is asked whether the faces could meet at all.
+    for index in other.index.candidates(own_extent) {
+        let other_face = &other.topology.faces[index];
         let outcome = match intersect(face.surface, other_face.value.surface, precision) {
             Ok(outcome) => outcome,
             Err(_) if faces_apart(own_extent, other.extents[index], precision) => continue,

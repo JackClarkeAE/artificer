@@ -10,12 +10,75 @@
 //! `MAX_EXTRUSION_PROFILE_VERTICES`: the largest profile the protocol accepts
 //! is the largest one worth timing.
 
+use std::collections::BTreeMap;
+
+use artificer_kernel::api::session::Session;
 use artificer_kernel::{CancellationToken, NativeKernel, Snapshot};
 use artificer_protocol::{
     ArcDirection, BooleanOperation, BooleanRequest, CURRENT_PROTOCOL_VERSION, ExecuteRequest,
     KernelCommand, PlanarCurve2, PlanarFrame3, PlanarLoop2, PlanarProfile2, PlanarRegion2, Point2,
     Point3, PrecisionPolicy, RequestId, Vector3,
 };
+
+/// A square plate with an `n × n` grid of drilled holes, built through the
+/// scripting API (ADR 0056 R2's scale fixture): `6 + 2·n²` faces, so `n = 8`
+/// is a hundred-face body and `n = 22` a thousand-face one. The holes lie on
+/// a 10 mm pitch through a 5 mm plate.
+#[must_use]
+pub fn drilled_plate(n: usize) -> Snapshot {
+    let side = 10.0 * n as f64;
+    let mut script = format!(
+        "let plate = box(origin: [{}, {}, 0], size: [{side}, {side}, 5], label: \"plate\");\nlet top = plate.face(\"top_face\");\n",
+        -side / 2.0,
+        -side / 2.0
+    );
+    for i in 0..n {
+        for j in 0..n {
+            let x = -side / 2.0 + 5.0 + 10.0 * i as f64;
+            let y = -side / 2.0 + 5.0 + 10.0 * j as f64;
+            script.push_str(&format!(
+                "drill(face: top, center: [{x}, {y}], diameter: 4, depth: 5, label: \"h_{i}_{j}\");\n"
+            ));
+        }
+    }
+    let mut session = Session::new();
+    let outcome = session.run_script(&script, &BTreeMap::new(), &CancellationToken::default());
+    assert!(
+        outcome.succeeded(),
+        "the drilled-plate bench fixture builds"
+    );
+    session.snapshot
+}
+
+/// The second plate of a two-plate Boolean bench: `(n−1)²` holes on the
+/// half-pitch grid, four millimetres narrower, lifted half a thickness so
+/// the slabs differ and the general analytic engine runs.
+#[must_use]
+pub fn second_drilled_plate(n: usize) -> Snapshot {
+    let side = 10.0 * n as f64 - 4.0;
+    let mut script = format!(
+        "let plate = box(origin: [{}, {}, 2.5], size: [{side}, {side}, 5], label: \"plate\");\nlet top = plate.face(\"top_face\");\n",
+        -side / 2.0,
+        -side / 2.0
+    );
+    for i in 0..n - 1 {
+        for j in 0..n - 1 {
+            let base = -(10.0 * n as f64) / 2.0 + 5.0;
+            let x = base + 10.0 * i as f64 + 5.0;
+            let y = base + 10.0 * j as f64 + 5.0;
+            script.push_str(&format!(
+                "drill(face: top, center: [{x}, {y}], diameter: 4, depth: 5, label: \"h_{i}_{j}\");\n"
+            ));
+        }
+    }
+    let mut session = Session::new();
+    let outcome = session.run_script(&script, &BTreeMap::new(), &CancellationToken::default());
+    assert!(
+        outcome.succeeded(),
+        "the second drilled-plate bench fixture builds"
+    );
+    session.snapshot
+}
 
 /// A regular polygon of `sides` vertices, inscribed in `radius`.
 ///

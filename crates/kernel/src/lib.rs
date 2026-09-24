@@ -4,6 +4,7 @@
 //! diagnostic display geometry. It intentionally has no foreign geometry,
 //! UI, renderer, or backend-abstraction dependency.
 
+mod agreement;
 mod analytic_extrusion;
 pub mod api;
 pub mod brep;
@@ -20,6 +21,7 @@ mod edge_finish_apart;
 mod exact_face_feature;
 mod extrusion;
 mod face_feature;
+mod face_index;
 mod faceted_boolean;
 // The certified loop offset is the geometric core of rim-loop blends
 // (ADR 0023 frontier, milestone B). It is complete and unit-tested; the band,
@@ -33,6 +35,8 @@ mod loft_skin;
 mod loop_offset;
 mod mirror;
 mod pattern;
+#[doc(hidden)]
+pub mod perf;
 mod planar_profile;
 mod prism_boolean;
 mod prism_edge_finish;
@@ -1073,6 +1077,7 @@ impl NativeKernel {
                             request.precision,
                             &mut warnings,
                             &REVOLVE_BOOLEAN,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1121,6 +1126,7 @@ impl NativeKernel {
                             request.precision,
                             &mut warnings,
                             &SWEEP_BOOLEAN,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1290,6 +1296,7 @@ impl NativeKernel {
                             *operation == LoftOperation::Add,
                             request.precision,
                             &mut warnings,
+                            cancellation,
                         )?;
                         rung = answered;
                         (topology, HistoryMode::RegularizedFaceFeature)
@@ -1351,6 +1358,7 @@ impl NativeKernel {
                     *operation,
                     request.precision,
                     &mut warnings,
+                    cancellation,
                 )?;
                 rung = answered;
                 (topology, HistoryMode::RegularizedFaceFeature)
@@ -1786,16 +1794,18 @@ impl NativeKernel {
                     ));
                 }
                 let profile = circle_profile(*center, *diameter * 0.5);
-                let feature = validate_exact_face_feature(
-                    input.id,
-                    &input.topology,
-                    *target_face,
-                    *frame,
-                    &profile,
-                    *depth,
-                    FaceExtrusionOperation::Cut,
-                    request.precision,
-                )
+                let feature = perf::stage("kernel.drill.exact", input.topology.faces.len(), || {
+                    validate_exact_face_feature(
+                        input.id,
+                        &input.topology,
+                        *target_face,
+                        *frame,
+                        &profile,
+                        *depth,
+                        FaceExtrusionOperation::Cut,
+                        request.precision,
+                    )
+                })
                 .map_err(|reason| planar_profile_input_error(input.id, reason))?;
                 rung = "drill/exact-prism";
                 (feature.topology, HistoryMode::RegularizedFaceFeature)
@@ -1996,6 +2006,7 @@ impl NativeKernel {
                                     request.precision,
                                     &mut warnings,
                                     &SHELL_BOOLEAN,
+                                    cancellation,
                                 )?;
                                 let digest = semantic_digest(&topology, request.precision);
                                 (
@@ -2275,11 +2286,14 @@ impl NativeKernel {
         // A sheet carried whole — moved, mirrored, patterned — is still a
         // sheet, and is held to the sheet profile (ADR 0056, Track S).
         let carried_sheet = sheet::is_sheet(&input.topology) && sheet::is_sheet(&topology);
-        let internal_validation = if carried_sheet {
-            sheet::validate_sheet(&topology, request.precision.linear_agreement)
-        } else {
-            validator::validate(&topology, request.precision.linear_agreement)
-        };
+        let internal_validation =
+            perf::stage("kernel.execute.validate", topology.faces.len(), || {
+                if carried_sheet {
+                    sheet::validate_sheet(&topology, request.precision.linear_agreement)
+                } else {
+                    validator::validate(&topology, request.precision.linear_agreement)
+                }
+            });
         let profile = if carried_sheet {
             ValidationProfile::Sheet
         } else {
@@ -2297,7 +2311,9 @@ impl NativeKernel {
         }
         check_cancelled(input.id, cancellation, KernelStage::Commit)?;
 
-        let semantic_digest = semantic_digest(&topology, request.precision);
+        let semantic_digest = perf::stage("kernel.execute.digest", topology.faces.len(), || {
+            semantic_digest(&topology, request.precision)
+        });
         let output_snapshot = snapshot_id(semantic_digest);
         let measures = public_measures(internal_validation.measures);
         let snapshot = Snapshot {
@@ -2307,35 +2323,44 @@ impl NativeKernel {
             topology,
             measures,
         };
+        let history = perf::stage(
+            "kernel.execute.history",
+            snapshot.topology.faces.len(),
+            || {
+                Ok::<_, KernelError>(match history_mode {
+                    HistoryMode::Generated => generated_history(&snapshot),
+                    HistoryMode::OneToOne => transformed_history(input, &snapshot),
+                    HistoryMode::Extrusion { profile_vertices } => {
+                        extrusion_history(&snapshot, profile_vertices)
+                    }
+                    HistoryMode::FaceFeature {
+                        operation,
+                        target_face,
+                        exit_face,
+                    } => face_feature_history(input, &snapshot, target_face, exit_face, operation)?,
+                    HistoryMode::RegularizedFaceFeature => {
+                        regularized_face_feature_history(input, &snapshot)
+                    }
+                    HistoryMode::FacePushPull { target_face } => {
+                        face_push_pull_history(input, &snapshot, target_face)?
+                    }
+                })
+            },
+        )?;
         let mut report = OperationReport {
             input_snapshot: input.id,
             output_snapshot,
             semantic_digest,
             topology: snapshot.counts(),
             bounds: measures.bounds,
-            history: match history_mode {
-                HistoryMode::Generated => generated_history(&snapshot),
-                HistoryMode::OneToOne => transformed_history(input, &snapshot),
-                HistoryMode::Extrusion { profile_vertices } => {
-                    extrusion_history(&snapshot, profile_vertices)
-                }
-                HistoryMode::FaceFeature {
-                    operation,
-                    target_face,
-                    exit_face,
-                } => face_feature_history(input, &snapshot, target_face, exit_face, operation)?,
-                HistoryMode::RegularizedFaceFeature => {
-                    regularized_face_feature_history(input, &snapshot)
-                }
-                HistoryMode::FacePushPull { target_face } => {
-                    face_push_pull_history(input, &snapshot, target_face)?
-                }
-            },
+            history,
             validation,
             warnings,
             rung: Some(rung.to_owned()),
         };
-        report.sort_deterministically();
+        perf::stage("kernel.execute.sort_report", report.history.len(), || {
+            report.sort_deterministically();
+        });
         Ok(ExecutionOutcome { snapshot, report })
     }
 
@@ -2631,7 +2656,9 @@ impl NativeKernel {
         };
         check_cancelled(target.id, cancellation, KernelStage::Construction)?;
         let internal_validation =
-            validator::validate(&topology, request.precision.linear_agreement);
+            perf::stage("kernel.boolean.validate", topology.faces.len(), || {
+                validator::validate(&topology, request.precision.linear_agreement)
+            });
         let validation =
             protocol_validation(target.id, ValidationProfile::Solid, &internal_validation);
         if !validation.valid {
@@ -2644,7 +2671,9 @@ impl NativeKernel {
             ));
         }
         check_cancelled(target.id, cancellation, KernelStage::Commit)?;
-        let semantic_digest = semantic_digest(&topology, request.precision);
+        let semantic_digest = perf::stage("kernel.boolean.digest", topology.faces.len(), || {
+            semantic_digest(&topology, request.precision)
+        });
         let output_snapshot = snapshot_id(semantic_digest);
         let measures = public_measures(internal_validation.measures);
         let snapshot = Snapshot {
@@ -3274,166 +3303,188 @@ impl NativeKernel {
         } else {
             TessellationFallback::Display
         };
-        let triangles = compute.flat_map(
-            "kernel.tessellation.faces",
-            &snapshot.topology.faces,
-            |index, face| {
-                let mut triangles = Vec::new();
-                let source_face = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
-                match face.value.surface {
-                    Surface::Plane(plane) => {
-                        let Some(boundaries) = face
-                            .value
-                            .loops()
-                            .map(|loop_key| {
-                                sampled_loop_polygon(
+        let triangles = perf::stage(
+            "kernel.tessellate.faces",
+            snapshot.topology.faces.len(),
+            || {
+                compute.flat_map(
+                    "kernel.tessellation.faces",
+                    &snapshot.topology.faces,
+                    |index, face| {
+                        let mut triangles = Vec::new();
+                        let source_face = entity_ref(snapshot.id, face.id.get(), EntityKind::Face);
+                        match face.value.surface {
+                            Surface::Plane(plane) => {
+                                let Some(boundaries) = face
+                                    .value
+                                    .loops()
+                                    .map(|loop_key| {
+                                        sampled_loop_polygon(
+                                            &snapshot.topology,
+                                            loop_key,
+                                            budget,
+                                            precision,
+                                        )
+                                    })
+                                    .collect::<Option<Vec<_>>>()
+                                else {
+                                    return triangles;
+                                };
+                                if boundaries.first().is_none_or(|polygon| polygon.len() < 3) {
+                                    return triangles;
+                                }
+                                for vertices in
+                                    triangulate_face_boundaries(&boundaries, plane, fallback)
+                                {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Cylinder(cylinder) => {
+                                for vertices in tessellate_cylinder_face(
                                     &snapshot.topology,
-                                    loop_key,
+                                    &face.value,
+                                    cylinder,
                                     budget,
                                     precision,
-                                )
-                            })
-                            .collect::<Option<Vec<_>>>()
-                        else {
-                            return triangles;
-                        };
-                        if boundaries.first().is_none_or(|polygon| polygon.len() < 3) {
-                            return triangles;
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Torus(torus) => {
+                                for vertices in tessellate_torus_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    torus,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Sphere(sphere) => {
+                                for vertices in tessellate_sphere_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    sphere,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            Surface::Cone(cone) => {
+                                for vertices in tessellate_cone_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    cone,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(shaded_triangle(
+                                        face.value.surface,
+                                        vertices,
+                                        source_face,
+                                        snapshot.topology.faces[index].value.role,
+                                    ));
+                                }
+                            }
+                            // The ruled tessellator knows each vertex's parameters,
+                            // so its normals come from them rather than from
+                            // inverting the vertex back onto the surface.
+                            Surface::Ruled(ruled) => {
+                                for (vertices, normals) in tessellate_ruled_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    ruled,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(DebugTriangle {
+                                        vertices: vertices.map(protocol_point),
+                                        normals: normals.map(protocol_vector),
+                                        source_face,
+                                        role: snapshot.topology.faces[index].value.role,
+                                    });
+                                }
+                            }
+                            // So does the B-spline tessellator's.
+                            Surface::Bspline(surface) => {
+                                for (vertices, normals) in tessellate_spline_face(
+                                    &snapshot.topology,
+                                    &face.value,
+                                    surface,
+                                    budget,
+                                    precision,
+                                ) {
+                                    triangles.push(DebugTriangle {
+                                        vertices: vertices.map(protocol_point),
+                                        normals: normals.map(protocol_vector),
+                                        source_face,
+                                        role: snapshot.topology.faces[index].value.role,
+                                    });
+                                }
+                            }
                         }
-                        for vertices in triangulate_face_boundaries(&boundaries, plane, fallback) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Cylinder(cylinder) => {
-                        for vertices in tessellate_cylinder_face(
-                            &snapshot.topology,
-                            &face.value,
-                            cylinder,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Torus(torus) => {
-                        for vertices in tessellate_torus_face(
-                            &snapshot.topology,
-                            &face.value,
-                            torus,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Sphere(sphere) => {
-                        for vertices in tessellate_sphere_face(
-                            &snapshot.topology,
-                            &face.value,
-                            sphere,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    Surface::Cone(cone) => {
-                        for vertices in tessellate_cone_face(
-                            &snapshot.topology,
-                            &face.value,
-                            cone,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(shaded_triangle(
-                                face.value.surface,
-                                vertices,
-                                source_face,
-                                snapshot.topology.faces[index].value.role,
-                            ));
-                        }
-                    }
-                    // The ruled tessellator knows each vertex's parameters,
-                    // so its normals come from them rather than from
-                    // inverting the vertex back onto the surface.
-                    Surface::Ruled(ruled) => {
-                        for (vertices, normals) in tessellate_ruled_face(
-                            &snapshot.topology,
-                            &face.value,
-                            ruled,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
-                                normals: normals.map(protocol_vector),
-                                source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
-                        }
-                    }
-                    // So does the B-spline tessellator's.
-                    Surface::Bspline(surface) => {
-                        for (vertices, normals) in tessellate_spline_face(
-                            &snapshot.topology,
-                            &face.value,
-                            surface,
-                            budget,
-                            precision,
-                        ) {
-                            triangles.push(DebugTriangle {
-                                vertices: vertices.map(protocol_point),
-                                normals: normals.map(protocol_vector),
-                                source_face,
-                                role: snapshot.topology.faces[index].value.role,
-                            });
-                        }
-                    }
-                }
-                triangles
+                        triangles
+                    },
+                )
             },
         );
 
-        let presentation_flags = presentation_edge_flags(&snapshot.topology);
+        let presentation_flags = perf::stage(
+            "kernel.tessellate.edge_flags",
+            snapshot.topology.edges.len(),
+            || presentation_edge_flags(&snapshot.topology),
+        );
         let presentation_smooth_edges = &presentation_flags.smooth;
         let edge_incident_faces = edge_incident_faces(snapshot);
-        let edges = compute.flat_map(
-            "kernel.tessellation.edges",
-            &snapshot.topology.edges,
-            |index, edge| {
-                let is_smooth = presentation_smooth_edges[index];
-                let is_tangent = presentation_flags.tangent[index];
-                let incident_faces = edge_incident_faces[index];
-                sampled_edge_segments(edge.value, budget, precision)
-                    .into_iter()
-                    .map(|endpoints| DebugEdge {
-                        endpoints: endpoints.map(protocol_point),
-                        source_edge: entity_ref(snapshot.id, edge.id.get(), EntityKind::Edge),
-                        is_smooth,
-                        is_tangent,
-                        incident_faces,
-                    })
-                    .collect()
+        let edges = perf::stage(
+            "kernel.tessellate.edges",
+            snapshot.topology.edges.len(),
+            || {
+                compute.flat_map(
+                    "kernel.tessellation.edges",
+                    &snapshot.topology.edges,
+                    |index, edge| {
+                        let is_smooth = presentation_smooth_edges[index];
+                        let is_tangent = presentation_flags.tangent[index];
+                        let incident_faces = edge_incident_faces[index];
+                        sampled_edge_segments(edge.value, budget, precision)
+                            .into_iter()
+                            .map(|endpoints| DebugEdge {
+                                endpoints: endpoints.map(protocol_point),
+                                source_edge: entity_ref(
+                                    snapshot.id,
+                                    edge.id.get(),
+                                    EntityKind::Edge,
+                                ),
+                                is_smooth,
+                                is_tangent,
+                                incident_faces,
+                            })
+                            .collect()
+                    },
+                )
             },
         );
         // A vertex where only tangent rails and one crease meet is not a
@@ -3444,21 +3495,27 @@ impl NativeKernel {
             .map(|(smooth, tangent)| *smooth || *tangent)
             .collect::<Vec<_>>();
 
-        let vertices = snapshot
-            .topology
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(vertex_index, vertex)| DebugVertex {
-                point: protocol_point(vertex.value.point),
-                source_vertex: entity_ref(snapshot.id, vertex.id.get(), EntityKind::Vertex),
-                is_smooth: presentation_vertex_is_smooth(
-                    &snapshot.topology,
-                    vertex_index,
-                    &crease_hidden,
-                ),
-            })
-            .collect();
+        let vertices = perf::stage(
+            "kernel.tessellate.vertices",
+            snapshot.topology.vertices.len(),
+            || {
+                snapshot
+                    .topology
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(vertex_index, vertex)| DebugVertex {
+                        point: protocol_point(vertex.value.point),
+                        source_vertex: entity_ref(snapshot.id, vertex.id.get(), EntityKind::Vertex),
+                        is_smooth: presentation_vertex_is_smooth(
+                            &snapshot.topology,
+                            vertex_index,
+                            &crease_hidden,
+                        ),
+                    })
+                    .collect()
+            },
+        );
 
         DebugScene {
             snapshot: snapshot.id,
@@ -3466,7 +3523,11 @@ impl NativeKernel {
             triangles,
             edges,
             vertices,
-            carriers: display_carriers(snapshot),
+            carriers: perf::stage(
+                "kernel.tessellate.carriers",
+                snapshot.topology.faces.len(),
+                || display_carriers(snapshot),
+            ),
         }
     }
 }
@@ -4601,8 +4662,17 @@ fn loft_boolean(
     add: bool,
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
-    tool_boolean(input, tool, add, precision, warnings, &LOFT_BOOLEAN)
+    tool_boolean(
+        input,
+        tool,
+        add,
+        precision,
+        warnings,
+        &LOFT_BOOLEAN,
+        cancellation,
+    )
 }
 
 /// A tool body added to or cut from a body, through the Boolean ladder: the
@@ -4622,6 +4692,7 @@ fn tool_boolean(
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
     labels: &ToolBoolean,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
     let noun = labels.noun;
     if input.topology.solids.is_empty() {
@@ -4716,9 +4787,16 @@ fn tool_boolean(
         )
     };
     let target_scene = scene_of(&input.topology);
-    let topology = faceted_boolean::combine_bodies(&target_scene, &scene_of(&tool), add, precision)
-        .ok_or_else(|| {
-            declined(error(
+    let topology = match faceted_boolean::combine_bodies(
+        &target_scene,
+        &scene_of(&tool),
+        add,
+        precision,
+        cancellation,
+    ) {
+        Ok(Some(topology)) => topology,
+        Ok(None) => {
+            return Err(declined(error(
                 KernelErrorCode::Unsupported,
                 KernelStage::Construction,
                 input.id,
@@ -4731,8 +4809,33 @@ fn tool_boolean(
                      rebuilt shell did not close within the approximation budget."
                     ),
                 )],
-            ))
-        })?;
+            )));
+        }
+        Err(faceted_boolean::FacetedRefusal::BudgetExceeded { polygons, ceiling }) => {
+            return Err(declined(faceted_budget_error(
+                input.id, noun, polygons, ceiling,
+            )));
+        }
+        Err(faceted_boolean::FacetedRefusal::Cancelled) => {
+            return Err(
+                check_cancelled(input.id, cancellation, KernelStage::Construction)
+                    .err()
+                    .unwrap_or_else(|| {
+                        error(
+                            KernelErrorCode::Cancelled,
+                            KernelStage::Construction,
+                            input.id,
+                            "operation cancelled; no snapshot was committed",
+                            vec![simple_diagnostic(
+                                "OPERATION_CANCELLED",
+                                KernelStage::Construction,
+                                "The cancellation token was set before publication.",
+                            )],
+                        )
+                    }),
+            );
+        }
+    };
     certify_faceted_candidate(input.id, &topology, precision).map_err(declined)?;
     certify_faceted_change(
         input.id,
@@ -4773,6 +4876,7 @@ fn spline_face_feature(
     operation: FaceExtrusionOperation,
     precision: PrecisionPolicy,
     warnings: &mut Vec<ProtocolDiagnostic>,
+    cancellation: &CancellationToken,
 ) -> Result<(Topology, &'static str), KernelError> {
     let refuse = |reason: FaceFeatureInputError| {
         planar_profile_input_error(input.id, PlanarProfileInputError::FaceFeature(reason))
@@ -4834,7 +4938,15 @@ fn spline_face_feature(
     )
     .map_err(|reason| spline_profile_error(input.id, reason))?;
     let tool = spline_profile::build_spline_extrusion(&regions);
-    tool_boolean(input, tool, add, precision, warnings, &SPLINE_FACE_BOOLEAN)
+    tool_boolean(
+        input,
+        tool,
+        add,
+        precision,
+        warnings,
+        &SPLINE_FACE_BOOLEAN,
+        cancellation,
+    )
 }
 
 /// The named refusal for a profile with splines.
@@ -5198,6 +5310,32 @@ fn regularized_edge_finish(
          solid rather than certifying it.",
     ));
     Ok((topology, certified_by))
+}
+
+/// The faceted tier's budget refusal (ADR 0056 R3): the polygon count it
+/// reached and the ceiling it passed, named rather than a silent decline.
+fn faceted_budget_error(
+    snapshot: SnapshotId,
+    noun: &str,
+    polygons: usize,
+    ceiling: usize,
+) -> KernelError {
+    error(
+        KernelErrorCode::ResourceLimitExceeded,
+        KernelStage::Construction,
+        snapshot,
+        format!("the {noun} is too large for the faceted tier's polygon budget"),
+        vec![simple_diagnostic(
+            "FACETED_BUDGET_EXCEEDED",
+            KernelStage::Construction,
+            &format!(
+                "The {noun} and the body tessellate to {polygons} polygons together, past the \
+                 faceted tier's budget of {ceiling}. Raise the precision policy's subdivision \
+                 budget, simplify the operands, or combine them where an exact engine carries \
+                 their surfaces."
+            ),
+        )],
+    )
 }
 
 /// Publishes the corner-blend rung's own refusal, code and sentence intact.

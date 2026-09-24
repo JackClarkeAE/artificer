@@ -538,6 +538,41 @@ V3 from ADR 0026: replay only the features downstream of an edit, with
 per-feature time budgets surfaced in the timeline. Effort: 4 weeks;
 independent of the kernel tracks.
 
+### Status — first landing (2026-09-24)
+
+Landed:
+
+- **R1 (agreement model, partial).** `agreement.rs`: `Agreement::from(
+  PrecisionPolicy)` with `point(scale)`, `angle()`, `feature()`, the named
+  weld multipliers (`SEAM_WELD`/`SECTION_WELD`/`SEW_WELD`) and
+  `Topology::coordinate_scale()`. Adopted in the sew weld and the faceted
+  finish/crossing epsilons; the wider replacement of the nine formulas is
+  left for the construction tracks, which read the same type. 3-D certified
+  predicates (`orient3d`/`insphere`) are not done.
+- **R2 (complexity).** A face-extent index (`face_index.rs`, a uniform grid
+  over `FaceExtent`) prunes `coincident_overlays` and `section_on_face` from
+  O(faces²) toward O(faces); the profile Boolean's crossing pass runs
+  through a segment grid (`profile_boolean`), sub-quadratic; `sew_shells`
+  welds vertices and edges through hash grids rather than linear scans.
+  Below a threshold each falls back to the exhaustive path, so small bodies
+  and every fixture are byte-identical. Measured: a Boolean of two ~10³-face
+  drilled plates fell from ~4.4 s to well under 1 s in debug. Validation was
+  already near-linear (~50 ms at 10³ faces in debug). Display tessellation of
+  a face with hundreds of holes is still quadratic in the hole count (the
+  hole-stitching in `triangulate_face_boundaries`); identified, not yet
+  fixed.
+- **R3 (caps become budgets).** `MAX_PLANAR_PROFILE_CURVES` 1,024 → 16,384
+  and `MAX_PLANAR_PROFILE_LOOPS` 128 → 1,024, once the crossing pass was
+  sub-quadratic; the protocol deserialisation visitors read the constants.
+  The faceted tier's polygon cap is a precision-driven budget with a hard
+  ceiling, and it refuses with `FACETED_BUDGET_EXCEEDED` (naming the count
+  and the ceiling) rather than declining silently; its long stages poll
+  `CancellationToken`.
+
+Not yet done: R4 (fuzzer/corpus), R5 (determinism), R6 (incremental replay),
+the small-scale (10⁻³) direction of the faceted epsilon (still floored by a
+fixed `modeling_resolution`), and the O(holes²) display tessellation.
+
 ## 8. Track I — STEP import
 
 The target is M11: a STEP file from any mainstream CAD system opens as an

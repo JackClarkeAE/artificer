@@ -5,6 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Kernel stage timing (ADR 0056, Track R). Build a bench or a test with
+# `--features perf-spans` and run with `ARTIFICER_PERF_REPORT=1` to see where
+# an operation's time went; off, the stages compile to nothing.
+perf-spans = ["artificer-compute/perf-spans"]
+
 [dependencies]
 artificer-compute = { path = "../compute" }
 artificer-geometry = { path = "../geometry" }

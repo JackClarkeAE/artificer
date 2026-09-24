@@ -40,6 +40,73 @@ pub(crate) struct SewFace {
     pub(crate) role: FaceRole,
 }
 
+/// A hash grid over sewn vertices, keyed by position quantised to the weld
+/// distance. Two points within `weld` land in the same cell or an adjacent
+/// one, so a query scans the 27-cell neighbourhood rather than every vertex.
+struct VertexGrid {
+    cell: f64,
+    buckets: std::collections::BTreeMap<[i64; 3], Vec<usize>>,
+}
+
+impl VertexGrid {
+    fn new(weld: f64) -> Self {
+        Self {
+            cell: weld.max(f64::MIN_POSITIVE),
+            buckets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn key(&self, point: Point3) -> [i64; 3] {
+        let quantize = |value: f64| {
+            let cell = (value / self.cell).floor();
+            if cell.is_finite() { cell as i64 } else { 0 }
+        };
+        [quantize(point.x), quantize(point.y), quantize(point.z)]
+    }
+
+    /// The vertex `point` welds into, adding it when none is within `weld`.
+    /// Among the vertices within reach the lowest index wins, so the result
+    /// is the very vertex a linear scan in insertion order would return.
+    fn find_or_insert(
+        &mut self,
+        topology: &mut Topology,
+        next_id: &mut u64,
+        point: Point3,
+    ) -> VertexKey {
+        let base = self.key(point);
+        let mut best: Option<usize> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let cell = [base[0] + dx, base[1] + dy, base[2] + dz];
+                    let Some(bucket) = self.buckets.get(&cell) else {
+                        continue;
+                    };
+                    for &index in bucket {
+                        if (topology.vertices[index].value.point - point).length() <= self.cell
+                            && best.is_none_or(|current| index < current)
+                        {
+                            best = Some(index);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(index) = best {
+            return VertexKey(index);
+        }
+        let index = topology.vertices.len();
+        let id = EntityId::from_raw(*next_id);
+        *next_id += 1;
+        topology.vertices.push(Record {
+            id,
+            value: Vertex { point },
+        });
+        self.buckets.entry(base).or_default().push(index);
+        VertexKey(index)
+    }
+}
+
 /// Sews face pieces into a topology of one or more solids with cavities.
 pub(crate) fn sew_shells(
     pieces: &[SewFace],
@@ -55,9 +122,15 @@ pub(crate) fn sew_shells(
         .flat_map(|segment| [segment.start(), segment.end()])
         .map(|point| point.x.abs().max(point.y.abs()))
         .fold(1.0_f64, f64::max);
-    let weld = precision.linear_agreement.max(1.0e-12) * scale * 32.0;
-    let merged = without_needless_vertices(pieces, weld);
+    // The one agreement model (ADR 0056 G1): a section weld, `·32` the point
+    // agreement, at the body's own scale — the same value the literal gave.
+    let weld =
+        crate::agreement::Agreement::from(precision).weld(scale, crate::agreement::SECTION_WELD);
+    let merged = crate::perf::stage("kernel.sew.needless_vertices", pieces.len(), || {
+        without_needless_vertices(pieces, weld)
+    });
     let pieces = merged.as_slice();
+    let welding = std::time::Instant::now();
 
     let mut topology = Topology::default();
     let mut next_id = 1_u64;
@@ -67,27 +140,18 @@ pub(crate) fn sew_shells(
         id
     }
 
-    // Vertex weld by position; edge weld by endpoint pair plus midpoint.
-    fn find_vertex(
-        topology: &mut Topology,
-        next_id: &mut u64,
-        weld: f64,
-        point: Point3,
-    ) -> VertexKey {
-        if let Some(index) = topology
-            .vertices
-            .iter()
-            .position(|candidate| (candidate.value.point - point).length() <= weld)
-        {
-            return VertexKey(index);
-        }
-        let key = VertexKey(topology.vertices.len());
-        topology.vertices.push(Record {
-            id: allocate(next_id),
-            value: Vertex { point },
-        });
-        key
-    }
+    // Vertex weld by position, through a hash grid so a body of thousands of
+    // welded vertices costs the cell it lands in rather than a scan of every
+    // vertex before it. A point within `weld` of a vertex shares its cell or
+    // a neighbour's, and among the matches the lowest index wins — exactly
+    // the vertex a linear `position()` would have returned.
+    let mut vertex_grid = VertexGrid::new(weld);
+
+    // Edge weld by endpoint pair plus midpoint, through a map keyed by the
+    // unordered vertex pair, so an edge is matched against the few edges on
+    // the same two vertices rather than every edge already sewn.
+    let mut edges_by_pair: std::collections::BTreeMap<[usize; 2], Vec<usize>> =
+        std::collections::BTreeMap::new();
 
     let mut face_keys: Vec<FaceKey> = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -118,23 +182,34 @@ pub(crate) fn sew_shells(
                 );
                 let middle_world =
                     surface_point(piece.surface, middle_2d).ok_or(SewError::Inconsistent)?;
-                let start_vertex = find_vertex(&mut topology, &mut next_id, weld, start_world);
-                let end_vertex = find_vertex(&mut topology, &mut next_id, weld, end_world);
+                let start_vertex =
+                    vertex_grid.find_or_insert(&mut topology, &mut next_id, start_world);
+                let end_vertex = vertex_grid.find_or_insert(&mut topology, &mut next_id, end_world);
 
                 let (curve, parameter_range) = match canonical {
                     Some(trace) => (trace.curve, trace.range),
                     None => segment_curve(piece.surface, *segment).ok_or(SewError::Inconsistent)?,
                 };
-                let found = topology.edges.iter().position(|edge| {
-                    let vertices = edge.value.vertices;
-                    let aligned = vertices == [start_vertex, end_vertex];
-                    let swapped = vertices == [end_vertex, start_vertex];
-                    if !aligned && !swapped {
-                        return false;
-                    }
-                    let range = edge.value.parameter_range;
-                    let middle = edge.value.curve.evaluate((range.start + range.end) / 2.0);
-                    (middle - middle_world).length() <= weld
+                let pair = if start_vertex.0 <= end_vertex.0 {
+                    [start_vertex.0, end_vertex.0]
+                } else {
+                    [end_vertex.0, start_vertex.0]
+                };
+                // The lowest-index edge on this vertex pair whose midpoint
+                // agrees: what a linear scan over every edge would have found.
+                let found = edges_by_pair.get(&pair).and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|index| {
+                            let range = topology.edges[*index].value.parameter_range;
+                            let middle = topology.edges[*index]
+                                .value
+                                .curve
+                                .evaluate((range.start + range.end) / 2.0);
+                            (middle - middle_world).length() <= weld
+                        })
+                        .min()
                 });
                 let (edge_key, orientation) = match found {
                     Some(index) => {
@@ -159,6 +234,7 @@ pub(crate) fn sew_shells(
                                 parameter_range,
                             },
                         });
+                        edges_by_pair.entry(pair).or_default().push(key.0);
                         (key, Orientation::Forward)
                     }
                 };
@@ -197,6 +273,8 @@ pub(crate) fn sew_shells(
         });
         face_keys.push(face_key);
     }
+    crate::perf::record("kernel.sew.weld", pieces.len(), welding.elapsed());
+    let components = std::time::Instant::now();
 
     // Edge-connected components become shells.
     let mut face_edges: Vec<Vec<EdgeKey>> = vec![Vec::new(); topology.faces.len()];
@@ -237,6 +315,8 @@ pub(crate) fn sew_shells(
         }
     }
 
+    crate::perf::record("kernel.sew.components", pieces.len(), components.elapsed());
+    let volumes_started = std::time::Instant::now();
     // Component volumes decide which are solids and which are cavities.
     let mut volumes = Vec::with_capacity(component_count);
     let mut samples = Vec::with_capacity(component_count);
@@ -261,9 +341,10 @@ pub(crate) fn sew_shells(
         }];
         let measures = crate::validator::calculate_exact_shell_measures(&probe, None)
             .ok_or(SewError::Degenerate)?;
-        if !measures.signed_volume.is_finite()
-            || measures.signed_volume.abs() <= precision.min_feature_size.powi(3)
-        {
+        // A component enclosing less than a cubic feature-size is a sliver,
+        // not a solid — the feature floor from the one agreement model.
+        let feature = crate::agreement::Agreement::from(precision).feature();
+        if !measures.signed_volume.is_finite() || measures.signed_volume.abs() <= feature.powi(3) {
             return Err(SewError::Degenerate);
         }
         volumes.push(measures.signed_volume);
@@ -276,6 +357,11 @@ pub(crate) fn sew_shells(
         );
         samples.push(surface_point(sample_face.surface, sample_2d).ok_or(SewError::Inconsistent)?);
     }
+    crate::perf::record(
+        "kernel.sew.volumes",
+        component_count,
+        volumes_started.elapsed(),
+    );
 
     // Assemble shells and solids: positive components own themselves,
     // negative components are cavities of whichever positive component's
