@@ -12153,20 +12153,23 @@ mod tests {
         let plate = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");";
         let crossed = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet top = base.face(\"top_face\");\ndrill(face: top, center: [-15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_a\");\ndrill(face: faces(\">Z\"), center: [15.0, -25.0], diameter: 16.0, depth: 40.0, label: \"hole_b\");\ndrill(face: faces(\"<Y\"), center: [0.0, 0.0], diameter: 20.0, depth: 30.0, label: \"side_cut\");";
         let slot = "let base = box(size: [100.0, 100.0, 40.0], label: \"base\");\nlet s = sketch(on: faces(\">Z\"), entities: [line(start: [-10, -5], end: [10, -5]), arc(center: [10, 0], radius: 5, start_angle: -90, end_angle: 90), line(start: [10, 5], end: [-10, 5]), arc(center: [-10, 0], radius: 5, start_angle: 90, end_angle: 270)], label: \"s\");\nextrude(sketch: s, distance: 10, operation: \"cut\", label: \"slot\");";
-        // A hub whose flange rim is blended, a bolt hole drilled beside the
-        // band, and a second hole drilled through the band: that last step
-        // meets the torus off its axis and reaches the faceted tier, which
-        // re-facets the whole body, the bolt hole's rim included.
-        let hub = "let section = sketch(on: \"XZ\", label: \"section\", entities: [line(start: [6, 0], end: [45, 0]), line(start: [45, 0], end: [45, 8]), line(start: [45, 8], end: [20, 8]), line(start: [20, 8], end: [20, 40]), line(start: [20, 40], end: [6, 40]), line(start: [6, 40], end: [6, 0])]);\nlet hub = revolve(sketch: section, axis: [0, 0, 1], label: \"hub\");\nfillet(edges: [nearest(point: [0, 45, 8], kind: \"edge\"), nearest(point: [0, -45, 8], kind: \"edge\")], radius: 2, label: \"flange_top_rim\");\ndrill(face: nearest(point: [-30.0, 5.0, 8.0]), center: [-30.0, 0.0], diameter: 6.0, depth: 8.0, label: \"bolt\");\ndrill(face: nearest(point: [25.0, 10.0, 8.0]), center: [43.0, 0.0], diameter: 6.0, depth: 8.0, label: \"rim_hole\");";
+        // A body extruded from a spline profile, a bolt hole drilled in its
+        // top, and a second hole drilled out through the spline wall: that
+        // last step meets a B-spline face, which no exact or numerical rung
+        // carries, and reaches the faceted tier, which re-facets the whole
+        // body, the bolt hole's rim included. (A drill through a torus band
+        // used to be the step that faceted this fixture; since ADR 0056
+        // Track B the numerical intersection rung keeps that rim exact.)
+        let hub = "let blob = sketch(on: \"XY\", entities: [spline(points: [[40, 0], [28, 28], [0, 40], [-28, 28], [-40, 0], [-28, -28], [0, -40], [28, -28]], closed: true)], label: \"blob\");\nlet body = extrude(sketch: blob, distance: 20, label: \"body\");\ndrill(face: faces(\">Z\"), center: [0.0, 0.0], diameter: 6.0, depth: 20.0, label: \"bolt\");\ndrill(face: faces(\">Z\"), center: [38.0, 0.0], diameter: 6.0, depth: 20.0, label: \"rim_hole\");";
         // Each case names a bore's rim on a top face: hole_a's at z = 40,
-        // eight from (35, 25), or the bolt hole's at z = 8, three from
-        // (−30, 0). The faceted tier splits a rim's polygon sides at points
+        // eight from (35, 25), or the bolt hole's at z = 20, three from
+        // (0, 0). The faceted tier splits a rim's polygon sides at points
         // along the chord, which sit inside the circle by up to the sagitta
         // of a sixteen-gon, so the band is half a millimetre.
         for (label, script, centre, radius, expected_sources) in [
             ("exact plate", plate, (35.0, 25.0, 40.0), 8.0, 2),
             ("crossing cut", crossed, (35.0, 25.0, 40.0), 8.0, 2),
-            ("faceted hub", hub, (-30.0, 0.0, 8.0), 3.0, 0),
+            ("faceted blob", hub, (0.0, 0.0, 20.0), 3.0, 0),
         ] {
             let on_hole_a = |edge: &&DebugEdge| {
                 edge.endpoints.iter().all(|point| {

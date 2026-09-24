@@ -306,7 +306,9 @@ fn arc_disc_prisms_combine_exactly_and_print_their_timings() {
 
 /// Every example script, with the semantic digest and tier its body had
 /// before the scale work began. A digest that moves is a body that changed,
-/// which no optimisation may do.
+/// which no optimisation may do. (`blend_then_drill` moved once, when the
+/// numerical intersection rung of ADR 0056 Track B took its drill through
+/// the torus band over from the faceted tier; the table carries that body.)
 const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[
     (
         "bearing_mount",
@@ -316,8 +318,8 @@ const EXAMPLE_DIGESTS: &[(&str, &str, &str, Tier)] = &[
     ),
     (
         "blend_then_drill",
-        "52cc22b4779085c47d706990c6bb257dc3f588efdbbfd2c41b9c93b2e18e8b0c",
-        "52cc22b4779085c47d706990c6bb257d",
+        "c5d91023d64cc6f3666119ca956c3fc882247daa5d0d43c697926f4f21a5aa4c",
+        "c5d91023d64cc6f3666119ca956c3fc8",
         Tier::Approximate,
     ),
     (
