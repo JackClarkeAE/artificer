@@ -338,7 +338,6 @@ impl ToolLibrary {
         self.tools.iter().find(|tool| tool.number == number)
     }
 
-    #[must_use]
     pub fn of_kind(&self, kind: ToolKind) -> impl Iterator<Item = &Tool> {
         self.tools.iter().filter(move |tool| tool.kind == kind)
     }

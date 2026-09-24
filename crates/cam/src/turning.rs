@@ -394,13 +394,9 @@ fn offset_envelope(
         // back the material lies to the right; outward is left).
         let (nr, nz) = (-dz / length, dr / length);
         let (nr, nz) = if nr < 0.0 { (-nr, -nz) } else { (nr, nz) };
-        let distance = if nr.abs() <= 1.0e-9 {
-            axial
-        } else if nz.abs() <= 1.0e-9 {
-            radial
-        } else {
-            radial
-        };
+        // A shoulder moves forward by the axial allowance; a cylinder and
+        // a slope move out by the radial one.
+        let distance = if nr.abs() <= 1.0e-9 { axial } else { radial };
         let shift = Point2::new(nr * distance, nz * distance);
         lines.push((
             Point2::new(a.x + shift.x, a.y + shift.y),

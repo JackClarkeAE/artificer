@@ -318,7 +318,6 @@ pub fn loop_swept_volume(source: &PlanarLoop2) -> f64 {
 /// Whether two closed loops describe the same region to `tolerance`: the
 /// same area, and every vertex of one within `tolerance` of a vertex of the
 /// other, once collinear vertices are dropped from both.
-#[must_use]
 pub fn loops_agree(
     first: &PlanarLoop2,
     second: &PlanarLoop2,

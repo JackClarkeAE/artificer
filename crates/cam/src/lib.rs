@@ -13,8 +13,10 @@
 //! feeds and speeds from the handbooks, and LinuxCNC's G-code dialect.
 
 pub mod geom;
+pub mod interpreter;
 pub mod milling;
 pub mod plan;
+pub mod post;
 pub mod recognise;
 pub mod simulate;
 pub mod space;

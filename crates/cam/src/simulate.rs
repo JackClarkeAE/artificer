@@ -129,6 +129,7 @@ pub const PECK_BACKOFF: f64 = 0.5;
 
 /// Expands one programmed move into motions from `current`, the canned
 /// cycles into their rapids and feeds exactly as the interpreter does.
+#[allow(clippy::too_many_arguments)]
 pub fn expand_move(
     current: &mut Point3,
     m: &Move,
@@ -229,6 +230,24 @@ pub fn motions_from_plan(plan: &Plan) -> Vec<Motion> {
                 &mut out,
             );
         }
+    }
+    // The program ends by retracting to the safe height, as the post
+    // writes it after `M30`'s spindle stop.
+    if let Some(last) = plan.operations.last() {
+        let retract = match plan.machine {
+            Machine::Mill => Point3::new(current.x, current.y, plan.safe_height),
+            Machine::Lathe => Point3::new(plan.safe_height, 0.0, plan.safe_height),
+        };
+        expand_move(
+            &mut current,
+            &Move::Rapid { to: retract },
+            last.tool,
+            plan.operations.len() - 1,
+            last.feed,
+            last.spindle,
+            0,
+            &mut out,
+        );
     }
     out
 }
