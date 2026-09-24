@@ -83,8 +83,24 @@ pub fn conjugate_gradients(
         .collect::<Vec<_>>();
 
     let mut q = vec![0.0; n];
-    // r = rhs − K x on the free dofs; x may carry prescribed values on the
-    // fixed ones, which the product honours.
+    // What drives the system is the right-hand side less what the
+    // prescribed values push on the free dofs: a bar held at two
+    // temperatures has no source term at all, and is driven entirely by
+    // its ends. The residual is measured against that, not against `rhs`.
+    let prescribed = x
+        .iter()
+        .zip(free)
+        .map(|(value, free)| if *free { 0.0 } else { *value })
+        .collect::<Vec<_>>();
+    operator.apply(&prescribed, &mut q);
+    let effective = rhs
+        .iter()
+        .zip(&q)
+        .zip(free)
+        .map(|((rhs, kx), free)| if *free { rhs - kx } else { 0.0 })
+        .collect::<Vec<_>>();
+    let rhs_norm = norm(&effective, free);
+    // r = rhs − K x on the free dofs, from wherever `x` starts.
     operator.apply(x, &mut q);
     let mut r = rhs
         .iter()
@@ -92,7 +108,6 @@ pub fn conjugate_gradients(
         .zip(free)
         .map(|((rhs, kx), free)| if *free { rhs - kx } else { 0.0 })
         .collect::<Vec<_>>();
-    let rhs_norm = norm(rhs, free);
     if rhs_norm == 0.0 {
         progress(Progress {
             phase: "solved",

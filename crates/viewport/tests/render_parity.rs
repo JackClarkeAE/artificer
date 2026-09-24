@@ -288,6 +288,7 @@ fn a_heat_map_repaints_on_both_backends_as_its_readings_change() {
                                 maximum: 0.4,
                             },
                             epoch,
+                            legend: None,
                         }));
 
                     let _ = show_document_with_feature_drag(
