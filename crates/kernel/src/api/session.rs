@@ -114,6 +114,42 @@ impl Session {
         self.execute_recorded(command, token, true)
     }
 
+    /// Reads a STEP file at `path` into a new body under `label` (ADR 0056,
+    /// Track I): the file is read now and each time the journal replays.
+    pub fn import_step(
+        &mut self,
+        label: impl Into<String>,
+        path: impl Into<String>,
+        token: &CancellationToken,
+    ) -> Result<CommandResult, ApiError> {
+        self.execute(
+            ApiCommand::ImportStep {
+                label: label.into(),
+                path: path.into(),
+                text: None,
+            },
+            token,
+        )
+    }
+
+    /// Reads STEP text into a new body under `label`; the text travels in
+    /// the journal, so the step replays without the file.
+    pub fn import_step_text(
+        &mut self,
+        label: impl Into<String>,
+        text: impl Into<String>,
+        token: &CancellationToken,
+    ) -> Result<CommandResult, ApiError> {
+        self.execute(
+            ApiCommand::ImportStep {
+                label: label.into(),
+                path: String::new(),
+                text: Some(text.into()),
+            },
+            token,
+        )
+    }
+
     /// Executes one command. With `record`, the step is journaled and can
     /// be undone; without it, the step is an instance of a feature pattern,
     /// committed under the pattern's journal entry.
@@ -672,7 +708,8 @@ impl Session {
             | ApiCommand::MakeCylinder { .. }
             | ApiCommand::SurfaceExtrude { .. }
             | ApiCommand::SurfaceRevolve { .. }
-            | ApiCommand::Patch { .. } => true,
+            | ApiCommand::Patch { .. }
+            | ApiCommand::ImportStep { .. } => true,
             ApiCommand::Extrude { operation, .. }
             | ApiCommand::Revolve { operation, .. }
             | ApiCommand::Loft { operation, .. } => *operation == ExtrudeOp::New,
@@ -811,6 +848,18 @@ impl Session {
 
     fn lower_command(&self, cmd: &ApiCommand) -> Result<KernelCommand, ApiError> {
         match cmd {
+            ApiCommand::ImportStep { path, text, .. } => {
+                let text = match text {
+                    Some(text) => text.clone(),
+                    None => std::fs::read_to_string(path).map_err(|error| {
+                        ApiError::new(
+                            ApiErrorCode::InvalidInput,
+                            format!("The STEP file \"{path}\" could not be read: {error}"),
+                        )
+                    })?,
+                };
+                Ok(KernelCommand::ImportStep { text })
+            }
             ApiCommand::MakeBox { origin, size, .. } => Ok(KernelCommand::MakeCuboid {
                 origin: *origin,
                 size_x: size[0],

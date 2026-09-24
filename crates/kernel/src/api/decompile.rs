@@ -509,6 +509,22 @@ impl Writer<'_> {
                 let plane = self.plane_argument(plane)?;
                 format!("trim(plane: {plane}, label: {})", quoted(&label))
             }
+            ApiCommand::ImportStep { path, text, .. } => {
+                if path.is_empty() && text.is_some() {
+                    return Err(ApiError::new(
+                        ApiErrorCode::InvalidInput,
+                        format!(
+                            "Step \"{label}\" imported STEP text inline; a script names a file, so \
+                             save the text and import it by path"
+                        ),
+                    ));
+                }
+                format!(
+                    "import_step(path: {}, label: {})",
+                    quoted(path),
+                    quoted(&label)
+                )
+            }
         };
         let _ = writeln!(self.body, "let {ident} = {call};");
         Ok(())

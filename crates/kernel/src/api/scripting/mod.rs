@@ -519,6 +519,7 @@ fn prelude() -> Names {
 const BUILTINS: &[&str] = &[
     "box",
     "cylinder",
+    "import_step",
     "line",
     "circle",
     "arc",
@@ -1670,6 +1671,12 @@ impl<'a> Interp<'a> {
                 axis: args.vector3_or("axis", up)?,
                 radius: args.radius()?,
                 height: args.number("height")?,
+            })),
+            // A body read from a STEP file (ADR 0056, Track I).
+            "import_step" => Ok(Value::command(ApiCommand::ImportStep {
+                label: args.label()?,
+                path: args.required("path")?.as_string()?.to_owned(),
+                text: None,
             })),
             // ---- sketches and what grows from them --------------------------
             "line" => Ok(Value::entity(SketchEntity::Line {

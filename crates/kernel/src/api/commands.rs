@@ -381,6 +381,15 @@ pub enum ApiCommand {
     /// The current sheet body trimmed by a plane, keeping the side the
     /// plane faces (ADR 0056, S2).
     Trim { label: String, plane: SketchPlane },
+    /// Reads a STEP file into a new body (ADR 0056, Track I). The file is
+    /// read from `path` when the command runs, relative to the working
+    /// directory, unless its `text` travels with the command.
+    ImportStep {
+        label: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 }
 
 impl ApiCommand {
@@ -412,6 +421,7 @@ impl ApiCommand {
             Self::Stitch { .. } => "stitch",
             Self::Thicken { .. } => "thicken",
             Self::Trim { .. } => "trim",
+            Self::ImportStep { .. } => "import_step",
         }
     }
 
@@ -440,7 +450,8 @@ impl ApiCommand {
             | Self::Patch { label, .. }
             | Self::Stitch { label, .. }
             | Self::Thicken { label, .. }
-            | Self::Trim { label, .. } => label,
+            | Self::Trim { label, .. }
+            | Self::ImportStep { label, .. } => label,
         }
     }
 }

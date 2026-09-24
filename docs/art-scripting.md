@@ -199,6 +199,44 @@ let d = cylinder(diameter: 16, height: 30, label: "d");
 | `center` | no | Centre of the base circle. Default `[0, 0, 0]`. |
 | `axis` | no | Direction of the height. Default `[0, 0, 1]`. |
 
+### `import_step`
+
+```art
+let bracket = import_step(path: "parts/bracket.step", label: "bracket");
+drill(face: bracket.face("#412"), center: [0, 0], diameter: 6, depth: 10, label: "pin");
+```
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `path` | yes | A STEP (ISO 10303-21) file, AP203, AP214 or AP242, read relative to the working directory each time the step runs. |
+| `label` | no | Step label. |
+
+A new body from the file's first product: `MANIFOLD_SOLID_BREP`,
+`BREP_WITH_VOIDS`, `FACETED_BREP`, or a `SHELL_BASED_SURFACE_MODEL` whose
+shells close. Planes, cylinders, cones, spheres, ring tori and non-rational
+B-spline surfaces bounded by their iso-lines; lines, circles, ellipses and
+B-spline curves (a B-spline edge on an analytic face that is really a line
+or a circle, rational or not, is snapped to the exact curve); millimetre,
+metre and inch units; the file's own accuracy for welding. The body is
+conformed to the kernel's conventions — a 360° cylinder with one seam
+becomes the kernel's two half faces — so everything a script does to a
+built body it does to an imported one. Faces and edges are named by their
+STEP entity numbers: `bracket.face("#412")` is the face `#412=ADVANCED_FACE`
+wrote, with `ordinal: 0` and `ordinal: 1` for the two halves of a face the
+import split at its seam; `bracket.faces()` and the direction selectors
+work as ever.
+
+A face the kernel cannot read exactly (a rational spline whose weights
+differ, a trimmed spline face, an offset surface, a gap wider than the
+file's accuracy) does not stop the import: the part opens as a reference
+mesh on the faceted tier, `approximate` in the report, with
+`STEP_FACETED_APPROXIMATION` listing every refusal by code and entity
+(`STEP_FACE_UNSUPPORTED`, `STEP_RATIONAL_UNSUPPORTED`,
+`STEP_GAP_EXCEEDS_TOLERANCE`, `STEP_SHELL_OPEN`, `STEP_ENTITY_UNSUPPORTED`).
+Text that is not Part 21 is refused (`STEP_SYNTAX_INVALID`), as is a file
+with no solid in it. An assembly's first product is read in its own frame
+and the report says the other occurrences were not placed.
+
 ---
 
 ## 5. Sketches
