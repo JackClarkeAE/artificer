@@ -364,7 +364,7 @@ fn read_wedge(
 /// make, so twice it, plus the setback, reaches past every end from anywhere
 /// on the edge. It is spent only along the edge: sideways the tool stays
 /// within the corner it finishes (see [`removal_tool`]).
-fn body_reach(topology: &Topology, distance: f64) -> f64 {
+pub(crate) fn body_reach(topology: &Topology, distance: f64) -> f64 {
     let mut low = [f64::INFINITY; 3];
     let mut high = [f64::NEG_INFINITY; 3];
     for vertex in &topology.vertices {
@@ -399,6 +399,22 @@ fn removal_tool(
     kind: EdgeFinishKind,
     distance: f64,
     reach: f64,
+    precision: PrecisionPolicy,
+) -> Result<Snapshot, ApartRefusal> {
+    removal_tool_between(topology, target, kind, distance, [reach, reach], precision)
+}
+
+/// The same removal solid with its own extent at each end: how far past the
+/// edge's first and second vertex it runs. Oversized at an end that runs out
+/// into air, as [`removal_tool`] has both; bounded exactly (`0.0`) at an end
+/// that stops where the edge does — against the band a concave neighbour
+/// left, whose tangency plane is then the tool's own cap (ADR 0056, F3).
+pub(crate) fn removal_tool_between(
+    topology: &Topology,
+    target: EntityRef,
+    kind: EdgeFinishKind,
+    distance: f64,
+    overshoot: [f64; 2],
     precision: PrecisionPolicy,
 ) -> Result<Snapshot, ApartRefusal> {
     let edge = topology
@@ -497,7 +513,7 @@ fn removal_tool(
         let delta = difference(point, anchor);
         ProtocolPoint2::new(dot(delta, u), dot(delta, v))
     };
-    let start = offset(anchor, scale(along, -reach));
+    let start = offset(anchor, scale(along, -overshoot[0]));
     let frame = PlanarFrame3::new(
         ProtocolPoint3::new(start.x, start.y, start.z),
         ProtocolVector3::new(u.x, u.y, u.z),
@@ -548,7 +564,7 @@ fn removal_tool(
             holes: Vec::new(),
         }],
     };
-    let sweep = length + reach * 2.0;
+    let sweep = length + overshoot[0] + overshoot[1];
     // Built by the same route any other body is: the extrusion command, run
     // on an empty snapshot. Calling the construction helpers directly would
     // skip the normalizing and certifying the command does on the way, and a
@@ -576,7 +592,7 @@ fn removal_tool(
         })
 }
 
-fn straight(start: ProtocolPoint2, end: ProtocolPoint2) -> PlanarCurve2 {
+pub(crate) fn straight(start: ProtocolPoint2, end: ProtocolPoint2) -> PlanarCurve2 {
     PlanarCurve2::Line { start, end }
 }
 
@@ -586,7 +602,7 @@ fn straight(start: ProtocolPoint2, end: ProtocolPoint2) -> PlanarCurve2 {
 /// towards the edge. The major arc through the far side of the circle is a
 /// different shape entirely, and picking it silently is how a removal solid
 /// stops being a fillet without anything saying so.
-fn minor_arc(start: ProtocolPoint2, end: ProtocolPoint2, center: ProtocolPoint2) -> PlanarCurve2 {
+pub(crate) fn minor_arc(start: ProtocolPoint2, end: ProtocolPoint2, center: ProtocolPoint2) -> PlanarCurve2 {
     let angle = |point: ProtocolPoint2| (point.y - center.y).atan2(point.x - center.x);
     let mut sweep = angle(end) - angle(start);
     while sweep <= -std::f64::consts::PI {
@@ -612,7 +628,7 @@ fn minor_arc(start: ProtocolPoint2, end: ProtocolPoint2, center: ProtocolPoint2)
 /// Which way round the two faces happen to sit decides the sign, so it is
 /// measured rather than assumed: the chord polygon's signed area has the same
 /// sign as the loop's, a minor arc never being enough to turn it.
-fn wound(curves: Vec<PlanarCurve2>) -> PlanarLoop2 {
+pub(crate) fn wound(curves: Vec<PlanarCurve2>) -> PlanarLoop2 {
     let ends = |curve: &PlanarCurve2| match curve {
         PlanarCurve2::Line { start, end } => (*start, *end),
         PlanarCurve2::CircularArc { start, end, .. } => (*start, *end),
@@ -660,7 +676,7 @@ fn wound(curves: Vec<PlanarCurve2>) -> PlanarLoop2 {
 /// The two faces an edge separates, if it separates exactly two: the one
 /// whose coedge walks the edge's own direction, then the one that walks it in
 /// reverse. A seam one face uses both ways round is not such an edge.
-fn oriented_faces_of_edge(topology: &Topology, edge: usize) -> Option<[usize; 2]> {
+pub(crate) fn oriented_faces_of_edge(topology: &Topology, edge: usize) -> Option<[usize; 2]> {
     let mut forward = None;
     let mut reverse = None;
     for (index, face) in topology.faces.iter().enumerate() {

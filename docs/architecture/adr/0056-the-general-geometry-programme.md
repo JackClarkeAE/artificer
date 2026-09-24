@@ -266,6 +266,25 @@ concave, with corners resolved; then variable radius and face–face blends.
 The exact rungs that exist stay as fast paths, since they produce the same
 result in closed form.
 
+**Status (first landing, 0.99.82).** F2's gates landed ahead of F1, as two
+rungs rather than the one construction: `edge-finish/concave-rim-blend`
+builds the torus or cone band in place along a concave rim (a boss on its
+plate, a counterbore's floor, a blind pocket's floor rim), exact by Pappus
+across twenty-four radii; `edge-finish/concave-fill` fills a concave
+straight edge between flat faces on any planar body by unioning its own
+corner region through the Boolean ladder (flat sides inset into the
+material, ends flush with square caps, the added volume certified against
+the closed form), and `EDGE_FINISH_REFLEX_UNSUPPORTED` is retired for
+planar bodies. F3's first slice landed with it: a selection mixing concave
+and convex edges fills the concave ones first, cuts a convex edge that meets
+a fill standing apart with its tool bounded at the band's tangency plane
+(the planar-cap corner, exact), and finishes the rest by the ladder or
+standing apart; the cube with all twelve edges was found to build already
+(vertex blend). Not landed: F1's `Surface::Pipe` and single construction,
+the rolling-ball patch at a concave–convex corner (planar cap only), a
+concave edge ending on a leaning face (`CONCAVE_EDGE_END_UNSUPPORTED`),
+F4–F7. Regressions: `crates/kernel/tests/fillet_frontier.rs`.
+
 ### F1. The rolling-ball blend as one construction
 
 A fillet of radius `r` along an edge between faces A and B is the envelope

@@ -694,9 +694,313 @@ fn drilled_l_block() -> Snapshot {
     drill(&l_block, 7.0, (3.0, 3.0), 1.0, 3.0)
 }
 
+/// What a fillet of radius `r` adds to a right-angled concave edge of
+/// `length`, or takes from a convex one: the corner region a rolling ball
+/// cannot reach, swept along the edge.
+fn fillet_corner(radius: f64, length: f64) -> f64 {
+    corner_area(radius) * length
+}
+
+/// The same for a chamfer: the right triangle of leg `d`.
+fn chamfer_corner(d: f64, length: f64) -> f64 {
+    0.5 * d * d * length
+}
+
+/// A point on the line through `(x, y)` along `z`.
+fn on_vertical(x: f64, y: f64) -> impl Fn(Point3) -> bool {
+    move |point| (point.x - x).abs() < 1.0e-6 && (point.y - y).abs() < 1.0e-6
+}
+
+// ---------------------------------------------------------------------------
+// F2: concave straight edges on a body no prism rung owns
+// ---------------------------------------------------------------------------
+
 #[test]
-fn the_drilled_l_block_still_has_its_reflex_edge() {
+fn a_reflex_edge_of_a_drilled_block_fillets_by_prism_arithmetic() {
     let body = drilled_l_block();
-    assert_close(body.measures().volume, 490.0 - PI * 3.0, "drilled L block");
-    let _ = vertical_edge(&body, 6.0, 4.0);
+    let before = body.measures().volume;
+    let r = 1.0;
+    let outcome = finish(
+        &body,
+        vec![vertical_edge(&body, 6.0, 4.0)],
+        EdgeFinishKind::Fillet,
+        r,
+    )
+    .expect("the reflex edge of a drilled block fillets");
+    assert_exact(&outcome, "edge-finish/concave-fill", "reflex edge fillet");
+    assert_close(
+        outcome.snapshot.measures().volume - before,
+        fillet_corner(r, 7.0),
+        "material a reflex edge fillet adds",
+    );
+    // The band meets each wall along a line the full height of the edge,
+    // tangentially.
+    assert_smooth_along(
+        &outcome.snapshot,
+        on_vertical(6.0, 4.0 + r),
+        "reflex fillet against the x = 6 wall",
+    );
+    assert_smooth_along(
+        &outcome.snapshot,
+        on_vertical(6.0 + r, 4.0),
+        "reflex fillet against the y = 4 wall",
+    );
+    // The hole is untouched.
+    assert_eq!(rim(&outcome.snapshot, 7.0, (3.0, 3.0), 1.0).len(), 2);
+}
+
+#[test]
+fn a_reflex_edge_of_a_drilled_block_chamfers_by_prism_arithmetic() {
+    let body = drilled_l_block();
+    let before = body.measures().volume;
+    let d = 1.5;
+    let outcome = finish(
+        &body,
+        vec![vertical_edge(&body, 6.0, 4.0)],
+        EdgeFinishKind::Chamfer,
+        d,
+    )
+    .expect("the reflex edge of a drilled block chamfers");
+    assert_exact(&outcome, "edge-finish/concave-fill", "reflex edge chamfer");
+    assert_close(
+        outcome.snapshot.measures().volume - before,
+        chamfer_corner(d, 7.0),
+        "material a reflex edge chamfer adds",
+    );
+    // A bevel's two edges are creases, not rails.
+    let scene = NativeKernel::debug_scene(&outcome.snapshot);
+    let creases = scene
+        .edges
+        .iter()
+        .filter(|edge| {
+            let keep = on_vertical(6.0, 4.0 + d);
+            keep(edge.endpoints[0]) && keep(edge.endpoints[1])
+        })
+        .count();
+    assert!(creases > 0, "the bevel meets the wall along an edge");
+    assert!(
+        scene.edges.iter().all(|edge| {
+            let keep = on_vertical(6.0, 4.0 + d);
+            !(keep(edge.endpoints[0]) && keep(edge.endpoints[1])) || !edge.is_tangent
+        }),
+        "a bevel's edge is not a tangent rail"
+    );
+}
+
+/// A U: a 30 × 5 base with 5-wide posts at each end up to `y = 20`, 10 tall,
+/// with a blind hole in one post so that no prism rung owns it.
+fn drilled_u_channel() -> Snapshot {
+    let channel = prism(
+        polygon(&[
+            (0.0, 0.0),
+            (30.0, 0.0),
+            (30.0, 20.0),
+            (25.0, 20.0),
+            (25.0, 5.0),
+            (5.0, 5.0),
+            (5.0, 20.0),
+            (0.0, 20.0),
+        ]),
+        Vec::new(),
+        10.0,
+        "u-channel",
+    );
+    assert_close(
+        channel.measures().volume,
+        (30.0 * 5.0 + 2.0 * 5.0 * 15.0) * 10.0,
+        "U channel",
+    );
+    drill(&channel, 10.0, (2.5, 12.0), 1.0, 3.0)
+}
+
+#[test]
+fn a_drilled_u_channel_fills_both_inner_edges() {
+    let body = drilled_u_channel();
+    let before = body.measures().volume;
+    let inner = vec![vertical_edge(&body, 5.0, 5.0), vertical_edge(&body, 25.0, 5.0)];
+    let r = 2.0;
+    let rounded = finish(&body, inner.clone(), EdgeFinishKind::Fillet, r)
+        .expect("both inner edges of a drilled channel fillet");
+    assert_exact(&rounded, "edge-finish/concave-fill", "U channel fillets");
+    assert_close(
+        rounded.snapshot.measures().volume - before,
+        2.0 * fillet_corner(r, 10.0),
+        "material two inner fillets add",
+    );
+    for x in [5.0 + r, 25.0 - r] {
+        assert_smooth_along(&rounded.snapshot, on_vertical(x, 5.0), "U fillet against the base");
+    }
+    for x in [5.0, 25.0] {
+        assert_smooth_along(
+            &rounded.snapshot,
+            on_vertical(x, 5.0 + r),
+            "U fillet against a post",
+        );
+    }
+    let bevelled = finish(&body, inner, EdgeFinishKind::Chamfer, r)
+        .expect("both inner edges of a drilled channel chamfer");
+    assert_exact(&bevelled, "edge-finish/concave-fill", "U channel chamfers");
+    assert_close(
+        bevelled.snapshot.measures().volume - before,
+        2.0 * chamfer_corner(r, 10.0),
+        "material two inner chamfers add",
+    );
+}
+
+/// The reflex edge at twenty-two sizes, both kinds.
+#[test]
+fn a_concave_edge_fills_at_every_size() {
+    let body = drilled_l_block();
+    let before = body.measures().volume;
+    let mut trouble = Vec::new();
+    for step in 1..=22 {
+        let size = f64::from(step) * 0.15;
+        for kind in [EdgeFinishKind::Fillet, EdgeFinishKind::Chamfer] {
+            let want = match kind {
+                EdgeFinishKind::Fillet => fillet_corner(size, 7.0),
+                EdgeFinishKind::Chamfer => chamfer_corner(size, 7.0),
+            };
+            match finish(&body, vec![vertical_edge(&body, 6.0, 4.0)], kind, size) {
+                Ok(outcome) => {
+                    let got = outcome.snapshot.measures().volume - before;
+                    if ((got - want) / want).abs() > 1.0e-9 {
+                        trouble.push(format!("{kind:?} {size:.2}: added {got}, wanted {want}"));
+                    }
+                    if !outcome.report.warnings.is_empty() {
+                        trouble.push(format!("{kind:?} {size:.2}: {:?}", outcome.report.warnings));
+                    }
+                }
+                Err(error) => trouble.push(format!("{kind:?} {size:.2}: {error}")),
+            }
+        }
+    }
+    assert!(
+        trouble.is_empty(),
+        "{} of 44 concave edge finishes refused or drifted:\n{}",
+        trouble.len(),
+        trouble.join("\n")
+    );
+}
+
+#[test]
+fn a_concave_edge_finish_that_does_not_fit_is_refused_by_name() {
+    let body = drilled_l_block();
+    // The face at y = 4 is 4 wide: a band set back 4.5 along it runs off the
+    // body, and the fill would add more than its own corner.
+    for kind in [EdgeFinishKind::Fillet, EdgeFinishKind::Chamfer] {
+        assert_refused(
+            finish(&body, vec![vertical_edge(&body, 6.0, 4.0)], kind, 4.5),
+            "CONCAVE_EDGE_DISTANCE_INVALID",
+            &format!("a {kind:?} wider than the face beside the edge"),
+        );
+    }
+    // An edge that ends against a leaning face: the block's top cut to a
+    // slope, so the reflex edge's upper end is no longer square.
+    let slope = build(
+        &NativeKernel::empty(),
+        KernelCommand::ExtrudePlanarProfile {
+            // A frame in the plane y = −1 with u along z and v along x, so
+            // the prism runs toward +y; the profile is the region above the
+            // line z = 4 + 0.3·x.
+            frame: PlanarFrame3::new(
+                Point3::new(0.0, -1.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                Vector3::new(1.0, 0.0, 0.0),
+            ),
+            profile: PlanarProfile2 {
+                regions: vec![PlanarRegion2 {
+                    outer: polygon(&[(3.7, -1.0), (7.3, 11.0), (9.0, 11.0), (9.0, -1.0)]),
+                    holes: vec![],
+                }],
+            },
+            distance: 11.0,
+        },
+        "slope cutter",
+    );
+    let sloped = subtract(&body, &slope, "sloped L block");
+    assert_refused(
+        finish(
+            &sloped,
+            vec![vertical_edge(&sloped, 6.0, 4.0)],
+            EdgeFinishKind::Fillet,
+            1.0,
+        ),
+        "CONCAVE_EDGE_END_UNSUPPORTED",
+        "a reflex edge ending against a leaning face",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F3: mixed selections
+// ---------------------------------------------------------------------------
+
+/// What two bands standing apart share at a right-angled corner, so the
+/// second removes that much less (ADR 0044): `r³(5/3 − π/2)` for fillets,
+/// `d³/3` for bevels.
+fn pair_overlap(kind: EdgeFinishKind, size: f64) -> f64 {
+    match kind {
+        EdgeFinishKind::Fillet => size.powi(3) * (5.0 / 3.0 - PI / 2.0),
+        EdgeFinishKind::Chamfer => size.powi(3) / 3.0,
+    }
+}
+
+#[test]
+fn the_l_block_finishes_its_concave_and_convex_edges_in_one_call() {
+    let body = drilled_l_block();
+    let before = body.measures().volume;
+    let top = edges_at(&body, 7.0, |_| true)
+        .into_iter()
+        .filter(|edge| {
+            // The top rim's straight edges, not the hole's arcs.
+            NativeKernel::describe_edge(&body, *edge)
+                .is_ok_and(|description| description.geometry.curve_kind() == "line")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(top.len(), 6, "the six straight edges of the top face");
+    for (kind, size) in [(EdgeFinishKind::Fillet, 1.0), (EdgeFinishKind::Chamfer, 0.8)] {
+        let mut targets = vec![vertical_edge(&body, 6.0, 4.0)];
+        targets.extend(top.iter().copied());
+        let outcome = finish(&body, targets, kind, size)
+            .unwrap_or_else(|error| panic!("the L block {kind:?}s all seven edges: {error}"));
+        assert_exact(&outcome, "edge-finish/concave-fill", "mixed L block");
+        let corner = |length: f64| match kind {
+            EdgeFinishKind::Fillet => fillet_corner(size, length),
+            EdgeFinishKind::Chamfer => chamfer_corner(size, length),
+        };
+        // The reflex edge is filled its full height. The two top edges that
+        // meet it are cut back to where its band begins, a size in from the
+        // corner, and run out at their far ends. The other four are cut
+        // standing apart, so each of the five convex corners of the top rim
+        // is a notch two bands share.
+        let expected = before + corner(7.0)
+            - corner(5.0 - size)
+            - corner(4.0 - size)
+            - corner(10.0 + 4.0 + 6.0 + 9.0)
+            + 5.0 * pair_overlap(kind, size);
+        assert_close(
+            outcome.snapshot.measures().volume,
+            expected,
+            &format!("the L block with every top edge and its reflex edge {kind:?}ed"),
+        );
+    }
+}
+
+#[test]
+fn a_cube_with_all_twelve_edges_filleted_builds() {
+    let side = 10.0;
+    let r = 1.5;
+    let cube = cuboid((0.0, 0.0, 0.0), (side, side, side), "cube");
+    let all = NativeKernel::edges(&cube);
+    assert_eq!(all.len(), 12);
+    let outcome = finish(&cube, all, EdgeFinishKind::Fillet, r).expect("all twelve edges round");
+    assert_valid(&outcome.snapshot);
+    assert!(outcome.report.warnings.is_empty(), "{:?}", outcome.report.warnings);
+    // Minkowski: the inner cube, six slabs, twelve quarter rods, eight
+    // sphere octants.
+    let inner = side - 2.0 * r;
+    assert_close(
+        outcome.snapshot.measures().volume,
+        inner.powi(3) + 6.0 * inner * inner * r + 3.0 * inner * PI * r * r + 4.0 / 3.0 * PI * r.powi(3),
+        "a cube rounded on every edge",
+    );
 }

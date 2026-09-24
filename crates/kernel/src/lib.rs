@@ -9,6 +9,7 @@ pub mod api;
 pub mod brep;
 mod bspline;
 mod coaxial_boolean;
+mod concave_edge_fill;
 mod concave_rim_blend;
 mod corner_blend;
 mod cuboid;
@@ -4930,6 +4931,42 @@ fn regularized_edge_finish(
             hole_rim_blend::HoleRimBlendError::TargetInvalid
             | hole_rim_blend::HoleRimBlendError::DomainUnsupported,
         ) => {}
+    }
+
+    // Concave straight edges between flat faces on a body no prism rung owns
+    // (ADR 0056, F2 and F3): each filled by unioning its own corner region
+    // into the body, then any convex edges of the same selection finished on
+    // the filled body — bounded against the fill where they meet it, and by
+    // the rungs below everywhere else. This route owns every selection with
+    // a concave edge in it: nothing below adds material, so a refusal here
+    // is the answer.
+    let (concave, rest) = concave_edge_fill::partition(&input.topology, targets, precision);
+    if !concave.is_empty() {
+        let mut ladder = |body: &Snapshot, remaining: &[EntityRef]| {
+            regularized_edge_finish(body, remaining, kind, distance, precision, warnings)
+        };
+        return concave_edge_fill::finish_with_fills(
+            input,
+            &concave,
+            &rest,
+            kind,
+            distance,
+            precision,
+            &mut ladder,
+        )
+        .map_err(|refusal| {
+            error(
+                KernelErrorCode::InvalidInput,
+                KernelStage::Preflight,
+                input.id,
+                refusal.message.clone(),
+                vec![simple_diagnostic(
+                    refusal.code,
+                    KernelStage::Preflight,
+                    &refusal.message,
+                )],
+            )
+        });
     }
 
     // The last exact rung: convex edges between planar faces, with a sphere or

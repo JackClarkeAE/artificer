@@ -84,6 +84,8 @@ are stable, slash-separated paths:
 | `face-feature/faceted` | A cut the exact rungs could not own, built on the faceted tier; also every add or cut whose profile has a spline, whose B-spline walls the exact engines do not carry (ADR 0050). |
 | `drill/exact-prism`, `rib/exact-prism`, `push-pull/planar` | The kernel's own drill, rib and push/pull. |
 | `edge-finish/analytic`, `edge-finish/prism`, `edge-finish/rim-blend`, `edge-finish/rim-loop-blend`, `edge-finish/logical-successor` | Exact fillets and chamfers, by the rung that carried them. |
+| `edge-finish/concave-rim-blend` | A fillet or chamfer along a concave rim — a boss on its plate, a counterbore's or pocket's floor rim (ADR 0056, F2): a torus or cone band built in place on the air side of the corner, with its material added. Exact, by Pappus. |
+| `edge-finish/concave-fill` | A concave straight edge between flat faces on a body no prism rung owns, filled by unioning its own corner region into the body (ADR 0056, F2); the material added is certified against the closed form. Convex edges in the same selection are finished on the filled body afterwards, bounded against the fill where they meet it (F3). Exact. |
 | `edge-finish/faceted` | A fillet or chamfer on the faceted tier. |
 | `boolean/prism`, `boolean/analytic` | A union, difference or intersection by the prism reduction or the general engine. |
 | `mirror/exact` | A mirror: every carrier reflected as itself, faces reversed to face outward. |

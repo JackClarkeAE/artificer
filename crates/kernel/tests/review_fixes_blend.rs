@@ -307,13 +307,24 @@ fn a_reflex_edge_is_never_finished_by_cutting_material_away() {
     // anything. The standing-apart cut only ever removes, and it used to
     // answer, taking 64.5 out of the body where the fillet adds 1.5. The
     // faceted tier only ever removes too, and published the body all but
-    // unchanged as the fillet. No route here adds the corner, so the finish
-    // is refused by name.
-    for kind in [EdgeFinishKind::Fillet, EdgeFinishKind::Chamfer] {
-        assert_refused(
-            finish(&body, vec![edge], kind, 1.0, false),
-            "EDGE_FINISH_REFLEX_UNSUPPORTED",
-            &format!("a {kind:?} of a reflex edge"),
+    // unchanged as the fillet. The ladder now fills the corner (ADR 0056,
+    // F2), and the answer is the corner region added, not anything taken.
+    let before = body.measures().volume;
+    for (kind, added) in [
+        (EdgeFinishKind::Fillet, fillet_corner(1.0, 7.0)),
+        (EdgeFinishKind::Chamfer, 0.5 * 7.0),
+    ] {
+        let outcome = finish(&body, vec![edge], kind, 1.0, false)
+            .unwrap_or_else(|error| panic!("a {kind:?} of a reflex edge fills: {error}"));
+        assert_eq!(
+            outcome.report.rung.as_deref(),
+            Some("edge-finish/concave-fill")
+        );
+        assert_valid(&outcome.snapshot);
+        assert_close(
+            outcome.snapshot.measures().volume - before,
+            added,
+            &format!("material a {kind:?} of a reflex edge adds"),
         );
     }
     // Asked for by name, the standing-apart route refuses the edge rather
