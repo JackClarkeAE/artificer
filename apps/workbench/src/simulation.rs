@@ -33,10 +33,24 @@ use egui::RichText;
 
 use crate::{KernelLabApp, theme, viewport};
 
+mod motion;
+mod thermal;
+mod topology;
+
+pub use motion::{MeasuredTimeline, MotionState, MotionSummary};
+pub use thermal::{ThermalOutcome, ThermalSetup, ThermalState, ThermalSummary};
+pub use topology::{
+    TopologyLive, TopologyOutcome, TopologySetup, TopologyState, TopologySummary, density_surface,
+};
+
 /// Which study the card is showing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StudyKind {
     Structural,
+    Thermal,
+    /// Experimental.
+    Topology,
+    Motion,
 }
 
 /// The direction a face force acts along, as the card offers it.
@@ -211,10 +225,34 @@ struct RunningSolve {
     resolution: Resolution,
 }
 
+/// What one picture was built from, so it is rebuilt only when that
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DisplayKey {
+    Structural {
+        body: BodyId,
+        snapshot: SnapshotId,
+        exaggeration_bits: u64,
+        show_field: bool,
+    },
+    Thermal {
+        body: BodyId,
+        snapshot: SnapshotId,
+        show_field: bool,
+    },
+    Topology {
+        body: BodyId,
+        iteration: usize,
+        voxels: usize,
+        threshold_bits: u64,
+    },
+}
+
 /// What the viewport is handed: the scene to draw for the studied body and
 /// the colours over it.
 #[derive(Clone, Debug)]
 pub struct SimulationDisplay {
+    pub key: DisplayKey,
     pub body: BodyId,
     pub scene: DebugScene,
     pub field: Vec<f32>,
@@ -239,6 +277,9 @@ pub struct SimulationState {
     /// How many times the drawn deformation is exaggerated; zero draws the
     /// part as modelled.
     pub exaggeration: f64,
+    pub thermal: ThermalState,
+    pub topology: TopologyState,
+    pub motion: MotionState,
     display: Option<SimulationDisplay>,
     epoch: u64,
     /// The last refusal or completion, for the card and the tests.
@@ -252,9 +293,13 @@ impl SimulationState {
         self.open.is_some()
     }
 
+    /// Whether any study is solving right now.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running.is_some()
+            || self.thermal.running.is_some()
+            || self.topology.running.is_some()
+            || self.motion.running.is_some()
     }
 
     /// Lifts the display out for the duration of a frame's drawing, the way
@@ -269,97 +314,184 @@ impl SimulationState {
         }
     }
 
-    /// Forgets the study and its picture.
+    /// Forgets every study and its picture.
     pub fn dismiss(&mut self) {
         if let Some(running) = self.running.take() {
             running.cancellation.cancel();
         }
+        self.thermal.cancel();
+        self.topology.cancel();
+        self.motion.cancel();
         self.open = None;
         self.outcome = None;
         self.previous = None;
+        self.thermal.outcome = None;
+        self.topology.outcome = None;
+        self.topology.live = None;
+        self.motion.timeline = None;
         self.display = None;
         self.message = None;
     }
 
-    /// Whether the picture drawn for this body differs from the body as
-    /// modelled: a stress field, a deformation, or both.
-    fn display_key(&self) -> Option<(BodyId, SnapshotId, u64, bool)> {
-        let outcome = self.outcome.as_ref()?;
-        Some((
-            outcome.body,
-            outcome.snapshot,
-            self.exaggeration.to_bits(),
-            self.show_stress,
-        ))
+    /// What the open study wants drawn over its body, or `None` for the
+    /// body as modelled.
+    fn display_key(&self) -> Option<DisplayKey> {
+        match self.open? {
+            StudyKind::Structural => {
+                let outcome = self.outcome.as_ref()?;
+                Some(DisplayKey::Structural {
+                    body: outcome.body,
+                    snapshot: outcome.snapshot,
+                    exaggeration_bits: self.exaggeration.to_bits(),
+                    show_field: self.show_stress,
+                })
+            }
+            StudyKind::Thermal => {
+                let outcome = self.thermal.outcome.as_ref()?;
+                Some(DisplayKey::Thermal {
+                    body: outcome.body,
+                    snapshot: outcome.snapshot,
+                    show_field: self.thermal.show_temperature,
+                })
+            }
+            StudyKind::Topology => {
+                let live = self.topology.live.as_ref()?;
+                Some(DisplayKey::Topology {
+                    body: self.topology.body?,
+                    iteration: live.iteration,
+                    voxels: live.densities.len(),
+                    threshold_bits: self.topology.setup.threshold.to_bits(),
+                })
+            }
+            StudyKind::Motion => None,
+        }
     }
 
-    /// Rebuilds the drawn scene when the result, the exaggeration or the
-    /// stress toggle changed.
+    /// Rebuilds the drawn scene when what it is built from changed.
     fn refresh_display(&mut self, scenes: impl Fn(BodyId) -> Option<DebugScene>) {
         let Some(key) = self.display_key() else {
             self.display = None;
             return;
         };
-        let current = self.display.as_ref().map(|display| {
-            (
-                display.body,
-                display.scene.semantic_digest,
-                display.exaggeration.to_bits(),
-                display.show_field,
-            )
-        });
-        let outcome = self.outcome.as_ref().expect("a key implies an outcome");
-        if let Some((body, digest, exaggeration, show)) = current
-            && body == key.0
-            && digest == display_digest(outcome, self.epoch)
-            && exaggeration == key.2
-            && show == key.3
+        if self
+            .display
+            .as_ref()
+            .is_some_and(|display| display.key == key)
         {
             return;
         }
-        let Some(mut scene) = scenes(outcome.body) else {
-            self.display = None;
-            return;
-        };
         self.epoch += 1;
         let epoch = self.epoch;
-        if self.exaggeration > 0.0 {
-            displace_scene(&mut scene, outcome, self.exaggeration);
-        }
-        // The GPU cache keys on the scene's snapshot id and the field's
-        // epoch; a fresh id per rebuild is what makes it re-upload.
-        scene.snapshot = SnapshotId::new(display_id_bytes(outcome, epoch));
-        scene.semantic_digest = display_digest(outcome, epoch);
-        let peak = outcome.result.peak_node_von_mises.max(1.0e-6) as f32;
-        let palette = viewport::HeatPalette::Gradient {
-            near: 0.0,
-            far: peak,
+        self.display = match key {
+            DisplayKey::Structural { body, .. } => {
+                let outcome = self.outcome.as_ref().expect("the key names an outcome");
+                let Some(mut scene) = scenes(body) else {
+                    self.display = None;
+                    return;
+                };
+                if self.exaggeration > 0.0 {
+                    displace_scene(&mut scene, outcome, self.exaggeration);
+                }
+                // The GPU cache keys on the scene's snapshot id and the
+                // field's epoch; a fresh id per rebuild is what makes it
+                // re-upload.
+                scene.snapshot = SnapshotId::new(display_id_bytes(outcome.snapshot, epoch));
+                scene.semantic_digest = display_digest(outcome.snapshot, epoch);
+                let peak = outcome.result.peak_node_von_mises.max(1.0e-6) as f32;
+                let palette = viewport::HeatPalette::Gradient {
+                    near: 0.0,
+                    far: peak,
+                };
+                // The palette paints `near` red and `far` blue; stress is
+                // stored as its distance below the peak so the peak reads
+                // red.
+                let field = outcome
+                    .vertex_stress
+                    .iter()
+                    .map(|stress| (peak - stress).max(0.0))
+                    .collect::<Vec<_>>();
+                Some(SimulationDisplay {
+                    key,
+                    body,
+                    scene,
+                    field,
+                    palette,
+                    legend: scale_legend(palette, peak, 0.0, "MPa"),
+                    epoch,
+                    show_field: self.show_stress,
+                    exaggeration: self.exaggeration,
+                })
+            }
+            DisplayKey::Thermal { body, .. } => {
+                let outcome = self
+                    .thermal
+                    .outcome
+                    .as_ref()
+                    .expect("the key names an outcome");
+                let Some(mut scene) = scenes(body) else {
+                    self.display = None;
+                    return;
+                };
+                scene.snapshot = SnapshotId::new(display_id_bytes(outcome.snapshot, epoch));
+                scene.semantic_digest = display_digest(outcome.snapshot, epoch);
+                let (low, high) = (outcome.result.min as f32, outcome.result.max as f32);
+                let span = (high - low).max(1.0e-6);
+                let palette = viewport::HeatPalette::Gradient {
+                    near: 0.0,
+                    far: span,
+                };
+                // Hottest reads red: the field is the distance below the
+                // maximum.
+                let field = outcome
+                    .vertex_temperature
+                    .iter()
+                    .map(|temperature| (high - temperature).max(0.0))
+                    .collect::<Vec<_>>();
+                Some(SimulationDisplay {
+                    key,
+                    body,
+                    scene,
+                    field,
+                    palette,
+                    legend: scale_legend(palette, high, low, "°C"),
+                    epoch,
+                    show_field: self.thermal.show_temperature,
+                    exaggeration: 0.0,
+                })
+            }
+            DisplayKey::Topology { body, .. } => {
+                let live = self.topology.live.as_ref().expect("the key names a field");
+                let snapshot = self.topology.snapshot.unwrap_or(SnapshotId::ZERO);
+                let scene = density_surface(
+                    &live.mesh,
+                    &live.densities,
+                    self.topology.setup.threshold as f32,
+                    snapshot,
+                    epoch,
+                );
+                Some(SimulationDisplay {
+                    key,
+                    body,
+                    scene,
+                    field: Vec::new(),
+                    palette: viewport::HeatPalette::Gradient {
+                        near: 0.0,
+                        far: 1.0,
+                    },
+                    legend: Vec::new(),
+                    epoch,
+                    show_field: false,
+                    exaggeration: 0.0,
+                })
+            }
         };
-        // The palette paints `near` red and `far` blue; stress is stored
-        // as its distance below the peak so the peak reads red.
-        let field = outcome
-            .vertex_stress
-            .iter()
-            .map(|stress| (peak - stress).max(0.0))
-            .collect::<Vec<_>>();
-        let legend = stress_legend(palette, peak);
-        self.display = Some(SimulationDisplay {
-            body: outcome.body,
-            scene,
-            field,
-            palette,
-            legend,
-            epoch,
-            show_field: self.show_stress,
-            exaggeration: self.exaggeration,
-        });
     }
 }
 
 /// A snapshot id that is unique to one rebuild of the picture.
-fn display_id_bytes(outcome: &StructuralOutcome, epoch: u64) -> [u8; 16] {
+fn display_id_bytes(snapshot: SnapshotId, epoch: u64) -> [u8; 16] {
     let mut sixteen = [0_u8; 16];
-    for (index, byte) in outcome.snapshot.as_bytes().iter().enumerate().take(16) {
+    for (index, byte) in snapshot.as_bytes().iter().enumerate().take(16) {
         sixteen[index] = *byte;
     }
     for (index, byte) in epoch.to_le_bytes().iter().enumerate() {
@@ -369,31 +501,34 @@ fn display_id_bytes(outcome: &StructuralOutcome, epoch: u64) -> [u8; 16] {
     sixteen
 }
 
-fn display_digest(outcome: &StructuralOutcome, epoch: u64) -> artificer_protocol::SemanticDigest {
+fn display_digest(snapshot: SnapshotId, epoch: u64) -> artificer_protocol::SemanticDigest {
     let mut bytes = [0_u8; 32];
-    for (index, byte) in outcome.snapshot.as_bytes().iter().enumerate().take(16) {
+    for (index, byte) in snapshot.as_bytes().iter().enumerate().take(16) {
         bytes[index] = *byte;
     }
     bytes[16..24].copy_from_slice(&epoch.to_le_bytes());
-    bytes[24..32].copy_from_slice(&outcome.result.max_deflection.to_bits().to_le_bytes());
     artificer_protocol::SemanticDigest::new(bytes)
 }
 
-/// The legend printed beside a stress picture: the peak in red down to
-/// nothing in blue.
-fn stress_legend(palette: viewport::HeatPalette, peak: f32) -> Vec<viewport::HeatBand> {
-    let band = |value: f32, label: String| viewport::HeatBand {
-        color: palette.color(value).unwrap_or(egui::Color32::GRAY),
-        label,
+/// The legend printed beside a picture painted from `high` in red down to
+/// `low` in blue, in a unit.
+fn scale_legend(
+    palette: viewport::HeatPalette,
+    high: f32,
+    low: f32,
+    unit: &str,
+) -> Vec<viewport::HeatBand> {
+    let span = high - low;
+    let band = |fraction: f32| viewport::HeatBand {
+        color: palette
+            .color(span * fraction)
+            .unwrap_or(egui::Color32::GRAY),
+        label: format!("{} {unit}", figure(high - span * fraction)),
     };
-    vec![
-        band(0.0, format!("{} MPa", megapascals(peak))),
-        band(peak * 0.5, format!("{} MPa", megapascals(peak * 0.5))),
-        band(peak, "0 MPa".to_owned()),
-    ]
+    vec![band(0.0), band(0.5), band(1.0)]
 }
 
-fn megapascals(value: f32) -> String {
+fn figure(value: f32) -> String {
     if value >= 100.0 {
         format!("{value:.0}")
     } else if value >= 1.0 {
@@ -707,7 +842,7 @@ impl KernelLabApp {
                 }
                 self.document_status = Some(format!(
                     "Structural study: max stress {} MPa, max deflection {}, safety factor {} · approximate on {} voxels",
-                    megapascals(outcome.result.max_von_mises as f32),
+                    figure(outcome.result.max_von_mises as f32),
                     self.length_unit().format(outcome.result.max_deflection),
                     factor(outcome.result.safety_factor),
                     outcome.voxel_count
@@ -784,6 +919,9 @@ impl KernelLabApp {
                 }
             }
         }
+        self.poll_thermal(context);
+        self.poll_topology(context);
+        self.poll_motion_timeline(context);
         let scenes = |body: BodyId| {
             self.bodies
                 .iter()
@@ -839,12 +977,19 @@ impl KernelLabApp {
     #[must_use]
     pub fn simulation_display_extent(&self) -> Option<(usize, f64)> {
         let display = self.simulation.display.as_ref()?;
-        let outcome = self.simulation.outcome.as_ref()?;
-        let moved = outcome
-            .vertex_displacement
-            .iter()
-            .map(|[x, y, z]| display.exaggeration * f64::from(x.hypot(*y).hypot(*z)))
-            .fold(0.0, f64::max);
+        // Only a structural picture moves anything.
+        let moved = match display.key {
+            DisplayKey::Structural { .. } => {
+                self.simulation.outcome.as_ref().map_or(0.0, |outcome| {
+                    outcome
+                        .vertex_displacement
+                        .iter()
+                        .map(|[x, y, z]| display.exaggeration * f64::from(x.hypot(*y).hypot(*z)))
+                        .fold(0.0, f64::max)
+                })
+            }
+            DisplayKey::Thermal { .. } | DisplayKey::Topology { .. } => 0.0,
+        };
         Some((
             if display.show_field {
                 display.field.len()
@@ -853,6 +998,56 @@ impl KernelLabApp {
             },
             moved,
         ))
+    }
+
+    /// How many triangles the studied body is drawn with: its own facets
+    /// under a field, or the voxel skin of a density field. `None` when it
+    /// is drawn as modelled.
+    #[must_use]
+    pub fn simulation_display_triangles(&self) -> Option<usize> {
+        self.simulation
+            .display
+            .as_ref()
+            .map(|display| display.scene.triangles.len())
+    }
+
+    /// Whether the motion is playing.
+    #[must_use]
+    pub const fn motion_is_playing(&self) -> bool {
+        self.motion.playing
+    }
+
+    /// Where the joints have put every component: the solved pose, which
+    /// is what the viewport draws, rather than the assembled pose the
+    /// document stores.
+    #[must_use]
+    pub fn posed_component_poses(&self) -> Vec<(u64, [f64; 3], [f64; 4])> {
+        self.document
+            .component_instances()
+            .iter()
+            .map(|component| {
+                let pose = self.kinematics.pose(component.id).unwrap_or(component.pose);
+                (
+                    component.id.get(),
+                    [
+                        pose.translation.x(),
+                        pose.translation.y(),
+                        pose.translation.z(),
+                    ],
+                    [
+                        pose.rotation.w(),
+                        pose.rotation.x(),
+                        pose.rotation.y(),
+                        pose.rotation.z(),
+                    ],
+                )
+            })
+            .collect()
+    }
+
+    /// Whether the thermal study lets the unheld skin lose heat to the air.
+    pub const fn set_thermal_convection(&mut self, convection: bool) {
+        self.simulation.thermal.setup.convection = convection;
     }
 
     /// Sets the drawn exaggeration, as the slider does.
@@ -889,11 +1084,26 @@ impl KernelLabApp {
         ))
     }
 
-    /// The structural study card.
+    /// The card, whichever study is open.
     pub(crate) fn simulation_card(&mut self, ui: &mut egui::Ui) {
-        let Some(StudyKind::Structural) = self.simulation.open else {
-            return;
-        };
+        match self.simulation.open {
+            Some(StudyKind::Structural) => self.structural_card(ui),
+            Some(StudyKind::Thermal) => self.thermal_card(ui),
+            Some(StudyKind::Topology) => self.topology_card(ui),
+            Some(StudyKind::Motion) => self.motion_card(ui),
+            None => {}
+        }
+    }
+
+    /// The bodies the open study flags on the part: the pair that may share
+    /// space at the motion timeline's current frame.
+    #[must_use]
+    pub fn simulation_flagged_bodies(&self) -> Vec<BodyId> {
+        self.motion_flagged_bodies()
+    }
+
+    /// The structural study card.
+    fn structural_card(&mut self, ui: &mut egui::Ui) {
         let body_label = self
             .simulation
             .structural
@@ -1146,7 +1356,7 @@ impl KernelLabApp {
             theme::property_row(
                 ui,
                 "Max stress",
-                &format!("{} MPa", megapascals(result.max_von_mises as f32)),
+                &format!("{} MPa", figure(result.max_von_mises as f32)),
             )
             .on_hover_text(
                 "Von Mises at the most worked element's centre. The node peak, half a cell nearer the surface, is what the colours show.",
@@ -1154,7 +1364,7 @@ impl KernelLabApp {
             theme::property_row(
                 ui,
                 "Surface peak",
-                &format!("{} MPa", megapascals(result.peak_node_von_mises as f32)),
+                &format!("{} MPa", figure(result.peak_node_von_mises as f32)),
             );
             theme::property_row(ui, "Max deflection", &unit.format(result.max_deflection));
             theme::property_row(

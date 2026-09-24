@@ -1,6 +1,20 @@
 # ADR 0058: A simulation tab — motion, voxel structural analysis, and experiments
 
-Status: proposed
+Status: implemented (M1–M4) in `crates/sim`, `crates/kernel/src/sim_queries.rs`
+and `apps/workbench/src/simulation.rs`, with these deviations. Resolutions
+are 24, 40 and 64 cells along the longest side rather than 30³ to 100³
+over the box: the solver is single-threaded by design and a million-voxel
+solve is minutes, not seconds. A fixed face holds the nodes on the exposed
+sides of its surface voxels, not every node of those voxels, so a clamp
+does not shorten the part by a cell. Stress is per element at its centre,
+and the picture is painted from node stresses extrapolated to the corners,
+which read nearer the surface. The motion timeline measures every frame,
+including those past the first collision, and marks them, where the
+kernel's sweep stops; it does not stop. Topology optimisation carries the
+structural study's supports and loads rather than picking its own, and
+draws the filtered densities as a thresholded voxel skin. The parity
+pixel snapshots of stress and deformation are not recorded: the headless
+tests check what is drawn by counting facets and displacements instead.
 Date: 2026-09-24
 Extends: [0028](0028-workbench-command-registry-and-contextual-properties.md), the assembly and kinematics
 work (`crates/model/src/kinematics.rs`, `api/analysis.rs`,

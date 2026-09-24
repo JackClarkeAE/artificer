@@ -66,7 +66,7 @@ fi
 # simulation crate off the UI thread; it never executes the kernel and never
 # writes to the document.
 mutation_pattern='NativeKernel::execute\(|execute_case\(|execute_sketch_extrusion\(|execute_face_push_pull\(|execute_library_insertion\(|apply_transform_preview\(|apply_component_placement_preview\(|apply_component_grounding\(|apply_revolute_joint\(|set_component_pose\(|set_component_grounded\(|add_joint\('
-for module in apps/workbench/src/material.rs apps/workbench/src/ribbon.rs apps/workbench/src/simulation.rs; do
+for module in apps/workbench/src/material.rs apps/workbench/src/ribbon.rs apps/workbench/src/simulation.rs apps/workbench/src/simulation/*.rs; do
     if rg "$mutation_pattern" "$module"; then
         printf 'error: a kernel-execution or document-mutation site entered the %s presentation module\n' "$module" >&2
         exit 1

@@ -1326,13 +1326,9 @@ impl KernelLabApp {
                 self.stage_new_variable(QuantityKind::Scalar);
             }
             ModelCommand::StructuralStudy => self.open_structural_study(),
-            ModelCommand::ThermalStudy
-            | ModelCommand::TopologyStudy
-            | ModelCommand::MotionTimeline => {
-                self.document_status = Some(
-                    "This study is not in the workbench yet; the structural study is".to_owned(),
-                );
-            }
+            ModelCommand::ThermalStudy => self.open_thermal_study(),
+            ModelCommand::TopologyStudy => self.open_topology_study(),
+            ModelCommand::MotionTimeline => self.open_motion_timeline(),
         }
     }
 }

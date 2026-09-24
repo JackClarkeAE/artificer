@@ -131,6 +131,9 @@ static DOCUMENT_SAVE_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Shades a body that is currently picked as a Boolean tool. It is deliberately
 /// unlike any material colour so a tinted body cannot be mistaken for a pick.
 const BOOLEAN_TOOL_TINT: egui::Color32 = egui::Color32::from_rgb(222, 104, 30);
+/// Shades a body the motion timeline flags as sharing space with another at
+/// the frame the mechanism is posed at: the red of a collision, on the part.
+const SIMULATION_FLAG_TINT: egui::Color32 = egui::Color32::from_rgb(214, 48, 60);
 const ARTIFICER_WORKSPACE_FORMAT: &str = "artificer.workspace";
 const ARTIFICER_WORKSPACE_VERSION: u32 = 1;
 
@@ -22285,6 +22288,9 @@ impl KernelLabApp {
         // The simulation's picture of the studied body is lifted out the
         // same way: a deformed copy of its scene and the stress over it.
         let simulation_display = self.simulation.take_display();
+        // The pair the motion timeline says share space at this frame is
+        // flagged on the parts themselves.
+        let flagged_bodies = self.simulation_flagged_bodies();
         let drives_joints = self.animation_drives_joints();
 
         let frame_output = Frame::new()
@@ -22379,6 +22385,8 @@ impl KernelLabApp {
                                 // only in the ribbon readout.
                                 if self.boolean_tools.contains(&body.id) {
                                     Some(BOOLEAN_TOOL_TINT)
+                                } else if flagged_bodies.contains(&body.id) {
+                                    Some(SIMULATION_FLAG_TINT)
                                 } else {
                                     // A colour the user chose outranks the one
                                     // its material implies.
