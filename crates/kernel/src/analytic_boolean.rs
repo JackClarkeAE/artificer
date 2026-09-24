@@ -28,6 +28,7 @@ use crate::profile_boolean::{
     ProfileBooleanError, ProfileRegion, chain_welded_segments, chord_region_pieces,
     profile_boolean_multi, split_at_mutual_crossings, weld_aligned, welded,
 };
+use crate::revolved::Revolved;
 use crate::sew::{SewError, SewFace, ray_directions, ray_face_crossings, sew_shells};
 use crate::surface_intersection::{IntersectionCurve, SurfaceIntersection, intersect};
 use crate::topology::{Cylinder, Face, Plane, Point2, Point3, Surface, Topology, Vector3};
@@ -479,11 +480,15 @@ fn face_extent(face: &Face, region: &[Vec<Segment>]) -> Option<FaceExtent> {
                 ));
             }
         }
-        Surface::Torus(_)
-        | Surface::Cone(_)
-        | Surface::Sphere(_)
-        | Surface::Ruled(_)
-        | Surface::Bspline(_) => {
+        // The whole drum, ball or ring over the face's `v` range: a box a
+        // little large still separates the faces it is asked about.
+        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => {
+            let revolved = Revolved::of(face.surface)?;
+            let (low_corner, high_corner) = crate::revolved::extent(revolved, low.y, high.y)?;
+            grow(low_corner);
+            grow(high_corner);
+        }
+        Surface::Ruled(_) | Surface::Bspline(_) => {
             return None;
         }
     }
@@ -573,9 +578,14 @@ fn coincident_overlays(
         // materials lie on the same side exactly when the outward normals
         // agree.
         let probe = match other_face.value.surface {
-            Surface::Plane(plane) => plane.evaluate(outer[0].start()),
-            Surface::Cylinder(cylinder) => cylinder.evaluate(outer[0].start()),
-            _ => return Err(AnalyticBooleanError::DomainUnsupported),
+            Surface::Plane(_)
+            | Surface::Cylinder(_)
+            | Surface::Cone(_)
+            | Surface::Sphere(_)
+            | Surface::Torus(_) => other_face.value.surface.evaluate(outer[0].start()),
+            Surface::Ruled(_) | Surface::Bspline(_) => {
+                return Err(AnalyticBooleanError::DomainUnsupported);
+            }
         };
         let (Some(own_normal), Some(other_normal)) = (
             face.surface.outward_normal_at(probe),
@@ -1618,6 +1628,11 @@ fn curve_chords(
             }
             (!pieces.is_empty()).then_some(pieces)
         }
+        // A cone, a sphere or a torus carries the matrix's rings and
+        // meridians as lines in its own parameter space (ADR 0056 B1).
+        (Surface::Cone(_) | Surface::Sphere(_) | Surface::Torus(_), curve) => {
+            crate::revolved::curve_chords(Revolved::of(*surface)?, curve, middle, reach)
+        }
         _ => None,
     }
 }
@@ -1651,7 +1666,7 @@ fn reparameterize_loop(
     window: Option<(f64, f64)>,
 ) -> Option<Vec<Segment>> {
     let tau = std::f64::consts::TAU;
-    let periodic = matches!(to, Surface::Cylinder(_));
+    let periodic = Revolved::of(*to).is_some();
     let mut mapped: Vec<Segment> = Vec::with_capacity(segments.len());
     for segment in segments {
         let mut piece = reparameterize(from, *segment, to)?;
@@ -1680,6 +1695,11 @@ fn reparameterize_loop(
 /// Re-expresses a chord piece from one face's parameter space into another's
 /// through world coordinates.
 fn reparameterize(from: &Surface, piece: Segment, to: &Surface) -> Option<Segment> {
+    if Revolved::is_general(*from) || Revolved::is_general(*to) {
+        // A cone, a sphere or a torus on either side: rings and meridians
+        // carried through the curve they are in space (ADR 0056 B1).
+        return crate::revolved::reparameterize(from, piece, to);
+    }
     let world = |point: Point2| -> Option<Point3> {
         match from {
             Surface::Plane(plane) => Some(plane.evaluate(point)),
@@ -2169,9 +2189,14 @@ fn face_sample_inside(
         return Err(AnalyticBooleanError::DomainUnsupported);
     };
     let sample = match face.surface {
-        Surface::Plane(plane) => plane.evaluate(sample_2d),
-        Surface::Cylinder(cylinder) => cylinder.evaluate(sample_2d),
-        _ => return Err(AnalyticBooleanError::DomainUnsupported),
+        Surface::Plane(_)
+        | Surface::Cylinder(_)
+        | Surface::Cone(_)
+        | Surface::Sphere(_)
+        | Surface::Torus(_) => face.surface.evaluate(sample_2d),
+        Surface::Ruled(_) | Surface::Bspline(_) => {
+            return Err(AnalyticBooleanError::DomainUnsupported);
+        }
     };
     point_in_solid(other, sample).ok_or(AnalyticBooleanError::DomainUnsupported)
 }
@@ -2214,7 +2239,16 @@ fn mirror_sew_face(piece: SewFace) -> Result<SewFace, AnalyticBooleanError> {
             }),
             |point: Point2| Point2::new(-point.x, point.y),
         ),
-        _ => return Err(AnalyticBooleanError::DomainUnsupported),
+        // The other carriers of revolution reverse as a cylinder does: the
+        // azimuth's sense turns round and nothing in space moves.
+        Surface::Cone(_) | Surface::Sphere(_) | Surface::Torus(_) => (
+            crate::revolved::reversed_surface(piece.surface)
+                .ok_or(AnalyticBooleanError::DomainUnsupported)?,
+            |point: Point2| Point2::new(-point.x, point.y),
+        ),
+        Surface::Ruled(_) | Surface::Bspline(_) => {
+            return Err(AnalyticBooleanError::DomainUnsupported);
+        }
     };
     let loops = piece
         .loops
@@ -2340,13 +2374,19 @@ fn mirror_segment(segment: Segment, mirror: fn(Point2) -> Point2) -> Segment {
     }
 }
 
-/// Guard: the engine only carries planes and cylinders today.
+/// Guard: the engine carries the analytic carriers — planes, cylinders,
+/// cones, spheres and tori (ADR 0056 B1) — and not ruled or B-spline walls.
 pub(crate) fn operands_in_engine_vocabulary(target: &Topology, tool: &Topology) -> bool {
-    target
-        .faces
-        .iter()
-        .chain(&tool.faces)
-        .all(|face| matches!(face.value.surface, Surface::Plane(_) | Surface::Cylinder(_)))
+    target.faces.iter().chain(&tool.faces).all(|face| {
+        matches!(
+            face.value.surface,
+            Surface::Plane(_)
+                | Surface::Cylinder(_)
+                | Surface::Cone(_)
+                | Surface::Sphere(_)
+                | Surface::Torus(_)
+        )
+    })
 }
 
 #[cfg(test)]

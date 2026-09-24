@@ -44,6 +44,7 @@ mod prism_edge_finish;
 mod profile_boolean;
 mod push_pull;
 mod revolve;
+mod revolved;
 mod rim_loop_blend;
 mod ruled;
 mod section_revolve;

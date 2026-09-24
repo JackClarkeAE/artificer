@@ -763,17 +763,22 @@ pub(crate) fn ray_face_crossings(
             }
             Some(crossings)
         }
-        Surface::Torus(_)
-        | Surface::Cone(_)
-        | Surface::Sphere(_)
-        | Surface::Ruled(_)
-        | Surface::Bspline(_) => None,
+        // A cone or a sphere is a quadric in the ray parameter, a torus a
+        // quartic; the hits land in the face's parameter space as a
+        // cylinder's do (ADR 0056 B1).
+        Surface::Torus(_) | Surface::Cone(_) | Surface::Sphere(_) => {
+            let revolved = crate::revolved::Revolved::of(face.surface)?;
+            crate::revolved::ray_face_crossings(revolved, point, direction, guard, &|local| {
+                interior_parity(&loops, local, guard)
+            })
+        }
+        Surface::Ruled(_) | Surface::Bspline(_) => None,
     }
 }
 
 /// Even-odd membership of a 2D point in a face's parameter loops, rejecting
 /// hits within `guard` of any boundary segment.
-fn interior_parity(loops: &[Vec<Segment>], point: Point2, guard: f64) -> Option<usize> {
+pub(crate) fn interior_parity(loops: &[Vec<Segment>], point: Point2, guard: f64) -> Option<usize> {
     for segments in loops {
         for segment in segments {
             if segment_distance(*segment, point) <= guard {
@@ -872,13 +877,12 @@ fn segment_midpoint(segment: Segment) -> Point2 {
 /// accepts.
 fn surface_point(surface: Surface, point: Point2) -> Option<Point3> {
     match surface {
-        Surface::Plane(plane) => Some(plane.evaluate(point)),
-        Surface::Cylinder(cylinder) => Some(cylinder.evaluate(point)),
-        Surface::Torus(_)
+        Surface::Plane(_)
+        | Surface::Cylinder(_)
+        | Surface::Torus(_)
         | Surface::Cone(_)
-        | Surface::Sphere(_)
-        | Surface::Ruled(_)
-        | Surface::Bspline(_) => None,
+        | Surface::Sphere(_) => Some(surface.evaluate(point)),
+        Surface::Ruled(_) | Surface::Bspline(_) => None,
     }
 }
 
@@ -985,6 +989,12 @@ fn segment_curve(surface: Surface, segment: Segment) -> Option<(Curve3, Paramete
                 ParameterRange::new(section.angle_at(start.x), section.angle_at(end.x)),
             ))
         }
+        // A ring, a meridian, a cone's generator or a pole on a carrier of
+        // revolution (ADR 0056 B1).
+        (
+            Surface::Cone(_) | Surface::Sphere(_) | Surface::Torus(_),
+            Segment::Line { start, end },
+        ) => crate::revolved::line_curve(crate::revolved::Revolved::of(surface)?, start, end),
         // A trace's curve is the pair's canonical reading, which
         // `canonical_trace` builds with its pcurve; nothing reaches here.
         _ => None,
