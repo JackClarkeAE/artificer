@@ -505,6 +505,53 @@ pub fn point_in_region(region: &PlanarRegion2, p: Point2) -> bool {
     point_in_loop(&region.outer, p) && !region.holes.iter().any(|hole| point_in_loop(hole, p))
 }
 
+/// The distance from a point to a curve.
+#[must_use]
+pub fn distance_to_curve(curve: &PlanarCurve2, p: Point2) -> f64 {
+    match curve {
+        PlanarCurve2::Line { start, end } => {
+            let dx = end.x - start.x;
+            let dy = end.y - start.y;
+            let length_squared = dx.mul_add(dx, dy * dy);
+            if length_squared <= 0.0 {
+                return distance(p, *start);
+            }
+            let t = ((p.x - start.x) * dx + (p.y - start.y) * dy) / length_squared;
+            let t = t.clamp(0.0, 1.0);
+            distance(p, point(dx.mul_add(t, start.x), dy.mul_add(t, start.y)))
+        }
+        PlanarCurve2::CircularArc {
+            center,
+            start,
+            end,
+            direction,
+        } => {
+            let (radius, start_angle, sweep) = arc_parameters(*center, *start, *end, *direction);
+            let angle = (p.y - center.y).atan2(p.x - center.x);
+            if angle_in_sweep(angle, start_angle, sweep) {
+                (distance(p, *center) - radius).abs()
+            } else {
+                distance(p, *start).min(distance(p, *end))
+            }
+        }
+        PlanarCurve2::Circle { center, radius, .. } => (distance(p, *center) - radius).abs(),
+        PlanarCurve2::Bspline { control_points, .. } => control_points
+            .iter()
+            .map(|c| distance(p, *c))
+            .fold(f64::INFINITY, f64::min),
+    }
+}
+
+/// The distance from a point to a loop's boundary.
+#[must_use]
+pub fn distance_to_loop(source: &PlanarLoop2, p: Point2) -> f64 {
+    source
+        .curves
+        .iter()
+        .map(|curve| distance_to_curve(curve, p))
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// A point strictly inside the loop, found by probing the midpoints of its
 /// curves a little to the left of travel (the interior side of a
 /// counter-clockwise loop).

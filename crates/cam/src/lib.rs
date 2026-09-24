@@ -13,15 +13,55 @@
 //! feeds and speeds from the handbooks, and LinuxCNC's G-code dialect.
 
 pub mod geom;
+pub mod plan;
 pub mod recognise;
+pub mod simulate;
 pub mod space;
+pub mod stock;
+pub mod tools;
+pub mod turning;
 
 use std::fmt;
 
+use artificer_kernel::Snapshot;
+
+pub use plan::{FeedRate, Machine, Move, Operation, OperationKind, Plan, Spindle};
 pub use recognise::{
     BarStock, BoxStock, FaceIssue, Level, MillAllowances, MillTurnSetup, MilledSetup, Setup,
     TurnAllowances, TurnAxis, TurnedSetup, WorkOrigin, recognise, recognise_with,
 };
+pub use tools::{Material, Tool, ToolKind, ToolLibrary};
+
+/// Plans a recognised setup: the operations, tools and toolpaths.
+pub fn plan_setup(
+    setup: &Setup,
+    library: &ToolLibrary,
+    material: Material,
+) -> Result<Plan, CamRefusal> {
+    match setup {
+        Setup::Turned(turned) => turning::plan_turning(turned, library, material),
+        Setup::Milled(_) => Err(CamRefusal::Pocket {
+            detail: "milling is planned in the next slice".to_owned(),
+        }),
+        Setup::MillTurn(mill_turn) => Err(CamRefusal::MillTurnNotPlanned {
+            faces: mill_turn.milled_faces.clone(),
+        }),
+        Setup::Unsupported { faces } => Err(CamRefusal::Unsupported {
+            faces: faces.clone(),
+        }),
+    }
+}
+
+/// The whole button: recognise a body and plan it.
+pub fn plan_part(
+    snapshot: &Snapshot,
+    library: &ToolLibrary,
+    material: Material,
+) -> Result<(Setup, Plan), CamRefusal> {
+    let setup = recognise(snapshot);
+    let plan = plan_setup(&setup, library, material)?;
+    Ok((setup, plan))
+}
 
 /// Why CAM could not plan a part, by name.
 #[derive(Clone, Debug, PartialEq)]
