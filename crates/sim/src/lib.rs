@@ -34,17 +34,25 @@
 pub mod element;
 pub mod material;
 pub mod mesh;
+pub mod motion;
 pub mod sample;
 pub mod solver;
 pub mod structural;
+pub mod thermal;
+pub mod topology;
 
 pub use artificer_kernel::{CancellationToken, SurfaceCell, VoxelGrid};
 pub use material::{MATERIALS, Material, material_by_key};
 pub use mesh::VoxelMesh;
+pub use motion::{FrameClearance, MotionTimeline, clearance_timeline};
 pub use sample::FieldSampler;
 pub use solver::{Progress, SolveOutcome};
 pub use structural::{
     Conditions, Load, StructuralError, StructuralResult, StructuralStudy, Support, solve_static,
+};
+pub use thermal::{Convection, ThermalError, ThermalResult, ThermalStudy, solve_steady_state};
+pub use topology::{
+    TopologyError, TopologyProgress, TopologyResult, TopologyStudy, optimise_topology,
 };
 
 /// How finely a body is voxelised: how many cells span its longest side.

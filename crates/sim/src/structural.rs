@@ -402,6 +402,31 @@ pub fn solve_displacements(
     Displacements { values, outcome }
 }
 
+/// Solves an elastic operator under conditions, from whatever `values`
+/// already holds as a warm start: an optimiser's next iteration begins
+/// where the last one ended.
+#[allow(clippy::too_many_arguments)]
+pub fn conjugate_gradients_on(
+    operator: &ElasticOperator<'_>,
+    conditions: &Conditions,
+    values: &mut [f64],
+    tolerance: f64,
+    max_iterations: usize,
+    cancellation: &CancellationToken,
+    progress: &mut dyn FnMut(Progress),
+) -> SolveOutcome {
+    conjugate_gradients(
+        operator,
+        &conditions.force,
+        &conditions.free,
+        values,
+        tolerance,
+        max_iterations,
+        cancellation,
+        progress,
+    )
+}
+
 /// A bound on iterations that grows with the system: conjugate gradients
 /// on a well-conditioned grid converges in far fewer, and a slender beam
 /// in more, so this is a stop rather than an expectation.
