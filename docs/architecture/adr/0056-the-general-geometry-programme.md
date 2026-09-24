@@ -581,6 +581,55 @@ body where a curve or surface had to be approximated, and as a labelled
 reference mesh where it could not be read, with every refusal named per
 face.
 
+**Status (2026-09-24): I1, I2a/b, I3 and the scripting and API halves of I4
+landed.** `crates/step` is the dependency-free Part 21 reader and writer
+(complex instances, typed arguments, `$`/`*`, comments, continuation
+lines, user-defined entities, edition-3 sections, SI prefixes, inch and
+degree units, the declared uncertainty); the scan add-on still carries its
+own copy and has not switched. `crates/kernel/src/step_import/` reads
+`MANIFOLD_SOLID_BREP`, `BREP_WITH_VOIDS`, `FACETED_BREP` and closed
+`SHELL_BASED_SURFACE_MODEL`s: planes, cylinders, cones, spheres, ring tori,
+non-rational `B_SPLINE_SURFACE_WITH_KNOTS` (simple and complex forms, with
+weights equal within `1e-9` read as one and warned as
+`STEP_RATIONAL_APPROXIMATED`), `SURFACE_OF_LINEAR_EXTRUSION` and
+`SURFACE_OF_REVOLUTION` where the generatrix is a line or circle,
+`RECTANGULAR_TRIMMED_SURFACE` through its basis; lines, circles, ellipses,
+B-splines, `SURFACE_CURVE`/`SEAM_CURVE`/`INTERSECTION_CURVE` through their
+3D curve, two-point polylines, and B-spline or rational edges on analytic
+faces snapped to the line or circle they lie on within the file's
+accuracy. The conforming stage lays every loop out in the surface's
+parameters, chooses the periodic branch for continuity (any branch at a
+pole, the narrowest loop that encloses area the right way winning) and the
+canonical window (lowest azimuth in `[0, 2π)`), inserts a pole edge where
+two faces meet at a pole and closes a lone corner patch through its pole
+vertex as the kernel's own vertex blends do, cuts every edge and face at
+azimuth `kπ` (and minor angle `kπ` on a torus), welds vertices and
+duplicate edges at the file's uncertainty, orders loops outer-first by
+area, turns a body inside out when its shells face into the material, and
+runs the solid validator. Refusals by name: `STEP_SYNTAX_INVALID`,
+`STEP_ENTITY_UNSUPPORTED`, `STEP_FACE_UNSUPPORTED`, `STEP_SHELL_OPEN`,
+`STEP_GAP_EXCEEDS_TOLERANCE`, `STEP_RATIONAL_UNSUPPORTED`,
+`STEP_UNIT_UNSUPPORTED`; any face refused opens the part as a reference
+mesh (`step-import/faceted`, `STEP_FACETED_APPROXIMATION` listing the
+refusals and carrying the chord as its measured deviation): every face is
+cut into chord-sized cells in its surface's parameters and each cell
+ear-clipped, unreadable faces are capped by their boundaries, and the
+triangles go through the faceted tier's assembler under the rules its
+tessellated Boolean operands use. Reachable as `KernelCommand::ImportStep`,
+`ApiCommand::ImportStep`, `Session::import_step`, the script builtin
+`import_step(path:)` (decompiles), the JSON-RPC method `import.step`, and
+history roles `#<entity>` for faces and edges. Not yet: pcurves from the
+file's `PCURVE`s (closed-form inversion is used instead), `Curve3::Trace`
+from `INTERSECTION_CURVE` (the cylinder–cylinder quartic falls to the
+mesh), periodic faces written without a seam edge, trimmed B-spline faces
+whose edges are not iso-lines (the validator's ADR 0050 rule), open shells
+as sheet bodies (Track S1), a canonical entity order so re-imports of one
+part share a digest, assemblies placed by `NEXT_ASSEMBLY_USAGE_OCCURRENCE`
+(the first product is read in its own frame), the workbench's File →
+Import (a `ReplayAction::ImportedBody { path, digest }` feature and a
+browser row, replayed through `Session::import_step`), and I2c's native
+rational splines. Gates: `crates/kernel/tests/step_frontier.rs`.
+
 ### I1. A shared STEP crate
 
 Move the scan add-on's Part 21 tokenizer and entity graph into
